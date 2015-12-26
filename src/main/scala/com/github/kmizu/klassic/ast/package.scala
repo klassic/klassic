@@ -9,5 +9,6 @@ package object ast {
   sealed abstract class Type extends AstNode
 
   sealed abstract class Expression extends AstNode
+  case class VariadicLiteral[T](value: T) extends Expression
   case class TypedExpression(location: Location, body: Expression, annotation: Type) extends Expression
 }
