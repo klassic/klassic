@@ -1,0 +1,8 @@
+.build.sbt.un~
+..gitignore.un~
+.idea/
+.idea_modules/
+target/
+.classpath
+.settings/
+.project
