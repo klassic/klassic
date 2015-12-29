@@ -12,6 +12,7 @@ package object ast {
   case class LambdaTypeConstructor(location: Location, args: List[Type], body: Type) extends AstNode
 
   sealed abstract class Expression extends AstNode
+  case class WhileExpression(location: Location, condition: Expression, body: Expression) extends Expression
   case class IfExpression(location: Location, condition: Expression, thenClause: Expression, elseClause: Expression) extends Expression
   case class BlockExpression(location: Location, expressions: List[Expression]) extends Expression
   case class MethodCall(location: Location, receiver: Expression, name: String, params: List[Expression]) extends Expression
