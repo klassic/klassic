@@ -18,6 +18,7 @@ scalacOptions in (Compile, doc) ++= { Seq(
 )}
 
 libraryDependencies ++= Seq(
+  "com.lihaoyi" %% "fastparse" % "0.3.4",
   "junit" % "junit" % "4.7" % "test",
   "org.scalatest" %% "scalatest" % "2.1.6" % "test"
 )
