@@ -26,5 +26,11 @@ class ParserSpec extends FunSpec {
       assert(integer.parse("-2").get.value == Ast.IntValue(-2))
       assert(integer.parse("-3").get.value == Ast.IntValue(-3))
     }
+    it("+0, +1, +2, +3") {
+      assert(integer.parse("+0").get.value == Ast.IntValue(0))
+      assert(integer.parse("+1").get.value == Ast.IntValue(1))
+      assert(integer.parse("+2").get.value == Ast.IntValue(2))
+      assert(integer.parse("+3").get.value == Ast.IntValue(3))
+    }
   }
 }
