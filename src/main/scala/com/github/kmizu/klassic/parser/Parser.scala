@@ -18,8 +18,8 @@ object Parser {
 
   val expression: P[Expression] = P(literal)
   val literal: P[Expression] = P((integer | double | string | bool | identifier) ~ spacing)
-  val integer: P[IntValue] = P(CharIn('0'to'9').rep(1).!.map{v => IntValue(v.toInt)})
-  val double: P[DoubleValue] = P((CharIn('0'to'9').rep(1) ~ "." ~ CharIn('0'to'9').rep(1)).!.map{v => DoubleValue(v.toDouble)})
+  val integer: P[IntValue] = P(("-"|"+").? ~ CharIn('0'to'9').rep(1)).!.map{v => IntValue(v.toInt)}
+  val double: P[DoubleValue] = P(("-"|"+").? ~ (CharIn('0'to'9').rep(1) ~ "." ~ CharIn('0'to'9').rep(1)).!.map{v => DoubleValue(v.toDouble)})
   val string: P[StringValue] = P("\"" ~ (chars | escape).rep(0).! ~ "\"").map(StringValue(_))
   val bool: P[BoolValue] = P(("true".!.map{_ => true} | "false".!.map{_ => false}).map{BoolValue(_)})
   val identifier: P[Identifier] = P{
