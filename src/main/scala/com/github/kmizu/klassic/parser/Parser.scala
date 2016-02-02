@@ -2,6 +2,8 @@ package com.github.kmizu.klassic.parser
 import fastparse.all._
 
 object Parser {
+  case class TypeIdentifier(symbol: String)
+  case class Define(name: Identifier, `type`: Option[TypeIdentifier], value: Expression)
   abstract sealed class Expression
   abstract sealed class Literal[T](value: T) extends Expression
   case class IntValue(value: Int) extends Literal[Int](value)
