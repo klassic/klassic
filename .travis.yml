@@ -1,4 +1,6 @@
 language: scala
-script: sbt test
+script:
+  - jdk_switcher use oraclejdk8
+  - sbt test
 scala:
   - 2.11.7
