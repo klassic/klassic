@@ -6,3 +6,5 @@ target/
 .classpath
 .settings/
 .project
+klassic.ipr
+klassic.iws
