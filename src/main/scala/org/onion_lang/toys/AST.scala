@@ -6,7 +6,7 @@ package toys
  */
 
 sealed trait AST
-case class Lines(expressions: List[AST]) extends AST
+case class Block(expressions: List[AST]) extends AST
 case class IfExpr(cond: AST, pos: AST, neg: AST) extends AST
 case class LessOp(left: AST, right: AST) extends AST
 case class AddOp(left: AST, right: AST) extends AST

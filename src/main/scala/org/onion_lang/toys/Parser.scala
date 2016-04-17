@@ -30,7 +30,7 @@ class Parser extends RegexParsers {
   lazy val ARROW: Parser[String] = "=>" <~ SPACING
 
   //lines ::= expr {";" expr} [";"]
-  def lines: Parser[AST] = repsep(line, SEMICOLON)<~opt(SEMICOLON)^^Lines
+  def lines: Parser[AST] = repsep(line, SEMICOLON)<~opt(SEMICOLON)^^Block
 
   def line: Parser[AST] = expr | val_declaration | funcDef
   //expr ::= cond | if | printLine

@@ -7,7 +7,7 @@ class Interpreter {
   def evaluate(env:Environment, ast:AST): Value = {
     def evalRecursive(ast:AST): Value = {
       ast match{
-        case Lines(exprs) =>
+        case Block(exprs) =>
           val local = new Environment(Some(env))
           exprs.foldLeft(UnitValue:Value){(result, x) => evaluate(local, x)}
         case IfExpr(cond, pos, neg) =>
