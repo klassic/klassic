@@ -9,25 +9,26 @@ import util.parsing.input.{Reader, CharSequenceReader}
 class Parser extends RegexParsers {
   override def skipWhitespace = false
   lazy val SPACING: Parser[String] = """\s*""".r
-  lazy val SEMICOLON: Parser[String] = ";" <~ SPACING
-  lazy val LT: Parser[String] = "<" <~ SPACING
-  lazy val GT: Parser[String] = "<" <~ SPACING
-  lazy val PLUS: Parser[String] = "+" <~ SPACING
-  lazy val MINUS: Parser[String] = "-" <~ SPACING
-  lazy val ASTER: Parser[String] = "*" <~ SPACING
-  lazy val SLASH: Parser[String] = "/" <~ SPACING
-  lazy val LPAREN: Parser[String] = "(" <~ SPACING
-  lazy val RPAREN: Parser[String] = ")" <~ SPACING
-  lazy val LBRACE: Parser[String] = "{" <~ SPACING
-  lazy val RBRACE: Parser[String] = "}" <~ SPACING
-  lazy val IF: Parser[String] = "if" <~ SPACING
-  lazy val ELSE: Parser[String] = "else" <~ SPACING
-  lazy val COMMA: Parser[String] = "," <~ SPACING
-  lazy val PRINTLN: Parser[String] = "println" <~ SPACING
-  lazy val DEF: Parser[String] = "def" <~ SPACING
-  lazy val VAL: Parser[String] = "val" <~ SPACING
-  lazy val EQ: Parser[String] = "=" <~ SPACING
-  lazy val ARROW: Parser[String] = "=>" <~ SPACING
+  def token(parser: Parser[String]): Parser[String] = parser <~ SPACING
+  lazy val SEMICOLON: Parser[String] = token(";")
+  lazy val LT: Parser[String]        = token("<")
+  lazy val GT: Parser[String]        = token("<")
+  lazy val PLUS: Parser[String]      = token("+")
+  lazy val MINUS: Parser[String]     = token("-")
+  lazy val ASTER: Parser[String]     = token("*")
+  lazy val SLASH: Parser[String]     = token("/")
+  lazy val LPAREN: Parser[String]    = token("(")
+  lazy val RPAREN: Parser[String]    = token(")")
+  lazy val LBRACE: Parser[String]    = token("{")
+  lazy val RBRACE: Parser[String]    = token("}")
+  lazy val IF: Parser[String]        = token("if")
+  lazy val ELSE: Parser[String]      = token("else")
+  lazy val COMMA: Parser[String]     = token(",")
+  lazy val PRINTLN: Parser[String]   = token("println")
+  lazy val DEF: Parser[String]       = token("def")
+  lazy val VAL: Parser[String]       = token("val")
+  lazy val EQ: Parser[String]        = token("=")
+  lazy val ARROW: Parser[String]     = token("=>")
 
   //lines ::= expr {";" expr} [";"]
   def lines: Parser[AST] = repsep(line, SEMICOLON)<~opt(SEMICOLON)^^Block
