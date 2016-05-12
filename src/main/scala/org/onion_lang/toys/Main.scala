@@ -17,6 +17,28 @@ object Main {
     define("matches") { case List(str: StringValue, regex: StringValue) =>
         BooleanValue(str.value.matches(regex.value))
     }
+    define("thread") { case List(fun: FunctionValue) =>
+        new Thread {
+          override def run(): Unit = {
+            val interpreter = new Interpreter
+            val env = new Environment(fun.environment)
+            interpreter.evaluate(env, FuncCall(fun.value, List()))
+          }
+        }.start()
+        UnitValue
+    }
+    define("stopwatch") { case List(fun: FunctionValue) =>
+      val interpreter = new Interpreter
+      val env = new Environment(fun.environment)
+      val start = System.currentTimeMillis()
+      interpreter.evaluate(env, FuncCall(fun.value, List()))
+      val end = System.currentTimeMillis()
+      IntValue((end - start).toInt)
+    }
+    define("sleep"){ case List(milliseconds: IntValue) =>
+      Thread.sleep(milliseconds.value)
+      UnitValue
+    }
   }
   def main(args: Array[String]): Unit = {
     val (flag: String, ast: AST) = parseCommandLine(args)

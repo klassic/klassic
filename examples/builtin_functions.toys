@@ -8,4 +8,13 @@ println(sub("BAR", 0, 1))
 val add = (x, y) => {
   x + y
 }
+val time = stopwatch(() => {
+  sleep(1000)
+  println("1")
+  sleep(1000)
+  println("2")
+  sleep(1000)
+  println("3")
+})
+println("it tooks #{time} milli seconds")
 println(add(2, 3))
