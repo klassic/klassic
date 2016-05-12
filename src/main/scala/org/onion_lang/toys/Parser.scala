@@ -25,6 +25,7 @@ class Parser extends RegexParsers {
   lazy val ELSE: Parser[String]      = token("else")
   lazy val COMMA: Parser[String]     = token(",")
   lazy val PRINTLN: Parser[String]   = token("println")
+  lazy val CLASS: Parser[String]     = token("class")
   lazy val DEF: Parser[String]       = token("def")
   lazy val VAL: Parser[String]       = token("val")
   lazy val EQ: Parser[String]        = token("=")
