@@ -22,8 +22,12 @@ class Environment(val parent:Option[Environment]) {
     iset(Some(this))
     value
   }
+  def define(name: String)(body: List[Value] => Value): Value = {
+    update(name, NativeFunctionValue(body))
+  }
   def update(key: String, value: Value): Value = {
     variables(key) = value
     value
   }
+  override def toString: String = s"Environment(${variables})"
 }

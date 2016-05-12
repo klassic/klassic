@@ -68,6 +68,8 @@ class Interpreter {
                 local(fp) = evalRecursive(ap)
               }
               evaluate(local, proc)
+            case NativeFunctionValue(body) =>
+              body(params.map{p => evalRecursive(p)})
             case _ => sys.error("Runtime Error!")
           }
       }

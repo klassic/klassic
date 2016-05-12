@@ -1,0 +1,5 @@
+println(substring("FOO", 0, 1));
+val pattern = "[0-9]+";
+println(matches("199", pattern));
+println(matches("200", pattern));
+println(matches("a", pattern));
