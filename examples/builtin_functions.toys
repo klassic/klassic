@@ -1,5 +1,11 @@
-println(substring("FOO", 0, 1));
-val pattern = "[0-9]+";
-println(matches("199", pattern));
-println(matches("200", pattern));
-println(matches("a", pattern));
+val pattern = "[0-9]+"
+println(substring("FOO", 0, 1))
+println(matches("199", pattern))
+println(matches("200", pattern))
+println(matches("a", pattern))
+val sub = substring
+println(sub("BAR", 0, 1))
+val add = (x, y) => {
+  x + y
+}
+println(add(2, 3))

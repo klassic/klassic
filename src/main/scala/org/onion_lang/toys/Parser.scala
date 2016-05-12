@@ -8,9 +8,18 @@ import util.parsing.input.{Reader, CharSequenceReader}
  */
 class Parser extends RegexParsers {
   override def skipWhitespace = false
+  private def not[T](p: => Parser[T], msg: String): Parser[Unit] = {
+    not(p) | failure(msg)
+  }
+  lazy val EOF: Parser[String] = not(elem(".", (ch: Char) => ch != CharSequenceReader.EofCh), "EOF Expected") ^^ {_.toString}
   lazy val SPACING: Parser[String] = """\s*""".r
-  def token(parser: Parser[String]): Parser[String] = parser <~ SPACING
-  lazy val SEMICOLON: Parser[String] = token(";")
+  lazy val SPACING_WITHOUT_LF: Parser[String] = ("\t" | " " | "\b" | "\f").* ^^ {_.mkString}
+  lazy val LINEFEED: Parser[String] = ("\r\n" | "\r" | "\n")
+  lazy val SEMICOLON: Parser[String] = ";"
+  lazy val TERMINATOR: Parser[String] = (LINEFEED | SEMICOLON | EOF) <~ SPACING
+
+  def CL[T](parser: Parser[T]): Parser[T] = parser <~ SPACING
+  def token(parser: Parser[String]): Parser[String] = parser <~ SPACING_WITHOUT_LF
   lazy val LT: Parser[String]        = token("<")
   lazy val GT: Parser[String]        = token("<")
   lazy val PLUS: Parser[String]      = token("+")
@@ -32,28 +41,28 @@ class Parser extends RegexParsers {
   lazy val ARROW: Parser[String]     = token("=>")
 
   //lines ::= expr {";" expr} [";"]
-  def lines: Parser[AST] = repsep(line, SEMICOLON)<~opt(SEMICOLON)^^Block
+  def lines: Parser[AST] = repsep(line, TERMINATOR)<~opt(TERMINATOR)^^Block
 
   def line: Parser[AST] = expr | val_declaration | funcDef
   //expr ::= cond | if | printLine
   def expr: Parser[AST] = assignment|condOp|ifExpr|printLine
   //if ::= "if" "(" expr ")" expr "else" expr
-  def ifExpr: Parser[AST] = IF ~ LPAREN ~> expr ~ RPAREN ~ expr ~ ELSE ~ expr^^{
+  def ifExpr: Parser[AST] = CL(IF) ~ CL(LPAREN) ~> expr ~ CL(RPAREN) ~ expr ~ CL(ELSE) ~ expr^^{
     case cond~_~pos~_~neg => IfExpr(cond, pos, neg)
   }
   //cond ::= add {"<" add}
   def condOp: Parser[AST] = chainl1(add,
-    LT ^^{op => (left:AST, right:AST) => LessOp(left, right)})
+    CL(LT) ^^{op => (left:AST, right:AST) => LessOp(left, right)})
   //add ::= term {"+" term | "-" term}.
   def add: Parser[AST] = chainl1(term,
-    PLUS ^^ {op => (left:AST, right:AST) => AddOp(left, right)}|
-    MINUS ^^ {op => (left:AST, right:AST) => SubOp(left, right)})
+    CL(PLUS) ^^ {op => (left:AST, right:AST) => AddOp(left, right)}|
+    CL(MINUS) ^^ {op => (left:AST, right:AST) => SubOp(left, right)})
   //term ::= factor {"*" factor | "/" factor}
   def term : Parser[AST] = chainl1(funcCall,
-    ASTER ^^ {op => (left:AST, right:AST) => MulOp(left, right)}|
-    SLASH ^^ {op => (left:AST, right:AST) => DivOp(left, right)})
+    CL(ASTER) ^^ {op => (left:AST, right:AST) => MulOp(left, right)}|
+    CL(SLASH) ^^ {op => (left:AST, right:AST) => DivOp(left, right)})
 
-  def funcCall: Parser[AST] = factor ~ opt(LPAREN ~> repsep(expr, COMMA) <~ RPAREN)^^{
+  def funcCall: Parser[AST] = factor ~ opt(CL(LPAREN) ~> repsep(expr, CL(COMMA)) <~ RPAREN)^^{
     case fac~param =>{
         param match{
           case Some(p) => FuncCall(fac, p)
@@ -63,15 +72,15 @@ class Parser extends RegexParsers {
   }
 
   //factor ::= intLiteral | stringLiteral | "(" expr ")" | "{" lines "}"
-  def factor: Parser[AST] = intLiteral | stringLiteral | ident | anonFun | LPAREN ~>expr<~ RPAREN | LBRACE ~>lines<~ RBRACE | hereDocument | hereExpression
+  def factor: Parser[AST] = intLiteral | stringLiteral | ident | anonFun | CL(LPAREN) ~>expr<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
-  def intLiteral : Parser[AST] = ("""[1-9][0-9]*|0""".r^^{ value => IntVal(value.toInt)}) <~ SPACING
+  def intLiteral : Parser[AST] = ("""[1-9][0-9]*|0""".r^^{ value => IntVal(value.toInt)}) <~ SPACING_WITHOUT_LF
 
   //stringLiteral ::= "\"" ((?!")(\[rnfb"'\\]|[^\\]))* "\""
   def stringLiteral : Parser[AST] = ("\""~> ("""((?!("|#\{))(\[rnfb"'\\]|[^\\]))+""".r ^^ StringVal | "#{" ~> expr <~ "}").*  <~ "\"" ^^ {values =>
     values.foldLeft(StringVal(""):AST) {(ast, content) => AddOp(ast, content) }
-  }) <~ SPACING
+  }) <~ SPACING_WITHOUT_LF
 
   def rebuild(a: Reader[Char], newSource: String, newOffset: Int): Reader[Char] = new Reader[Char] {
     def atEnd = a.atEnd
@@ -115,7 +124,7 @@ class Parser extends RegexParsers {
         case Error(msg, next) => Error(msg, cat(line, next))
       }
     }
-  }) <~ SPACING
+  }) <~ SPACING_WITHOUT_LF
 
   def hereDocumentBody(beginTag: String): Parser[String] = oneLine >> {line =>
     if(beginTag == line.trim) "" else hereDocumentBody(beginTag) ^^ {result =>
@@ -138,30 +147,30 @@ class Parser extends RegexParsers {
         case Error(msg, next) => Error(msg, cat(line, next))
       }
     }
-  }) <~ SPACING
+  }) <~ SPACING_WITHOUT_LF
 
   def ident :Parser[Ident] = ("""[A-Za-z_][a-zA-Z0-9]*""".r^? {
     case n if n != "if" && n!= "val" && n!= "println" && n != "def" => n
-  } ^^ Ident) <~ SPACING
+  } ^^ Ident) <~ SPACING_WITHOUT_LF
 
-  def assignment: Parser[Assignment] = (ident <~ EQ) ~ expr ^^ {
+  def assignment: Parser[Assignment] = (ident <~ CL(EQ)) ~ expr ^^ {
     case v ~ value => Assignment(v.name, value)
   }
 
   // val_declaration ::= "val" ident "=" expr
-  def val_declaration:Parser[ValDeclaration] = (VAL ~> ident <~ EQ) ~ expr ^^ {
+  def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident <~ CL(EQ)) ~ expr ^^ {
     case v ~ value => ValDeclaration(v.name, value)
   }
   // printLine ::= "printLn" "(" expr ")"
-  def printLine: Parser[AST] = PRINTLN ~> (LPAREN ~> expr <~ RPAREN) ^^PrintLine
+  def printLine: Parser[AST] = CL(PRINTLN) ~> (CL(LPAREN) ~> expr <~ RPAREN) ^^PrintLine
 
   // anonFun ::= "(" [param {"," param}] ")" "=>" expr
-  def anonFun:Parser[AST] = ((LPAREN ~> repsep(ident, COMMA) <~ RPAREN) <~ ARROW) ~ expr ^^ {
+  def anonFun:Parser[AST] = ((CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expr ^^ {
     case params ~ proc => Func(params.map{_.name}, proc)
   }
 
   // funcDef ::= "def" ident  ["(" [param {"," param]] ")"] "=" expr
-  def funcDef:Parser[FuncDef] = DEF ~> ident ~ opt(LPAREN ~>repsep(ident, COMMA) <~ RPAREN) ~ EQ ~ expr ^^ {
+  def funcDef:Parser[FuncDef] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident, CL(COMMA)) <~ CL(RPAREN)) ~ CL(EQ) ~ expr ^^ {
     case v~params~_~proc => {
         val p = params match {
           case Some(pr) => pr
