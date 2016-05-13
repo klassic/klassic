@@ -23,3 +23,22 @@ case class NativeFunctionValue(body: List[Value] => Value) extends Value {
 case object UnitValue extends Value {
   override def toString() = "unit"
 }
+case class ObjectValue(value: AnyRef) extends Value {
+  override def toString() = s"object(${value})"
+}
+object Value {
+  def fromToys(value: Value): AnyRef = value match {
+    case StringValue(v) => v
+    case BooleanValue(v) => new java.lang.Boolean(v)
+    case IntValue(v) => new java.lang.Integer(v)
+    case UnitValue => UnitValue
+    case ObjectValue(v) => v
+  }
+  def toToys(value: AnyRef): Value = value match {
+    case v:java.lang.String => StringValue(v)
+    case v:java.lang.Boolean => BooleanValue(v.booleanValue())
+    case v:java.lang.Integer => IntValue(v.intValue())
+    case UnitValue => UnitValue
+    case otherwise => ObjectValue(otherwise)
+  }
+}

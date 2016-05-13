@@ -39,6 +39,17 @@ object Main {
       Thread.sleep(milliseconds.value)
       UnitValue
     }
+    define("new") { case (className: StringValue)::params =>
+      val actualParams: Array[AnyRef] = params.map {param => Value.fromToys(param)}.toArray
+      val actualClasses = actualParams.map{_.getClass}
+      val constructor = Class.forName(className.value).getConstructor(actualClasses:_*)
+      Value.toToys(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
+    }
+    define("invoke"){ case ObjectValue(self)::StringValue(name)::params =>
+      val actualParams = params.map{Value.fromToys(_)}.toArray
+      val actualClasses = actualParams.map{_.getClass}
+      Value.toToys(self.getClass.getMethod(name, actualClasses:_*).invoke(self, actualParams))
+    }
   }
   def main(args: Array[String]): Unit = {
     val (flag: String, ast: AstNode) = parseCommandLine(args)
