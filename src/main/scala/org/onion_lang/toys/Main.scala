@@ -22,7 +22,7 @@ object Main {
           override def run(): Unit = {
             val interpreter = new Interpreter
             val env = new Environment(fun.environment)
-            interpreter.evaluate(env, FuncCall(fun.value, List()))
+            interpreter.evaluate(env, FunctionCall(fun.value, List()))
           }
         }.start()
         UnitValue
@@ -31,7 +31,7 @@ object Main {
       val interpreter = new Interpreter
       val env = new Environment(fun.environment)
       val start = System.currentTimeMillis()
-      interpreter.evaluate(env, FuncCall(fun.value, List()))
+      interpreter.evaluate(env, FunctionCall(fun.value, List()))
       val end = System.currentTimeMillis()
       IntValue((end - start).toInt)
     }
@@ -41,7 +41,7 @@ object Main {
     }
   }
   def main(args: Array[String]): Unit = {
-    val (flag: String, ast: AST) = parseCommandLine(args)
+    val (flag: String, ast: AstNode) = parseCommandLine(args)
     val interpreter = new Interpreter
     val result = interpreter.evaluate(BuiltinEnvironment, ast)
     flag match {

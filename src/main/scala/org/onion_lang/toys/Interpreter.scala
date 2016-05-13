@@ -4,8 +4,8 @@ package org.onion_lang.toys
  * @author Kota Mizushima
  */
 class Interpreter {
-  def evaluate(env:Environment, ast:AST): Value = {
-    def evalRecursive(ast:AST): Value = {
+  def evaluate(env:Environment, ast:AstNode): Value = {
+    def evalRecursive(ast:AstNode): Value = {
       ast match{
         case Block(exprs) =>
           val local = new Environment(Some(env))
@@ -43,26 +43,26 @@ class Interpreter {
             case (IntValue(lval), IntValue(rval)) => IntValue(lval / rval)
             case _ => sys.error("Runtime Error!")
           }
-        case IntVal(value) =>
+        case IntNode(value) =>
           IntValue(value)
-        case StringVal(value) =>
+        case StringNode(value) =>
           StringValue(value)
         case PrintLine(value) =>
           val v = evalRecursive(value)
           println(v)
           v
-        case Ident(name) => env(name)
+        case Identifier(name) => env(name)
         case ValDeclaration(vr, value) =>
           env(vr) = evalRecursive(value)
         case Assignment(vr, value) =>
           env.set(vr, evalRecursive(value))
-        case func@Func(_, _) =>
+        case func@FunctionLiteral(_, _) =>
           FunctionValue(func, Some(env))
-        case FuncDef(name, func) =>
+        case FunctionDefinition(name, func) =>
           env(name) = FunctionValue(func, Some(env)): Value
-        case FuncCall(func, params) =>
+        case FunctionCall(func, params) =>
           evalRecursive(func) match{
-            case FunctionValue(Func(fparams, proc), cenv) =>
+            case FunctionValue(FunctionLiteral(fparams, proc), cenv) =>
               val local = new Environment(cenv)
               (fparams zip params).foreach{ case (fp, ap) =>
                 local(fp) = evalRecursive(ap)

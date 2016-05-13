@@ -14,7 +14,7 @@ case class IntValue(value: Int) extends Value {
 case class BooleanValue(value: Boolean) extends Value {
   override def toString() = value.toString
 }
-case class FunctionValue(value: Func, environment: Option[Environment]) extends Value {
+case class FunctionValue(value: FunctionLiteral, environment: Option[Environment]) extends Value {
   override def toString() = s"function value:${value} environment:${environment}"
 }
 case class NativeFunctionValue(body: List[Value] => Value) extends Value {
