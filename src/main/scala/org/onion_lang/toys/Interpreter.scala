@@ -4,9 +4,9 @@ package org.onion_lang.toys
  * @author Kota Mizushima
  */
 class Interpreter {
-  def evaluate(env:Environment, ast:AstNode): Value = {
-    def evalRecursive(ast:AstNode): Value = {
-      ast match{
+  def evaluate(env:Environment, node: AstNode): Value = {
+    def evalRecursive(node: AstNode): Value = {
+      node match{
         case Block(exprs) =>
           val local = new Environment(Some(env))
           exprs.foldLeft(UnitValue:Value){(result, x) => evaluate(local, x)}
@@ -74,6 +74,6 @@ class Interpreter {
           }
       }
     }
-    evalRecursive(ast)
+    evalRecursive(node)
   }
 }
