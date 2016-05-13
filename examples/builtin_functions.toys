@@ -19,4 +19,7 @@ val time = stopwatch( => {
 println("it took #{time} milli seconds")
 println(add(2, 3))
 val list = new("java.util.ArrayList")
+invoke(list, "add", 1)
+invoke(list, "add", 2)
+invoke(list, "add", 3)
 println(list)

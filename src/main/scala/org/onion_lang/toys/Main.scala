@@ -2,12 +2,32 @@ package org.onion_lang
 package toys
 
 import scala.collection.Iterator.continually
+import java.lang.reflect.{Constructor, Method}
 
 /**
  * @author Kota Mizushima
  */
 object Main {
   object BuiltinEnvironment extends Environment(None) {
+    def findMethod(self: AnyRef, name: String, params: Array[AnyRef]): Option[Method] = {
+      val selfClass = self.getClass
+      val nameMatchedMethods = selfClass.getMethods.filter{_.getName == name}
+      nameMatchedMethods.find{m =>
+        m.getParameterCount == params.length &&
+        (m.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
+            arg.isAssignableFrom(param)
+        }
+      }
+    }
+    def findConstructor(target: Class[_], params: Array[AnyRef]): Option[Constructor[_]] = {
+      val constructors = target.getConstructors
+      constructors.find{c =>
+        c.getParameterCount == params.length &&
+        (c.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
+          arg.isAssignableFrom(param)
+        }
+      }
+    }
     define("substring"){ case List(s: StringValue, begin: IntValue, end: IntValue) =>
         StringValue(s.value.substring(begin.value, end.value))
     }
@@ -41,14 +61,18 @@ object Main {
     }
     define("new") { case (className: StringValue)::params =>
       val actualParams: Array[AnyRef] = params.map {param => Value.fromToys(param)}.toArray
-      val actualClasses = actualParams.map{_.getClass}
-      val constructor = Class.forName(className.value).getConstructor(actualClasses:_*)
-      Value.toToys(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
+      findConstructor(Class.forName(className.value), actualParams) match {
+        case Some(constructor) =>
+          Value.toToys(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
+        case None => throw new IllegalArgumentException(s"new(${className}, ${params}")
+      }
     }
     define("invoke"){ case ObjectValue(self)::StringValue(name)::params =>
       val actualParams = params.map{Value.fromToys(_)}.toArray
-      val actualClasses = actualParams.map{_.getClass}
-      Value.toToys(self.getClass.getMethod(name, actualClasses:_*).invoke(self, actualParams))
+      findMethod(self, name, actualParams) match {
+        case Some(method) => Value.toToys(method.invoke(self, actualParams:_*))
+        case None => throw new IllegalArgumentException(s"invoke(${self}, ${name}, ${params})")
+      }
     }
   }
   def main(args: Array[String]): Unit = {
