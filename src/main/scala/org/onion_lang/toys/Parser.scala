@@ -165,8 +165,9 @@ class Parser extends RegexParsers {
   def printLine: Parser[AST] = CL(PRINTLN) ~> (CL(LPAREN) ~> expr <~ RPAREN) ^^PrintLine
 
   // anonFun ::= "(" [param {"," param}] ")" "=>" expr
-  def anonFun:Parser[AST] = ((CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expr ^^ {
-    case params ~ proc => Func(params.map{_.name}, proc)
+  def anonFun:Parser[AST] = (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expr ^^ {
+    case Some(params) ~ proc => Func(params.map{_.name}, proc)
+    case None ~ proc => Func(List(), proc)
   }
 
   // funcDef ::= "def" ident  ["(" [param {"," param]] ")"] "=" expr
