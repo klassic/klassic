@@ -138,7 +138,12 @@ class Interpreter {evaluator =>
               }
               evaluate(local, proc)
             case NativeFunctionValue(body) =>
-              body(params.map{p => evalRecursive(p)})
+              val actualParams = params.map{evalRecursive(_)}
+              if(body.isDefinedAt(actualParams)) {
+                body(params.map{p => evalRecursive(p)})
+              } else {
+                sys.error("parameters are not matched to the function's arguments")
+              }
             case _ => sys.error("Runtime Error!")
           }
       }
