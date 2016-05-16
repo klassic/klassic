@@ -59,23 +59,24 @@ class Parser extends RegexParsers {
     CL(PLUS) ^^ {op => (left:AstNode, right:AstNode) => AddOp(left, right)}|
     CL(MINUS) ^^ {op => (left:AstNode, right:AstNode) => SubOp(left, right)})
   //term ::= factor {"*" factor | "/" factor}
-  def term : Parser[AstNode] = chainl1(funcCall,
+  def term : Parser[AstNode] = chainl1(methodCall,
     CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => MulOp(left, right)}|
     CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => DivOp(left, right)})
 
-  def funcCall: Parser[AstNode] = (factor ~ opt(CL(LPAREN) ~> repsep(expr, CL(COMMA)) <~ RPAREN)^^{
-    case fac~param =>{
-        param match{
-          case Some(p) => FunctionCall(fac, p)
-          case None => fac
-        }
-    }
-  }) | ((factor <~ CL(DOT)) ~ ident ~ opt(CL(LPAREN) ~> repsep(expr, CL(COMMA)) <~ RPAREN) ^^ {
-    case fac~name~param =>
+  def methodCall: Parser[AstNode] = funcCall ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expr, CL(COMMA)) <~ RPAREN)).* ^^ {
+    case self ~ Nil =>
+      self
+    case self ~ npList  =>
+      npList.foldLeft(self){case (self, name ~ params) => MethodCall(self, name, params.getOrElse(Nil))}
+  }
+
+  def funcCall: Parser[AstNode] = (factor ~ opt(CL(LPAREN) ~> repsep(expr, CL(COMMA)) <~ RPAREN)^^ {
+    case fac ~ param => {
       param match {
-        case Some(p) => MethodCall(fac, name, p)
-        case None => MethodCall(fac, name, List())
+        case Some(p) => FunctionCall(fac, p)
+        case None => fac
       }
+    }
   })
 
   //factor ::= intLiteral | stringLiteral | "(" expr ")" | "{" lines "}"
