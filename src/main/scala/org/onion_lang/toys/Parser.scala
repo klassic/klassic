@@ -33,6 +33,7 @@ class Parser extends RegexParsers {
   lazy val IF: Parser[String]        = token("if")
   lazy val ELSE: Parser[String]      = token("else")
   lazy val COMMA: Parser[String]     = token(",")
+  lazy val DOT: Parser[String]       = token(".")
   lazy val PRINTLN: Parser[String]   = token("println")
   lazy val CLASS: Parser[String]     = token("class")
   lazy val DEF: Parser[String]       = token("def")
@@ -62,14 +63,20 @@ class Parser extends RegexParsers {
     CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => MulOp(left, right)}|
     CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => DivOp(left, right)})
 
-  def funcCall: Parser[AstNode] = factor ~ opt(CL(LPAREN) ~> repsep(expr, CL(COMMA)) <~ RPAREN)^^{
+  def funcCall: Parser[AstNode] = (factor ~ opt(CL(LPAREN) ~> repsep(expr, CL(COMMA)) <~ RPAREN)^^{
     case fac~param =>{
         param match{
           case Some(p) => FunctionCall(fac, p)
           case None => fac
         }
     }
-  }
+  }) | ((factor <~ CL(DOT)) ~ ident ~ opt(CL(LPAREN) ~> repsep(expr, CL(COMMA)) <~ RPAREN) ^^ {
+    case fac~name~param =>
+      param match {
+        case Some(p) => MethodCall(fac, name, p)
+        case None => MethodCall(fac, name, List())
+      }
+  })
 
   //factor ::= intLiteral | stringLiteral | "(" expr ")" | "{" lines "}"
   def factor: Parser[AstNode] = intLiteral | stringLiteral | ident | anonFun | CL(LPAREN) ~>expr<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression

@@ -129,6 +129,13 @@ class Interpreter {evaluator =>
           FunctionValue(func, Some(env))
         case FunctionDefinition(name, func) =>
           env(name) = FunctionValue(func, Some(env)): Value
+        case MethodCall(self, name, params) =>
+          evalRecursive(self) match {
+            case ObjectValue(value) =>
+              val actualParams = params.map{p => Value.fromToys(evalRecursive(p))}.toArray
+              val method = BuiltinEnvironment.findMethod(value, name.name, actualParams).get
+              Value.toToys(method.invoke(value, actualParams:_*))
+          }
         case FunctionCall(func, params) =>
           evalRecursive(func) match{
             case FunctionValue(FunctionLiteral(fparams, proc), cenv) =>
