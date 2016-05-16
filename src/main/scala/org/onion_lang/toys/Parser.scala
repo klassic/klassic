@@ -44,33 +44,39 @@ class Parser extends RegexParsers {
   //lines ::= expr {";" expr} [";"]
   def lines: Parser[AstNode] = repsep(line, TERMINATOR)<~opt(TERMINATOR)^^Block
 
-  def line: Parser[AstNode] = expr | val_declaration | funcDef
-  //expr ::= cond | if | printLine
-  def expr: Parser[AstNode] = assignment|condOp|ifExpr|printLine
-  //if ::= "if" "(" expr ")" expr "else" expr
-  def ifExpr: Parser[AstNode] = CL(IF) ~ CL(LPAREN) ~> expr ~ CL(RPAREN) ~ expr ~ CL(ELSE) ~ expr^^{
+  //line ::= expression | val_declaration | functionDefinition
+  def line: Parser[AstNode] = expression | val_declaration | functionDefinition
+
+  //expression ::= conditional | if | printLine
+  def expression: Parser[AstNode] = assignment|conditional|ifExpr|printLine
+
+  //if ::= "if" "(" expression ")" expression "else" expression
+  def ifExpr: Parser[AstNode] = CL(IF) ~ CL(LPAREN) ~> expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression^^{
     case cond~_~pos~_~neg => IfExpr(cond, pos, neg)
   }
-  //cond ::= add {"<" add}
-  def condOp: Parser[AstNode] = chainl1(add,
+
+  //conditional ::= add {"<" add}
+  def conditional: Parser[AstNode] = chainl1(add,
     CL(LT) ^^{op => (left:AstNode, right:AstNode) => LessOp(left, right)})
-  //add ::= term {"+" term | "-" term}.
+
+  //add ::= term {"+" term | "-" term}
   def add: Parser[AstNode] = chainl1(term,
     CL(PLUS) ^^ {op => (left:AstNode, right:AstNode) => AddOp(left, right)}|
     CL(MINUS) ^^ {op => (left:AstNode, right:AstNode) => SubOp(left, right)})
+
   //term ::= factor {"*" factor | "/" factor}
-  def term : Parser[AstNode] = chainl1(methodCall,
+  def term : Parser[AstNode] = chainl1(invocation,
     CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => MulOp(left, right)}|
     CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => DivOp(left, right)})
 
-  def methodCall: Parser[AstNode] = funcCall ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expr, CL(COMMA)) <~ RPAREN)).* ^^ {
+  def invocation: Parser[AstNode] = application ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
     case self ~ Nil =>
       self
     case self ~ npList  =>
       npList.foldLeft(self){case (self, name ~ params) => MethodCall(self, name, params.getOrElse(Nil))}
   }
 
-  def funcCall: Parser[AstNode] = (factor ~ opt(CL(LPAREN) ~> repsep(expr, CL(COMMA)) <~ RPAREN)^^ {
+  def application: Parser[AstNode] = (primary ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)^^ {
     case fac ~ param => {
       param match {
         case Some(p) => FunctionCall(fac, p)
@@ -79,14 +85,14 @@ class Parser extends RegexParsers {
     }
   })
 
-  //factor ::= intLiteral | stringLiteral | "(" expr ")" | "{" lines "}"
-  def factor: Parser[AstNode] = intLiteral | stringLiteral | ident | anonFun | CL(LPAREN) ~>expr<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
+  //primary ::= intLiteral | stringLiteral | "(" expr ")" | "{" lines "}"
+  def primary: Parser[AstNode] = intLiteral | stringLiteral | ident | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def intLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r^^{ value => IntNode(value.toInt)}) <~ SPACING_WITHOUT_LF
 
   //stringLiteral ::= "\"" ((?!")(\[rnfb"'\\]|[^\\]))* "\""
-  def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\[rnfb"'\\]|[^\\]))+""".r ^^ StringNode | "#{" ~> expr <~ "}").*  <~ "\"" ^^ { values =>
+  def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\[rnfb"'\\]|[^\\]))+""".r ^^ StringNode | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
     values.foldLeft(StringNode(""):AstNode) { (ast, content) => AddOp(ast, content) }
   }) <~ SPACING_WITHOUT_LF
 
@@ -161,25 +167,25 @@ class Parser extends RegexParsers {
     case n if n != "if" && n!= "val" && n!= "println" && n != "def" => n
   } ^^ Identifier) <~ SPACING_WITHOUT_LF
 
-  def assignment: Parser[Assignment] = (ident <~ CL(EQ)) ~ expr ^^ {
+  def assignment: Parser[Assignment] = (ident <~ CL(EQ)) ~ expression ^^ {
     case v ~ value => Assignment(v.name, value)
   }
 
   // val_declaration ::= "val" ident "=" expr
-  def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident <~ CL(EQ)) ~ expr ^^ {
+  def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident <~ CL(EQ)) ~ expression ^^ {
     case v ~ value => ValDeclaration(v.name, value)
   }
   // printLine ::= "printLn" "(" expr ")"
-  def printLine: Parser[AstNode] = CL(PRINTLN) ~> (CL(LPAREN) ~> expr <~ RPAREN) ^^PrintLine
+  def printLine: Parser[AstNode] = CL(PRINTLN) ~> (CL(LPAREN) ~> expression <~ RPAREN) ^^PrintLine
 
   // anonFun ::= "(" [param {"," param}] ")" "=>" expr
-  def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expr ^^ {
+  def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
     case Some(params) ~ proc => FunctionLiteral(params.map{_.name}, proc)
     case None ~ proc => FunctionLiteral(List(), proc)
   }
 
   // funcDef ::= "def" ident  ["(" [param {"," param]] ")"] "=" expr
-  def funcDef:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident, CL(COMMA)) <~ CL(RPAREN)) ~ CL(EQ) ~ expr ^^ {
+  def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident, CL(COMMA)) <~ CL(RPAREN)) ~ CL(EQ) ~ expression ^^ {
     case v~params~_~proc => {
         val p = params match {
           case Some(pr) => pr
