@@ -76,14 +76,14 @@ class Parser extends RegexParsers {
       npList.foldLeft(self){case (self, name ~ params) => MethodCall(self, name, params.getOrElse(Nil))}
   }
 
-  def application: Parser[AstNode] = (primary ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)^^ {
+  def application: Parser[AstNode] = primary ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)^^ {
     case fac ~ param => {
       param match {
         case Some(p) => FunctionCall(fac, p)
         case None => fac
       }
     }
-  })
+  }
 
   //primary ::= intLiteral | stringLiteral | "(" expr ")" | "{" lines "}"
   def primary: Parser[AstNode] = intLiteral | stringLiteral | ident | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
