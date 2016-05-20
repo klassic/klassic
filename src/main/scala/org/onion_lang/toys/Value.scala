@@ -21,10 +21,10 @@ case class NativeFunctionValue(body: PartialFunction[List[Value], Value]) extend
   override def toString() = s"native function"
 }
 case object UnitValue extends Value {
-  override def toString() = "unit"
+  override def toString() = "()"
 }
 case class ObjectValue(value: AnyRef) extends Value {
-  override def toString() = s"object(${value})"
+  override def toString() = value.toString
 }
 object Value {
   def fromToys(value: Value): AnyRef = value match {
