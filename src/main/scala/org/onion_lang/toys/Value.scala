@@ -33,6 +33,7 @@ object Value {
     case IntValue(v) => new java.lang.Integer(v)
     case UnitValue => UnitValue
     case ObjectValue(v) => v
+    case otherwise => otherwise
   }
   def toToys(value: AnyRef): Value = value match {
     case v:java.lang.String => StringValue(v)
