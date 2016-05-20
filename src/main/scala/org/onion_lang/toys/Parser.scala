@@ -41,7 +41,7 @@ class Parser extends RegexParsers {
   lazy val EQ: Parser[String]        = token("=")
   lazy val ARROW: Parser[String]     = token("=>")
 
-  //lines ::= expr {";" expr} [";"]
+  //lines ::= line {TERMINATOR expr} [TERMINATOR]
   def lines: Parser[AstNode] = repsep(line, TERMINATOR)<~opt(TERMINATOR)^^Block
 
   //line ::= expression | val_declaration | functionDefinition
@@ -85,7 +85,7 @@ class Parser extends RegexParsers {
     }
   }
 
-  //primary ::= intLiteral | stringLiteral | "(" expr ")" | "{" lines "}"
+  //primary ::= intLiteral | stringLiteral | "(" expression ")" | "{" lines "}"
   def primary: Parser[AstNode] = intLiteral | stringLiteral | ident | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
@@ -171,20 +171,20 @@ class Parser extends RegexParsers {
     case v ~ value => Assignment(v.name, value)
   }
 
-  // val_declaration ::= "val" ident "=" expr
+  // val_declaration ::= "val" ident "=" expression
   def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident <~ CL(EQ)) ~ expression ^^ {
     case v ~ value => ValDeclaration(v.name, value)
   }
-  // printLine ::= "printLn" "(" expr ")"
+  // printLine ::= "printLn" "(" expression ")"
   def printLine: Parser[AstNode] = CL(PRINTLN) ~> (CL(LPAREN) ~> expression <~ RPAREN) ^^PrintLine
 
-  // anonFun ::= "(" [param {"," param}] ")" "=>" expr
+  // anonFun ::= "(" [param {"," param}] ")" "=>" expression
   def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
     case Some(params) ~ proc => FunctionLiteral(params.map{_.name}, proc)
     case None ~ proc => FunctionLiteral(List(), proc)
   }
 
-  // funcDef ::= "def" ident  ["(" [param {"," param]] ")"] "=" expr
+  // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
   def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident, CL(COMMA)) <~ CL(RPAREN)) ~ CL(EQ) ~ expression ^^ {
     case v~params~_~proc => {
         val p = params match {
