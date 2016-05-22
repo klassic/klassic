@@ -6,26 +6,26 @@ import java.lang.reflect.{Constructor, Method}
  * @author Kota Mizushima
  */
 class Interpreter {evaluator =>
+  def findMethod(self: AnyRef, name: String, params: Array[AnyRef]): Option[Method] = {
+    val selfClass = self.getClass
+    val nameMatchedMethods = selfClass.getMethods.filter{_.getName == name}
+    nameMatchedMethods.find{m =>
+      m.getParameterCount == params.length &&
+        (m.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
+          arg.isAssignableFrom(param)
+        }
+    }
+  }
+  def findConstructor(target: Class[_], params: Array[AnyRef]): Option[Constructor[_]] = {
+    val constructors = target.getConstructors
+    constructors.find{c =>
+      c.getParameterCount == params.length &&
+        (c.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
+          arg.isAssignableFrom(param)
+        }
+    }
+  }
   object BuiltinEnvironment extends Environment(None) {
-    def findMethod(self: AnyRef, name: String, params: Array[AnyRef]): Option[Method] = {
-      val selfClass = self.getClass
-      val nameMatchedMethods = selfClass.getMethods.filter{_.getName == name}
-      nameMatchedMethods.find{m =>
-        m.getParameterCount == params.length &&
-          (m.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
-            arg.isAssignableFrom(param)
-          }
-      }
-    }
-    def findConstructor(target: Class[_], params: Array[AnyRef]): Option[Constructor[_]] = {
-      val constructors = target.getConstructors
-      constructors.find{c =>
-        c.getParameterCount == params.length &&
-          (c.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
-            arg.isAssignableFrom(param)
-          }
-      }
-    }
     define("substring"){ case List(s: StringValue, begin: IntValue, end: IntValue) =>
       StringValue(s.value.substring(begin.value, end.value))
     }
@@ -133,12 +133,12 @@ class Interpreter {evaluator =>
           evalRecursive(self) match {
             case ObjectValue(value) =>
               val actualParams = params.map{p => Value.fromToys(evalRecursive(p))}.toArray
-              val method = BuiltinEnvironment.findMethod(value, name.name, actualParams).get
+              val method = findMethod(value, name.name, actualParams).get
               Value.toToys(method.invoke(value, actualParams:_*))
           }
         case NewObject(className, params) =>
           val actualParams: Array[AnyRef] = params.map {p => Value.fromToys(evalRecursive((p)))}.toArray
-          BuiltinEnvironment.findConstructor(Class.forName(className), actualParams) match {
+          findConstructor(Class.forName(className), actualParams) match {
             case Some(constructor) =>
               Value.toToys(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
             case None => throw new IllegalArgumentException(s"new(${className}, ${params}")
