@@ -1,6 +1,15 @@
 package com.github.klassic
 
+import java.util.ArrayList
+
 class LiteralSpec extends SpecHelper {
+  def listOf[T](elements: T*): ArrayList[T] = {
+    val newList = new ArrayList[T]
+    elements.foreach{e =>
+      newList.add(e)
+    }
+    newList
+  }
   val I = new Interpreter
   describe("integer literal") {
     val expectations = List[(String, Value)](
@@ -15,6 +24,37 @@ class LiteralSpec extends SpecHelper {
       "-0"   -> IntValue(0)
     )
     expectations.foreach{ case (in, expected) =>
+      it(s"${in} evaluates to ${expected}") {
+        assert(expected == I.evaluateString(in))
+      }
+    }
+  }
+  describe("list literal") {
+    val expectations = List[(String, Value)](
+      "[]" -> ObjectValue(listOf[Any]()),
+      "[1]" -> ObjectValue(listOf(IntValue(1))),
+      """["a"]""" -> ObjectValue(listOf(StringValue("a"))),
+      "[1, 2]" -> ObjectValue(listOf(IntValue(1), IntValue(2))),
+      """|[1
+        | 2]
+      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2))),
+      """|[1,
+        |
+        | 2]
+      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2))),
+      """|[1
+        |
+        | 2]
+      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2))),
+      """|[1 +
+        |
+        | 2]
+      """.stripMargin -> ObjectValue(listOf(IntValue(3))),
+      """|[1, 2
+        | 3]
+      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2), IntValue(3)))
+    )
+    expectations.foreach { case (in, expected) =>
       it(s"${in} evaluates to ${expected}") {
         assert(expected == I.evaluateString(in))
       }
