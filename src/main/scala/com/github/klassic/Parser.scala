@@ -17,6 +17,7 @@ class Parser extends RegexParsers {
   lazy val LINEFEED: Parser[String] = ("\r\n" | "\r" | "\n")
   lazy val SEMICOLON: Parser[String] = ";"
   lazy val TERMINATOR: Parser[String] = (LINEFEED | SEMICOLON | EOF) <~ SPACING
+  lazy val SEPARATOR: Parser[String] = (LINEFEED | COMMA | EOF) <~ SPACING
 
   def CL[T](parser: Parser[T]): Parser[T] = parser <~ SPACING
   def token(parser: Parser[String]): Parser[String] = parser <~ SPACING_WITHOUT_LF
@@ -30,6 +31,8 @@ class Parser extends RegexParsers {
   lazy val RPAREN: Parser[String]    = token(")")
   lazy val LBRACE: Parser[String]    = token("{")
   lazy val RBRACE: Parser[String]    = token("}")
+  lazy val LBRACKET: Parser[String]  = token("[")
+  lazy val RBRACKET: Parser[String]  = token("]")
   lazy val IF: Parser[String]        = token("if")
   lazy val ELSE: Parser[String]      = token("else")
   lazy val COMMA: Parser[String]     = token(",")
@@ -86,8 +89,8 @@ class Parser extends RegexParsers {
     }
   }
 
-  //primary ::= intLiteral | stringLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AstNode] = intLiteral | stringLiteral | newObject | ident | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
+  //primary ::= intLiteral | stringLiteral | listLiteral | "(" expression ")" | "{" lines "}"
+  def primary: Parser[AstNode] = intLiteral | stringLiteral | listLiteral | newObject | ident | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def intLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r^^{ value => IntNode(value.toInt)}) <~ SPACING_WITHOUT_LF
@@ -96,6 +99,8 @@ class Parser extends RegexParsers {
   def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\[rnfb"'\\]|[^\\]))+""".r ^^ StringNode | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
     values.foldLeft(StringNode(""):AstNode) { (ast, content) => AddOp(ast, content) }
   }) <~ SPACING_WITHOUT_LF
+
+  def listLiteral: Parser[AstNode] = CL(LBRACKET) ~> (repsep(expression, SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET ^^ ListLiteral
 
   def fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ { case id ~ ids => ids.foldLeft(id.name){ case (a, d ~ e) => a + d + e.name} }
 
