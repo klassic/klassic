@@ -1,3 +1,5 @@
+Klassic [![Build Status](https://travis-ci.org/klassic/klassic.png?branch=master)](https://travis-ci.org/klassic/klassic)
+
 Klassic **is** Yet Another Programming Language.  Although Klassic is a dynamically-typed
 language currently, it will be a statically typed programming language.  Klassic has: 
 
