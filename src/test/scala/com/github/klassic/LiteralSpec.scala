@@ -33,6 +33,22 @@ class LiteralSpec extends SpecHelper {
       }
     }
   }
+  describe("string literal with escape sequence") {
+    val expectations = List[(String, Value)](
+      """"\r\n"""" -> StringValue("\r\n"),
+      """"\r"""" -> StringValue("\r"),
+      """"\n"""" -> StringValue("\n"),
+      """"\t"""" -> StringValue("\t"),
+      """"\b"""" -> StringValue("\b"),
+      """"\f"""" -> StringValue("\f"),
+      """"\\"""" -> StringValue("\\")
+    )
+    expectations.foreach{ case (in, expected) =>
+      it(s"${in} evaluates to ${expected}") {
+        assert(expected == I.evaluateString(in))
+      }
+    }
+  }
   describe("list literal") {
     val expectations = List[(String, Value)](
       "[]" -> ObjectValue(listOf[Any]()),

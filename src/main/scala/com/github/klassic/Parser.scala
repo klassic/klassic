@@ -21,6 +21,26 @@ class Parser extends RegexParsers {
 
   def CL[T](parser: Parser[T]): Parser[T] = parser <~ SPACING
   def token(parser: Parser[String]): Parser[String] = parser <~ SPACING_WITHOUT_LF
+  def unEscape(input: String): String = {
+    val builder = new java.lang.StringBuilder
+    val length = input.length
+    var i = 0
+    while(i < length - 1) {
+      (input.charAt(i), input.charAt(i + 1)) match {
+        case ('\\', 'r') => builder.append('\r'); i += 2
+        case ('\\', 'n') => builder.append('\n'); i += 2
+        case ('\\', 'b') => builder.append('\b'); i += 2
+        case ('\\', 'f') => builder.append('\f'); i += 2
+        case ('\\', 't') => builder.append('\t'); i += 2
+        case ('\\', '\\') => builder.append('\\'); i += 2
+        case (ch, _) => builder.append(ch); i += 1
+      }
+    }
+    if(i == length - 1) {
+      builder.append(input.charAt(i))
+    }
+    new String(builder)
+  }
   lazy val LT: Parser[String]        = token("<")
   lazy val GT: Parser[String]        = token("<")
   lazy val PLUS: Parser[String]      = token("+")
@@ -101,8 +121,8 @@ class Parser extends RegexParsers {
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def intLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r^^{ value => IntNode(value.toLong.toInt)}) <~ SPACING_WITHOUT_LF
 
-  //stringLiteral ::= "\"" ((?!")(\[rnfb"'\\]|[^\\]))* "\""
-  def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\[rnfb"'\\]|[^\\]))+""".r ^^ StringNode | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
+  //stringLiteral ::= "\"" ((?!")(\[rntfb"'\\]|[^\\]))* "\""
+  def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {in => StringNode(unEscape(in))} | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
     values.foldLeft(StringNode(""):AstNode) { (ast, content) => AddOp(ast, content) }
   }) <~ SPACING_WITHOUT_LF
 
