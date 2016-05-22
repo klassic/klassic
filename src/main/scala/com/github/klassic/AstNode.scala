@@ -21,5 +21,6 @@ case class ValDeclaration(variable: String, value: AstNode) extends AstNode
 case class FunctionLiteral(params:List[String], proc: AstNode) extends AstNode
 case class FunctionDefinition(name: String, func: FunctionLiteral) extends AstNode
 case class FunctionCall(func:AstNode, params:List[AstNode]) extends AstNode
+case class ListLiteral(elements: List[AstNode]) extends AstNode
 case class NewObject(className: String, params: List[AstNode]) extends AstNode
 case class MethodCall(self:AstNode, name: Identifier, params:List[AstNode]) extends AstNode

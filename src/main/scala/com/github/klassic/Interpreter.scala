@@ -116,6 +116,13 @@ class Interpreter {evaluator =>
           IntValue(value)
         case StringNode(value) =>
           StringValue(value)
+        case ListLiteral(elements) =>
+          val params = elements.map{evalRecursive(_)}
+          val newList = new java.util.ArrayList[Any]
+          params.foreach{param =>
+            newList.add(param)
+          }
+          ObjectValue(newList)
         case PrintLine(value) =>
           val v = evalRecursive(value)
           println(v)
