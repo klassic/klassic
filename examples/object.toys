@@ -1,7 +1,7 @@
-val list = new("java.util.ArrayList")
+val list = new java.util.ArrayList
 list.add(1)
 list.add(2)
 println(list)
-val buffer = new ("java.lang.StringBuffer")
+val buffer = new java.lang.StringBuffer
 buffer.append("A").append("B").append("C")
 println(buffer)

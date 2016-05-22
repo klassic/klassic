@@ -40,6 +40,7 @@ class Parser extends RegexParsers {
   lazy val VAL: Parser[String]       = token("val")
   lazy val EQ: Parser[String]        = token("=")
   lazy val ARROW: Parser[String]     = token("=>")
+  lazy val NEW: Parser[String]       = token("new")
 
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
   def lines: Parser[AstNode] = repsep(line, TERMINATOR)<~opt(TERMINATOR)^^Block
@@ -86,7 +87,7 @@ class Parser extends RegexParsers {
   }
 
   //primary ::= intLiteral | stringLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AstNode] = intLiteral | stringLiteral | ident | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
+  def primary: Parser[AstNode] = intLiteral | stringLiteral | newObject | ident | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def intLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r^^{ value => IntNode(value.toInt)}) <~ SPACING_WITHOUT_LF
@@ -95,6 +96,8 @@ class Parser extends RegexParsers {
   def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\[rnfb"'\\]|[^\\]))+""".r ^^ StringNode | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
     values.foldLeft(StringNode(""):AstNode) { (ast, content) => AddOp(ast, content) }
   }) <~ SPACING_WITHOUT_LF
+
+  def fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ { case id ~ ids => ids.foldLeft(id.name){ case (a, d ~ e) => a + d + e.name} }
 
   def rebuild(a: Reader[Char], newSource: String, newOffset: Int): Reader[Char] = new Reader[Char] {
     def atEnd = a.atEnd
@@ -182,6 +185,12 @@ class Parser extends RegexParsers {
   def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
     case Some(params) ~ proc => FunctionLiteral(params.map{_.name}, proc)
     case None ~ proc => FunctionLiteral(List(), proc)
+  }
+
+  // newObject ::= "new" fqcn "(" [param {"," param} ")"
+  def newObject: Parser[AstNode] = CL(NEW) ~> fqcn ~ (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ (RPAREN))) ^^ {
+    case className ~ Some(params) => NewObject(className, params)
+    case className ~ None => NewObject(className, List())
   }
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
