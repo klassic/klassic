@@ -69,9 +69,15 @@ class Parser extends RegexParsers {
     CL(MINUS) ^^ {op => (left:AstNode, right:AstNode) => SubOp(left, right)})
 
   //term ::= factor {"*" factor | "/" factor}
-  def term : Parser[AstNode] = chainl1(invocation,
+  def term : Parser[AstNode] = chainl1(unary,
     CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => MulOp(left, right)}|
     CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => DivOp(left, right)})
+
+  def unary: Parser[AstNode] = (
+    CL(MINUS) ~ unary ^^ { case _ ~ operand => MinusOp(operand) }
+  | CL(PLUS) ~ unary ^^ { case _ ~ operand => PlusOp(operand) }
+  | invocation
+  )
 
   def invocation: Parser[AstNode] = application ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
     case self ~ Nil =>
@@ -209,5 +215,5 @@ class Parser extends RegexParsers {
     }
   }
 
-  def parse(str:String) = parseAll(lines, str)
+  def parse(str:String): ParseResult[AstNode] = parseAll(lines, str)
 }

@@ -1,5 +1,6 @@
 package com.github.klassic
 
+import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
 import java.lang.reflect.{Constructor, Method}
 
 /**
@@ -72,6 +73,18 @@ class Interpreter {evaluator =>
       }
     }
   }
+  def evaluateFile(file: File): Value = using(new BufferedReader(new InputStreamReader(new FileInputStream(file)))){in =>
+    val program = Iterator.continually(in.read()).takeWhile(_ != -1).map(_.toChar).mkString
+    evaluateString(program)
+  }
+  def evaluateString(program: String): Value = {
+    val parser = new Parser
+    parser.parse(program) match {
+      case parser.Success(node: AstNode, _) => evaluate(node)
+      case parser.Failure(m, n) => sys.error(n.pos + ":" + m)
+      case parser.Error(m, n) => sys.error(n.pos + ":" + m)
+    }
+  }
   def evaluate(node: AstNode): Value = evaluate(BuiltinEnvironment, node)
   def evaluate(env:Environment, node: AstNode): Value = {
     def evalRecursive(node: AstNode): Value = {
@@ -111,6 +124,16 @@ class Interpreter {evaluator =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (IntValue(lval), IntValue(rval)) => IntValue(lval / rval)
             case _ => sys.error("Runtime Error!")
+          }
+        case MinusOp(operand) =>
+          evalRecursive(operand) match {
+            case IntValue(value) => IntValue(-value)
+            case _ => sys.error("- cannot be applied to non-integer value")
+          }
+        case PlusOp(operand) =>
+          evalRecursive(operand) match {
+            case IntValue(value) => IntValue(value)
+            case _ => sys.error("+ cannot be applied to non-integer value")
           }
         case IntNode(value) =>
           IntValue(value)

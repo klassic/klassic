@@ -12,6 +12,8 @@ case class AddOp(left: AstNode, right: AstNode) extends AstNode
 case class SubOp(left: AstNode, right: AstNode) extends AstNode
 case class MulOp(left: AstNode, right: AstNode) extends AstNode
 case class DivOp(left: AstNode, right: AstNode) extends AstNode
+case class MinusOp(operand: AstNode) extends AstNode
+case class PlusOp(operand: AstNode) extends AstNode
 case class StringNode(value: String) extends AstNode
 case class PrintLine(value: AstNode) extends AstNode
 case class IntNode(value: Int) extends AstNode
