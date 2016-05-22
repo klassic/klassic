@@ -7,5 +7,6 @@ cache:
 jdk: oraclejdk8
 script:
 - sbt ++$TRAVIS_SCALA_VERSION test
+- sbt ++$TRAVIS_SCALA_VERSION assembly
 - find $HOME/.ivy2 -name "ivydata-*.properties" | xargs rm
 scala: 2.11.8
