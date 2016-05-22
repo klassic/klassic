@@ -1,5 +1,4 @@
-package org.onion_lang
-package toys
+package com.github.klassic
 
 /**
  * @author Kota Mizushima

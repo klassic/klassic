@@ -1,7 +1,7 @@
-package org.onion_lang
-package toys
+package com.github.klassic
+
 import scala.util.parsing.combinator.RegexParsers
-import util.parsing.input.{Reader, CharSequenceReader}
+import scala.util.parsing.input.{CharSequenceReader, Reader}
 
 /**
  * @author Kota Mizushima

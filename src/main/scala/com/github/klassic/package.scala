@@ -1,12 +1,13 @@
-package org.onion_lang
+package com.github
+
+import java.io.{BufferedReader, FileInputStream, InputStreamReader}
 
 import scala.language.reflectiveCalls
-import java.io.{FileInputStream, InputStreamReader, BufferedReader}
 
 /**
  * @author Kota Mizushima
  */
-package object toys {
+package object klassic {
   def openReader[A](fileName: String)(f: BufferedReader => A): A = {
     val reader = new BufferedReader(new InputStreamReader(new FileInputStream(fileName), "UTF-8"))
     using(reader)(f)

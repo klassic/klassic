@@ -1,6 +1,6 @@
-organization := "com.github.kmizu"
+organization := "com.github.klassic"
 
-name := "toys"
+name := "klassic"
 
 version := "0.0.1-SNAPSHOT"
 
@@ -14,7 +14,7 @@ scaladocBranch := "master"
 
 scalacOptions in (Compile, doc) ++= { Seq(
   "-sourcepath", baseDirectory.value.getAbsolutePath,
-  "-doc-source-url", s"https://github.com/kmizu/toys/tree/${scaladocBranch.value}€{FILE_PATH}.scala"
+  "-doc-source-url", s"https://github.com/klassic/klassic/tree/${scaladocBranch.value}€{FILE_PATH}.scala"
 )}
 
 testOptions in Test += Tests.Argument("-u", "target/scalatest-reports")
@@ -36,7 +36,7 @@ initialCommands in console += {
 }
 
 pomExtra := (
-  <url>https://github.com/kmizu/toys</url>
+  <url>https://github.com/klassic/klassic</url>
   <licenses>
     <license>
       <name>The MIT License</name>
@@ -45,8 +45,8 @@ pomExtra := (
     </license>
   </licenses>
   <scm>
-    <url>git@github.com:kmizu/toys.git</url>
-    <connection>scm:git:git@github.com:kmizu/toys.git</connection>
+    <url>git@github.com:klassic/klassic.git</url>
+    <connection>scm:git:git@github.com:klassic/klassic.git</connection>
   </scm>
   <developers>
     <developer>

@@ -1,5 +1,5 @@
-Toys **is** a toy programming language.  Currently, Toys is a dynamically-typed
-language.  Toys has: 
+Klassic **is** Yet Another Programming Language.  Although Klassic is a dynamically-typed
+language currently, it will be a statically typed programming language.  Klassic has: 
 
 * lexically-scoped variables
 * first-class functions
@@ -7,5 +7,4 @@ language.  Toys has:
 * here expression(new!)
 * etc.
 
-The name of the language come from "Detective Opera Milky Holmes", a Japanese TV animation.
-
+Klassic will enable Object-Functional Programming.

@@ -1,4 +1,4 @@
-package org.onion_lang.toys
+package com.github.klassic
 
 /**
   * Created by Mizushima on 2016/05/20.

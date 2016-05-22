@@ -1,5 +1,5 @@
-package org.onion_lang
-package toys
+package com.github.klassic
+
 import scala.collection.mutable
 
 /**

@@ -1,4 +1,4 @@
-package org.onion_lang.toys
+package com.github.klassic
 
 import java.lang.reflect.{Constructor, Method}
 
@@ -36,10 +36,10 @@ class Interpreter {evaluator =>
       BooleanValue(str.value.matches(regex.value))
     }
     define("newObject") { case (className: StringValue)::params =>
-      val actualParams: Array[AnyRef] = params.map {param => Value.fromToys(param)}.toArray
+      val actualParams: Array[AnyRef] = params.map {param => Value.fromKlassic(param)}.toArray
       findConstructor(Class.forName(className.value), actualParams) match {
         case Some(constructor) =>
-          Value.toToys(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
+          Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
         case None => throw new IllegalArgumentException(s"newObject(${className}, ${params}")
       }
     }
@@ -65,9 +65,9 @@ class Interpreter {evaluator =>
       UnitValue
     }
     define("invoke"){ case ObjectValue(self)::StringValue(name)::params =>
-      val actualParams = params.map{Value.fromToys(_)}.toArray
+      val actualParams = params.map{Value.fromKlassic(_)}.toArray
       findMethod(self, name, actualParams) match {
-        case Some(method) => Value.toToys(method.invoke(self, actualParams:_*))
+        case Some(method) => Value.toKlassic(method.invoke(self, actualParams:_*))
         case None => throw new IllegalArgumentException(s"invoke(${self}, ${name}, ${params})")
       }
     }
@@ -132,15 +132,15 @@ class Interpreter {evaluator =>
         case MethodCall(self, name, params) =>
           evalRecursive(self) match {
             case ObjectValue(value) =>
-              val actualParams = params.map{p => Value.fromToys(evalRecursive(p))}.toArray
+              val actualParams = params.map{p => Value.fromKlassic(evalRecursive(p))}.toArray
               val method = findMethod(value, name.name, actualParams).get
-              Value.toToys(method.invoke(value, actualParams:_*))
+              Value.toKlassic(method.invoke(value, actualParams:_*))
           }
         case NewObject(className, params) =>
-          val actualParams: Array[AnyRef] = params.map {p => Value.fromToys(evalRecursive((p)))}.toArray
+          val actualParams: Array[AnyRef] = params.map {p => Value.fromKlassic(evalRecursive((p)))}.toArray
           findConstructor(Class.forName(className), actualParams) match {
             case Some(constructor) =>
-              Value.toToys(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
+              Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
             case None => throw new IllegalArgumentException(s"new(${className}, ${params}")
           }
         case FunctionCall(func, params) =>

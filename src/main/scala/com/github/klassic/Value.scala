@@ -1,5 +1,4 @@
-package org.onion_lang
-package toys
+package com.github.klassic
 
 /**
  * @author Kota Mizushima
@@ -27,7 +26,7 @@ case class ObjectValue(value: AnyRef) extends Value {
   override def toString() = value.toString
 }
 object Value {
-  def fromToys(value: Value): AnyRef = value match {
+  def fromKlassic(value: Value): AnyRef = value match {
     case StringValue(v) => v
     case BooleanValue(v) => new java.lang.Boolean(v)
     case IntValue(v) => new java.lang.Integer(v)
@@ -35,7 +34,7 @@ object Value {
     case ObjectValue(v) => v
     case otherwise => otherwise
   }
-  def toToys(value: AnyRef): Value = value match {
+  def toKlassic(value: AnyRef): Value = value match {
     case v:java.lang.String => StringValue(v)
     case v:java.lang.Boolean => BooleanValue(v.booleanValue())
     case v:java.lang.Integer => IntValue(v.intValue())

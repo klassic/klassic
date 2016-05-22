@@ -1,8 +1,6 @@
-package org.onion_lang
-package toys
+package com.github.klassic
 
 import scala.collection.Iterator.continually
-import java.lang.reflect.{Constructor, Method}
 
 /**
  * @author Kota Mizushima
