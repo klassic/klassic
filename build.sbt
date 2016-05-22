@@ -23,13 +23,15 @@ scalacOptions <++= scalaVersion map { v =>
   Seq("-unchecked", "-deprecation", "-feature", "-language:implicitConversions")
 }
 
-
 libraryDependencies ++= Seq(
   "org.scala-lang.modules" %% "scala-parser-combinators" % "1.0.3",
   "junit" % "junit" % "4.7" % "test",
   "org.scalatest" %% "scalatest" % "2.2.6" % "test"
 )
 
+assemblyJarName in assembly := "klassic.jar"
+
+mainClass in assembly := Some("com.github.klassic.Main")
 
 initialCommands in console += {
   Iterator().map("import "+).mkString("\n")
