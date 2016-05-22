@@ -21,7 +21,11 @@ class LiteralSpec extends SpecHelper {
       "-1"   -> IntValue(-1),
       "0"    -> IntValue(0),
       "+0"   -> IntValue(0),
-      "-0"   -> IntValue(0)
+      "-0"   -> IntValue(0),
+      s"${Int.MinValue}" -> IntValue(Int.MinValue),
+      s"-${Int.MinValue}" -> IntValue(-Int.MinValue),
+      s"${Int.MaxValue}" -> IntValue(Int.MaxValue),
+      s"-${Int.MaxValue}" -> IntValue(-Int.MaxValue)
     )
     expectations.foreach{ case (in, expected) =>
       it(s"${in} evaluates to ${expected}") {
