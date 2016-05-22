@@ -27,7 +27,7 @@ scalacOptions <++= scalaVersion map { v =>
 libraryDependencies ++= Seq(
   "org.scala-lang.modules" %% "scala-parser-combinators" % "1.0.3",
   "junit" % "junit" % "4.7" % "test",
-  "org.scalatest" %% "scalatest" % "2.1.6" % "test"
+  "org.scalatest" %% "scalatest" % "2.2.6" % "test"
 )
 
 
