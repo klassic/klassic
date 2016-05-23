@@ -83,22 +83,22 @@ class Parser extends RegexParsers {
 
   //conditional ::= add {"<" add | ">" add | "<=" add | ">=" add}
   def conditional: Parser[AstNode] = chainl1(add,
-    CL(LT) ^^ {op => (left:AstNode, right:AstNode) => LessOp(left, right)} |
-    CL(GT) ^^ {op => (left:AstNode, right:AstNode) => GreaterOp(left, right)} |
-    CL(LTE) ^^ {op => (left:AstNode, right:AstNode) => LessOrEqualOp(left, right)} |
-    CL(GTE) ^^ {op => (left:AstNode, right:AstNode) => GreaterOrEqualOp(left, right)}
+    CL(LT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.LESS_THAN, left, right)} |
+    CL(GT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.GREATER_THAN, left, right)} |
+    CL(LTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.LESS_OR_EQUAL, left, right)} |
+    CL(GTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.GREATER_EQUAL, left, right)}
   )
 
 
   //add ::= term {"+" term | "-" term}
   def add: Parser[AstNode] = chainl1(term,
-    CL(PLUS) ^^ {op => (left:AstNode, right:AstNode) => AddOp(left, right)}|
-    CL(MINUS) ^^ {op => (left:AstNode, right:AstNode) => SubOp(left, right)})
+    CL(PLUS) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.ADD, left, right)}|
+    CL(MINUS) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.SUBTRACT, left, right)})
 
   //term ::= factor {"*" factor | "/" factor}
   def term : Parser[AstNode] = chainl1(unary,
-    CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => MulOp(left, right)}|
-    CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => DivOp(left, right)})
+    CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.MULTIPLY, left, right)}|
+    CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.DIVIDE, left, right)})
 
   def unary: Parser[AstNode] = (
     CL(MINUS) ~ unary ^^ { case _ ~ operand => MinusOp(operand) }
@@ -135,7 +135,7 @@ class Parser extends RegexParsers {
 
   //stringLiteral ::= "\"" ((?!")(\[rntfb"'\\]|[^\\]))* "\""
   def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {in => StringNode(unEscape(in))} | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
-    values.foldLeft(StringNode(""):AstNode) { (ast, content) => AddOp(ast, content) }
+    values.foldLeft(StringNode(""):AstNode) { (node, content) => BinaryExpression(Operator.ADD, node, content) }
   }) <~ SPACING_WITHOUT_LF
 
   def listLiteral: Parser[AstNode] = CL(LBRACKET) ~> (repsep(expression, SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET ^^ ListLiteral
