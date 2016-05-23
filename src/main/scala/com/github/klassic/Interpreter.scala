@@ -7,6 +7,9 @@ import java.lang.reflect.{Constructor, Method}
  * @author Kota Mizushima
  */
 class Interpreter {evaluator =>
+  def reportError(message: String): Nothing = {
+    throw InterpreterException(message)
+  }
   def findMethod(self: AnyRef, name: String, params: Array[AnyRef]): Option[Method] = {
     val selfClass = self.getClass
     val nameMatchedMethods = selfClass.getMethods.filter{_.getName == name}
@@ -66,7 +69,7 @@ class Interpreter {evaluator =>
       UnitValue
     }
     define("invoke"){ case ObjectValue(self)::StringValue(name)::params =>
-      val actualParams = params.map{Value.fromKlassic(_)}.toArray
+      val actualParams = params.map{Value.fromKlassic}.toArray
       findMethod(self, name, actualParams) match {
         case Some(method) => Value.toKlassic(method.invoke(self, actualParams:_*))
         case None => throw new IllegalArgumentException(s"invoke(${self}, ${name}, ${params})")
@@ -96,7 +99,7 @@ class Interpreter {evaluator =>
           evalRecursive(cond) match {
             case BooleanValue(true) => evalRecursive(pos)
             case BooleanValue(false) => evalRecursive(neg)
-            case _ => sys.error("Runtime Error!")
+            case _ => reportError("type error")
           }
         case BinaryExpression(Operator.LESS_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
@@ -104,7 +107,7 @@ class Interpreter {evaluator =>
             case (LongValue(lval), LongValue(rval)) => BooleanValue(lval < rval)
             case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval < rval)
             case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval < rval)
-            case _ => sys.error("Runtime Error!")
+            case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.GREATER_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
@@ -112,7 +115,7 @@ class Interpreter {evaluator =>
             case (LongValue(lval), LongValue(rval)) => BooleanValue(lval > rval)
             case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval > rval)
             case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval > rval)
-            case _ => sys.error("Runtime Error!")
+            case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.LESS_OR_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
@@ -120,7 +123,7 @@ class Interpreter {evaluator =>
             case (LongValue(lval), LongValue(rval)) => BooleanValue(lval <= rval)
             case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval <= rval)
             case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval <= rval)
-            case _ => sys.error("Runtime Error!")
+            case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.GREATER_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
@@ -128,7 +131,7 @@ class Interpreter {evaluator =>
             case (LongValue(lval), LongValue(rval)) => BooleanValue(lval >= rval)
             case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval >= rval)
             case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval >= rval)
-            case _ => sys.error("Runtime Error!")
+            case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.ADD, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
@@ -138,7 +141,7 @@ class Interpreter {evaluator =>
             case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval + rval).toByte)
             case (StringValue(lval), rval) => StringValue(lval + rval)
             case (lval, StringValue(rval)) => StringValue(lval + rval)
-            case _ => sys.error("Runtime Error!")
+            case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case BinaryExpression(Operator.SUBTRACT, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
@@ -146,7 +149,7 @@ class Interpreter {evaluator =>
             case (LongValue(lval), LongValue(rval)) => LongValue(lval - rval)
             case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval - rval).toShort)
             case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval - rval).toByte)
-            case _ => sys.error("Runtime Error!")
+            case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case BinaryExpression(Operator.MULTIPLY, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
@@ -154,7 +157,7 @@ class Interpreter {evaluator =>
             case (LongValue(lval), LongValue(rval)) => LongValue(lval * rval)
             case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval * rval).toShort)
             case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval * rval).toByte)
-            case _ => sys.error("Runtime Error!")
+            case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case BinaryExpression(Operator.DIVIDE, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
@@ -162,7 +165,7 @@ class Interpreter {evaluator =>
             case (LongValue(lval), LongValue(rval)) => LongValue(lval / rval)
             case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval / rval).toShort)
             case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval / rval).toByte)
-            case _ => sys.error("Runtime Error!")
+            case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case MinusOp(operand) =>
           evalRecursive(operand) match {
@@ -170,7 +173,7 @@ class Interpreter {evaluator =>
             case LongValue(value) => LongValue(-value)
             case ShortValue(value) => ShortValue((-value).toShort)
             case ByteValue(value) => ByteValue((-value).toByte)
-            case _ => sys.error("- cannot be applied to non-integer value")
+            case _ => reportError("- cannot be applied to non-integer value")
           }
         case PlusOp(operand) =>
           evalRecursive(operand) match {
@@ -178,7 +181,7 @@ class Interpreter {evaluator =>
             case LongValue(value) => LongValue(value)
             case ShortValue(value) => ShortValue(value)
             case ByteValue(value) => ByteValue(value)
-            case _ => sys.error("+ cannot be applied to non-integer value")
+            case _ => reportError("+ cannot be applied to non-integer value")
           }
         case IntNode(value) =>
           IntValue(value)
@@ -218,11 +221,11 @@ class Interpreter {evaluator =>
               Value.toKlassic(method.invoke(value, actualParams:_*))
           }
         case NewObject(className, params) =>
-          val actualParams: Array[AnyRef] = params.map {p => Value.fromKlassic(evalRecursive((p)))}.toArray
+          val actualParams: Array[AnyRef] = params.map {p => Value.fromKlassic(evalRecursive(p))}.toArray
           findConstructor(Class.forName(className), actualParams) match {
             case Some(constructor) =>
               Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
-            case None => throw new IllegalArgumentException(s"new(${className}, ${params}")
+            case None => reportError(s"new(${className}, ${params} is illegal")
           }
         case FunctionCall(func, params) =>
           evalRecursive(func) match{
@@ -237,9 +240,10 @@ class Interpreter {evaluator =>
               if(body.isDefinedAt(actualParams)) {
                 body(params.map{p => evalRecursive(p)})
               } else {
-                sys.error("parameters are not matched to the function's arguments")
+                reportError("parameters are not matched to the function's arguments")
               }
-            case _ => sys.error("Runtime Error!")
+            case _ =>
+              reportError("unknown error")
           }
       }
     }
