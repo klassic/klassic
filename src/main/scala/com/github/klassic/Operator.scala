@@ -5,12 +5,12 @@ package com.github.klassic
   */
 sealed abstract class Operator(val descriptor: String)
 object Operator {
-  case object Add extends Operator("+")
-  case object Subtract extends Operator("-")
-  case object Divide extends Operator("/")
-  case object Multiply extends Operator("*")
-  case object LessThan extends Operator("<")
-  case object LessOrEqual extends Operator("<=")
-  case object GreaterThan extends Operator(">")
-  case object GreaterOrEqual extends Operator(">=")
+  case object ADD extends Operator("+")
+  case object SUBTRACT extends Operator("-")
+  case object DIVIDE extends Operator("/")
+  case object MULTIPLY extends Operator("*")
+  case object LESS_THAN extends Operator("<")
+  case object LESS_OR_EQUAL extends Operator("<=")
+  case object GREATER_THAN extends Operator(">")
+  case object GREATER_EQUAL extends Operator(">=")
 }

@@ -98,7 +98,7 @@ class Interpreter {evaluator =>
             case BooleanValue(false) => evalRecursive(neg)
             case _ => sys.error("Runtime Error!")
           }
-        case LessOp(left, right) =>
+        case BinaryExpression(Operator.LESS_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (IntValue(lval), IntValue(rval)) => BooleanValue(lval < rval)
             case (LongValue(lval), LongValue(rval)) => BooleanValue(lval < rval)
@@ -106,7 +106,7 @@ class Interpreter {evaluator =>
             case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval < rval)
             case _ => sys.error("Runtime Error!")
           }
-        case GreaterOp(left, right) =>
+        case BinaryExpression(Operator.GREATER_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (IntValue(lval), IntValue(rval)) => BooleanValue(lval > rval)
             case (LongValue(lval), LongValue(rval)) => BooleanValue(lval > rval)
@@ -114,7 +114,7 @@ class Interpreter {evaluator =>
             case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval > rval)
             case _ => sys.error("Runtime Error!")
           }
-        case LessOrEqualOp(left, right) =>
+        case BinaryExpression(Operator.LESS_OR_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (IntValue(lval), IntValue(rval)) => BooleanValue(lval <= rval)
             case (LongValue(lval), LongValue(rval)) => BooleanValue(lval <= rval)
@@ -122,7 +122,7 @@ class Interpreter {evaluator =>
             case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval <= rval)
             case _ => sys.error("Runtime Error!")
           }
-        case GreaterOrEqualOp(left, right) =>
+        case BinaryExpression(Operator.GREATER_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (IntValue(lval), IntValue(rval)) => BooleanValue(lval >= rval)
             case (LongValue(lval), LongValue(rval)) => BooleanValue(lval >= rval)
@@ -130,7 +130,7 @@ class Interpreter {evaluator =>
             case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval >= rval)
             case _ => sys.error("Runtime Error!")
           }
-        case AddOp(left, right) =>
+        case BinaryExpression(Operator.ADD, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (IntValue(lval), IntValue(rval)) => IntValue(lval + rval)
             case (LongValue(lval), LongValue(rval)) => LongValue(lval + rval)
@@ -140,7 +140,7 @@ class Interpreter {evaluator =>
             case (lval, StringValue(rval)) => StringValue(lval + rval)
             case _ => sys.error("Runtime Error!")
           }
-        case SubOp(left, right) =>
+        case BinaryExpression(Operator.SUBTRACT, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (IntValue(lval), IntValue(rval)) => IntValue(lval - rval)
             case (LongValue(lval), LongValue(rval)) => LongValue(lval - rval)
@@ -148,7 +148,7 @@ class Interpreter {evaluator =>
             case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval - rval).toByte)
             case _ => sys.error("Runtime Error!")
           }
-        case MulOp(left, right) =>
+        case BinaryExpression(Operator.MULTIPLY, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (IntValue(lval), IntValue(rval)) => IntValue(lval * rval)
             case (LongValue(lval), LongValue(rval)) => LongValue(lval * rval)
@@ -156,7 +156,7 @@ class Interpreter {evaluator =>
             case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval * rval).toByte)
             case _ => sys.error("Runtime Error!")
           }
-        case DivOp(left, right) =>
+        case BinaryExpression(Operator.DIVIDE, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (IntValue(lval), IntValue(rval)) => IntValue(lval / rval)
             case (LongValue(lval), LongValue(rval)) => LongValue(lval / rval)
