@@ -17,6 +17,7 @@ case class PlusOp(operand: AstNode) extends AstNode
 case class StringNode(value: String) extends AstNode
 case class PrintLine(value: AstNode) extends AstNode
 case class IntNode(value: Int) extends AstNode
+case class LongNode(value: Long) extends AstNode
 case class Identifier(name: String) extends AstNode
 case class Assignment(variable: String, value: AstNode) extends AstNode
 case class ValDeclaration(variable: String, value: AstNode) extends AstNode
