@@ -10,6 +10,9 @@ case class StringValue(value: String) extends Value {
 case class IntValue(value: Int) extends Value {
   override def toString() = value.toString
 }
+case class LongValue(value: Long) extends Value {
+  override def toString() = value.toString
+}
 case class BooleanValue(value: Boolean) extends Value {
   override def toString() = value.toString
 }

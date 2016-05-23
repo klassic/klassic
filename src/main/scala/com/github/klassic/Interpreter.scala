@@ -106,6 +106,7 @@ class Interpreter {evaluator =>
         case AddOp(left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (IntValue(lval), IntValue(rval)) => IntValue(lval + rval)
+            case (LongValue(lval), LongValue(rval)) => LongValue(lval + rval)
             case (StringValue(lval), rval) => StringValue(lval + rval)
             case (lval, StringValue(rval)) => StringValue(lval + rval)
             case _ => sys.error("Runtime Error!")
@@ -113,32 +114,39 @@ class Interpreter {evaluator =>
         case SubOp(left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (IntValue(lval), IntValue(rval)) => IntValue(lval - rval)
+            case (LongValue(lval), LongValue(rval)) => LongValue(lval - rval)
             case _ => sys.error("Runtime Error!")
           }
         case MulOp(left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (IntValue(lval), IntValue(rval)) => IntValue(lval * rval)
+            case (LongValue(lval), LongValue(rval)) => LongValue(lval * rval)
             case _ => sys.error("Runtime Error!")
           }
         case DivOp(left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (IntValue(lval), IntValue(rval)) => IntValue(lval / rval)
+            case (LongValue(lval), LongValue(rval)) => LongValue(lval / rval)
             case _ => sys.error("Runtime Error!")
           }
         case MinusOp(operand) =>
           evalRecursive(operand) match {
             case IntValue(value) => IntValue(-value)
+            case LongValue(value) => LongValue(-value)
             case _ => sys.error("- cannot be applied to non-integer value")
           }
         case PlusOp(operand) =>
           evalRecursive(operand) match {
             case IntValue(value) => IntValue(value)
+            case LongValue(value) => LongValue(value)
             case _ => sys.error("+ cannot be applied to non-integer value")
           }
         case IntNode(value) =>
           IntValue(value)
         case StringNode(value) =>
           StringValue(value)
+        case LongNode(value) =>
+          LongValue(value)
         case ListLiteral(elements) =>
           val params = elements.map{evalRecursive(_)}
           val newList = new java.util.ArrayList[Any]

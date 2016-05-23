@@ -11,6 +11,7 @@ class LiteralSpec extends SpecHelper {
     newList
   }
   val I = new Interpreter
+
   describe("integer literal") {
     val expectations = List[(String, Value)](
       "2"    -> IntValue(2),
@@ -32,7 +33,29 @@ class LiteralSpec extends SpecHelper {
         assert(expected == I.evaluateString(in))
       }
     }
+
+    describe("long literal") {
+      val expectations = List[(String, Value)](
+        "2L"    -> LongValue(2),
+        "+2L"   -> LongValue(+2),
+        "-2L"   -> LongValue(-2),
+        "1L"    -> LongValue(1),
+        "+1L"   -> LongValue(+1),
+        "-1L"   -> LongValue(-1),
+        "0L"    -> LongValue(0),
+        "+0L"   -> LongValue(0),
+        "-0L"   -> LongValue(0),
+        s"${Long.MaxValue}L" -> LongValue(Long.MaxValue),
+        s"${Long.MinValue + 1}L" -> LongValue(Long.MinValue + 1)
+      )
+      expectations.foreach{ case (in, expected) =>
+        it(s"${in} evaluates to ${expected}") {
+          assert(expected == I.evaluateString(in))
+        }
+      }
+    }
   }
+
   describe("string literal with escape sequence") {
     val expectations = List[(String, Value)](
       """"\r\n"""" -> StringValue("\r\n"),
