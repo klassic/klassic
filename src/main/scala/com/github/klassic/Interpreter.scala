@@ -101,12 +101,41 @@ class Interpreter {evaluator =>
         case LessOp(left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (IntValue(lval), IntValue(rval)) => BooleanValue(lval < rval)
+            case (LongValue(lval), LongValue(rval)) => BooleanValue(lval < rval)
+            case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval < rval)
+            case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval < rval)
+            case _ => sys.error("Runtime Error!")
+          }
+        case GreaterOp(left, right) =>
+          (evalRecursive(left), evalRecursive(right)) match {
+            case (IntValue(lval), IntValue(rval)) => BooleanValue(lval > rval)
+            case (LongValue(lval), LongValue(rval)) => BooleanValue(lval > rval)
+            case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval > rval)
+            case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval > rval)
+            case _ => sys.error("Runtime Error!")
+          }
+        case LessOrEqualOp(left, right) =>
+          (evalRecursive(left), evalRecursive(right)) match {
+            case (IntValue(lval), IntValue(rval)) => BooleanValue(lval <= rval)
+            case (LongValue(lval), LongValue(rval)) => BooleanValue(lval <= rval)
+            case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval <= rval)
+            case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval <= rval)
+            case _ => sys.error("Runtime Error!")
+          }
+        case GreaterOrEqualOp(left, right) =>
+          (evalRecursive(left), evalRecursive(right)) match {
+            case (IntValue(lval), IntValue(rval)) => BooleanValue(lval >= rval)
+            case (LongValue(lval), LongValue(rval)) => BooleanValue(lval >= rval)
+            case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval >= rval)
+            case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval >= rval)
             case _ => sys.error("Runtime Error!")
           }
         case AddOp(left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (IntValue(lval), IntValue(rval)) => IntValue(lval + rval)
             case (LongValue(lval), LongValue(rval)) => LongValue(lval + rval)
+            case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval + rval).toShort)
+            case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval + rval).toByte)
             case (StringValue(lval), rval) => StringValue(lval + rval)
             case (lval, StringValue(rval)) => StringValue(lval + rval)
             case _ => sys.error("Runtime Error!")
@@ -115,30 +144,40 @@ class Interpreter {evaluator =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (IntValue(lval), IntValue(rval)) => IntValue(lval - rval)
             case (LongValue(lval), LongValue(rval)) => LongValue(lval - rval)
+            case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval - rval).toShort)
+            case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval - rval).toByte)
             case _ => sys.error("Runtime Error!")
           }
         case MulOp(left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (IntValue(lval), IntValue(rval)) => IntValue(lval * rval)
             case (LongValue(lval), LongValue(rval)) => LongValue(lval * rval)
+            case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval * rval).toShort)
+            case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval * rval).toByte)
             case _ => sys.error("Runtime Error!")
           }
         case DivOp(left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (IntValue(lval), IntValue(rval)) => IntValue(lval / rval)
             case (LongValue(lval), LongValue(rval)) => LongValue(lval / rval)
+            case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval / rval).toShort)
+            case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval / rval).toByte)
             case _ => sys.error("Runtime Error!")
           }
         case MinusOp(operand) =>
           evalRecursive(operand) match {
             case IntValue(value) => IntValue(-value)
             case LongValue(value) => LongValue(-value)
+            case ShortValue(value) => ShortValue((-value).toShort)
+            case ByteValue(value) => ByteValue((-value).toByte)
             case _ => sys.error("- cannot be applied to non-integer value")
           }
         case PlusOp(operand) =>
           evalRecursive(operand) match {
             case IntValue(value) => IntValue(value)
             case LongValue(value) => LongValue(value)
+            case ShortValue(value) => ShortValue(value)
+            case ByteValue(value) => ByteValue(value)
             case _ => sys.error("+ cannot be applied to non-integer value")
           }
         case IntNode(value) =>
@@ -147,6 +186,10 @@ class Interpreter {evaluator =>
           StringValue(value)
         case LongNode(value) =>
           LongValue(value)
+        case ShortNode(value) =>
+          ShortValue(value)
+        case ByteNode(value) =>
+          ByteValue(value)
         case ListLiteral(elements) =>
           val params = elements.map{evalRecursive(_)}
           val newList = new java.util.ArrayList[Any]
