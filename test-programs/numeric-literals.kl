@@ -1,5 +1,5 @@
-println(127L)
-println((-127B)-1B)
+println(127BY)
+println((-127BY)-1BY)
 println(32767S)
 println((-32767S)-1S)
 println(2147483647)
