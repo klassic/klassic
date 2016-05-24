@@ -7,6 +7,12 @@ sealed abstract class Value
 case class StringValue(value: String) extends Value {
   override def toString() = value
 }
+case class ByteValue(value: Byte) extends Value {
+  override def toString() = value.toString
+}
+case class ShortValue(value: Short) extends Value {
+  override def toString() = value.toString
+}
 case class IntValue(value: Int) extends Value {
   override def toString() = value.toString
 }

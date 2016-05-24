@@ -42,7 +42,9 @@ class Parser extends RegexParsers {
     new String(builder)
   }
   lazy val LT: Parser[String]        = token("<")
-  lazy val GT: Parser[String]        = token("<")
+  lazy val GT: Parser[String]        = token(">")
+  lazy val LTE: Parser[String]       = token("<=")
+  lazy val GTE: Parser[String]       = token(">=")
   lazy val PLUS: Parser[String]      = token("+")
   lazy val MINUS: Parser[String]     = token("-")
   lazy val ASTER: Parser[String]     = token("*")
@@ -79,19 +81,24 @@ class Parser extends RegexParsers {
     case cond~_~pos~_~neg => IfExpr(cond, pos, neg)
   }
 
-  //conditional ::= add {"<" add}
+  //conditional ::= add {"<" add | ">" add | "<=" add | ">=" add}
   def conditional: Parser[AstNode] = chainl1(add,
-    CL(LT) ^^{op => (left:AstNode, right:AstNode) => LessOp(left, right)})
+    CL(LT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.LESS_THAN, left, right)} |
+    CL(GT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.GREATER_THAN, left, right)} |
+    CL(LTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.LESS_OR_EQUAL, left, right)} |
+    CL(GTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.GREATER_EQUAL, left, right)}
+  )
+
 
   //add ::= term {"+" term | "-" term}
   def add: Parser[AstNode] = chainl1(term,
-    CL(PLUS) ^^ {op => (left:AstNode, right:AstNode) => AddOp(left, right)}|
-    CL(MINUS) ^^ {op => (left:AstNode, right:AstNode) => SubOp(left, right)})
+    CL(PLUS) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.ADD, left, right)}|
+    CL(MINUS) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.SUBTRACT, left, right)})
 
   //term ::= factor {"*" factor | "/" factor}
   def term : Parser[AstNode] = chainl1(unary,
-    CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => MulOp(left, right)}|
-    CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => DivOp(left, right)})
+    CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.MULTIPLY, left, right)}|
+    CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.DIVIDE, left, right)})
 
   def unary: Parser[AstNode] = (
     CL(MINUS) ~ unary ^^ { case _ ~ operand => MinusOp(operand) }
@@ -119,14 +126,16 @@ class Parser extends RegexParsers {
   def primary: Parser[AstNode] = integerLiteral | stringLiteral | listLiteral | newObject | ident | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
-  def integerLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r ~ opt("L") ^^ {
+  def integerLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r ~ (opt("L") | opt("S") | opt("B")) ^^ {
     case value ~ None => IntNode(value.toLong.toInt)
     case value ~ Some("L") => LongNode(value.toLong)
+    case value ~ Some("S") => ShortNode(value.toShort)
+    case value ~ Some("B") => ByteNode(value.toByte)
   }) <~ SPACING_WITHOUT_LF
 
   //stringLiteral ::= "\"" ((?!")(\[rntfb"'\\]|[^\\]))* "\""
   def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {in => StringNode(unEscape(in))} | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
-    values.foldLeft(StringNode(""):AstNode) { (ast, content) => AddOp(ast, content) }
+    values.foldLeft(StringNode(""):AstNode) { (node, content) => BinaryExpression(Operator.ADD, node, content) }
   }) <~ SPACING_WITHOUT_LF
 
   def listLiteral: Parser[AstNode] = CL(LBRACKET) ~> (repsep(expression, SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET ^^ ListLiteral

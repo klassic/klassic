@@ -7,17 +7,15 @@ package com.github.klassic
 sealed abstract class AstNode
 case class Block(expressions: List[AstNode]) extends AstNode
 case class IfExpr(cond: AstNode, pos: AstNode, neg: AstNode) extends AstNode
-case class LessOp(left: AstNode, right: AstNode) extends AstNode
-case class AddOp(left: AstNode, right: AstNode) extends AstNode
-case class SubOp(left: AstNode, right: AstNode) extends AstNode
-case class MulOp(left: AstNode, right: AstNode) extends AstNode
-case class DivOp(left: AstNode, right: AstNode) extends AstNode
+case class BinaryExpression(operator: Operator, lhs: AstNode, rhs: AstNode) extends AstNode
 case class MinusOp(operand: AstNode) extends AstNode
 case class PlusOp(operand: AstNode) extends AstNode
 case class StringNode(value: String) extends AstNode
 case class PrintLine(value: AstNode) extends AstNode
 case class IntNode(value: Int) extends AstNode
 case class LongNode(value: Long) extends AstNode
+case class ShortNode(value: Short) extends AstNode
+case class ByteNode(value: Byte) extends AstNode
 case class Identifier(name: String) extends AstNode
 case class Assignment(variable: String, value: AstNode) extends AstNode
 case class ValDeclaration(variable: String, value: AstNode) extends AstNode
