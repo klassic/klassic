@@ -1,0 +1,8 @@
+println(127L)
+println((-127B)-1B)
+println(32767S)
+println((-32767S)-1S)
+println(2147483647)
+println((12147483647)-1)
+println(9223372036854775807L)
+println((-9223372036854775807L)-1L)

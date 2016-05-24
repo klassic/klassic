@@ -126,7 +126,7 @@ class Parser extends RegexParsers {
   def primary: Parser[AstNode] = integerLiteral | stringLiteral | listLiteral | newObject | ident | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
-  def integerLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r ~ (opt("L") | opt("S") | opt("B")) ^^ {
+  def integerLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r ~ opt("L" | "S" | "B") ^^ {
     case value ~ None => IntNode(value.toLong.toInt)
     case value ~ Some("L") => LongNode(value.toLong)
     case value ~ Some("S") => ShortNode(value.toShort)

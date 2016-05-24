@@ -10,7 +10,14 @@ class FileBasedProgramSpec extends SpecHelper {
       override def accept(file: File): Boolean = file.getName.endsWith(".kl")
     })) {
       it(s"program ${program} runs successfully") {
-        I.evaluateFile(program)
+        try {
+          I.evaluateFile(program)
+          assert(true)
+        }catch {
+          case e:Throwable =>
+            println(e)
+            assert(false)
+        }
       }
     }
   }
