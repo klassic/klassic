@@ -95,7 +95,10 @@ class LiteralSpec extends SpecHelper {
       """.stripMargin -> ObjectValue(listOf(IntValue(3))),
       """|[1, 2
         | 3]
-      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2), IntValue(3)))
+      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2), IntValue(3))),
+      """|[1 2
+         | 3 4]
+      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2), IntValue(3), IntValue(4)))
     )
     expectations.foreach { case (in, expected) =>
       it(s"${in} evaluates to ${expected}") {
