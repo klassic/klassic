@@ -12,12 +12,13 @@ class Parser extends RegexParsers {
     not(p) | failure(msg)
   }
   lazy val EOF: Parser[String] = not(elem(".", (ch: Char) => ch != CharSequenceReader.EofCh), "EOF Expected") ^^ {_.toString}
+  lazy val SPACE: Parser[String] = (" " | "\t").* ^^ {_.mkString}
   lazy val SPACING: Parser[String] = """\s*""".r
   lazy val SPACING_WITHOUT_LF: Parser[String] = ("\t" | " " | "\b" | "\f").* ^^ {_.mkString}
   lazy val LINEFEED: Parser[String] = ("\r\n" | "\r" | "\n")
   lazy val SEMICOLON: Parser[String] = ";"
   lazy val TERMINATOR: Parser[String] = (LINEFEED | SEMICOLON | EOF) <~ SPACING
-  lazy val SEPARATOR: Parser[String] = (LINEFEED | COMMA | EOF) <~ SPACING
+  lazy val SEPARATOR: Parser[String] = (LINEFEED | COMMA | EOF | SPACE) <~ SPACING
 
   def CL[T](parser: Parser[T]): Parser[T] = parser <~ SPACING
   def token(parser: Parser[String]): Parser[String] = parser <~ SPACING_WITHOUT_LF
