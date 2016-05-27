@@ -56,6 +56,10 @@ class Interpreter {evaluator =>
       }.start()
       UnitValue
     }
+    define("println") { case List(param) =>
+      println(param)
+      param
+    }
     define("stopwatch") { case List(fun: FunctionValue) =>
       val interpreter = new Interpreter
       val env = new Environment(fun.environment)
@@ -200,10 +204,6 @@ class Interpreter {evaluator =>
             newList.add(param)
           }
           ObjectValue(newList)
-        case PrintLine(value) =>
-          val v = evalRecursive(value)
-          println(v)
-          v
         case Identifier(name) => env(name)
         case ValDeclaration(vr, value) =>
           env(vr) = evalRecursive(value)
