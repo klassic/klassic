@@ -11,7 +11,6 @@ case class BinaryExpression(operator: Operator, lhs: AstNode, rhs: AstNode) exte
 case class MinusOp(operand: AstNode) extends AstNode
 case class PlusOp(operand: AstNode) extends AstNode
 case class StringNode(value: String) extends AstNode
-case class PrintLine(value: AstNode) extends AstNode
 case class IntNode(value: Int) extends AstNode
 case class LongNode(value: Long) extends AstNode
 case class ShortNode(value: Short) extends AstNode
