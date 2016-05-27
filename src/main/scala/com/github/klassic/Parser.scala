@@ -74,8 +74,8 @@ class Parser extends RegexParsers {
   //line ::= expression | val_declaration | functionDefinition
   def line: Parser[AstNode] = expression | val_declaration | functionDefinition
 
-  //expression ::= conditional | if | printLine
-  def expression: Parser[AstNode] = assignment|conditional|ifExpr|printLine
+  //expression ::= conditional | if |
+  def expression: Parser[AstNode] = assignment|conditional|ifExpr
 
   //if ::= "if" "(" expression ")" expression "else" expression
   def ifExpr: Parser[AstNode] = CL(IF) ~ CL(LPAREN) ~> expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression^^{
@@ -213,7 +213,7 @@ class Parser extends RegexParsers {
   }) <~ SPACING_WITHOUT_LF
 
   def ident :Parser[Identifier] = ("""[A-Za-z_][a-zA-Z0-9]*""".r^? {
-    case n if n != "if" && n!= "val" && n!= "println" && n != "def" => n
+    case n if n != "if" && n!= "val" && n != "def" => n
   } ^^ Identifier) <~ SPACING_WITHOUT_LF
 
   def assignment: Parser[Assignment] = (ident <~ CL(EQ)) ~ expression ^^ {
@@ -224,8 +224,6 @@ class Parser extends RegexParsers {
   def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident <~ CL(EQ)) ~ expression ^^ {
     case v ~ value => ValDeclaration(v.name, value)
   }
-  // printLine ::= "printLn" "(" expression ")"
-  def printLine: Parser[AstNode] = CL(PRINTLN) ~> (CL(LPAREN) ~> CL(expression) <~ RPAREN) ^^PrintLine
 
   // anonFun ::= "(" [param {"," param}] ")" "=>" expression
   def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
