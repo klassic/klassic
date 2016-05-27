@@ -71,11 +71,13 @@ val list2 = [
   5
 ]
 println(list2)
+val list3 = [[1 2 3]
+             [4 5 6]
+             [7 8 9]]
 ```
 
 A list literal can be expressed as the form `[e1, e2, ...,en]`.  Note that
-separator characters have also line feeds in Klassic unlike other programming
-languages.
+separator characters have also line feeds and spaces in Klassic unlike other programming languages.
 
 ### Integer Literal
 
