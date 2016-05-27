@@ -114,11 +114,13 @@ class Parser extends RegexParsers {
       npList.foldLeft(self){case (self, name ~ params) => MethodCall(self, name, params.getOrElse(Nil))}
   }
 
-  def application: Parser[AstNode] = primary ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)^^ {
+  def application: Parser[AstNode] = primary ~ opt(CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN))^^ {
     case fac ~ param => {
       param match {
-        case Some(p) => FunctionCall(fac, p)
-        case None => fac
+        case Some(p) =>
+          FunctionCall(fac, p)
+        case None =>
+          fac
       }
     }
   }
@@ -139,7 +141,7 @@ class Parser extends RegexParsers {
     values.foldLeft(StringNode(""):AstNode) { (node, content) => BinaryExpression(Operator.ADD, node, content) }
   }) <~ SPACING_WITHOUT_LF
 
-  def listLiteral: Parser[AstNode] = CL(LBRACKET) ~> (repsep(expression, SEPARATOR) <~ opt(SEPARATOR)) <~ CL(RBRACKET) ^^ ListLiteral
+  def listLiteral: Parser[AstNode] = CL(LBRACKET) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET ^^ ListLiteral
 
   def fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ { case id ~ ids => ids.foldLeft(id.name){ case (a, d ~ e) => a + d + e.name} }
 
@@ -223,7 +225,7 @@ class Parser extends RegexParsers {
     case v ~ value => ValDeclaration(v.name, value)
   }
   // printLine ::= "printLn" "(" expression ")"
-  def printLine: Parser[AstNode] = CL(PRINTLN) ~> (CL(LPAREN) ~> expression <~ RPAREN) ^^PrintLine
+  def printLine: Parser[AstNode] = CL(PRINTLN) ~> (CL(LPAREN) ~> CL(expression) <~ RPAREN) ^^PrintLine
 
   // anonFun ::= "(" [param {"," param}] ")" "=>" expression
   def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
