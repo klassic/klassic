@@ -139,7 +139,7 @@ class Parser extends RegexParsers {
     values.foldLeft(StringNode(""):AstNode) { (node, content) => BinaryExpression(Operator.ADD, node, content) }
   }) <~ SPACING_WITHOUT_LF
 
-  def listLiteral: Parser[AstNode] = CL(LBRACKET) ~> (repsep(expression, SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET ^^ ListLiteral
+  def listLiteral: Parser[AstNode] = CL(LBRACKET) ~> (repsep(expression, SEPARATOR) <~ opt(SEPARATOR)) <~ CL(RBRACKET) ^^ ListLiteral
 
   def fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ { case id ~ ids => ids.foldLeft(id.name){ case (a, d ~ e) => a + d + e.name} }
 
