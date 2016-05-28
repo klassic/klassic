@@ -14,19 +14,19 @@ class LiteralSpec extends SpecHelper {
 
   describe("integer literal") {
     val expectations = List[(String, Value)](
-      "2"    -> IntValue(2),
-      "+2"   -> IntValue(+2),
-      "-2"   -> IntValue(-2),
-      "1"    -> IntValue(1),
-      "+1"   -> IntValue(+1),
-      "-1"   -> IntValue(-1),
-      "0"    -> IntValue(0),
-      "+0"   -> IntValue(0),
-      "-0"   -> IntValue(0),
-      s"${Int.MinValue}" -> IntValue(Int.MinValue),
-      s"-${Int.MinValue}" -> IntValue(-Int.MinValue),
-      s"${Int.MaxValue}" -> IntValue(Int.MaxValue),
-      s"-${Int.MaxValue}" -> IntValue(-Int.MaxValue)
+      "2"    -> BoxedInt(2),
+      "+2"   -> BoxedInt(+2),
+      "-2"   -> BoxedInt(-2),
+      "1"    -> BoxedInt(1),
+      "+1"   -> BoxedInt(+1),
+      "-1"   -> BoxedInt(-1),
+      "0"    -> BoxedInt(0),
+      "+0"   -> BoxedInt(0),
+      "-0"   -> BoxedInt(0),
+      s"${Int.MinValue}" -> BoxedInt(Int.MinValue),
+      s"-${Int.MinValue}" -> BoxedInt(-Int.MinValue),
+      s"${Int.MaxValue}" -> BoxedInt(Int.MaxValue),
+      s"-${Int.MaxValue}" -> BoxedInt(-Int.MaxValue)
     )
     expectations.foreach{ case (in, expected) =>
       it(s"${in} evaluates to ${expected}") {
@@ -36,17 +36,17 @@ class LiteralSpec extends SpecHelper {
 
     describe("long literal") {
       val expectations = List[(String, Value)](
-        "2L"    -> LongValue(2),
-        "+2L"   -> LongValue(+2),
-        "-2L"   -> LongValue(-2),
-        "1L"    -> LongValue(1),
-        "+1L"   -> LongValue(+1),
-        "-1L"   -> LongValue(-1),
-        "0L"    -> LongValue(0),
-        "+0L"   -> LongValue(0),
-        "-0L"   -> LongValue(0),
-        s"${Long.MaxValue}L" -> LongValue(Long.MaxValue),
-        s"${Long.MinValue + 1}L" -> LongValue(Long.MinValue + 1)
+        "2L"    -> BoxedLong(2),
+        "+2L"   -> BoxedLong(+2),
+        "-2L"   -> BoxedLong(-2),
+        "1L"    -> BoxedLong(1),
+        "+1L"   -> BoxedLong(+1),
+        "-1L"   -> BoxedLong(-1),
+        "0L"    -> BoxedLong(0),
+        "+0L"   -> BoxedLong(0),
+        "-0L"   -> BoxedLong(0),
+        s"${Long.MaxValue}L" -> BoxedLong(Long.MaxValue),
+        s"${Long.MinValue + 1}L" -> BoxedLong(Long.MinValue + 1)
       )
       expectations.foreach{ case (in, expected) =>
         it(s"${in} evaluates to ${expected}") {
@@ -75,30 +75,30 @@ class LiteralSpec extends SpecHelper {
   describe("list literal") {
     val expectations = List[(String, Value)](
       "[]" -> ObjectValue(listOf[Any]()),
-      "[1]" -> ObjectValue(listOf(IntValue(1))),
+      "[1]" -> ObjectValue(listOf(BoxedInt(1))),
       """["a"]""" -> ObjectValue(listOf(StringValue("a"))),
-      "[1, 2]" -> ObjectValue(listOf(IntValue(1), IntValue(2))),
+      "[1, 2]" -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2))),
       """|[1
         | 2]
-      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2))),
+      """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2))),
       """|[1,
         |
         | 2]
-      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2))),
+      """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2))),
       """|[1
         |
         | 2]
-      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2))),
+      """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2))),
       """|[1 +
         |
         | 2]
-      """.stripMargin -> ObjectValue(listOf(IntValue(3))),
+      """.stripMargin -> ObjectValue(listOf(BoxedInt(3))),
       """|[1, 2
         | 3]
-      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2), IntValue(3))),
+      """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2), BoxedInt(3))),
       """|[1 2
          | 3 4]
-      """.stripMargin -> ObjectValue(listOf(IntValue(1), IntValue(2), IntValue(3), IntValue(4)))
+      """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2), BoxedInt(3), BoxedInt(4)))
     )
     expectations.foreach { case (in, expected) =>
       it(s"${in} evaluates to ${expected}") {
