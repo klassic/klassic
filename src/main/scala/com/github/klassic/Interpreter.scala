@@ -30,14 +30,14 @@ class Interpreter {evaluator =>
     }
   }
   object BuiltinEnvironment extends Environment(None) {
-    define("substring"){ case List(s: StringValue, begin: IntValue, end: IntValue) =>
+    define("substring"){ case List(s: StringValue, begin: BoxedInt, end: BoxedInt) =>
       StringValue(s.value.substring(begin.value, end.value))
     }
-    define("at") { case List(s: StringValue, index: IntValue) =>
+    define("at") { case List(s: StringValue, index: BoxedInt) =>
       StringValue(s.value.substring(index.value, index.value + 1))
     }
     define("matches") { case List(str: StringValue, regex: StringValue) =>
-      BooleanValue(str.value.matches(regex.value))
+      BoxedBoolean(str.value.matches(regex.value))
     }
     define("newObject") { case (className: StringValue)::params =>
       val actualParams: Array[AnyRef] = params.map {param => Value.fromKlassic(param)}.toArray
@@ -66,9 +66,9 @@ class Interpreter {evaluator =>
       val start = System.currentTimeMillis()
       interpreter.evaluate(env, FunctionCall(fun.value, List()))
       val end = System.currentTimeMillis()
-      IntValue((end - start).toInt)
+      BoxedInt((end - start).toInt)
     }
-    define("sleep"){ case List(milliseconds: IntValue) =>
+    define("sleep"){ case List(milliseconds: BoxedInt) =>
       Thread.sleep(milliseconds.value)
       UnitValue
     }
@@ -101,102 +101,102 @@ class Interpreter {evaluator =>
           exprs.foldLeft(UnitValue:Value){(result, x) => evaluate(local, x)}
         case IfExpr(cond, pos, neg) =>
           evalRecursive(cond) match {
-            case BooleanValue(true) => evalRecursive(pos)
-            case BooleanValue(false) => evalRecursive(neg)
+            case BoxedBoolean(true) => evalRecursive(pos)
+            case BoxedBoolean(false) => evalRecursive(neg)
             case _ => reportError("type error")
           }
         case BinaryExpression(Operator.LESS_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (IntValue(lval), IntValue(rval)) => BooleanValue(lval < rval)
-            case (LongValue(lval), LongValue(rval)) => BooleanValue(lval < rval)
-            case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval < rval)
-            case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval < rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval < rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval < rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval < rval)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval < rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.GREATER_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (IntValue(lval), IntValue(rval)) => BooleanValue(lval > rval)
-            case (LongValue(lval), LongValue(rval)) => BooleanValue(lval > rval)
-            case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval > rval)
-            case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval > rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval > rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval > rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval > rval)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval > rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.LESS_OR_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (IntValue(lval), IntValue(rval)) => BooleanValue(lval <= rval)
-            case (LongValue(lval), LongValue(rval)) => BooleanValue(lval <= rval)
-            case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval <= rval)
-            case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval <= rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval <= rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval <= rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval <= rval)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval <= rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.GREATER_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (IntValue(lval), IntValue(rval)) => BooleanValue(lval >= rval)
-            case (LongValue(lval), LongValue(rval)) => BooleanValue(lval >= rval)
-            case (ShortValue(lval), ShortValue(rval)) => BooleanValue(lval >= rval)
-            case (ByteValue(lval), ByteValue(rval)) => BooleanValue(lval >= rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval >= rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval >= rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval >= rval)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval >= rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.ADD, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
-            case (IntValue(lval), IntValue(rval)) => IntValue(lval + rval)
-            case (LongValue(lval), LongValue(rval)) => LongValue(lval + rval)
-            case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval + rval).toShort)
-            case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval + rval).toByte)
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval + rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval + rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval + rval).toShort)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval + rval).toByte)
             case (StringValue(lval), rval) => StringValue(lval + rval)
             case (lval, StringValue(rval)) => StringValue(lval + rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case BinaryExpression(Operator.SUBTRACT, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
-            case (IntValue(lval), IntValue(rval)) => IntValue(lval - rval)
-            case (LongValue(lval), LongValue(rval)) => LongValue(lval - rval)
-            case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval - rval).toShort)
-            case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval - rval).toByte)
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval - rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval - rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval - rval).toShort)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval - rval).toByte)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case BinaryExpression(Operator.MULTIPLY, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
-            case (IntValue(lval), IntValue(rval)) => IntValue(lval * rval)
-            case (LongValue(lval), LongValue(rval)) => LongValue(lval * rval)
-            case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval * rval).toShort)
-            case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval * rval).toByte)
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval * rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval * rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval * rval).toShort)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval * rval).toByte)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case BinaryExpression(Operator.DIVIDE, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (IntValue(lval), IntValue(rval)) => IntValue(lval / rval)
-            case (LongValue(lval), LongValue(rval)) => LongValue(lval / rval)
-            case (ShortValue(lval), ShortValue(rval)) => ShortValue((lval / rval).toShort)
-            case (ByteValue(lval), ByteValue(rval)) => ByteValue((lval / rval).toByte)
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval / rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval / rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval / rval).toShort)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval / rval).toByte)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case MinusOp(operand) =>
           evalRecursive(operand) match {
-            case IntValue(value) => IntValue(-value)
-            case LongValue(value) => LongValue(-value)
-            case ShortValue(value) => ShortValue((-value).toShort)
-            case ByteValue(value) => ByteValue((-value).toByte)
+            case BoxedInt(value) => BoxedInt(-value)
+            case BoxedLong(value) => BoxedLong(-value)
+            case BoxedShort(value) => BoxedShort((-value).toShort)
+            case BoxedByte(value) => BoxedByte((-value).toByte)
             case _ => reportError("- cannot be applied to non-integer value")
           }
         case PlusOp(operand) =>
           evalRecursive(operand) match {
-            case IntValue(value) => IntValue(value)
-            case LongValue(value) => LongValue(value)
-            case ShortValue(value) => ShortValue(value)
-            case ByteValue(value) => ByteValue(value)
+            case BoxedInt(value) => BoxedInt(value)
+            case BoxedLong(value) => BoxedLong(value)
+            case BoxedShort(value) => BoxedShort(value)
+            case BoxedByte(value) => BoxedByte(value)
             case _ => reportError("+ cannot be applied to non-integer value")
           }
         case IntNode(value) =>
-          IntValue(value)
+          BoxedInt(value)
         case StringNode(value) =>
           StringValue(value)
         case LongNode(value) =>
-          LongValue(value)
+          BoxedLong(value)
         case ShortNode(value) =>
-          ShortValue(value)
+          BoxedShort(value)
         case ByteNode(value) =>
-          ByteValue(value)
+          BoxedByte(value)
         case ListLiteral(elements) =>
           val params = elements.map{evalRecursive(_)}
           val newList = new java.util.ArrayList[Any]
