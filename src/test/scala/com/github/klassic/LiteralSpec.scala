@@ -28,8 +28,8 @@ class LiteralSpec extends SpecHelper {
       s"${Int.MaxValue}" -> BoxedInt(Int.MaxValue),
       s"-${Int.MaxValue}" -> BoxedInt(-Int.MaxValue)
     )
-    expectations.foreach{ case (in, expected) =>
-      it(s"${in} evaluates to ${expected}") {
+    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
+      it(s"expectations ${i}") {
         assert(expected == I.evaluateString(in))
       }
     }
@@ -48,8 +48,8 @@ class LiteralSpec extends SpecHelper {
         s"${Long.MaxValue}L" -> BoxedLong(Long.MaxValue),
         s"${Long.MinValue + 1}L" -> BoxedLong(Long.MinValue + 1)
       )
-      expectations.foreach{ case (in, expected) =>
-        it(s"${in} evaluates to ${expected}") {
+      expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
+        it(s"expectations ${i}") {
           assert(expected == I.evaluateString(in))
         }
       }
@@ -66,8 +66,8 @@ class LiteralSpec extends SpecHelper {
       """"\f"""" -> ObjectValue("\f"),
       """"\\"""" -> ObjectValue("\\")
     )
-    expectations.foreach{ case (in, expected) =>
-      it(s"${in} evaluates to ${expected}") {
+    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
+      it(s"expectations ${i}") {
         assert(expected == I.evaluateString(in))
       }
     }
@@ -100,8 +100,8 @@ class LiteralSpec extends SpecHelper {
          | 3 4]
       """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2), BoxedInt(3), BoxedInt(4)))
     )
-    expectations.foreach { case (in, expected) =>
-      it(s"${in} evaluates to ${expected}") {
+    expectations.zipWithIndex.foreach { case ((in, expected), i) =>
+      it(s"expectations ${i}") {
         assert(expected == I.evaluateString(in))
       }
     }
