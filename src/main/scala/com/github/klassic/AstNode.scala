@@ -6,7 +6,8 @@ package com.github.klassic
 
 sealed abstract class AstNode
 case class Block(expressions: List[AstNode]) extends AstNode
-case class IfExpr(cond: AstNode, pos: AstNode, neg: AstNode) extends AstNode
+case class IfExpression(cond: AstNode, pos: AstNode, neg: AstNode) extends AstNode
+case class WhileExpression(condition: AstNode, body: AstNode) extends AstNode
 case class BinaryExpression(operator: Operator, lhs: AstNode, rhs: AstNode) extends AstNode
 case class MinusOp(operand: AstNode) extends AstNode
 case class PlusOp(operand: AstNode) extends AstNode
