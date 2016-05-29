@@ -1,9 +1,6 @@
 package com.github.klassic
 
 sealed abstract class Value
-case class StringValue(value: String) extends Value {
-  override def toString = value
-}
 case class BoxedByte(value: Byte) extends Value {
   override def toString = value.toString
 }
@@ -32,8 +29,32 @@ case class ObjectValue(value: AnyRef) extends Value {
   override def toString = value.toString
 }
 object Value {
+
+  def classOfValue(value: Value): java.lang.Class[_]= value match {
+    case BoxedBoolean(v) => classOf[Boolean]
+    case BoxedByte(v) => classOf[Byte]
+    case BoxedShort(v) => classOf[Short]
+    case BoxedInt(v) => classOf[Int]
+    case BoxedLong(v) => classOf[Long]
+    case ObjectValue(v) => v.getClass
+    case otherwise => otherwise.getClass
+  }
+
+  def boxedClassOfValue(value: Value): java.lang.Class[_]= value match {
+    case BoxedBoolean(v) => classOf[java.lang.Boolean]
+    case BoxedByte(v) => classOf[java.lang.Byte]
+    case BoxedShort(v) => classOf[java.lang.Short]
+    case BoxedInt(v) => classOf[java.lang.Integer]
+    case BoxedLong(v) => classOf[java.lang.Long]
+    case ObjectValue(v) => v.getClass
+    case otherwise => otherwise.getClass
+  }
+
+  def boxedClassesOfValues(values: Array[Value]): Array[java.lang.Class[_]] = values.map(boxedClassOfValue)
+
+  def classesOfValues(values: Array[Value]):  Array[java.lang.Class[_]] = values.map(classOfValue)
+
   def fromKlassic(value: Value): AnyRef = value match {
-    case StringValue(v) => v
     case BoxedBoolean(v) => new java.lang.Boolean(v)
     case BoxedByte(v) => new java.lang.Byte(v)
     case BoxedShort(v) => new java.lang.Short(v)
@@ -45,7 +66,6 @@ object Value {
   }
 
   def toKlassic(value: AnyRef): Value = value match {
-    case v:java.lang.String => StringValue(v)
     case v:java.lang.Boolean => BoxedBoolean(v.booleanValue())
     case v:java.lang.Byte => BoxedByte(v.byteValue())
     case v:java.lang.Short => BoxedShort(v.shortValue())

@@ -58,13 +58,13 @@ class LiteralSpec extends SpecHelper {
 
   describe("string literal with escape sequence") {
     val expectations = List[(String, Value)](
-      """"\r\n"""" -> StringValue("\r\n"),
-      """"\r"""" -> StringValue("\r"),
-      """"\n"""" -> StringValue("\n"),
-      """"\t"""" -> StringValue("\t"),
-      """"\b"""" -> StringValue("\b"),
-      """"\f"""" -> StringValue("\f"),
-      """"\\"""" -> StringValue("\\")
+      """"\r\n"""" -> ObjectValue("\r\n"),
+      """"\r"""" -> ObjectValue("\r"),
+      """"\n"""" -> ObjectValue("\n"),
+      """"\t"""" -> ObjectValue("\t"),
+      """"\b"""" -> ObjectValue("\b"),
+      """"\f"""" -> ObjectValue("\f"),
+      """"\\"""" -> ObjectValue("\\")
     )
     expectations.foreach{ case (in, expected) =>
       it(s"${in} evaluates to ${expected}") {
@@ -76,7 +76,7 @@ class LiteralSpec extends SpecHelper {
     val expectations = List[(String, Value)](
       "[]" -> ObjectValue(listOf[Any]()),
       "[1]" -> ObjectValue(listOf(BoxedInt(1))),
-      """["a"]""" -> ObjectValue(listOf(StringValue("a"))),
+      """["a"]""" -> ObjectValue(listOf(ObjectValue("a"))),
       "[1, 2]" -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2))),
       """|[1
         | 2]
