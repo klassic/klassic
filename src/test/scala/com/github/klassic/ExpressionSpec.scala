@@ -9,12 +9,12 @@ class ExpressionSpec extends SpecHelper {
   describe("assignment") {
     val expectations: List[(String, Value)] = List(
       """
-        |val a=1;
+        |val a=1
         |a
       """.stripMargin -> BoxedInt(1),
       """
-        |val a=1;
-        |a=a+1
+        |val a=1
+        |a = a + 1
         |a
       """.stripMargin -> BoxedInt(2)
     )
