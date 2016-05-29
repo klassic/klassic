@@ -21,7 +21,7 @@ Klassic will enable Object-Functional Programming.
 val one = 1
 ```
 
-Declare variable `one` and `one` is bounded to `1`.  You can omit
+Declare variable `one` and `one` is bound to `1`.  You can omit
 semicolon(`;`) at the last of the declaration:
 
 ```
@@ -79,7 +79,11 @@ val list3 = [[1 2 3]
 A list literal can be expressed as the form `[e1, e2, ...,en]`.  Note that
 separator characters have also line feeds and spaces in Klassic unlike other programming languages.
 
-### Integer Literal
+### Numeric Literal
+
+Klassic supports various literal.  The followings are explanations:
+
+### Int
 
 ```
 println(100)
@@ -87,11 +91,35 @@ println(200)
 println(300)
 ```
 
-Klassic supports integer literal.  The max value of integer literals is
+The max value of Int literals is
 `Int.MaxValue` in Scala and the min value of integer literals is `Int.MinValue`
 in Scala.
 
-### Long Literal
+### Byte
+
+The suffix of byte literal is `BY`.  The max
+value of long literals is `Byte.MaxValue` in Scala and the min value of long
+literals is `Byte.MinValue` in Scala.
+
+```
+println(127BY)
+println(-127BY)
+println(100BY)
+```
+
+### Short
+
+The suffix of short literal is `S`.  The max
+value of long literals is `Short.MaxValue` in Scala and the min value of long
+literals is `Short.MinValue` in Scala.
+
+```
+println(100S)
+println(200S)
+println(300S)
+```
+
+### Long
 
 ```
 println(100L)
@@ -99,6 +127,6 @@ println(200L)
 println(300L)
 ```
 
-Klassic also supports long literal.  The suffix of long literal is `L`.  The max
+The suffix of long literal is `L`.  The max
 value of long literals is `Long.MaxValue` in Scala and the min value of long
 literals is `Long.MinValue` in Scala.
