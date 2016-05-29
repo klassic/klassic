@@ -38,8 +38,9 @@ object Value {
     case BoxedByte(v) => new java.lang.Byte(v)
     case BoxedShort(v) => new java.lang.Short(v)
     case BoxedInt(v) => new java.lang.Integer(v)
-    case UnitValue => UnitValue
+    case BoxedLong(v) => new java.lang.Long(v)
     case ObjectValue(v) => v
+    case UnitValue => UnitValue
     case otherwise => otherwise
   }
 
@@ -49,6 +50,7 @@ object Value {
     case v:java.lang.Byte => BoxedByte(v.byteValue())
     case v:java.lang.Short => BoxedShort(v.shortValue())
     case v:java.lang.Integer => BoxedInt(v.intValue())
+    case v:java.lang.Long => BoxedLong(v.intValue())
     case UnitValue => UnitValue
     case otherwise => ObjectValue(otherwise)
   }

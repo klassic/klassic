@@ -10,25 +10,32 @@ class Interpreter {evaluator =>
   def reportError(message: String): Nothing = {
     throw InterpreterException(message)
   }
+
   def findMethod(self: AnyRef, name: String, params: Array[AnyRef]): Option[Method] = {
     val selfClass = self.getClass
-    val nameMatchedMethods = selfClass.getMethods.filter{_.getName == name}
-    nameMatchedMethods.find{m =>
-      m.getParameterCount == params.length &&
-        (m.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
-          arg.isAssignableFrom(param)
-        }
+    val nameMatchedMethods = selfClass.getMethods.filter {
+      _.getName == name
+    }
+    nameMatchedMethods.find { m =>
+      val parameterCountMatches = m.getParameterCount == params.length
+      val parameterTypesMatches = (m.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
+        arg.isAssignableFrom(param)
+      }
+      parameterCountMatches && parameterTypesMatches
     }
   }
+
   def findConstructor(target: Class[_], params: Array[AnyRef]): Option[Constructor[_]] = {
     val constructors = target.getConstructors
     constructors.find{c =>
-      c.getParameterCount == params.length &&
-        (c.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
-          arg.isAssignableFrom(param)
-        }
+      val parameterCountMatches = c.getParameterCount == params.length
+      val parameterTypesMatches  = (c.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
+        arg.isAssignableFrom(param)
+      }
+      parameterCountMatches && parameterTypesMatches
     }
   }
+
   object BuiltinEnvironment extends Environment(None) {
     define("substring"){ case List(s: StringValue, begin: BoxedInt, end: BoxedInt) =>
       StringValue(s.value.substring(begin.value, end.value))
