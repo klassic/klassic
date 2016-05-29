@@ -52,8 +52,8 @@ class ExpressionSpec extends SpecHelper {
       """.stripMargin -> ObjectValue("012345")
 
     )
-    expectations.foreach{ case (in, expected) =>
-      it(s"${in} evaluates to ${expected}") {
+    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
+      it(s"expectations ${i}") {
         assert(expected == I.evaluateString(in))
       }
     }
