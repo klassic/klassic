@@ -11,18 +11,32 @@ class Interpreter {evaluator =>
     throw InterpreterException(message)
   }
 
-  def findMethod(self: AnyRef, name: String, params: Array[AnyRef]): Option[Method] = {
+  def findMethod(self: AnyRef, name: String, params: Array[Value]): MethodSearchResult = {
     val selfClass = self.getClass
     val nameMatchedMethods = selfClass.getMethods.filter {
       _.getName == name
     }
     nameMatchedMethods.find { m =>
       val parameterCountMatches = m.getParameterCount == params.length
-      val parameterTypesMatches = (m.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
+      val parameterTypes = Value.classesOfValues(params)
+      val parameterTypesMatches = (m.getParameterTypes zip parameterTypes).forall{ case (arg, param) =>
         arg.isAssignableFrom(param)
       }
       parameterCountMatches && parameterTypesMatches
-    }
+    }.map{m =>
+      UnboxedVersionMethodFound(m)
+    }.orElse({
+      nameMatchedMethods.find{m =>
+        val parameterCountMatches = m.getParameterCount == params.length
+        val boxedParameterTypes = Value.boxedClassesOfValues(params)
+        val boxedParameterTypesMatches = (m.getParameterTypes zip boxedParameterTypes).forall{ case (arg, param) =>
+          arg.isAssignableFrom(param)
+        }
+        parameterCountMatches && boxedParameterTypesMatches
+      }
+    }.map{m =>
+      BoxedVersionMethodFound(m)
+    }).getOrElse(NoMethodFound)
   }
 
   def findConstructor(target: Class[_], params: Array[AnyRef]): Option[Constructor[_]] = {
@@ -37,18 +51,18 @@ class Interpreter {evaluator =>
   }
 
   object BuiltinEnvironment extends Environment(None) {
-    define("substring"){ case List(s: StringValue, begin: BoxedInt, end: BoxedInt) =>
-      StringValue(s.value.substring(begin.value, end.value))
+    define("substring"){ case List(ObjectValue(s:String), begin: BoxedInt, end: BoxedInt) =>
+      ObjectValue(s.substring(begin.value, end.value))
     }
-    define("at") { case List(s: StringValue, index: BoxedInt) =>
-      StringValue(s.value.substring(index.value, index.value + 1))
+    define("at") { case List(ObjectValue(s:String), index: BoxedInt) =>
+      ObjectValue(s.substring(index.value, index.value + 1))
     }
-    define("matches") { case List(str: StringValue, regex: StringValue) =>
-      BoxedBoolean(str.value.matches(regex.value))
+    define("matches") { case List(ObjectValue(s: String), ObjectValue(regex: String)) =>
+      BoxedBoolean(s.matches(regex))
     }
-    define("newObject") { case (className: StringValue)::params =>
+    define("newObject") { case ObjectValue(className:java.lang.String)::params =>
       val actualParams: Array[AnyRef] = params.map {param => Value.fromKlassic(param)}.toArray
-      findConstructor(Class.forName(className.value), actualParams) match {
+      findConstructor(Class.forName(className), actualParams) match {
         case Some(constructor) =>
           Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
         case None => throw new IllegalArgumentException(s"newObject(${className}, ${params}")
@@ -79,11 +93,17 @@ class Interpreter {evaluator =>
       Thread.sleep(milliseconds.value)
       UnitValue
     }
-    define("invoke"){ case ObjectValue(self)::StringValue(name)::params =>
-      val actualParams = params.map{Value.fromKlassic}.toArray
-      findMethod(self, name, actualParams) match {
-        case Some(method) => Value.toKlassic(method.invoke(self, actualParams:_*))
-        case None => throw new IllegalArgumentException(s"invoke(${self}, ${name}, ${params})")
+    define("invoke"){ case ObjectValue(self)::ObjectValue(name:String)::params =>
+      val paramsArray = params.toArray
+      findMethod(self, name, paramsArray) match {
+        case UnboxedVersionMethodFound(method) =>
+          val actualParams = paramsArray.map{Value.fromKlassic}
+          Value.toKlassic(method.invoke(self, actualParams:_*))
+        case BoxedVersionMethodFound(method) =>
+          val actualParams = paramsArray.map{Value.fromKlassic}
+          Value.toKlassic(method.invoke(self, actualParams:_*))
+        case NoMethodFound =>
+          throw new IllegalArgumentException(s"invoke(${self}, ${name}, ${params})")
       }
     }
   }
@@ -150,8 +170,8 @@ class Interpreter {evaluator =>
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval + rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval + rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval + rval).toByte)
-            case (StringValue(lval), rval) => StringValue(lval + rval)
-            case (lval, StringValue(rval)) => StringValue(lval + rval)
+            case (ObjectValue(lval:String), rval) => ObjectValue(lval + rval)
+            case (lval, ObjectValue(rval:String)) => ObjectValue(lval + rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case BinaryExpression(Operator.SUBTRACT, left, right) =>
@@ -197,7 +217,7 @@ class Interpreter {evaluator =>
         case IntNode(value) =>
           BoxedInt(value)
         case StringNode(value) =>
-          StringValue(value)
+          ObjectValue(value)
         case LongNode(value) =>
           BoxedLong(value)
         case ShortNode(value) =>
@@ -223,9 +243,17 @@ class Interpreter {evaluator =>
         case MethodCall(self, name, params) =>
           evalRecursive(self) match {
             case ObjectValue(value) =>
-              val actualParams = params.map{p => Value.fromKlassic(evalRecursive(p))}.toArray
-              val method = findMethod(value, name.name, actualParams).get
-              Value.toKlassic(method.invoke(value, actualParams:_*))
+              val paramsArray = params.map{p => evalRecursive(p)}.toArray
+              findMethod(value, name.name, paramsArray) match {
+                case UnboxedVersionMethodFound(method) =>
+                  val actualParams = paramsArray.map{Value.fromKlassic}
+                  Value.toKlassic(method.invoke(value, actualParams:_*))
+                case BoxedVersionMethodFound(method) =>
+                  val actualParams = paramsArray.map{Value.fromKlassic}
+                  Value.toKlassic(method.invoke(value, actualParams:_*))
+                case NoMethodFound =>
+                  throw new IllegalArgumentException(s"invoke(${self}, ${name}, ${params})")
+              }
           }
         case NewObject(className, params) =>
           val actualParams: Array[AnyRef] = params.map {p => Value.fromKlassic(evalRecursive(p))}.toArray

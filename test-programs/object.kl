@@ -10,3 +10,4 @@ println([
   "BAR"
   "BAZ"
 ])
+println("FOO".substring(0, 1))
