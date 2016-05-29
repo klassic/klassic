@@ -1,8 +1,5 @@
 package com.github.klassic
 
-/**
- * @author Kota Mizushima
- */
 sealed abstract class Value
 case class StringValue(value: String) extends Value {
   override def toString = value
@@ -38,14 +35,19 @@ object Value {
   def fromKlassic(value: Value): AnyRef = value match {
     case StringValue(v) => v
     case BoxedBoolean(v) => new java.lang.Boolean(v)
+    case BoxedByte(v) => new java.lang.Byte(v)
+    case BoxedShort(v) => new java.lang.Short(v)
     case BoxedInt(v) => new java.lang.Integer(v)
     case UnitValue => UnitValue
     case ObjectValue(v) => v
     case otherwise => otherwise
   }
+
   def toKlassic(value: AnyRef): Value = value match {
     case v:java.lang.String => StringValue(v)
     case v:java.lang.Boolean => BoxedBoolean(v.booleanValue())
+    case v:java.lang.Byte => BoxedByte(v.byteValue())
+    case v:java.lang.Short => BoxedShort(v.shortValue())
     case v:java.lang.Integer => BoxedInt(v.intValue())
     case UnitValue => UnitValue
     case otherwise => ObjectValue(otherwise)
