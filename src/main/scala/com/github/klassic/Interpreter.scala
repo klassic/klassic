@@ -126,7 +126,12 @@ class Interpreter {evaluator =>
         case Block(exprs) =>
           val local = new Environment(Some(env))
           exprs.foldLeft(UnitValue:Value){(result, x) => evaluate(local, x)}
-        case IfExpr(cond, pos, neg) =>
+        case WhileExpression(cond, body) =>
+          while(evalRecursive(cond) == BoxedBoolean(true)) {
+            evalRecursive(body)
+          }
+          UnitValue
+        case IfExpression(cond, pos, neg) =>
           evalRecursive(cond) match {
             case BoxedBoolean(true) => evalRecursive(pos)
             case BoxedBoolean(false) => evalRecursive(neg)
