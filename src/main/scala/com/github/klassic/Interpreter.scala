@@ -39,15 +39,29 @@ class Interpreter {evaluator =>
     }).getOrElse(NoMethodFound)
   }
 
-  def findConstructor(target: Class[_], params: Array[AnyRef]): Option[Constructor[_]] = {
+  def findConstructor(target: Class[_], params: Array[Value]): ConstructorSearchResult = {
     val constructors = target.getConstructors
     constructors.find{c =>
       val parameterCountMatches = c.getParameterCount == params.length
-      val parameterTypesMatches  = (c.getParameterTypes zip params.map{_.getClass}).forall{ case (arg, param) =>
+      val unboxedParameterTypes = Value.classesOfValues(params)
+      val parameterTypesMatches  = (c.getParameterTypes zip unboxedParameterTypes).forall{ case (arg, param) =>
         arg.isAssignableFrom(param)
       }
       parameterCountMatches && parameterTypesMatches
-    }
+    }.map{c =>
+      UnboxedVersionConstructorFound(c)
+    }.orElse({
+      constructors.find{c =>
+        val parameterCountMatches = c.getParameterCount == params.length
+        val boxedParameterTypes = Value.boxedClassesOfValues(params)
+        val parameterTypesMatches  = (c.getParameterTypes zip boxedParameterTypes).forall{ case (arg, param) =>
+          arg.isAssignableFrom(param)
+        }
+        parameterCountMatches && parameterTypesMatches
+      }
+    }.map { c =>
+      BoxedVersionConstructorFound(c)
+    }).getOrElse(NoConstructorFound)
   }
 
   object BuiltinEnvironment extends Environment(None) {
@@ -60,14 +74,7 @@ class Interpreter {evaluator =>
     define("matches") { case List(ObjectValue(s: String), ObjectValue(regex: String)) =>
       BoxedBoolean(s.matches(regex))
     }
-    define("newObject") { case ObjectValue(className:java.lang.String)::params =>
-      val actualParams: Array[AnyRef] = params.map {param => Value.fromKlassic(param)}.toArray
-      findConstructor(Class.forName(className), actualParams) match {
-        case Some(constructor) =>
-          Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
-        case None => throw new IllegalArgumentException(s"newObject(${className}, ${params}")
-      }
-    }
+
     define("thread") { case List(fun: FunctionValue) =>
       new Thread {
         override def run(): Unit = {
@@ -106,6 +113,20 @@ class Interpreter {evaluator =>
           throw new IllegalArgumentException(s"invoke(${self}, ${name}, ${params})")
       }
     }
+    define("newObject") { case ObjectValue(className:java.lang.String)::params =>
+      val paramsArray = params.toArray
+      findConstructor(Class.forName(className), paramsArray) match {
+        case UnboxedVersionConstructorFound(constructor) =>
+          val actualParams = paramsArray.map{Value.fromKlassic}
+          Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
+        case BoxedVersionConstructorFound(constructor) =>
+          val actualParams = paramsArray.map{Value.fromKlassic}
+          Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
+        case NoConstructorFound =>
+          throw new IllegalArgumentException(s"newObject(${className}, ${params}")
+      }
+    }
+
   }
   def evaluateFile(file: File): Value = using(new BufferedReader(new InputStreamReader(new FileInputStream(file)))){in =>
     val program = Iterator.continually(in.read()).takeWhile(_ != -1).map(_.toChar).mkString
@@ -261,11 +282,16 @@ class Interpreter {evaluator =>
               }
           }
         case NewObject(className, params) =>
-          val actualParams: Array[AnyRef] = params.map {p => Value.fromKlassic(evalRecursive(p))}.toArray
-          findConstructor(Class.forName(className), actualParams) match {
-            case Some(constructor) =>
+          val paramsArray = params.map{evalRecursive}.toArray
+          findConstructor(Class.forName(className), paramsArray) match {
+            case UnboxedVersionConstructorFound(constructor) =>
+              val actualParams = paramsArray.map{Value.fromKlassic}
               Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
-            case None => reportError(s"new(${className}, ${params} is illegal")
+            case BoxedVersionConstructorFound(constructor) =>
+              val actualParams = paramsArray.map{Value.fromKlassic}
+              Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
+            case NoConstructorFound =>
+              throw new IllegalArgumentException(s"newObject(${className}, ${params}")
           }
         case FunctionCall(func, params) =>
           evalRecursive(func) match{
