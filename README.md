@@ -143,3 +143,21 @@ println(300L)
 The suffix of long literal is `L`.  The max
 value of long literals is `Long.MaxValue` in Scala and the min value of long
 literals is `Long.MinValue` in Scala.
+
+### Comment
+
+Klassic provides two kinds of comment
+
+### (Nestable) Block Comment
+
+```
+1 + /* nested
+  /* comment */ here */ 2
+```
+
+### Line comment
+
+```
+1 + // comment
+    2
+```
