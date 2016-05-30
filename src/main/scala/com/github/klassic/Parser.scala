@@ -12,14 +12,27 @@ class Parser extends RegexParsers {
   private def not[T](p: => Parser[T], msg: String): Parser[Unit] = {
     not(p) | failure(msg)
   }
+  private def and[T](p: => Parser[T], msg: String): Parser[Unit] = {
+    not(not(p)) | failure(msg)
+  }
   lazy val EOF: Parser[String] = not(elem(".", (ch: Char) => ch != CharSequenceReader.EofCh), "EOF Expected") ^^ {_.toString}
-  lazy val SPACE: Parser[String] = (" " | "\t").* ^^ {_.mkString}
-  lazy val SPACING: Parser[String] = """\s*""".r
-  lazy val SPACING_WITHOUT_LF: Parser[String] = ("\t" | " " | "\b" | "\f").* ^^ {_.mkString}
   lazy val LINEFEED: Parser[String] = ("\r\n" | "\r" | "\n")
   lazy val SEMICOLON: Parser[String] = ";"
+  lazy val ANY: Parser[String] = elem(".", (ch: Char) => ch != CharSequenceReader.EofCh) ^^ {_.toString}
+
+  lazy val SPACING: Parser[String] = (COMMENT | "\r\n" | "\r" | "\n" | " " | "\t" | "\b" | "\f").* ^^ {_.mkString}
+  lazy val SPACING_WITHOUT_LF: Parser[String] = (COMMENT | "\t" | " " | "\b" | "\f").* ^^ {_.mkString}
   lazy val TERMINATOR: Parser[String] = (LINEFEED | SEMICOLON | EOF) <~ SPACING
-  lazy val SEPARATOR: Parser[String] = (LINEFEED | COMMA | EOF | SPACE) <~ SPACING
+  lazy val SEPARATOR: Parser[String] = (LINEFEED | COMMA | EOF | SPACING_WITHOUT_LF) <~ SPACING
+
+  lazy val BLOCK_COMMENT: Parser[Any] = (
+    "/*" ~ (not("*/") ~ (BLOCK_COMMENT | ANY)).* ~ "*/"
+  )
+  lazy val LINE_COMMENT: Parser[Any] = (
+    "//" ~ (not(LINEFEED) ~ ANY).* ~ LINEFEED
+  )
+  lazy val COMMENT: Parser[Any] = BLOCK_COMMENT | LINE_COMMENT
+
 
   def CL[T](parser: Parser[T]): Parser[T] = parser <~ SPACING
   def token(parser: Parser[String]): Parser[String] = parser <~ SPACING_WITHOUT_LF
