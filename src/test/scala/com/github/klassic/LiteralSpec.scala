@@ -3,13 +3,6 @@ package com.github.klassic
 import java.util.ArrayList
 
 class LiteralSpec extends SpecHelper {
-  def listOf[T](elements: T*): ArrayList[T] = {
-    val newList = new ArrayList[T]
-    elements.foreach{e =>
-      newList.add(e)
-    }
-    newList
-  }
   val I = new Interpreter
 
   describe("integer literal") {
@@ -75,30 +68,38 @@ class LiteralSpec extends SpecHelper {
   describe("list literal") {
     val expectations = List[(String, Value)](
       "[]" -> ObjectValue(listOf[Any]()),
-      "[1]" -> ObjectValue(listOf(BoxedInt(1))),
-      """["a"]""" -> ObjectValue(listOf(ObjectValue("a"))),
-      "[1, 2]" -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2))),
+      "[1]" -> ObjectValue(listOf(1)),
+      """["a"]""" -> ObjectValue(listOf("a")),
+      "[1, 2]" -> ObjectValue(listOf(1, 2)),
       """|[1
         | 2]
-      """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2))),
+      """.stripMargin -> ObjectValue(listOf(1, 2)),
       """|[1,
         |
         | 2]
-      """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2))),
+      """.stripMargin -> ObjectValue(listOf(1, 2)),
       """|[1
         |
         | 2]
-      """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2))),
+      """.stripMargin -> ObjectValue(listOf(1, 2)),
       """|[1 +
         |
         | 2]
-      """.stripMargin -> ObjectValue(listOf(BoxedInt(3))),
+      """.stripMargin -> ObjectValue(listOf(3)),
       """|[1, 2
         | 3]
-      """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2), BoxedInt(3))),
+      """.stripMargin -> ObjectValue(listOf(1, 2, 3)),
       """|[1 2
          | 3 4]
-      """.stripMargin -> ObjectValue(listOf(BoxedInt(1), BoxedInt(2), BoxedInt(3), BoxedInt(4)))
+      """.stripMargin -> ObjectValue(listOf(1, 2, 3, 4)),
+      """| [[1 2]
+         |  [3 4]]
+      """.stripMargin -> ObjectValue(
+        listOf(
+          listOf(1, 2),
+          listOf(3, 4)
+        )
+      )
     )
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
       it(s"expectations ${i}") {

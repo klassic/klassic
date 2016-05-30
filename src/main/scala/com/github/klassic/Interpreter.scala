@@ -2,12 +2,22 @@ package com.github.klassic
 
 import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
 import java.lang.reflect.{Constructor, Method}
+
 import com.github.klassic.AstNode._
 
 /**
  * @author Kota Mizushima
  */
 class Interpreter {evaluator =>
+  object SymbolGenerator {
+    private[this] var counter: Int = 0
+    def symbol(): String = {
+      val name = "var" + counter
+      counter += 1
+      name
+    }
+  }
+  import SymbolGenerator.symbol
   def reportError(message: String): Nothing = {
     throw InterpreterException(message)
   }
@@ -25,6 +35,7 @@ class Interpreter {evaluator =>
       }
       parameterCountMatches && parameterTypesMatches
     }.map{m =>
+      m.setAccessible(true)
       UnboxedVersionMethodFound(m)
     }.orElse({
       nameMatchedMethods.find{m =>
@@ -36,6 +47,7 @@ class Interpreter {evaluator =>
         parameterCountMatches && boxedParameterTypesMatches
       }
     }.map{m =>
+      m.setAccessible(true)
       BoxedVersionMethodFound(m)
     }).getOrElse(NoMethodFound)
   }
@@ -143,6 +155,48 @@ class Interpreter {evaluator =>
   }
   def evaluate(node: AstNode): Value = evaluate(BuiltinEnvironment, node)
   def evaluate(env:Environment, node: AstNode): Value = {
+    def rewrite(node: AstNode): AstNode = node match {
+      case Block(expressions) => Block(expressions.map{rewrite})
+      case IfExpression(cond: AstNode, pos: AstNode, neg: AstNode) =>
+        IfExpression(rewrite(cond), rewrite(pos), rewrite(neg))
+      case WhileExpression(condition, body: AstNode) =>
+        WhileExpression(rewrite(condition), rewrite(body))
+      case ForeachExpression(name, collection, body) =>
+        val itVariable = symbol()
+        Block(List(
+          ValDeclaration(itVariable, MethodCall(rewrite(collection), "iterator", List())),
+          WhileExpression(
+            BinaryExpression(
+              Operator.EQUAL,
+              MethodCall(Identifier(itVariable), "hasNext", List()),
+              BooleanNode(true)
+            ),
+            Block(List(
+              ValDeclaration(name, MethodCall(Identifier(itVariable), "next", List())),
+              body
+            ))
+          )
+        ))
+      case BinaryExpression(operator: Operator, lhs: AstNode, rhs: AstNode) =>
+        BinaryExpression(operator, rewrite(lhs), rewrite(rhs))
+      case MinusOp(operand) => MinusOp(rewrite(operand))
+      case PlusOp(operand) => PlusOp(rewrite(operand))
+      case n@StringNode(value) => n
+      case n@IntNode(value) => n
+      case n@LongNode(value)  => n
+      case n@ShortNode(value) => n
+      case n@ByteNode(value) => n
+      case n@BooleanNode(value) => n
+      case n@Identifier(name) => n
+      case Assignment(variable, value) => Assignment(variable, rewrite(value))
+      case ValDeclaration(variable, value) => ValDeclaration(variable, rewrite(value))
+      case FunctionLiteral(params, proc) => FunctionLiteral(params, rewrite(proc))
+      case FunctionDefinition(name, func) => FunctionDefinition(name, rewrite(func).asInstanceOf[FunctionLiteral])
+      case FunctionCall(func, params) => FunctionCall(rewrite(func), params.map{rewrite})
+      case ListLiteral(elements) =>  ListLiteral(elements.map{rewrite})
+      case NewObject(className, params) => NewObject(className, params.map{rewrite})
+      case MethodCall(self, name, params) => MethodCall(rewrite(self), name, params.map{rewrite})
+    }
     def evalRecursive(node: AstNode): Value = {
       node match{
         case Block(exprs) =>
@@ -158,6 +212,18 @@ class Interpreter {evaluator =>
             case BoxedBoolean(true) => evalRecursive(pos)
             case BoxedBoolean(false) => evalRecursive(neg)
             case _ => reportError("type error")
+          }
+        case BinaryExpression(Operator.EQUAL, left, right) =>
+          (evalRecursive(left), evalRecursive(right)) match {
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval == rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval == rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval == rval)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval == rval)
+            case (BoxedBoolean(lval), BoxedBoolean(rval)) => BoxedBoolean(lval == rval)
+            case (BoxedBoolean(lval), ObjectValue(rval:java.lang.Boolean)) => BoxedBoolean(lval == rval.booleanValue())
+            case (ObjectValue(lval:java.lang.Boolean), BoxedBoolean(rval)) => BoxedBoolean(lval.booleanValue() == rval)
+            case (ObjectValue(lval), ObjectValue(rval)) => BoxedBoolean(lval == rval)
+            case _ => reportError("comparation must be done between same types")
           }
         case BinaryExpression(Operator.LESS_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
@@ -251,8 +317,10 @@ class Interpreter {evaluator =>
           BoxedShort(value)
         case ByteNode(value) =>
           BoxedByte(value)
+        case BooleanNode(value) =>
+          BoxedBoolean(value)
         case ListLiteral(elements) =>
-          val params = elements.map{evalRecursive(_)}
+          val params = elements.map{e => Value.fromKlassic(evalRecursive(e))}
           val newList = new java.util.ArrayList[Any]
           params.foreach{param =>
             newList.add(param)
@@ -271,7 +339,7 @@ class Interpreter {evaluator =>
           evalRecursive(self) match {
             case ObjectValue(value) =>
               val paramsArray = params.map{p => evalRecursive(p)}.toArray
-              findMethod(value, name.name, paramsArray) match {
+              findMethod(value, name, paramsArray) match {
                 case UnboxedVersionMethodFound(method) =>
                   val actualParams = paramsArray.map{Value.fromKlassic}
                   Value.toKlassic(method.invoke(value, actualParams:_*))
@@ -279,7 +347,7 @@ class Interpreter {evaluator =>
                   val actualParams = paramsArray.map{Value.fromKlassic}
                   Value.toKlassic(method.invoke(value, actualParams:_*))
                 case NoMethodFound =>
-                  throw new IllegalArgumentException(s"invoke(${self}, ${name}, ${params})")
+                  throw new IllegalArgumentException(s"${self}.${name}(${params})")
               }
           }
         case NewObject(className, params) =>
@@ -314,6 +382,6 @@ class Interpreter {evaluator =>
           }
       }
     }
-    evalRecursive(node)
+    evalRecursive(rewrite(node))
   }
 }
