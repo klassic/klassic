@@ -349,6 +349,8 @@ class Interpreter {evaluator =>
                 case NoMethodFound =>
                   throw new IllegalArgumentException(s"${self}.${name}(${params})")
               }
+            case otherwise =>
+              sys.error(s"cannot reach here: ${otherwise}")
           }
         case NewObject(className, params) =>
           val paramsArray = params.map{evalRecursive}.toArray
@@ -380,6 +382,7 @@ class Interpreter {evaluator =>
             case _ =>
               reportError("unknown error")
           }
+        case e@ForeachExpression(_, _, _) => sys.error(s"cannot reach here: ${e}")
       }
     }
     evalRecursive(rewrite(node))
