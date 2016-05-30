@@ -2,6 +2,7 @@ package com.github.klassic
 
 import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
 import java.lang.reflect.{Constructor, Method}
+import com.github.klassic.AstNode._
 
 /**
  * @author Kota Mizushima
