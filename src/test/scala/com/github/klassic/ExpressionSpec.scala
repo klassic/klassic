@@ -68,6 +68,24 @@ class ExpressionSpec extends SpecHelper {
       """.stripMargin -> BoxedInt(6)
     )
 
+    expectations.zipWithIndex.foreach { case ((in, expected), i) =>
+      it(s"expectations ${i}") {
+        assert(expected == I.evaluateString(in))
+      }
+    }
+  }
+
+  describe("foreach expression") {
+    val expectations: List[(String, Value)] = List(
+      """
+         |val newList = new java.util.ArrayList
+         |foreach(a in [1, 2, 3, 4, 5]) {
+         |  newList.add(a * 2)
+         |}
+         |newList
+      """.stripMargin -> ObjectValue(listOf(2, 4, 6, 8, 10))
+    )
+
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
       it(s"expectations ${i}") {
         assert(expected == I.evaluateString(in))

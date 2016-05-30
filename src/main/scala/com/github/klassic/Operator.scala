@@ -9,6 +9,7 @@ object Operator {
   case object SUBTRACT extends Operator("-")
   case object DIVIDE extends Operator("/")
   case object MULTIPLY extends Operator("*")
+  case object EQUAL extends Operator("==")
   case object LESS_THAN extends Operator("<")
   case object LESS_OR_EQUAL extends Operator("<=")
   case object GREATER_THAN extends Operator(">")

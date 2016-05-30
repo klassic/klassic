@@ -10,9 +10,11 @@ object AstNode {
 
   case class IfExpression(cond: AstNode, pos: AstNode, neg: AstNode) extends AstNode
 
-  case class WhileExpression(condition: AstNode, body: AstNode) extends AstNode
+  case class ForeachExpression(name: String, collection: AstNode, body: AstNode) extends AstNode
 
   case class BinaryExpression(operator: Operator, lhs: AstNode, rhs: AstNode) extends AstNode
+
+  case class WhileExpression(condition: AstNode, body: AstNode) extends AstNode
 
   case class MinusOp(operand: AstNode) extends AstNode
 
@@ -27,6 +29,8 @@ object AstNode {
   case class ShortNode(value: Short) extends AstNode
 
   case class ByteNode(value: Byte) extends AstNode
+
+  case class BooleanNode(value: Boolean) extends AstNode
 
   case class Identifier(name: String) extends AstNode
 
@@ -44,5 +48,5 @@ object AstNode {
 
   case class NewObject(className: String, params: List[AstNode]) extends AstNode
 
-  case class MethodCall(self: AstNode, name: Identifier, params: List[AstNode]) extends AstNode
+  case class MethodCall(self: AstNode, name: String, params: List[AstNode]) extends AstNode
 }

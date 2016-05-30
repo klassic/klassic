@@ -60,14 +60,24 @@ class Parser extends RegexParsers {
   lazy val IF: Parser[String]        = token("if")
   lazy val ELSE: Parser[String]      = token("else")
   lazy val WHILE: Parser[String]     = token("while")
+  lazy val FOREACH: Parser[String]   = token("foreach")
+  lazy val TRUE: Parser[String]      = token("true")
+  lazy val FALSE: Parser[String]     = token("false")
+  lazy val IN: Parser[String]        = token("in")
   lazy val COMMA: Parser[String]     = token(",")
   lazy val DOT: Parser[String]       = token(".")
   lazy val CLASS: Parser[String]     = token("class")
   lazy val DEF: Parser[String]       = token("def")
   lazy val VAL: Parser[String]       = token("val")
   lazy val EQ: Parser[String]        = token("=")
+  lazy val EQEQ: Parser[String]      = token("==")
   lazy val ARROW: Parser[String]     = token("=>")
   lazy val NEW: Parser[String]       = token("new")
+  lazy val KEYWORDS: Set[String]     = Set(
+    "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]",
+    "if", "else", "while", "foreach", "true", "false", "in", ",", ".",
+    "class", "def", "val", "=", "==", "=>", "new"
+  )
 
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
   def lines: Parser[AstNode] = SPACING ~> repsep(line, TERMINATOR) <~ opt(TERMINATOR) ^^ Block
@@ -76,7 +86,7 @@ class Parser extends RegexParsers {
   def line: Parser[AstNode] = expression | val_declaration | functionDefinition
 
   //expression ::= assignment | conditional | if | while
-  def expression: Parser[AstNode] = assignment | conditional | ifExpression | whileExpression
+  def expression: Parser[AstNode] = assignment | conditional | ifExpression | whileExpression | foreachExpression
 
   //if ::= "if" "(" expression ")" expression "else" expression
   def ifExpression: Parser[AstNode] = CL(IF) ~ CL(LPAREN) ~> expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression ^^ {
@@ -88,8 +98,14 @@ class Parser extends RegexParsers {
     case condition ~  body => WhileExpression(condition, body)
   }
 
+  //foreach ::= "foreach" "(" ident "in" expression ")" expression
+  def foreachExpression: Parser[AstNode] = ((CL(FOREACH) ~> CL(LPAREN)) ~> (CL(ident) <~ CL(IN)) ~ expression <~ CL(RPAREN)) ~ expression ^^ {
+    case variable ~ collection ~ body => ForeachExpression(variable.name, collection, body)
+  }
+
   //conditional ::= add {"<" add | ">" add | "<=" add | ">=" add}
   def conditional: Parser[AstNode] = chainl1(add,
+    CL(EQEQ) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.EQUAL, left, right)} |
     CL(LTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.LESS_OR_EQUAL, left, right)} |
     CL(GTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.GREATER_EQUAL, left, right)} |
     CL(LT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.LESS_THAN, left, right)} |
@@ -117,7 +133,7 @@ class Parser extends RegexParsers {
     case self ~ Nil =>
       self
     case self ~ npList  =>
-      npList.foldLeft(self){case (self, name ~ params) => MethodCall(self, name, params.getOrElse(Nil))}
+      npList.foldLeft(self){case (self, name ~ params) => MethodCall(self, name.name, params.getOrElse(Nil))}
   }
 
   def application: Parser[AstNode] = primary ~ opt(CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN))^^ {
@@ -132,7 +148,7 @@ class Parser extends RegexParsers {
   }
 
   //primary ::= intLiteral | stringLiteral | listLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AstNode] = integerLiteral | stringLiteral | listLiteral | newObject | ident | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
+  def primary: Parser[AstNode] = ident | integerLiteral | stringLiteral | listLiteral | newObject | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def integerLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r ~ opt("BY"| "L" | "S") ^^ {
@@ -141,6 +157,11 @@ class Parser extends RegexParsers {
     case value ~ Some("S") => ShortNode(value.toShort)
     case value ~ Some("BY") => ByteNode(value.toByte)
   }) <~ SPACING_WITHOUT_LF
+
+  def booleanLiteral: Parser[AstNode] = (TRUE | FALSE) ^^ {
+    case "true" => BooleanNode(true)
+    case "false" => BooleanNode(false)
+  }
 
   //stringLiteral ::= "\"" ((?!")(\[rntfb"'\\]|[^\\]))* "\""
   def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {in => StringNode(unEscape(in))} | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
@@ -219,7 +240,7 @@ class Parser extends RegexParsers {
   }) <~ SPACING_WITHOUT_LF
 
   def ident :Parser[Identifier] = ("""[A-Za-z_][a-zA-Z0-9]*""".r^? {
-    case n if n != "if" && n!= "val" && n != "def" && n != "while" => n
+    case n if !KEYWORDS(n) => n
   } ^^ Identifier) <~ SPACING_WITHOUT_LF
 
   def assignment: Parser[Assignment] = (ident <~ CL(EQ)) ~ expression ^^ {
