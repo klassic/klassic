@@ -58,4 +58,20 @@ class ExpressionSpec extends SpecHelper {
       }
     }
   }
+
+  describe("anonymous function") {
+    val expectations: List[(String, Value)] = List(
+      """
+        |val Y = (f) => ((x) => f((y) => x(x(y))))((x) => f((y) => x(x(y))))
+        |val fact = Y((f) => (x) => if(x < 2) 1 else x * fact(x - 1))
+        |fact(3)
+      """.stripMargin -> BoxedInt(6)
+    )
+
+    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
+      it(s"expectations ${i}") {
+        assert(expected == I.evaluateString(in))
+      }
+    }
+  }
 }
