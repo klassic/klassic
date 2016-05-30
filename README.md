@@ -48,6 +48,19 @@ val printAndAdd = (x, y) => {
 
 Note that semicolon at the end of each expression of block can be omitted.
 
+### Method Invocation
+
+```
+val list = new java.util.ArrayList
+list.add(1)
+list.add(2)
+list.add(3)
+list.add(4)
+println(list)
+```
+
+Currently, only method invocations to Java objects are acceptable.  Boxing of primitive types is automatically done.
+
 ### Function Invocation
 
 ```
