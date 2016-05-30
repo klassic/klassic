@@ -2,6 +2,7 @@ package com.github.klassic
 
 import scala.util.parsing.combinator.RegexParsers
 import scala.util.parsing.input.{CharSequenceReader, Reader}
+import com.github.klassic.AstNode._
 
 /**
  * @author Kota Mizushima

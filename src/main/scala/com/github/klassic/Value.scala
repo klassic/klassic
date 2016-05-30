@@ -1,5 +1,7 @@
 package com.github.klassic
 
+import com.github.klassic.AstNode._
+
 sealed abstract class Value
 case class BoxedByte(value: Byte) extends Value {
   override def toString = value.toString
