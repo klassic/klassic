@@ -145,12 +145,12 @@ class Interpreter {evaluator =>
     val program = Iterator.continually(in.read()).takeWhile(_ != -1).map(_.toChar).mkString
     evaluateString(program)
   }
-  def evaluateString(program: String): Value = {
+  def evaluateString(program: String, fileName: String = "<no file>"): Value = {
     val parser = new Parser
     parser.parse(program) match {
       case parser.Success(node: AstNode, _) => evaluate(node)
-      case parser.Failure(m, n) => sys.error(n.pos + ":" + m)
-      case parser.Error(m, n) => sys.error(n.pos + ":" + m)
+      case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
+      case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
     }
   }
   def evaluate(node: AstNode): Value = evaluate(BuiltinEnvironment, node)
