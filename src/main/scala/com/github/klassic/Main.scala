@@ -1,5 +1,7 @@
 package com.github.klassic
 
+import java.io.File
+
 import scala.collection.Iterator.continually
 
 /**
@@ -7,32 +9,24 @@ import scala.collection.Iterator.continually
  */
 object Main {
   def main(args: Array[String]): Unit = {
-    val (flag: String, node: AstNode) = parseCommandLine(args)
     val interpreter = new Interpreter
-    val result = interpreter.evaluate(node)
-    flag match {
-      case "-e" => println(result)
+    parseCommandLine(args) match {
+      case Some(("-e", line)) =>
+        println(interpreter.evaluateString(line))
+      case Some(("-f", fileName)) =>
+        interpreter.evaluateFile(new File(fileName))
       case _ =>
+        Console.err.println("please specify program")
     }
   }
 
-  def parseCommandLine(args: Array[String]): (String, Any) = {
+  def parseCommandLine(args: Array[String]): Option[(String, String)] = {
     val parser = new Parser
-    val (flag, ast) = args match {
-      case Array("-e", line) => ("-e", parser.parse(line).get)
-      case Array(fileName) =>
-        openReader(fileName) { in =>
-          val program = continually(in.read()).takeWhile(_ != -1).map(_.toChar).mkString
-          parser.parse(program) match {
-            case parser.Success(v, _) => ("-f", v)
-            case parser.Failure(m, n) => sys.error(n.pos + ":" + m)
-            case parser.Error(m, n) => sys.error(n.pos + ":" + m)
-          }
-        }
-      case Array() =>
-        sys.error("please specify program")
+    args match {
+      case Array("-e", line) => Some("-e" -> line)
+      case Array(fileName) => Some("-f"-> fileName)
+      case otherwise  => None
     }
-    (flag, ast)
   }
 }
 
