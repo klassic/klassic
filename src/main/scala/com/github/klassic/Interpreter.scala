@@ -397,7 +397,7 @@ class Interpreter {evaluator =>
             case FunctionValue(FunctionLiteral(fparams, proc), cenv) =>
               val local = new Environment(cenv)
               (fparams zip params).foreach{ case (fp, ap) =>
-                local(fp) = evalRecursive(ap)
+                local(fp.name) = evalRecursive(ap)
               }
               evaluate(local, proc)
             case NativeFunctionValue(body) =>
