@@ -284,7 +284,7 @@ class Parser extends RegexParsers {
   }
 
   // val_declaration ::= "val" ident "=" expression
-  def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident ~ opt(COLON ~> typeAnnotation)<~ CL(EQ)) ~ expression ^^ {
+  def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
     case valName ~ optionalType ~ value => ValDeclaration(valName.name, value)
   }
 
@@ -301,7 +301,7 @@ class Parser extends RegexParsers {
   }
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
-  def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(COLON ~> typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ opt(COLON ~> typeAnnotation) ~ CL(EQ) ~ expression ^^ {
+  def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ opt(typeAnnotation) ~ CL(EQ) ~ expression ^^ {
     case functionName ~ params ~ _ ~ optionalType ~ body => {
         val ps = params match {
           case Some(xs) => xs
