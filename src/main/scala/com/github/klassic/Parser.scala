@@ -3,6 +3,7 @@ package com.github.klassic
 import scala.util.parsing.combinator.RegexParsers
 import scala.util.parsing.input.{CharSequenceReader, Reader, Position}
 import com.github.klassic.AstNode._
+import com.github.klassic.TypeDescription._
 
 /**
  * @author Kota Mizushima
@@ -91,13 +92,23 @@ class Parser extends RegexParsers {
   lazy val ARROW   : Parser[String] = token("=>")
   lazy val COLON   : Parser[String] = token(":")
   lazy val NEW     : Parser[String] = token("new")
+  lazy val QUES    : Parser[String] = token("?")
   lazy val KEYWORDS: Set[String]     = Set(
-    "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":",
+    "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
     "if", "else", "while", "foreach", "true", "false", "in", ",", ".",
     "class", "def", "val", "=", "==", "=>", "new"
   )
 
-  def typeName: Parser[Identifier] = ident
+  def typeAnnotation: Parser[TypeDescription] = COLON ~> (
+    token("Byte") ^^ {_ => ByteType}
+  | token("Short")  ^^ {_ => ShortType}
+  | token("Int")  ^^ {_ => IntType}
+  | token("Long")  ^^ {_ => LongType}
+  | token("Float") ^^ {_ => FloatType}
+  | token("Double")  ^^ {_ => DoubleType}
+  | token("Boolean")  ^^ {_ => BooleanType}
+  | token("?") ^^ {_ => DynamicType}
+  )
 
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
   def lines: Parser[AstNode] = SPACING ~> repsep(line, TERMINATOR) <~ opt(TERMINATOR) ^^ Block
@@ -273,7 +284,7 @@ class Parser extends RegexParsers {
   }
 
   // val_declaration ::= "val" ident "=" expression
-  def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident ~ opt(COLON ~> typeName)<~ CL(EQ)) ~ expression ^^ {
+  def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
     case valName ~ optionalType ~ value => ValDeclaration(valName.name, value)
   }
 
@@ -290,7 +301,7 @@ class Parser extends RegexParsers {
   }
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
-  def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(COLON ~> typeName), CL(COMMA)) <~ CL(RPAREN)) ~ opt(COLON ~> typeName) ~ CL(EQ) ~ expression ^^ {
+  def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ opt(typeAnnotation) ~ CL(EQ) ~ expression ^^ {
     case functionName ~ params ~ _ ~ optionalType ~ body => {
         val ps = params match {
           case Some(xs) => xs
