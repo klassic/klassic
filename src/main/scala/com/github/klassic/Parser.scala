@@ -290,7 +290,7 @@ class Parser extends RegexParsers {
 
   // anonFun ::= "(" [param {"," param}] ")" "=>" expression
   def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
-    case Some(params) ~ proc => FunctionLiteral(params.map{_.name}, proc)
+    case Some(params) ~ proc => FunctionLiteral(params.map{param => FormalParameter(param.name)}, proc)
     case None ~ proc => FunctionLiteral(List(), proc)
   }
 
@@ -304,12 +304,12 @@ class Parser extends RegexParsers {
   def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ opt(typeAnnotation) ~ CL(EQ) ~ expression ^^ {
     case functionName ~ params ~ _ ~ optionalType ~ body => {
         val ps = params match {
-          case Some(xs) => xs
+          case Some(xs) => xs.map{ case name ~  annotation => FormalParameter(name.name) }
           case None => Nil
         }
         FunctionDefinition(
           functionName.name,
-          FunctionLiteral(ps.map{ case pname ~ ptype => pname.name}, body)
+          FunctionLiteral(ps, body)
         )
     }
   }

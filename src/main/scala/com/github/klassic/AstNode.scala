@@ -45,7 +45,7 @@ object AstNode {
 
   case class ValDeclaration(variable: String, value: AstNode) extends AstNode(None)
 
-  case class FunctionLiteral(params: List[String], proc: AstNode) extends AstNode(None)
+  case class FunctionLiteral(params: List[FormalParameter], proc: AstNode) extends AstNode(None)
 
   case class FunctionDefinition(name: String, func: FunctionLiteral) extends AstNode(None)
 
