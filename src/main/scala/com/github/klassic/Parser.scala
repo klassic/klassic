@@ -16,7 +16,7 @@ class Parser extends RegexParsers {
     not(not(p)) | failure(msg)
   }
   lazy val EOF: Parser[String] = not(elem(".", (ch: Char) => ch != CharSequenceReader.EofCh), "EOF Expected") ^^ {_.toString}
-  lazy val LINEFEED: Parser[String] = ("\r\n" | "\r" | "\n")
+  lazy val LINEFEED : Parser[String] = ("\r\n" | "\r" | "\n")
   lazy val SEMICOLON: Parser[String] = ";"
   lazy val ANY: Parser[String] = elem(".", (ch: Char) => ch != CharSequenceReader.EofCh) ^^ {_.toString}
 
@@ -36,7 +36,7 @@ class Parser extends RegexParsers {
 
   def CL[T](parser: Parser[T]): Parser[T] = parser <~ SPACING
   def token(parser: Parser[String]): Parser[String] = parser <~ SPACING_WITHOUT_LF
-  def unEscape(input: String): String = {
+  def unescape(input: String): String = {
     val builder = new java.lang.StringBuilder
     val length = input.length
     var i = 0
@@ -56,41 +56,45 @@ class Parser extends RegexParsers {
     }
     new String(builder)
   }
-  lazy val LT: Parser[String]        = token("<")
-  lazy val GT: Parser[String]        = token(">")
-  lazy val LTE: Parser[String]       = token("<=")
-  lazy val GTE: Parser[String]       = token(">=")
-  lazy val PLUS: Parser[String]      = token("+")
-  lazy val MINUS: Parser[String]     = token("-")
-  lazy val ASTER: Parser[String]     = token("*")
-  lazy val SLASH: Parser[String]     = token("/")
-  lazy val LPAREN: Parser[String]    = token("(")
-  lazy val RPAREN: Parser[String]    = token(")")
-  lazy val LBRACE: Parser[String]    = token("{")
-  lazy val RBRACE: Parser[String]    = token("}")
-  lazy val LBRACKET: Parser[String]  = token("[")
-  lazy val RBRACKET: Parser[String]  = token("]")
-  lazy val IF: Parser[String]        = token("if")
-  lazy val ELSE: Parser[String]      = token("else")
-  lazy val WHILE: Parser[String]     = token("while")
-  lazy val FOREACH: Parser[String]   = token("foreach")
-  lazy val TRUE: Parser[String]      = token("true")
-  lazy val FALSE: Parser[String]     = token("false")
-  lazy val IN: Parser[String]        = token("in")
-  lazy val COMMA: Parser[String]     = token(",")
-  lazy val DOT: Parser[String]       = token(".")
-  lazy val CLASS: Parser[String]     = token("class")
-  lazy val DEF: Parser[String]       = token("def")
-  lazy val VAL: Parser[String]       = token("val")
-  lazy val EQ: Parser[String]        = token("=")
-  lazy val EQEQ: Parser[String]      = token("==")
-  lazy val ARROW: Parser[String]     = token("=>")
-  lazy val NEW: Parser[String]       = token("new")
+
+  lazy val LT      : Parser[String] = token("<")
+  lazy val GT      : Parser[String] = token(">")
+  lazy val LTE     : Parser[String] = token("<=")
+  lazy val GTE     : Parser[String] = token(">=")
+  lazy val PLUS    : Parser[String] = token("+")
+  lazy val MINUS   : Parser[String] = token("-")
+  lazy val ASTER   : Parser[String] = token("*")
+  lazy val SLASH   : Parser[String] = token("/")
+  lazy val LPAREN  : Parser[String] = token("(")
+  lazy val RPAREN  : Parser[String] = token(")")
+  lazy val LBRACE  : Parser[String] = token("{")
+  lazy val RBRACE  : Parser[String] = token("}")
+  lazy val LBRACKET: Parser[String] = token("[")
+  lazy val RBRACKET: Parser[String] = token("]")
+  lazy val IF      : Parser[String] = token("if")
+  lazy val ELSE    : Parser[String] = token("else")
+  lazy val WHILE   : Parser[String] = token("while")
+  lazy val FOREACH : Parser[String] = token("foreach")
+  lazy val TRUE    : Parser[String] = token("true")
+  lazy val FALSE   : Parser[String] = token("false")
+  lazy val IN      : Parser[String] = token("in")
+  lazy val COMMA   : Parser[String] = token(",")
+  lazy val DOT     : Parser[String] = token(".")
+  lazy val CLASS   : Parser[String] = token("class")
+  lazy val DEF     : Parser[String] = token("def")
+  lazy val VAL     : Parser[String] = token("val")
+  lazy val EQ      : Parser[String] = token("=")
+  lazy val EQEQ    : Parser[String] = token("==")
+  lazy val ARROW   : Parser[String] = token("=>")
+  lazy val COLON   : Parser[String] = token(":")
+  lazy val NEW     : Parser[String] = token("new")
   lazy val KEYWORDS: Set[String]     = Set(
-    "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]",
+    "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":",
     "if", "else", "while", "foreach", "true", "false", "in", ",", ".",
     "class", "def", "val", "=", "==", "=>", "new"
   )
+
+  def typeName: Parser[Identifier] = ident
 
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
   def lines: Parser[AstNode] = SPACING ~> repsep(line, TERMINATOR) <~ opt(TERMINATOR) ^^ Block
@@ -177,7 +181,7 @@ class Parser extends RegexParsers {
   }
 
   //stringLiteral ::= "\"" ((?!")(\[rntfb"'\\]|[^\\]))* "\""
-  def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {in => StringNode(unEscape(in))} | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
+  def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {in => StringNode(unescape(in))} | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
     values.foldLeft(StringNode(""):AstNode) { (node, content) => BinaryExpression(Operator.ADD, node, content) }
   }) <~ SPACING_WITHOUT_LF
 
@@ -261,8 +265,8 @@ class Parser extends RegexParsers {
   }
 
   // val_declaration ::= "val" ident "=" expression
-  def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident <~ CL(EQ)) ~ expression ^^ {
-    case v ~ value => ValDeclaration(v.name, value)
+  def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident ~ opt(COLON ~> typeName)<~ CL(EQ)) ~ expression ^^ {
+    case valName ~ optionalType ~ value => ValDeclaration(valName.name, value)
   }
 
   // anonFun ::= "(" [param {"," param}] ")" "=>" expression
@@ -278,13 +282,16 @@ class Parser extends RegexParsers {
   }
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
-  def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident, CL(COMMA)) <~ CL(RPAREN)) ~ CL(EQ) ~ expression ^^ {
-    case v~params~_~proc => {
-        val p = params match {
-          case Some(pr) => pr
+  def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(COLON ~> typeName), CL(COMMA)) <~ CL(RPAREN)) ~ opt(COLON ~> typeName) ~ CL(EQ) ~ expression ^^ {
+    case functionName ~ params ~ _ ~ optionalType ~ body => {
+        val ps = params match {
+          case Some(xs) => xs
           case None => Nil
         }
-        FunctionDefinition(v.name, FunctionLiteral(p.map{_.name}, proc))
+        FunctionDefinition(
+          functionName.name,
+          FunctionLiteral(ps.map{ case pname ~ ptype => pname.name}, body)
+        )
     }
   }
 
