@@ -18,6 +18,12 @@ case class BoxedLong(value: Long) extends Value {
 case class BoxedBoolean(value: Boolean) extends Value {
   override def toString = value.toString
 }
+case class BoxedDouble(value: Double) extends Value {
+  override def toString = value.toString
+}
+case class BoxedFloat(value: Float) extends Value {
+  override def toString = value.toString
+}
 case class FunctionValue(value: FunctionLiteral, environment: Option[Environment]) extends Value {
   override def toString = s"function value:${value} environment:${environment}"
 }

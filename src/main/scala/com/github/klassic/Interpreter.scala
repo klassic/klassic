@@ -188,6 +188,8 @@ class Interpreter {evaluator =>
       case n@ByteNode(value) => n
       case n@BooleanNode(value) => n
       case n@Identifier(name) => n
+      case n@DoubleNode(name) => n
+      case n@FloatNode(name) => n
       case Assignment(variable, value) => Assignment(variable, rewrite(value))
       case ValDeclaration(variable, value) => ValDeclaration(variable, rewrite(value))
       case FunctionLiteral(params, proc) => FunctionLiteral(params, rewrite(proc))
@@ -219,6 +221,8 @@ class Interpreter {evaluator =>
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval == rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval == rval)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval == rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedBoolean(lval == rval)
+            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval == rval)
             case (BoxedBoolean(lval), BoxedBoolean(rval)) => BoxedBoolean(lval == rval)
             case (BoxedBoolean(lval), ObjectValue(rval:java.lang.Boolean)) => BoxedBoolean(lval == rval.booleanValue())
             case (ObjectValue(lval:java.lang.Boolean), BoxedBoolean(rval)) => BoxedBoolean(lval.booleanValue() == rval)
@@ -231,6 +235,8 @@ class Interpreter {evaluator =>
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval < rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval < rval)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval < rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedBoolean(lval < rval)
+            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval < rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.GREATER_THAN, left, right) =>
@@ -239,6 +245,8 @@ class Interpreter {evaluator =>
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval > rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval > rval)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval > rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedBoolean(lval > rval)
+            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval > rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.LESS_OR_EQUAL, left, right) =>
@@ -247,6 +255,8 @@ class Interpreter {evaluator =>
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval <= rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval <= rval)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval <= rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedBoolean(lval <= rval)
+            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval <= rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.GREATER_EQUAL, left, right) =>
@@ -255,6 +265,8 @@ class Interpreter {evaluator =>
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval >= rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval >= rval)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval >= rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedBoolean(lval >= rval)
+            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval >= rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case BinaryExpression(Operator.ADD, left, right) =>
@@ -265,6 +277,8 @@ class Interpreter {evaluator =>
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval + rval).toByte)
             case (ObjectValue(lval:String), rval) => ObjectValue(lval + rval)
             case (lval, ObjectValue(rval:String)) => ObjectValue(lval + rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedFloat((lval + rval))
+            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval + rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case BinaryExpression(Operator.SUBTRACT, left, right) =>
@@ -273,6 +287,8 @@ class Interpreter {evaluator =>
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval - rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval - rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval - rval).toByte)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedFloat((lval - rval))
+            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval - rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case BinaryExpression(Operator.MULTIPLY, left, right) =>
@@ -281,6 +297,8 @@ class Interpreter {evaluator =>
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval * rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval * rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval * rval).toByte)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedFloat((lval * rval))
+            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval * rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case BinaryExpression(Operator.DIVIDE, left, right) =>
@@ -289,6 +307,8 @@ class Interpreter {evaluator =>
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval / rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval / rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval / rval).toByte)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedFloat((lval / rval))
+            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval / rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
         case MinusOp(operand) =>
@@ -297,6 +317,8 @@ class Interpreter {evaluator =>
             case BoxedLong(value) => BoxedLong(-value)
             case BoxedShort(value) => BoxedShort((-value).toShort)
             case BoxedByte(value) => BoxedByte((-value).toByte)
+            case BoxedFloat(value) => BoxedFloat(-value)
+            case BoxedDouble(value) => BoxedDouble(-value)
             case _ => reportError("- cannot be applied to non-integer value")
           }
         case PlusOp(operand) =>
@@ -305,6 +327,8 @@ class Interpreter {evaluator =>
             case BoxedLong(value) => BoxedLong(value)
             case BoxedShort(value) => BoxedShort(value)
             case BoxedByte(value) => BoxedByte(value)
+            case BoxedFloat(value) => BoxedFloat(value)
+            case BoxedDouble(value) => BoxedDouble(value)
             case _ => reportError("+ cannot be applied to non-integer value")
           }
         case IntNode(value) =>
@@ -317,6 +341,10 @@ class Interpreter {evaluator =>
           BoxedShort(value)
         case ByteNode(value) =>
           BoxedByte(value)
+        case DoubleNode(value) =>
+          BoxedDouble(value)
+        case FloatNode(value) =>
+          BoxedFloat(value)
         case BooleanNode(value) =>
           BoxedBoolean(value)
         case ListLiteral(elements) =>

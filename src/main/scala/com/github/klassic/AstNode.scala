@@ -35,6 +35,10 @@ object AstNode {
 
   case class BooleanNode(value: Boolean) extends AstNode(None)
 
+  case class DoubleNode(value: Double) extends AstNode(None)
+
+  case class FloatNode(value: Float) extends AstNode(None)
+
   case class Identifier(name: String) extends AstNode(None)
 
   case class Assignment(variable: String, value: AstNode) extends AstNode(None)
