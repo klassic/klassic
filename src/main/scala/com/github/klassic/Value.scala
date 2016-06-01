@@ -44,6 +44,8 @@ object Value {
     case BoxedShort(v) => classOf[Short]
     case BoxedInt(v) => classOf[Int]
     case BoxedLong(v) => classOf[Long]
+    case BoxedFloat(v) => classOf[Float]
+    case BoxedDouble(v) => classOf[Double]
     case ObjectValue(v) => v.getClass
     case otherwise => otherwise.getClass
   }
@@ -54,6 +56,8 @@ object Value {
     case BoxedShort(v) => classOf[java.lang.Short]
     case BoxedInt(v) => classOf[java.lang.Integer]
     case BoxedLong(v) => classOf[java.lang.Long]
+    case BoxedFloat(v) => classOf[java.lang.Float]
+    case BoxedDouble(v) => classOf[java.lang.Double]
     case ObjectValue(v) => v.getClass
     case otherwise => otherwise.getClass
   }
@@ -68,6 +72,8 @@ object Value {
     case BoxedShort(v) => new java.lang.Short(v)
     case BoxedInt(v) => new java.lang.Integer(v)
     case BoxedLong(v) => new java.lang.Long(v)
+    case BoxedFloat(v) => new java.lang.Float(v)
+    case BoxedDouble(v) => new java.lang.Double(v)
     case ObjectValue(v) => v
     case UnitValue => UnitValue
     case otherwise => otherwise
@@ -79,6 +85,8 @@ object Value {
     case v:java.lang.Short => BoxedShort(v.shortValue())
     case v:java.lang.Integer => BoxedInt(v.intValue())
     case v:java.lang.Long => BoxedLong(v.intValue())
+    case v:java.lang.Float => BoxedFloat(v.floatValue())
+    case v:java.lang.Double => BoxedDouble(v.doubleValue())
     case UnitValue => UnitValue
     case otherwise => ObjectValue(otherwise)
   }
