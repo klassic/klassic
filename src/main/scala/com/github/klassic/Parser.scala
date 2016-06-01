@@ -1,7 +1,7 @@
 package com.github.klassic
 
 import scala.util.parsing.combinator.RegexParsers
-import scala.util.parsing.input.{CharSequenceReader, Reader}
+import scala.util.parsing.input.{CharSequenceReader, Reader, Position}
 import com.github.klassic.AstNode._
 
 /**
@@ -14,6 +14,9 @@ class Parser extends RegexParsers {
   }
   private def and[T](p: => Parser[T], msg: String): Parser[Unit] = {
     not(not(p)) | failure(msg)
+  }
+  lazy val % : Parser[Location] = Parser{reader => Success(reader.pos, reader)}.map{position =>
+    Location(position.line, position.column)
   }
   lazy val EOF: Parser[String] = not(elem(".", (ch: Char) => ch != CharSequenceReader.EofCh), "EOF Expected") ^^ {_.toString}
   lazy val LINEFEED : Parser[String] = ("\r\n" | "\r" | "\n")
