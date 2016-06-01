@@ -179,7 +179,7 @@ class Parser extends RegexParsers {
   }
 
   //primary ::= intLiteral | stringLiteral | listLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AstNode] = ident | integerLiteral | stringLiteral | listLiteral | newObject | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
+  def primary: Parser[AstNode] = ident | floatLiteral | integerLiteral | stringLiteral | listLiteral | newObject | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def integerLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r ~ opt("BY"| "L" | "S") ^^ {

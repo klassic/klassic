@@ -17,7 +17,7 @@ scalacOptions in (Compile, doc) ++= { Seq(
   "-doc-source-url", s"https://github.com/klassic/klassic/tree/${scaladocBranch.value}€{FILE_PATH}.scala"
 )}
 
-testOptions in Test += Tests.Argument("-u", "target/scalatest-reports")
+testOptions in Test += Tests.Argument("-oI")
 
 scalacOptions <++= scalaVersion map { v =>
   Seq("-unchecked", "-deprecation", "-feature", "-language:implicitConversions")
