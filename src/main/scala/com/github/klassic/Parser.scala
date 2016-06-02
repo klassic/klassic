@@ -289,9 +289,15 @@ class Parser extends RegexParsers {
   }
 
   // anonFun ::= "(" [param {"," param}] ")" "=>" expression
-  def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
-    case Some(params) ~ proc => FunctionLiteral(params.map{param => FormalParameter(param.name)}, proc)
-    case None ~ proc => FunctionLiteral(List(), proc)
+  def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
+    case Some(params) ~ body =>
+      FunctionLiteral(
+        params.map {
+          case name ~ Some(description) => FormalParameter(name.name, description)
+          case name ~ None => FormalParameter(name.name)
+        }, body
+      )
+    case None ~ body => FunctionLiteral(List(), body)
   }
 
   // newObject ::= "new" fqcn "(" [param {"," param} ")"
@@ -302,16 +308,19 @@ class Parser extends RegexParsers {
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
   def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ opt(typeAnnotation) ~ CL(EQ) ~ expression ^^ {
-    case functionName ~ params ~ _ ~ optionalType ~ body => {
-        val ps = params match {
-          case Some(xs) => xs.map{ case name ~  annotation => FormalParameter(name.name) }
-          case None => Nil
-        }
-        FunctionDefinition(
-          functionName.name,
-          FunctionLiteral(ps, body)
-        )
-    }
+    case functionName ~ params ~ _ ~ optionalType ~ body =>
+      val ps = params match {
+        case Some(xs) =>
+          xs.map{
+            case name ~ Some(annotation) => FormalParameter(name.name, annotation)
+            case name ~ None => FormalParameter(name.name)
+          }
+        case None => Nil
+      }
+      FunctionDefinition(
+        functionName.name,
+        FunctionLiteral(ps, body)
+      )
   }
 
   def parse(str:String): ParseResult[AstNode] = parseAll(lines, str)
