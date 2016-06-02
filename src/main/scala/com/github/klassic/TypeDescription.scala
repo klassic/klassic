@@ -9,5 +9,6 @@ object TypeDescription {
   case object FloatType extends TypeDescription("Float")
   case object DoubleType extends TypeDescription("Double")
   case object BooleanType extends TypeDescription("Boolean")
-  case object DynamicType extends TypeDescription("?")
+  case object DynamicType extends TypeDescription("*")
+  case object UnknownType extends TypeDescription("?")
 }

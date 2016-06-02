@@ -107,7 +107,8 @@ class Parser extends RegexParsers {
   | token("Float") ^^ {_ => FloatType}
   | token("Double")  ^^ {_ => DoubleType}
   | token("Boolean")  ^^ {_ => BooleanType}
-  | token("?") ^^ {_ => DynamicType}
+  | token("?") ^^ {_ => UnknownType}
+  | token("*") ^^ {_ => DynamicType}
   )
 
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
