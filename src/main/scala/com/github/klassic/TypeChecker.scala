@@ -22,35 +22,12 @@ object TypeChecker {
   def typeCheck(node: AstNode, environment : TypeEnvironment): TypeDescription = {
     node match {
       case Block(expressions) =>
-        var description: TypeDescription = UnitType
-        var xs = expressions
-        while(!xs.isEmpty) {
-          val current = xs.head
-          current match {
-            case ValDeclaration(variable, optVariableType, value) =>
-              if(environment.variables.contains(variable)) {
-                throw new InterruptedException(s"variable ${variable} is already defined")
-              }
-              val valueType = typeCheck(value, environment)
-              val declarationType = optVariableType.map { variableType =>
-                if(expeted(variableType, valueType))
-                  variableType
-                else
-                  ErrorType
-              }.getOrElse {
-                valueType
-              }
-              if(declarationType == ErrorType) {
-                throw new InterpreterException(s"expected type: ${declarationType}, but actual type: ${valueType}")
-              }
-              environment.variables(variable) = declarationType
-              description = declarationType
-            case otherwise =>
-              description = typeCheck(otherwise, environment)
-          }
-          xs = xs.tail
+        expressions match {
+          case Nil => UnitType
+          case x::xs =>
+            val xType = typeCheck(x, environment)
+            xs.foldLeft(xType){(b, e) => typeCheck(e, environment)}
         }
-        description
       case IntNode(_) => IntType
       case ShortNode(_) => ShortType
       case ByteNode(_) => ByteType
@@ -70,13 +47,71 @@ object TypeChecker {
             UnitType
         }
         result
-      case IfExpression(cond: AstNode, pos: AstNode, neg: AstNode) => ???
-      case ValDeclaration(variable: String, description: Option[TypeDescription], value: AstNode) => ???
+      case IfExpression(cond: AstNode, pos: AstNode, neg: AstNode) =>
+        val condType = typeCheck(cond, environment)
+        if(condType != BooleanType) {
+          throw InterpreterException(s"condition type must be Boolean, actual: ${condType}")
+        } else {
+          val posType = typeCheck(pos, environment)
+          val negType = typeCheck(neg, environment)
+          if(expeted(posType, negType)) {
+            throw new InterpreterException(s"type ${posType} and type ${negType} is incomparable")
+          }
+          if(posType == DynamicType)
+            DynamicType
+          else if(negType == DynamicType)
+            DynamicType
+          else
+            posType
+        }
+      case ValDeclaration(variable: String, optVariableType: Option[TypeDescription], value: AstNode) =>
+        if(environment.variables.contains(variable)) {
+          throw new InterruptedException(s"variable ${variable} is already defined")
+        }
+        val valueType = typeCheck(value, environment)
+        val declarationType = optVariableType.map { variableType =>
+          if(expeted(variableType, valueType))
+            variableType
+          else
+            ErrorType
+        }.getOrElse {
+          valueType
+        }
+        if(declarationType == ErrorType) {
+          throw new InterpreterException(s"expected type: ${declarationType}, but actual type: ${valueType}")
+        }
+        environment.variables(variable) = declarationType
+        UnitType
       case ForeachExpression(name: String, collection: AstNode, body: AstNode) => ???
       case BinaryExpression(operator: Operator, lhs: AstNode, rhs: AstNode) => ???
-      case WhileExpression(condition: AstNode, body: AstNode) => ???
-      case MinusOp(operand: AstNode) => ???
-      case PlusOp(operand: AstNode) => ???
+      case WhileExpression(condition: AstNode, body: AstNode) =>
+        val conditionType = typeCheck(condition, environment)
+        if(conditionType != Boolean) {
+          throw InterpreterException(s"condition type must be Boolean, actual: ${conditionType}")
+        } else {
+          typeCheck(body, environment)
+          UnitType
+        }
+      case MinusOp(operand: AstNode) =>
+        typeCheck(operand, environment) match {
+          case ByteType => ByteType
+          case IntType => IntType
+          case ShortType => ShortType
+          case LongType => LongType
+          case FloatType => FloatType
+          case DoubleType => DoubleType
+          case otherwise => throw InterpreterException(s"expected: Numeric type, actual: ${otherwise}")
+        }
+      case PlusOp(operand: AstNode) =>
+        typeCheck(operand, environment) match {
+          case ByteType => ByteType
+          case IntType => IntType
+          case ShortType => ShortType
+          case LongType => LongType
+          case FloatType => FloatType
+          case DoubleType => DoubleType
+          case otherwise => throw InterpreterException(s"expected: Numeric type, actual: ${otherwise}")
+        }
       case StringNode(value: String) =>
         DynamicType
       case Identifier(name: String) =>
@@ -84,13 +119,16 @@ object TypeChecker {
           case None => throw InterpreterException(s"variable ${name} is not found")
           case Some(description) => description
         }
-      case FunctionLiteral(params: List[FormalParameter], proc: AstNode) => ???
+      case FunctionLiteral(params: List[FormalParameter], proc: AstNode) =>
         val paramsMap = mutable.Map(params.map{p => p.name -> p.description}:_*)
         val newEnvironment = TypeEnvironment(paramsMap, Some(environment))
         val paramTypes = params.map{_.description}
         val returnType = typeCheck(proc, newEnvironment)
         FunctionType(paramTypes, returnType)
-      case FunctionDefinition(name: String, func: FunctionLiteral) => ???
+      case FunctionDefinition(name: String, func: FunctionLiteral) =>
+        if(environment.variables.contains(name)) {
+          throw new InterruptedException(s"function ${name} is already defined")
+        }
         environment.variables(name) = typeCheck(func, environment)
         UnitType
       case FunctionCall(func: AstNode, params: List[AstNode]) =>
