@@ -86,7 +86,7 @@ object TypeChecker {
       case BinaryExpression(operator: Operator, lhs: AstNode, rhs: AstNode) => ???
       case WhileExpression(condition: AstNode, body: AstNode) =>
         val conditionType = typeCheck(condition, environment)
-        if(conditionType != Boolean) {
+        if(conditionType != BooleanType) {
           throw InterpreterException(s"condition type must be Boolean, actual: ${conditionType}")
         } else {
           typeCheck(body, environment)
