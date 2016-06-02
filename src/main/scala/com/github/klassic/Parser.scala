@@ -107,6 +107,7 @@ class Parser extends RegexParsers {
   | token("Float") ^^ {_ => FloatType}
   | token("Double")  ^^ {_ => DoubleType}
   | token("Boolean")  ^^ {_ => BooleanType}
+  | token("Unit") ^^ {_ => UnitType}
   | token("?") ^^ {_ => UnknownType}
   | token("*") ^^ {_ => DynamicType}
   )
@@ -286,7 +287,7 @@ class Parser extends RegexParsers {
 
   // val_declaration ::= "val" ident "=" expression
   def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
-    case valName ~ optionalType ~ value => ValDeclaration(valName.name, value)
+    case valName ~ optionalType ~ value => ValDeclaration(valName.name, optionalType, value)
   }
 
   // anonFun ::= "(" [param {"," param}] ")" "=>" expression

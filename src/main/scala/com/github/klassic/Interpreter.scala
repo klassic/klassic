@@ -164,7 +164,7 @@ class Interpreter {evaluator =>
       case ForeachExpression(name, collection, body) =>
         val itVariable = symbol()
         Block(List(
-          ValDeclaration(itVariable, MethodCall(rewrite(collection), "iterator", List())),
+          ValDeclaration(itVariable, None, MethodCall(rewrite(collection), "iterator", List())),
           WhileExpression(
             BinaryExpression(
               Operator.EQUAL,
@@ -172,7 +172,7 @@ class Interpreter {evaluator =>
               BooleanNode(true)
             ),
             Block(List(
-              ValDeclaration(name, MethodCall(Identifier(itVariable), "next", List())),
+              ValDeclaration(name, None, MethodCall(Identifier(itVariable), "next", List())),
               body
             ))
           )
@@ -191,7 +191,7 @@ class Interpreter {evaluator =>
       case n@DoubleNode(name) => n
       case n@FloatNode(name) => n
       case Assignment(variable, value) => Assignment(variable, rewrite(value))
-      case ValDeclaration(variable, value) => ValDeclaration(variable, rewrite(value))
+      case ValDeclaration(variable, optionalType, value) => ValDeclaration(variable, optionalType, rewrite(value))
       case FunctionLiteral(params, proc) => FunctionLiteral(params, rewrite(proc))
       case FunctionDefinition(name, func) => FunctionDefinition(name, rewrite(func).asInstanceOf[FunctionLiteral])
       case FunctionCall(func, params) => FunctionCall(rewrite(func), params.map{rewrite})
@@ -355,7 +355,7 @@ class Interpreter {evaluator =>
           }
           ObjectValue(newList)
         case Identifier(name) => env(name)
-        case ValDeclaration(vr, value) =>
+        case ValDeclaration(vr, optVariableType, value) =>
           env(vr) = evalRecursive(value)
         case Assignment(vr, value) =>
           env.set(vr, evalRecursive(value))
