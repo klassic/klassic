@@ -13,4 +13,6 @@ object TypeDescription {
   case object DynamicType extends TypeDescription("*")
   case object UnknownType extends TypeDescription("?")
   case object ErrorType extends TypeDescription("!")
+  case class FunctionType(paramTypes: List[TypeDescription], returnType: TypeDescription) extends
+    TypeDescription(s"(${paramTypes.mkString(", ")}) => ${returnType}")
 }
