@@ -7,7 +7,7 @@ import scala.collection.mutable
 /**
   * Created by kota_mizushima on 2016/06/02.
   */
-object TypeChecker {
+class TypeChecker {
   def isAssignableFrom(expectedType: TypeDescription, actualType: TypeDescription): Boolean = {
     if(expectedType == ErrorType || actualType == ErrorType) {
       false
@@ -18,6 +18,9 @@ object TypeChecker {
     } else {
       expectedType == actualType
     }
+  }
+  def typed(node: AstNode): TypeDescription = {
+    typeCheck(node, TypeEnvironment(mutable.Map.empty, None))
   }
   def typeCheck(node: AstNode, environment : TypeEnvironment): TypeDescription = {
     node match {
@@ -69,21 +72,18 @@ object TypeChecker {
           throw new InterruptedException(s"variable ${variable} is already defined")
         }
         val valueType = typeCheck(value, environment)
-        val declarationType = optVariableType.map { variableType =>
-          if(isAssignableFrom(variableType, valueType))
-            variableType
-          else
-            ErrorType
-        }.getOrElse {
-          valueType
+        optVariableType match {
+          case Some(variableType) =>
+            if(isAssignableFrom(variableType, valueType)) {
+              environment.variables(variable) = variableType
+            } else {
+              throw new InterpreterException(s"expected type: ${variableType}, but actual type: ${valueType}")
+            }
+          case None =>
+            environment.variables(variable) = valueType
         }
-        if(declarationType == ErrorType) {
-          throw new InterpreterException(s"expected type: ${declarationType}, but actual type: ${valueType}")
-        }
-        environment.variables(variable) = declarationType
         UnitType
       case ForeachExpression(name: String, collection: AstNode, body: AstNode) => ???
-      case BinaryExpression(operator: Operator, lhs: AstNode, rhs: AstNode) => ???
       case WhileExpression(condition: AstNode, body: AstNode) =>
         val conditionType = typeCheck(condition, environment)
         if(conditionType != BooleanType) {
