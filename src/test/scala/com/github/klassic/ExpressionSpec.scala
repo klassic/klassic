@@ -92,4 +92,24 @@ class ExpressionSpec extends SpecHelper {
       }
     }
   }
+
+  describe("function definition") {
+    val expectations: List[(String, Value)] = List(
+      """
+         |def add(x, y) = x + y
+         |add(2, 3)
+      """.stripMargin -> BoxedInt(5),
+      """
+         |def fact(n) = if(n < 2) 1 else (n * fact(n - 1))
+         |fact(4)
+      """.stripMargin -> BoxedInt(24)
+    )
+
+    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
+      it(s"expectations ${i}") {
+        assert(expected == I.evaluateString(in))
+      }
+    }
+  }
+
 }
