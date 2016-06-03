@@ -16,8 +16,8 @@ class Parser extends RegexParsers {
   private def and[T](p: => Parser[T], msg: String): Parser[Unit] = {
     not(not(p)) | failure(msg)
   }
-  lazy val % : Parser[Location] = Parser{reader => Success(reader.pos, reader)}.map{position =>
-    Location(position.line, position.column)
+  lazy val % : Parser[SourceLocation] = Parser{reader => Success(reader.pos, reader)}.map{position =>
+    SourceLocation(position.line, position.column)
   }
   lazy val EOF: Parser[String] = not(elem(".", (ch: Char) => ch != CharSequenceReader.EofCh), "EOF Expected") ^^ {_.toString}
   lazy val LINEFEED : Parser[String] = ("\r\n" | "\r" | "\n")
