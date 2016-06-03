@@ -153,6 +153,16 @@ class Interpreter {evaluator =>
       case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
     }
   }
+
+  def parse(program: String): AstNode = {
+    val parser = new Parser
+    parser.parse(program) match {
+      case parser.Success(node: AstNode, _) => node
+      case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
+      case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
+    }
+  }
+
   def evaluate(node: AstNode): Value = evaluate(BuiltinEnvironment, node)
   def evaluate(env:Environment, node: AstNode): Value = {
     def rewrite(node: AstNode): AstNode = node match {
