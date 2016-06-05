@@ -93,10 +93,12 @@ class Parser extends RegexParsers {
   lazy val COLON   : Parser[String] = token(":")
   lazy val NEW     : Parser[String] = token("new")
   lazy val QUES    : Parser[String] = token("?")
+  lazy val AMP2    : Parser[String] = token("&&")
+  lazy val BAR2    : Parser[String] = token("||")
   lazy val KEYWORDS: Set[String]     = Set(
     "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
     "if", "else", "while", "foreach", "true", "false", "in", ",", ".",
-    "class", "def", "val", "=", "==", "=>", "new"
+    "class", "def", "val", "=", "==", "=>", "new", "&&", "||"
   )
 
   def typeAnnotation: Parser[TypeDescription] = COLON ~> (
@@ -119,7 +121,7 @@ class Parser extends RegexParsers {
   def line: Parser[AstNode] = expression | val_declaration | functionDefinition
 
   //expression ::= assignment | conditional | if | while
-  def expression: Parser[AstNode] = assignment | conditional | ifExpression | whileExpression | foreachExpression
+  def expression: Parser[AstNode] = assignment | logical | ifExpression | whileExpression | foreachExpression
 
   //if ::= "if" "(" expression ")" expression "else" expression
   def ifExpression: Parser[AstNode] = CL(IF) ~ CL(LPAREN) ~> expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression ^^ {
@@ -135,6 +137,11 @@ class Parser extends RegexParsers {
   def foreachExpression: Parser[AstNode] = ((CL(FOREACH) ~> CL(LPAREN)) ~> (CL(ident) <~ CL(IN)) ~ expression <~ CL(RPAREN)) ~ expression ^^ {
     case variable ~ collection ~ body => ForeachExpression(variable.name, collection, body)
   }
+
+  def logical: Parser[AstNode] = chainl1(conditional,
+    CL(AMP2) ^^ {op => (lhs: AstNode, rhs: AstNode) => BinaryExpression(Operator.AND2, lhs, rhs)} |
+    CL(BAR2) ^^ {op => (lhs: AstNode, rhs: AstNode) => BinaryExpression(Operator.BAR2, lhs, rhs)}
+  )
 
   //conditional ::= add {"<" add | ">" add | "<=" add | ">=" add}
   def conditional: Parser[AstNode] = chainl1(add,
