@@ -225,6 +225,18 @@ class Interpreter {evaluator =>
             case BoxedBoolean(false) => evalRecursive(neg)
             case _ => reportError("type error")
           }
+        case BinaryExpression(Operator.AND2, lhs, rhs) =>
+          evalRecursive(lhs) match {
+            case BoxedBoolean(true) => evalRecursive(rhs)
+            case BoxedBoolean(false) => BoxedBoolean(false)
+            case _ => reportError("type error")
+          }
+        case BinaryExpression(Operator.BAR2, lhs, rhs) =>
+          evalRecursive(lhs) match {
+            case BoxedBoolean(false) => evalRecursive(rhs)
+            case BoxedBoolean(true) => BoxedBoolean(true)
+            case _ => reportError("type error")
+          }
         case BinaryExpression(Operator.EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval == rval)

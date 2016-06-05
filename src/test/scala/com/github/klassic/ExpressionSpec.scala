@@ -25,6 +25,7 @@ class ExpressionSpec extends SpecHelper {
       }
     }
   }
+
   describe("while expression") {
     val expectations: List[(String, Value)] = List(
       """
@@ -69,6 +70,32 @@ class ExpressionSpec extends SpecHelper {
     )
 
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
+      it(s"expectations ${i}") {
+        assert(expected == I.evaluateString(in))
+      }
+    }
+  }
+
+  describe("logical expression") {
+    val expectations: List[(String, Value)] = List(
+      """
+        |val i = 1
+        |0 <= i && i <= 10
+      """.stripMargin -> BoxedBoolean(true),
+      """
+        |val i = -1
+        |0 <= i && i <= 10
+      """.stripMargin -> BoxedBoolean(false),
+      """
+        |val i = -1
+        |i < 0 || i > 10
+      """.stripMargin -> BoxedBoolean(true),
+      """
+        |val i = 1
+        |i < 0 || i > 10
+      """.stripMargin -> BoxedBoolean(false)
+    )
+    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
       it(s"expectations ${i}") {
         assert(expected == I.evaluateString(in))
       }

@@ -18,11 +18,16 @@ class TypeCheckerSpec extends SpecHelper {
         |val a=1
         |a = a + 1
         |a
-      """.stripMargin -> (BoxedInt(2), IntType)
+      """.stripMargin -> (BoxedInt(2), IntType),
+      """
+        |val s="FOO"
+        |s=s+s
+        |s
+      """.stripMargin -> (ObjectValue("FOOFOO"), DynamicType)
     )
 
-    expectations.foreach { case (in, expected) =>
-      it(s"${in} evaluates to ${expected}") {
+    expectations.zipWithIndex.foreach { case ((in, expected), i) =>
+      it(s"expectation  ${i}") {
         assert(expected == I.evaluateString(in))
       }
     }
