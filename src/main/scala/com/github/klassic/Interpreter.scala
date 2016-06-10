@@ -166,14 +166,14 @@ class Interpreter {evaluator =>
   def evaluate(node: AstNode): Value = evaluate(BuiltinEnvironment, node)
   def evaluate(env:Environment, node: AstNode): Value = {
     def rewrite(node: AstNode): AstNode = node match {
-      case Block(expressions) => Block(expressions.map{rewrite})
+      case Block(location, expressions) => Block(location, expressions.map{rewrite})
       case IfExpression(cond: AstNode, pos: AstNode, neg: AstNode) =>
         IfExpression(rewrite(cond), rewrite(pos), rewrite(neg))
       case WhileExpression(condition, body: AstNode) =>
         WhileExpression(rewrite(condition), rewrite(body))
-      case ForeachExpression(name, collection, body) =>
+      case e@ForeachExpression(name, collection, body) =>
         val itVariable = symbol()
-        Block(List(
+        Block(e.location, List(
           ValDeclaration(itVariable, None, MethodCall(rewrite(collection), "iterator", List())),
           WhileExpression(
             BinaryExpression(
@@ -181,7 +181,7 @@ class Interpreter {evaluator =>
               MethodCall(Identifier(itVariable), "hasNext", List()),
               BooleanNode(true)
             ),
-            Block(List(
+            Block(e.location, List(
               ValDeclaration(name, None, MethodCall(Identifier(itVariable), "next", List())),
               body
             ))
@@ -211,7 +211,7 @@ class Interpreter {evaluator =>
     }
     def evalRecursive(node: AstNode): Value = {
       node match{
-        case Block(exprs) =>
+        case Block(location, exprs) =>
           val local = new Environment(Some(env))
           exprs.foldLeft(UnitValue:Value){(result, x) => evaluate(local, x)}
         case WhileExpression(cond, body) =>

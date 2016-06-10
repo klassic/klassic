@@ -115,7 +115,9 @@ class Parser extends RegexParsers {
   )
 
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
-  def lines: Parser[AstNode] = SPACING ~> repsep(line, TERMINATOR) <~ opt(TERMINATOR) ^^ Block
+  def lines: Parser[AstNode] = SPACING ~> (% ~ repsep(line, TERMINATOR)) <~ opt(TERMINATOR) ^^{ case location ~ expressions =>
+      Block(location, expressions)
+  }
 
   //line ::= expression | val_declaration | functionDefinition
   def line: Parser[AstNode] = expression | val_declaration | functionDefinition
