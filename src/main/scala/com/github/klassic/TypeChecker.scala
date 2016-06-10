@@ -57,7 +57,7 @@ class TypeChecker {
         } else {
           val posType = typeCheck(pos, environment)
           val negType = typeCheck(neg, environment)
-          if(isAssignableFrom(posType, negType)) {
+          if(!isAssignableFrom(posType, negType)) {
             throw new InterpreterException(s"type ${posType} and type ${negType} is incomparable")
           }
           if(posType == DynamicType)
