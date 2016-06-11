@@ -24,7 +24,7 @@ class TypeChecker {
   }
   def typeCheck(node: AstNode, environment : TypeEnvironment): TypeDescription = {
     node match {
-      case Block(expressions) =>
+      case Block(location, expressions) =>
         expressions match {
           case Nil => UnitType
           case x::xs =>

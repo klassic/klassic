@@ -17,7 +17,7 @@ object AstNode {
     def format: String = s"<empty>:"
   }
 
-  case class Block(expressions: List[AstNode]) extends AstNode(NoLocation)
+  case class Block(override val location: Location, expressions: List[AstNode]) extends AstNode(NoLocation)
 
   case class IfExpression(cond: AstNode, pos: AstNode, neg: AstNode) extends AstNode(NoLocation)
 
