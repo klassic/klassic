@@ -11,7 +11,7 @@ object AstNode {
     def format: String
   }
   case class SourceLocation(line: Int, column: Int) extends Location {
-    def format: String = s"<${line}, {colum}>:"
+    def format: String = s"<${line}, ${column}>:"
   }
   case object NoLocation extends Location {
     def format: String = s"<empty>:"
