@@ -16,7 +16,12 @@ object Main {
       case Some(("-f", fileName)) =>
         interpreter.evaluateFile(new File(fileName))
       case _ =>
-        Console.err.println("please specify program")
+        Console.err.println(
+          """
+            |Usage: java -jar klassic.jar (-f <fileName> | -e <expression>)
+            |-f <fileName>   : read a program from <fileName> and execute it
+            |-e <expression> : evaluate <expression>
+          """.stripMargin)
     }
   }
 
