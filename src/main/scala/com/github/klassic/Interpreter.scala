@@ -92,7 +92,7 @@ class Interpreter {evaluator =>
       new Thread {
         override def run(): Unit = {
           val env = new Environment(fun.environment)
-          evaluator.evaluate(env, FunctionCall(fun.value, Nil))
+          evaluator.evaluate(env, FunctionCall(NoLocation, fun.value, Nil))
         }
       }.start()
       UnitValue
@@ -105,7 +105,7 @@ class Interpreter {evaluator =>
       val interpreter = new Interpreter
       val env = new Environment(fun.environment)
       val start = System.currentTimeMillis()
-      interpreter.evaluate(env, FunctionCall(fun.value, List()))
+      interpreter.evaluate(env, FunctionCall(NoLocation, fun.value, List()))
       val end = System.currentTimeMillis()
       BoxedInt((end - start).toInt)
     }
@@ -167,77 +167,80 @@ class Interpreter {evaluator =>
   def evaluate(env:Environment, node: AstNode): Value = {
     def rewrite(node: AstNode): AstNode = node match {
       case Block(location, expressions) => Block(location, expressions.map{rewrite})
-      case IfExpression(cond: AstNode, pos: AstNode, neg: AstNode) =>
-        IfExpression(rewrite(cond), rewrite(pos), rewrite(neg))
-      case WhileExpression(condition, body: AstNode) =>
-        WhileExpression(rewrite(condition), rewrite(body))
-      case e@ForeachExpression(name, collection, body) =>
+      case IfExpression(location, cond, pos, neg) =>
+        IfExpression(location, rewrite(cond), rewrite(pos), rewrite(neg))
+      case WhileExpression(location, condition, body: AstNode) =>
+        WhileExpression(location, rewrite(condition), rewrite(body))
+      case e@ForeachExpression(location, name, collection, body) =>
         val itVariable = symbol()
-        Block(e.location, List(
-          ValDeclaration(itVariable, None, MethodCall(rewrite(collection), "iterator", List())),
+        val location = e.location
+        Block(location, List(
+          ValDeclaration(location, itVariable, None, MethodCall(location, rewrite(collection), "iterator", List())),
           WhileExpression(
+            location,
             BinaryExpression(
+              location,
               Operator.EQUAL,
-              MethodCall(Identifier(itVariable), "hasNext", List()),
-              BooleanNode(true)
+              MethodCall(location, Identifier(location, itVariable), "hasNext", List()),
+              BooleanNode(location, true)
             ),
-            Block(e.location, List(
-              ValDeclaration(name, None, MethodCall(Identifier(itVariable), "next", List())),
+            Block(location, List(
+              ValDeclaration(location, name, None, MethodCall(location, Identifier(location, itVariable), "next", List())),
               body
             ))
           )
         ))
-      case BinaryExpression(operator: Operator, lhs: AstNode, rhs: AstNode) =>
-        BinaryExpression(operator, rewrite(lhs), rewrite(rhs))
-      case MinusOp(operand) => MinusOp(rewrite(operand))
-      case PlusOp(operand) => PlusOp(rewrite(operand))
-      case n@StringNode(value) => n
-      case n@IntNode(value) => n
-      case n@LongNode(value)  => n
-      case n@ShortNode(value) => n
-      case n@ByteNode(value) => n
-      case n@BooleanNode(value) => n
-      case n@Identifier(name) => n
-      case n@DoubleNode(name) => n
-      case n@FloatNode(name) => n
-      case Assignment(variable, value) => Assignment(variable, rewrite(value))
-      case ValDeclaration(variable, optionalType, value) => ValDeclaration(variable, optionalType, rewrite(value))
-      case FunctionLiteral(params, proc) => FunctionLiteral(params, rewrite(proc))
-      case FunctionDefinition(name, func) => FunctionDefinition(name, rewrite(func).asInstanceOf[FunctionLiteral])
-      case FunctionCall(func, params) => FunctionCall(rewrite(func), params.map{rewrite})
-      case ListLiteral(elements) =>  ListLiteral(elements.map{rewrite})
-      case NewObject(className, params) => NewObject(className, params.map{rewrite})
-      case MethodCall(self, name, params) => MethodCall(rewrite(self), name, params.map{rewrite})
+      case BinaryExpression(location, operator, lhs, rhs) =>
+        BinaryExpression(location, operator, rewrite(lhs), rewrite(rhs))
+      case MinusOp(location, operand) => MinusOp(location, rewrite(operand))
+      case PlusOp(location, operand) => PlusOp(location, rewrite(operand))
+      case literal@StringNode(location, value) => literal
+      case literal@IntNode(location, value) => literal
+      case literal@LongNode(location, value)  => literal
+      case literal@ShortNode(location, value) => literal
+      case literal@ByteNode(location, value) => literal
+      case literal@BooleanNode(location, value) => literal
+      case literal@DoubleNode(location, value) => literal
+      case literal@FloatNode(lcation, value) => literal
+      case node@Identifier(_, name) => node
+      case Assignment(location, variable, value) => Assignment(location, variable, rewrite(value))
+      case ValDeclaration(location, variable, optionalType, value) => ValDeclaration(location, variable, optionalType, rewrite(value))
+      case FunctionLiteral(location, params, proc) => FunctionLiteral(location, params, rewrite(proc))
+      case FunctionDefinition(location, name, func) => FunctionDefinition(location, name, rewrite(func).asInstanceOf[FunctionLiteral])
+      case FunctionCall(location, func, params) => FunctionCall(location, rewrite(func), params.map{rewrite})
+      case ListLiteral(location, elements) =>  ListLiteral(location, elements.map{rewrite})
+      case NewObject(location, className, params) => NewObject(location, className, params.map{rewrite})
+      case MethodCall(location ,self, name, params) => MethodCall(location, rewrite(self), name, params.map{rewrite})
     }
     def evalRecursive(node: AstNode): Value = {
       node match{
         case Block(location, exprs) =>
           val local = new Environment(Some(env))
           exprs.foldLeft(UnitValue:Value){(result, x) => evaluate(local, x)}
-        case WhileExpression(cond, body) =>
+        case WhileExpression(location, cond, body) =>
           while(evalRecursive(cond) == BoxedBoolean(true)) {
             evalRecursive(body)
           }
           UnitValue
-        case IfExpression(cond, pos, neg) =>
-          evalRecursive(cond) match {
+        case IfExpression(location, condition, pos, neg) =>
+          evalRecursive(condition) match {
             case BoxedBoolean(true) => evalRecursive(pos)
             case BoxedBoolean(false) => evalRecursive(neg)
             case _ => reportError("type error")
           }
-        case BinaryExpression(Operator.AND2, lhs, rhs) =>
+        case BinaryExpression(location, Operator.AND2, lhs, rhs) =>
           evalRecursive(lhs) match {
             case BoxedBoolean(true) => evalRecursive(rhs)
             case BoxedBoolean(false) => BoxedBoolean(false)
             case _ => reportError("type error")
           }
-        case BinaryExpression(Operator.BAR2, lhs, rhs) =>
+        case BinaryExpression(location, Operator.BAR2, lhs, rhs) =>
           evalRecursive(lhs) match {
             case BoxedBoolean(false) => evalRecursive(rhs)
             case BoxedBoolean(true) => BoxedBoolean(true)
             case _ => reportError("type error")
           }
-        case BinaryExpression(Operator.EQUAL, left, right) =>
+        case BinaryExpression(location, Operator.EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval == rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval == rval)
@@ -251,7 +254,7 @@ class Interpreter {evaluator =>
             case (ObjectValue(lval), ObjectValue(rval)) => BoxedBoolean(lval == rval)
             case _ => reportError("comparation must be done between same types")
           }
-        case BinaryExpression(Operator.LESS_THAN, left, right) =>
+        case BinaryExpression(location, Operator.LESS_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval < rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval < rval)
@@ -261,7 +264,7 @@ class Interpreter {evaluator =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval < rval)
             case _ => reportError("comparation must be done between numeric types")
           }
-        case BinaryExpression(Operator.GREATER_THAN, left, right) =>
+        case BinaryExpression(location, Operator.GREATER_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval > rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval > rval)
@@ -271,7 +274,7 @@ class Interpreter {evaluator =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval > rval)
             case _ => reportError("comparation must be done between numeric types")
           }
-        case BinaryExpression(Operator.LESS_OR_EQUAL, left, right) =>
+        case BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval <= rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval <= rval)
@@ -281,7 +284,7 @@ class Interpreter {evaluator =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval <= rval)
             case _ => reportError("comparation must be done between numeric types")
           }
-        case BinaryExpression(Operator.GREATER_EQUAL, left, right) =>
+        case BinaryExpression(location, Operator.GREATER_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval >= rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval >= rval)
@@ -291,7 +294,7 @@ class Interpreter {evaluator =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval >= rval)
             case _ => reportError("comparation must be done between numeric types")
           }
-        case BinaryExpression(Operator.ADD, left, right) =>
+        case BinaryExpression(location, Operator.ADD, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval + rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval + rval)
@@ -303,7 +306,7 @@ class Interpreter {evaluator =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval + rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
-        case BinaryExpression(Operator.SUBTRACT, left, right) =>
+        case BinaryExpression(location, Operator.SUBTRACT, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval - rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval - rval)
@@ -313,7 +316,7 @@ class Interpreter {evaluator =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval - rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
-        case BinaryExpression(Operator.MULTIPLY, left, right) =>
+        case BinaryExpression(location, Operator.MULTIPLY, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval * rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval * rval)
@@ -323,7 +326,7 @@ class Interpreter {evaluator =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval * rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
-        case BinaryExpression(Operator.DIVIDE, left, right) =>
+        case BinaryExpression(location, Operator.DIVIDE, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval / rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval / rval)
@@ -333,7 +336,7 @@ class Interpreter {evaluator =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval / rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
-        case MinusOp(operand) =>
+        case MinusOp(location, operand) =>
           evalRecursive(operand) match {
             case BoxedInt(value) => BoxedInt(-value)
             case BoxedLong(value) => BoxedLong(-value)
@@ -343,7 +346,7 @@ class Interpreter {evaluator =>
             case BoxedDouble(value) => BoxedDouble(-value)
             case _ => reportError("- cannot be applied to non-integer value")
           }
-        case PlusOp(operand) =>
+        case PlusOp(location, operand) =>
           evalRecursive(operand) match {
             case BoxedInt(value) => BoxedInt(value)
             case BoxedLong(value) => BoxedLong(value)
@@ -353,39 +356,39 @@ class Interpreter {evaluator =>
             case BoxedDouble(value) => BoxedDouble(value)
             case _ => reportError("+ cannot be applied to non-integer value")
           }
-        case IntNode(value) =>
+        case IntNode(location, value) =>
           BoxedInt(value)
-        case StringNode(value) =>
+        case StringNode(location, value) =>
           ObjectValue(value)
-        case LongNode(value) =>
+        case LongNode(location, value) =>
           BoxedLong(value)
-        case ShortNode(value) =>
+        case ShortNode(location, value) =>
           BoxedShort(value)
-        case ByteNode(value) =>
+        case ByteNode(location, value) =>
           BoxedByte(value)
-        case DoubleNode(value) =>
+        case DoubleNode(location, value) =>
           BoxedDouble(value)
-        case FloatNode(value) =>
+        case FloatNode(location, value) =>
           BoxedFloat(value)
-        case BooleanNode(value) =>
+        case BooleanNode(location, value) =>
           BoxedBoolean(value)
-        case ListLiteral(elements) =>
+        case ListLiteral(location, elements) =>
           val params = elements.map{e => Value.fromKlassic(evalRecursive(e))}
           val newList = new java.util.ArrayList[Any]
           params.foreach{param =>
             newList.add(param)
           }
           ObjectValue(newList)
-        case Identifier(name) => env(name)
-        case ValDeclaration(vr, optVariableType, value) =>
+        case Identifier(location, name) => env(name)
+        case ValDeclaration(location, vr, optVariableType, value) =>
           env(vr) = evalRecursive(value)
-        case Assignment(vr, value) =>
+        case Assignment(location, vr, value) =>
           env.set(vr, evalRecursive(value))
-        case func@FunctionLiteral(_, _) =>
-          FunctionValue(func, Some(env))
-        case FunctionDefinition(name, func) =>
+        case literal@FunctionLiteral(location, _, _) =>
+          FunctionValue(literal, Some(env))
+        case FunctionDefinition(location, name, func) =>
           env(name) = FunctionValue(func, Some(env)): Value
-        case MethodCall(self, name, params) =>
+        case MethodCall(location, self, name, params) =>
           evalRecursive(self) match {
             case ObjectValue(value) =>
               val paramsArray = params.map{p => evalRecursive(p)}.toArray
@@ -402,7 +405,7 @@ class Interpreter {evaluator =>
             case otherwise =>
               sys.error(s"cannot reach here: ${otherwise}")
           }
-        case NewObject(className, params) =>
+        case NewObject(location, className, params) =>
           val paramsArray = params.map{evalRecursive}.toArray
           findConstructor(Class.forName(className), paramsArray) match {
             case UnboxedVersionConstructorFound(constructor) =>
@@ -414,9 +417,9 @@ class Interpreter {evaluator =>
             case NoConstructorFound =>
               throw new IllegalArgumentException(s"newObject(${className}, ${params}")
           }
-        case FunctionCall(func, params) =>
+        case FunctionCall(location, func, params) =>
           evalRecursive(func) match{
-            case FunctionValue(FunctionLiteral(fparams, proc), cenv) =>
+            case FunctionValue(FunctionLiteral(location, fparams, proc), cenv) =>
               val local = new Environment(cenv)
               (fparams zip params).foreach{ case (fp, ap) =>
                 local(fp.name) = evalRecursive(ap)
@@ -432,7 +435,7 @@ class Interpreter {evaluator =>
             case _ =>
               reportError("unknown error")
           }
-        case e@ForeachExpression(_, _, _) => sys.error(s"cannot reach here: ${e}")
+        case otherwise@ForeachExpression(location, _, _, _) => sys.error(s"cannot reach here: ${otherwise}")
       }
     }
     evalRecursive(rewrite(node))

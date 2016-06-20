@@ -4,7 +4,9 @@ package com.github.klassic
  * @author Kota Mizushima
  */
 
-sealed abstract class AstNode(val location: AstNode.Location)
+sealed abstract class AstNode {
+  val location: AstNode.Location
+}
 
 object AstNode {
   sealed abstract class Location {
@@ -17,51 +19,51 @@ object AstNode {
     def format: String = s"<empty>:"
   }
 
-  case class Block(override val location: Location, expressions: List[AstNode]) extends AstNode(NoLocation)
+  case class Block(val location: Location, expressions: List[AstNode]) extends AstNode
 
-  case class IfExpression(cond: AstNode, pos: AstNode, neg: AstNode) extends AstNode(NoLocation)
+  case class IfExpression(val location: Location, cond: AstNode, pos: AstNode, neg: AstNode) extends AstNode
 
-  case class ForeachExpression(name: String, collection: AstNode, body: AstNode) extends AstNode(NoLocation)
+  case class ForeachExpression(val location: Location, name: String, collection: AstNode, body: AstNode) extends AstNode
 
-  case class BinaryExpression(operator: Operator, lhs: AstNode, rhs: AstNode) extends AstNode(NoLocation)
+  case class BinaryExpression(val location: Location, operator: Operator, lhs: AstNode, rhs: AstNode) extends AstNode
 
-  case class WhileExpression(condition: AstNode, body: AstNode) extends AstNode(NoLocation)
+  case class WhileExpression(val location: Location, condition: AstNode, body: AstNode) extends AstNode
 
-  case class MinusOp(operand: AstNode) extends AstNode(NoLocation)
+  case class MinusOp(val location: Location, operand: AstNode) extends AstNode
 
-  case class PlusOp(operand: AstNode) extends AstNode(NoLocation)
+  case class PlusOp(val location: Location, operand: AstNode) extends AstNode
 
-  case class StringNode(value: String) extends AstNode(NoLocation)
+  case class StringNode(val location: Location, value: String) extends AstNode
 
-  case class IntNode(value: Int) extends AstNode(NoLocation)
+  case class IntNode(val location: Location, value: Int) extends AstNode
 
-  case class LongNode(value: Long) extends AstNode(NoLocation)
+  case class LongNode(val location: Location, value: Long) extends AstNode
 
-  case class ShortNode(value: Short) extends AstNode(NoLocation)
+  case class ShortNode(val location: Location, value: Short) extends AstNode
 
-  case class ByteNode(value: Byte) extends AstNode(NoLocation)
+  case class ByteNode(val location: Location, value: Byte) extends AstNode
 
-  case class BooleanNode(value: Boolean) extends AstNode(NoLocation)
+  case class BooleanNode(val location: Location, value: Boolean) extends AstNode
 
-  case class DoubleNode(value: Double) extends AstNode(NoLocation)
+  case class DoubleNode(val location: Location, value: Double) extends AstNode
 
-  case class FloatNode(value: Float) extends AstNode(NoLocation)
+  case class FloatNode(val location: Location, value: Float) extends AstNode
 
-  case class Identifier(name: String) extends AstNode(NoLocation)
+  case class Identifier(val location: Location, name: String) extends AstNode
 
-  case class Assignment(variable: String, value: AstNode) extends AstNode(NoLocation)
+  case class Assignment(val location: Location, variable: String, value: AstNode) extends AstNode
 
-  case class ValDeclaration(variable: String, description: Option[TypeDescription], value: AstNode) extends AstNode(NoLocation)
+  case class ValDeclaration(val location: Location, variable: String, description: Option[TypeDescription], value: AstNode) extends AstNode
 
-  case class FunctionLiteral(params: List[FormalParameter], proc: AstNode) extends AstNode(NoLocation)
+  case class FunctionLiteral(val location: Location, params: List[FormalParameter], proc: AstNode) extends AstNode
 
-  case class FunctionDefinition(name: String, func: FunctionLiteral) extends AstNode(NoLocation)
+  case class FunctionDefinition(val location: Location, name: String, func: FunctionLiteral) extends AstNode
 
-  case class FunctionCall(func: AstNode, params: List[AstNode]) extends AstNode(NoLocation)
+  case class FunctionCall(val location: Location, func: AstNode, params: List[AstNode]) extends AstNode
 
-  case class ListLiteral(elements: List[AstNode]) extends AstNode(NoLocation)
+  case class ListLiteral(val location: Location, elements: List[AstNode]) extends AstNode
 
-  case class NewObject(className: String, params: List[AstNode]) extends AstNode(NoLocation)
+  case class NewObject(val location: Location, className: String, params: List[AstNode]) extends AstNode
 
-  case class MethodCall(self: AstNode, name: String, params: List[AstNode]) extends AstNode(NoLocation)
+  case class MethodCall(val location: Location, self: AstNode, name: String, params: List[AstNode]) extends AstNode
 }
