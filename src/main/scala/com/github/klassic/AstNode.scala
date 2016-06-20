@@ -13,10 +13,10 @@ object AstNode {
     def format: String
   }
   case class SourceLocation(line: Int, column: Int) extends Location {
-    def format: String = s"<${line}, ${column}>:"
+    def format: String = s"${line}, ${column} :"
   }
   case object NoLocation extends Location {
-    def format: String = s"<empty>:"
+    def format: String = s"? :"
   }
 
   case class Block(val location: Location, expressions: List[AstNode]) extends AstNode

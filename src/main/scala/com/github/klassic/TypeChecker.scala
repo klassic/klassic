@@ -69,7 +69,7 @@ class TypeChecker {
         }
       case ValDeclaration(location, variable, optVariableType, value) =>
         if(environment.variables.contains(variable)) {
-          throw InterpreterException(s"variable ${variable} is already defined")
+          throw InterpreterException(s"${location.format} variable ${variable} is already defined")
         }
         val valueType = typeCheck(value, environment)
         optVariableType match {
@@ -77,7 +77,7 @@ class TypeChecker {
             if(isAssignableFrom(variableType, valueType)) {
               environment.variables(variable) = variableType
             } else {
-              throw new InterpreterException(s"expected type: ${variableType}, but actual type: ${valueType}")
+              throw new InterpreterException(s"${location.format} expected type: ${variableType}, but actual type: ${valueType}")
             }
           case None =>
             environment.variables(variable) = valueType
@@ -86,10 +86,10 @@ class TypeChecker {
       case ForeachExpression(location, variable, collection, body) =>
         val collectionType = typeCheck(collection, environment)
         if(!isAssignableFrom(collectionType, DynamicType)) {
-          throw InterpreterException(s"expression should be DynamicType")
+          throw InterpreterException(s"${location.format} expression should be DynamicType")
         }
         if(environment.variables.contains(variable)) {
-          throw InterpreterException(s"variable ${variable} is already defined")
+          throw InterpreterException(s"${location.format} variable ${variable} is already defined")
         }
         environment.variables(variable) = DynamicType
         typeCheck(body, environment)
@@ -97,7 +97,7 @@ class TypeChecker {
       case WhileExpression(location, condition, body) =>
         val conditionType = typeCheck(condition, environment)
         if(conditionType != BooleanType) {
-          throw InterpreterException(s"condition type must be Boolean, actual: ${conditionType}")
+          throw InterpreterException(s"${location.format} condition type must be Boolean, actual: ${conditionType}")
         } else {
           typeCheck(body, environment)
           UnitType
@@ -108,7 +108,7 @@ class TypeChecker {
         if(isAssignableFrom(lType, rType)) {
           BooleanType
         } else {
-          throw InterpreterException(s"expected type: ${lType}, actual type: ${rType}")
+          throw InterpreterException(s"${location.format} expected type: ${lType}, actual type: ${rType}")
         }
       case BinaryExpression(location, Operator.LESS_THAN, left, right) =>
         (typeCheck(left, environment), typeCheck(right, environment)) match{
@@ -120,7 +120,7 @@ class TypeChecker {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException("comparison operation must be done between the same numeric types")
+          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
         }
       case BinaryExpression(location, Operator.GREATER_THAN, left, right) =>
         (typeCheck(left, environment), typeCheck(right, environment)) match{
@@ -132,7 +132,7 @@ class TypeChecker {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException("comparison operation must be done between the same numeric types")
+          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
         }
       case BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right) =>
         (typeCheck(left, environment), typeCheck(right, environment)) match{
@@ -144,7 +144,7 @@ class TypeChecker {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException("comparison operation must be done between the same numeric types")
+          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
         }
       case BinaryExpression(location, Operator.GREATER_EQUAL, left, right) =>
         (typeCheck(left, environment), typeCheck(right, environment)) match{
@@ -156,7 +156,7 @@ class TypeChecker {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException("comparison operation must be done between the same numeric types")
+          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
         }
       case BinaryExpression(location, Operator.ADD, left, right) =>
         (typeCheck(left, environment), typeCheck(right, environment)) match{
@@ -168,7 +168,7 @@ class TypeChecker {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException("arithmetic operation must be done between the same numeric types")
+          case _ => throw InterpreterException(s"${location.format} arithmetic operation must be done between the same numeric types")
         }
       case BinaryExpression(location, Operator.SUBTRACT, left, right) =>
         (typeCheck(left, environment), typeCheck(right, environment)) match{
@@ -180,7 +180,7 @@ class TypeChecker {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException("arithmetic operation must be done between the same numeric types")
+          case _ => throw InterpreterException(s"${location.format} arithmetic operation must be done between the same numeric types")
         }
       case BinaryExpression(location, Operator.MULTIPLY, left, right) =>
         (typeCheck(left, environment), typeCheck(right, environment)) match{
@@ -192,7 +192,7 @@ class TypeChecker {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException("arithmetic operation must be done between the same numeric types")
+          case _ => throw InterpreterException(s"${location.format} arithmetic operation must be done between the same numeric types")
         }
       case BinaryExpression(location, Operator.DIVIDE, left, right) =>
         (typeCheck(left, environment), typeCheck(right, environment)) match{
@@ -204,7 +204,7 @@ class TypeChecker {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException("arithmetic operation must be done between the same numeric types")
+          case _ => throw InterpreterException(s"${location.format} arithmetic operation must be done between the same numeric types")
         }
       case MinusOp(location, operand) =>
         typeCheck(operand, environment) match {
@@ -215,7 +215,7 @@ class TypeChecker {
           case FloatType => FloatType
           case DoubleType => DoubleType
           case DynamicType => DynamicType
-          case otherwise => throw InterpreterException(s"expected: Numeric type, actual: ${otherwise}")
+          case otherwise => throw InterpreterException(s"${location.format} expected: Numeric type, actual: ${otherwise}")
         }
       case PlusOp(location, operand) =>
         typeCheck(operand, environment) match {
@@ -226,13 +226,13 @@ class TypeChecker {
           case FloatType => FloatType
           case DoubleType => DoubleType
           case DynamicType => DynamicType
-          case otherwise => throw InterpreterException(s"expected: Numeric type, actual: ${otherwise}")
+          case otherwise => throw InterpreterException(s"${location.format} expected: Numeric type, actual: ${otherwise}")
         }
       case StringNode(location, value) =>
         DynamicType
       case Identifier(location, name) =>
         environment.lookup(name) match {
-          case None => throw InterpreterException(s"variable ${name} is not found")
+          case None => throw InterpreterException(s"${location.format} variable ${name} is not found")
           case Some(description) => description
         }
       case FunctionLiteral(location, params, proc) =>
@@ -243,22 +243,22 @@ class TypeChecker {
         FunctionType(paramTypes, returnType)
       case FunctionDefinition(location, name, func) =>
         if(environment.variables.contains(name)) {
-          throw new InterruptedException(s"function ${name} is already defined")
+          throw new InterruptedException(s"${location.format} function ${name} is already defined")
         }
         environment.variables(name) = typeCheck(func, environment)
         UnitType
       case FunctionCall(location, func, params) =>
         val funcType: FunctionType = typeCheck(func, environment) match {
           case f@FunctionType(_, _) => f
-          case otherwise => throw InterpreterException(s"expected: function type, actual type: ${otherwise}")
+          case otherwise => throw InterpreterException(s"${location.format} expected: function type, actual type: ${otherwise}")
         }
         val actualParamTypes = params.map(p => typeCheck(p, environment))
         if(funcType.paramTypes.length != actualParamTypes.length) {
-          throw InterpreterException(s"expected length: ${funcType.paramTypes.length}, actual length: ${actualParamTypes.length}")
+          throw InterpreterException(s"${location.format} expected length: ${funcType.paramTypes.length}, actual length: ${actualParamTypes.length}")
         }
         funcType.paramTypes.zip(actualParamTypes).foreach { case (expectedType, actualType) =>
             if(!isAssignableFrom(expectedType, actualType)){
-              throw InterpreterException(s"expected type: ${expectedType}, actual type:${actualType}")
+              throw InterpreterException(s"${location.format} expected type: ${expectedType}, actual type:${actualType}")
             }
         }
         funcType.returnType
@@ -271,7 +271,7 @@ class TypeChecker {
       case MethodCall(location, receiver, name, params) =>
         val receiverType = typeCheck(receiver, environment)
         if(receiverType != DynamicType) {
-          throw InterpreterException(s"expected: [*], actual: ${receiverType}")
+          throw InterpreterException(s"${location.format} expected: [*], actual: ${receiverType}")
         }
         params.foreach(p => typeCheck(p, environment))
         DynamicType
