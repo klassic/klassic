@@ -126,63 +126,63 @@ class Parser extends RegexParsers {
   def expression: Parser[AstNode] = assignment | logical | ifExpression | whileExpression | foreachExpression
 
   //if ::= "if" "(" expression ")" expression "else" expression
-  def ifExpression: Parser[AstNode] = CL(IF) ~ CL(LPAREN) ~> expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression ^^ {
-    case condition ~ _ ~ positive ~ _ ~ negative => IfExpression(NoLocation, condition, positive, negative)
+  def ifExpression: Parser[AstNode] = (% <~ CL(IF) <~ CL(LPAREN)) ~ expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression ^^ {
+    case location ~ condition ~ _ ~ positive ~ _ ~ negative => IfExpression(location, condition, positive, negative)
   }
 
   //while ::= "while" "(" expression ")" expression
-  def whileExpression: Parser[AstNode] = (CL(WHILE) ~ CL(LPAREN)) ~> expression ~ (CL(RPAREN) ~> expression) ^^ {
-    case condition ~  body => WhileExpression(NoLocation, condition, body)
+  def whileExpression: Parser[AstNode] = (% <~ CL(WHILE) <~ CL(LPAREN)) ~ expression ~ (CL(RPAREN) ~> expression) ^^ {
+    case location ~ condition ~  body => WhileExpression(location, condition, body)
   }
 
   //foreach ::= "foreach" "(" ident "in" expression ")" expression
-  def foreachExpression: Parser[AstNode] = ((CL(FOREACH) ~> CL(LPAREN)) ~> (CL(ident) <~ CL(IN)) ~ expression <~ CL(RPAREN)) ~ expression ^^ {
-    case variable ~ collection ~ body => ForeachExpression(NoLocation, variable.name, collection, body)
+  def foreachExpression: Parser[AstNode] = (% <~ CL(FOREACH) <~ CL(LPAREN)) ~ (CL(ident) <~ CL(IN)) ~ (expression <~ CL(RPAREN)) ~ expression ^^ {
+    case location ~ variable ~ collection ~ body => ForeachExpression(location, variable.name, collection, body)
   }
 
   def logical: Parser[AstNode] = chainl1(conditional,
-    CL(AMP2) ^^ {op => (lhs: AstNode, rhs: AstNode) => BinaryExpression(NoLocation, Operator.AND2, lhs, rhs)} |
-    CL(BAR2) ^^ {op => (lhs: AstNode, rhs: AstNode) => BinaryExpression(NoLocation, Operator.BAR2, lhs, rhs)}
+    (% <~ CL(AMP2)) ^^ {location => (lhs: AstNode, rhs: AstNode) => BinaryExpression(location, Operator.AND2, lhs, rhs)} |
+    (% <~ CL(BAR2)) ^^ {location => (lhs: AstNode, rhs: AstNode) => BinaryExpression(location, Operator.BAR2, lhs, rhs)}
   )
 
   //conditional ::= add {"<" add | ">" add | "<=" add | ">=" add}
   def conditional: Parser[AstNode] = chainl1(add,
-    CL(EQEQ) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.EQUAL, left, right)} |
-    CL(LTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.LESS_OR_EQUAL, left, right)} |
-    CL(GTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.GREATER_EQUAL, left, right)} |
-    CL(LT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.LESS_THAN, left, right)} |
-    CL(GT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.GREATER_THAN, left, right)}
+    (% <~ CL(EQEQ)) ^^ {location => (left:AstNode, right:AstNode) => BinaryExpression(location, Operator.EQUAL, left, right)} |
+    (% <~ CL(LTE)) ^^ {location => (left:AstNode, right:AstNode) => BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right)} |
+    (% <~ CL(GTE)) ^^ {location => (left:AstNode, right:AstNode) => BinaryExpression(location, Operator.GREATER_EQUAL, left, right)} |
+    (% <~ CL(LT)) ^^ {location => (left:AstNode, right:AstNode) => BinaryExpression(location, Operator.LESS_THAN, left, right)} |
+    (% <~ CL(GT)) ^^ {location => (left:AstNode, right:AstNode) => BinaryExpression(location, Operator.GREATER_THAN, left, right)}
   )
 
 
   //add ::= term {"+" term | "-" term}
   def add: Parser[AstNode] = chainl1(term,
-    CL(PLUS) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.ADD, left, right)}|
-    CL(MINUS) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.SUBTRACT, left, right)})
+    (% <~ CL(PLUS)) ^^ {location => (left:AstNode, right:AstNode) => BinaryExpression(location, Operator.ADD, left, right)}|
+    (% <~ CL(MINUS)) ^^ {location => (left:AstNode, right:AstNode) => BinaryExpression(location, Operator.SUBTRACT, left, right)})
 
   //term ::= factor {"*" factor | "/" factor}
   def term : Parser[AstNode] = chainl1(unary,
-    CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.MULTIPLY, left, right)}|
-    CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.DIVIDE, left, right)})
+    (% <~ CL(ASTER)) ^^ {location => (left:AstNode, right:AstNode) => BinaryExpression(location, Operator.MULTIPLY, left, right)}|
+    (% <~ CL(SLASH)) ^^ {location => (left:AstNode, right:AstNode) => BinaryExpression(location, Operator.DIVIDE, left, right)})
 
   def unary: Parser[AstNode] = (
-    CL(MINUS) ~ unary ^^ { case _ ~ operand => MinusOp(NoLocation, operand) }
-  | CL(PLUS) ~ unary ^^ { case _ ~ operand => PlusOp(NoLocation, operand) }
+    % ~ CL(MINUS) ~ unary ^^ { case location ~ _ ~ operand => MinusOp(location, operand) }
+  | % ~ CL(PLUS) ~ unary ^^ { case location ~ _ ~ operand => PlusOp(location, operand) }
   | invocation
   )
 
-  def invocation: Parser[AstNode] = application ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
-    case self ~ Nil =>
+  def invocation: Parser[AstNode] = % ~ application ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
+    case location ~ self ~ Nil =>
       self
-    case self ~ npList  =>
-      npList.foldLeft(self){case (self, name ~ params) => MethodCall(NoLocation, self, name.name, params.getOrElse(Nil))}
+    case location ~ self ~ npList  =>
+      npList.foldLeft(self){case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil))}
   }
 
-  def application: Parser[AstNode] = primary ~ opt(CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN))^^ {
-    case fac ~ param => {
+  def application: Parser[AstNode] = % ~ primary ~ opt(CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN))^^ {
+    case location ~ fac ~ param => {
       param match {
         case Some(p) =>
-          FunctionCall(NoLocation, fac, p)
+          FunctionCall(location, fac, p)
         case None =>
           fac
       }
@@ -190,34 +190,44 @@ class Parser extends RegexParsers {
   }
 
   //primary ::= intLiteral | stringLiteral | listLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AstNode] = ident | floatLiteral | integerLiteral | stringLiteral | listLiteral | newObject | anonFun | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
+  def primary: Parser[AstNode] = ident | floatLiteral | integerLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
-  def integerLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r ~ opt("BY"| "L" | "S") ^^ {
-    case value ~ None => IntNode(NoLocation, value.toLong.toInt)
-    case value ~ Some("L") => LongNode(NoLocation, value.toLong)
-    case value ~ Some("S") => ShortNode(NoLocation, value.toShort)
-    case value ~ Some("BY") => ByteNode(NoLocation, value.toByte)
+  def integerLiteral : Parser[AstNode] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY"| "L" | "S") ^^ {
+    case location ~ value ~ None => IntNode(location, value.toLong.toInt)
+    case location ~ value ~ Some("L") => LongNode(location, value.toLong)
+    case location ~ value ~ Some("S") => ShortNode(location, value.toShort)
+    case location ~ value ~ Some("BY") => ByteNode(location, value.toByte)
   }) <~ SPACING_WITHOUT_LF
 
-  def floatLiteral: Parser[AstNode]= "([1-9][0-9]*|0)\\.[0-9]*".r ~ opt("F") ^^ {
-    case value ~ None => DoubleNode(NoLocation, value.toDouble)
-    case value ~ Some("F") => FloatNode(NoLocation, value.toFloat)
+  def floatLiteral: Parser[AstNode]= (% ~ "([1-9][0-9]*|0)\\.[0-9]*".r ~ opt("F")) ^^ {
+    case location ~ value ~ None => DoubleNode(location, value.toDouble)
+    case location ~ value ~ Some("F") => FloatNode(location, value.toFloat)
   }
 
-  def booleanLiteral: Parser[AstNode] = (TRUE | FALSE) ^^ {
-    case "true" => BooleanNode(NoLocation, true)
-    case "false" => BooleanNode(NoLocation, false)
+  def booleanLiteral: Parser[AstNode] = % ~ (TRUE | FALSE) ^^ {
+    case location ~ "true" => BooleanNode(location, true)
+    case location ~ "false" => BooleanNode(location, false)
   }
 
   //stringLiteral ::= "\"" ((?!")(\[rntfb"'\\]|[^\\]))* "\""
-  def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {in => StringNode(NoLocation, unescape(in))} | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
-    values.foldLeft(StringNode(NoLocation, ""):AstNode) { (node, content) => BinaryExpression(NoLocation, Operator.ADD, node, content) }
+  def stringLiteral : Parser[AstNode] =
+    ("\"" ~>
+      (% ~ """((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {case location ~ in =>
+        StringNode(location, unescape(in))
+      } | "#{" ~> expression <~ "}"
+      ).*
+    <~ "\"" ^^ { values =>
+    values.foldLeft(StringNode(NoLocation, ""):AstNode) { (node, content) => BinaryExpression(content.location, Operator.ADD, node, content) }
   }) <~ SPACING_WITHOUT_LF
 
-  def listLiteral: Parser[AstNode] = CL(LBRACKET) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET ^^ {case contents => ListLiteral(NoLocation, contents)}
+  def listLiteral: Parser[AstNode] = % ~ (CL(LBRACKET) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET) ^^ {
+    case location ~ contents => ListLiteral(location, contents)
+  }
 
-  def fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ { case id ~ ids => ids.foldLeft(id.name){ case (a, d ~ e) => a + d + e.name} }
+  def fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ {
+    case id ~ ids => ids.foldLeft(id.name){ case (a, d ~ e) => a + d + e.name}
+  }
 
   def rebuild(a: Reader[Char], newSource: String, newOffset: Int): Reader[Char] = new Reader[Char] {
     def atEnd = a.atEnd
@@ -286,41 +296,41 @@ class Parser extends RegexParsers {
     }
   }) <~ SPACING_WITHOUT_LF
 
-  def ident :Parser[Identifier] = ("""[A-Za-z_][a-zA-Z0-9]*""".r^? {
-    case n if !KEYWORDS(n) => n
-  } ^^ {case name => Identifier(NoLocation, name)}) <~ SPACING_WITHOUT_LF
+  def ident :Parser[Identifier] = (% ~ """[A-Za-z_][a-zA-Z0-9]*""".r^? {
+    case r@(_ ~ n) if !KEYWORDS(n) => r
+  } ^^ {case location ~ name => Identifier(location, name)}) <~ SPACING_WITHOUT_LF
 
   def assignment: Parser[Assignment] = (ident <~ CL(EQ)) ~ expression ^^ {
-    case v ~ value => Assignment(NoLocation, v.name, value)
+    case v ~ value => Assignment(v.location, v.name, value)
   }
 
   // val_declaration ::= "val" ident "=" expression
-  def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
-    case valName ~ optionalType ~ value => ValDeclaration(NoLocation, valName.name, optionalType, value)
+  def val_declaration:Parser[ValDeclaration] = ((% <~ CL(VAL)) ~ ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
+    case location ~ valName ~ optionalType ~ value => ValDeclaration(location, valName.name, optionalType, value)
   }
 
-  // anonFun ::= "(" [param {"," param}] ")" "=>" expression
-  def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
-    case Some(params) ~ body =>
+  // anonnymousFunction ::= "(" [param {"," param}] ")" "=>" expression
+  def anonymousFunction():Parser[AstNode] = % ~ (opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
+    case location ~ Some(params) ~ body =>
       FunctionLiteral(
-        NoLocation,
+        location,
         params.map {
           case name ~ Some(description) => FormalParameter(name.name, description)
           case name ~ None => FormalParameter(name.name)
         }, body
       )
-    case None ~ body => FunctionLiteral(NoLocation, List(), body)
+    case location ~ None ~ body => FunctionLiteral(location, List(), body)
   }
 
   // newObject ::= "new" fqcn "(" [param {"," param} ")"
-  def newObject: Parser[AstNode] = CL(NEW) ~> fqcn ~ (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ (RPAREN))) ^^ {
-    case className ~ Some(params) => NewObject(NoLocation, className, params)
-    case className ~ None => NewObject(NoLocation, className, List())
+  def newObject: Parser[AstNode] = (% <~ CL(NEW)) ~ fqcn ~ (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ (RPAREN))) ^^ {
+    case location ~ className ~ Some(params) => NewObject(location, className, params)
+    case location ~ className ~ None => NewObject(location, className, List())
   }
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
-  def functionDefinition:Parser[FunctionDefinition] = CL(DEF) ~> ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ opt(typeAnnotation) ~ CL(EQ) ~ expression ^^ {
-    case functionName ~ params ~ _ ~ optionalType ~ body =>
+  def functionDefinition:Parser[FunctionDefinition] = (% <~ CL(DEF)) ~ ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ opt(typeAnnotation) ~ CL(EQ) ~ expression ^^ {
+    case location ~ functionName ~ params ~ _ ~ optionalType ~ body =>
       val ps = params match {
         case Some(xs) =>
           xs.map{
@@ -330,9 +340,9 @@ class Parser extends RegexParsers {
         case None => Nil
       }
       FunctionDefinition(
-        NoLocation,
+        location,
         functionName.name,
-        FunctionLiteral(NoLocation, ps, body)
+        FunctionLiteral(body.location, ps, body)
       )
   }
 
