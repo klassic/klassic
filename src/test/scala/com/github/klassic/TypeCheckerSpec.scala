@@ -53,5 +53,42 @@ class TypeCheckerSpec extends SpecHelper {
       println(e)
     }
   }
+
+  describe("valid foreach expression") {
+    val expectations: List[(String, (Value, TypeDescription))] = List(
+      """
+        |val a = 1
+        |foreach(b in [1, 2, 3]) {
+        |  b + 3
+        |}
+      """.stripMargin -> (UnitValue, UnitType)
+    )
+
+    expectations.zipWithIndex.foreach { case ((in, expected), i) =>
+      it(s"expectation  ${i}") {
+        assert(expected == I.evaluateString(in))
+      }
+    }
+  }
+
+  describe("invalid foreach expression") {
+    val illTypedPrograms: List[String] = List(
+      """
+        |val a = 1
+        |foreach(a in [1, 2, 3]) {
+        |  b + 3
+        |}
+      """.stripMargin
+    )
+    illTypedPrograms.zipWithIndex.foreach { case (in, i) =>
+      it(s"expectation  ${i}") {
+        val e = intercept[InterpreterException] {
+          I.evaluateString(in)
+        }
+        println(e)
+      }
+    }
+  }
+
 }
 
