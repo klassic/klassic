@@ -69,7 +69,7 @@ class TypeChecker {
         }
       case ValDeclaration(location, variable, optVariableType, value) =>
         if(environment.variables.contains(variable)) {
-          throw new InterruptedException(s"variable ${variable} is already defined")
+          throw InterpreterException(s"variable ${variable} is already defined")
         }
         val valueType = typeCheck(value, environment)
         optVariableType match {
@@ -83,7 +83,17 @@ class TypeChecker {
             environment.variables(variable) = valueType
         }
         UnitType
-      case ForeachExpression(location, name, collection, body) => ???
+      case ForeachExpression(location, variable, collection, body) =>
+        val collectionType = typeCheck(collection, environment)
+        if(!isAssignableFrom(collectionType, DynamicType)) {
+          throw InterpreterException(s"expression should be DynamicType")
+        }
+        if(environment.variables.contains(variable)) {
+          throw InterpreterException(s"variable ${variable} is already defined")
+        }
+        environment.variables(variable) = DynamicType
+        typeCheck(body, environment)
+        UnitType
       case WhileExpression(location, condition, body) =>
         val conditionType = typeCheck(condition, environment)
         if(conditionType != BooleanType) {
