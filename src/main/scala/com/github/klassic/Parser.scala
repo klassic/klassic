@@ -127,47 +127,47 @@ class Parser extends RegexParsers {
 
   //if ::= "if" "(" expression ")" expression "else" expression
   def ifExpression: Parser[AstNode] = CL(IF) ~ CL(LPAREN) ~> expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression ^^ {
-    case condition ~ _ ~ positive ~ _ ~ negative => IfExpression(condition, positive, negative)
+    case condition ~ _ ~ positive ~ _ ~ negative => IfExpression(NoLocation, condition, positive, negative)
   }
 
   //while ::= "while" "(" expression ")" expression
   def whileExpression: Parser[AstNode] = (CL(WHILE) ~ CL(LPAREN)) ~> expression ~ (CL(RPAREN) ~> expression) ^^ {
-    case condition ~  body => WhileExpression(condition, body)
+    case condition ~  body => WhileExpression(NoLocation, condition, body)
   }
 
   //foreach ::= "foreach" "(" ident "in" expression ")" expression
   def foreachExpression: Parser[AstNode] = ((CL(FOREACH) ~> CL(LPAREN)) ~> (CL(ident) <~ CL(IN)) ~ expression <~ CL(RPAREN)) ~ expression ^^ {
-    case variable ~ collection ~ body => ForeachExpression(variable.name, collection, body)
+    case variable ~ collection ~ body => ForeachExpression(NoLocation, variable.name, collection, body)
   }
 
   def logical: Parser[AstNode] = chainl1(conditional,
-    CL(AMP2) ^^ {op => (lhs: AstNode, rhs: AstNode) => BinaryExpression(Operator.AND2, lhs, rhs)} |
-    CL(BAR2) ^^ {op => (lhs: AstNode, rhs: AstNode) => BinaryExpression(Operator.BAR2, lhs, rhs)}
+    CL(AMP2) ^^ {op => (lhs: AstNode, rhs: AstNode) => BinaryExpression(NoLocation, Operator.AND2, lhs, rhs)} |
+    CL(BAR2) ^^ {op => (lhs: AstNode, rhs: AstNode) => BinaryExpression(NoLocation, Operator.BAR2, lhs, rhs)}
   )
 
   //conditional ::= add {"<" add | ">" add | "<=" add | ">=" add}
   def conditional: Parser[AstNode] = chainl1(add,
-    CL(EQEQ) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.EQUAL, left, right)} |
-    CL(LTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.LESS_OR_EQUAL, left, right)} |
-    CL(GTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.GREATER_EQUAL, left, right)} |
-    CL(LT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.LESS_THAN, left, right)} |
-    CL(GT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.GREATER_THAN, left, right)}
+    CL(EQEQ) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.EQUAL, left, right)} |
+    CL(LTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.LESS_OR_EQUAL, left, right)} |
+    CL(GTE) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.GREATER_EQUAL, left, right)} |
+    CL(LT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.LESS_THAN, left, right)} |
+    CL(GT) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.GREATER_THAN, left, right)}
   )
 
 
   //add ::= term {"+" term | "-" term}
   def add: Parser[AstNode] = chainl1(term,
-    CL(PLUS) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.ADD, left, right)}|
-    CL(MINUS) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.SUBTRACT, left, right)})
+    CL(PLUS) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.ADD, left, right)}|
+    CL(MINUS) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.SUBTRACT, left, right)})
 
   //term ::= factor {"*" factor | "/" factor}
   def term : Parser[AstNode] = chainl1(unary,
-    CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.MULTIPLY, left, right)}|
-    CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(Operator.DIVIDE, left, right)})
+    CL(ASTER) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.MULTIPLY, left, right)}|
+    CL(SLASH) ^^ {op => (left:AstNode, right:AstNode) => BinaryExpression(NoLocation, Operator.DIVIDE, left, right)})
 
   def unary: Parser[AstNode] = (
-    CL(MINUS) ~ unary ^^ { case _ ~ operand => MinusOp(operand) }
-  | CL(PLUS) ~ unary ^^ { case _ ~ operand => PlusOp(operand) }
+    CL(MINUS) ~ unary ^^ { case _ ~ operand => MinusOp(NoLocation, operand) }
+  | CL(PLUS) ~ unary ^^ { case _ ~ operand => PlusOp(NoLocation, operand) }
   | invocation
   )
 
@@ -175,14 +175,14 @@ class Parser extends RegexParsers {
     case self ~ Nil =>
       self
     case self ~ npList  =>
-      npList.foldLeft(self){case (self, name ~ params) => MethodCall(self, name.name, params.getOrElse(Nil))}
+      npList.foldLeft(self){case (self, name ~ params) => MethodCall(NoLocation, self, name.name, params.getOrElse(Nil))}
   }
 
   def application: Parser[AstNode] = primary ~ opt(CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN))^^ {
     case fac ~ param => {
       param match {
         case Some(p) =>
-          FunctionCall(fac, p)
+          FunctionCall(NoLocation, fac, p)
         case None =>
           fac
       }
@@ -194,28 +194,28 @@ class Parser extends RegexParsers {
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def integerLiteral : Parser[AstNode] = ("""[1-9][0-9]*|0""".r ~ opt("BY"| "L" | "S") ^^ {
-    case value ~ None => IntNode(value.toLong.toInt)
-    case value ~ Some("L") => LongNode(value.toLong)
-    case value ~ Some("S") => ShortNode(value.toShort)
-    case value ~ Some("BY") => ByteNode(value.toByte)
+    case value ~ None => IntNode(NoLocation, value.toLong.toInt)
+    case value ~ Some("L") => LongNode(NoLocation, value.toLong)
+    case value ~ Some("S") => ShortNode(NoLocation, value.toShort)
+    case value ~ Some("BY") => ByteNode(NoLocation, value.toByte)
   }) <~ SPACING_WITHOUT_LF
 
   def floatLiteral: Parser[AstNode]= "([1-9][0-9]*|0)\\.[0-9]*".r ~ opt("F") ^^ {
-    case value ~ None => DoubleNode(value.toDouble)
-    case value ~ Some("F") => FloatNode(value.toFloat)
+    case value ~ None => DoubleNode(NoLocation, value.toDouble)
+    case value ~ Some("F") => FloatNode(NoLocation, value.toFloat)
   }
 
   def booleanLiteral: Parser[AstNode] = (TRUE | FALSE) ^^ {
-    case "true" => BooleanNode(true)
-    case "false" => BooleanNode(false)
+    case "true" => BooleanNode(NoLocation, true)
+    case "false" => BooleanNode(NoLocation, false)
   }
 
   //stringLiteral ::= "\"" ((?!")(\[rntfb"'\\]|[^\\]))* "\""
-  def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {in => StringNode(unescape(in))} | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
-    values.foldLeft(StringNode(""):AstNode) { (node, content) => BinaryExpression(Operator.ADD, node, content) }
+  def stringLiteral : Parser[AstNode] = ("\""~> ("""((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {in => StringNode(NoLocation, unescape(in))} | "#{" ~> expression <~ "}").*  <~ "\"" ^^ { values =>
+    values.foldLeft(StringNode(NoLocation, ""):AstNode) { (node, content) => BinaryExpression(NoLocation, Operator.ADD, node, content) }
   }) <~ SPACING_WITHOUT_LF
 
-  def listLiteral: Parser[AstNode] = CL(LBRACKET) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET ^^ ListLiteral
+  def listLiteral: Parser[AstNode] = CL(LBRACKET) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET ^^ {case contents => ListLiteral(NoLocation, contents)}
 
   def fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ { case id ~ ids => ids.foldLeft(id.name){ case (a, d ~ e) => a + d + e.name} }
 
@@ -256,7 +256,7 @@ class Parser extends RegexParsers {
       hereDocumentBody(tag).apply(rest) match {
         case Success(value, next) =>
           val source = cat(line, next)
-          Success(StringNode(value), source)
+          Success(StringNode(NoLocation, value), source)
         case Failure(msg, next) => Failure(msg, cat(line, next))
         case Error(msg, next) => Error(msg, cat(line, next))
       }
@@ -288,33 +288,34 @@ class Parser extends RegexParsers {
 
   def ident :Parser[Identifier] = ("""[A-Za-z_][a-zA-Z0-9]*""".r^? {
     case n if !KEYWORDS(n) => n
-  } ^^ Identifier) <~ SPACING_WITHOUT_LF
+  } ^^ {case name => Identifier(NoLocation, name)}) <~ SPACING_WITHOUT_LF
 
   def assignment: Parser[Assignment] = (ident <~ CL(EQ)) ~ expression ^^ {
-    case v ~ value => Assignment(v.name, value)
+    case v ~ value => Assignment(NoLocation, v.name, value)
   }
 
   // val_declaration ::= "val" ident "=" expression
   def val_declaration:Parser[ValDeclaration] = (CL(VAL) ~> ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
-    case valName ~ optionalType ~ value => ValDeclaration(valName.name, optionalType, value)
+    case valName ~ optionalType ~ value => ValDeclaration(NoLocation, valName.name, optionalType, value)
   }
 
   // anonFun ::= "(" [param {"," param}] ")" "=>" expression
   def anonFun:Parser[AstNode] = (opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
     case Some(params) ~ body =>
       FunctionLiteral(
+        NoLocation,
         params.map {
           case name ~ Some(description) => FormalParameter(name.name, description)
           case name ~ None => FormalParameter(name.name)
         }, body
       )
-    case None ~ body => FunctionLiteral(List(), body)
+    case None ~ body => FunctionLiteral(NoLocation, List(), body)
   }
 
   // newObject ::= "new" fqcn "(" [param {"," param} ")"
   def newObject: Parser[AstNode] = CL(NEW) ~> fqcn ~ (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ (RPAREN))) ^^ {
-    case className ~ Some(params) => NewObject(className, params)
-    case className ~ None => NewObject(className, List())
+    case className ~ Some(params) => NewObject(NoLocation, className, params)
+    case className ~ None => NewObject(NoLocation, className, List())
   }
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
@@ -329,8 +330,9 @@ class Parser extends RegexParsers {
         case None => Nil
       }
       FunctionDefinition(
+        NoLocation,
         functionName.name,
-        FunctionLiteral(ps, body)
+        FunctionLiteral(NoLocation, ps, body)
       )
   }
 
