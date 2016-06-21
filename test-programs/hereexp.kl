@@ -1,5 +1,0 @@
-println(<<$EXP1 * <<$EXP2);
-1 + 2
-EXP1
-3 + 4
-EXP2

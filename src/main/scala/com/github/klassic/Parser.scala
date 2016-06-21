@@ -1,7 +1,7 @@
 package com.github.klassic
 
 import scala.util.parsing.combinator.RegexParsers
-import scala.util.parsing.input.{CharSequenceReader, Reader, Position}
+import scala.util.parsing.input.{CharSequenceReader, Position, Reader}
 import com.github.klassic.AstNode._
 import com.github.klassic.TypeDescription._
 
@@ -79,6 +79,7 @@ class Parser extends RegexParsers {
   lazy val ELSE    : Parser[String] = token("else")
   lazy val WHILE   : Parser[String] = token("while")
   lazy val FOREACH : Parser[String] = token("foreach")
+  lazy val IMPORT  : Parser[String] = token("import")
   lazy val TRUE    : Parser[String] = token("true")
   lazy val FALSE   : Parser[String] = token("false")
   lazy val IN      : Parser[String] = token("in")
@@ -97,7 +98,7 @@ class Parser extends RegexParsers {
   lazy val BAR2    : Parser[String] = token("||")
   lazy val KEYWORDS: Set[String]     = Set(
     "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
-    "if", "else", "while", "foreach", "true", "false", "in", ",", ".",
+    "if", "else", "while", "foreach", "import", "true", "false", "in", ",", ".",
     "class", "def", "val", "=", "==", "=>", "new", "&&", "||"
   )
 
@@ -114,8 +115,17 @@ class Parser extends RegexParsers {
   | token("*") ^^ {_ => DynamicType}
   )
 
+  def program: Parser[Program] = (SPACING ~> %) ~ repsep(`import`, TERMINATOR) ~ (lines <~ opt(TERMINATOR)) ^^ {
+    case location ~ imports ~ block => Program(location, imports, block)
+  }
+
+  def `import`: Parser[Import] = (% <~ CL(IMPORT)) ~ fqcn ^^ { case location ~ fqcn =>
+    val fragments = fqcn.split(".")
+    Import(location, fragments(fragments.length - 1), fqcn)
+  }
+
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
-  def lines: Parser[AstNode] = SPACING ~> (% ~ repsep(line, TERMINATOR)) <~ opt(TERMINATOR) ^^{ case location ~ expressions =>
+  def lines: Parser[Block] = SPACING ~> (% ~ repsep(line, TERMINATOR)) <~ opt(TERMINATOR) ^^ { case location ~ expressions =>
       Block(location, expressions)
   }
 
@@ -190,7 +200,7 @@ class Parser extends RegexParsers {
   }
 
   //primary ::= intLiteral | stringLiteral | listLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AstNode] = ident | floatLiteral | integerLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument | hereExpression
+  def primary: Parser[AstNode] = ident | floatLiteral | integerLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def integerLiteral : Parser[AstNode] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY"| "L" | "S") ^^ {
@@ -278,23 +288,6 @@ class Parser extends RegexParsers {
       line + result
     }
   }
-
-  lazy val hereExpression: Parser[AstNode] = ("""<<\$[a-zA-Z_][a-zA-Z0-9_]*""".r >> { t =>
-    val tag = t.substring(3)
-    Parser{in =>
-      val Success(temp, rest) = oneLine(in)
-
-      val line = new CharSequenceReader(temp, 0)
-      hereDocumentBody(tag).apply(rest) match {
-        case Success(value, next) =>
-          val Success(ast, _) = lines(new CharSequenceReader(value, 0))
-          val source = cat(line, next)
-          Success(ast, source)
-        case Failure(msg, next) => Failure(msg, cat(line, next))
-        case Error(msg, next) => Error(msg, cat(line, next))
-      }
-    }
-  }) <~ SPACING_WITHOUT_LF
 
   def ident :Parser[Identifier] = (% ~ """[A-Za-z_][a-zA-Z0-9]*""".r^? {
     case r@(_ ~ n) if !KEYWORDS(n) => r
