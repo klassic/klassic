@@ -25,7 +25,7 @@ object AstNode {
 
   case class Block(val location: Location, expressions: List[AstNode]) extends AstNode
 
-  case class IfExpression(val location: Location, cond: AstNode, pos: AstNode, neg: AstNode) extends AstNode
+  case class IfExpression(val location: Location, condition: AstNode, thenExpression: AstNode, elseExpression: AstNode) extends AstNode
 
   case class ForeachExpression(val location: Location, name: String, collection: AstNode, body: AstNode) extends AstNode
 
