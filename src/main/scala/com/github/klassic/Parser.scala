@@ -65,6 +65,7 @@ class Parser extends RegexParsers {
   lazy val GT      : Parser[String] = token(">")
   lazy val LTE     : Parser[String] = token("<=")
   lazy val GTE     : Parser[String] = token(">=")
+  lazy val MAP_OPEN: Parser[String] = token("%[")
   lazy val PLUS    : Parser[String] = token("+")
   lazy val MINUS   : Parser[String] = token("-")
   lazy val ASTER   : Parser[String] = token("*")
@@ -199,8 +200,8 @@ class Parser extends RegexParsers {
     }
   }
 
-  //primary ::= intLiteral | stringLiteral | listLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AstNode] = ident | floatLiteral | integerLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
+  //primary ::= ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | "(" expression ")" | "{" lines "}"
+  def primary: Parser[AstNode] = ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def integerLiteral : Parser[AstNode] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY"| "L" | "S") ^^ {
@@ -233,6 +234,10 @@ class Parser extends RegexParsers {
 
   def listLiteral: Parser[AstNode] = % ~ (CL(LBRACKET) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET) ^^ {
     case location ~ contents => ListLiteral(location, contents)
+  }
+
+  def mapLiteral: Parser[AstNode] = % ~ (CL(MAP_OPEN) ~> (repsep(CL(expression ~ COLON ~ expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET) ^^ {
+    case location ~ contents => MapLiteral(location, contents.map {case k ~ colon ~ v => (k, v)})
   }
 
   def fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ {
