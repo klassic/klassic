@@ -67,6 +67,8 @@ object AstNode {
 
   case class ListLiteral(val location: Location, elements: List[AstNode]) extends AstNode
 
+  case class MapLiteral(val location: Location, elements: List[(AstNode, AstNode)]) extends AstNode
+
   case class NewObject(val location: Location, className: String, params: List[AstNode]) extends AstNode
 
   case class MethodCall(val location: Location, self: AstNode, name: String, params: List[AstNode]) extends AstNode
