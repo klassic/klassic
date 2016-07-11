@@ -166,6 +166,8 @@ class Interpreter {evaluator =>
   def evaluate(node: AstNode): Value = evaluate(BuiltinEnvironment, node)
   def evaluate(env:Environment, node: AstNode): Value = {
     def rewrite(node: AstNode): AstNode = node match {
+      case Program(location, imports, block) => sys.error("cannot reach here")
+      case Import(_, _, _) => sys.error("cannot reach here")
       case Block(location, expressions) => Block(location, expressions.map{rewrite})
       case IfExpression(location, cond, pos, neg) =>
         IfExpression(location, rewrite(cond), rewrite(pos), rewrite(neg))
@@ -209,6 +211,7 @@ class Interpreter {evaluator =>
       case FunctionDefinition(location, name, func) => FunctionDefinition(location, name, rewrite(func).asInstanceOf[FunctionLiteral])
       case FunctionCall(location, func, params) => FunctionCall(location, rewrite(func), params.map{rewrite})
       case ListLiteral(location, elements) =>  ListLiteral(location, elements.map{rewrite})
+      case MapLiteral(location, elements) => MapLiteral(location, elements.map{ case (k, v) => (rewrite(k), rewrite(v))})
       case NewObject(location, className, params) => NewObject(location, className, params.map{rewrite})
       case MethodCall(location ,self, name, params) => MethodCall(location, rewrite(self), name, params.map{rewrite})
     }
@@ -379,6 +382,15 @@ class Interpreter {evaluator =>
             newList.add(param)
           }
           ObjectValue(newList)
+        case MapLiteral(location, elements) =>
+          val params = elements.map{ case (k, v) =>
+            (Value.fromKlassic(evalRecursive(k)), Value.fromKlassic(evalRecursive(v)))
+          }
+          val newMap = new java.util.HashMap[Any, Any]
+          params.foreach{ case (k, v) =>
+             newMap.put(k, v)
+          }
+          ObjectValue(newMap)
         case Identifier(location, name) => env(name)
         case ValDeclaration(location, vr, optVariableType, value) =>
           env(vr) = evalRecursive(value)

@@ -265,6 +265,12 @@ class TypeChecker {
       case ListLiteral(location, elements) =>
         elements.foreach(e => typeCheck(e, environment))
         DynamicType
+      case MapLiteral(location, elements) =>
+        elements.foreach { case (k, v) =>
+            typeCheck(k, environment)
+            typeCheck(v, environment)
+        }
+        DynamicType
       case NewObject(location, className, params) =>
         params.foreach(p => typeCheck(p, environment))
         DynamicType
