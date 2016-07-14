@@ -177,7 +177,7 @@ class Interpreter {evaluator =>
         val itVariable = symbol()
         val location = e.location
         Block(location, List(
-          ValDeclaration(location, itVariable, None, MethodCall(location, rewrite(collection), "iterator", List())),
+          ValDeclaration(location, itVariable, None, MethodCall(location, rewrite(collection), "iterator", List()), false),
           WhileExpression(
             location,
             BinaryExpression(
@@ -187,7 +187,7 @@ class Interpreter {evaluator =>
               BooleanNode(location, true)
             ),
             Block(location, List(
-              ValDeclaration(location, name, None, MethodCall(location, Identifier(location, itVariable), "next", List())),
+              ValDeclaration(location, name, None, MethodCall(location, Identifier(location, itVariable), "next", List()), false),
               body
             ))
           )
@@ -206,7 +206,7 @@ class Interpreter {evaluator =>
       case literal@FloatNode(lcation, value) => literal
       case node@Identifier(_, name) => node
       case Assignment(location, variable, value) => Assignment(location, variable, rewrite(value))
-      case ValDeclaration(location, variable, optionalType, value) => ValDeclaration(location, variable, optionalType, rewrite(value))
+      case ValDeclaration(location, variable, optionalType, value, immutable) => ValDeclaration(location, variable, optionalType, rewrite(value), immutable)
       case FunctionLiteral(location, params, proc) => FunctionLiteral(location, params, rewrite(proc))
       case FunctionDefinition(location, name, func) => FunctionDefinition(location, name, rewrite(func).asInstanceOf[FunctionLiteral])
       case FunctionCall(location, func, params) => FunctionCall(location, rewrite(func), params.map{rewrite})
@@ -392,7 +392,7 @@ class Interpreter {evaluator =>
           }
           ObjectValue(newMap)
         case Identifier(location, name) => env(name)
-        case ValDeclaration(location, vr, optVariableType, value) =>
+        case ValDeclaration(location, vr, optVariableType, value, immutable) =>
           env(vr) = evalRecursive(value)
         case Assignment(location, vr, value) =>
           env.set(vr, evalRecursive(value))

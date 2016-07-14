@@ -57,7 +57,7 @@ object AstNode {
 
   case class Assignment(val location: Location, variable: String, value: AstNode) extends AstNode
 
-  case class ValDeclaration(val location: Location, variable: String, description: Option[TypeDescription], value: AstNode) extends AstNode
+  case class ValDeclaration(val location: Location, variable: String, description: Option[TypeDescription], value: AstNode, immutable: Boolean) extends AstNode
 
   case class FunctionLiteral(val location: Location, params: List[FormalParameter], proc: AstNode) extends AstNode
 
