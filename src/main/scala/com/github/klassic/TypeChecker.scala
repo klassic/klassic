@@ -20,7 +20,7 @@ class TypeChecker {
     }
   }
   def typed(node: AstNode): TypeDescription = {
-    typeCheck(node, TypeEnvironment(mutable.Map.empty, None))
+    typeCheck(node, TypeEnvironment(mutable.Map.empty, mutable.Set.empty, None))
   }
   def typeCheck(node: AstNode, environment : TypeEnvironment): TypeDescription = {
     node match {
@@ -237,7 +237,8 @@ class TypeChecker {
         }
       case FunctionLiteral(location, params, proc) =>
         val paramsMap = mutable.Map(params.map{p => p.name -> p.description}:_*)
-        val newEnvironment = TypeEnvironment(paramsMap, Some(environment))
+        val paramsSet = mutable.Set(params.map{_.name}:_*)
+        val newEnvironment = TypeEnvironment(paramsMap, paramsSet, Some(environment))
         val paramTypes = params.map{_.description}
         val returnType = typeCheck(proc, newEnvironment)
         FunctionType(paramTypes, returnType)
