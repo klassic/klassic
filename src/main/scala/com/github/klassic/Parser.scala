@@ -304,8 +304,8 @@ class Parser extends RegexParsers {
   }
 
   // val_declaration ::= "val" ident "=" expression
-  def val_declaration:Parser[ValDeclaration] = ((% <~ CL(MUTABLE | VAL)) ~ ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
-    case location ~ valName ~ optionalType ~ value => ValDeclaration(location, valName.name, optionalType, value)
+  def val_declaration:Parser[ValDeclaration] = ((% ~ CL(MUTABLE ^^ {_ => false } | VAL ^^ {_ => true})) ~ ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
+    case location ~  immutable ~ valName ~ optionalType ~ value => ValDeclaration(location, valName.name, optionalType, value, immutable)
   }
 
   // anonnymousFunction ::= "(" [param {"," param}] ")" "=>" expression
