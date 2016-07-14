@@ -88,6 +88,7 @@ class Parser extends RegexParsers {
   lazy val DOT     : Parser[String] = token(".")
   lazy val CLASS   : Parser[String] = token("class")
   lazy val DEF     : Parser[String] = token("def")
+  lazy val MUTABLE : Parser[String] = token("mutable")
   lazy val VAL     : Parser[String] = token("val")
   lazy val EQ      : Parser[String] = token("=")
   lazy val EQEQ    : Parser[String] = token("==")
@@ -100,7 +101,7 @@ class Parser extends RegexParsers {
   lazy val KEYWORDS: Set[String]     = Set(
     "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
     "if", "else", "while", "foreach", "import", "true", "false", "in", ",", ".",
-    "class", "def", "val", "=", "==", "=>", "new", "&&", "||"
+    "class", "def", "val", "mutable", "=", "==", "=>", "new", "&&", "||"
   )
 
   def typeAnnotation: Parser[TypeDescription] = COLON ~> (
@@ -303,7 +304,7 @@ class Parser extends RegexParsers {
   }
 
   // val_declaration ::= "val" ident "=" expression
-  def val_declaration:Parser[ValDeclaration] = ((% <~ CL(VAL)) ~ ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
+  def val_declaration:Parser[ValDeclaration] = ((% <~ CL(MUTABLE | VAL)) ~ ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
     case location ~ valName ~ optionalType ~ value => ValDeclaration(location, valName.name, optionalType, value)
   }
 
