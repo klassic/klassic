@@ -166,8 +166,6 @@ class Interpreter {evaluator =>
   def evaluate(node: AstNode): Value = evaluate(BuiltinEnvironment, node)
   def evaluate(env:Environment, node: AstNode): Value = {
     def rewrite(node: AstNode): AstNode = node match {
-      case Program(location, imports, block) => sys.error("cannot reach here")
-      case Import(_, _, _) => sys.error("cannot reach here")
       case Block(location, expressions) => Block(location, expressions.map{rewrite})
       case IfExpression(location, cond, pos, neg) =>
         IfExpression(location, rewrite(cond), rewrite(pos), rewrite(neg))

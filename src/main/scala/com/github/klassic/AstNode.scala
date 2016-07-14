@@ -19,9 +19,9 @@ object AstNode {
     def format: String = s"? :"
   }
 
-  case class Program(val location: Location, imports: List[Import], block: Block) extends AstNode
+  case class Program(val location: Location, imports: List[Import], block: Block)
 
-  case class Import(val location: Location, simpleName: String, fqcn: String) extends AstNode
+  case class Import(val location: Location, simpleName: String, fqcn: String)
 
   case class Block(val location: Location, expressions: List[AstNode]) extends AstNode
 
