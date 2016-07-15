@@ -19,7 +19,7 @@ class TypeChecker {
       expectedType == actualType
     }
   }
-  def typed(node: AstNode): TypeDescription = {
+  def doType(node: AstNode): TypeDescription = {
     typeCheck(node, TypeEnvironment(mutable.Map.empty, mutable.Set.empty, None))
   }
   def typeCheck(node: AstNode, environment : TypeEnvironment): TypeDescription = {
