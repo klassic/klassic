@@ -15,12 +15,12 @@ class TypeCheckerSpec extends SpecHelper {
         |a
       """.stripMargin -> (BoxedInt(1), IntType),
       """
-        |val a=1
+        |mutable a=1
         |a = a + 1
         |a
       """.stripMargin -> (BoxedInt(2), IntType),
       """
-        |val s="FOO"
+        |mutable s="FOO"
         |s=s+s
         |s
       """.stripMargin -> (ObjectValue("FOOFOO"), DynamicType)
@@ -57,7 +57,8 @@ class TypeCheckerSpec extends SpecHelper {
   describe("valid foreach expression") {
     val expectations: List[(String, (Value, TypeDescription))] = List(
       """
-        |val a = 1
+        |mutable a = 1
+        |a = 2
         |foreach(b in [1, 2, 3]) {
         |  b + 3
         |}
@@ -78,6 +79,24 @@ class TypeCheckerSpec extends SpecHelper {
         |foreach(a in [1, 2, 3]) {
         |  b + 3
         |}
+      """.stripMargin
+    )
+    illTypedPrograms.zipWithIndex.foreach { case (in, i) =>
+      it(s"expectation  ${i}") {
+        val e = intercept[InterpreterException] {
+          I.evaluateString(in)
+        }
+        println(e)
+      }
+    }
+  }
+
+  describe("val channt change its value") {
+    val illTypedPrograms: List[String] = List(
+      """
+        |val a = 1
+        |a = 2
+        |a
       """.stripMargin
     )
     illTypedPrograms.zipWithIndex.foreach { case (in, i) =>
