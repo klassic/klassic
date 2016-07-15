@@ -154,7 +154,7 @@ class Interpreter {evaluator =>
     }
   }
 
-  def parse(program: String): AstNode = {
+  def doParse(program: String): AstNode = {
     val parser = new Parser
     parser.parse(program) match {
       case parser.Success(node: AstNode, _) => node
