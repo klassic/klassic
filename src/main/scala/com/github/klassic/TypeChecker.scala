@@ -39,6 +39,9 @@ class TypeChecker {
       case DoubleNode(_, _) => DoubleType
       case BooleanNode(_, _) => BooleanType
       case Assignment(location, variable, value) =>
+        if(environment.immutableVariables.contains(variable)) {
+          throw InterpreterException(s"variable ${variable} cannot change")
+        }
         val result = environment.lookup(variable) match {
           case None =>
             throw new InterpreterException(s"variable ${value} is not defined")
@@ -81,6 +84,9 @@ class TypeChecker {
             }
           case None =>
             environment.variables(variable) = valueType
+            if(immutable) {
+              environment.immutableVariables += variable
+            }
         }
         UnitType
       case ForeachExpression(location, variable, collection, body) =>
