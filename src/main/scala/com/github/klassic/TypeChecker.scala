@@ -40,7 +40,7 @@ class TypeChecker {
       case BooleanNode(_, _) => BooleanType
       case Assignment(location, variable, value) =>
         if(environment.immutableVariables.contains(variable)) {
-          throw InterpreterException(s"variable ${variable} cannot change")
+          throw InterpreterException(s"variable '${variable}' cannot change")
         }
         val result = environment.lookup(variable) match {
           case None =>
@@ -238,7 +238,7 @@ class TypeChecker {
         DynamicType
       case Identifier(location, name) =>
         environment.lookup(name) match {
-          case None => throw InterpreterException(s"${location.format} variable ${name} is not found")
+          case None => throw InterpreterException(s"${location.format} variable '${name}' is not found")
           case Some(description) => description
         }
       case FunctionLiteral(location, params, proc) =>
@@ -261,7 +261,7 @@ class TypeChecker {
         }
         val actualParamTypes = params.map(p => typeCheck(p, environment))
         if(funcType.paramTypes.length != actualParamTypes.length) {
-          throw InterpreterException(s"${location.format} expected length: ${funcType.paramTypes.length}, actual length: ${actualParamTypes.length}")
+          throw InterpreterException(s"${location.format} function arity mismatch: expected length: ${funcType.paramTypes.length}, actual length: ${actualParamTypes.length}")
         }
         funcType.paramTypes.zip(actualParamTypes).foreach { case (expectedType, actualType) =>
             if(!isAssignableFrom(expectedType, actualType)){

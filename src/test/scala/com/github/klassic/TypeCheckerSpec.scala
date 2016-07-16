@@ -109,5 +109,22 @@ class TypeCheckerSpec extends SpecHelper {
     }
   }
 
+  describe("function type doesn't match ") {
+    val illTypedPrograms: List[String] = List(
+      """
+        |def f(x, y) = x + y
+        |f(10)
+      """.stripMargin
+    )
+    illTypedPrograms.zipWithIndex.foreach { case (in, i) =>
+      it(s"expectation  ${i}") {
+        val e = intercept[InterpreterException] {
+          I.evaluateString(in)
+        }
+        println(e)
+      }
+    }
+  }
+
 }
 
