@@ -206,7 +206,7 @@ class Interpreter {evaluator =>
       case Assignment(location, variable, value) => Assignment(location, variable, rewrite(value))
       case ValDeclaration(location, variable, optionalType, value, immutable) => ValDeclaration(location, variable, optionalType, rewrite(value), immutable)
       case FunctionLiteral(location, params, proc) => FunctionLiteral(location, params, rewrite(proc))
-      case FunctionDefinition(location, name, func) => FunctionDefinition(location, name, rewrite(func).asInstanceOf[FunctionLiteral])
+      case FunctionDefinition(location, name, func, cleanup) => FunctionDefinition(location, name, rewrite(func).asInstanceOf[FunctionLiteral], cleanup.map(rewrite))
       case FunctionCall(location, func, params) => FunctionCall(location, rewrite(func), params.map{rewrite})
       case ListLiteral(location, elements) =>  ListLiteral(location, elements.map{rewrite})
       case MapLiteral(location, elements) => MapLiteral(location, elements.map{ case (k, v) => (rewrite(k), rewrite(v))})
@@ -395,9 +395,9 @@ class Interpreter {evaluator =>
         case Assignment(location, vr, value) =>
           env.set(vr, evalRecursive(value))
         case literal@FunctionLiteral(location, _, _) =>
-          FunctionValue(literal, Some(env))
-        case FunctionDefinition(location, name, func) =>
-          env(name) = FunctionValue(func, Some(env)): Value
+          FunctionValue(literal, None, Some(env))
+        case FunctionDefinition(location, name, func, cleanup) =>
+          env(name) = FunctionValue(func, cleanup, Some(env)): Value
         case MethodCall(location, self, name, params) =>
           evalRecursive(self) match {
             case ObjectValue(value) =>
@@ -429,12 +429,18 @@ class Interpreter {evaluator =>
           }
         case FunctionCall(location, func, params) =>
           evalRecursive(func) match{
-            case FunctionValue(FunctionLiteral(location, fparams, proc), cenv) =>
+            case FunctionValue(FunctionLiteral(location, fparams, proc), cleanup, cenv) =>
               val local = new Environment(cenv)
               (fparams zip params).foreach{ case (fp, ap) =>
                 local(fp.name) = evalRecursive(ap)
               }
-              evaluate(local, proc)
+              try {
+                evaluate(local, proc)
+              } finally {
+                cleanup.foreach { expression =>
+                  evaluate(local, expression)
+                }
+              }
             case NativeFunctionValue(body) =>
               val actualParams = params.map{evalRecursive(_)}
               if(body.isDefinedAt(actualParams)) {

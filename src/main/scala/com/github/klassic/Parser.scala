@@ -89,6 +89,7 @@ class Parser extends RegexParsers {
   lazy val CLASS   : Parser[String] = token("class")
   lazy val DEF     : Parser[String] = token("def")
   lazy val MUTABLE : Parser[String] = token("mutable")
+  lazy val CLEANUP : Parser[String] = token("cleanup")
   lazy val VAL     : Parser[String] = token("val")
   lazy val EQ      : Parser[String] = token("=")
   lazy val EQEQ    : Parser[String] = token("==")
@@ -100,7 +101,7 @@ class Parser extends RegexParsers {
   lazy val BAR2    : Parser[String] = token("||")
   lazy val KEYWORDS: Set[String]     = Set(
     "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
-    "if", "else", "while", "foreach", "import", "true", "false", "in", ",", ".",
+    "if", "else", "while", "foreach", "import", "cleanup", "true", "false", "in", ",", ".",
     "class", "def", "val", "mutable", "=", "==", "=>", "new", "&&", "||"
   )
 
@@ -328,8 +329,9 @@ class Parser extends RegexParsers {
   }
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
-  def functionDefinition:Parser[FunctionDefinition] = (% <~ CL(DEF)) ~ ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ opt(typeAnnotation) ~ CL(EQ) ~ expression ^^ {
-    case location ~ functionName ~ params ~ _ ~ optionalType ~ body =>
+  def functionDefinition:Parser[FunctionDefinition] =
+    (% <~ CL(DEF)) ~ ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ opt(typeAnnotation) ~ CL(EQ) ~ expression ~ opt(CL(CLEANUP) ~> expression) ^^ {
+    case location ~ functionName ~ params ~ _ ~ optionalType ~ body ~ cleanup =>
       val ps = params match {
         case Some(xs) =>
           xs.map{
@@ -341,7 +343,8 @@ class Parser extends RegexParsers {
       FunctionDefinition(
         location,
         functionName.name,
-        FunctionLiteral(body.location, ps, body)
+        FunctionLiteral(body.location, ps, body),
+        cleanup
       )
   }
 

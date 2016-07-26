@@ -248,7 +248,7 @@ class TypeChecker {
         val paramTypes = params.map{_.description}
         val returnType = typeCheck(proc, newEnvironment)
         FunctionType(paramTypes, returnType)
-      case FunctionDefinition(location, name, func) =>
+      case FunctionDefinition(location, name, func, cleanup) =>
         if(environment.variables.contains(name)) {
           throw new InterruptedException(s"${location.format} function ${name} is already defined")
         }
