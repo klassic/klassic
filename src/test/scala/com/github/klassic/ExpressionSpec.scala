@@ -129,6 +129,10 @@ class ExpressionSpec extends SpecHelper {
       """
          |def fact(n) = if(n < 2) 1 else (n * fact(n - 1))
          |fact(4)
+      """.stripMargin -> BoxedInt(24),
+      """
+         |def none() = 24 cleanup println("none")
+         |none()
       """.stripMargin -> BoxedInt(24)
     )
 

@@ -61,7 +61,7 @@ object AstNode {
 
   case class FunctionLiteral(val location: Location, params: List[FormalParameter], proc: AstNode) extends AstNode
 
-  case class FunctionDefinition(val location: Location, name: String, func: FunctionLiteral) extends AstNode
+  case class FunctionDefinition(val location: Location, name: String, func: FunctionLiteral, cleanup: Option[AstNode]) extends AstNode
 
   case class FunctionCall(val location: Location, func: AstNode, params: List[AstNode]) extends AstNode
 
