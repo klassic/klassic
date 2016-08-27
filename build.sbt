@@ -17,6 +17,8 @@ scalacOptions in (Compile, doc) ++= { Seq(
   "-doc-source-url", s"https://github.com/klassic/klassic/tree/${scaladocBranch.value}€{FILE_PATH}.scala"
 )}
 
+crossScalaVersions := Seq("2.11.8", "2.12.0-M5")
+
 testOptions in Test += Tests.Argument("-oI")
 
 scalacOptions <++= scalaVersion map { v =>
@@ -24,10 +26,16 @@ scalacOptions <++= scalaVersion map { v =>
 }
 
 libraryDependencies ++= Seq(
-  "org.scala-lang.modules" %% "scala-parser-combinators" % "1.0.3",
+  "org.scala-lang.modules" %% "scala-parser-combinators" % (
+    if(scalaVersion.value.startsWith("2.11")) {
+     "1.0.3"
+    } else {
+     "1.0.4"
+    }
+  ),
   "org.ow2.asm" % "asm" % "5.0.4",
   "junit" % "junit" % "4.7" % "test",
-  "org.scalatest" %% "scalatest" % "2.2.6" % "test"
+  "org.scalatest" %% "scalatest" %  "3.0.0"
 )
 
 assemblyJarName in assembly := "klassic.jar"
