@@ -37,7 +37,6 @@ class Parser extends RegexParsers {
   )
   lazy val COMMENT: Parser[Any] = BLOCK_COMMENT | LINE_COMMENT
 
-
   def CL[T](parser: Parser[T]): Parser[T] = parser <~ SPACING
   def token(parser: Parser[String]): Parser[String] = parser <~ SPACING_WITHOUT_LF
   def unescape(input: String): String = {
