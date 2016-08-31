@@ -133,7 +133,16 @@ class ExpressionSpec extends SpecHelper {
       """
          |def none() = 24 cleanup println("none")
          |none()
-      """.stripMargin -> BoxedInt(24)
+      """.stripMargin -> BoxedInt(24),
+      """
+         |def hello() = {
+         |  println("Hello")
+         |  0
+         |} cleanup {
+         |  println("World")
+         |}
+         |hello()
+      """.stripMargin -> BoxedInt(0)
     )
 
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
