@@ -141,4 +141,19 @@ class LiteralSpec extends SpecHelper {
       }
     }
   }
+  describe("map literal") {
+    val expectations = List[(String, Value)](
+      "%[]" -> ObjectValue(mapOf[String, String]()),
+      "%[1 : 2]" -> ObjectValue(mapOf(1 -> 2)),
+      """%["a":"b"]""" -> ObjectValue(mapOf("a" -> "b")),
+      """%["a":"b" "c":"d"]""" -> ObjectValue(mapOf("a" -> "b", "c" -> "d")),
+    """%["a":"b"
+      | "c":"d"]""".stripMargin -> ObjectValue(mapOf("a" -> "b", "c" -> "d"))
+    )
+    expectations.zipWithIndex.foreach { case ((in, expected), i) =>
+      it(s"expectations ${i}") {
+        assert(expected == I.evaluateString(in))
+      }
+    }
+  }
 }
