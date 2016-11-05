@@ -89,12 +89,10 @@ class Interpreter {evaluator =>
     }
 
     define("thread") { case List(fun: FunctionValue) =>
-      new Thread {
-        override def run(): Unit = {
+      new Thread({() =>
           val env = new Environment(fun.environment)
           evaluator.evaluate(FunctionCall(NoLocation, fun.value, Nil), env)
-        }
-      }.start()
+      }).start()
       UnitValue
     }
     define("println") { case List(param) =>
