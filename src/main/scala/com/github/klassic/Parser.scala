@@ -205,21 +205,21 @@ class Parser extends RegexParsers {
   def primary: Parser[AstNode] = ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
-  def integerLiteral : Parser[AstNode] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY"| "L" | "S") ^^ {
+  def integerLiteral : Parser[AstNode] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY" ^^ {_ => ByteSuffix } | "L" ^^ {_ => LongSuffix} | "S" ^^ {_ => ShortSuffix }) ^^ {
     case location ~ value ~ None => IntNode(location, value.toLong.toInt)
-    case location ~ value ~ Some("L") => LongNode(location, value.toLong)
-    case location ~ value ~ Some("S") => ShortNode(location, value.toShort)
-    case location ~ value ~ Some("BY") => ByteNode(location, value.toByte)
+    case location ~ value ~ Some(LongSuffix) => LongNode(location, value.toLong)
+    case location ~ value ~ Some(ShortSuffix) => ShortNode(location, value.toShort)
+    case location ~ value ~ Some(ByteSuffix) => ByteNode(location, value.toByte)
   }) <~ SPACING_WITHOUT_LF
 
-  def floatLiteral: Parser[AstNode]= (% ~ "([1-9][0-9]*|0)\\.[0-9]*".r ~ opt("F")) ^^ {
+  def floatLiteral: Parser[AstNode]= (% ~ "([1-9][0-9]*|0)\\.[0-9]*".r ~ opt("F" ^^ {_ => FloatSuffix })) ^^ {
     case location ~ value ~ None => DoubleNode(location, value.toDouble)
-    case location ~ value ~ Some("F") => FloatNode(location, value.toFloat)
+    case location ~ value ~ Some(FloatSuffix) => FloatNode(location, value.toFloat)
   }
 
-  def booleanLiteral: Parser[AstNode] = % ~ (TRUE | FALSE) ^^ {
-    case location ~ "true" => BooleanNode(location, true)
-    case location ~ "false" => BooleanNode(location, false)
+  def booleanLiteral: Parser[AstNode] = % ~ (TRUE ^^ {_ => true }| FALSE ^^ {_ => false}) ^^ {
+    case location ~  true => BooleanNode(location, true)
+    case location ~  false => BooleanNode(location, false)
   }
 
   //stringLiteral ::= "\"" ((?!")(\[rntfb"'\\]|[^\\]))* "\""

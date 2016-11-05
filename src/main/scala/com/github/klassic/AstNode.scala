@@ -19,6 +19,18 @@ object AstNode {
     def format: String = s"? :"
   }
 
+  sealed trait IntegerSuffix
+
+  case object ByteSuffix extends IntegerSuffix
+
+  case object ShortSuffix extends IntegerSuffix
+
+  case object LongSuffix extends IntegerSuffix
+
+  sealed trait FloatSuffix
+
+  case object FloatSuffix extends FloatSuffix
+
   case class Program(val location: Location, imports: List[Import], block: Block)
 
   case class Import(val location: Location, simpleName: String, fqcn: String)
