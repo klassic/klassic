@@ -92,7 +92,7 @@ class Interpreter {evaluator =>
       new Thread {
         override def run(): Unit = {
           val env = new Environment(fun.environment)
-          evaluator.evaluate(env, FunctionCall(NoLocation, fun.value, Nil))
+          evaluator.evaluate(FunctionCall(NoLocation, fun.value, Nil), env)
         }
       }.start()
       UnitValue
@@ -105,7 +105,7 @@ class Interpreter {evaluator =>
       val interpreter = new Interpreter
       val env = new Environment(fun.environment)
       val start = System.currentTimeMillis()
-      interpreter.evaluate(env, FunctionCall(NoLocation, fun.value, List()))
+      interpreter.evaluate(FunctionCall(NoLocation, fun.value, List()), env)
       val end = System.currentTimeMillis()
       BoxedInt((end - start).toInt)
     }
@@ -163,8 +163,8 @@ class Interpreter {evaluator =>
     }
   }
 
-  def evaluate(node: AstNode): Value = evaluate(BuiltinEnvironment, node)
-  def evaluate(env:Environment, node: AstNode): Value = {
+  def evaluate(node: AstNode): Value = evaluate(node, BuiltinEnvironment)
+  def evaluate(node: AstNode, env: Environment): Value = {
     def rewrite(node: AstNode): AstNode = node match {
       case Block(location, expressions) => Block(location, expressions.map{rewrite})
       case IfExpression(location, cond, pos, neg) =>
@@ -217,7 +217,7 @@ class Interpreter {evaluator =>
       node match{
         case Block(location, exprs) =>
           val local = new Environment(Some(env))
-          exprs.foldLeft(UnitValue:Value){(result, x) => evaluate(local, x)}
+          exprs.foldLeft(UnitValue:Value){(result, x) => evaluate(x, local)}
         case WhileExpression(location, cond, body) =>
           while(evalRecursive(cond) == BoxedBoolean(true)) {
             evalRecursive(body)
@@ -435,10 +435,10 @@ class Interpreter {evaluator =>
                 local(fp.name) = evalRecursive(ap)
               }
               try {
-                evaluate(local, proc)
+                evaluate(proc, local)
               } finally {
                 cleanup.foreach { expression =>
-                  evaluate(local, expression)
+                  evaluate(expression, local)
                 }
               }
             case NativeFunctionValue(body) =>
