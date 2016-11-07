@@ -7,9 +7,13 @@ language currently, it will be a statically typed programming language.  Klassic
 
 * lexically-scoped variables
 * first-class functions
-* here document
-* here expression(new!)
-* etc.
+* here documents
+* loop expression
+* cleanup clause
+* space-sensitive and line-sensitive list literals
+* space-sensitive and line-sensitive map literals
+* Java FFI
+* , etc.
 
 Klassic will enable Object-Functional Programming.
 
@@ -127,6 +131,21 @@ val map2 = #[
 ```
 
 Currently, the type of map literal is `java.util.Map`.
+
+### Cleanup Clause
+
+Cleanup clauses are executed after the blocks are executed.  For example,
+
+```
+val i = 0
+while(i < 10) {
+  i = i + 1
+} cleanup {
+  println(i)
+}
+```
+
+the above program prints `10`.  Each block can at most one cleanup clause.
 
 ### Numeric Literal
 
