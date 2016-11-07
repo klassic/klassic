@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.AstNode._
+import com.github.klassic.AST._
 import com.github.klassic.TypeDescription._
 
 import scala.collection.mutable
@@ -19,10 +19,10 @@ class TypeChecker {
       expectedType == actualType
     }
   }
-  def doType(node: AstNode): TypeDescription = {
+  def doType(node: AST): TypeDescription = {
     typeCheck(node, TypeEnvironment(mutable.Map.empty, mutable.Set.empty, None))
   }
-  def typeCheck(node: AstNode, environment : TypeEnvironment): TypeDescription = {
+  def typeCheck(node: AST, environment : TypeEnvironment): TypeDescription = {
     node match {
       case Block(location, expressions) =>
         expressions match {
