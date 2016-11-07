@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.AstNode._
+import com.github.klassic.AST._
 
 sealed abstract class Value
 case class BoxedByte(value: Byte) extends Value {
@@ -24,7 +24,7 @@ case class BoxedDouble(value: Double) extends Value {
 case class BoxedFloat(value: Float) extends Value {
   override def toString = value.toString
 }
-case class FunctionValue(value: FunctionLiteral, cleanup: Option[AstNode], environment: Option[Environment]) extends Value {
+case class FunctionValue(value: FunctionLiteral, cleanup: Option[AST], environment: Option[Environment]) extends Value {
   override def toString = s"function value:${value} environment:${environment}"
 }
 case class NativeFunctionValue(body: PartialFunction[List[Value], Value]) extends Value {

@@ -3,7 +3,7 @@ package com.github.klassic
 import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
 import java.lang.reflect.{Constructor, Method}
 
-import com.github.klassic.AstNode._
+import com.github.klassic.AST._
 
 /**
  * @author Kota Mizushima
@@ -146,28 +146,28 @@ class Interpreter {evaluator =>
   def evaluateString(program: String, fileName: String = "<no file>"): Value = {
     val parser = new Parser
     parser.parse(program) match {
-      case parser.Success(node: AstNode, _) => evaluate(node)
+      case parser.Success(node: AST, _) => evaluate(node)
       case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
       case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
     }
   }
 
-  def doParse(program: String): AstNode = {
+  def doParse(program: String): AST = {
     val parser = new Parser
     parser.parse(program) match {
-      case parser.Success(node: AstNode, _) => node
+      case parser.Success(node: AST, _) => node
       case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
       case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
     }
   }
 
-  def evaluate(node: AstNode): Value = evaluate(node, BuiltinEnvironment)
-  def evaluate(node: AstNode, env: Environment): Value = {
-    def rewrite(node: AstNode): AstNode = node match {
+  def evaluate(node: AST): Value = evaluate(node, BuiltinEnvironment)
+  def evaluate(node: AST, env: Environment): Value = {
+    def rewrite(node: AST): AST = node match {
       case Block(location, expressions) => Block(location, expressions.map{rewrite})
       case IfExpression(location, cond, pos, neg) =>
         IfExpression(location, rewrite(cond), rewrite(pos), rewrite(neg))
-      case WhileExpression(location, condition, body: AstNode) =>
+      case WhileExpression(location, condition, body: AST) =>
         WhileExpression(location, rewrite(condition), rewrite(body))
       case e@ForeachExpression(location, name, collection, body) =>
         val itVariable = symbol()
@@ -211,7 +211,7 @@ class Interpreter {evaluator =>
       case NewObject(location, className, params) => NewObject(location, className, params.map{rewrite})
       case MethodCall(location ,self, name, params) => MethodCall(location, rewrite(self), name, params.map{rewrite})
     }
-    def evalRecursive(node: AstNode): Value = {
+    def evalRecursive(node: AST): Value = {
       node match{
         case Block(location, exprs) =>
           val local = new Environment(Some(env))
