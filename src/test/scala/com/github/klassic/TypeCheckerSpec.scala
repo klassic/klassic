@@ -45,7 +45,7 @@ class TypeCheckerSpec extends SpecHelper {
       """.stripMargin
     )
     inputs.foreach{in =>
-      val e = intercept[InterpreterException] {
+      val e = intercept[TyperException] {
         I.evaluateString(in)
       }
       println(e)
@@ -81,7 +81,7 @@ class TypeCheckerSpec extends SpecHelper {
     )
     illTypedPrograms.zipWithIndex.foreach { case (in, i) =>
       it(s"expectation  ${i}") {
-        val e = intercept[InterpreterException] {
+        val e = intercept[TyperException] {
           I.evaluateString(in)
         }
         println(e)
@@ -99,7 +99,7 @@ class TypeCheckerSpec extends SpecHelper {
     )
     illTypedPrograms.zipWithIndex.foreach { case (in, i) =>
       it(s"expectation  ${i}") {
-        val e = intercept[InterpreterException] {
+        val e = intercept[TyperException] {
           I.evaluateString(in)
         }
         println(e)
@@ -116,7 +116,7 @@ class TypeCheckerSpec extends SpecHelper {
     )
     illTypedPrograms.zipWithIndex.foreach { case (in, i) =>
       it(s"expectation  ${i}") {
-        val e = intercept[InterpreterException] {
+        val e = intercept[TyperException] {
           I.evaluateString(in)
         }
         println(e)
