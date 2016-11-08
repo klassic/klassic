@@ -8,14 +8,14 @@ import scala.collection.mutable
   * Created by kota_mizushima on 2016/06/02.
   */
 class Typer {
-  val BuiltinEnvironment: Map[String, TypeDescription] = Map(
-    "substring" -> FunctionType(List(DynamicType, IntType, IntType), DynamicType),
-    "at" -> FunctionType(List(DynamicType, IntType), DynamicType),
-    "matches" -> FunctionType(List(DynamicType, DynamicType), BooleanType),
-    "thread" -> FunctionType(List(FunctionType(List.empty, DynamicType)), DynamicType),
-    "println" ->  FunctionType(List(DynamicType), UnitType),
-    "stopwatch" -> FunctionType(List(FunctionType(List.empty, DynamicType)), IntType),
-    "sleep" -> FunctionType(List(IntType), UnitType)
+  val BuiltinEnvironment: Map[String, TypeScheme] = Map(
+    "substring" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType, IntType), DynamicType)),
+    "at" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType), DynamicType)),
+    "matches" -> TypeScheme(List(), FunctionType(List(DynamicType, DynamicType), BooleanType)),
+    "thread" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), DynamicType)),
+    "println" ->  TypeScheme(List(), FunctionType(List(DynamicType), UnitType)),
+    "stopwatch" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), IntType)),
+    "sleep" -> TypeScheme(List(), FunctionType(List(IntType), UnitType))
   )
 
   def isAssignableFrom(expectedType: TypeDescription, actualType: TypeDescription): Boolean = {
@@ -35,7 +35,7 @@ class Typer {
     }
   }
   def doType(node: AST): TypedAST = {
-    val environment = mutable.Map.empty[String, TypeDescription]
+    val environment = mutable.Map.empty[String, TypeScheme]
     environment ++= BuiltinEnvironment
     typeCheck(node, TypeEnvironment(environment, mutable.Set.empty, None))
   }
@@ -65,10 +65,10 @@ class Typer {
             throw new TyperException(s"variable ${value} is not defined")
           case Some(variableType) =>
             val typedValue = typeCheck(value, environment)
-            if(!isAssignableFrom(variableType, typedValue.description)) {
+            if(!isAssignableFrom(variableType.description, typedValue.description)) {
               throw new TyperException(s"expected type: ${variableType}, actual type: ${typedValue.description}")
             }
-            TypedAST.Assignment(variableType, location, variable, typedValue)
+            TypedAST.Assignment(variableType.description, location, variable, typedValue)
         }
         result
       case AST.IfExpression(location, cond, pos, neg) =>
@@ -96,13 +96,13 @@ class Typer {
         val declaredType = optVariableType match {
           case Some(variableType) =>
             if(isAssignableFrom(variableType, typedValue.description)) {
-              environment.variables(variable) = variableType
+              environment.variables(variable) = TypeScheme(List(), variableType)
               variableType
             } else {
               throw TyperException(s"${location.format} expected type: ${variableType}, but actual type: ${typedValue.description}")
             }
           case None =>
-            environment.variables(variable) = typedValue.description
+            environment.variables(variable) = TypeScheme(List(), typedValue.description)
             if(immutable) {
               environment.immutableVariables += variable
             }
@@ -117,7 +117,7 @@ class Typer {
         if(environment.variables.contains(variable)) {
           throw TyperException(s"${location.format} variable ${variable} is already defined")
         }
-        environment.variables(variable) = DynamicType
+        environment.variables(variable) = TypeScheme(List(), DynamicType)
         val typedBody = typeCheck(body, environment)
         TypedAST.ForeachExpression(UnitType, location, variable, typedCollection, typedBody)
       case AST.WhileExpression(location, condition, body) =>
@@ -310,9 +310,9 @@ class Typer {
           case None => throw TyperException(s"${location.format} variable '${name}' is not found")
           case Some(description) => description
         }
-        TypedAST.Identifier(resultType, location, name)
+        TypedAST.Identifier(resultType.description, location, name)
       case AST.FunctionLiteral(location, params, optionalType, proc) =>
-        val paramsMap = mutable.Map(params.map{p => p.name -> p.description}:_*)
+        val paramsMap = mutable.Map(params.map{p => p.name -> TypeScheme(List(), p.description)}:_*)
         val paramsSet = mutable.Set(params.map{_.name}:_*)
         val newEnvironment = TypeEnvironment(paramsMap, paramsSet, Some(environment))
         val paramTypes = params.map{_.description}
@@ -324,10 +324,10 @@ class Typer {
         }
         val paramTypes = body.params.map{_.description}
         val returnType = body.optionalType.getOrElse(DynamicType)
-        environment.variables(name) = FunctionType(paramTypes, returnType)
+        environment.variables(name) = TypeScheme(List(), FunctionType(paramTypes, returnType))
         val typedBody = typeCheck(body, environment).asInstanceOf[TypedAST.FunctionLiteral]
         val typedCleanup = cleanup.map{c => typeCheck(c, environment)}
-        environment.variables(name) = FunctionType(typedBody.params.map{_.description}, typedBody.description)
+        environment.variables(name) = TypeScheme(List(), FunctionType(typedBody.params.map{_.description}, typedBody.description))
         TypedAST.FunctionDefinition(typedBody.description, location, name, typedBody, typedCleanup)
       case AST.FunctionCall(location, target, params) =>
         val typedTarget = typeCheck(target, environment)
