@@ -58,15 +58,15 @@ class Typer {
       case AST.BooleanNode(location, value) => TypedAST.BooleanNode(BooleanType, location, value)
       case AST.Assignment(location, variable, value) =>
         if(environment.immutableVariables.contains(variable)) {
-          throw InterpreterException(s"variable '${variable}' cannot change")
+          throw TyperException(s"variable '${variable}' cannot change")
         }
         val result = environment.lookup(variable) match {
           case None =>
-            throw new InterpreterException(s"variable ${value} is not defined")
+            throw new TyperException(s"variable ${value} is not defined")
           case Some(variableType) =>
             val typedValue = typeCheck(value, environment)
             if(!isAssignableFrom(variableType, typedValue.description)) {
-              throw new InterpreterException(s"expected type: ${variableType}, actual type: ${typedValue.description}")
+              throw new TyperException(s"expected type: ${variableType}, actual type: ${typedValue.description}")
             }
             TypedAST.Assignment(variableType, location, variable, typedValue)
         }
@@ -74,12 +74,12 @@ class Typer {
       case AST.IfExpression(location, cond, pos, neg) =>
         val typedCondition = typeCheck(cond, environment)
         if(typedCondition.description != BooleanType) {
-          throw InterpreterException(s"condition type must be Boolean, actual: ${typedCondition.description}")
+          throw TyperException(s"condition type must be Boolean, actual: ${typedCondition.description}")
         } else {
           val posTyped = typeCheck(pos, environment)
           val negTyped = typeCheck(neg, environment)
           if(!isAssignableFrom(posTyped.description, negTyped.description)) {
-            throw new InterpreterException(s"type ${posTyped.description} and type ${negTyped.description} is incomparable")
+            throw new TyperException(s"type ${posTyped.description} and type ${negTyped.description} is incomparable")
           }
           if(posTyped.description == DynamicType)
             TypedAST.IfExpression(DynamicType, location, typedCondition, posTyped, negTyped)
@@ -90,7 +90,7 @@ class Typer {
         }
       case AST.ValDeclaration(location, variable, optVariableType, value, immutable) =>
         if(environment.variables.contains(variable)) {
-          throw InterpreterException(s"${location.format} variable ${variable} is already defined")
+          throw TyperException(s"${location.format} variable ${variable} is already defined")
         }
         val typedValue = typeCheck(value, environment)
         val declaredType = optVariableType match {
@@ -99,7 +99,7 @@ class Typer {
               environment.variables(variable) = variableType
               variableType
             } else {
-              throw new InterpreterException(s"${location.format} expected type: ${variableType}, but actual type: ${typedValue.description}")
+              throw TyperException(s"${location.format} expected type: ${variableType}, but actual type: ${typedValue.description}")
             }
           case None =>
             environment.variables(variable) = typedValue.description
@@ -112,10 +112,10 @@ class Typer {
       case AST.ForeachExpression(location, variable, collection, body) =>
         val typedCollection = typeCheck(collection, environment)
         if(!isAssignableFrom(typedCollection.description, DynamicType)) {
-          throw InterpreterException(s"${location.format} expression should be DynamicType")
+          throw TyperException(s"${location.format} expression should be DynamicType")
         }
         if(environment.variables.contains(variable)) {
-          throw InterpreterException(s"${location.format} variable ${variable} is already defined")
+          throw TyperException(s"${location.format} variable ${variable} is already defined")
         }
         environment.variables(variable) = DynamicType
         val typedBody = typeCheck(body, environment)
@@ -123,7 +123,7 @@ class Typer {
       case AST.WhileExpression(location, condition, body) =>
         val typedCondition = typeCheck(condition, environment)
         if(typedCondition.description != BooleanType) {
-          throw InterpreterException(s"${location.format} condition type must be Boolean, actual: ${typedCondition.description}")
+          throw TyperException(s"${location.format} condition type must be Boolean, actual: ${typedCondition.description}")
         } else {
           val typedBody = typeCheck(body, environment)
           TypedAST.WhileExpression(UnitType, location, typedCondition, typedBody)
@@ -134,7 +134,7 @@ class Typer {
         if(isAssignableFrom(typedLhs.description, typedRhs.description)) {
           TypedAST.BinaryExpression(BooleanType, location, Operator.EQUAL, typedLhs, typedRhs)
         } else {
-          throw InterpreterException(s"${location.format} expected type: ${typedLhs.description}, actual type: ${typedRhs.description}")
+          throw TyperException(s"${location.format} expected type: ${typedLhs.description}, actual type: ${typedRhs.description}")
         }
       case AST.BinaryExpression(location, Operator.LESS_THAN, left, right) =>
         val typedLhs = typeCheck(left, environment)
@@ -148,7 +148,7 @@ class Typer {
           case (DoubleType, DoubleType) => BooleanType
           case (lType, DynamicType) => BooleanType
           case (DynamicType, rtype) => BooleanType
-          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
+          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
         }
         TypedAST.BinaryExpression(resultType, location, Operator.LESS_THAN, typedLhs, typedRhs)
       case AST.BinaryExpression(location, Operator.GREATER_THAN, left, right) =>
@@ -163,7 +163,7 @@ class Typer {
           case (DoubleType, DoubleType) => BooleanType
           case (lType, DynamicType) => BooleanType
           case (DynamicType, rtype) => BooleanType
-          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
+          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
         }
         TypedAST.BinaryExpression(resultType, location, Operator.GREATER_THAN, typedLhs, typedRhs)
       case AST.BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right) =>
@@ -178,7 +178,7 @@ class Typer {
           case (DoubleType, DoubleType) => BooleanType
           case (lType, DynamicType) => BooleanType
           case (DynamicType, rtype) => BooleanType
-          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
+          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
         }
         TypedAST.BinaryExpression(resultType, location, Operator.LESS_OR_EQUAL, typedLhs, typedRhs)
       case AST.BinaryExpression(location, Operator.GREATER_EQUAL, left, right) =>
@@ -193,7 +193,7 @@ class Typer {
           case (DoubleType, DoubleType) => BooleanType
           case (lType, DynamicType) => BooleanType
           case (DynamicType, rtype) => BooleanType
-          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
+          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
         }
         TypedAST.BinaryExpression(resultType, location, Operator.GREATER_EQUAL, typedLhs, typedRhs)
       case AST.BinaryExpression(location, Operator.ADD, left, right) =>
@@ -208,7 +208,7 @@ class Typer {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
+          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
         }
         TypedAST.BinaryExpression(resultType, location, Operator.ADD, typedLhs, typedRhs)
       case AST.BinaryExpression(location, Operator.SUBTRACT, left, right) =>
@@ -223,7 +223,7 @@ class Typer {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
+          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
         }
         TypedAST.BinaryExpression(resultType, location, Operator.SUBTRACT, typedLhs, typedRhs)
 
@@ -239,27 +239,27 @@ class Typer {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
+          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
         }
         TypedAST.BinaryExpression(resultType, location, Operator.MULTIPLY, typedLhs, typedRhs)
       case AST.BinaryExpression(location, Operator.AND2, left, right) =>
         val typedLhs = typeCheck(left, environment)
         val typedRhs = typeCheck(right, environment)
         if(typedLhs.description != BooleanType) {
-          throw InterpreterException(s"${location.format} lhs of && must be Boolean")
+          throw TyperException(s"${location.format} lhs of && must be Boolean")
         }
         if(typedRhs.description != BooleanType) {
-          throw InterpreterException(s"${location.format} lhs of && must be Boolean")
+          throw TyperException(s"${location.format} lhs of && must be Boolean")
         }
         TypedAST.BinaryExpression(TypeDescription.BooleanType, location, Operator.AND2, typedLhs, typedRhs)
       case AST.BinaryExpression(location, Operator.BAR2, left, right) =>
         val typedLhs = typeCheck(left, environment)
         val typedRhs = typeCheck(right, environment)
         if(typedLhs.description != BooleanType) {
-          throw InterpreterException(s"${location.format} lhs of || must be Boolean")
+          throw TyperException(s"${location.format} lhs of || must be Boolean")
         }
         if(typedRhs.description != BooleanType) {
-          throw InterpreterException(s"${location.format} lhs of || must be Boolean")
+          throw TyperException(s"${location.format} lhs of || must be Boolean")
         }
         TypedAST.BinaryExpression(TypeDescription.BooleanType, location, Operator.BAR2, typedLhs, typedRhs)
       case AST.BinaryExpression(location, Operator.DIVIDE, left, right) =>
@@ -274,7 +274,7 @@ class Typer {
           case (DoubleType, DoubleType) => DoubleType
           case (lType, DynamicType) => lType
           case (DynamicType, rtype) => rtype
-          case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
+          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
         }
         TypedAST.BinaryExpression(resultType, location, Operator.DIVIDE, typedLhs, typedRhs)
       case AST.MinusOp(location, operand) =>
@@ -287,7 +287,7 @@ class Typer {
           case FloatType => FloatType
           case DoubleType => DoubleType
           case DynamicType => DynamicType
-          case otherwise => throw InterpreterException(s"${location.format} expected: Numeric type, actual: ${otherwise}")
+          case otherwise => throw TyperException(s"${location.format} expected: Numeric type, actual: ${otherwise}")
         }
         TypedAST.MinusOp(resultType, location, typedOperand)
       case AST.PlusOp(location, operand) =>
@@ -300,14 +300,14 @@ class Typer {
           case FloatType => FloatType
           case DoubleType => DoubleType
           case DynamicType => DynamicType
-          case otherwise => throw InterpreterException(s"${location.format} expected: Numeric type, actual: ${otherwise}")
+          case otherwise => throw TyperException(s"${location.format} expected: Numeric type, actual: ${otherwise}")
         }
         TypedAST.PlusOp(resultType, location, typedOperand)
       case AST.StringNode(location, value) =>
         TypedAST.StringNode(DynamicType, location, value)
       case AST.Identifier(location, name) =>
         val resultType = environment.lookup(name) match {
-          case None => throw InterpreterException(s"${location.format} variable '${name}' is not found")
+          case None => throw TyperException(s"${location.format} variable '${name}' is not found")
           case Some(description) => description
         }
         TypedAST.Identifier(resultType, location, name)
@@ -333,16 +333,16 @@ class Typer {
         val typedTarget = typeCheck(target, environment)
         val functionType: FunctionType = typedTarget.description match {
           case f@FunctionType(_, _) => f
-          case otherwise => throw InterpreterException(s"${location.format} expected: function type, actual type: ${otherwise}")
+          case otherwise => throw TyperException(s"${location.format} expected: function type, actual type: ${otherwise}")
         }
         val actualTypedParams = params.map(p => typeCheck(p, environment))
         val actualParamTypes = actualTypedParams.map(_.description)
         if(functionType.paramTypes.length != actualParamTypes.length) {
-          throw InterpreterException(s"${location.format} function arity mismatch: expected length: ${functionType.paramTypes.length}, actual length: ${actualParamTypes.length}")
+          throw TyperException(s"${location.format} function arity mismatch: expected length: ${functionType.paramTypes.length}, actual length: ${actualParamTypes.length}")
         }
         functionType.paramTypes.zip(actualParamTypes).foreach { case (expectedType, actualType) =>
             if(!isAssignableFrom(expectedType, actualType)){
-              throw InterpreterException(s"${location.format} expected type: ${expectedType}, actual type:${actualType}")
+              throw TyperException(s"${location.format} expected type: ${expectedType}, actual type:${actualType}")
             }
         }
         TypedAST.FunctionCall(functionType.returnType, location, typedTarget, actualTypedParams)
@@ -360,12 +360,12 @@ class Typer {
       case AST.MethodCall(location, receiver, name, params) =>
         val typedReceiver = typeCheck(receiver, environment)
         if(typedReceiver.description != DynamicType) {
-          throw InterpreterException(s"${location.format} expected: [*], actual: ${typedReceiver.description}")
+          throw TyperException(s"${location.format} expected: [*], actual: ${typedReceiver.description}")
         }
         val typedParams = params.map(p => typeCheck(p, environment))
         TypedAST.MethodCall(DynamicType, location, typedReceiver, name, typedParams)
       case otherwise =>
-        throw InterpreterPanic(otherwise.toString)
+        throw TyperPanic(otherwise.toString)
     }
   }
 }
