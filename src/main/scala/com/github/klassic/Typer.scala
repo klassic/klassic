@@ -8,6 +8,16 @@ import scala.collection.mutable
   * Created by kota_mizushima on 2016/06/02.
   */
 class Typer {
+  val BuiltinEnvironment: Map[String, TypeDescription] = Map(
+    "substring" -> FunctionType(List(DynamicType, IntType, IntType), DynamicType),
+    "at" -> FunctionType(List(DynamicType, IntType), DynamicType),
+    "matches" -> FunctionType(List(DynamicType, DynamicType), BooleanType),
+    "thread" -> FunctionType(List(FunctionType(List.empty, DynamicType)), DynamicType),
+    "println" ->  FunctionType(List(DynamicType), UnitType),
+    "stopwatch" -> FunctionType(List(FunctionType(List.empty, DynamicType)), IntType),
+    "sleep" -> FunctionType(List(IntType), UnitType)
+  )
+
   def isAssignableFrom(expectedType: TypeDescription, actualType: TypeDescription): Boolean = {
     if(expectedType == ErrorType || actualType == ErrorType) {
       false
@@ -16,13 +26,20 @@ class Typer {
     } else if(actualType == DynamicType) {
       true
     } else {
-      expectedType == actualType
+      (expectedType, actualType) match {
+        case (x:FunctionType, y:FunctionType) =>
+          x.paramTypes.length == y.paramTypes.length && x.paramTypes.zip(y.paramTypes).forall { case (a, b) => isAssignableFrom(a, b) } && isAssignableFrom(x.returnType, y.returnType)
+        case otherwise =>
+          expectedType == actualType
+      }
     }
   }
   def doType(node: AST): TypedAST = {
-    typeCheck(node, TypeEnvironment(mutable.Map.empty, mutable.Set.empty, None))
+    val environment = mutable.Map.empty[String, TypeDescription]
+    environment ++= BuiltinEnvironment
+    typeCheck(node, TypeEnvironment(environment, mutable.Set.empty, None))
   }
-  def typeCheck(node: AST, environment : TypeEnvironment): TypedAST = {
+  private def typeCheck(node: AST, environment : TypeEnvironment): TypedAST = {
     node match {
       case AST.Block(location, expressions) =>
         expressions match {
@@ -209,6 +226,7 @@ class Typer {
           case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
         }
         TypedAST.BinaryExpression(resultType, location, Operator.SUBTRACT, typedLhs, typedRhs)
+
       case AST.BinaryExpression(location, Operator.MULTIPLY, left, right) =>
         val typedLhs = typeCheck(left, environment)
         val typedRhs = typeCheck(right, environment)
@@ -224,6 +242,26 @@ class Typer {
           case _ => throw InterpreterException(s"${location.format} comparison operation must be done between the same numeric types")
         }
         TypedAST.BinaryExpression(resultType, location, Operator.MULTIPLY, typedLhs, typedRhs)
+      case AST.BinaryExpression(location, Operator.AND2, left, right) =>
+        val typedLhs = typeCheck(left, environment)
+        val typedRhs = typeCheck(right, environment)
+        if(typedLhs.description != BooleanType) {
+          throw InterpreterException(s"${location.format} lhs of && must be Boolean")
+        }
+        if(typedRhs.description != BooleanType) {
+          throw InterpreterException(s"${location.format} lhs of && must be Boolean")
+        }
+        TypedAST.BinaryExpression(TypeDescription.BooleanType, location, Operator.AND2, typedLhs, typedRhs)
+      case AST.BinaryExpression(location, Operator.BAR2, left, right) =>
+        val typedLhs = typeCheck(left, environment)
+        val typedRhs = typeCheck(right, environment)
+        if(typedLhs.description != BooleanType) {
+          throw InterpreterException(s"${location.format} lhs of || must be Boolean")
+        }
+        if(typedRhs.description != BooleanType) {
+          throw InterpreterException(s"${location.format} lhs of || must be Boolean")
+        }
+        TypedAST.BinaryExpression(TypeDescription.BooleanType, location, Operator.BAR2, typedLhs, typedRhs)
       case AST.BinaryExpression(location, Operator.DIVIDE, left, right) =>
         val typedLhs = typeCheck(left, environment)
         val typedRhs = typeCheck(right, environment)
@@ -273,20 +311,24 @@ class Typer {
           case Some(description) => description
         }
         TypedAST.Identifier(resultType, location, name)
-      case AST.FunctionLiteral(location, params, proc) =>
+      case AST.FunctionLiteral(location, params, optionalType, proc) =>
         val paramsMap = mutable.Map(params.map{p => p.name -> p.description}:_*)
         val paramsSet = mutable.Set(params.map{_.name}:_*)
         val newEnvironment = TypeEnvironment(paramsMap, paramsSet, Some(environment))
         val paramTypes = params.map{_.description}
         val typedProc = typeCheck(proc, newEnvironment)
-        TypedAST.FunctionLiteral(FunctionType(paramTypes, typedProc.description), location, params, typedProc)
+        TypedAST.FunctionLiteral(FunctionType(paramTypes, typedProc.description), location, params, optionalType, typedProc)
       case AST.FunctionDefinition(location, name, body, cleanup) =>
         if(environment.variables.contains(name)) {
           throw new InterruptedException(s"${location.format} function ${name} is already defined")
         }
-        val typedBody = typeCheck(body, environment)
+        val paramTypes = body.params.map{_.description}
+        val returnType = body.optionalType.getOrElse(DynamicType)
+        environment.variables(name) = FunctionType(paramTypes, returnType)
+        val typedBody = typeCheck(body, environment).asInstanceOf[TypedAST.FunctionLiteral]
         val typedCleanup = cleanup.map{c => typeCheck(c, environment)}
-        TypedAST.FunctionDefinition(typedBody.description, location, name, typedBody.asInstanceOf[TypedAST.FunctionLiteral], typedCleanup)
+        environment.variables(name) = FunctionType(typedBody.params.map{_.description}, typedBody.description)
+        TypedAST.FunctionDefinition(typedBody.description, location, name, typedBody, typedCleanup)
       case AST.FunctionCall(location, target, params) =>
         val typedTarget = typeCheck(target, environment)
         val functionType: FunctionType = typedTarget.description match {

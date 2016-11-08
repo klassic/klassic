@@ -62,7 +62,7 @@ object AST {
 
   case class ValDeclaration(val location: Location, variable: String, description: Option[TypeDescription], value: AST, immutable: Boolean) extends AST
 
-  case class FunctionLiteral(val location: Location, params: List[FormalParameter], proc: AST) extends AST
+  case class FunctionLiteral(val location: Location, params: List[FormalParameter], optionalType: Option[TypeDescription], proc: AST) extends AST
 
   case class FunctionDefinition(val location: Location, name: String, func: FunctionLiteral, cleanup: Option[AST]) extends AST
 
