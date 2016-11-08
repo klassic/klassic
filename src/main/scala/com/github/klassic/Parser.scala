@@ -309,16 +309,18 @@ class Parser extends RegexParsers {
   }
 
   // anonnymousFunction ::= "(" [param {"," param}] ")" "=>" expression
-  def anonymousFunction():Parser[AST] = % ~ (opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ expression ^^ {
-    case location ~ Some(params) ~ body =>
+  def anonymousFunction():Parser[AST] = % ~ opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ (opt(typeAnnotation) <~ CL(ARROW)) ~ expression ^^ {
+    case location ~ Some(params) ~ optionalType ~ body =>
       FunctionLiteral(
         location,
         params.map {
           case name ~ Some(description) => FormalParameter(name.name, description)
           case name ~ None => FormalParameter(name.name)
-        }, body
+        },
+        optionalType,
+        body
       )
-    case location ~ None ~ body => FunctionLiteral(location, List(), body)
+    case location ~ None ~ optionalType ~ body => FunctionLiteral(location, List(), optionalType, body)
   }
 
   // newObject ::= "new" fqcn "(" [param {"," param} ")"
@@ -329,8 +331,8 @@ class Parser extends RegexParsers {
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
   def functionDefinition:Parser[FunctionDefinition] =
-    (% <~ CL(DEF)) ~ ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ opt(typeAnnotation) ~ CL(EQ) ~ expression ~ opt(CL(CLEANUP) ~> expression) ^^ {
-    case location ~ functionName ~ params ~ _ ~ optionalType ~ body ~ cleanup =>
+    (% <~ CL(DEF)) ~ ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ (opt(typeAnnotation) <~ CL(EQ)) ~ expression ~ opt(CL(CLEANUP) ~> expression) ^^ {
+    case location ~ functionName ~ params ~ optionalType ~ body ~ cleanup =>
       val ps = params match {
         case Some(xs) =>
           xs.map{
@@ -342,7 +344,7 @@ class Parser extends RegexParsers {
       FunctionDefinition(
         location,
         functionName.name,
-        FunctionLiteral(body.location, ps, body),
+        FunctionLiteral(body.location, ps, optionalType, body),
         cleanup
       )
   }

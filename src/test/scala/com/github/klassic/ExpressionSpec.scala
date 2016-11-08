@@ -9,11 +9,11 @@ class ExpressionSpec extends SpecHelper {
   describe("assignment") {
     val expectations: List[(String, Value)] = List(
       """
-        |val a=1
+        |mutable a=1
         |a
       """.stripMargin -> BoxedInt(1),
       """
-        |val a=1
+        |mutable a=1
         |a = a + 1
         |a
       """.stripMargin -> BoxedInt(2)
@@ -29,14 +29,14 @@ class ExpressionSpec extends SpecHelper {
   describe("while expression") {
     val expectations: List[(String, Value)] = List(
       """
-        |val i = 1
+        |mutable i = 1
         |while(i < 10) {
         |  i = i + 1
         |}
         |i
       """.stripMargin -> BoxedInt(10),
       """
-        |val i = 10
+        |mutable i = 10
         |while(i >= 0) {
         |  i = i - 1
         |}
@@ -44,7 +44,7 @@ class ExpressionSpec extends SpecHelper {
       """.stripMargin -> BoxedInt(-1),
       s"""
         |val buf = new java.lang.StringBuffer
-        |val i = 0
+        |mutable i = 0
         |while(i <= 5) {
         |  buf.append("#{i}")
         |  i = i + 1
@@ -63,9 +63,8 @@ class ExpressionSpec extends SpecHelper {
   describe("anonymous function") {
     val expectations: List[(String, Value)] = List(
       """
-        |val Y = (f) => ((x) => f((y) => x(x(y))))((x) => f((y) => x(x(y))))
-        |val fact = Y((f) => (x) => if(x < 2) 1 else x * fact(x - 1))
-        |fact(3)
+        |val add = (x, y) => x + y
+        |add(3, 3)
       """.stripMargin -> BoxedInt(6)
     )
 

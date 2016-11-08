@@ -15,7 +15,7 @@ class FileBasedProgramSpec extends SpecHelper {
           assert(true)
         }catch {
           case e:Throwable =>
-            println(e)
+            System.err.println(e)
             assert(false)
         }
       }

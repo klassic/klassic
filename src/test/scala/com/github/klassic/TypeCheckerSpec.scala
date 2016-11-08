@@ -1,29 +1,27 @@
 package com.github.klassic
 
-import com.github.klassic.TypeDescription._
-
 /**
   * Created by Mizushima on 2016/05/30.
   */
 class TypeCheckerSpec extends SpecHelper {
-  val I = new TypeCheckerInterpreter
+  val I = new Interpreter
 
   describe("assignment") {
-    val expectations: List[(String, (Value, TypeDescription))] = List(
+    val expectations: List[(String, Value)] = List(
       """
         |val a=1
         |a
-      """.stripMargin -> (BoxedInt(1), IntType),
+      """.stripMargin -> BoxedInt(1),
       """
         |mutable a=1
         |a = a + 1
         |a
-      """.stripMargin -> (BoxedInt(2), IntType),
+      """.stripMargin -> BoxedInt(2),
       """
         |mutable s="FOO"
         |s=s+s
         |s
-      """.stripMargin -> (ObjectValue("FOOFOO"), DynamicType)
+      """.stripMargin -> ObjectValue("FOOFOO")
     )
 
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
@@ -55,14 +53,14 @@ class TypeCheckerSpec extends SpecHelper {
   }
 
   describe("valid foreach expression") {
-    val expectations: List[(String, (Value, TypeDescription))] = List(
+    val expectations: List[(String, Value)] = List(
       """
         |mutable a = 1
         |a = 2
         |foreach(b in [1, 2, 3]) {
         |  b + 3
         |}
-      """.stripMargin -> (UnitValue, UnitType)
+      """.stripMargin -> UnitValue
     )
 
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
@@ -91,7 +89,7 @@ class TypeCheckerSpec extends SpecHelper {
     }
   }
 
-  describe("val channt change its value") {
+  describe("val channot change its value") {
     val illTypedPrograms: List[String] = List(
       """
         |val a = 1
