@@ -1,27 +1,15 @@
-package com.github.klassic.TypedAST.scala
-
-import com.github.klassic.{FormalParameter, Operator, TypeDescription}
+package com.github.klassic
 
 /**
  * @author Kota Mizushima
  */
 
 sealed abstract class TypedAST {
-  val location: TypedAST.Location
+  val location: Location
   val description: TypeDescription
 }
 
 object TypedAST {
-  sealed abstract class Location {
-    def format: String
-  }
-  case class SourceLocation(line: Int, column: Int) extends Location {
-    def format: String = s"${line}, ${column} :"
-  }
-  case object NoLocation extends Location {
-    def format: String = s"? :"
-  }
-
   sealed trait IntegerSuffix
 
   case object ByteSuffix extends IntegerSuffix
