@@ -32,7 +32,7 @@ semicolon(`;`) at the last of the declaration:
 val name = expression [;]
 ```
 
-A variable declared by `let` cannot change its value.  If you want to change the value of
+A variable declared by `val` cannot change its value.  If you want to change the value of
 the variable, use `mutable` instead:
 
 ```
