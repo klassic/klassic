@@ -16,7 +16,28 @@ class ExpressionSpec extends SpecHelper {
         |mutable a=1
         |a = a + 1
         |a
+      """.stripMargin -> BoxedInt(2),
+      """
+        |mutable a=1
+        |a += 1
+        |a
+      """.stripMargin -> BoxedInt(2),
+      """
+        |mutable a=1
+        |a -= 1
+        |a
+      """.stripMargin -> BoxedInt(0),
+      """
+        |mutable a=3
+        |a *= 2
+        |a
+      """.stripMargin -> BoxedInt(6),
+      """
+        |mutable a=5
+        |a /= 2
+        |a
       """.stripMargin -> BoxedInt(2)
+
     )
 
     expectations.foreach{ case (in, expected) =>

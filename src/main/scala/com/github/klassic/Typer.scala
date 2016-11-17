@@ -56,17 +56,17 @@ class Typer {
       case AST.FloatNode(location, value) => TypedAST.FloatNode(FloatType, location, value)
       case AST.DoubleNode(location, value) => TypedAST.DoubleNode(DoubleType, location, value)
       case AST.BooleanNode(location, value) => TypedAST.BooleanNode(BooleanType, location, value)
-      case AST.Assignment(location, variable, value) =>
+      case AST.SimpleAssignment(location, variable, value) =>
         if(environment.immutableVariables.contains(variable)) {
-          throw TyperException(s"variable '${variable}' cannot change")
+          throw TyperException(s"${location.format} variable '${variable}' cannot change")
         }
         val result = environment.lookup(variable) match {
           case None =>
-            throw new TyperException(s"variable ${value} is not defined")
+            throw new TyperException(s"${location.format} variable ${variable} is not defined")
           case Some(variableType) =>
             val typedValue = typeCheck(value, environment)
             if(!isAssignableFrom(variableType.description, typedValue.description)) {
-              throw new TyperException(s"expected type: ${variableType}, actual type: ${typedValue.description}")
+              throw new TyperException(s"${value.location.format} expected type: ${variableType}, actual type: ${typedValue.description}")
             }
             TypedAST.Assignment(variableType.description, location, variable, typedValue)
         }
@@ -74,12 +74,12 @@ class Typer {
       case AST.IfExpression(location, cond, pos, neg) =>
         val typedCondition = typeCheck(cond, environment)
         if(typedCondition.description != BooleanType) {
-          throw TyperException(s"condition type must be Boolean, actual: ${typedCondition.description}")
+          throw TyperException(s"${cond.location.format} condition type must be Boolean, actual: ${typedCondition.description}")
         } else {
           val posTyped = typeCheck(pos, environment)
           val negTyped = typeCheck(neg, environment)
           if(!isAssignableFrom(posTyped.description, negTyped.description)) {
-            throw new TyperException(s"type ${posTyped.description} and type ${negTyped.description} is incomparable")
+            throw new TyperException(s"${pos.location.format} type ${posTyped.description} and type ${negTyped.description} is incomparable")
           }
           if(posTyped.description == DynamicType)
             TypedAST.IfExpression(DynamicType, location, typedCondition, posTyped, negTyped)
