@@ -58,7 +58,21 @@ object AST {
 
   case class Identifier(val location: Location, name: String) extends AST
 
-  case class Assignment(val location: Location, variable: String, value: AST) extends AST
+  sealed abstract class Assignment extends AST {
+    val location: Location
+    val variable: String
+    val value: AST
+  }
+
+  case class SimpleAssignment(val location: Location, variable: String, value: AST) extends Assignment
+
+  case class PlusAssignment(val location: Location, variable: String, value: AST) extends Assignment
+
+  case class MinusAssignment(val location: Location, variable: String, value: AST) extends Assignment
+
+  case class MultiplicationAssignment(val location: Location, variable: String, value: AST) extends Assignment
+
+  case class DivisionAssignment(val location: Location, variable: String, value: AST) extends Assignment
 
   case class ValDeclaration(val location: Location, variable: String, description: Option[TypeDescription], value: AST, immutable: Boolean) extends AST
 

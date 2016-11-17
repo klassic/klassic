@@ -91,6 +91,10 @@ class Parser extends RegexParsers {
   lazy val CLEANUP : Parser[String] = token("cleanup")
   lazy val VAL     : Parser[String] = token("val")
   lazy val EQ      : Parser[String] = token("=")
+  lazy val PLUSEQ  : Parser[String] = token("+=")
+  lazy val MINUSEQ : Parser[String] = token("-=")
+  lazy val ASTEREQ : Parser[String] = token("*=")
+  lazy val SLASHEQ : Parser[String] = token("/=")
   lazy val EQEQ    : Parser[String] = token("==")
   lazy val ARROW   : Parser[String] = token("=>")
   lazy val COLON   : Parser[String] = token(":")
@@ -303,8 +307,13 @@ class Parser extends RegexParsers {
     case r@(_ ~ n) if !KEYWORDS(n) => r
   } ^^ {case location ~ name => Identifier(location, name)}) <~ SPACING_WITHOUT_LF
 
-  def assignment: Parser[Assignment] = (ident <~ CL(EQ)) ~ expression ^^ {
-    case v ~ value => Assignment(v.location, v.name, value)
+  def assignment: Parser[Assignment] = ident ~ CL(PLUSEQ | MINUSEQ | ASTEREQ | SLASHEQ | EQ) ~ expression ^^ {
+    case v ~ "=" ~ value => SimpleAssignment(v.location, v.name, value)
+    case v ~ "+=" ~ value => PlusAssignment(v.location, v.name, value)
+    case v ~ "-=" ~ value => MinusAssignment(v.location, v.name, value)
+    case v ~ "*=" ~ value => MultiplicationAssignment(v.location, v.name, value)
+    case v ~ "/=" ~ value => DivisionAssignment(v.location, v.name, value)
+    case _ ~ op ~ _ => sys.error(s"unknown assignment operator ${op}")
   }
 
   // val_declaration ::= "val" ident "=" expression

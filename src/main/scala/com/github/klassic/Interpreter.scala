@@ -202,7 +202,55 @@ class Interpreter {evaluator =>
     case literal@DoubleNode(location, value) => literal
     case literal@FloatNode(lcation, value) => literal
     case node@Identifier(_, name) => node
-    case Assignment(location, variable, value) => Assignment(location, variable, rewrite(value))
+    case SimpleAssignment(location, variable, value) => SimpleAssignment(location, variable, rewrite(value))
+    case PlusAssignment(location, variable, value) =>
+      val generatedSymbol = symbol()
+      val rewritedValue = rewrite(value)
+      Block(
+        location,
+        List(
+          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
+          SimpleAssignment(location, variable,
+            BinaryExpression(location, Operator.ADD, Identifier(location, variable), Identifier(location, generatedSymbol) )
+          )
+        )
+      )
+    case MinusAssignment(location, variable, value) =>
+      val generatedSymbol = symbol()
+      val rewritedValue = rewrite(value)
+      Block(
+        location,
+        List(
+          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
+          SimpleAssignment(location, variable,
+            BinaryExpression(location, Operator.SUBTRACT, Identifier(location, variable), Identifier(location, generatedSymbol) )
+          )
+        )
+      )
+    case MultiplicationAssignment(location, variable, value) =>
+      val generatedSymbol = symbol()
+      val rewritedValue = rewrite(value)
+      Block(
+        location,
+        List(
+          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
+          SimpleAssignment(location, variable,
+            BinaryExpression(location, Operator.MULTIPLY, Identifier(location, variable), Identifier(location, generatedSymbol) )
+          )
+        )
+      )
+    case DivisionAssignment(location, variable, value) =>
+      val generatedSymbol = symbol()
+      val rewritedValue = rewrite(value)
+      Block(
+        location,
+        List(
+          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
+          SimpleAssignment(location, variable,
+            BinaryExpression(location, Operator.DIVIDE, Identifier(location, variable), Identifier(location, generatedSymbol) )
+          )
+        )
+      )
     case ValDeclaration(location, variable, optionalType, value, immutable) => ValDeclaration(location, variable, optionalType, rewrite(value), immutable)
     case FunctionLiteral(location, params, optionalType, proc) => FunctionLiteral(location, params, optionalType, rewrite(proc))
     case FunctionDefinition(location, name, func, cleanup) => FunctionDefinition(location, name, rewrite(func).asInstanceOf[FunctionLiteral], cleanup.map(rewrite))
