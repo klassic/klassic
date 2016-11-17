@@ -327,7 +327,7 @@ class Typer {
         environment.variables(name) = TypeScheme(List(), FunctionType(paramTypes, returnType))
         val typedBody = typeCheck(body, environment).asInstanceOf[TypedAST.FunctionLiteral]
         val typedCleanup = cleanup.map{c => typeCheck(c, environment)}
-        environment.variables(name) = TypeScheme(List(), FunctionType(typedBody.params.map{_.description}, typedBody.description))
+        environment.variables(name) = TypeScheme(List(), FunctionType(typedBody.params.map{_.description}, typedBody.proc.description))
         TypedAST.FunctionDefinition(typedBody.description, location, name, typedBody, typedCleanup)
       case AST.FunctionCall(location, target, params) =>
         val typedTarget = typeCheck(target, environment)

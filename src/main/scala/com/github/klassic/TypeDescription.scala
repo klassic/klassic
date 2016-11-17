@@ -1,6 +1,8 @@
 package com.github.klassic
 
-sealed abstract class TypeDescription(val image: String)
+sealed abstract class TypeDescription(val image: String) {
+  override def toString: String = image
+}
 object TypeDescription {
   private var n: Int = 0
   def newTypeVariable(): TypeDescription = {

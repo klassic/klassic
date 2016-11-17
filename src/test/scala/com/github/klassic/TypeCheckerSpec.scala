@@ -31,6 +31,21 @@ class TypeCheckerSpec extends SpecHelper {
     }
   }
 
+  describe("valid function type") {
+    val expectations: List[(String, Value)] = List(
+      """
+        |def add(x: Int, y: Int): Int = x + y
+        |val f: (Int, Int) => Int = add
+        |f(2, 3)
+      """.stripMargin -> BoxedInt(5))
+
+    expectations.zipWithIndex.foreach { case ((in, expected), i) =>
+      it(s"expectation  ${i}") {
+        assert(expected == I.evaluateString(in))
+      }
+    }
+  }
+
   describe("arithmetic operation between incompatible type cannot be done") {
     val inputs = List(
       """
@@ -44,11 +59,13 @@ class TypeCheckerSpec extends SpecHelper {
         |b
       """.stripMargin
     )
-    inputs.foreach{in =>
-      val e = intercept[TyperException] {
-        I.evaluateString(in)
+    inputs.zipWithIndex.foreach{ case (in, i) =>
+      it(s"expectation  ${i}") {
+        val e = intercept[TyperException] {
+          I.evaluateString(in)
+        }
+        println(e)
       }
-      println(e)
     }
   }
 
