@@ -16,7 +16,15 @@ class SyntaxRewriter {
   import SymbolGenerator.symbol
   def doRewrite(node: AST): AST = node match {
     case Block(location, expressions) =>
-      Block(location, expressions.map{doRewrite})
+      def rewriteBlock(es: List[AST]): List[AST] = es match {
+        case ValDeclaration(location, variable, description, value, immutable) :: xs =>
+          List(LetDeclaration(location, variable, description, doRewrite(value), Block(location, rewriteBlock(xs)), immutable))
+        case x :: xs =>
+          doRewrite(x) :: rewriteBlock(xs)
+        case Nil =>
+          Nil
+      }
+      Block(location, rewriteBlock(expressions))
     case IfExpression(location, cond, pos, neg) =>
       IfExpression(location, doRewrite(cond), doRewrite(pos), doRewrite(neg))
     case WhileExpression(location, condition, body: AST) =>
@@ -25,20 +33,21 @@ class SyntaxRewriter {
       val itVariable = symbol()
       val location = e.location
       Block(location, List(
-        ValDeclaration(location, itVariable, None, MethodCall(location, doRewrite(collection), "iterator", List()), false),
-        WhileExpression(
-          location,
-          BinaryExpression(
+        LetDeclaration(
+          location, itVariable, None, MethodCall(location, doRewrite(collection), "iterator", List()),
+          WhileExpression(
             location,
-            Operator.EQUAL,
-            MethodCall(location, Identifier(location, itVariable), "hasNext", List()),
-            BooleanNode(location, true)
+            BinaryExpression(
+              location,
+              Operator.EQUAL,
+              MethodCall(location, Identifier(location, itVariable), "hasNext", List()),
+              BooleanNode(location, true)
+            ),
+            Block(location, List(
+              LetDeclaration(location, name, None, MethodCall(location, Identifier(location, itVariable), "next", List()), doRewrite(body), false)
+            ))
           ),
-          Block(location, List(
-            ValDeclaration(location, name, None, MethodCall(location, Identifier(location, itVariable), "next", List()), false),
-            body
-          ))
-        )
+          false)
       ))
     case BinaryExpression(location, operator, lhs, rhs) =>
       BinaryExpression(location, operator, doRewrite(lhs), doRewrite(rhs))
@@ -60,9 +69,11 @@ class SyntaxRewriter {
       Block(
         location,
         List(
-          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
-          SimpleAssignment(location, variable,
-            BinaryExpression(location, Operator.ADD, Identifier(location, variable), Identifier(location, generatedSymbol) )
+          LetDeclaration(location, generatedSymbol, None, rewritedValue,
+            SimpleAssignment(location, variable,
+              BinaryExpression(location, Operator.ADD, Identifier(location, variable), Identifier(location, generatedSymbol) )
+            ),
+            true
           )
         )
       )
@@ -72,9 +83,11 @@ class SyntaxRewriter {
       Block(
         location,
         List(
-          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
-          SimpleAssignment(location, variable,
-            BinaryExpression(location, Operator.SUBTRACT, Identifier(location, variable), Identifier(location, generatedSymbol) )
+          LetDeclaration(location, generatedSymbol, None, rewritedValue,
+            SimpleAssignment(location, variable,
+              BinaryExpression(location, Operator.SUBTRACT, Identifier(location, variable), Identifier(location, generatedSymbol) )
+            ),
+            true
           )
         )
       )
@@ -84,9 +97,11 @@ class SyntaxRewriter {
       Block(
         location,
         List(
-          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
-          SimpleAssignment(location, variable,
-            BinaryExpression(location, Operator.MULTIPLY, Identifier(location, variable), Identifier(location, generatedSymbol) )
+          LetDeclaration(location, generatedSymbol, None, rewritedValue,
+            SimpleAssignment(location, variable,
+              BinaryExpression(location, Operator.MULTIPLY, Identifier(location, variable), Identifier(location, generatedSymbol) )
+            ),
+            true
           )
         )
       )
@@ -96,9 +111,11 @@ class SyntaxRewriter {
       Block(
         location,
         List(
-          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
-          SimpleAssignment(location, variable,
-            BinaryExpression(location, Operator.DIVIDE, Identifier(location, variable), Identifier(location, generatedSymbol) )
+          LetDeclaration(location, generatedSymbol, None, rewritedValue,
+            SimpleAssignment(location, variable,
+              BinaryExpression(location, Operator.DIVIDE, Identifier(location, variable), Identifier(location, generatedSymbol) )
+            ),
+            true
           )
         )
       )
@@ -110,6 +127,7 @@ class SyntaxRewriter {
     case MapLiteral(location, elements) => MapLiteral(location, elements.map{ case (k, v) => (doRewrite(k), doRewrite(v))})
     case NewObject(location, className, params) => NewObject(location, className, params.map{doRewrite})
     case MethodCall(location ,self, name, params) => MethodCall(location, doRewrite(self), name, params.map{doRewrite})
+    case otherwise => throw RewriterPanic(otherwise.toString)
   }
 
 }
