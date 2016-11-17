@@ -146,9 +146,7 @@ class Typer {
     }
   }
   def doType(node: AST): TypedAST = {
-    val environment = mutable.Map.empty[String, TypeScheme]
-    environment ++= BuiltinEnvironment
-    typeCheck(node, TypeEnvironment(environment, mutable.Set.empty, None))
+    typeCheck(node, TypeEnvironment(BuiltinEnvironment, Set.empty, None))
   }
   private def typeCheck(node: AST, environment : TypeEnvironment): TypedAST = {
     node match {
@@ -204,22 +202,25 @@ class Typer {
           throw TyperException(s"${location.format} variable ${variable} is already defined")
         }
         val typedValue = typeCheck(value, environment)
-        val declaredType = optVariableType match {
+        val (updatedEnvironment, declaredType) = optVariableType match {
           case Some(variableType) =>
             if(isAssignableFrom(variableType, typedValue.description)) {
-              environment.variables(variable) = TypeScheme(List(), variableType)
-              variableType
+              if(immutable) {
+                (environment.updateImmuableVariable(variable, TypeScheme(List(), variableType)), variableType)
+              } else {
+                (environment.updateMutableVariable(variable, TypeScheme(List(), variableType)), variableType)
+              }
             } else {
               throw TyperException(s"${location.format} expected type: ${variableType}, but actual type: ${typedValue.description}")
             }
           case None =>
-            environment.variables(variable) = TypeScheme(List(), typedValue.description)
             if(immutable) {
-              environment.immutableVariables += variable
+              (environment.updateImmuableVariable(variable, TypeScheme(List(), typedValue.description)), typedValue.description)
+            } else {
+              (environment.updateMutableVariable(variable, TypeScheme(List(), typedValue.description)), typedValue.description)
             }
-            typedValue.description
         }
-        val typedBody = typeCheck(body, environment)
+        val typedBody = typeCheck(body, updatedEnvironment)
         TypedAST.LetDeclaration(declaredType, location, variable, optVariableType, typedValue, typedBody, immutable)
       case AST.ForeachExpression(location, variable, collection, body) =>
         val typedCollection = typeCheck(collection, environment)
@@ -229,8 +230,7 @@ class Typer {
         if(environment.variables.contains(variable)) {
           throw TyperException(s"${location.format} variable ${variable} is already defined")
         }
-        environment.variables(variable) = TypeScheme(List(), DynamicType)
-        val typedBody = typeCheck(body, environment)
+        val typedBody = typeCheck(body, environment.updateMutableVariable(variable, TypeScheme(List(), DynamicType)))
         TypedAST.ForeachExpression(UnitType, location, variable, typedCollection, typedBody)
       case AST.WhileExpression(location, condition, body) =>
         val typedCondition = typeCheck(condition, environment)
@@ -424,8 +424,8 @@ class Typer {
         }
         TypedAST.Identifier(resultType.description, location, name)
       case AST.FunctionLiteral(location, params, optionalType, proc) =>
-        val paramsMap = mutable.Map(params.map{p => p.name -> TypeScheme(List(), p.description)}:_*)
-        val paramsSet = mutable.Set(params.map{_.name}:_*)
+        val paramsMap = Map(params.map{p => p.name -> TypeScheme(List(), p.description)}:_*)
+        val paramsSet = Set(params.map{_.name}:_*)
         val newEnvironment = TypeEnvironment(paramsMap, paramsSet, Some(environment))
         val paramTypes = params.map{_.description}
         val typedProc = typeCheck(proc, newEnvironment)
@@ -436,11 +436,11 @@ class Typer {
         }
         val paramTypes = body.params.map{_.description}
         val returnType = body.optionalType.getOrElse(DynamicType)
-        environment.variables(name) = TypeScheme(List(), FunctionType(paramTypes, returnType))
-        val typedBody = typeCheck(body, environment).asInstanceOf[TypedAST.FunctionLiteral]
-        val typedCleanup = cleanup.map{c => typeCheck(c, environment)}
-        environment.variables(name) = TypeScheme(List(), FunctionType(typedBody.params.map{_.description}, typedBody.proc.description))
-        val typedExpression = typeCheck(expression, environment)
+        val updatedEnvironment = environment.updateMutableVariable(name, TypeScheme(List(), FunctionType(paramTypes, returnType)))
+        val typedBody = typeCheck(body, updatedEnvironment).asInstanceOf[TypedAST.FunctionLiteral]
+        val typedCleanup = cleanup.map{c => typeCheck(c, updatedEnvironment)}
+        //environment.variables(name) = TypeScheme(List(), FunctionType(typedBody.params.map{_.description}, typedBody.proc.description))
+        val typedExpression = typeCheck(expression, updatedEnvironment)
         TypedAST.LetFunctionDefinition(typedBody.description, location, name, typedBody, typedCleanup, typedExpression)
       case AST.FunctionCall(location, target, params) =>
         val typedTarget = typeCheck(target, environment)
