@@ -324,8 +324,9 @@ class Interpreter {evaluator =>
           env.set(vr, evalRecursive(value))
         case literal@TypedAST.FunctionLiteral(description, location, _, _, _) =>
           FunctionValue(literal, None, Some(env))
-        case TypedAST.FunctionDefinition(description, location, name, func, cleanup) =>
-          env(name) = FunctionValue(func, cleanup, Some(env)): Value
+        case TypedAST.LetFunctionDefinition(description, location, name, body, cleanup, expression) =>
+          env(name) = FunctionValue(body, cleanup, Some(env)): Value
+          evalRecursive(expression)
         case TypedAST.MethodCall(description, location, self, name, params) =>
           evalRecursive(self) match {
             case ObjectValue(value) =>

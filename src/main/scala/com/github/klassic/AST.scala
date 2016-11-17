@@ -80,7 +80,9 @@ object AST {
 
   case class FunctionLiteral(val location: Location, params: List[FormalParameter], optionalType: Option[TypeDescription], proc: AST) extends AST
 
-  case class FunctionDefinition(val location: Location, name: String, func: FunctionLiteral, cleanup: Option[AST]) extends AST
+  case class FunctionDefinition(val location: Location, name: String, body: FunctionLiteral, cleanup: Option[AST]) extends AST
+
+  case class LetFunctionDefinition(val location: Location, name: String, body: FunctionLiteral, cleanup: Option[AST], expression: AST) extends AST
 
   case class FunctionCall(val location: Location, func: AST, params: List[AST]) extends AST
 

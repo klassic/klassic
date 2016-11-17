@@ -19,6 +19,8 @@ class SyntaxRewriter {
       def rewriteBlock(es: List[AST]): List[AST] = es match {
         case ValDeclaration(location, variable, description, value, immutable) :: xs =>
           List(LetDeclaration(location, variable, description, doRewrite(value), Block(location, rewriteBlock(xs)), immutable))
+        case FunctionDefinition(loation, name, expression, cleanup) :: xs =>
+          List(LetFunctionDefinition(location, name, doRewrite(expression).asInstanceOf[AST.FunctionLiteral], cleanup.map(doRewrite), Block(location, rewriteBlock(xs))))
         case x :: xs =>
           doRewrite(x) :: rewriteBlock(xs)
         case Nil =>
@@ -121,7 +123,6 @@ class SyntaxRewriter {
       )
     case ValDeclaration(location, variable, optionalType, value, immutable) => ValDeclaration(location, variable, optionalType, doRewrite(value), immutable)
     case FunctionLiteral(location, params, optionalType, proc) => FunctionLiteral(location, params, optionalType, doRewrite(proc))
-    case FunctionDefinition(location, name, func, cleanup) => FunctionDefinition(location, name, doRewrite(func).asInstanceOf[FunctionLiteral], cleanup.map(doRewrite))
     case FunctionCall(location, func, params) => FunctionCall(location, doRewrite(func), params.map{doRewrite})
     case ListLiteral(location, elements) =>  ListLiteral(location, elements.map{doRewrite})
     case MapLiteral(location, elements) => MapLiteral(location, elements.map{ case (k, v) => (doRewrite(k), doRewrite(v))})

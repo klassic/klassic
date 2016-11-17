@@ -64,7 +64,7 @@ object TypedAST {
 
   case class FunctionLiteral(val description: TypeDescription, val location: Location, params: List[FormalParameter], optionalType: Option[TypeDescription], proc: TypedAST) extends TypedAST
 
-  case class FunctionDefinition(val description: TypeDescription, val location: Location, name: String, func: FunctionLiteral, cleanup: Option[TypedAST]) extends TypedAST
+  case class LetFunctionDefinition(val description: TypeDescription, val location: Location, name: String, body: FunctionLiteral, cleanup: Option[TypedAST], expression: TypedAST) extends TypedAST
 
   case class FunctionCall(val description: TypeDescription, val location: Location, func: TypedAST, params: List[TypedAST]) extends TypedAST
 

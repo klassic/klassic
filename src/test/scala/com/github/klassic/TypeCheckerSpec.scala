@@ -41,7 +41,7 @@ class TypeCheckerSpec extends SpecHelper {
 
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
       it(s"expectation  ${i}") {
-        assert(expected == I.evaluateString(in))
+        assertResult(expected)(I.evaluateString(in))
       }
     }
   }
