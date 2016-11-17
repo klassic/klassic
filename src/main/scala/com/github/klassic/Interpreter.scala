@@ -20,6 +20,7 @@ class Interpreter {evaluator =>
   }
   import SymbolGenerator.symbol
   val typer = new Typer
+  val rewriter = new SyntaxRewriter
   def reportError(message: String): Nothing = {
     throw InterpreterException(message)
   }
@@ -113,33 +114,6 @@ class Interpreter {evaluator =>
       Thread.sleep(milliseconds.value)
       UnitValue
     }
-    define("invoke"){ case ObjectValue(self)::ObjectValue(name:String)::params =>
-      val paramsArray = params.toArray
-      findMethod(self, name, paramsArray) match {
-        case UnboxedVersionMethodFound(method) =>
-          val actualParams = paramsArray.map{Value.fromKlassic}
-          Value.toKlassic(method.invoke(self, actualParams:_*))
-        case BoxedVersionMethodFound(method) =>
-          val actualParams = paramsArray.map{Value.fromKlassic}
-          Value.toKlassic(method.invoke(self, actualParams:_*))
-        case NoMethodFound =>
-          throw new IllegalArgumentException(s"invoke(${self}, ${name}, ${params})")
-      }
-    }
-    define("newObject") { case ObjectValue(className:java.lang.String)::params =>
-      val paramsArray = params.toArray
-      findConstructor(Class.forName(className), paramsArray) match {
-        case UnboxedVersionConstructorFound(constructor) =>
-          val actualParams = paramsArray.map{Value.fromKlassic}
-          Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
-        case BoxedVersionConstructorFound(constructor) =>
-          val actualParams = paramsArray.map{Value.fromKlassic}
-          Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
-        case NoConstructorFound =>
-          throw new IllegalArgumentException(s"newObject(${className}, ${params}")
-      }
-    }
-
   }
 
   def evaluateFile(file: File): Value = using(new BufferedReader(new InputStreamReader(new FileInputStream(file)))){in =>
@@ -149,7 +123,7 @@ class Interpreter {evaluator =>
   def evaluateString(program: String, fileName: String = "<no file>"): Value = {
     val parser = new Parser
     parser.parse(program) match {
-      case parser.Success(node: AST, _) => evaluate(typer.doType(rewrite(node)))
+      case parser.Success(node: AST, _) => evaluate(typer.doType(rewriter.doRewrite(node)))
       case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
       case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
     }
@@ -162,103 +136,6 @@ class Interpreter {evaluator =>
       case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
       case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
     }
-  }
-
-  def rewrite(node: AST): AST = node match {
-    case Block(location, expressions) => Block(location, expressions.map{rewrite})
-    case IfExpression(location, cond, pos, neg) =>
-      IfExpression(location, rewrite(cond), rewrite(pos), rewrite(neg))
-    case WhileExpression(location, condition, body: AST) =>
-      WhileExpression(location, rewrite(condition), rewrite(body))
-    case e@ForeachExpression(location, name, collection, body) =>
-      val itVariable = symbol()
-      val location = e.location
-      Block(location, List(
-        ValDeclaration(location, itVariable, None, MethodCall(location, rewrite(collection), "iterator", List()), false),
-        WhileExpression(
-          location,
-          BinaryExpression(
-            location,
-            Operator.EQUAL,
-            MethodCall(location, Identifier(location, itVariable), "hasNext", List()),
-            BooleanNode(location, true)
-          ),
-          Block(location, List(
-            ValDeclaration(location, name, None, MethodCall(location, Identifier(location, itVariable), "next", List()), false),
-            body
-          ))
-        )
-      ))
-    case BinaryExpression(location, operator, lhs, rhs) =>
-      BinaryExpression(location, operator, rewrite(lhs), rewrite(rhs))
-    case MinusOp(location, operand) => MinusOp(location, rewrite(operand))
-    case PlusOp(location, operand) => PlusOp(location, rewrite(operand))
-    case literal@StringNode(location, value) => literal
-    case literal@IntNode(location, value) => literal
-    case literal@LongNode(location, value)  => literal
-    case literal@ShortNode(location, value) => literal
-    case literal@ByteNode(location, value) => literal
-    case literal@BooleanNode(location, value) => literal
-    case literal@DoubleNode(location, value) => literal
-    case literal@FloatNode(lcation, value) => literal
-    case node@Identifier(_, name) => node
-    case SimpleAssignment(location, variable, value) => SimpleAssignment(location, variable, rewrite(value))
-    case PlusAssignment(location, variable, value) =>
-      val generatedSymbol = symbol()
-      val rewritedValue = rewrite(value)
-      Block(
-        location,
-        List(
-          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
-          SimpleAssignment(location, variable,
-            BinaryExpression(location, Operator.ADD, Identifier(location, variable), Identifier(location, generatedSymbol) )
-          )
-        )
-      )
-    case MinusAssignment(location, variable, value) =>
-      val generatedSymbol = symbol()
-      val rewritedValue = rewrite(value)
-      Block(
-        location,
-        List(
-          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
-          SimpleAssignment(location, variable,
-            BinaryExpression(location, Operator.SUBTRACT, Identifier(location, variable), Identifier(location, generatedSymbol) )
-          )
-        )
-      )
-    case MultiplicationAssignment(location, variable, value) =>
-      val generatedSymbol = symbol()
-      val rewritedValue = rewrite(value)
-      Block(
-        location,
-        List(
-          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
-          SimpleAssignment(location, variable,
-            BinaryExpression(location, Operator.MULTIPLY, Identifier(location, variable), Identifier(location, generatedSymbol) )
-          )
-        )
-      )
-    case DivisionAssignment(location, variable, value) =>
-      val generatedSymbol = symbol()
-      val rewritedValue = rewrite(value)
-      Block(
-        location,
-        List(
-          ValDeclaration(location, generatedSymbol, None, rewritedValue, true),
-          SimpleAssignment(location, variable,
-            BinaryExpression(location, Operator.DIVIDE, Identifier(location, variable), Identifier(location, generatedSymbol) )
-          )
-        )
-      )
-    case ValDeclaration(location, variable, optionalType, value, immutable) => ValDeclaration(location, variable, optionalType, rewrite(value), immutable)
-    case FunctionLiteral(location, params, optionalType, proc) => FunctionLiteral(location, params, optionalType, rewrite(proc))
-    case FunctionDefinition(location, name, func, cleanup) => FunctionDefinition(location, name, rewrite(func).asInstanceOf[FunctionLiteral], cleanup.map(rewrite))
-    case FunctionCall(location, func, params) => FunctionCall(location, rewrite(func), params.map{rewrite})
-    case ListLiteral(location, elements) =>  ListLiteral(location, elements.map{rewrite})
-    case MapLiteral(location, elements) => MapLiteral(location, elements.map{ case (k, v) => (rewrite(k), rewrite(v))})
-    case NewObject(location, className, params) => NewObject(location, className, params.map{rewrite})
-    case MethodCall(location ,self, name, params) => MethodCall(location, rewrite(self), name, params.map{rewrite})
   }
 
   private def evaluate(node: TypedAST): Value = evaluate(node, BuiltinEnvironment)
