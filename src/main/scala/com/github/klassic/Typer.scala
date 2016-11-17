@@ -132,7 +132,7 @@ class Typer {
     case (FunctionType(t1, t2), FunctionType(u1, u2)) =>
       (t1 zip u1).foldLeft(s){ case (s, (t, u)) => mgu(t, u, s)}
     case (TypeConstructor(k1, ts), TypeConstructor(k2, us)) if k1 == k2 =>
-      (ts zip us).foldLeft(s){(s, tu) => mgu(tu._1, tu._2, s)}
+      (ts zip us).foldLeft(s){ case (s, (t, u)) => mgu(t, u, s)}
     case _ =>
       throw TyperException("cannot unify " + s(t) + " with " + s(u))
   }
