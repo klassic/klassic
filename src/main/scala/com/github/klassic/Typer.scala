@@ -138,19 +138,15 @@ class Typer {
   }
 
 
-  def typeOf(environment: Environment, e: AST): TypeDescription = {
+  def typeOf(e: AST, environment: Environment = BuiltinEnvironment): TypeDescription = {
     val a = newTypeVariable()
-    tp(environment, e, a, EmptySubstitution).apply(a)
-  }
-
-  def showType(e: AST): String = {
     try {
-      typeOf(BuiltinEnvironment, e).toString
-    } catch {
-      case TyperException(msg) =>
-        "\n cannot type: " + current + "\n reason: " + msg
+      tp(environment, e, a, EmptySubstitution).apply(a)
+    }catch {
+      case TyperException(msg) => throw TyperException("\n cannot type: " + current + "\n reason: " + msg)
     }
   }
+
 
   var current: AST = null
   def tp(env: Environment, e: AST, t: TypeDescription, s: Substitution): Substitution = {
