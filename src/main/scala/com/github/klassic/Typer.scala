@@ -8,15 +8,23 @@ import scala.collection.mutable
   * Created by kota_mizushima on 2016/06/02.
   */
 class Typer {
-  val BuiltinEnvironment: Map[String, TypeScheme] = Map(
-    "substring" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType, IntType), DynamicType)),
-    "at" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType), DynamicType)),
-    "matches" -> TypeScheme(List(), FunctionType(List(DynamicType, DynamicType), BooleanType)),
-    "thread" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), DynamicType)),
-    "println" ->  TypeScheme(List(), FunctionType(List(DynamicType), UnitType)),
-    "stopwatch" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), IntType)),
-    "sleep" -> TypeScheme(List(), FunctionType(List(IntType), UnitType))
-  )
+  def listOf(tp: TypeDescription): TypeConstructor = {
+    TypeConstructor("List", List(tp))
+  }
+  val BuiltinEnvironment: Map[String, TypeScheme] = {
+    val a = newTypeVariable()
+    Map(
+      "substring" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType, IntType), DynamicType)),
+      "at" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType), DynamicType)),
+      "matches" -> TypeScheme(List(), FunctionType(List(DynamicType, DynamicType), BooleanType)),
+      "thread" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), DynamicType)),
+      "println" ->  TypeScheme(List(), FunctionType(List(DynamicType), UnitType)),
+      "stopwatch" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), IntType)),
+      "sleep" -> TypeScheme(List(), FunctionType(List(IntType), UnitType)),
+      "head" -> TypeScheme(List(), FunctionType(List(listOf(a)), a)),
+      "tail" -> TypeScheme(List(), FunctionType(List(listOf(a)), listOf(a)))
+    )
+  }
 
   def newInstanceFrom(scheme: TypeScheme): TypeDescription = {
     scheme.typeVariables.foldLeft(EmptySubstitution)((s, tv) => s.extend(tv, newTypeVariable())).apply(scheme.description)
