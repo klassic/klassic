@@ -130,7 +130,7 @@ class Typer {
     case (DynamicType, DynamicType) =>
       s
     case (FunctionType(t1, t2), FunctionType(u1, u2)) =>
-      (t1 zip u1).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
+      unify(t2, u2, (t1 zip u1).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)})
     case (TypeConstructor(k1, ts), TypeConstructor(k2, us)) if k1 == k2 =>
       (ts zip us).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
     case _ =>
