@@ -104,8 +104,12 @@ class Parser extends RegexParsers {
     "class", "def", "val", "mutable", "=", "==", "=>", "new", "&&", "||"
   )
 
-  def typeAnnotation: Parser[TypeDescription] = COLON ~> (
-    token("Byte") ^^ {_ => ByteType}
+
+  def typeAnnotation: Parser[TypeDescription] = COLON ~> typeDescription
+
+  def typeDescription: Parser[TypeDescription] = (
+    ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
+  | token("Byte") ^^ {_ => ByteType}
   | token("Short")  ^^ {_ => ShortType}
   | token("Int")  ^^ {_ => IntType}
   | token("Long")  ^^ {_ => LongType}
