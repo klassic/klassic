@@ -64,6 +64,24 @@ class Typer {
   def typeVariables(t: TypeDescription): List[TypeVariable] = t match {
     case tv @ TypeVariable(a) =>
       List(tv)
+    case IntType =>
+      Nil
+    case ShortType =>
+      Nil
+    case ByteType =>
+      Nil
+    case LongType =>
+      Nil
+    case FloatType =>
+      Nil
+    case DoubleType =>
+      Nil
+    case BooleanType =>
+      Nil
+    case UnitType =>
+      Nil
+    case DynamicType =>
+      Nil
     case FunctionType(t1, t2) =>
       t1.flatMap{typeVariables} union typeVariables(t2)
     case TypeConstructor(k, ts) =>
@@ -85,6 +103,24 @@ class Typer {
       s.extend(TypeVariable(a), u)
     case (_, TypeVariable(a)) =>
       mgu(u, t, s)
+    case (IntType, IntType) =>
+      s
+    case (ShortType, ShortType) =>
+      s
+    case (ByteType, ByteType) =>
+      s
+    case (LongType, LongType) =>
+      s
+    case (FloatType, FloatType) =>
+      s
+    case (DoubleType, DoubleType) =>
+      s
+    case (BooleanType, BooleanType) =>
+      s
+    case (UnitType, UnitType) =>
+      s
+    case (DynamicType, DynamicType) =>
+      s
     case (FunctionType(t1, t2), FunctionType(u1, u2)) =>
       (t1 zip u1).foldLeft(s){ case (s, (t, u)) => mgu(t, u, s)}
     case (TypeConstructor(k1, ts), TypeConstructor(k2, us)) if k1 == k2 =>
