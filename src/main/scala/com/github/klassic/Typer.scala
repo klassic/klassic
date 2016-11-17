@@ -430,7 +430,7 @@ class Typer {
         val paramTypes = params.map{_.description}
         val typedProc = typeCheck(proc, newEnvironment)
         TypedAST.FunctionLiteral(FunctionType(paramTypes, typedProc.description), location, params, optionalType, typedProc)
-      case AST.FunctionDefinition(location, name, body, cleanup) =>
+      case AST.LetFunctionDefinition(location, name, body, cleanup, expression) =>
         if(environment.variables.contains(name)) {
           throw new InterruptedException(s"${location.format} function ${name} is already defined")
         }
@@ -440,7 +440,8 @@ class Typer {
         val typedBody = typeCheck(body, environment).asInstanceOf[TypedAST.FunctionLiteral]
         val typedCleanup = cleanup.map{c => typeCheck(c, environment)}
         environment.variables(name) = TypeScheme(List(), FunctionType(typedBody.params.map{_.description}, typedBody.proc.description))
-        TypedAST.FunctionDefinition(typedBody.description, location, name, typedBody, typedCleanup)
+        val typedExpression = typeCheck(expression, environment)
+        TypedAST.LetFunctionDefinition(typedBody.description, location, name, typedBody, typedCleanup, typedExpression)
       case AST.FunctionCall(location, target, params) =>
         val typedTarget = typeCheck(target, environment)
         val functionType: FunctionType = typedTarget.description match {
