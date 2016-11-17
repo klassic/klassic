@@ -317,8 +317,9 @@ class Interpreter {evaluator =>
           }
           ObjectValue(newMap)
         case TypedAST.Identifier(description, location, name) => env(name)
-        case TypedAST.ValDeclaration(description, location, vr, optVariableType, value, immutable) =>
+        case TypedAST.LetDeclaration(description, location, vr, optVariableType, value, body, immutable) =>
           env(vr) = evalRecursive(value)
+          evalRecursive(body)
         case TypedAST.Assignment(description, location, vr, value) =>
           env.set(vr, evalRecursive(value))
         case literal@TypedAST.FunctionLiteral(description, location, _, _, _) =>

@@ -199,7 +199,7 @@ class Typer {
           else
             TypedAST.IfExpression(posTyped.description, location, typedCondition, posTyped, negTyped)
         }
-      case AST.ValDeclaration(location, variable, optVariableType, value, immutable) =>
+      case AST.LetDeclaration(location, variable, optVariableType, value, body, immutable) =>
         if(environment.variables.contains(variable)) {
           throw TyperException(s"${location.format} variable ${variable} is already defined")
         }
@@ -219,7 +219,8 @@ class Typer {
             }
             typedValue.description
         }
-        TypedAST.ValDeclaration(declaredType, location, variable, optVariableType, typedValue, immutable)
+        val typedBody = typeCheck(body, environment)
+        TypedAST.LetDeclaration(declaredType, location, variable, optVariableType, typedValue, typedBody, immutable)
       case AST.ForeachExpression(location, variable, collection, body) =>
         val typedCollection = typeCheck(collection, environment)
         if(!isAssignableFrom(typedCollection.description, DynamicType)) {

@@ -135,7 +135,7 @@ class ExpressionSpec extends SpecHelper {
 
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
       it(s"expectations ${i}") {
-        assert(expected == I.evaluateString(in))
+        assertResult(expected)(I.evaluateString(in))
       }
     }
   }
