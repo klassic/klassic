@@ -104,13 +104,13 @@ class Typer {
     environment.foldLeft(List[TypeVariable]()) { (tvs, nt) => tvs union typeVariables(nt._2) }
   }
 
-  def mgu(t: TypeDescription, u: TypeDescription, s: Substitution): Substitution = (s(t), s(u)) match {
+  def unify(t: TypeDescription, u: TypeDescription, s: Substitution): Substitution = (s(t), s(u)) match {
     case (TypeVariable(a), TypeVariable(b)) if a == b =>
       s
     case (TypeVariable(a), _) if !(typeVariables(u) contains a) =>
       s.extend(TypeVariable(a), u)
     case (_, TypeVariable(a)) =>
-      mgu(u, t, s)
+      unify(u, t, s)
     case (IntType, IntType) =>
       s
     case (ShortType, ShortType) =>
@@ -130,9 +130,9 @@ class Typer {
     case (DynamicType, DynamicType) =>
       s
     case (FunctionType(t1, t2), FunctionType(u1, u2)) =>
-      (t1 zip u1).foldLeft(s){ case (s, (t, u)) => mgu(t, u, s)}
+      (t1 zip u1).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
     case (TypeConstructor(k1, ts), TypeConstructor(k2, us)) if k1 == k2 =>
-      (ts zip us).foldLeft(s){ case (s, (t, u)) => mgu(t, u, s)}
+      (ts zip us).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
     case _ =>
       throw TyperException("cannot unify " + s(t) + " with " + s(u))
   }
@@ -155,13 +155,13 @@ class Typer {
       case AST.Identifier(location, x) =>
         lookup(x, env) match {
           case None => throw TyperException("undefined: " + x)
-          case Some(u) => mgu(newInstanceFrom(u), t, s)
+          case Some(u) => unify(newInstanceFrom(u), t, s)
         }
       case AST.FunctionLiteral(location, x, optionalType, e1) =>
         val b = newTypeVariable()
         val ts = x.map{_ => newTypeVariable()}
         val as = (x zip ts).map{ case (p, t) => p.name -> TypeScheme(List(), t) }
-        val s1 = mgu(t, FunctionType(ts, b), s)
+        val s1 = unify(t, FunctionType(ts, b), s)
         val env1 = env ++ as
         tp(env1, e1, b, s1)
       case AST.FunctionCall(location, e1, e2) =>
