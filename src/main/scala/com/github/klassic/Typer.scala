@@ -37,7 +37,7 @@ class Typer {
   val EmptySubstitution: Substitution = new Substitution(Map.empty)
   class Substitution(val map: Map[TypeVariable, TypeDescription]) extends Function1[TypeDescription, TypeDescription] {
     def lookup(x: TypeVariable): TypeDescription = {
-      map.get(x).getOrElse(x)
+      map.getOrElse(x, x)
     }
 
     def apply(t: TypeDescription): TypeDescription = t match {
@@ -135,6 +135,49 @@ class Typer {
       (ts zip us).foldLeft(s){(s, tu) => mgu(tu._1, tu._2, s)}
     case _ =>
       throw TyperException("cannot unify " + s(t) + " with " + s(u))
+  }
+
+
+  def typeOf(environment: Environment, e: AST): TypeDescription = {
+    val a = newTypeVariable()
+    tp(environment, e, a, EmptySubstitution).apply(a)
+  }
+
+  def showType(e: AST): String = {
+    try {
+      typeOf(BuiltinEnvironment, e).toString
+    } catch {
+      case TyperException(msg) =>
+        "\n cannot type: " + current + "\n reason: " + msg
+    }
+  }
+
+  var current: AST = null
+  def tp(env: Environment, e: AST, t: TypeDescription, s: Substitution): Substitution = {
+    current = e
+    e match {
+      case AST.Identifier(location, x) =>
+        lookup(x, env) match {
+          case None => throw TyperException("undefined: " + x)
+          case Some(u) => mgu(newInstanceFrom(u), t, s)
+        }
+      case AST.FunctionLiteral(location, x, optionalType, e1) =>
+        val b = newTypeVariable()
+        val ts = x.map{_ => newTypeVariable()}
+        val as = (x zip ts).map{ case (p, t) => p.name -> TypeScheme(List(), t) }
+        val s1 = mgu(t, FunctionType(ts, b), s)
+        val env1 = env ++ as
+        tp(env1, e1, b, s1)
+      case AST.FunctionCall(location, e1, e2) =>
+        val a = newTypeVariable()
+        val ts = e2.map{_ => newTypeVariable()}
+        val s1 = tp(env, e1, FunctionType(ts, t), s)
+        e2.foldLeft(s1){(s, e) => tp(env, e, a, s)}
+      case AST.LetDeclaration(location, x, optionalType, e1, e2, immutable) =>
+        val a = newTypeVariable()
+        val s1 = tp(env, e1, a, s)
+        tp(env + (x -> generate(s1(a), env)), e2, t, s1)
+    }
   }
 
   def isAssignableFrom(expectedType: TypeDescription, actualType: TypeDescription): Boolean = {

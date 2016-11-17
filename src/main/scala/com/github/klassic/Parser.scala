@@ -121,7 +121,6 @@ class Parser extends RegexParsers {
   | token("Double")  ^^ {_ => DoubleType}
   | token("Boolean")  ^^ {_ => BooleanType}
   | token("Unit") ^^ {_ => UnitType}
-  | token("?") ^^ {_ => UnknownType}
   | token("*") ^^ {_ => DynamicType}
   )
 
