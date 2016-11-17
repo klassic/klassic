@@ -65,7 +65,7 @@ class Typer {
     case None => None
   }
 
-  def generate(t: TypeDescription, environment: Environment): TypeScheme = {
+  def generalize(t: TypeDescription, environment: Environment): TypeScheme = {
     TypeScheme(typeVariables(t) diff typeVariables(environment), t)
   }
 
@@ -172,7 +172,7 @@ class Typer {
       case AST.LetDeclaration(location, x, optionalType, e1, e2, immutable) =>
         val a = newTypeVariable()
         val s1 = tp(env, e1, a, s)
-        tp(env + (x -> generate(s1(a), env)), e2, t, s1)
+        tp(env + (x -> generalize(s1(a), env)), e2, t, s1)
     }
   }
 
