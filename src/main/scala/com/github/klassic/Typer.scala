@@ -149,12 +149,12 @@ class Typer {
 
   def tp(env: Environment, e: AST, t: TypeDescription, s: Substitution): Substitution = {
     e match {
-      case AST.Identifier(location, x) =>
+      case AST.Id(location, x) =>
         lookup(x, env) match {
           case None => throw TyperException("undefined: " + x)
           case Some(u) => unify(newInstanceFrom(u), t, s)
         }
-      case AST.FunctionLiteral(location, x, optionalType, e1) =>
+      case AST.Lambda(location, x, optionalType, e1) =>
         val b = newTypeVariable()
         val ts = x.map{_ => newTypeVariable()}
         val as = (x zip ts).map{ case (p, t) => p.name -> TypeScheme(List(), t) }
@@ -180,11 +180,11 @@ class Typer {
         val ts = e2.map{_ => newTypeVariable()}
         val s1 = tp(env, e1, FunctionType(ts, t), s)
         e2.foldLeft(s1){(s, e) => tp(env, e, a, s)}
-      case AST.LetDeclaration(location, x, optionalType, e1, e2, immutable) =>
+      case AST.Let(location, x, optionalType, e1, e2, immutable) =>
         val a = optionalType.getOrElse(newTypeVariable())
         val s1 = tp(env, e1, a, s)
         tp(env + (x -> generalize(s1(a), env)), e2, t, s1)
-      case AST.LetFunctionDefinition(location, name, body, cleanup, expression) =>
+      case AST.LetRec(location, name, body, cleanup, expression) =>
         ???
     }
   }
@@ -254,7 +254,7 @@ class Typer {
           else
             TypedAST.IfExpression(posTyped.description, location, typedCondition, posTyped, negTyped)
         }
-      case AST.LetDeclaration(location, variable, optVariableType, value, body, immutable) =>
+      case AST.Let(location, variable, optVariableType, value, body, immutable) =>
         if(environment.variables.contains(variable)) {
           throw TyperException(s"${location.format} variable ${variable} is already defined")
         }
@@ -474,20 +474,20 @@ class Typer {
         TypedAST.PlusOp(resultType, location, typedOperand)
       case AST.StringNode(location, value) =>
         TypedAST.StringNode(DynamicType, location, value)
-      case AST.Identifier(location, name) =>
+      case AST.Id(location, name) =>
         val resultType = environment.lookup(name) match {
           case None => throw TyperException(s"${location.format} variable '${name}' is not found")
           case Some(description) => description
         }
         TypedAST.Identifier(resultType.description, location, name)
-      case AST.FunctionLiteral(location, params, optionalType, proc) =>
+      case AST.Lambda(location, params, optionalType, proc) =>
         val paramsMap = Map(params.map{p => p.name -> TypeScheme(List(), p.optionalType.getOrElse(DynamicType))}:_*)
         val paramsSet = Set(params.map{_.name}:_*)
         val newEnvironment = TypeEnvironment(paramsMap, paramsSet, Some(environment))
         val paramTypes = params.map{_.optionalType.getOrElse(DynamicType)}
         val typedProc = doType(proc, newEnvironment, substitution)
         TypedAST.FunctionLiteral(FunctionType(paramTypes, typedProc.description), location, params, optionalType, typedProc)
-      case AST.LetFunctionDefinition(location, name, body, cleanup, expression) =>
+      case AST.LetRec(location, name, body, cleanup, expression) =>
         if(environment.variables.contains(name)) {
           throw new InterruptedException(s"${location.format} function ${name} is already defined")
         }
