@@ -58,6 +58,12 @@ class Typer {
       case TypeConstructor(name, args) => TypeConstructor(name, args.map{arg => apply(arg)})
     }
 
+    def apply(env: Environment): Environment = {
+      env.map { case (x, ts) =>
+          x -> TypeScheme(typeVariables(ts), this.apply(ts.description))
+      }
+    }
+
     def extend(tv: TypeVariable, td: TypeDescription): Substitution = new Substitution(this.map + (tv -> td))
   }
 
@@ -139,7 +145,7 @@ class Typer {
     case _ =>
       throw TyperException(
         s"""
-           | cannot unify ${s(t)} with $s(u)
+           | cannot unify ${s(t)} with ${s(u)}
            | location: ${current.location.format}
          """.stripMargin
       )
@@ -208,21 +214,6 @@ class Typer {
         val (posTyped, newSub2) = doType(pos, env, typ, newSub1)
         val (negTyped, newSub3) = doType(neg, env, typ, newSub2)
         (TypedAST.IfExpression(newSub3(typ), location, typedCondition, posTyped, negTyped), newSub3)
-      case AST.Let(location, variable, optionalType, value, body, immutable) =>
-        if(env.variables.contains(variable)) {
-          throw TyperException(s"${location.format} variable $variable is already defined")
-        }
-        val a = optionalType.getOrElse(newTypeVariable())
-        val (typedValue, s1) = doType(value, env, a, s0)
-        val gen = generalize(s1(a), env.variables)
-        val declaredType = s1(a)
-        val newEnv = if(immutable) {
-          env.updateImmuableVariable(variable, generalize(declaredType, env.variables))
-        } else {
-          env.updateMutableVariable(variable, generalize(declaredType, env.variables))
-        }
-        val (typedBody, s2) = doType(body, newEnv, typ, s1)
-        (TypedAST.LetDeclaration(typedBody.description, location, variable, declaredType, typedValue, typedBody, immutable), s2)
       case AST.WhileExpression(location, condition, body) =>
         val a = newTypeVariable()
         val b = newTypeVariable()
@@ -580,26 +571,41 @@ class Typer {
         val env1 = as.foldLeft(env) { case (env, (name, scheme)) => env.updateImmuableVariable(name, scheme)}
         val (typedBody, s2) = doType(body, env1, b, s1)
         (TypedAST.FunctionLiteral(s2(typ), location, params, optionalType, typedBody), s2)
-      case AST.LetRec(location, x, e1, cleanup, e2) =>
-        if(env.variables.contains(x)) {
-          throw new InterruptedException(s"${location.format} function ${x} is already defined")
+      case AST.Let(location, variable, optionalType, value, body, immutable) =>
+        if(env.variables.contains(variable)) {
+          throw TyperException(s"${location.format} variable $variable is already defined")
+        }
+        val a = optionalType.getOrElse(newTypeVariable())
+        val (typedValue, s1) = doType(value, env, a, s0)
+        val gen = generalize(s1(a), env.variables)
+        val declaredType = s1(a)
+        val newEnv = if(immutable) {
+          env.updateImmuableVariable(variable, generalize(declaredType, env.variables))
+        } else {
+          env.updateMutableVariable(variable, generalize(declaredType, env.variables))
+        }
+        val (typedBody, s2) = doType(body, newEnv, typ, s1)
+        (TypedAST.LetDeclaration(typedBody.description, location, variable, declaredType, typedValue, typedBody, immutable), s2)
+      case AST.LetRec(location, variable, value, cleanup, body) =>
+        if(env.variables.contains(variable)) {
+          throw new InterruptedException(s"${location.format} function ${variable} is already defined")
         }
         val a = newTypeVariable()
-        val (typedE1, s1) = doType(e1, env.updateImmuableVariable(x, generalize(a, env.variables)), a, s0)
-        val (typedE2, s2) = doType(e2, env.updateImmuableVariable(x, generalize(s1(a), env.variables)), typ, s1)
         val b = newTypeVariable()
-        val (typedCleanup, s3) = cleanup.map{c => doType(c, env, b, s2)} match {
+        val (typedE1, s1) = doType(value, env.updateImmuableVariable(variable, TypeScheme(List(), a)), b, s0)
+        val s2 = unify(a, b, s1)
+        val (typedE2, s3) = doType(body, env.updateImmuableVariable(variable, generalize(s2(a), s2(env.variables))), typ, s2)
+        val (typedCleanup, s4) = cleanup.map{c => doType(c, env, b, s3)} match {
           case Some((c, s)) => (Some(c), s)
-          case None => (None, s2)
+          case None => (None, s3)
         }
-        (TypedAST.LetFunctionDefinition(typedE2.description, location, x, typedE1.asInstanceOf[TypedAST.FunctionLiteral], typedCleanup, typedE2), s3)
+        (TypedAST.LetFunctionDefinition(typedE2.description, location, variable, typedE1.asInstanceOf[TypedAST.FunctionLiteral], typedCleanup, typedE2), s4)
       case AST.FunctionCall(location, e1, ps) =>
         val t2 = ps.map{_ => newTypeVariable()}
         val (typedTarget, s1) = doType(e1, env, FunctionType(t2, typ), s0)
         val (tparams, s2) = (ps zip t2).foldLeft((Nil:List[TypedAST], s1)){ case ((tparams, s), (e, t)) =>
           val (tparam, sx) = doType(e, env, t, s)
-          val sy = unify(t, tparam.description, sx)
-          (tparam::tparams, sy)
+          (tparam::tparams, sx)
         }
         (TypedAST.FunctionCall(s2(typ), location, typedTarget, tparams.reverse), s2)
         /*
