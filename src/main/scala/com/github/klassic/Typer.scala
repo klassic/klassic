@@ -176,16 +176,18 @@ class Typer {
       case AST.BooleanNode(location, value) =>
         unify(t, BooleanType, s)
       case AST.FunctionCall(location, e1, e2) =>
-        val a = newTypeVariable()
-        val ts = e2.map{_ => newTypeVariable()}
-        val s1 = tp(env, e1, FunctionType(ts, t), s)
-        e2.foldLeft(s1){(s, e) => tp(env, e, a, s)}
+        val t2 = e2.map{_ => newTypeVariable()}
+        val s1 = tp(env, e1, FunctionType(t2, t), s)
+        (e2 zip t2).foldLeft(s1){ case (s, (e, t)) => tp(env, e, t, s)}
       case AST.Let(location, x, optionalType, e1, e2, immutable) =>
         val a = optionalType.getOrElse(newTypeVariable())
         val s1 = tp(env, e1, a, s)
         tp(env + (x -> generalize(s1(a), env)), e2, t, s1)
-      case AST.LetRec(location, name, body, cleanup, expression) =>
-        ???
+      case AST.LetRec(location, x, e1, cleanup, e2) =>
+        val a = newTypeVariable()
+        val b = x -> generalize(a, env)
+        val s1 = tp(env + (x -> generalize(a, env)), e1, a, s)
+        tp(env + (x -> generalize(s1(a), env)), e2, t, s1)
     }
   }
 

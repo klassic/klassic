@@ -95,7 +95,7 @@ object AST {
 
   case class FunctionDefinition(location: Location, name: String, body: Lambda, cleanup: Option[AST]) extends AST
 
-  case class LetRec(location: Location, name: String, body: Lambda, cleanup: Option[AST], expression: AST) extends AST
+  case class LetRec(location: Location, name: String, e1: Lambda, cleanup: Option[AST], e2: AST) extends AST
   object LetRec {
     def apply(name: String, body: Lambda, expression: AST): LetRec = {
       LetRec(NoLocation, name, body, None, expression)
