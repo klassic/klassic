@@ -309,9 +309,9 @@ class Parser extends RegexParsers {
     }
   }
 
-  def ident :Parser[Identifier] = (% ~ """[A-Za-z_][a-zA-Z0-9]*""".r^? {
+  def ident :Parser[Id] = (% ~ """[A-Za-z_][a-zA-Z0-9]*""".r^? {
     case r@(_ ~ n) if !KEYWORDS(n) => r
-  } ^^ {case location ~ name => Identifier(location, name)}) <~ SPACING_WITHOUT_LF
+  } ^^ {case location ~ name => Id(location, name)}) <~ SPACING_WITHOUT_LF
 
   def assignment: Parser[Assignment] = ident ~ CL(PLUSEQ | MINUSEQ | ASTEREQ | SLASHEQ | EQ) ~ expression ^^ {
     case v ~ "=" ~ value => SimpleAssignment(v.location, v.name, value)
@@ -330,7 +330,7 @@ class Parser extends RegexParsers {
   // anonnymousFunction ::= "(" [param {"," param}] ")" "=>" expression
   def anonymousFunction():Parser[AST] = % ~ opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ (opt(typeAnnotation) <~ CL(ARROW)) ~ expression ^^ {
     case location ~ Some(params) ~ optionalType ~ body =>
-      FunctionLiteral(
+      Lambda(
         location,
         params.map {
           case name ~ Some(description) => FormalParameter(name.name, Some(description))
@@ -339,7 +339,7 @@ class Parser extends RegexParsers {
         optionalType,
         body
       )
-    case location ~ None ~ optionalType ~ body => FunctionLiteral(location, List(), optionalType, body)
+    case location ~ None ~ optionalType ~ body => Lambda(location, List(), optionalType, body)
   }
 
   // newObject ::= "new" fqcn "(" [param {"," param} ")"
@@ -363,7 +363,7 @@ class Parser extends RegexParsers {
       FunctionDefinition(
         location,
         functionName.name,
-        FunctionLiteral(body.location, ps, optionalType, body),
+        Lambda(body.location, ps, optionalType, body),
         cleanup
       )
   }
