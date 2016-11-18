@@ -153,67 +153,6 @@ class Typer {
     s(a)
   }
 
-
-  private def tp(env: Environment, e: AST, t: TypeDescription, s: Substitution): Substitution = {
-    e match {
-      case AST.Id(location, x) =>
-        lookup(x, env) match {
-          case None => throw TyperException("undefined: " + x)
-          case Some(u) => unify(newInstanceFrom(u), t, s)
-        }
-      case AST.Lambda(location, x, optionalType, e1) =>
-        val b = newTypeVariable()
-        val ts = x.map{_ => newTypeVariable()}
-        val as = (x zip ts).map{ case (p, t) => p.name -> TypeScheme(List(), t) }
-        val s1 = unify(t, FunctionType(ts, b), s)
-        val env1 = env ++ as
-        tp(env1, e1, b, s1)
-      case AST.ByteNode(location, value) =>
-        unify(t, ByteType, s)
-      case AST.ShortNode(location, value) =>
-        unify(t, ShortType, s)
-      case AST.IntNode(location, value) =>
-        unify(t, IntType, s)
-      case AST.LongNode(location, value) =>
-        unify(t, LongType, s)
-      case AST.FloatNode(location, value) =>
-        unify(t, FloatType, s)
-      case AST.DoubleNode(location, value) =>
-        unify(t, DoubleType, s)
-      case AST.BooleanNode(location, value) =>
-        unify(t, BooleanType, s)
-      case AST.FunctionCall(location, e1, e2) =>
-        val t2 = e2.map{_ => newTypeVariable()}
-        val s1 = tp(env, e1, FunctionType(t2, t), s)
-        (e2 zip t2).foldLeft(s1){ case (s, (e, t)) => tp(env, e, t, s)}
-      case AST.Let(location, x, optionalType, e1, e2, immutable) =>
-        val a = optionalType.getOrElse(newTypeVariable())
-        val s1 = tp(env, e1, a, s)
-        tp(env + (x -> generalize(s1(a), env)), e2, t, s1)
-      case AST.LetRec(location, x, e1, cleanup, e2) =>
-        val a = newTypeVariable()
-        val b = x -> generalize(a, env)
-        val s1 = tp(env + (x -> generalize(a, env)), e1, a, s)
-        tp(env + (x -> generalize(s1(a), env)), e2, t, s1)
-    }
-  }
-
-  def isAssignableFrom(expectedType: TypeDescription, actualType: TypeDescription): Boolean = {
-    if(expectedType == ErrorType || actualType == ErrorType) {
-      false
-    } else if(expectedType == DynamicType) {
-      true
-    } else if(actualType == DynamicType) {
-      true
-    } else {
-      (expectedType, actualType) match {
-        case (x:FunctionType, y:FunctionType) =>
-          x.paramTypes.length == y.paramTypes.length && x.paramTypes.zip(y.paramTypes).forall { case (a, b) => isAssignableFrom(a, b) } && isAssignableFrom(x.returnType, y.returnType)
-        case otherwise =>
-          expectedType == actualType
-      }
-    }
-  }
   var current: AST = null
   def doType(e: AST, env: TypeEnvironment, typ: TypeDescription, s0: Substitution): (TypedAST, Substitution) = {
     current = e
@@ -654,12 +593,13 @@ class Typer {
           case None => (None, s2)
         }
         (TypedAST.LetFunctionDefinition(typedE2.description, location, x, typedE1.asInstanceOf[TypedAST.FunctionLiteral], typedCleanup, typedE2), s3)
-      case AST.FunctionCall(location, e, ps) =>
+      case AST.FunctionCall(location, e1, ps) =>
         val t2 = ps.map{_ => newTypeVariable()}
-        val (typedTarget, s1) = doType(e, env, FunctionType(t2, typ), s0)
+        val (typedTarget, s1) = doType(e1, env, FunctionType(t2, typ), s0)
         val (tparams, s2) = (ps zip t2).foldLeft((Nil:List[TypedAST], s1)){ case ((tparams, s), (e, t)) =>
           val (tparam, sx) = doType(e, env, t, s)
-          (tparam::tparams, sx)
+          val sy = unify(t, tparam.description, sx)
+          (tparam::tparams, sy)
         }
         (TypedAST.FunctionCall(s2(typ), location, typedTarget, tparams.reverse), s2)
         /*
