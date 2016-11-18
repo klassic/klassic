@@ -54,6 +54,7 @@ class Typer {
       case BooleanType => BooleanType
       case UnitType => UnitType
       case DynamicType => DynamicType
+      case ErrorType => ErrorType
       case TypeConstructor(name, args) => TypeConstructor(name, args.map{arg => apply(arg)})
     }
 
@@ -89,6 +90,8 @@ class Typer {
     case UnitType =>
       Nil
     case DynamicType =>
+      Nil
+    case ErrorType =>
       Nil
     case FunctionType(t1, t2) =>
       t1.flatMap{typeVariables} union typeVariables(t2)
@@ -129,7 +132,7 @@ class Typer {
       s
     case (DynamicType, DynamicType) =>
       s
-    case (FunctionType(t1, t2), FunctionType(u1, u2)) =>
+    case (FunctionType(t1, t2), FunctionType(u1, u2)) if t1.size == u1.size =>
       unify(t2, u2, (t1 zip u1).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)})
     case (TypeConstructor(k1, ts), TypeConstructor(k2, us)) if k1 == k2 =>
       (ts zip us).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
@@ -164,15 +167,31 @@ class Typer {
         val s1 = unify(t, FunctionType(ts, b), s)
         val env1 = env ++ as
         tp(env1, e1, b, s1)
+      case AST.ByteNode(location, value) =>
+        unify(t, ByteType, s)
+      case AST.ShortNode(location, value) =>
+        unify(t, ShortType, s)
+      case AST.IntNode(location, value) =>
+        unify(t, IntType, s)
+      case AST.LongNode(location, value) =>
+        unify(t, LongType, s)
+      case AST.FloatNode(location, value) =>
+        unify(t, FloatType, s)
+      case AST.DoubleNode(location, value) =>
+        unify(t, DoubleType, s)
+      case AST.BooleanNode(location, value) =>
+        unify(t, BooleanType, s)
       case AST.FunctionCall(location, e1, e2) =>
         val a = newTypeVariable()
         val ts = e2.map{_ => newTypeVariable()}
         val s1 = tp(env, e1, FunctionType(ts, t), s)
         e2.foldLeft(s1){(s, e) => tp(env, e, a, s)}
       case AST.LetDeclaration(location, x, optionalType, e1, e2, immutable) =>
-        val a = newTypeVariable()
+        val a = optionalType.getOrElse(newTypeVariable())
         val s1 = tp(env, e1, a, s)
         tp(env + (x -> generalize(s1(a), env)), e2, t, s1)
+      case AST.LetFunctionDefinition(location, name, body, cleanup, expression) =>
+        ???
     }
   }
 
