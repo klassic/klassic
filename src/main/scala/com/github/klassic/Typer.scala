@@ -137,7 +137,12 @@ class Typer {
     case (TypeConstructor(k1, ts), TypeConstructor(k2, us)) if k1 == k2 =>
       (ts zip us).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
     case _ =>
-      throw TyperException("cannot unify " + s(t) + " with " + s(u))
+      throw TyperException(
+        s"""
+           | cannot unify ${s(t)} with $s(u)
+           | location: ${current.location.format}
+         """.stripMargin
+      )
   }
 
 
@@ -209,7 +214,9 @@ class Typer {
       }
     }
   }
+  var current: AST = null
   def doType(e: AST, env: TypeEnvironment, typ: TypeDescription, s0: Substitution): (TypedAST, Substitution) = {
+    current = e
     e match {
       case AST.Block(location, expressions) =>
         expressions match {
@@ -258,7 +265,7 @@ class Typer {
             (TypedAST.Assignment(variableType.description, location, variable, typedValue), s2)
         }
       case AST.IfExpression(location, cond, pos, neg) =>
-        val (typedCondition, newSub1) = doType(e, env, BooleanType, s0)
+        val (typedCondition, newSub1) = doType(cond, env, BooleanType, s0)
         val (posTyped, newSub2) = doType(pos, env, typ, newSub1)
         val (negTyped, newSub3) = doType(neg, env, typ, newSub2)
         (TypedAST.IfExpression(newSub3(typ), location, typedCondition, posTyped, negTyped), newSub3)
@@ -647,10 +654,10 @@ class Typer {
           case None => (None, s2)
         }
         (TypedAST.LetFunctionDefinition(typedE2.description, location, x, typedE1.asInstanceOf[TypedAST.FunctionLiteral], typedCleanup, typedE2), s3)
-      case AST.FunctionCall(location, target, params) =>
-        val t2 = params.map{_ => newTypeVariable()}
-        val (typedTarget, s1) = doType(target, env, FunctionType(t2, typ), s0)
-        val (tparams, s2) = (params zip t2).foldLeft((Nil:List[TypedAST], s1)){ case ((tparams, s), (e, t)) =>
+      case AST.FunctionCall(location, e, ps) =>
+        val t2 = ps.map{_ => newTypeVariable()}
+        val (typedTarget, s1) = doType(e, env, FunctionType(t2, typ), s0)
+        val (tparams, s2) = (ps zip t2).foldLeft((Nil:List[TypedAST], s1)){ case ((tparams, s), (e, t)) =>
           val (tparam, sx) = doType(e, env, t, s)
           (tparam::tparams, sx)
         }
