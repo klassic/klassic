@@ -207,28 +207,36 @@ class Typer {
       }
     }
   }
-  def doType(node: AST, environment: TypeEnvironment, substitution: Substitution): TypedAST = {
-    def typeCheck(node: AST): TypedAST = node match {
+  def doType(e: AST, env: TypeEnvironment, sub: Substitution): TypedAST = {
+    def typeCheck(e: AST): TypedAST = e match {
       case AST.Block(location, expressions) =>
         expressions match {
-          case Nil => TypedAST.Block(UnitType, location, Nil)
+          case Nil =>
+            TypedAST.Block(UnitType, location, Nil)
           case x::xs =>
             val typedX = typeCheck(x)
             val reversedTypedElements = xs.foldLeft(typedX::Nil){(a, e) => typeCheck(e)::a}
             TypedAST.Block(reversedTypedElements.head.description, location, reversedTypedElements.reverse)
         }
-      case AST.IntNode(location, value) => TypedAST.IntNode(IntType, location, value)
-      case AST.ShortNode(location, value) => TypedAST.ShortNode(ShortType, location, value)
-      case AST.ByteNode(location, value) => TypedAST.ByteNode(ByteType, location, value)
-      case AST.LongNode(location, value) => TypedAST.LongNode(LongType, location, value)
-      case AST.FloatNode(location, value) => TypedAST.FloatNode(FloatType, location, value)
-      case AST.DoubleNode(location, value) => TypedAST.DoubleNode(DoubleType, location, value)
-      case AST.BooleanNode(location, value) => TypedAST.BooleanNode(BooleanType, location, value)
+      case AST.IntNode(location, value) =>
+        TypedAST.IntNode(IntType, location, value)
+      case AST.ShortNode(location, value) =>
+        TypedAST.ShortNode(ShortType, location, value)
+      case AST.ByteNode(location, value) =>
+        TypedAST.ByteNode(ByteType, location, value)
+      case AST.LongNode(location, value) =>
+        TypedAST.LongNode(LongType, location, value)
+      case AST.FloatNode(location, value) =>
+        TypedAST.FloatNode(FloatType, location, value)
+      case AST.DoubleNode(location, value) =>
+        TypedAST.DoubleNode(DoubleType, location, value)
+      case AST.BooleanNode(location, value) =>
+        TypedAST.BooleanNode(BooleanType, location, value)
       case AST.SimpleAssignment(location, variable, value) =>
-        if(environment.immutableVariables.contains(variable)) {
+        if(env.immutableVariables.contains(variable)) {
           throw TyperException(s"${location.format} variable '${variable}' cannot change")
         }
-        val result = environment.lookup(variable) match {
+        val result = env.lookup(variable) match {
           case None =>
             throw new TyperException(s"${location.format} variable ${variable} is not defined")
           case Some(variableType) =>
@@ -257,7 +265,7 @@ class Typer {
             TypedAST.IfExpression(posTyped.description, location, typedCondition, posTyped, negTyped)
         }
       case AST.Let(location, variable, optVariableType, value, body, immutable) =>
-        if(environment.variables.contains(variable)) {
+        if(env.variables.contains(variable)) {
           throw TyperException(s"${location.format} variable ${variable} is already defined")
         }
         val typedValue = typeCheck(value)
@@ -265,31 +273,31 @@ class Typer {
           case Some(variableType) =>
             if(isAssignableFrom(variableType, typedValue.description)) {
               if(immutable) {
-                (environment.updateImmuableVariable(variable, TypeScheme(List(), variableType)), variableType)
+                (env.updateImmuableVariable(variable, TypeScheme(List(), variableType)), variableType)
               } else {
-                (environment.updateMutableVariable(variable, TypeScheme(List(), variableType)), variableType)
+                (env.updateMutableVariable(variable, TypeScheme(List(), variableType)), variableType)
               }
             } else {
               throw TyperException(s"${location.format} expected type: ${variableType}, but actual type: ${typedValue.description}")
             }
           case None =>
             if(immutable) {
-              (environment.updateImmuableVariable(variable, TypeScheme(List(), typedValue.description)), typedValue.description)
+              (env.updateImmuableVariable(variable, TypeScheme(List(), typedValue.description)), typedValue.description)
             } else {
-              (environment.updateMutableVariable(variable, TypeScheme(List(), typedValue.description)), typedValue.description)
+              (env.updateMutableVariable(variable, TypeScheme(List(), typedValue.description)), typedValue.description)
             }
         }
-        val typedBody = doType(body, updatedEnvironment, substitution)
+        val typedBody = doType(body, updatedEnvironment, sub)
         TypedAST.LetDeclaration(declaredType, location, variable, optVariableType, typedValue, typedBody, immutable)
       case AST.ForeachExpression(location, variable, collection, body) =>
         val typedCollection = typeCheck(collection)
         if(!isAssignableFrom(typedCollection.description, DynamicType)) {
           throw TyperException(s"${location.format} expression should be DynamicType")
         }
-        if(environment.variables.contains(variable)) {
+        if(env.variables.contains(variable)) {
           throw TyperException(s"${location.format} variable ${variable} is already defined")
         }
-        val typedBody = doType(body, environment.updateMutableVariable(variable, TypeScheme(List(), DynamicType)), substitution)
+        val typedBody = doType(body, env.updateMutableVariable(variable, TypeScheme(List(), DynamicType)), sub)
         TypedAST.ForeachExpression(UnitType, location, variable, typedCollection, typedBody)
       case AST.WhileExpression(location, condition, body) =>
         val typedCondition = typeCheck(condition)
@@ -477,7 +485,7 @@ class Typer {
       case AST.StringNode(location, value) =>
         TypedAST.StringNode(DynamicType, location, value)
       case AST.Id(location, name) =>
-        val resultType = environment.lookup(name) match {
+        val resultType = env.lookup(name) match {
           case None => throw TyperException(s"${location.format} variable '${name}' is not found")
           case Some(description) => description
         }
@@ -485,21 +493,21 @@ class Typer {
       case AST.Lambda(location, params, optionalType, proc) =>
         val paramsMap = Map(params.map{p => p.name -> TypeScheme(List(), p.optionalType.getOrElse(DynamicType))}:_*)
         val paramsSet = Set(params.map{_.name}:_*)
-        val newEnvironment = TypeEnvironment(paramsMap, paramsSet, Some(environment))
+        val newEnvironment = TypeEnvironment(paramsMap, paramsSet, Some(env))
         val paramTypes = params.map{_.optionalType.getOrElse(DynamicType)}
-        val typedProc = doType(proc, newEnvironment, substitution)
+        val typedProc = doType(proc, newEnvironment, sub)
         TypedAST.FunctionLiteral(FunctionType(paramTypes, typedProc.description), location, params, optionalType, typedProc)
       case AST.LetRec(location, name, body, cleanup, expression) =>
-        if(environment.variables.contains(name)) {
+        if(env.variables.contains(name)) {
           throw new InterruptedException(s"${location.format} function ${name} is already defined")
         }
         val paramTypes = body.params.map{_.optionalType.getOrElse(DynamicType)}
         val returnType = body.optionalType.getOrElse(DynamicType)
-        val updatedEnvironment = environment.updateMutableVariable(name, TypeScheme(List(), FunctionType(paramTypes, returnType)))
-        val typedBody = doType(body, updatedEnvironment, substitution).asInstanceOf[TypedAST.FunctionLiteral]
-        val typedCleanup = cleanup.map{c => doType(c, updatedEnvironment, substitution)}
+        val updatedEnvironment = env.updateMutableVariable(name, TypeScheme(List(), FunctionType(paramTypes, returnType)))
+        val typedBody = doType(body, updatedEnvironment, sub).asInstanceOf[TypedAST.FunctionLiteral]
+        val typedCleanup = cleanup.map{c => doType(c, updatedEnvironment, sub)}
         //environment.variables(name) = TypeScheme(List(), FunctionType(typedBody.params.map{_.description}, typedBody.proc.description))
-        val typedExpression = doType(expression, updatedEnvironment, substitution)
+        val typedExpression = doType(expression, updatedEnvironment, sub)
         TypedAST.LetFunctionDefinition(typedBody.description, location, name, typedBody, typedCleanup, typedExpression)
       case AST.FunctionCall(location, target, params) =>
         val typedTarget = typeCheck(target)
@@ -542,6 +550,6 @@ class Typer {
       case otherwise =>
         throw TyperPanic(otherwise.toString)
     }
-    typeCheck(node)
+    typeCheck(e)
   }
 }
