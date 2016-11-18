@@ -215,8 +215,8 @@ class Parser extends RegexParsers {
     case target ~ castings => castings.foldLeft(target){ case (e, location ~ description) => Casting(location, e, description)}
   }
 
-  //primary ::= ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AST] = ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
+  //primary ::= booleanLiteral | ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | "(" expression ")" | "{" lines "}"
+  def primary: Parser[AST] = booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def integerLiteral : Parser[AST] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix} | "S" ^^ { _ => ShortSuffix }) ^^ {

@@ -18,7 +18,7 @@ class Typer {
       "at" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType), DynamicType)),
       "matches" -> TypeScheme(List(), FunctionType(List(DynamicType, DynamicType), BooleanType)),
       "thread" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), DynamicType)),
-      "println" ->  TypeScheme(List(), FunctionType(List(DynamicType), UnitType)),
+      "println" ->  TypeScheme(List(TypeVariable("x")), FunctionType(List(TypeVariable("x")), UnitType)),
       "stopwatch" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), IntType)),
       "sleep" -> TypeScheme(List(), FunctionType(List(IntType), UnitType)),
       "head" -> TypeScheme(List(), FunctionType(List(listOf(a)), a)),
@@ -143,11 +143,13 @@ class Typer {
 
   def typeOf(e: AST, environment: Environment = BuiltinEnvironment): TypeDescription = {
     val a = newTypeVariable()
-    tp(environment, e, a, EmptySubstitution).apply(a)
+    val r = new SyntaxRewriter
+    val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, None), a, EmptySubstitution)
+    s(a)
   }
 
 
-  def tp(env: Environment, e: AST, t: TypeDescription, s: Substitution): Substitution = {
+  private def tp(env: Environment, e: AST, t: TypeDescription, s: Substitution): Substitution = {
     e match {
       case AST.Id(location, x) =>
         lookup(x, env) match {
@@ -207,325 +209,453 @@ class Typer {
       }
     }
   }
-  def doType(e: AST, env: TypeEnvironment, sub: Substitution): TypedAST = {
-    def typeCheck(e: AST): TypedAST = e match {
+  def doType(e: AST, env: TypeEnvironment, typ: TypeDescription, s0: Substitution): (TypedAST, Substitution) = {
+    e match {
       case AST.Block(location, expressions) =>
         expressions match {
           case Nil =>
-            TypedAST.Block(UnitType, location, Nil)
+            (TypedAST.Block(UnitType, location, Nil), s0)
+          case x::Nil =>
+            val (typedX, newSub) = doType(x, env, typ, s0)
+            (TypedAST.Block(newSub(typ), location, typedX::Nil), newSub)
           case x::xs =>
-            val typedX = typeCheck(x)
-            val reversedTypedElements = xs.foldLeft(typedX::Nil){(a, e) => typeCheck(e)::a}
-            TypedAST.Block(reversedTypedElements.head.description, location, reversedTypedElements.reverse)
+            val result = doType(x, env, typ, s0)
+            val reversedTypedElements = xs.foldLeft(result::Nil){(a, e) => doType(e, env, typ, s0)::a}
+            val (hdTypd, newSub) = reversedTypedElements.head
+            (TypedAST.Block(newSub(typ), location, reversedTypedElements.map{_._1}.reverse), newSub)
         }
       case AST.IntNode(location, value) =>
-        TypedAST.IntNode(IntType, location, value)
+        val newSub = unify(typ, IntType, s0)
+        (TypedAST.IntNode(newSub(typ), location, value), newSub)
       case AST.ShortNode(location, value) =>
-        TypedAST.ShortNode(ShortType, location, value)
+        val newSub = unify(typ, ShortType, s0)
+        (TypedAST.ShortNode(newSub(typ), location, value), newSub)
       case AST.ByteNode(location, value) =>
-        TypedAST.ByteNode(ByteType, location, value)
+        val newSub = unify(typ, ByteType, s0)
+        (TypedAST.ByteNode(newSub(typ), location, value), newSub)
       case AST.LongNode(location, value) =>
-        TypedAST.LongNode(LongType, location, value)
+        val newSub = unify(typ, LongType, s0)
+        (TypedAST.LongNode(newSub(typ), location, value), newSub)
       case AST.FloatNode(location, value) =>
-        TypedAST.FloatNode(FloatType, location, value)
+        val newSub = unify(typ, FloatType, s0)
+        (TypedAST.FloatNode(newSub(typ), location, value), newSub)
       case AST.DoubleNode(location, value) =>
-        TypedAST.DoubleNode(DoubleType, location, value)
+        val newSub = unify(typ, DoubleType, s0)
+        (TypedAST.DoubleNode(newSub(typ), location, value), newSub)
       case AST.BooleanNode(location, value) =>
-        TypedAST.BooleanNode(BooleanType, location, value)
+        val newSub = unify(typ, BooleanType, s0)
+        (TypedAST.BooleanNode(newSub(typ), location, value), newSub)
       case AST.SimpleAssignment(location, variable, value) =>
         if(env.immutableVariables.contains(variable)) {
-          throw TyperException(s"${location.format} variable '${variable}' cannot change")
+          throw TyperException(s"${location.format} variable '$variable' cannot change")
         }
-        val result = env.lookup(variable) match {
+        env.lookup(variable) match {
           case None =>
-            throw new TyperException(s"${location.format} variable ${variable} is not defined")
+            throw TyperException(s"${location.format} variable $variable is not defined")
           case Some(variableType) =>
-            val typedValue = typeCheck(value)
-            if(!isAssignableFrom(variableType.description, typedValue.description)) {
-              throw new TyperException(s"${value.location.format} expected type: ${variableType}, actual type: ${typedValue.description}")
-            }
-            TypedAST.Assignment(variableType.description, location, variable, typedValue)
+            val (typedValue, s1) = doType(value, env, typ, s0)
+            val s2 = unify(variableType.description, typedValue.description, s1)
+            (TypedAST.Assignment(variableType.description, location, variable, typedValue), s2)
         }
-        result
       case AST.IfExpression(location, cond, pos, neg) =>
-        val typedCondition = typeCheck(cond)
-        if(typedCondition.description != BooleanType) {
-          throw TyperException(s"${cond.location.format} condition type must be Boolean, actual: ${typedCondition.description}")
+        val (typedCondition, newSub1) = doType(e, env, BooleanType, s0)
+        val (posTyped, newSub2) = doType(pos, env, typ, newSub1)
+        val (negTyped, newSub3) = doType(neg, env, typ, newSub2)
+        (TypedAST.IfExpression(newSub3(typ), location, typedCondition, posTyped, negTyped), newSub3)
+      case AST.Let(location, variable, optionalType, value, body, immutable) =>
+        if(env.variables.contains(variable)) {
+          throw TyperException(s"${location.format} variable $variable is already defined")
+        }
+        val a = optionalType.getOrElse(newTypeVariable())
+        val (typedValue, s1) = doType(value, env, a, s0)
+        val gen = generalize(s1(a), env.variables)
+        val declaredType = s1(a)
+        val newEnv = if(immutable) {
+          env.updateImmuableVariable(variable, generalize(declaredType, env.variables))
         } else {
-          val posTyped = typeCheck(pos)
-          val negTyped = typeCheck(neg)
-          if(!isAssignableFrom(posTyped.description, negTyped.description)) {
-            throw new TyperException(s"${pos.location.format} type ${posTyped.description} and type ${negTyped.description} is incomparable")
-          }
-          if(posTyped.description == DynamicType)
-            TypedAST.IfExpression(DynamicType, location, typedCondition, posTyped, negTyped)
-          else if(negTyped.description == DynamicType)
-            TypedAST.IfExpression(DynamicType, location, typedCondition, posTyped, negTyped)
-          else
-            TypedAST.IfExpression(posTyped.description, location, typedCondition, posTyped, negTyped)
+          env.updateMutableVariable(variable, generalize(declaredType, env.variables))
         }
-      case AST.Let(location, variable, optVariableType, value, body, immutable) =>
-        if(env.variables.contains(variable)) {
-          throw TyperException(s"${location.format} variable ${variable} is already defined")
-        }
-        val typedValue = typeCheck(value)
-        val (updatedEnvironment, declaredType) = optVariableType match {
-          case Some(variableType) =>
-            if(isAssignableFrom(variableType, typedValue.description)) {
-              if(immutable) {
-                (env.updateImmuableVariable(variable, TypeScheme(List(), variableType)), variableType)
-              } else {
-                (env.updateMutableVariable(variable, TypeScheme(List(), variableType)), variableType)
-              }
-            } else {
-              throw TyperException(s"${location.format} expected type: ${variableType}, but actual type: ${typedValue.description}")
-            }
-          case None =>
-            if(immutable) {
-              (env.updateImmuableVariable(variable, TypeScheme(List(), typedValue.description)), typedValue.description)
-            } else {
-              (env.updateMutableVariable(variable, TypeScheme(List(), typedValue.description)), typedValue.description)
-            }
-        }
-        val typedBody = doType(body, updatedEnvironment, sub)
-        TypedAST.LetDeclaration(declaredType, location, variable, optVariableType, typedValue, typedBody, immutable)
-      case AST.ForeachExpression(location, variable, collection, body) =>
-        val typedCollection = typeCheck(collection)
-        if(!isAssignableFrom(typedCollection.description, DynamicType)) {
-          throw TyperException(s"${location.format} expression should be DynamicType")
-        }
-        if(env.variables.contains(variable)) {
-          throw TyperException(s"${location.format} variable ${variable} is already defined")
-        }
-        val typedBody = doType(body, env.updateMutableVariable(variable, TypeScheme(List(), DynamicType)), sub)
-        TypedAST.ForeachExpression(UnitType, location, variable, typedCollection, typedBody)
+        val (typedBody, s2) = doType(body, newEnv, typ, s1)
+        (TypedAST.LetDeclaration(typedBody.description, location, variable, declaredType, typedValue, typedBody, immutable), s2)
       case AST.WhileExpression(location, condition, body) =>
-        val typedCondition = typeCheck(condition)
+        val a = newTypeVariable()
+        val b = newTypeVariable()
+        val c = newTypeVariable()
+        val (typedCondition, s1) = doType(condition, env, a, s0)
         if(typedCondition.description != BooleanType) {
           throw TyperException(s"${location.format} condition type must be Boolean, actual: ${typedCondition.description}")
         } else {
-          val typedBody = typeCheck(body)
-          TypedAST.WhileExpression(UnitType, location, typedCondition, typedBody)
+          val (typedBody, s2) = doType(body, env, b, s1)
+          val s3 = unify(UnitType, typ, s2)
+          (TypedAST.WhileExpression(UnitType, location, typedCondition, typedBody), s3)
         }
-      case AST.BinaryExpression(location, Operator.EQUAL, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        if(isAssignableFrom(typedLhs.description, typedRhs.description)) {
-          TypedAST.BinaryExpression(BooleanType, location, Operator.EQUAL, typedLhs, typedRhs)
-        } else {
-          throw TyperException(s"${location.format} expected type: ${typedLhs.description}, actual type: ${typedRhs.description}")
+      case AST.BinaryExpression(location, Operator.EQUAL, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2(a), s2(b)) match {
+          case (IntType, IntType) =>
+            (BooleanType, s2)
+          case (LongType, LongType) =>
+            (BooleanType, s2)
+          case (ShortType, ShortType) =>
+            (BooleanType, s2)
+          case (ByteType, ByteType) =>
+            (BooleanType, s2)
+          case (FloatType, FloatType) =>
+            (BooleanType, s2)
+          case (DoubleType, DoubleType) =>
+            (BooleanType, s2)
+          case (DynamicType, DynamicType) =>
+            (BooleanType, s2)
+          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+            (BooleanType, unify(x, y, s2))
+          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+            (BooleanType, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(IntType, ltype, s2)
+            val s4 = unify(IntType, rtype, s3)
+            (BooleanType, s4)
         }
-      case AST.BinaryExpression(location, Operator.LESS_THAN, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        val resultType = (typedLhs.description, typedRhs.description) match{
-          case (IntType, IntType) => BooleanType
-          case (LongType, LongType) => BooleanType
-          case (ShortType, ShortType) => BooleanType
-          case (ByteType, ByteType) => BooleanType
-          case (FloatType, FloatType) => BooleanType
-          case (DoubleType, DoubleType) => BooleanType
-          case (lType, DynamicType) => BooleanType
-          case (DynamicType, rtype) => BooleanType
-          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
+        val s4 = unify(BooleanType, typ, s3)
+        (TypedAST.BinaryExpression(resultType, location, Operator.EQUAL, typedLhs, typedRhs), s4)
+      case AST.BinaryExpression(location, Operator.LESS_THAN, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2(a), s2(b)) match {
+          case (IntType, IntType) =>
+            (BooleanType, s2)
+          case (LongType, LongType) =>
+            (BooleanType, s2)
+          case (ShortType, ShortType) =>
+            (BooleanType, s2)
+          case (ByteType, ByteType) =>
+            (BooleanType, s2)
+          case (FloatType, FloatType) =>
+            (BooleanType, s2)
+          case (DoubleType, DoubleType) =>
+            (BooleanType, s2)
+          case (DynamicType, DynamicType) =>
+            (BooleanType, s2)
+          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+            (BooleanType, unify(x, y, s2))
+          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+            (BooleanType, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(IntType, ltype, s2)
+            val s4 = unify(IntType, rtype, s3)
+            (BooleanType, s4)
         }
-        TypedAST.BinaryExpression(resultType, location, Operator.LESS_THAN, typedLhs, typedRhs)
-      case AST.BinaryExpression(location, Operator.GREATER_THAN, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        val resultType = (typedLhs.description, typedRhs.description) match{
-          case (IntType, IntType) => BooleanType
-          case (LongType, LongType) => BooleanType
-          case (ShortType, ShortType) => BooleanType
-          case (ByteType, ByteType) => BooleanType
-          case (FloatType, FloatType) => BooleanType
-          case (DoubleType, DoubleType) => BooleanType
-          case (lType, DynamicType) => BooleanType
-          case (DynamicType, rtype) => BooleanType
-          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
+        val s4 = unify(BooleanType, typ, s3)
+        (TypedAST.BinaryExpression(resultType, location, Operator.LESS_THAN, typedLhs, typedRhs), s4)
+      case AST.BinaryExpression(location, Operator.GREATER_THAN, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2(a), s2(b)) match {
+          case (IntType, IntType) =>
+            (BooleanType, s2)
+          case (LongType, LongType) =>
+            (BooleanType, s2)
+          case (ShortType, ShortType) =>
+            (BooleanType, s2)
+          case (ByteType, ByteType) =>
+            (BooleanType, s2)
+          case (FloatType, FloatType) =>
+            (BooleanType, s2)
+          case (DoubleType, DoubleType) =>
+            (BooleanType, s2)
+          case (DynamicType, DynamicType) =>
+            (BooleanType, s2)
+          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+            (BooleanType, unify(x, y, s2))
+          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+            (BooleanType, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(IntType, ltype, s2)
+            val s4 = unify(IntType, rtype, s3)
+            (BooleanType, s4)
         }
-        TypedAST.BinaryExpression(resultType, location, Operator.GREATER_THAN, typedLhs, typedRhs)
-      case AST.BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        val resultType = (typedLhs.description, typedRhs.description) match{
-          case (IntType, IntType) => BooleanType
-          case (LongType, LongType) => BooleanType
-          case (ShortType, ShortType) => BooleanType
-          case (ByteType, ByteType) => BooleanType
-          case (FloatType, FloatType) => BooleanType
-          case (DoubleType, DoubleType) => BooleanType
-          case (lType, DynamicType) => BooleanType
-          case (DynamicType, rtype) => BooleanType
-          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
+        val s4 = unify(BooleanType, typ, s3)
+        (TypedAST.BinaryExpression(resultType, location, Operator.GREATER_THAN, typedLhs, typedRhs), s4)
+      case AST.BinaryExpression(location, Operator.LESS_OR_EQUAL, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2(a), s2(b)) match {
+          case (IntType, IntType) =>
+            (BooleanType, s2)
+          case (LongType, LongType) =>
+            (BooleanType, s2)
+          case (ShortType, ShortType) =>
+            (BooleanType, s2)
+          case (ByteType, ByteType) =>
+            (BooleanType, s2)
+          case (FloatType, FloatType) =>
+            (BooleanType, s2)
+          case (DoubleType, DoubleType) =>
+            (BooleanType, s2)
+          case (DynamicType, DynamicType) =>
+            (BooleanType, s2)
+          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+            (BooleanType, unify(x, y, s2))
+          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+            (BooleanType, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(IntType, ltype, s2)
+            val s4 = unify(IntType, rtype, s3)
+            (BooleanType, s4)
         }
-        TypedAST.BinaryExpression(resultType, location, Operator.LESS_OR_EQUAL, typedLhs, typedRhs)
-      case AST.BinaryExpression(location, Operator.GREATER_EQUAL, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        val resultType = (typedLhs.description, typedRhs.description) match{
-          case (IntType, IntType) => BooleanType
-          case (LongType, LongType) => BooleanType
-          case (ShortType, ShortType) => BooleanType
-          case (ByteType, ByteType) => BooleanType
-          case (FloatType, FloatType) => BooleanType
-          case (DoubleType, DoubleType) => BooleanType
-          case (lType, DynamicType) => BooleanType
-          case (DynamicType, rtype) => BooleanType
-          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
+        val s4 = unify(BooleanType, typ, s3)
+        (TypedAST.BinaryExpression(resultType, location, Operator.LESS_OR_EQUAL, typedLhs, typedRhs), s4)
+      case AST.BinaryExpression(location, Operator.GREATER_EQUAL, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2(a), s2(b)) match {
+          case (IntType, IntType) =>
+            (BooleanType, s2)
+          case (LongType, LongType) =>
+            (BooleanType, s2)
+          case (ShortType, ShortType) =>
+            (BooleanType, s2)
+          case (ByteType, ByteType) =>
+            (BooleanType, s2)
+          case (FloatType, FloatType) =>
+            (BooleanType, s2)
+          case (DoubleType, DoubleType) =>
+            (BooleanType, s2)
+          case (DynamicType, DynamicType) =>
+            (BooleanType, s2)
+          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+            (BooleanType, unify(x, y, s2))
+          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+            (BooleanType, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(IntType, ltype, s2)
+            val s4 = unify(IntType, rtype, s3)
+            (BooleanType, s4)
         }
-        TypedAST.BinaryExpression(resultType, location, Operator.GREATER_EQUAL, typedLhs, typedRhs)
-      case AST.BinaryExpression(location, Operator.ADD, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        val resultType = (typedLhs.description, typedRhs.description) match{
-          case (IntType, IntType) => IntType
-          case (LongType, LongType) => LongType
-          case (ShortType, ShortType) => ShortType
-          case (ByteType, ByteType) => ByteType
-          case (FloatType, FloatType) => FloatType
-          case (DoubleType, DoubleType) => DoubleType
-          case (lType, DynamicType) => lType
-          case (DynamicType, rtype) => rtype
-          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
+        val s4 = unify(BooleanType, typ, s3)
+        (TypedAST.BinaryExpression(resultType, location, Operator.GREATER_EQUAL, typedLhs, typedRhs), s4)
+      case AST.BinaryExpression(location, Operator.ADD, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2(a), s2(b)) match {
+          case (IntType, IntType) =>
+            (IntType, s2)
+          case (LongType, LongType) =>
+            (LongType, s2)
+          case (ShortType, ShortType) =>
+            (ShortType, s2)
+          case (ByteType, ByteType) =>
+            (ByteType, s2)
+          case (FloatType, FloatType) =>
+            (FloatType, s2)
+          case (DoubleType, DoubleType) =>
+            (DoubleType, s2)
+          case (DynamicType, DynamicType) =>
+            (DynamicType, s2)
+          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+            (y, unify(x, y, s2))
+          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+            (x, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(IntType, ltype, s2)
+            val s4 = unify(IntType, rtype, s3)
+            (IntType, s4)
         }
-        TypedAST.BinaryExpression(resultType, location, Operator.ADD, typedLhs, typedRhs)
-      case AST.BinaryExpression(location, Operator.SUBTRACT, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        val resultType = (typedLhs.description, typedRhs.description) match{
-          case (IntType, IntType) => IntType
-          case (LongType, LongType) => LongType
-          case (ShortType, ShortType) => ShortType
-          case (ByteType, ByteType) => ByteType
-          case (FloatType, FloatType) => FloatType
-          case (DoubleType, DoubleType) => DoubleType
-          case (lType, DynamicType) => lType
-          case (DynamicType, rtype) => rtype
-          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
+        val s4 = unify(resultType, typ, s3)
+        (TypedAST.BinaryExpression(resultType, location, Operator.ADD, typedLhs, typedRhs), s4)
+      case AST.BinaryExpression(location, Operator.SUBTRACT, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2(a), s2(b)) match {
+          case (IntType, IntType) =>
+            (IntType, s2)
+          case (LongType, LongType) =>
+            (LongType, s2)
+          case (ShortType, ShortType) =>
+            (ShortType, s2)
+          case (ByteType, ByteType) =>
+            (ByteType, s2)
+          case (FloatType, FloatType) =>
+            (FloatType, s2)
+          case (DoubleType, DoubleType) =>
+            (DoubleType, s2)
+          case (DynamicType, DynamicType) =>
+            (DynamicType, s2)
+          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+            (y, unify(x, y, s2))
+          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+            (x, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(IntType, ltype, s2)
+            val s4 = unify(IntType, rtype, s3)
+            (IntType, s4)
         }
-        TypedAST.BinaryExpression(resultType, location, Operator.SUBTRACT, typedLhs, typedRhs)
-
-      case AST.BinaryExpression(location, Operator.MULTIPLY, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        val resultType = (typedLhs.description, typedRhs.description) match{
-          case (IntType, IntType) => IntType
-          case (LongType, LongType) => LongType
-          case (ShortType, ShortType) => ShortType
-          case (ByteType, ByteType) => ByteType
-          case (FloatType, FloatType) => FloatType
-          case (DoubleType, DoubleType) => DoubleType
-          case (lType, DynamicType) => lType
-          case (DynamicType, rtype) => rtype
-          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
+        val s4 = unify(resultType, typ, s3)
+        (TypedAST.BinaryExpression(resultType, location, Operator.SUBTRACT, typedLhs, typedRhs), s4)
+      case AST.BinaryExpression(location, Operator.MULTIPLY, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2(a), s2(b)) match {
+          case (IntType, IntType) =>
+            (IntType, s2)
+          case (LongType, LongType) =>
+            (LongType, s2)
+          case (ShortType, ShortType) =>
+            (ShortType, s2)
+          case (ByteType, ByteType) =>
+            (ByteType, s2)
+          case (FloatType, FloatType) =>
+            (FloatType, s2)
+          case (DoubleType, DoubleType) =>
+            (DoubleType, s2)
+          case (DynamicType, DynamicType) =>
+            (DynamicType, s2)
+          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+            (y, unify(x, y, s2))
+          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+            (x, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(IntType, ltype, s2)
+            val s4 = unify(IntType, rtype, s3)
+            (IntType, s4)
         }
-        TypedAST.BinaryExpression(resultType, location, Operator.MULTIPLY, typedLhs, typedRhs)
-      case AST.BinaryExpression(location, Operator.AND2, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        if(typedLhs.description != BooleanType) {
-          throw TyperException(s"${location.format} lhs of && must be Boolean")
+        val s4 = unify(resultType, typ, s3)
+        (TypedAST.BinaryExpression(resultType, location, Operator.MULTIPLY, typedLhs, typedRhs), s4)
+      case AST.BinaryExpression(location, Operator.DIVIDE, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2(a), s2(b)) match {
+          case (IntType, IntType) =>
+            (IntType, s2)
+          case (LongType, LongType) =>
+            (LongType, s2)
+          case (ShortType, ShortType) =>
+            (ShortType, s2)
+          case (ByteType, ByteType) =>
+            (ByteType, s2)
+          case (FloatType, FloatType) =>
+            (FloatType, s2)
+          case (DoubleType, DoubleType) =>
+            (DoubleType, s2)
+          case (DynamicType, DynamicType) =>
+            (DynamicType, s2)
+          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+            (y, unify(x, y, s2))
+          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+            (x, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(IntType, ltype, s2)
+            val s4 = unify(IntType, rtype, s3)
+            (IntType, s4)
         }
-        if(typedRhs.description != BooleanType) {
-          throw TyperException(s"${location.format} lhs of && must be Boolean")
-        }
-        TypedAST.BinaryExpression(TypeDescription.BooleanType, location, Operator.AND2, typedLhs, typedRhs)
-      case AST.BinaryExpression(location, Operator.BAR2, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        if(typedLhs.description != BooleanType) {
-          throw TyperException(s"${location.format} lhs of || must be Boolean")
-        }
-        if(typedRhs.description != BooleanType) {
-          throw TyperException(s"${location.format} lhs of || must be Boolean")
-        }
-        TypedAST.BinaryExpression(TypeDescription.BooleanType, location, Operator.BAR2, typedLhs, typedRhs)
-      case AST.BinaryExpression(location, Operator.DIVIDE, left, right) =>
-        val typedLhs = typeCheck(left)
-        val typedRhs = typeCheck(right)
-        val resultType = (typedLhs.description, typedRhs.description) match{
-          case (IntType, IntType) => IntType
-          case (LongType, LongType) => LongType
-          case (ShortType, ShortType) => ShortType
-          case (ByteType, ByteType) => ByteType
-          case (FloatType, FloatType) => FloatType
-          case (DoubleType, DoubleType) => DoubleType
-          case (lType, DynamicType) => lType
-          case (DynamicType, rtype) => rtype
-          case _ => throw TyperException(s"${location.format} comparison operation must be done between the same numeric types")
-        }
-        TypedAST.BinaryExpression(resultType, location, Operator.DIVIDE, typedLhs, typedRhs)
+        val s4 = unify(resultType, typ, s3)
+        (TypedAST.BinaryExpression(resultType, location, Operator.DIVIDE, typedLhs, typedRhs), s4)
       case AST.MinusOp(location, operand) =>
-        val typedOperand = typeCheck(operand)
-        val resultType = typedOperand.description match {
-          case ByteType => ByteType
-          case IntType => IntType
-          case ShortType => ShortType
-          case LongType => LongType
-          case FloatType => FloatType
-          case DoubleType => DoubleType
-          case DynamicType => DynamicType
-          case otherwise => throw TyperException(s"${location.format} expected: Numeric type, actual: ${otherwise}")
+        val a = newTypeVariable()
+        val (typedOperand, s1) = doType(operand, env, a, s0)
+        val (resultType, s2) = s1(a) match {
+          case IntType  =>
+            (IntType, s1)
+          case LongType =>
+            (LongType, s1)
+          case ShortType =>
+            (ShortType, s1)
+          case ByteType =>
+            (ByteType, s1)
+          case FloatType  =>
+            (FloatType, s1)
+          case DoubleType =>
+            (DoubleType, s1)
+          case DynamicType =>
+            (DynamicType, s1)
+          case operandType =>
+            val s2 = unify(IntType, operandType, s1)
+            (IntType, s2)
         }
-        TypedAST.MinusOp(resultType, location, typedOperand)
+        (TypedAST.MinusOp(resultType, location, typedOperand), s2)
       case AST.PlusOp(location, operand) =>
-        val typedOperand = typeCheck(operand)
-        val resultType = typedOperand.description match {
-          case ByteType => ByteType
-          case IntType => IntType
-          case ShortType => ShortType
-          case LongType => LongType
-          case FloatType => FloatType
-          case DoubleType => DoubleType
-          case DynamicType => DynamicType
-          case otherwise => throw TyperException(s"${location.format} expected: Numeric type, actual: ${otherwise}")
+        val a = newTypeVariable()
+        val (typedOperand, s1) = doType(operand, env, a, s0)
+        val (resultType, s2) = s1(a) match {
+          case IntType  =>
+            (IntType, s1)
+          case LongType =>
+            (LongType, s1)
+          case ShortType =>
+            (ShortType, s1)
+          case ByteType =>
+            (ByteType, s1)
+          case FloatType  =>
+            (FloatType, s1)
+          case DoubleType =>
+            (DoubleType, s1)
+          case DynamicType =>
+            (DynamicType, s1)
+          case operandType =>
+            val s2 = unify(IntType, operandType, s1)
+            (IntType, s2)
         }
-        TypedAST.PlusOp(resultType, location, typedOperand)
+        (TypedAST.PlusOp(resultType, location, typedOperand), s2)
+      case AST.BinaryExpression(location, Operator.AND2, lhs, rhs) =>
+        val (typedLhs, s1) = doType(lhs, env, BooleanType, s0)
+        val (typedRhs, s2) = doType(rhs, env, BooleanType, s1)
+        val s3 = unify(BooleanType, typ, s2)
+        (TypedAST.BinaryExpression(BooleanType, location, Operator.AND2, typedLhs, typedRhs), s3)
+      case AST.BinaryExpression(location, Operator.BAR2, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, BooleanType, s0)
+        val (typedRhs, s2) = doType(rhs, env, BooleanType, s1)
+        val s3 = unify(BooleanType, typ, s2)
+        (TypedAST.BinaryExpression(BooleanType, location, Operator.BAR2, typedLhs, typedRhs), s3)
       case AST.StringNode(location, value) =>
-        TypedAST.StringNode(DynamicType, location, value)
+        val s1 = unify(DynamicType, typ, s0)
+        (TypedAST.StringNode(DynamicType, location, value), s1)
       case AST.Id(location, name) =>
-        val resultType = env.lookup(name) match {
+        val s1 = env.lookup(name) match {
           case None => throw TyperException(s"${location.format} variable '${name}' is not found")
-          case Some(description) => description
+          case Some(u) => unify(newInstanceFrom(u), typ, s0)
         }
-        TypedAST.Identifier(resultType.description, location, name)
-      case AST.Lambda(location, params, optionalType, proc) =>
-        val paramsMap = Map(params.map{p => p.name -> TypeScheme(List(), p.optionalType.getOrElse(DynamicType))}:_*)
-        val paramsSet = Set(params.map{_.name}:_*)
-        val newEnvironment = TypeEnvironment(paramsMap, paramsSet, Some(env))
-        val paramTypes = params.map{_.optionalType.getOrElse(DynamicType)}
-        val typedProc = doType(proc, newEnvironment, sub)
-        TypedAST.FunctionLiteral(FunctionType(paramTypes, typedProc.description), location, params, optionalType, typedProc)
-      case AST.LetRec(location, name, body, cleanup, expression) =>
-        if(env.variables.contains(name)) {
-          throw new InterruptedException(s"${location.format} function ${name} is already defined")
+        val resultType = s1(typ)
+        (TypedAST.Identifier(resultType, location, name), s1)
+      case AST.Lambda(location, params, optionalType, body) =>
+        val b = optionalType.getOrElse(newTypeVariable())
+        val ts = params.map{p => p.optionalType.getOrElse(newTypeVariable())}
+        val as = (params zip ts).map{ case (p, t) => p.name -> TypeScheme(List(), t) }
+        val s1 = unify(typ, FunctionType(ts, b), s0)
+        val env1 = as.foldLeft(env) { case (env, (name, scheme)) => env.updateImmuableVariable(name, scheme)}
+        val (typedBody, s2) = doType(body, env1, b, s1)
+        (TypedAST.FunctionLiteral(s2(typ), location, params, optionalType, typedBody), s2)
+      case AST.LetRec(location, x, e1, cleanup, e2) =>
+        if(env.variables.contains(x)) {
+          throw new InterruptedException(s"${location.format} function ${x} is already defined")
         }
-        val paramTypes = body.params.map{_.optionalType.getOrElse(DynamicType)}
-        val returnType = body.optionalType.getOrElse(DynamicType)
-        val updatedEnvironment = env.updateMutableVariable(name, TypeScheme(List(), FunctionType(paramTypes, returnType)))
-        val typedBody = doType(body, updatedEnvironment, sub).asInstanceOf[TypedAST.FunctionLiteral]
-        val typedCleanup = cleanup.map{c => doType(c, updatedEnvironment, sub)}
-        //environment.variables(name) = TypeScheme(List(), FunctionType(typedBody.params.map{_.description}, typedBody.proc.description))
-        val typedExpression = doType(expression, updatedEnvironment, sub)
-        TypedAST.LetFunctionDefinition(typedBody.description, location, name, typedBody, typedCleanup, typedExpression)
+        val a = newTypeVariable()
+        val (typedE1, s1) = doType(e1, env.updateImmuableVariable(x, generalize(a, env.variables)), a, s0)
+        val (typedE2, s2) = doType(e2, env.updateImmuableVariable(x, generalize(s1(a), env.variables)), typ, s1)
+        val b = newTypeVariable()
+        val (typedCleanup, s3) = cleanup.map{c => doType(c, env, b, s2)} match {
+          case Some((c, s)) => (Some(c), s)
+          case None => (None, s2)
+        }
+        (TypedAST.LetFunctionDefinition(typedE2.description, location, x, typedE1.asInstanceOf[TypedAST.FunctionLiteral], typedCleanup, typedE2), s3)
       case AST.FunctionCall(location, target, params) =>
-        val typedTarget = typeCheck(target)
-        val functionType: FunctionType = typedTarget.description match {
-          case f@FunctionType(_, _) => f
-          case otherwise => throw TyperException(s"${location.format} expected: function type, actual type: ${otherwise}")
+        val t2 = params.map{_ => newTypeVariable()}
+        val (typedTarget, s1) = doType(target, env, FunctionType(t2, typ), s0)
+        val (tparams, s2) = (params zip t2).foldLeft((Nil:List[TypedAST], s1)){ case ((tparams, s), (e, t)) =>
+          val (tparam, sx) = doType(e, env, t, s)
+          (tparam::tparams, sx)
         }
-        val actualTypedParams = params.map(p => typeCheck(p))
-        val actualParamTypes = actualTypedParams.map(_.description)
-        if(functionType.paramTypes.length != actualParamTypes.length) {
-          throw TyperException(s"${location.format} function arity mismatch: expected length: ${functionType.paramTypes.length}, actual length: ${actualParamTypes.length}")
-        }
-        functionType.paramTypes.zip(actualParamTypes).foreach { case (expectedType, actualType) =>
-          if(!isAssignableFrom(expectedType, actualType)){
-            throw TyperException(s"${location.format} expected type: ${expectedType}, actual type:${actualType}")
-          }
-        }
-        TypedAST.FunctionCall(functionType.returnType, location, typedTarget, actualTypedParams)
+        (TypedAST.FunctionCall(s2(typ), location, typedTarget, tparams.reverse), s2)
+        /*
       case AST.ListLiteral(location, elements) =>
         val typedElements = elements.map(e => typeCheck(e))
         TypedAST.ListLiteral(DynamicType, location, typedElements)
@@ -549,7 +679,7 @@ class Typer {
         TypedAST.Casting(typedTarget.description, location, typedTarget, to)
       case otherwise =>
         throw TyperPanic(otherwise.toString)
+        */
     }
-    typeCheck(e)
   }
 }

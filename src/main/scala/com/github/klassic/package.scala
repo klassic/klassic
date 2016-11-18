@@ -17,4 +17,10 @@ package object klassic {
   } finally {
     scala.util.control.Exception.allCatch(resource.close())
   }
+
+  val p = new Parser
+  val t = new Typer
+  def typeOf(input: String): TypeDescription = {
+    t.typeOf(p.parse(input).get)
+  }
 }
