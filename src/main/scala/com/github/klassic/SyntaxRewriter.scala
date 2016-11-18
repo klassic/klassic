@@ -128,6 +128,7 @@ class SyntaxRewriter {
     case MapLiteral(location, elements) => MapLiteral(location, elements.map{ case (k, v) => (doRewrite(k), doRewrite(v))})
     case NewObject(location, className, params) => NewObject(location, className, params.map{doRewrite})
     case MethodCall(location ,self, name, params) => MethodCall(location, doRewrite(self), name, params.map{doRewrite})
+    case Casting(location, target, to) => Casting(location, doRewrite(target), to)
     case otherwise => throw RewriterPanic(otherwise.toString)
   }
 

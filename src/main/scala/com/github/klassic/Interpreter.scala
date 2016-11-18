@@ -380,6 +380,8 @@ class Interpreter {evaluator =>
             case _ =>
               reportError("unknown error")
           }
+        case TypedAST.Casting(description, location, target, to) =>
+          evalRecursive(target)
         case otherwise@TypedAST.ForeachExpression(description, location, _, _, _) => sys.error(s"cannot reach here: ${otherwise}")
       }
     }
