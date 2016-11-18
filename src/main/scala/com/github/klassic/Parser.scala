@@ -95,6 +95,7 @@ class Parser extends RegexParsers {
   lazy val MINUSEQ : Parser[String] = token("-=")
   lazy val ASTEREQ : Parser[String] = token("*=")
   lazy val SLASHEQ : Parser[String] = token("/=")
+  lazy val COLONGT : Parser[String] = token(":>")
   lazy val EQEQ    : Parser[String] = token("==")
   lazy val ARROW   : Parser[String] = token("=>")
   lazy val COLON   : Parser[String] = token(":")
@@ -110,6 +111,8 @@ class Parser extends RegexParsers {
 
 
   def typeAnnotation: Parser[TypeDescription] = COLON ~> typeDescription
+
+  def castType: Parser[TypeDescription] = token("#") ~> typeDescription
 
   def typeDescription: Parser[TypeDescription] = (
     ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
@@ -197,7 +200,7 @@ class Parser extends RegexParsers {
       npList.foldLeft(self){case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil))}
   }
 
-  def application: Parser[AST] = % ~ primary ~ opt(CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN))^^ {
+  def application: Parser[AST] = % ~ castable ~ opt(CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN))^^ {
     case location ~ fac ~ param => {
       param match {
         case Some(p) =>
@@ -206,6 +209,10 @@ class Parser extends RegexParsers {
           fac
       }
     }
+  }
+
+  def castable: Parser[AST] = primary ~ repsep(% ~ CL(castType), CL(COLONGT)) ^^ {
+    case target ~ castings => castings.foldLeft(target){ case (e, location ~ description) => Casting(location, e, description)}
   }
 
   //primary ::= ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | "(" expression ")" | "{" lines "}"

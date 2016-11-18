@@ -534,6 +534,9 @@ class Typer {
         }
         val typedParams = params.map(p => typeCheck(p))
         TypedAST.MethodCall(DynamicType, location, typedReceiver, name, typedParams)
+      case AST.Casting(location, target, to) =>
+        val typedTarget = typeCheck(target)
+        TypedAST.Casting(typedTarget.description, location, typedTarget, to)
       case otherwise =>
         throw TyperPanic(otherwise.toString)
     }

@@ -93,4 +93,6 @@ object AST {
   case class NewObject(val location: Location, className: String, params: List[AST]) extends AST
 
   case class MethodCall(val location: Location, self: AST, name: String, params: List[AST]) extends AST
+
+  case class Casting(val location: Location, target: AST, to: TypeDescription) extends AST
 }

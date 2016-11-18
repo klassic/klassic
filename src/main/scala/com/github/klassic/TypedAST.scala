@@ -75,4 +75,6 @@ object TypedAST {
   case class NewObject(val description: TypeDescription, val location: Location, className: String, params: List[TypedAST]) extends TypedAST
 
   case class MethodCall(val description: TypeDescription, val location: Location, self: TypedAST, name: String, params: List[TypedAST]) extends TypedAST
+
+  case class Casting(val description: TypeDescription, val location: Location, target: TypedAST, to: TypeDescription) extends TypedAST
 }
