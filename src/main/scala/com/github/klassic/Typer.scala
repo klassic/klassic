@@ -143,17 +143,11 @@ class Typer {
 
   def typeOf(e: AST, environment: Environment = BuiltinEnvironment): TypeDescription = {
     val a = newTypeVariable()
-    try {
-      tp(environment, e, a, EmptySubstitution).apply(a)
-    }catch {
-      case TyperException(msg) => throw TyperException("\n cannot type: " + current + "\n reason: " + msg)
-    }
+    tp(environment, e, a, EmptySubstitution).apply(a)
   }
 
 
-  var current: AST = null
   def tp(env: Environment, e: AST, t: TypeDescription, s: Substitution): Substitution = {
-    current = e
     e match {
       case AST.Identifier(location, x) =>
         lookup(x, env) match {
@@ -488,17 +482,17 @@ class Typer {
           }
           TypedAST.Identifier(resultType.description, location, name)
         case AST.FunctionLiteral(location, params, optionalType, proc) =>
-          val paramsMap = Map(params.map{p => p.name -> TypeScheme(List(), p.description)}:_*)
+          val paramsMap = Map(params.map{p => p.name -> TypeScheme(List(), p.optionalType.getOrElse(DynamicType))}:_*)
           val paramsSet = Set(params.map{_.name}:_*)
           val newEnvironment = TypeEnvironment(paramsMap, paramsSet, Some(environment))
-          val paramTypes = params.map{_.description}
+          val paramTypes = params.map{_.optionalType.getOrElse(DynamicType)}
           val typedProc = doType(proc, newEnvironment, substitution)
           TypedAST.FunctionLiteral(FunctionType(paramTypes, typedProc.description), location, params, optionalType, typedProc)
         case AST.LetFunctionDefinition(location, name, body, cleanup, expression) =>
           if(environment.variables.contains(name)) {
             throw new InterruptedException(s"${location.format} function ${name} is already defined")
           }
-          val paramTypes = body.params.map{_.description}
+          val paramTypes = body.params.map{_.optionalType.getOrElse(DynamicType)}
           val returnType = body.optionalType.getOrElse(DynamicType)
           val updatedEnvironment = environment.updateMutableVariable(name, TypeScheme(List(), FunctionType(paramTypes, returnType)))
           val typedBody = doType(body, updatedEnvironment, substitution).asInstanceOf[TypedAST.FunctionLiteral]

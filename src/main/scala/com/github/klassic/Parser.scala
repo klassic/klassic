@@ -326,8 +326,8 @@ class Parser extends RegexParsers {
       FunctionLiteral(
         location,
         params.map {
-          case name ~ Some(description) => FormalParameter(name.name, description)
-          case name ~ None => FormalParameter(name.name)
+          case name ~ Some(description) => FormalParameter(name.name, Some(description))
+          case name ~ None => FormalParameter(name.name, None)
         },
         optionalType,
         body
@@ -348,8 +348,8 @@ class Parser extends RegexParsers {
       val ps = params match {
         case Some(xs) =>
           xs.map{
-            case name ~ Some(annotation) => FormalParameter(name.name, annotation)
-            case name ~ None => FormalParameter(name.name)
+            case name ~ Some(annotation) => FormalParameter(name.name, Some(annotation))
+            case name ~ None => FormalParameter(name.name, None)
           }
         case None => Nil
       }
