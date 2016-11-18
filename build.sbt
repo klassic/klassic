@@ -37,7 +37,11 @@ assemblyJarName in assembly := "klassic.jar"
 mainClass in assembly := Some("com.github.klassic.Main")
 
 initialCommands in console += {
-  Iterator().map("import "+).mkString("\n")
+  Iterator(
+    "com.github.klassic._",
+    "com.github.klassic.AST._",
+    "com.github.klassic.TypeDescription._"
+  ).map("import "+).mkString("\n")
 }
 
 pomExtra := (
