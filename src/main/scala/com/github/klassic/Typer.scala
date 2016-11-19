@@ -11,6 +11,9 @@ class Typer {
   def listOf(tp: TypeDescription): TypeConstructor = {
     TypeConstructor("List", List(tp))
   }
+  def mapOf(k: TypeDescription, v: TypeDescription): TypeConstructor = {
+    TypeConstructor("Map", List(k, v))
+  }
   val BuiltinEnvironment: Map[String, TypeScheme] = {
     val a = newTypeVariable()
     Map(
@@ -608,15 +611,27 @@ class Typer {
           (tparam::tparams, sx)
         }
         (TypedAST.FunctionCall(s2(typ), location, typedTarget, tparams.reverse), s2)
-        /*
       case AST.ListLiteral(location, elements) =>
-        val typedElements = elements.map(e => typeCheck(e))
-        TypedAST.ListLiteral(DynamicType, location, typedElements)
-      case AST.MapLiteral(location, elements) =>
-        val typedElements = elements.map{ case (k, v) =>
-          (typeCheck(k), typeCheck(v))
+        val a = newTypeVariable()
+        val listOfA = listOf(a)
+        val (tes, sx) = elements.foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), e) =>
+          val (te, sx) = doType(e, env, a, s)
+          (te::tes, sx)
         }
-        TypedAST.MapLiteral(DynamicType, location, typedElements)
+        val sy = unify(listOfA, typ, sx)
+        (TypedAST.ListLiteral(sy(typ), location, tes), sy)
+      case AST.MapLiteral(location, elements) =>
+        val kt = newTypeVariable()
+        val vt = newTypeVariable()
+        val mapOfKV = mapOf(kt, vt)
+        val (tes, sx) = elements.foldLeft((Nil:List[(TypedAST, TypedAST)], s0)){ case ((tes, s), (k, v)) =>
+          val (typedK, sx) = doType(k, env, kt, s)
+          val (typedY, sy) = doType(v, env, vt, sx)
+          ((typedK -> typedY)::tes, sy)
+        }
+        val sy = unify(mapOfKV, typ, sx)
+        (TypedAST.MapLiteral(sy(typ), location, tes), sy)
+        /*
       case AST.NewObject(location, className, params) =>
         val typedParams = params.map(p => typeCheck(p))
         TypedAST.NewObject(DynamicType, location, className, typedParams)
