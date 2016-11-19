@@ -235,10 +235,10 @@ class Parser extends RegexParsers {
     case location ~ value ~ Some(ByteSuffix) => ByteNode(location, value.toByte)
   }) <~ SPACING_WITHOUT_LF
 
-  def floatLiteral: Parser[AST]= (% ~ "([1-9][0-9]*|0)\\.[0-9]*".r ~ opt("F" ^^ { _ => FloatSuffix })) ^^ {
+  def floatLiteral: Parser[AST]= ((% ~ "([1-9][0-9]*|0)\\.[0-9]*".r ~ opt("F" ^^ { _ => FloatSuffix })) ^^ {
     case location ~ value ~ None => DoubleNode(location, value.toDouble)
     case location ~ value ~ Some(FloatSuffix) => FloatNode(location, value.toFloat)
-  }
+  }) <~ SPACING_WITHOUT_LF
 
   def booleanLiteral: Parser[AST] = % ~ (TRUE ^^ { _ => true }| FALSE ^^ { _ => false}) ^^ {
     case location ~  true => BooleanNode(location, true)

@@ -1,4 +1,4 @@
-println("#{<<TAG1 + (1 :> *)} #{<<TAG2 + (2 :> *)} #{<<TAG3 + (3 :> *)}")
+println("#{<<TAG1 + 1} #{<<TAG2 + 2} #{<<TAG3 + 3}")
 tag1
 TAG1
 tag2

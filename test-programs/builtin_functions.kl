@@ -12,7 +12,7 @@ val time = stopwatch( => {
   sleep(1000)
   println("1")
 })
-println("it took #{time :> *} milli seconds")
+println("it took #{time} milli seconds")
 println(add(2, 3))
 val list = new java.util.ArrayList
 list.add(4)

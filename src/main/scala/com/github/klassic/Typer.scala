@@ -413,6 +413,10 @@ class Typer {
             (y, unify(x, y, s2))
           case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
             (x, unify(x, y, s2))
+          case (DynamicType, other) =>
+            (DynamicType, s2)
+          case (other, DynamicType) =>
+            (DynamicType, s2)
           case (ltype, rtype) =>
             val s3 = unify(IntType, ltype, s2)
             val s4 = unify(IntType, rtype, s3)

@@ -67,7 +67,7 @@ class ExpressionSpec extends SpecHelper {
         |val buf = new java.lang.StringBuffer
         |mutable i = 0
         |while(i <= 5) {
-        |  buf.append("#{i :> *}")
+        |  buf.append("#{i}")
         |  i = i + 1
         |}
         |buf.toString()
@@ -131,6 +131,23 @@ class ExpressionSpec extends SpecHelper {
          |}
          |newList
       """.stripMargin -> ObjectValue(listOf(2, 4, 6, 8, 10))
+    )
+
+    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
+      it(s"expectations ${i}") {
+        assertResult(expected)(I.evaluateString(in))
+      }
+    }
+  }
+
+  describe("if expression") {
+    val expectations: List[(String, Value)] = List(
+      """
+         |if(true) 1.0 else 2.0
+      """.stripMargin -> BoxedDouble(1.0),
+      """
+         |if(false) 1.0 else 2.0
+      """.stripMargin -> BoxedDouble(2.0)
     )
 
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
