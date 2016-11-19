@@ -16,6 +16,7 @@ class Typer {
   }
   val BuiltinEnvironment: Map[String, TypeScheme] = {
     val a = newTypeVariable()
+    val b = newTypeVariable()
     Map(
       "substring" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType, IntType), DynamicType)),
       "at" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType), DynamicType)),
@@ -24,8 +25,11 @@ class Typer {
       "println" ->  TypeScheme(List(TypeVariable("x")), FunctionType(List(TypeVariable("x")), UnitType)),
       "stopwatch" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), IntType)),
       "sleep" -> TypeScheme(List(), FunctionType(List(IntType), UnitType)),
-      "head" -> TypeScheme(List(), FunctionType(List(listOf(a)), a)),
-      "tail" -> TypeScheme(List(), FunctionType(List(listOf(a)), listOf(a)))
+      "head" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(listOf(TypeVariable("a"))), TypeVariable("a"))),
+      "tail" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(listOf(TypeVariable("a"))), listOf(TypeVariable("a")))),
+      "cons" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(TypeVariable("a"), listOf(TypeVariable("a"))), listOf(TypeVariable("a")))),
+      "size" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(listOf(TypeVariable("a"))), IntType)),
+      "isEmpty" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(listOf(TypeVariable("a"))), BooleanType))
     )
   }
 

@@ -4,7 +4,7 @@ import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
 import java.lang.reflect.{Constructor, Method}
 
 import com.github.klassic.AST._
-import com.github.klassic.TypeDescription.DynamicType
+import com.github.klassic.TypeDescription._
 
 /**
  * @author Kota Mizushima
@@ -113,6 +113,28 @@ class Interpreter {evaluator =>
     define("sleep"){ case List(milliseconds: BoxedInt) =>
       Thread.sleep(milliseconds.value)
       UnitValue
+    }
+    define("head") { case List(ObjectValue(list: java.util.List[_])) =>
+      Value.toKlassic(list.get(0).asInstanceOf[AnyRef])
+    }
+    define("tail") { case List(ObjectValue(list: java.util.List[_])) =>
+      Value.toKlassic(list.subList(1, list.size()))
+    }
+    define("cons") { case List(value: Value, ObjectValue(list: java.util.List[_])) =>
+      val newList = new java.util.ArrayList[Any]
+      var i = 0
+      newList.add(Value.fromKlassic(value))
+      while(i < list.size()) {
+        newList.add(list.get(i))
+        i += 1
+      }
+      Value.toKlassic(newList)
+    }
+    define("size") { case List(ObjectValue(list: java.util.List[_])) =>
+      BoxedInt(list.size())
+    }
+    define("isEmpty") { case List(ObjectValue(list: java.util.List[_])) =>
+      BoxedBoolean(list.isEmpty)
     }
   }
 
