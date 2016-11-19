@@ -5,6 +5,7 @@
 Klassic **is** Yet Another Programming Language.  Although Klassic is a dynamically-typed
 language currently, it will be a statically typed programming language.  Klassic has: 
 
+* type system, which is based on Hindley-Milner type system
 * lexically-scoped variables
 * first-class functions
 * here documents
