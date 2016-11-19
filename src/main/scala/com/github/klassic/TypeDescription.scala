@@ -1,6 +1,9 @@
 package com.github.klassic
 
 sealed abstract class TypeDescription(val image: String) {
+  def ==>(returnType: TypeDescription): TypeDescription.FunctionType = {
+    TypeDescription.FunctionType(List(this), returnType)
+  }
   override def toString: String = image
 }
 object TypeDescription {

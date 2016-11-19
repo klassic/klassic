@@ -24,13 +24,13 @@ class Typer {
       "thread" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), DynamicType)),
       "println" ->  TypeScheme(List(TypeVariable("x")), FunctionType(List(TypeVariable("x")), UnitType)),
       "stopwatch" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), IntType)),
-      "sleep" -> TypeScheme(List(), FunctionType(List(IntType), UnitType)),
-      "map" -> TypeScheme(List(TypeVariable("a"), TypeVariable("b")), FunctionType(List(listOf(TypeVariable("a"))), FunctionType(List(FunctionType(List(TypeVariable("a")), TypeVariable("b"))), listOf(TypeVariable("b"))))),
-      "head" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(listOf(TypeVariable("a"))), TypeVariable("a"))),
-      "tail" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(listOf(TypeVariable("a"))), listOf(TypeVariable("a")))),
+      "sleep" -> TypeScheme(List(), IntType ==> UnitType),
+      "map" -> TypeScheme(List(TypeVariable("a"), TypeVariable("b")), listOf(TypeVariable("a")) ==> ((TypeVariable("a") ==>  TypeVariable("b"))  ==> listOf(TypeVariable("b")))),
+      "head" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> TypeVariable("a")),
+      "tail" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> listOf(TypeVariable("a"))),
       "cons" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(TypeVariable("a"), listOf(TypeVariable("a"))), listOf(TypeVariable("a")))),
-      "size" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(listOf(TypeVariable("a"))), IntType)),
-      "isEmpty" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(listOf(TypeVariable("a"))), BooleanType))
+      "size" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> IntType),
+      "isEmpty" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> BooleanType)
     )
   }
 
