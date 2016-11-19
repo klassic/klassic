@@ -63,6 +63,22 @@ val printAndAdd = (x, y) => {
 
 Note that semicolon at the end of each expression of block can be omitted.
 
+### Named Function
+
+If you want to define recursive functions, anonymous function literal cannot be used.
+Instead, you can use the notation for recursive functions:
+
+```
+def fact(n) = if(n < 2) 1 else n * fact(n - 1)
+fact(0) // 1
+fact(1) // 1
+fact(2) // 2
+fact(3) // 6
+fact(4) // 24
+fact(5) // 120
+// The result of type inference of fact is : Int => Int
+```
+
 ### Method Invocation
 
 ```
@@ -115,7 +131,7 @@ Currently, the type of list literal is `java.util.List`.
 ### Map Literal
 
 ```
-val map = $["A": 1, "B": 2]
+val map = %["A": 1, "B": 2]
 map.get("A") // => 1
 map.get("B") // => 2
 map.get("C") // => null
@@ -125,7 +141,7 @@ A map literal can be expressed as the form `#{k1:v1, ..., kn:vn]` (`kn` and `vn`
 separator characters have also line feeds and spaces in Klassic unlike other programmign languages:
 
 ```
-val map2 = #[
+val map2 = %[
   "A" : 1
   "b" : 2
 ]
