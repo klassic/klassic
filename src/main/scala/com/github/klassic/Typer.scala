@@ -174,10 +174,14 @@ class Typer {
             val (typedX, newSub) = doType(x, env, typ, s0)
             (TypedAST.Block(newSub(typ), location, typedX::Nil), newSub)
           case x::xs =>
-            val result = doType(x, env, typ, s0)
-            val reversedTypedElements = xs.foldLeft(result::Nil){(a, e) => doType(e, env, typ, s0)::a}
-            val (hdTypd, newSub) = reversedTypedElements.head
-            (TypedAST.Block(newSub(typ), location, reversedTypedElements.map{_._1}.reverse), newSub)
+            val t = newTypeVariable()
+            val ts = xs.map{_ => newTypeVariable()}
+            val (result, s1) = doType(x, env, t, s0)
+            val (reversedTypedElements, s2) = (xs zip ts).foldLeft((result::Nil, s0)){ case ((a, s), (e, t)) =>
+              val (e2, s2) = doType(e, env, t, s)
+              (e2::a, s2)
+            }
+            (TypedAST.Block(s2(ts.last), location, reversedTypedElements.reverse), s2)
         }
       case AST.IntNode(location, value) =>
         val newSub = unify(typ, IntType, s0)
@@ -245,6 +249,8 @@ class Typer {
           case (FloatType, FloatType) =>
             (BooleanType, s2)
           case (DoubleType, DoubleType) =>
+            (BooleanType, s2)
+          case (BooleanType, BooleanType) =>
             (BooleanType, s2)
           case (DynamicType, DynamicType) =>
             (BooleanType, s2)
@@ -598,7 +604,8 @@ class Typer {
         val (typedE1, s1) = doType(value, env.updateImmuableVariable(variable, TypeScheme(List(), a)), b, s0)
         val s2 = unify(a, b, s1)
         val (typedE2, s3) = doType(body, env.updateImmuableVariable(variable, generalize(s2(a), s2(env.variables))), typ, s2)
-        val (typedCleanup, s4) = cleanup.map{c => doType(c, env, b, s3)} match {
+        val x = newTypeVariable()
+        val (typedCleanup, s4) = cleanup.map{c => doType(c, env, x, s3)} match {
           case Some((c, s)) => (Some(c), s)
           case None => (None, s3)
         }
