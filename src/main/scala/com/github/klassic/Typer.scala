@@ -619,7 +619,7 @@ class Typer {
           (te::tes, sx)
         }
         val sy = unify(listOfA, typ, sx)
-        (TypedAST.ListLiteral(sy(typ), location, tes), sy)
+        (TypedAST.ListLiteral(sy(typ), location, tes.reverse), sy)
       case AST.MapLiteral(location, elements) =>
         val kt = newTypeVariable()
         val vt = newTypeVariable()
@@ -630,11 +630,16 @@ class Typer {
           ((typedK -> typedY)::tes, sy)
         }
         val sy = unify(mapOfKV, typ, sx)
-        (TypedAST.MapLiteral(sy(typ), location, tes), sy)
-        /*
+        (TypedAST.MapLiteral(sy(typ), location, tes.reverse), sy)
       case AST.NewObject(location, className, params) =>
-        val typedParams = params.map(p => typeCheck(p))
-        TypedAST.NewObject(DynamicType, location, className, typedParams)
+        val ts = params.map{_ => newTypeVariable()}
+        val (tes, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), (e, t)) =>
+          val (te, sx) = doType(e, env, t, s)
+          (te::tes, sx)
+        }
+        val sy = unify(DynamicType, typ, sx)
+        (TypedAST.NewObject(DynamicType, location, className, tes.reverse), sy)
+        /*
       case AST.MethodCall(location, receiver, name, params) =>
         val typedReceiver = typeCheck(receiver)
         if(typedReceiver.description != DynamicType) {

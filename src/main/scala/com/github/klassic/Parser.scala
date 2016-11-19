@@ -343,7 +343,7 @@ class Parser extends RegexParsers {
   }
 
   // newObject ::= "new" fqcn "(" [param {"," param} ")"
-  def newObject: Parser[AST] = (% <~ CL(NEW)) ~ fqcn ~ (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ (RPAREN))) ^^ {
+  def newObject: Parser[AST] = (% <~ CL(NEW)) ~ fqcn ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN) ^^ {
     case location ~ className ~ Some(params) => NewObject(location, className, params)
     case location ~ className ~ None => NewObject(location, className, List())
   }
