@@ -112,7 +112,7 @@ class Parser extends RegexParsers {
 
   def typeAnnotation: Parser[TypeDescription] = COLON ~> typeDescription
 
-  def castType: Parser[TypeDescription] = token("#") ~> typeDescription
+  def castType: Parser[TypeDescription] = typeDescription
 
   def typeDescription: Parser[TypeDescription] = (
     ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
@@ -211,8 +211,9 @@ class Parser extends RegexParsers {
     }
   }
 
-  def castable: Parser[AST] = primary ~ repsep(% ~ CL(castType), CL(COLONGT)) ^^ {
-    case target ~ castings => castings.foldLeft(target){ case (e, location ~ description) => Casting(location, e, description)}
+  def castable: Parser[AST] = primary ~ opt((% <~ CL(COLONGT)) ~ CL(castType)) ^^ {
+    case target ~ Some((location ~ castType)) => Casting(location, target, castType)
+    case target ~ None => target
   }
 
   //primary ::= booleanLiteral | ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | "(" expression ")" | "{" lines "}"
