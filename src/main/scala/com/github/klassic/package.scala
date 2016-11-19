@@ -2,6 +2,8 @@ package com.github
 
 import java.io.{BufferedReader, FileInputStream, InputStreamReader}
 
+import com.github.klassic.TypeDescription.FunctionType
+
 import scala.language.reflectiveCalls
 
 /**
