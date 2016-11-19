@@ -126,7 +126,7 @@ val list3 = [[1 2 3]
              [7 8 9]]
 ```
 
-Currently, the type of list literal is `java.util.List`.
+The type of list literal is a instance of special type constructor `List[a]`.
 
 ### Map Literal
 
@@ -137,8 +137,8 @@ map.get("B") // => 2
 map.get("C") // => null
 ```
 
-A map literal can be expressed as the form `#{k1:v1, ..., kn:vn]` (`kn` and `vn` are expressions).  Note that
-separator characters have also line feeds and spaces in Klassic unlike other programmign languages:
+A map literal can be expressed as the form `%[k1:v1, ..., kn:vn]` (`kn` and `vn` are expressions).  Note that
+separator characters also include line feeds and spaces in Klassic unlike other programmign languages:
 
 ```
 val map2 = %[
@@ -147,7 +147,7 @@ val map2 = %[
 ]
 ```
 
-Currently, the type of map literal is `java.util.Map`.
+The type of map literal is a instance of special type constructor `Map[k, v]`.
 
 ### Cleanup Clause
 
