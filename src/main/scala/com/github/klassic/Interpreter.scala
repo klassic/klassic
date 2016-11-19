@@ -5,6 +5,7 @@ import java.lang.reflect.{Constructor, Method}
 
 import com.github.klassic.AST._
 import com.github.klassic.TypeDescription._
+import com.github.klassic.TypedAST.{FunctionLiteral, ValueNode}
 
 /**
  * @author Kota Mizushima
@@ -98,6 +99,7 @@ class Interpreter {evaluator =>
       }).start()
       UnitValue
     }
+
     define("println") { case List(param) =>
       println(param)
       param
@@ -114,6 +116,25 @@ class Interpreter {evaluator =>
       Thread.sleep(milliseconds.value)
       UnitValue
     }
+
+    define("map") { case List(ObjectValue(list: java.util.List[_])) =>
+      NativeFunctionValue{
+        case List(fun: FunctionValue) =>
+          val newList = new java.util.ArrayList[Any]
+          val interpreter = new Interpreter
+          val env = new Environment(fun.environment)
+          var i = 0
+          while(i < list.size()) {
+            val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
+            val result: Value = performFunction(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, List(ValueNode(param))), env)
+            newList.add(Value.fromKlassic(result))
+            i += 1
+          }
+          ObjectValue(newList)
+      }
+    }
+
+
     define("head") { case List(ObjectValue(list: java.util.List[_])) =>
       Value.toKlassic(list.get(0).asInstanceOf[AnyRef])
     }
@@ -164,6 +185,32 @@ class Interpreter {evaluator =>
   }
 
   private def evaluate(node: TypedAST): Value = evaluate(node, BuiltinEnvironment)
+  private def performFunction(node: TypedAST.FunctionCall, env: Environment): Value = node match {
+    case TypedAST.FunctionCall(description, location, func, params) =>
+      evaluate(func, env) match {
+        case FunctionValue(TypedAST.FunctionLiteral(description, location, fparams, optionalType, proc), cleanup, cenv) =>
+          val local = new Environment(cenv)
+          (fparams zip params).foreach{ case (fp, ap) =>
+            local(fp.name) = evaluate(ap, env)
+          }
+          try {
+            evaluate(proc, local)
+          } finally {
+            cleanup.foreach { expression =>
+              evaluate(expression, local)
+            }
+          }
+        case NativeFunctionValue(body) =>
+          val actualParams = params.map{p => evaluate(p, env)}
+          if(body.isDefinedAt(actualParams)) {
+            body(params.map{p => evaluate(p, env)})
+          } else {
+            reportError("parameters are not matched to the function's arguments")
+          }
+        case _ =>
+          reportError("unknown error")
+      }
+  }
   private def evaluate(node: TypedAST, env: Environment): Value = {
     def evalRecursive(node: TypedAST): Value = {
       node match{
@@ -381,32 +428,12 @@ class Interpreter {evaluator =>
             case NoConstructorFound =>
               throw new IllegalArgumentException(s"newObject(${className}, ${params}")
           }
-        case TypedAST.FunctionCall(description, location, func, params) =>
-          evalRecursive(func) match{
-            case FunctionValue(TypedAST.FunctionLiteral(description, location, fparams, optionalType, proc), cleanup, cenv) =>
-              val local = new Environment(cenv)
-              (fparams zip params).foreach{ case (fp, ap) =>
-                local(fp.name) = evalRecursive(ap)
-              }
-              try {
-                evaluate(proc, local)
-              } finally {
-                cleanup.foreach { expression =>
-                  evaluate(expression, local)
-                }
-              }
-            case NativeFunctionValue(body) =>
-              val actualParams = params.map{evalRecursive}
-              if(body.isDefinedAt(actualParams)) {
-                body(params.map{p => evalRecursive(p)})
-              } else {
-                reportError("parameters are not matched to the function's arguments")
-              }
-            case _ =>
-              reportError("unknown error")
-          }
+        case call@TypedAST.FunctionCall(description, location, func, params) =>
+          performFunction(call, env)
         case TypedAST.Casting(description, location, target, to) =>
           evalRecursive(target)
+        case TypedAST.ValueNode(value) =>
+          value
         case otherwise@TypedAST.ForeachExpression(description, location, _, _, _) => sys.error(s"cannot reach here: ${otherwise}")
       }
     }

@@ -97,7 +97,8 @@ class Parser extends RegexParsers {
   lazy val SLASHEQ : Parser[String] = token("/=")
   lazy val COLONGT : Parser[String] = token(":>")
   lazy val EQEQ    : Parser[String] = token("==")
-  lazy val ARROW   : Parser[String] = token("=>")
+  lazy val ARROW1  : Parser[String] = token("=>")
+  lazy val ARROW2  : Parser[String] = token("->")
   lazy val COLON   : Parser[String] = token(":")
   lazy val NEW     : Parser[String] = token("new")
   lazy val QUES    : Parser[String] = token("?")
@@ -115,7 +116,7 @@ class Parser extends RegexParsers {
   def castType: Parser[TypeDescription] = typeDescription
 
   def typeDescription: Parser[TypeDescription] = (
-    ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
+    ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
   | token("Byte") ^^ {_ => ByteType}
   | token("Short")  ^^ {_ => ShortType}
   | token("Int")  ^^ {_ => IntType}
@@ -200,7 +201,7 @@ class Parser extends RegexParsers {
       npList.foldLeft(self){case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil))}
   }
 
-  def application: Parser[AST] = % ~ castable ~ opt(CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN))^^ {
+  def application: Parser[AST] = % ~ pipelinable ~ opt(CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN))^^ {
     case location ~ fac ~ param => {
       param match {
         case Some(p) =>
@@ -209,6 +210,13 @@ class Parser extends RegexParsers {
           fac
       }
     }
+  }
+
+  def pipelinable: Parser[AST] = % ~ castable ~ opt(CL(ARROW2) ~> ident) ^^ {
+    case location ~ self ~ None =>
+      self
+    case location ~ self ~ Some(name) =>
+      FunctionCall(location, name, List(self))
   }
 
   def castable: Parser[AST] = primary ~ opt((% <~ CL(COLONGT)) ~ CL(castType)) ^^ {
@@ -329,7 +337,7 @@ class Parser extends RegexParsers {
   }
 
   // anonnymousFunction ::= "(" [param {"," param}] ")" "=>" expression
-  def anonymousFunction():Parser[AST] = % ~ opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ (opt(typeAnnotation) <~ CL(ARROW)) ~ expression ^^ {
+  def anonymousFunction():Parser[AST] = % ~ opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ (opt(typeAnnotation) <~ CL(ARROW1)) ~ expression ^^ {
     case location ~ Some(params) ~ optionalType ~ body =>
       Lambda(
         location,
