@@ -75,7 +75,7 @@ class TypeCheckerSpec extends SpecHelper {
         |mutable a = 1
         |a = 2
         |foreach(b in [1, 2, 3]) {
-        |  b + 3
+        |  (b :> Int) + 3
         |}
       """.stripMargin -> UnitValue
     )

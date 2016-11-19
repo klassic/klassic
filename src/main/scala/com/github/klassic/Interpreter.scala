@@ -123,7 +123,10 @@ class Interpreter {evaluator =>
   def evaluateString(program: String, fileName: String = "<no file>"): Value = {
     val parser = new Parser
     parser.parse(program) match {
-      case parser.Success(node: AST, _) => evaluate(typer.doType(rewriter.doRewrite(node), TypeEnvironment(typer.BuiltinEnvironment, Set.empty, None), typer.EmptySubstitution))
+      case parser.Success(node: AST, _) =>
+        val tv = typer.newTypeVariable()
+        val (typedExpression, _) = typer.doType(rewriter.doRewrite(node), TypeEnvironment(typer.BuiltinEnvironment, Set.empty, None), tv, typer.EmptySubstitution)
+        evaluate(typedExpression)
       case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
       case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
     }

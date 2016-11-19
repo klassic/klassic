@@ -19,4 +19,10 @@ trait SpecHelper extends FunSpec with DiagrammedAssertions {
     }
     newMap
   }
+  def expect[A, B](expectation: (A, B)): Unit = expectation match {
+    case (expected, actual) =>
+      it(s"expectation ${expected}") {
+        assertResult(expected)(actual)
+      }
+  }
 }

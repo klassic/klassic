@@ -60,9 +60,11 @@ object TypedAST {
 
   case class Assignment(val description: TypeDescription, val location: Location, variable: String, value: TypedAST) extends TypedAST
 
-  case class LetDeclaration(val description: TypeDescription, val location: Location, variable: String, declaredType: Option[TypeDescription], value: TypedAST, body: TypedAST, immutable: Boolean) extends TypedAST
+  case class LetDeclaration(val description: TypeDescription, val location: Location, variable: String, declaredType: TypeDescription, value: TypedAST, body: TypedAST, immutable: Boolean) extends TypedAST
 
-  case class FunctionLiteral(val description: TypeDescription, val location: Location, params: List[FormalParameter], optionalType: Option[TypeDescription], proc: TypedAST) extends TypedAST
+  case class FunctionLiteral(val description: TypeDescription, val location: Location, params: List[FormalParameter], optionalType: Option[TypeDescription], proc: TypedAST) extends TypedAST {
+    override def toString: String = s"""${params.mkString(", ")} => ${optionalType.getOrElse("?")}"""
+  }
 
   case class LetFunctionDefinition(val description: TypeDescription, val location: Location, name: String, body: FunctionLiteral, cleanup: Option[TypedAST], expression: TypedAST) extends TypedAST
 

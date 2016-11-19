@@ -112,7 +112,7 @@ class Parser extends RegexParsers {
 
   def typeAnnotation: Parser[TypeDescription] = COLON ~> typeDescription
 
-  def castType: Parser[TypeDescription] = token("#") ~> typeDescription
+  def castType: Parser[TypeDescription] = typeDescription
 
   def typeDescription: Parser[TypeDescription] = (
     ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
@@ -211,12 +211,13 @@ class Parser extends RegexParsers {
     }
   }
 
-  def castable: Parser[AST] = primary ~ repsep(% ~ CL(castType), CL(COLONGT)) ^^ {
-    case target ~ castings => castings.foldLeft(target){ case (e, location ~ description) => Casting(location, e, description)}
+  def castable: Parser[AST] = primary ~ opt((% <~ CL(COLONGT)) ~ CL(castType)) ^^ {
+    case target ~ Some((location ~ castType)) => Casting(location, target, castType)
+    case target ~ None => target
   }
 
-  //primary ::= ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AST] = ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
+  //primary ::= booleanLiteral | ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | "(" expression ")" | "{" lines "}"
+  def primary: Parser[AST] = booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def integerLiteral : Parser[AST] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix} | "S" ^^ { _ => ShortSuffix }) ^^ {
@@ -343,7 +344,7 @@ class Parser extends RegexParsers {
   }
 
   // newObject ::= "new" fqcn "(" [param {"," param} ")"
-  def newObject: Parser[AST] = (% <~ CL(NEW)) ~ fqcn ~ (opt(CL(LPAREN) ~> repsep(ident, CL(COMMA)) <~ (RPAREN))) ^^ {
+  def newObject: Parser[AST] = (% <~ CL(NEW)) ~ fqcn ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN) ^^ {
     case location ~ className ~ Some(params) => NewObject(location, className, params)
     case location ~ className ~ None => NewObject(location, className, List())
   }

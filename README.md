@@ -114,7 +114,7 @@ Currently, the type of list literal is `java.util.List`.
 ### Map Literal
 
 ```
-val map = #["A": 1, "B": 2]
+val map = $["A": 1, "B": 2]
 map.get("A") // => 1
 map.get("B") // => 2
 map.get("C") // => null
