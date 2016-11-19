@@ -644,17 +644,19 @@ class Typer {
         val (typedTarget, s1) = doType(target, env, a, s0)
         val s2 = unify(typ, to, s1)
         (TypedAST.Casting(to, location, typedTarget, to), s2)
-        /*
       case AST.MethodCall(location, receiver, name, params) =>
-        val typedReceiver = typeCheck(receiver)
-        if(typedReceiver.description != DynamicType) {
-          throw TyperException(s"${location.format} expected: [*], actual: ${typedReceiver.description}")
+        val a = newTypeVariable()
+        val (typedReceiver, s1) = doType(receiver, env, a, s0)
+        val s2 = unify(s0(a), DynamicType, s1)
+        val ts = params.map{_ => newTypeVariable()}
+        val (tes, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s2)){ case ((tes, s), (e, t)) =>
+          val (te, sx) = doType(e, env, t, s)
+          (te::tes, sx)
         }
-        val typedParams = params.map(p => typeCheck(p))
-        TypedAST.MethodCall(DynamicType, location, typedReceiver, name, typedParams)
+        val sy = unify(typ, DynamicType, sx)
+        (TypedAST.MethodCall(DynamicType, location, typedReceiver, name, tes.reverse), sy)
       case otherwise =>
         throw TyperPanic(otherwise.toString)
-        */
     }
   }
 }
