@@ -205,14 +205,9 @@ class Parser extends RegexParsers {
       npList.foldLeft(self){case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil))}
   }
 
-  def application: Parser[AST] = % ~ pipelinable ~ opt(CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN))^^ {
-    case location ~ fac ~ param => {
-      param match {
-        case Some(p) =>
-          FunctionCall(location, fac, p)
-        case None =>
-          fac
-      }
+  def application: Parser[AST] = % ~ pipelinable ~ (CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN)).* ^^ {
+    case location ~ f ~ xs => {
+       xs.foldLeft(f){ case (e, x) => FunctionCall(e.location, e, x) }
     }
   }
 
@@ -322,11 +317,11 @@ class Parser extends RegexParsers {
     }
   }
 
-  def ident :Parser[Id] = (% ~ """[A-Za-z_][a-zA-Z0-9]*""".r^? {
+  def ident :Parser[Id] = (% ~ """[A-Za-z_][a-zA-Z0-9_]*""".r^? {
     case r@(_ ~ n) if !KEYWORDS(n) => r
   } ^^ {case location ~ name => Id(location, name)}) <~ SPACING_WITHOUT_LF
 
-  def operator:Parser[String] = ("""#[A-Za-z_][a-zA-Z0-9]*""".r^? {
+  def operator:Parser[String] = ("""#[A-Za-z_][a-zA-Z0-9_]*""".r^? {
     case  n if !KEYWORDS(n.substring(1)) => n.substring(1)
   }) <~ SPACING_WITHOUT_LF
 
