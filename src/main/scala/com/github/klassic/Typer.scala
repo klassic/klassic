@@ -30,7 +30,8 @@ class Typer {
       "tail" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> listOf(TypeVariable("a"))),
       "cons" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(TypeVariable("a"), listOf(TypeVariable("a"))), listOf(TypeVariable("a")))),
       "size" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> IntType),
-      "isEmpty" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> BooleanType)
+      "isEmpty" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> BooleanType),
+      "ToDo" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(), TypeVariable("a")))
     )
   }
 

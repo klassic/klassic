@@ -5,6 +5,7 @@ import java.lang.reflect.{Constructor, Method}
 
 import com.github.klassic.AST._
 import com.github.klassic.TypeDescription._
+import com.github.klassic.runtime._
 import com.github.klassic.TypedAST.{FunctionLiteral, ValueNode}
 
 /**
@@ -156,6 +157,10 @@ class Interpreter {evaluator =>
     }
     define("isEmpty") { case List(ObjectValue(list: java.util.List[_])) =>
       BoxedBoolean(list.isEmpty)
+    }
+
+    define("ToDo") { case Nil =>
+        throw NotImplementedError("not implemented yet")
     }
   }
 
