@@ -52,6 +52,9 @@ class ListSpec extends SpecHelper {
       """.stripMargin -> ObjectValue(listOf(2, 1)),
       """
         | cons(3, [2, 1])
+      """.stripMargin -> ObjectValue(listOf(3, 2, 1)),
+      """
+        | 3 #cons (2 #cons (1 #cons []))
       """.stripMargin -> ObjectValue(listOf(3, 2, 1))
     )
 

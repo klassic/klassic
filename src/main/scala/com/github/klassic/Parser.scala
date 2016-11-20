@@ -146,7 +146,7 @@ class Parser extends RegexParsers {
   def line: Parser[AST] = expression | val_declaration | functionDefinition
 
   //expression ::= assignment | conditional | if | while
-  def expression: Parser[AST] = assignment | logical | ifExpression | whileExpression | foreachExpression
+  def expression: Parser[AST] = assignment | infix | ifExpression | whileExpression | foreachExpression
 
   //if ::= "if" "(" expression ")" expression "else" expression
   def ifExpression: Parser[AST] = (% <~ CL(IF) <~ CL(LPAREN)) ~ expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression ^^ {
@@ -162,6 +162,10 @@ class Parser extends RegexParsers {
   def foreachExpression: Parser[AST] = (% <~ CL(FOREACH) <~ CL(LPAREN)) ~ (CL(ident) <~ CL(IN)) ~ (expression <~ CL(RPAREN)) ~ expression ^^ {
     case location ~ variable ~ collection ~ body => ForeachExpression(location, variable.name, collection, body)
   }
+
+  def infix: Parser[AST] = chainl1(logical,
+    (% ~ CL(operator)) ^^ { case location ~ op => (lhs: AST, rhs: AST) => FunctionCall(location, Id(location, op), List(lhs, rhs))}
+  )
 
   def logical: Parser[AST] = chainl1(conditional,
     (% <~ CL(AMP2)) ^^ {location => (lhs: AST, rhs: AST) => BinaryExpression(location, Operator.AND2, lhs, rhs)} |
@@ -321,6 +325,10 @@ class Parser extends RegexParsers {
   def ident :Parser[Id] = (% ~ """[A-Za-z_][a-zA-Z0-9]*""".r^? {
     case r@(_ ~ n) if !KEYWORDS(n) => r
   } ^^ {case location ~ name => Id(location, name)}) <~ SPACING_WITHOUT_LF
+
+  def operator:Parser[String] = ("""#[A-Za-z_][a-zA-Z0-9]*""".r^? {
+    case  n if !KEYWORDS(n.substring(1)) => n.substring(1)
+  }) <~ SPACING_WITHOUT_LF
 
   def assignment: Parser[Assignment] = ident ~ CL(PLUSEQ | MINUSEQ | ASTEREQ | SLASHEQ | EQ) ~ expression ^^ {
     case v ~ "=" ~ value => SimpleAssignment(v.location, v.name, value)
