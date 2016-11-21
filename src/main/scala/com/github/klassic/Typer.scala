@@ -14,6 +14,9 @@ class Typer {
   def mapOf(k: TypeDescription, v: TypeDescription): TypeConstructor = {
     TypeConstructor("Map", List(k, v))
   }
+  def setOf(tp: TypeDescription): TypeConstructor = {
+    TypeConstructor("Set", List(tp))
+  }
   val BuiltinEnvironment: Map[String, TypeScheme] = {
     val a = newTypeVariable()
     val b = newTypeVariable()
@@ -639,6 +642,15 @@ class Typer {
         }
         val sy = unify(listOfA, t, sx)
         (TypedAST.ListLiteral(sy(t), location, tes.reverse), sy)
+      case AST.SetLiteral(location, elements) =>
+        val a = newTypeVariable()
+        val setOfA = setOf(a)
+        val (tes, sx) = elements.foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), e) =>
+          val (te, sx) = doType(e, env, a, s)
+          (te::tes, sx)
+        }
+        val sy = unify(setOfA, t, sx)
+        (TypedAST.SetLiteral(sy(t), location, tes.reverse), sy)
       case AST.MapLiteral(location, elements) =>
         val kt = newTypeVariable()
         val vt = newTypeVariable()

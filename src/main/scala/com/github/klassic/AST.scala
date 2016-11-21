@@ -106,6 +106,8 @@ object AST {
 
   case class ListLiteral(location: Location, elements: List[AST]) extends AST
 
+  case class SetLiteral(location: Location, elements: List[AST]) extends AST
+
   case class MapLiteral(location: Location, elements: List[(AST, AST)]) extends AST
 
   case class NewObject(location: Location, className: String, params: List[AST]) extends AST

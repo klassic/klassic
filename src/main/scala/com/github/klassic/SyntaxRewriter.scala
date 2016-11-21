@@ -126,6 +126,7 @@ class SyntaxRewriter {
     case Lambda(location, params, optionalType, proc) => Lambda(location, params, optionalType, doRewrite(proc))
     case FunctionCall(location, func, params) => FunctionCall(location, doRewrite(func), params.map{doRewrite})
     case ListLiteral(location, elements) =>  ListLiteral(location, elements.map{doRewrite})
+    case SetLiteral(location, elements) =>  SetLiteral(location, elements.map{doRewrite})
     case MapLiteral(location, elements) => MapLiteral(location, elements.map{ case (k, v) => (doRewrite(k), doRewrite(v))})
     case NewObject(location, className, params) => NewObject(location, className, params.map{doRewrite})
     case MethodCall(location ,self, name, params) => MethodCall(location, doRewrite(self), name, params.map{doRewrite})

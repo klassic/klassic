@@ -394,6 +394,13 @@ class Interpreter {evaluator =>
             newList.add(param)
           }
           ObjectValue(newList)
+        case TypedAST.SetLiteral(description, location, elements) =>
+          val params = elements.map{e => Value.fromKlassic(evalRecursive(e))}
+          val newSet = new java.util.HashSet[Any]
+          params.foreach{param =>
+            newSet.add(param)
+          }
+          ObjectValue(newSet)
         case TypedAST.MapLiteral(description, location, elements) =>
           val params = elements.map{ case (k, v) =>
             (Value.fromKlassic(evalRecursive(k)), Value.fromKlassic(evalRecursive(v)))

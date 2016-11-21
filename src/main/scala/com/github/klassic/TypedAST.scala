@@ -74,6 +74,8 @@ object TypedAST {
 
   case class ListLiteral(val description: TypeDescription, val location: Location, elements: List[TypedAST]) extends TypedAST
 
+  case class SetLiteral(val description: TypeDescription, val location: Location, elements: List[TypedAST]) extends TypedAST
+
   case class MapLiteral(val description: TypeDescription,  val location: Location, elements: List[(TypedAST, TypedAST)]) extends TypedAST
 
   case class NewObject(val description: TypeDescription, val location: Location, className: String, params: List[TypedAST]) extends TypedAST
