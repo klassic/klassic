@@ -61,6 +61,8 @@ object AST {
     def apply(name: String): Id = Id(NoLocation, name)
   }
 
+  case class Selector(location: Location, module: String, name: String) extends AST
+
   sealed abstract class Assignment extends AST {
     val location: Location
     val variable: String

@@ -8,6 +8,8 @@ import scala.collection.mutable
   * Created by kota_mizushima on 2016/06/02.
   */
 class Typer {
+  type Environment = Map[String, TypeScheme]
+  type ModuleEnvironment = Map[String, Environment]
   def listOf(tp: TypeDescription): TypeConstructor = {
     TypeConstructor("List", List(tp))
   }
@@ -17,7 +19,7 @@ class Typer {
   def setOf(tp: TypeDescription): TypeConstructor = {
     TypeConstructor("Set", List(tp))
   }
-  val BuiltinEnvironment: Map[String, TypeScheme] = {
+  val BuiltinEnvironment: Environment = {
     val a = newTypeVariable()
     val b = newTypeVariable()
     Map(
@@ -28,15 +30,27 @@ class Typer {
       "println" ->  TypeScheme(List(tv("x")), FunctionType(List(tv("x")), UnitType)),
       "stopwatch" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), IntType)),
       "sleep" -> TypeScheme(List(), IntType ==> UnitType),
+      "isEmpty" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> BooleanType),
+      "ToDo" -> TypeScheme(List(tv("a")), FunctionType(List(), tv("a"))),
+      "assert" -> TypeScheme(List(tv("a")), BooleanType ==> UnitType),
+      "assertResult" -> TypeScheme(List(tv("a")), tv("a") ==> (tv("a") ==> UnitType)),
       "map" -> TypeScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
       "head" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
       "tail" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
       "cons" -> TypeScheme(List(tv("a")), FunctionType(List(tv("a"), listOf(tv("a"))), listOf(tv("a")))),
-      "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType),
-      "isEmpty" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> BooleanType),
-      "ToDo" -> TypeScheme(List(tv("a")), FunctionType(List(), tv("a"))),
-      "assert" -> TypeScheme(List(tv("a")), BooleanType ==> UnitType),
-      "assertResult" -> TypeScheme(List(tv("a")), tv("a") ==> (tv("a") ==> UnitType))
+      "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType)
+    )
+  }
+
+  val BuiltinModuleEnvironment: Map[String, Environment] = {
+    Map(
+      "List" -> Map(
+        "map" -> TypeScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
+        "head" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
+        "tail" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
+        "cons" -> TypeScheme(List(tv("a")), FunctionType(List(tv("a"), listOf(tv("a"))), listOf(tv("a")))),
+        "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType)
+      )
     )
   }
 
@@ -47,7 +61,6 @@ class Typer {
   def newTypeVariable(): TypeDescription = {
     n += 1; TypeVariable("'a" + n)
   }
-  type Environment = Map[String, TypeScheme]
   val EmptySubstitution: Substitution = new Substitution(Map.empty)
   class Substitution(val map: Map[TypeVariable, TypeDescription]) extends Function1[TypeDescription, TypeDescription] {
     def lookup(x: TypeVariable): TypeDescription = {
@@ -166,10 +179,10 @@ class Typer {
   }
 
 
-  def typeOf(e: AST, environment: Environment = BuiltinEnvironment): TypeDescription = {
+  def typeOf(e: AST, environment: Environment = BuiltinEnvironment, modules: ModuleEnvironment = BuiltinModuleEnvironment): TypeDescription = {
     val a = newTypeVariable()
     val r = new SyntaxRewriter
-    val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, None), a, EmptySubstitution)
+    val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, modules, None), a, EmptySubstitution)
     s(a)
   }
 
@@ -586,7 +599,14 @@ class Typer {
           case Some(u) => unify(newInstanceFrom(u), t, s0)
         }
         val resultType = s1(t)
-        (TypedAST.Identifier(resultType, location, name), s1)
+        (TypedAST.Id(resultType, location, name), s1)
+      case AST.Selector(location, module, name) =>
+        val s1 = env.lookupModuleMember(module, name) match {
+          case None => throw TyperException(s"${location.format} module '${module}' or member '${name}' is not found")
+          case Some(u) => unify(newInstanceFrom(u), t, s0)
+        }
+        val resultType = s1(t)
+        (TypedAST.Selector(resultType, location, module, name), s1)
       case AST.Lambda(location, params, optionalType, body) =>
         val b = optionalType.getOrElse(newTypeVariable())
         val ts = params.map{p => p.optionalType.getOrElse(newTypeVariable())}

@@ -58,7 +58,9 @@ object TypedAST {
 
   case class FloatNode(val description: TypeDescription, val location: Location, value: Float) extends TypedAST
 
-  case class Identifier(val description: TypeDescription, val location: Location, name: String) extends TypedAST
+  case class Id(val description: TypeDescription, val location: Location, name: String) extends TypedAST
+
+  case class Selector(val description: TypeDescription, val location: Location, module: String, name: String) extends TypedAST
 
   case class Assignment(val description: TypeDescription, val location: Location, variable: String, value: TypedAST) extends TypedAST
 

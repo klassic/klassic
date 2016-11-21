@@ -174,6 +174,51 @@ class Interpreter {evaluator =>
     }
   }
 
+  object BuiltinModuleEnvironment extends ModuleEnvironment() {
+    private final val LIST= "List"
+    define(LIST)("head") { case List(ObjectValue(list: java.util.List[_])) =>
+      Value.toKlassic(list.get(0).asInstanceOf[AnyRef])
+    }
+    define(LIST)("tail") { case List(ObjectValue(list: java.util.List[_])) =>
+      Value.toKlassic(list.subList(1, list.size()))
+    }
+    define(LIST)("cons") { case List(value: Value, ObjectValue(list: java.util.List[_])) =>
+      val newList = new java.util.ArrayList[Any]
+      var i = 0
+      newList.add(Value.fromKlassic(value))
+      while(i < list.size()) {
+        newList.add(list.get(i))
+        i += 1
+      }
+      Value.toKlassic(newList)
+    }
+
+    define(LIST)("size") { case List(ObjectValue(list: java.util.List[_])) =>
+      BoxedInt(list.size())
+    }
+
+    define(LIST)("isEmpty") { case List(ObjectValue(list: java.util.List[_])) =>
+      BoxedBoolean(list.isEmpty)
+    }
+
+    define(LIST)("map") { case List(ObjectValue(list: java.util.List[_])) =>
+      NativeFunctionValue{
+        case List(fun: FunctionValue) =>
+          val newList = new java.util.ArrayList[Any]
+          val interpreter = new Interpreter
+          val env = new Environment(fun.environment)
+          var i = 0
+          while(i < list.size()) {
+            val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
+            val result: Value = performFunction(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, List(ValueNode(param))), env)
+            newList.add(Value.fromKlassic(result))
+            i += 1
+          }
+          ObjectValue(newList)
+      }
+    }
+  }
+
   def evaluateFile(file: File): Value = using(new BufferedReader(new InputStreamReader(new FileInputStream(file)))){in =>
     val program = Iterator.continually(in.read()).takeWhile(_ != -1).map(_.toChar).mkString
     evaluateString(program)
@@ -183,7 +228,7 @@ class Interpreter {evaluator =>
     parser.parse(program) match {
       case parser.Success(node: AST, _) =>
         val tv = typer.newTypeVariable()
-        val (typedExpression, _) = typer.doType(rewriter.doRewrite(node), TypeEnvironment(typer.BuiltinEnvironment, Set.empty, None), tv, typer.EmptySubstitution)
+        val (typedExpression, _) = typer.doType(rewriter.doRewrite(node), TypeEnvironment(typer.BuiltinEnvironment, Set.empty, typer.BuiltinModuleEnvironment, None), tv, typer.EmptySubstitution)
         evaluate(typedExpression)
       case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
       case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
@@ -226,7 +271,7 @@ class Interpreter {evaluator =>
           reportError("unknown error")
       }
   }
-  private def evaluate(node: TypedAST, env: Environment): Value = {
+  private def evaluate(node: TypedAST, env: Environment, moduleEnv: ModuleEnvironment = BuiltinModuleEnvironment): Value = {
     def evalRecursive(node: TypedAST): Value = {
       node match{
         case TypedAST.Block(description, location, expressions) =>
@@ -410,7 +455,10 @@ class Interpreter {evaluator =>
             newMap.put(k, v)
           }
           ObjectValue(newMap)
-        case TypedAST.Identifier(description, location, name) => env(name)
+        case TypedAST.Id(description, location, name) =>
+          env(name)
+        case TypedAST.Selector(description, location, module, name) =>
+          moduleEnv(module)(name)
         case TypedAST.LetDeclaration(description, location, vr, optVariableType, value, body, immutable) =>
           env(vr) = evalRecursive(value)
           evalRecursive(body)

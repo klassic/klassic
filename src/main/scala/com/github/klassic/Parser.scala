@@ -225,8 +225,8 @@ class Parser extends RegexParsers {
     case target ~ None => target
   }
 
-  //primary ::= booleanLiteral | ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | |setLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AST] = booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
+  //primary ::= selector | booleanLiteral | ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | |setLiteral | "(" expression ")" | "{" lines "}"
+  def primary: Parser[AST] = selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def integerLiteral : Parser[AST] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix} | "S" ^^ { _ => ShortSuffix }) ^^ {
@@ -323,9 +323,15 @@ class Parser extends RegexParsers {
     }
   }
 
-  def ident :Parser[Id] = (% ~ """[A-Za-z_][a-zA-Z0-9_]*""".r^? {
+  def component: Parser[String] = """[A-Za-z_][a-zA-Z0-9_]*""".r
+
+  def ident :Parser[Id] = (% ~ component ^? {
     case r@(_ ~ n) if !KEYWORDS(n) => r
   } ^^ {case location ~ name => Id(location, name)}) <~ SPACING_WITHOUT_LF
+
+  def selector: Parser[Selector] = (% ~ component ~ "#" ~ component ^? {
+    case r@(_ ~ m ~ _ ~ n) if (!KEYWORDS(m)) && (!KEYWORDS(n)) => r
+  } ^^ {case location ~ m ~ _ ~ n => Selector(location, m, n)}) <~ SPACING_WITHOUT_LF
 
   def qident:Parser[String] = ("""'[A-Za-z_][a-zA-Z0-9_]*""".r^? {
     case  n if !KEYWORDS(n) => n
