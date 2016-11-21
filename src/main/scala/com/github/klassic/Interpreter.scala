@@ -135,6 +135,16 @@ class Interpreter {evaluator =>
       }
     }
 
+    define("assert") { case List(BoxedBoolean(condition)) =>
+        if(!condition) throw runtime.AssertionError("assertion failure") else UnitValue
+    }
+
+    define("assertResult") { case List(a: Value) =>
+      NativeFunctionValue{
+        case List(b: Value) =>
+          if(a != b) throw AssertionError(s"expected: ${a}, actual: ${b}") else UnitValue
+      }
+    }
 
     define("head") { case List(ObjectValue(list: java.util.List[_])) =>
       Value.toKlassic(list.get(0).asInstanceOf[AnyRef])

@@ -31,7 +31,9 @@ class Typer {
       "cons" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(TypeVariable("a"), listOf(TypeVariable("a"))), listOf(TypeVariable("a")))),
       "size" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> IntType),
       "isEmpty" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> BooleanType),
-      "ToDo" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(), TypeVariable("a")))
+      "ToDo" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(), TypeVariable("a"))),
+      "assert" -> TypeScheme(List(TypeVariable("a")), BooleanType ==> UnitType),
+      "assertResult" -> TypeScheme(List(TypeVariable("a")), TypeVariable("a") ==> (TypeVariable("a") ==> UnitType))
     )
   }
 
