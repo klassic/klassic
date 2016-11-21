@@ -64,7 +64,8 @@ class SyntaxRewriter {
     case literal@BooleanNode(location, value) => literal
     case literal@DoubleNode(location, value) => literal
     case literal@FloatNode(lcation, value) => literal
-    case node@Id(_, name) => node
+    case node@Id(_, _) => node
+    case node@Selector(_, _, _) => node
     case SimpleAssignment(location, variable, value) => SimpleAssignment(location, variable, doRewrite(value))
     case PlusAssignment(location, variable, value) =>
       val generatedSymbol = symbol()
