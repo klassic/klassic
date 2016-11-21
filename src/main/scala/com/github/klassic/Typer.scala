@@ -22,18 +22,18 @@ class Typer {
       "at" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType), DynamicType)),
       "matches" -> TypeScheme(List(), FunctionType(List(DynamicType, DynamicType), BooleanType)),
       "thread" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), DynamicType)),
-      "println" ->  TypeScheme(List(TypeVariable("x")), FunctionType(List(TypeVariable("x")), UnitType)),
+      "println" ->  TypeScheme(List(tv("x")), FunctionType(List(tv("x")), UnitType)),
       "stopwatch" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), IntType)),
       "sleep" -> TypeScheme(List(), IntType ==> UnitType),
-      "map" -> TypeScheme(List(TypeVariable("a"), TypeVariable("b")), listOf(TypeVariable("a")) ==> ((TypeVariable("a") ==>  TypeVariable("b"))  ==> listOf(TypeVariable("b")))),
-      "head" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> TypeVariable("a")),
-      "tail" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> listOf(TypeVariable("a"))),
-      "cons" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(TypeVariable("a"), listOf(TypeVariable("a"))), listOf(TypeVariable("a")))),
-      "size" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> IntType),
-      "isEmpty" -> TypeScheme(List(TypeVariable("a")), listOf(TypeVariable("a")) ==> BooleanType),
-      "ToDo" -> TypeScheme(List(TypeVariable("a")), FunctionType(List(), TypeVariable("a"))),
-      "assert" -> TypeScheme(List(TypeVariable("a")), BooleanType ==> UnitType),
-      "assertResult" -> TypeScheme(List(TypeVariable("a")), TypeVariable("a") ==> (TypeVariable("a") ==> UnitType))
+      "map" -> TypeScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
+      "head" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
+      "tail" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
+      "cons" -> TypeScheme(List(tv("a")), FunctionType(List(tv("a"), listOf(tv("a"))), listOf(tv("a")))),
+      "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType),
+      "isEmpty" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> BooleanType),
+      "ToDo" -> TypeScheme(List(tv("a")), FunctionType(List(), tv("a"))),
+      "assert" -> TypeScheme(List(tv("a")), BooleanType ==> UnitType),
+      "assertResult" -> TypeScheme(List(tv("a")), tv("a") ==> (tv("a") ==> UnitType))
     )
   }
 
