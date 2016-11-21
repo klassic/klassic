@@ -65,6 +65,7 @@ class Parser extends RegexParsers {
   lazy val LTE     : Parser[String] = token("<=")
   lazy val GTE     : Parser[String] = token(">=")
   lazy val MAP_OPEN: Parser[String] = token("%[")
+  lazy val SET_OPEN: Parser[String] = token("%(")
   lazy val PLUS    : Parser[String] = token("+")
   lazy val MINUS   : Parser[String] = token("-")
   lazy val ASTER   : Parser[String] = token("*")
@@ -223,8 +224,8 @@ class Parser extends RegexParsers {
     case target ~ None => target
   }
 
-  //primary ::= booleanLiteral | ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AST] = booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
+  //primary ::= booleanLiteral | ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | |setLiteral | "(" expression ")" | "{" lines "}"
+  def primary: Parser[AST] = booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
 
   //intLiteral ::= ["1"-"9"] {"0"-"9"}
   def integerLiteral : Parser[AST] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix} | "S" ^^ { _ => ShortSuffix }) ^^ {
@@ -257,6 +258,10 @@ class Parser extends RegexParsers {
 
   def listLiteral: Parser[AST] = % ~ (CL(LBRACKET) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET) ^^ {
     case location ~ contents => ListLiteral(location, contents)
+  }
+
+  def setLiteral: Parser[AST] = % ~ (CL(SET_OPEN) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RPAREN) ^^ {
+    case location ~ contents => SetLiteral(location, contents)
   }
 
   def mapLiteral: Parser[AST] = % ~ (CL(MAP_OPEN) ~> (repsep(CL(expression ~ COLON ~ expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET) ^^ {
