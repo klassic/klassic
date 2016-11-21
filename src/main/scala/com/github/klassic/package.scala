@@ -2,7 +2,7 @@ package com.github
 
 import java.io.{BufferedReader, FileInputStream, InputStreamReader}
 
-import com.github.klassic.TypeDescription.FunctionType
+import com.github.klassic.TypeDescription.{FunctionType, TypeVariable}
 
 import scala.language.reflectiveCalls
 
@@ -25,4 +25,6 @@ package object klassic {
   def typeOf(input: String): TypeDescription = {
     t.typeOf(p.parse(input).get)
   }
+
+  def tv(name: String): TypeVariable = TypeVariable(name)
 }
