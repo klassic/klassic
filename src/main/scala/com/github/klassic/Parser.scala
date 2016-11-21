@@ -118,6 +118,7 @@ class Parser extends RegexParsers {
 
   def typeDescription: Parser[TypeDescription] = (
     ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
+  | qident ^^ {id => TypeVariable(id) }
   | token("Byte") ^^ {_ => ByteType}
   | token("Short")  ^^ {_ => ShortType}
   | token("Int")  ^^ {_ => IntType}
@@ -325,6 +326,10 @@ class Parser extends RegexParsers {
   def ident :Parser[Id] = (% ~ """[A-Za-z_][a-zA-Z0-9_]*""".r^? {
     case r@(_ ~ n) if !KEYWORDS(n) => r
   } ^^ {case location ~ name => Id(location, name)}) <~ SPACING_WITHOUT_LF
+
+  def qident:Parser[String] = ("""'[A-Za-z_][a-zA-Z0-9_]*""".r^? {
+    case  n if !KEYWORDS(n) => n
+  }) <~ SPACING_WITHOUT_LF
 
   def operator:Parser[String] = ("""#[A-Za-z_][a-zA-Z0-9_]*""".r^? {
     case  n if !KEYWORDS(n.substring(1)) => n.substring(1)
