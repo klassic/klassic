@@ -1,7 +1,10 @@
 package com.github.klassic
 
+import scala.collection.JavaConverters._
+
 import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
 import java.lang.reflect.{Constructor, Method}
+import java.util
 
 import com.github.klassic.AST._
 import com.github.klassic.TypeDescription._
@@ -168,14 +171,17 @@ class Interpreter {evaluator =>
     define("isEmpty") { case List(ObjectValue(list: java.util.List[_])) =>
       BoxedBoolean(list.isEmpty)
     }
-
     define("ToDo") { case Nil =>
-        throw NotImplementedError("not implemented yet")
+      throw NotImplementedError("not implemented yet")
     }
+    defineValue("null")(
+      ObjectValue(null)
+    )
   }
 
   object BuiltinModuleEnvironment extends ModuleEnvironment() {
     private final val LIST= "List"
+    private final val MAP = "Map"
     define(LIST)("head") { case List(ObjectValue(list: java.util.List[_])) =>
       Value.toKlassic(list.get(0).asInstanceOf[AnyRef])
     }
@@ -217,6 +223,40 @@ class Interpreter {evaluator =>
           ObjectValue(newList)
       }
     }
+
+    define(MAP)("add") { case List(ObjectValue(self: java.util.Map[_, _])) =>
+      NativeFunctionValue{ case List(a: Value, b: Value) =>
+        val newMap = new java.util.HashMap[Any, Any]()
+        for((k, v) <- self.asScala) {
+          newMap.put(k, v)
+        }
+        newMap.put(Value.fromKlassic(a), Value.fromKlassic(b))
+        ObjectValue(newMap)
+      }
+    }
+
+    define(MAP)("containsKey") { case List(ObjectValue(self: java.util.Map[_, _])) =>
+        NativeFunctionValue{ case List(k: Value) =>
+          BoxedBoolean(self.containsKey(Value.fromKlassic(k)))
+        }
+    }
+
+    define(MAP)("containsValue") { case List(ObjectValue(self: java.util.Map[_, _])) =>
+      NativeFunctionValue{ case List(v: Value) =>
+        BoxedBoolean(self.containsValue(Value.fromKlassic(v)))
+      }
+    }
+
+    define(MAP)("get") { case List(ObjectValue(self: java.util.Map[_, _])) =>
+      NativeFunctionValue{ case List(k: Value) =>
+          Value.toKlassic(self.get(Value.fromKlassic(k)).asInstanceOf[AnyRef])
+      }
+    }
+
+    define(MAP)("size") { case List(ObjectValue(self: java.util.Map[_, _])) =>
+        BoxedInt(self.size())
+    }
+
   }
 
   def evaluateFile(file: File): Value = using(new BufferedReader(new InputStreamReader(new FileInputStream(file)))){in =>
