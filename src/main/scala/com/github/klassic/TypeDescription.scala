@@ -34,5 +34,5 @@ object TypeDescription {
 
   case class TypeScheme(typeVariables: List[TypeVariable], description: TypeDescription)
 
-  case class TypeConstructor(name: String, ts: List[TypeDescription]) extends TypeDescription(name + "[" + ts.mkString(", ") + "]")
+  case class TypeConstructor(name: String, ts: List[TypeDescription]) extends TypeDescription(name + "<" + ts.mkString(", ") + ">")
 }

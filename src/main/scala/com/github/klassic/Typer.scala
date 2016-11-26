@@ -38,18 +38,26 @@ class Typer {
       "head" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
       "tail" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
       "cons" -> TypeScheme(List(tv("a")), FunctionType(List(tv("a"), listOf(tv("a"))), listOf(tv("a")))),
-      "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType)
+      "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType),
+      "null" -> TypeScheme(List(tv("a")), tv("a"))
     )
   }
 
   val BuiltinModuleEnvironment: Map[String, Environment] = {
     Map(
       "List" -> Map(
+        "cons" -> TypeScheme(List(tv("a")), FunctionType(List(tv("a"), listOf(tv("a"))), listOf(tv("a")))),
         "map" -> TypeScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
         "head" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
         "tail" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
-        "cons" -> TypeScheme(List(tv("a")), FunctionType(List(tv("a"), listOf(tv("a"))), listOf(tv("a")))),
         "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType)
+      ),
+      "Map" -> Map(
+        "add" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> FunctionType(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")))),
+        "containsKey" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> BooleanType)),
+        "containsValue" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("b") ==> BooleanType)),
+        "get" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> tv("b"))),
+        "size" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> IntType)
       )
     )
   }

@@ -23,6 +23,9 @@ class Environment(val parent:Option[Environment]) {
   def define(name: String)(body: PartialFunction[List[Value], Value]): Value = {
     update(name, NativeFunctionValue(body))
   }
+  def defineValue(name: String)(value: Value): Value = {
+    update(name, value)
+  }
   def update(key: String, value: Value): Value = {
     variables(key) = value
     value
