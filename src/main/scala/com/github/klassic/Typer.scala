@@ -53,7 +53,7 @@ class Typer {
         "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType)
       ),
       "Map" -> Map(
-        "add" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> FunctionType(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")))),
+        "add" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (List(tv("a"), tv("b")) ==> mapOf(tv("a"), tv("b")))),
         "containsKey" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> BooleanType)),
         "containsValue" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("b") ==> BooleanType)),
         "get" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> tv("b"))),
