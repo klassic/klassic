@@ -155,15 +155,17 @@ class Interpreter {evaluator =>
     define("tail") { case List(ObjectValue(list: java.util.List[_])) =>
       Value.toKlassic(list.subList(1, list.size()))
     }
-    define("cons") { case List(value: Value, ObjectValue(list: java.util.List[_])) =>
-      val newList = new java.util.ArrayList[Any]
-      var i = 0
-      newList.add(Value.fromKlassic(value))
-      while(i < list.size()) {
-        newList.add(list.get(i))
-        i += 1
+    define("cons") { case List(value: Value) =>
+      NativeFunctionValue{ case List(ObjectValue(list: java.util.List[_])) =>
+        val newList = new java.util.ArrayList[Any]
+        var i = 0
+        newList.add(Value.fromKlassic(value))
+        while(i < list.size()) {
+          newList.add(list.get(i))
+          i += 1
+        }
+        Value.toKlassic(newList)
       }
-      Value.toKlassic(newList)
     }
     define("size") { case List(ObjectValue(list: java.util.List[_])) =>
       BoxedInt(list.size())
@@ -188,15 +190,17 @@ class Interpreter {evaluator =>
     define(LIST)("tail") { case List(ObjectValue(list: java.util.List[_])) =>
       Value.toKlassic(list.subList(1, list.size()))
     }
-    define(LIST)("cons") { case List(value: Value, ObjectValue(list: java.util.List[_])) =>
-      val newList = new java.util.ArrayList[Any]
-      var i = 0
-      newList.add(Value.fromKlassic(value))
-      while(i < list.size()) {
-        newList.add(list.get(i))
-        i += 1
+    define(LIST)("cons") { case List(value: Value) =>
+      NativeFunctionValue { case List(ObjectValue(list: java.util.List[_])) =>
+        val newList = new java.util.ArrayList[Any]
+        var i = 0
+        newList.add(Value.fromKlassic(value))
+        while (i < list.size()) {
+          newList.add(list.get(i))
+          i += 1
+        }
+        Value.toKlassic(newList)
       }
-      Value.toKlassic(newList)
     }
 
     define(LIST)("size") { case List(ObjectValue(list: java.util.List[_])) =>
