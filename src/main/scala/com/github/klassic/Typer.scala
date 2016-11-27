@@ -50,14 +50,16 @@ class Typer {
         "map" -> TypeScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
         "head" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
         "tail" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
-        "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType)
+        "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType),
+        "isEmpty" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> BooleanType)
       ),
       "Map" -> Map(
         "add" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (List(tv("a"), tv("b")) ==> mapOf(tv("a"), tv("b")))),
         "containsKey" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> BooleanType)),
         "containsValue" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("b") ==> BooleanType)),
         "get" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> tv("b"))),
-        "size" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> IntType)
+        "size" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> IntType),
+        "isEmpty" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> BooleanType)
       )
     )
   }

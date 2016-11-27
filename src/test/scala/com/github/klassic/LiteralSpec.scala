@@ -3,8 +3,6 @@ package com.github.klassic
 import java.util.ArrayList
 
 class LiteralSpec extends SpecHelper {
-  val I = new Interpreter
-
   describe("integer literal") {
     val expectations = List[(String, Value)](
       "2" -> BoxedInt(2),

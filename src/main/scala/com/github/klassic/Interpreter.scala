@@ -258,9 +258,12 @@ class Interpreter {evaluator =>
     }
 
     define(MAP)("size") { case List(ObjectValue(self: java.util.Map[_, _])) =>
-        BoxedInt(self.size())
+      BoxedInt(self.size())
     }
 
+    define(MAP)("isEmpty") { case List(ObjectValue(map: java.util.Map[_, _])) =>
+      BoxedBoolean(map.isEmpty)
+    }
   }
 
   def evaluateFile(file: File): Value = using(new BufferedReader(new InputStreamReader(new FileInputStream(file)))){in =>

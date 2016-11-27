@@ -1,8 +1,6 @@
 package com.github.klassic
 
 class CommentSpec extends SpecHelper {
-  val I = new Interpreter
-
   describe("line comment") {
     val expectations = List[(String, Value)](
       """|//line comment
