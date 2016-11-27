@@ -166,7 +166,8 @@ class Parser extends RegexParsers {
   }
 
   def infix: Parser[AST] = chainl1(logical,
-    (% ~ CL(operator)) ^^ { case location ~ op => (lhs: AST, rhs: AST) => FunctionCall(location, Id(location, op), List(lhs, rhs))}
+      (% ~ CL(operator)) ^^ { case location ~ op => (lhs: AST, rhs: AST) => FunctionCall(location, FunctionCall(location, Id(location, op), List(lhs)), List(rhs))}
+    | (% ~ CL(selector)) ^^ { case location ~ sl => (lhs: AST, rhs: AST) => FunctionCall(location, FunctionCall(location, sl, List(lhs)), List(rhs)) }
   )
 
   def logical: Parser[AST] = chainl1(conditional,

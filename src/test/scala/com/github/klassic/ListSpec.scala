@@ -45,13 +45,13 @@ class ListSpec extends SpecHelper {
   describe("cons") {
     val expectations: List[(String, Value)] = List(
       """
-         | cons(1, [])
+         | cons(1)([])
       """.stripMargin -> ObjectValue(listOf(1)),
       """
-         | cons(2, [1])
+         | cons(2)([1])
       """.stripMargin -> ObjectValue(listOf(2, 1)),
       """
-        | cons(3, [2, 1])
+        | cons(3)([2, 1])
       """.stripMargin -> ObjectValue(listOf(3, 2, 1)),
       """
         | 3 #cons (2 #cons (1 #cons []))
