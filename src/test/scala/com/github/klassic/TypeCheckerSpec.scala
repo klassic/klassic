@@ -4,8 +4,6 @@ package com.github.klassic
   * Created by Mizushima on 2016/05/30.
   */
 class TypeCheckerSpec extends SpecHelper {
-  val I = new Interpreter
-
   describe("assignment") {
     val expectations: List[(String, Value)] = List(
       """

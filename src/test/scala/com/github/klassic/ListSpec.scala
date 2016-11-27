@@ -1,8 +1,6 @@
 package com.github.klassic
 
 class ListSpec extends SpecHelper {
-  val I = new Interpreter
-
   describe("head") {
     val expectations: List[(String, Value)] = List(
       """

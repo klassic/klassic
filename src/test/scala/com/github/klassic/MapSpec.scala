@@ -1,8 +1,6 @@
 package com.github.klassic
 
 class MapSpec extends SpecHelper {
-  val I = new Interpreter
-
   describe("containsKey") {
     val expectations: List[(String, Value)] = List(
       """
@@ -59,5 +57,18 @@ class MapSpec extends SpecHelper {
         assert(expected == I.evaluateString(in))
       }
     }
+  }
+
+  describe("isEmpty") {
+    expect("empty map should be isEmpty")(
+      """
+        |Map#isEmpty(%[])
+      """.stripMargin -> BoxedBoolean(true)
+    )
+    expect("non empty map should not be isEmpty")(
+      """
+        |Map#isEmpty(%["x": 1 "y": 2])
+      """.stripMargin -> BoxedBoolean(false)
+    )
   }
 }

@@ -3,8 +3,6 @@ package com.github.klassic
 import com.github.klassic.runtime.NotImplementedError
 
 class ToDoSpec extends SpecHelper {
-  val I = new Interpreter
-
   describe("ToDo() function") {
     it("throw NotImplementedException when it is evaluated") {
       intercept[NotImplementedError] {
