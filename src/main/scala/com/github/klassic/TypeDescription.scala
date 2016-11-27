@@ -7,6 +7,11 @@ sealed abstract class TypeDescription(val image: String) {
   override def toString: String = image
 }
 object TypeDescription {
+  implicit class RichTypeDescriptions(args: List[TypeDescription]) {
+    def ==>(returnType: TypeDescription): TypeDescription.FunctionType = {
+      TypeDescription.FunctionType(args, returnType)
+    }
+  }
 
   case class TypeVariable(name: String) extends TypeDescription(name)
 
