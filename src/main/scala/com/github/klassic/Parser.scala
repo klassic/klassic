@@ -367,8 +367,8 @@ class Parser extends RegexParsers {
       Lambda(
         location,
         params.map {
-          case name ~ Some(description) => FormalParameter(name.name, Some(description))
-          case name ~ None => FormalParameter(name.name, None)
+          case name ~ Some(description) => FormalParameterOptional(name.name, Some(description))
+          case name ~ None => FormalParameterOptional(name.name, None)
         },
         optionalType,
         body
@@ -389,8 +389,8 @@ class Parser extends RegexParsers {
       val ps = params match {
         case Some(xs) =>
           xs.map{
-            case name ~ Some(annotation) => FormalParameter(name.name, Some(annotation))
-            case name ~ None => FormalParameter(name.name, None)
+            case name ~ Some(annotation) => FormalParameterOptional(name.name, Some(annotation))
+            case name ~ None => FormalParameterOptional(name.name, None)
           }
         case None => Nil
       }
