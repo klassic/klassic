@@ -112,11 +112,11 @@ class Parser extends RegexParsers {
   )
 
 
-  def typeAnnotation: Parser[TypeDescription] = COLON ~> typeDescription
+  lazy val typeAnnotation: Parser[TypeDescription] = COLON ~> typeDescription
 
-  def castType: Parser[TypeDescription] = typeDescription
+  lazy val castType: Parser[TypeDescription] = typeDescription
 
-  def typeDescription: Parser[TypeDescription] = (
+  lazy val typeDescription: Parser[TypeDescription] = (
     ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
   | (sident <~ CL(LT)) ~ repsep(typeDescription, CL(COMMA)) <~ CL(GT) ^^ { case name ~ args => TypeConstructor(name, args) }
   | qident ^^ {id => TypeVariable(id) }
@@ -131,53 +131,53 @@ class Parser extends RegexParsers {
   | token("*") ^^ {_ => DynamicType}
   )
 
-  def program: Parser[Program] = (SPACING ~> %) ~ repsep(`import`, TERMINATOR) ~ (lines <~ opt(TERMINATOR)) ^^ {
+  lazy val program: Parser[Program] = (SPACING ~> %) ~ repsep(`import`, TERMINATOR) ~ (lines <~ opt(TERMINATOR)) ^^ {
     case location ~ imports ~ block => Program(location, imports, block)
   }
 
-  def `import`: Parser[Import] = (% <~ CL(IMPORT)) ~ fqcn ^^ { case location ~ fqcn =>
+  lazy val `import`: Parser[Import] = (% <~ CL(IMPORT)) ~ fqcn ^^ { case location ~ fqcn =>
     val fragments = fqcn.split(".")
     Import(location, fragments(fragments.length - 1), fqcn)
   }
 
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
-  def lines: Parser[Block] = SPACING ~> (% ~ repsep(line, TERMINATOR)) <~ opt(TERMINATOR) ^^ { case location ~ expressions =>
+  lazy val lines: Parser[Block] = SPACING ~> (% ~ repsep(line, TERMINATOR)) <~ opt(TERMINATOR) ^^ { case location ~ expressions =>
       Block(location, expressions)
   }
 
   //line ::= expression | val_declaration | functionDefinition
-  def line: Parser[AST] = expression | val_declaration | functionDefinition
+  lazy val line: Parser[AST] = expression | val_declaration | functionDefinition
 
-  //expression ::= assignment | conditional | if | while
-  def expression: Parser[AST] = assignment | infix | ifExpression | whileExpression | foreachExpression
+  //expression ::= assignment | infix | ifExpression | whileEpression | foreachExpression
+  lazy val expression: Parser[AST] = assignment | infix | ifExpression | whileExpression | foreachExpression
 
-  //if ::= "if" "(" expression ")" expression "else" expression
-  def ifExpression: Parser[AST] = (% <~ CL(IF) <~ CL(LPAREN)) ~ expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression ^^ {
+  //ifExpression ::= "if" "(" expression ")" expression "else" expression
+  lazy val ifExpression: Parser[AST] = (% <~ CL(IF) <~ CL(LPAREN)) ~ expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression ^^ {
     case location ~ condition ~ _ ~ positive ~ _ ~ negative => IfExpression(location, condition, positive, negative)
   }
 
-  //while ::= "while" "(" expression ")" expression
-  def whileExpression: Parser[AST] = (% <~ CL(WHILE) <~ CL(LPAREN)) ~ expression ~ (CL(RPAREN) ~> expression) ^^ {
+  //whileExpression ::= "while" "(" expression ")" expression
+  lazy val whileExpression: Parser[AST] = (% <~ CL(WHILE) <~ CL(LPAREN)) ~ expression ~ (CL(RPAREN) ~> expression) ^^ {
     case location ~ condition ~  body => WhileExpression(location, condition, body)
   }
 
-  //foreach ::= "foreach" "(" ident "in" expression ")" expression
-  def foreachExpression: Parser[AST] = (% <~ CL(FOREACH) <~ CL(LPAREN)) ~ (CL(ident) <~ CL(IN)) ~ (expression <~ CL(RPAREN)) ~ expression ^^ {
+  //foreachExpression ::= "foreach" "(" ident "in" expression ")" expression
+  lazy val foreachExpression: Parser[AST] = (% <~ CL(FOREACH) <~ CL(LPAREN)) ~ (CL(ident) <~ CL(IN)) ~ (expression <~ CL(RPAREN)) ~ expression ^^ {
     case location ~ variable ~ collection ~ body => ForeachExpression(location, variable.name, collection, body)
   }
 
-  def infix: Parser[AST] = chainl1(logical,
+  lazy val infix: Parser[AST] = chainl1(logical,
       (% ~ CL(operator)) ^^ { case location ~ op => (lhs: AST, rhs: AST) => FunctionCall(location, FunctionCall(location, Id(location, op), List(lhs)), List(rhs))}
     | (% ~ CL(selector)) ^^ { case location ~ sl => (lhs: AST, rhs: AST) => FunctionCall(location, FunctionCall(location, sl, List(lhs)), List(rhs)) }
   )
 
-  def logical: Parser[AST] = chainl1(conditional,
+  lazy val logical: Parser[AST] = chainl1(conditional,
     (% <~ CL(AMP2)) ^^ {location => (lhs: AST, rhs: AST) => BinaryExpression(location, Operator.AND2, lhs, rhs)} |
     (% <~ CL(BAR2)) ^^ {location => (lhs: AST, rhs: AST) => BinaryExpression(location, Operator.BAR2, lhs, rhs)}
   )
 
   //conditional ::= add {"<" add | ">" add | "<=" add | ">=" add}
-  def conditional: Parser[AST] = chainl1(add,
+  lazy val conditional: Parser[AST] = chainl1(add,
     (% <~ CL(EQEQ)) ^^ {location => (left:AST, right:AST) => BinaryExpression(location, Operator.EQUAL, left, right)} |
     (% <~ CL(LTE)) ^^ {location => (left:AST, right:AST) => BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right)} |
     (% <~ CL(GTE)) ^^ {location => (left:AST, right:AST) => BinaryExpression(location, Operator.GREATER_EQUAL, left, right)} |
@@ -187,69 +187,69 @@ class Parser extends RegexParsers {
 
 
   //add ::= term {"+" term | "-" term}
-  def add: Parser[AST] = chainl1(term,
+  lazy val add: Parser[AST] = chainl1(term,
     (% <~ CL(PLUS)) ^^ {location => (left:AST, right:AST) => BinaryExpression(location, Operator.ADD, left, right)}|
     (% <~ CL(MINUS)) ^^ {location => (left:AST, right:AST) => BinaryExpression(location, Operator.SUBTRACT, left, right)})
 
   //term ::= factor {"*" factor | "/" factor}
-  def term : Parser[AST] = chainl1(unary,
+  lazy val term : Parser[AST] = chainl1(unary,
     (% <~ CL(ASTER)) ^^ {location => (left:AST, right:AST) => BinaryExpression(location, Operator.MULTIPLY, left, right)}|
     (% <~ CL(SLASH)) ^^ {location => (left:AST, right:AST) => BinaryExpression(location, Operator.DIVIDE, left, right)})
 
-  def unary: Parser[AST] = (
+  lazy val unary: Parser[AST] = (
     % ~ CL(MINUS) ~ unary ^^ { case location ~ _ ~ operand => MinusOp(location, operand) }
   | % ~ CL(PLUS) ~ unary ^^ { case location ~ _ ~ operand => PlusOp(location, operand) }
   | invocation
   )
 
-  def invocation: Parser[AST] = % ~ application ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
+  lazy val invocation: Parser[AST] = % ~ application ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
     case location ~ self ~ Nil =>
       self
     case location ~ self ~ npList  =>
       npList.foldLeft(self){case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil))}
   }
 
-  def application: Parser[AST] = % ~ pipelinable ~ (CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN)).* ^^ {
+  lazy val application: Parser[AST] = % ~ pipelinable ~ (CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN)).* ^^ {
     case location ~ f ~ xs => {
        xs.foldLeft(f){ case (e, x) => FunctionCall(e.location, e, x) }
     }
   }
 
-  def pipelinable: Parser[AST] = % ~ castable ~ opt(CL(ARROW2) ~> ident) ^^ {
+  lazy val pipelinable: Parser[AST] = % ~ castable ~ opt(CL(ARROW2) ~> ident) ^^ {
     case location ~ self ~ None =>
       self
     case location ~ self ~ Some(name) =>
       FunctionCall(location, name, List(self))
   }
 
-  def castable: Parser[AST] = primary ~ opt((% <~ CL(COLONGT)) ~ CL(castType)) ^^ {
+  lazy val castable: Parser[AST] = primary ~ opt((% <~ CL(COLONGT)) ~ CL(castType)) ^^ {
     case target ~ Some((location ~ castType)) => Casting(location, target, castType)
     case target ~ None => target
   }
 
-  //primary ::= selector | booleanLiteral | ident | floatLiteral | integerLiteral | stringLiteral | mapLiteral | listLiteral | |setLiteral | "(" expression ")" | "{" lines "}"
-  def primary: Parser[AST] = selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newObject | anonymousFunction | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
+  //primary ::= selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | |setLiteral | newObject | functionLiteral | "(" expression ")" | "{" lines "}" | hereDocument
+  lazy val primary: Parser[AST] = selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newObject | functionLiteral | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
 
-  //intLiteral ::= ["1"-"9"] {"0"-"9"}
-  def integerLiteral : Parser[AST] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix} | "S" ^^ { _ => ShortSuffix }) ^^ {
+  //integerLiteral ::= ["1"-"9"] {"0"-"9"}
+  lazy val integerLiteral : Parser[AST] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix} | "S" ^^ { _ => ShortSuffix }) ^^ {
     case location ~ value ~ None => IntNode(location, value.toLong.toInt)
     case location ~ value ~ Some(LongSuffix) => LongNode(location, value.toLong)
     case location ~ value ~ Some(ShortSuffix) => ShortNode(location, value.toShort)
     case location ~ value ~ Some(ByteSuffix) => ByteNode(location, value.toByte)
   }) <~ SPACING_WITHOUT_LF
 
-  def floatLiteral: Parser[AST]= ((% ~ "([1-9][0-9]*|0)\\.[0-9]*".r ~ opt("F" ^^ { _ => FloatSuffix })) ^^ {
+  lazy val floatLiteral: Parser[AST]= ((% ~ "([1-9][0-9]*|0)\\.[0-9]*".r ~ opt("F" ^^ { _ => FloatSuffix })) ^^ {
     case location ~ value ~ None => DoubleNode(location, value.toDouble)
     case location ~ value ~ Some(FloatSuffix) => FloatNode(location, value.toFloat)
   }) <~ SPACING_WITHOUT_LF
 
-  def booleanLiteral: Parser[AST] = % ~ (TRUE ^^ { _ => true }| FALSE ^^ { _ => false}) ^^ {
+  lazy val booleanLiteral: Parser[AST] = % ~ (TRUE ^^ { _ => true }| FALSE ^^ { _ => false}) ^^ {
     case location ~  true => BooleanNode(location, true)
     case location ~  false => BooleanNode(location, false)
   }
 
   //stringLiteral ::= "\"" ((?!")(\[rntfb"'\\]|[^\\]))* "\""
-  def stringLiteral : Parser[AST] =
+  lazy val stringLiteral : Parser[AST] =
     ("\"" ~>
       (% ~ """((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ {case location ~ in =>
         StringNode(location, unescape(in))
@@ -259,19 +259,19 @@ class Parser extends RegexParsers {
     values.foldLeft(StringNode(NoLocation, ""):AST) { (node, content) => BinaryExpression(content.location, Operator.ADD, node, content) }
   }) <~ SPACING_WITHOUT_LF
 
-  def listLiteral: Parser[AST] = % ~ (CL(LBRACKET) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET) ^^ {
+  lazy val listLiteral: Parser[AST] = % ~ (CL(LBRACKET) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET) ^^ {
     case location ~ contents => ListLiteral(location, contents)
   }
 
-  def setLiteral: Parser[AST] = % ~ (CL(SET_OPEN) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RPAREN) ^^ {
+  lazy val setLiteral: Parser[AST] = % ~ (CL(SET_OPEN) ~> (repsep(CL(expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RPAREN) ^^ {
     case location ~ contents => SetLiteral(location, contents)
   }
 
-  def mapLiteral: Parser[AST] = % ~ (CL(MAP_OPEN) ~> (repsep(CL(expression ~ COLON ~ expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET) ^^ {
+  lazy val mapLiteral: Parser[AST] = % ~ (CL(MAP_OPEN) ~> (repsep(CL(expression ~ COLON ~ expression), SEPARATOR) <~ opt(SEPARATOR)) <~ RBRACKET) ^^ {
     case location ~ contents => MapLiteral(location, contents.map {case k ~ colon ~ v => (k, v)})
   }
 
-  def fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ {
+  lazy val fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ {
     case id ~ ids => ids.foldLeft(id.name){ case (a, d ~ e) => a + d + e.name}
   }
 
@@ -325,9 +325,9 @@ class Parser extends RegexParsers {
     }
   }
 
-  def component: Parser[String] = """[A-Za-z_][a-zA-Z0-9_]*""".r
+  lazy val component: Parser[String] = """[A-Za-z_][a-zA-Z0-9_]*""".r
 
-  def ident :Parser[Id] = (% ~ component ^? {
+  lazy val ident :Parser[Id] = (% ~ component ^? {
     case r@(_ ~ n) if !KEYWORDS(n) => r
   } ^^ {case location ~ name => Id(location, name)}) <~ SPACING_WITHOUT_LF
 
@@ -335,19 +335,19 @@ class Parser extends RegexParsers {
     case r@(_ ~ m ~ _ ~ n) if (!KEYWORDS(m)) && (!KEYWORDS(n)) => r
   } ^^ {case location ~ m ~ _ ~ n => Selector(location, m, n)}) <~ SPACING_WITHOUT_LF
 
-  def qident:Parser[String] = ("""'[A-Za-z_][a-zA-Z0-9_]*""".r^? {
+  lazy val qident:Parser[String] = ("""'[A-Za-z_][a-zA-Z0-9_]*""".r^? {
     case  n if !KEYWORDS(n) => n
   }) <~ SPACING_WITHOUT_LF
 
-  def sident:Parser[String] = ("""[A-Za-z_][a-zA-Z0-9_]*""".r^? {
+  lazy val sident:Parser[String] = ("""[A-Za-z_][a-zA-Z0-9_]*""".r^? {
     case  n if !KEYWORDS(n) => n
   }) <~ SPACING_WITHOUT_LF
 
-  def operator:Parser[String] = ("""#[A-Za-z_][a-zA-Z0-9_]*""".r^? {
+  lazy val operator:Parser[String] = ("""#[A-Za-z_][a-zA-Z0-9_]*""".r^? {
     case  n if !KEYWORDS(n.substring(1)) => n.substring(1)
   }) <~ SPACING_WITHOUT_LF
 
-  def assignment: Parser[Assignment] = ident ~ CL(PLUSEQ | MINUSEQ | ASTEREQ | SLASHEQ | EQ) ~ expression ^^ {
+  lazy val assignment: Parser[Assignment] = ident ~ CL(PLUSEQ | MINUSEQ | ASTEREQ | SLASHEQ | EQ) ~ expression ^^ {
     case v ~ "=" ~ value => SimpleAssignment(v.location, v.name, value)
     case v ~ "+=" ~ value => PlusAssignment(v.location, v.name, value)
     case v ~ "-=" ~ value => MinusAssignment(v.location, v.name, value)
@@ -357,12 +357,12 @@ class Parser extends RegexParsers {
   }
 
   // val_declaration ::= "val" ident "=" expression
-  def val_declaration:Parser[ValDeclaration] = ((% ~ CL(MUTABLE ^^ {_ => false } | VAL ^^ {_ => true})) ~ ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
+  lazy val val_declaration:Parser[ValDeclaration] = ((% ~ CL(MUTABLE ^^ {_ => false } | VAL ^^ {_ => true})) ~ ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
     case location ~  immutable ~ valName ~ optionalType ~ value => ValDeclaration(location, valName.name, optionalType, value, immutable)
   }
 
   // anonnymousFunction ::= "(" [param {"," param}] ")" "=>" expression
-  def anonymousFunction():Parser[AST] = % ~ opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ (opt(typeAnnotation) <~ CL(ARROW1)) ~ expression ^^ {
+  lazy val functionLiteral: Parser[AST] = % ~ opt(CL(LPAREN) ~> repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ (opt(typeAnnotation) <~ CL(ARROW1)) ~ expression ^^ {
     case location ~ Some(params) ~ optionalType ~ body =>
       Lambda(
         location,
@@ -377,13 +377,13 @@ class Parser extends RegexParsers {
   }
 
   // newObject ::= "new" fqcn "(" [param {"," param} ")"
-  def newObject: Parser[AST] = (% <~ CL(NEW)) ~ fqcn ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN) ^^ {
+  lazy val newObject: Parser[AST] = (% <~ CL(NEW)) ~ fqcn ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN) ^^ {
     case location ~ className ~ Some(params) => NewObject(location, className, params)
     case location ~ className ~ None => NewObject(location, className, List())
   }
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
-  def functionDefinition:Parser[FunctionDefinition] =
+  lazy val functionDefinition: Parser[FunctionDefinition] =
     (% <~ CL(DEF)) ~ ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ (opt(typeAnnotation) <~ CL(EQ)) ~ expression ~ opt(CL(CLEANUP) ~> expression) ^^ {
     case location ~ functionName ~ params ~ optionalType ~ body ~ cleanup =>
       val ps = params match {
