@@ -88,10 +88,10 @@ object AST {
     }
   }
 
-  case class Lambda(location: Location, params: List[FormalParameter], optionalType: Option[TypeDescription], body: AST) extends AST
+  case class Lambda(location: Location, params: List[FormalParameterOptional], optionalType: Option[TypeDescription], body: AST) extends AST
   object Lambda {
     def apply(params: List[String], body: AST): Lambda = {
-      Lambda(NoLocation, params.map{ case name => FormalParameter(name, None)}, None, body)
+      Lambda(NoLocation, params.map{ case name => FormalParameterOptional(name, None)}, None, body)
     }
   }
 
