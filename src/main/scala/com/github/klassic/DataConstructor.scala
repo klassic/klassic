@@ -1,3 +1,3 @@
 package com.github.klassic
 
-case class DataConstructor(params: List[FormalParameter])
+case class DataConstructor(name: String, params: List[FormalParameter])
