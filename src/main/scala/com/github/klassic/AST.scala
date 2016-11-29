@@ -26,6 +26,8 @@ object AST {
 
   case class Import(location: Location, simpleName: String, fqcn: String)
 
+  case class VariantDeclaration(location: Location, id: String, params: List[TypeDescription], constructors: List[DataConstructor]) extends AST
+
   case class Block(location: Location, expressions: List[AST]) extends AST
 
   case class IfExpression(location: Location, condition: AST, thenExpression: AST, elseExpression: AST) extends AST
@@ -80,6 +82,8 @@ object AST {
   case class DivisionAssignment(location: Location, variable: String, value: AST) extends Assignment
 
   case class ValDeclaration(location: Location, variable: String, description: Option[TypeDescription], value: AST, immutable: Boolean) extends AST
+
+  case class VariantIn(location: Location, variant: VariantDeclaration, body: AST) extends AST
 
   case class Let(location: Location, variable: String, description: Option[TypeDescription], value: AST, body: AST, immutable: Boolean) extends AST
   object Let {
