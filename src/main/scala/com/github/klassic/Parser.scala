@@ -81,6 +81,7 @@ class Parser extends RegexParsers {
   lazy val WHILE   : Parser[String] = token("while")
   lazy val FOREACH : Parser[String] = token("foreach")
   lazy val IMPORT  : Parser[String] = token("import")
+  lazy val VARIANT : Parser[String] = token("variant")
   lazy val TRUE    : Parser[String] = token("true")
   lazy val FALSE   : Parser[String] = token("false")
   lazy val IN      : Parser[String] = token("in")
@@ -105,6 +106,7 @@ class Parser extends RegexParsers {
   lazy val QUES    : Parser[String] = token("?")
   lazy val AMP2    : Parser[String] = token("&&")
   lazy val BAR2    : Parser[String] = token("||")
+  lazy val BAR     : Parser[String] = token("|")
   lazy val KEYWORDS: Set[String]     = Set(
     "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
     "if", "else", "while", "foreach", "import", "cleanup", "true", "false", "in", ",", ".",
@@ -145,8 +147,23 @@ class Parser extends RegexParsers {
       Block(location, expressions)
   }
 
-  //line ::= expression | val_declaration | functionDefinition
-  lazy val line: Parser[AST] = expression | val_declaration | functionDefinition
+  lazy val variantDeclaration: Parser[VariantDeclaration] = for {
+    location <- %
+    _ <- CL(VARIANT)
+    name <- sident
+    ts <- opt(LT ~> rep1sep(typeAnnotation, CL(COMMA)) <~ GT <~ EQ)
+    cs <- dataConstructor.*
+  } yield VariantDeclaration(location, name, ts.getOrElse(Nil), cs)
+
+  lazy val dataConstructor: Parser[DataConstructor] = (
+    (BAR ~> sident) ~ opt(LPAREN ~> rep1sep((sident <~ CL(COLON)) ~ typeAnnotation ^^ { case i ~ t => FormalParameter(i, t)}, CL(COMMA)) <~ RPAREN) ^^ {
+      case name ~ Some(params) => DataConstructor(name, params)
+      case name ~ None => DataConstructor(name, Nil)
+    }
+  )
+
+  //line ::= expression | valDeclaration | functionDefinition
+  lazy val line: Parser[AST] = variantDeclaration | expression | valDeclaration | functionDefinition
 
   //expression ::= assignment | infix | ifExpression | whileEpression | foreachExpression
   lazy val expression: Parser[AST] = assignment | infix | ifExpression | whileExpression | foreachExpression
@@ -356,8 +373,8 @@ class Parser extends RegexParsers {
     case _ ~ op ~ _ => sys.error(s"unknown assignment operator ${op}")
   }
 
-  // val_declaration ::= "val" ident "=" expression
-  lazy val val_declaration:Parser[ValDeclaration] = ((% ~ CL(MUTABLE ^^ {_ => false } | VAL ^^ {_ => true})) ~ ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
+  // valDeclaration ::= "val" ident "=" expression
+  lazy val valDeclaration:Parser[ValDeclaration] = ((% ~ CL(MUTABLE ^^ {_ => false } | VAL ^^ {_ => true})) ~ ident ~ opt(typeAnnotation) <~ CL(EQ)) ~ expression ^^ {
     case location ~  immutable ~ valName ~ optionalType ~ value => ValDeclaration(location, valName.name, optionalType, value, immutable)
   }
 
