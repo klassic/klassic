@@ -1,4 +1,4 @@
-# Klassic: Yet Another Klass-based Programming Language
+# Klassic: Klass-based Programming Language
 
 [![Build Status](https://travis-ci.org/klassic/klassic.png?branch=master)](https://travis-ci.org/klassic/klassic)
 
