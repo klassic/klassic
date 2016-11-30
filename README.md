@@ -13,6 +13,7 @@ language currently, it will be a statically typed programming language.  Klassic
 * cleanup clause
 * space-sensitive and line-sensitive list literals
 * space-sensitive and line-sensitive map literals
+* space-sensitive and line-sensitive set literals
 * Java FFI
 * , etc.
 
@@ -43,13 +44,13 @@ let j = 1
 // j = j + 1 NG
 ```
 
-### Anonymous Function
+### Function Literal
 
 ```
 val add = (x, y) => x + y
 ```
 
-Declare variable `add` and `add` is bounded to **the anonymous function** that
+Declare variable `add` and `add` is bounded to **the function literal** that
 calculates `x + y`.  If an anonymous function has block body, you can write as
 the following:
 
@@ -126,15 +127,15 @@ val list3 = [[1 2 3]
              [7 8 9]]
 ```
 
-The type of list literal is a instance of special type constructor `List[a]`.
+The type of list literal is a instance of special type constructor `List<'a>`.
 
 ### Map Literal
 
 ```
 val map = %["A": 1, "B": 2]
-map.get("A") // => 1
-map.get("B") // => 2
-map.get("C") // => null
+map Map#get "A" // => 1
+map Map#get "B" // => 2
+map Map#get "C" // => null
 ```
 
 A map literal can be expressed as the form `%[k1:v1, ..., kn:vn]` (`kn` and `vn` are expressions).  Note that
@@ -147,7 +148,30 @@ val map2 = %[
 ]
 ```
 
-The type of map literal is a instance of special type constructor `Map[k, v]`.
+The type of map literal is a instance of special type constructor `Map<'k, 'v>`.
+
+### Set Literal
+
+A map literal can be expressed as the form `%(v1, ..., vn)` (`vn` are expressions).  Note that
+separator characters also include line feeds and spaces in Klassic unlike other programmign languages:
+
+```
+val set1 = %(1, 2, 3)
+```
+
+```
+val set2 = %(1 2 3) // spae is omitted
+```
+
+```
+val set3 = %(
+  1
+  2
+  3
+)
+```
+
+The type of set literal is a instance of special type constructor `Set<'a>`.
 
 ### Cleanup Clause
 
