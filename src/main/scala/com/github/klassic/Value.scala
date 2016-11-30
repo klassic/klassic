@@ -36,6 +36,11 @@ case object UnitValue extends Value {
 case class ObjectValue(value: AnyRef) extends Value {
   override def toString = value.toString
 }
+case class VariantValue(tag: String, items: List[Value]) extends Value {
+  override def toString: String = {
+    s"${tag}(${items.mkString(", ")})"
+  }
+}
 object Value {
 
   def classOfValue(value: Value): java.lang.Class[_]= value match {
