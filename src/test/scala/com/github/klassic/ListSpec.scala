@@ -106,4 +106,17 @@ class ListSpec extends SpecHelper {
       }
     }
   }
+
+  describe("map") {
+    expect("for empty list")(
+      """
+        |map([])((x) => x + 1)
+      """.stripMargin, ObjectValue(listOf())
+    )
+    expect("for a non empty list and a function that add arg to 1")(
+      """
+        |map([1 2 3])((x) => x + 1)
+      """.stripMargin, ObjectValue(listOf(2, 3, 4))
+    )
+  }
 }

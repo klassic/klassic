@@ -130,7 +130,7 @@ class Interpreter {evaluator =>
           var i = 0
           while(i < list.size()) {
             val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
-            val result: Value = performFunction(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, List(ValueNode(param))), env)
+            val result: Value = performFunctionInternal(fun.value, List(ValueNode(param)), env)
             newList.add(Value.fromKlassic(result))
             i += 1
           }
@@ -177,20 +177,20 @@ class Interpreter {evaluator =>
       throw NotImplementedError("not implemented yet")
     }
     define("foldLeft") { case List(ObjectValue(list: java.util.List[_])) =>
-        NativeFunctionValue{ case List(init: Value) =>
-            NativeFunctionValue { case List(fun: FunctionValue) =>
-              val interpreter = new Interpreter
-              val env = new Environment(fun.environment)
-              var i = 0
-              var result: Value = init
-              while(i < list.size()) {
-                val params: List[TypedAST] = List(ValueNode(result), ValueNode(Value.toKlassic(list.get(i).asInstanceOf[AnyRef])))
-                result = performFunction(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, params), env)
-                i += 1
-              }
-              result
-            }
+      NativeFunctionValue{ case List(init: Value) =>
+        NativeFunctionValue { case List(fun: FunctionValue) =>
+          val interpreter = new Interpreter
+          val env = new Environment(fun.environment)
+          var i = 0
+          var result: Value = init
+          while(i < list.size()) {
+            val params: List[TypedAST] = List(ValueNode(result), ValueNode(Value.toKlassic(list.get(i).asInstanceOf[AnyRef])))
+            result = performFunctionInternal(fun.value, params, env)
+            i += 1
+          }
+          result
         }
+      }
     }
     defineValue("null")(
       ObjectValue(null)
@@ -236,7 +236,7 @@ class Interpreter {evaluator =>
           var i = 0
           while(i < list.size()) {
             val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
-            val result: Value = performFunction(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, List(ValueNode(param))), env)
+            val result: Value = performFunctionInternal(fun.value, List(ValueNode(param)), env)
             newList.add(Value.fromKlassic(result))
             i += 1
           }
@@ -253,7 +253,7 @@ class Interpreter {evaluator =>
               var result: Value = init
               while(i < list.size()) {
                 val params: List[TypedAST] = List(ValueNode(result), ValueNode(Value.toKlassic(list.get(i).asInstanceOf[AnyRef])))
-                result = performFunction(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, params), env)
+                result = performFunctionInternal(fun.value, params, env)
                 i += 1
               }
               result
@@ -325,6 +325,9 @@ class Interpreter {evaluator =>
   }
 
   private def evaluate(node: TypedAST): Value = evaluate(node, BuiltinEnvironment)
+  private def performFunctionInternal(func: TypedAST, params: List[TypedAST], env: Environment): Value = {
+    performFunction(TypedAST.FunctionCall(DynamicType, NoLocation, func, params), env)
+  }
   private def performFunction(node: TypedAST.FunctionCall, env: Environment): Value = node match {
     case TypedAST.FunctionCall(description, location, func, params) =>
       evaluate(func, env) match {
