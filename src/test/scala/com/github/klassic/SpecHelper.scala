@@ -21,9 +21,9 @@ trait SpecHelper extends FunSpec with DiagrammedAssertions {
     newMap
   }
   def expect[A, B](label: String)(expectation: (String, Value)): Unit = expectation match {
-    case (expected, actual) =>
+    case (actual, expected) =>
       it(label) {
-        assertResult(I.evaluateString(expected))(actual)
+        assertResult(expected)(I.evaluateString(actual))
       }
   }
 }
