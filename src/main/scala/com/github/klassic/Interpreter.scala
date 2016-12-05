@@ -15,15 +15,6 @@ import com.github.klassic.TypedAST.{FunctionLiteral, ValueNode}
  * @author Kota Mizushima
  */
 class Interpreter {evaluator =>
-  object SymbolGenerator {
-    private[this] var counter: Int = 0
-    def symbol(): String = {
-      val name = "var" + counter
-      counter += 1
-      name
-    }
-  }
-  import SymbolGenerator.symbol
   val typer = new Typer
   val rewriter = new SyntaxRewriter
   def reportError(message: String): Nothing = {
