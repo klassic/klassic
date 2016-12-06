@@ -4,7 +4,6 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 
 @Retention(RetentionPolicy.RUNTIME)
-public @interface ATypeScheme {
-    String[] tvs();
-    AType ty();
+public @interface AType {
+    String value();
 }
