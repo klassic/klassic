@@ -100,10 +100,9 @@ class Interpreter {evaluator =>
       param
     }
     define("stopwatch") { case List(fun: FunctionValue) =>
-      val interpreter = new Interpreter
       val env = new Environment(fun.environment)
       val start = System.currentTimeMillis()
-      interpreter.evaluate(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, List()), env)
+      evaluator.evaluate(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, List()), env)
       val end = System.currentTimeMillis()
       BoxedInt((end - start).toInt)
     }
@@ -116,7 +115,6 @@ class Interpreter {evaluator =>
       NativeFunctionValue{
         case List(fun: FunctionValue) =>
           val newList = new java.util.ArrayList[Any]
-          val interpreter = new Interpreter
           val env = new Environment(fun.environment)
           var i = 0
           while(i < list.size()) {
@@ -170,7 +168,6 @@ class Interpreter {evaluator =>
     define("foldLeft") { case List(ObjectValue(list: java.util.List[_])) =>
       NativeFunctionValue{ case List(init: Value) =>
         NativeFunctionValue { case List(fun: FunctionValue) =>
-          val interpreter = new Interpreter
           val env = new Environment(fun.environment)
           var i = 0
           var result: Value = init
@@ -231,7 +228,6 @@ class Interpreter {evaluator =>
         NativeFunctionValue{
           case List(fun: FunctionValue) =>
             val newList = new java.util.ArrayList[Any]
-            val interpreter = new Interpreter
             val env = new Environment(fun.environment)
             var i = 0
             while(i < list.size()) {
@@ -246,7 +242,6 @@ class Interpreter {evaluator =>
       define("foldLeft") { case List(ObjectValue(list: java.util.List[_])) =>
         NativeFunctionValue{ case List(init: Value) =>
           NativeFunctionValue { case List(fun: FunctionValue) =>
-            val interpreter = new Interpreter
             val env = new Environment(fun.environment)
             var i = 0
             var result: Value = init
