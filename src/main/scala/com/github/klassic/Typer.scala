@@ -61,6 +61,13 @@ class Typer {
         "get" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> tv("b"))),
         "size" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> IntType),
         "isEmpty" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> BooleanType)
+      ),
+      "Set" -> Map(
+        "add" -> TypeScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> setOf(tv("a")))),
+        "remove" -> TypeScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> setOf(tv("a")))),
+        "contains" -> TypeScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> BooleanType)),
+        "size" -> TypeScheme(List(tv("a")), setOf(tv("a")) ==> IntType),
+        "isEmpty" -> TypeScheme(List(tv("a")), setOf(tv("a")) ==> BooleanType)
       )
     )
   }

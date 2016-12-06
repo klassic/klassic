@@ -191,6 +191,7 @@ class Interpreter {evaluator =>
   object BuiltinModuleEnvironment extends ModuleEnvironment() {
     private final val LIST= "List"
     private final val MAP = "Map"
+    private final val SET = "Set"
     enter(LIST) {
       define("head") { case List(ObjectValue(list: java.util.List[_])) =>
         Value.toKlassic(list.get(0).asInstanceOf[AnyRef])
@@ -208,6 +209,16 @@ class Interpreter {evaluator =>
             i += 1
           }
           Value.toKlassic(newList)
+        }
+      }
+      define("remove") { case List(ObjectValue(self: java.util.List[_])) =>
+        NativeFunctionValue{ case List(a: Value) =>
+          val newList = new java.util.ArrayList[Any]
+          for(v <- self.asScala) {
+            newList.add(v)
+          }
+          newList.remove(Value.fromKlassic(a))
+          ObjectValue(newList)
         }
       }
       define("size") { case List(ObjectValue(list: java.util.List[_])) =>
@@ -282,7 +293,39 @@ class Interpreter {evaluator =>
         BoxedBoolean(map.isEmpty)
       }
     }
-
+    enter(SET) {
+      define("add") { case List(ObjectValue(self: java.util.Set[_])) =>
+        NativeFunctionValue{ case List(a: Value) =>
+          val newSet = new java.util.HashSet[Any]()
+          for(v <- self.asScala) {
+            newSet.add(v)
+          }
+          newSet.add(Value.fromKlassic(a))
+          ObjectValue(newSet)
+        }
+      }
+      define("remove") { case List(ObjectValue(self: java.util.Set[_])) =>
+        NativeFunctionValue{ case List(a: Value) =>
+          val newSet = new java.util.HashSet[Any]()
+          for(v <- self.asScala) {
+            newSet.add(v)
+          }
+          newSet.remove(Value.fromKlassic(a))
+          ObjectValue(newSet)
+        }
+      }
+      define("contains") { case List(ObjectValue(self: java.util.Set[_])) =>
+        NativeFunctionValue { case List(a: Value) =>
+          BoxedBoolean(self.contains(Value.fromKlassic(a)))
+        }
+      }
+      define("size") { case List(ObjectValue(self: java.util.Set[_])) =>
+        BoxedInt(self.size())
+      }
+      define("isEmpty") { case List(ObjectValue(self: java.util.Set[_])) =>
+        BoxedBoolean(self.isEmpty)
+      }
+    }
   }
 
   def evaluateFile(file: File): Value = using(new BufferedReader(new InputStreamReader(new FileInputStream(file)))){in =>
