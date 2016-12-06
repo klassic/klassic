@@ -191,103 +191,98 @@ class Interpreter {evaluator =>
   object BuiltinModuleEnvironment extends ModuleEnvironment() {
     private final val LIST= "List"
     private final val MAP = "Map"
-    define(LIST)("head") { case List(ObjectValue(list: java.util.List[_])) =>
-      Value.toKlassic(list.get(0).asInstanceOf[AnyRef])
-    }
-    define(LIST)("tail") { case List(ObjectValue(list: java.util.List[_])) =>
-      Value.toKlassic(list.subList(1, list.size()))
-    }
-    define(LIST)("cons") { case List(value: Value) =>
-      NativeFunctionValue { case List(ObjectValue(list: java.util.List[_])) =>
-        val newList = new java.util.ArrayList[Any]
-        var i = 0
-        newList.add(Value.fromKlassic(value))
-        while (i < list.size()) {
-          newList.add(list.get(i))
-          i += 1
-        }
-        Value.toKlassic(newList)
+    enter(LIST) {
+      define("head") { case List(ObjectValue(list: java.util.List[_])) =>
+        Value.toKlassic(list.get(0).asInstanceOf[AnyRef])
       }
-    }
-
-    define(LIST)("size") { case List(ObjectValue(list: java.util.List[_])) =>
-      BoxedInt(list.size())
-    }
-
-    define(LIST)("isEmpty") { case List(ObjectValue(list: java.util.List[_])) =>
-      BoxedBoolean(list.isEmpty)
-    }
-
-    define(LIST)("map") { case List(ObjectValue(list: java.util.List[_])) =>
-      NativeFunctionValue{
-        case List(fun: FunctionValue) =>
+      define("tail") { case List(ObjectValue(list: java.util.List[_])) =>
+        Value.toKlassic(list.subList(1, list.size()))
+      }
+      define("cons") { case List(value: Value) =>
+        NativeFunctionValue { case List(ObjectValue(list: java.util.List[_])) =>
           val newList = new java.util.ArrayList[Any]
-          val interpreter = new Interpreter
-          val env = new Environment(fun.environment)
           var i = 0
-          while(i < list.size()) {
-            val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
-            val result: Value = performFunctionInternal(fun.value, List(ValueNode(param)), env)
-            newList.add(Value.fromKlassic(result))
+          newList.add(Value.fromKlassic(value))
+          while (i < list.size()) {
+            newList.add(list.get(i))
             i += 1
           }
-          ObjectValue(newList)
+          Value.toKlassic(newList)
+        }
       }
-    }
-
-    define(LIST)("foldLeft") { case List(ObjectValue(list: java.util.List[_])) =>
-        NativeFunctionValue{ case List(init: Value) =>
-            NativeFunctionValue { case List(fun: FunctionValue) =>
-              val interpreter = new Interpreter
-              val env = new Environment(fun.environment)
-              var i = 0
-              var result: Value = init
-              while(i < list.size()) {
-                val params: List[TypedAST] = List(ValueNode(result), ValueNode(Value.toKlassic(list.get(i).asInstanceOf[AnyRef])))
-                result = performFunctionInternal(fun.value, params, env)
-                i += 1
-              }
-              result
+      define("size") { case List(ObjectValue(list: java.util.List[_])) =>
+        BoxedInt(list.size())
+      }
+      define("isEmpty") { case List(ObjectValue(list: java.util.List[_])) =>
+        BoxedBoolean(list.isEmpty)
+      }
+      define("map") { case List(ObjectValue(list: java.util.List[_])) =>
+        NativeFunctionValue{
+          case List(fun: FunctionValue) =>
+            val newList = new java.util.ArrayList[Any]
+            val interpreter = new Interpreter
+            val env = new Environment(fun.environment)
+            var i = 0
+            while(i < list.size()) {
+              val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
+              val result: Value = performFunctionInternal(fun.value, List(ValueNode(param)), env)
+              newList.add(Value.fromKlassic(result))
+              i += 1
             }
+            ObjectValue(newList)
         }
-    }
-
-    define(MAP)("add") { case List(ObjectValue(self: java.util.Map[_, _])) =>
-      NativeFunctionValue{ case List(a: Value, b: Value) =>
-        val newMap = new java.util.HashMap[Any, Any]()
-        for((k, v) <- self.asScala) {
-          newMap.put(k, v)
+      }
+      define("foldLeft") { case List(ObjectValue(list: java.util.List[_])) =>
+        NativeFunctionValue{ case List(init: Value) =>
+          NativeFunctionValue { case List(fun: FunctionValue) =>
+            val interpreter = new Interpreter
+            val env = new Environment(fun.environment)
+            var i = 0
+            var result: Value = init
+            while(i < list.size()) {
+              val params: List[TypedAST] = List(ValueNode(result), ValueNode(Value.toKlassic(list.get(i).asInstanceOf[AnyRef])))
+              result = performFunctionInternal(fun.value, params, env)
+              i += 1
+            }
+            result
+          }
         }
-        newMap.put(Value.fromKlassic(a), Value.fromKlassic(b))
-        ObjectValue(newMap)
       }
     }
-
-    define(MAP)("containsKey") { case List(ObjectValue(self: java.util.Map[_, _])) =>
+    enter(MAP) {
+      define("add") { case List(ObjectValue(self: java.util.Map[_, _])) =>
+        NativeFunctionValue{ case List(a: Value, b: Value) =>
+          val newMap = new java.util.HashMap[Any, Any]()
+          for((k, v) <- self.asScala) {
+            newMap.put(k, v)
+          }
+          newMap.put(Value.fromKlassic(a), Value.fromKlassic(b))
+          ObjectValue(newMap)
+        }
+      }
+      define("containsKey") { case List(ObjectValue(self: java.util.Map[_, _])) =>
         NativeFunctionValue{ case List(k: Value) =>
           BoxedBoolean(self.containsKey(Value.fromKlassic(k)))
         }
-    }
-
-    define(MAP)("containsValue") { case List(ObjectValue(self: java.util.Map[_, _])) =>
-      NativeFunctionValue{ case List(v: Value) =>
-        BoxedBoolean(self.containsValue(Value.fromKlassic(v)))
       }
-    }
-
-    define(MAP)("get") { case List(ObjectValue(self: java.util.Map[_, _])) =>
-      NativeFunctionValue{ case List(k: Value) =>
+      define("containsValue") { case List(ObjectValue(self: java.util.Map[_, _])) =>
+        NativeFunctionValue{ case List(v: Value) =>
+          BoxedBoolean(self.containsValue(Value.fromKlassic(v)))
+        }
+      }
+      define("get") { case List(ObjectValue(self: java.util.Map[_, _])) =>
+        NativeFunctionValue{ case List(k: Value) =>
           Value.toKlassic(self.get(Value.fromKlassic(k)).asInstanceOf[AnyRef])
+        }
+      }
+      define("size") { case List(ObjectValue(self: java.util.Map[_, _])) =>
+        BoxedInt(self.size())
+      }
+      define("isEmpty") { case List(ObjectValue(map: java.util.Map[_, _])) =>
+        BoxedBoolean(map.isEmpty)
       }
     }
 
-    define(MAP)("size") { case List(ObjectValue(self: java.util.Map[_, _])) =>
-      BoxedInt(self.size())
-    }
-
-    define(MAP)("isEmpty") { case List(ObjectValue(map: java.util.Map[_, _])) =>
-      BoxedBoolean(map.isEmpty)
-    }
   }
 
   def evaluateFile(file: File): Value = using(new BufferedReader(new InputStreamReader(new FileInputStream(file)))){in =>
