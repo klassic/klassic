@@ -40,7 +40,7 @@ initialCommands in console += {
   Iterator(
     "com.github.klassic._",
     "com.github.klassic.AST._",
-    "com.github.klassic.TypeDescription._"
+    "com.github.klassic.Type._"
   ).map("import "+).mkString("\n")
 }
 
