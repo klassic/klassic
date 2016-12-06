@@ -3,7 +3,7 @@ package com.github.klassic
 import scala.util.parsing.combinator.RegexParsers
 import scala.util.parsing.input.{CharSequenceReader, Position, Reader}
 import com.github.klassic.AST._
-import com.github.klassic.TypeDescription._
+import com.github.klassic.Type._
 
 /**
  * @author Kota Mizushima
@@ -114,11 +114,11 @@ class Parser extends RegexParsers {
   )
 
 
-  lazy val typeAnnotation: Parser[TypeDescription] = COLON ~> typeDescription
+  lazy val typeAnnotation: Parser[Type] = COLON ~> typeDescription
 
-  lazy val castType: Parser[TypeDescription] = typeDescription
+  lazy val castType: Parser[Type] = typeDescription
 
-  lazy val typeDescription: Parser[TypeDescription] = (
+  lazy val typeDescription: Parser[Type] = (
     ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
   | (sident <~ CL(LT)) ~ repsep(typeDescription, CL(COMMA)) <~ CL(GT) ^^ { case name ~ args => TypeConstructor(name, args) }
   | qident ^^ {id => TypeVariable(id) }

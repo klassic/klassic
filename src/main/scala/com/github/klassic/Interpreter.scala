@@ -7,7 +7,7 @@ import java.lang.reflect.{Constructor, Method}
 import java.util
 
 import com.github.klassic.AST._
-import com.github.klassic.TypeDescription._
+import com.github.klassic.Type._
 import com.github.klassic.runtime._
 import com.github.klassic.TypedAST.{FunctionLiteral, ValueNode}
 
