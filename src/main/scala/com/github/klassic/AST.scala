@@ -26,7 +26,7 @@ object AST {
 
   case class Import(location: Location, simpleName: String, fqcn: String)
 
-  case class VariantDeclaration(location: Location, id: String, params: List[TypeDescription], constructors: List[DataConstructor]) extends AST
+  case class VariantDeclaration(location: Location, id: String, params: List[Type], constructors: List[DataConstructor]) extends AST
 
   case class Block(location: Location, expressions: List[AST]) extends AST
 
@@ -81,18 +81,18 @@ object AST {
 
   case class DivisionAssignment(location: Location, variable: String, value: AST) extends Assignment
 
-  case class ValDeclaration(location: Location, variable: String, description: Option[TypeDescription], value: AST, immutable: Boolean) extends AST
+  case class ValDeclaration(location: Location, variable: String, description: Option[Type], value: AST, immutable: Boolean) extends AST
 
   case class VariantIn(location: Location, variant: VariantDeclaration, body: AST) extends AST
 
-  case class Let(location: Location, variable: String, description: Option[TypeDescription], value: AST, body: AST, immutable: Boolean) extends AST
+  case class Let(location: Location, variable: String, description: Option[Type], value: AST, body: AST, immutable: Boolean) extends AST
   object Let {
-    def apply(variable: String, description: Option[TypeDescription], value: AST, body: AST): Let = {
+    def apply(variable: String, description: Option[Type], value: AST, body: AST): Let = {
       Let(NoLocation, variable, description, value, body, true)
     }
   }
 
-  case class Lambda(location: Location, params: List[FormalParameterOptional], optionalType: Option[TypeDescription], body: AST) extends AST
+  case class Lambda(location: Location, params: List[FormalParameterOptional], optionalType: Option[Type], body: AST) extends AST
   object Lambda {
     def apply(params: List[String], body: AST): Lambda = {
       Lambda(NoLocation, params.map{ case name => FormalParameterOptional(name, None)}, None, body)
@@ -120,5 +120,5 @@ object AST {
 
   case class MethodCall(location: Location, self: AST, name: String, params: List[AST]) extends AST
 
-  case class Casting(location: Location, target: AST, to: TypeDescription) extends AST
+  case class Casting(location: Location, target: AST, to: Type) extends AST
 }

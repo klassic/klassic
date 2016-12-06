@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.TypeDescription.{TypeConstructor, _}
+import com.github.klassic.Type.{TypeConstructor, _}
 
 import scala.collection.mutable
 
@@ -10,13 +10,13 @@ import scala.collection.mutable
 class Typer {
   type Environment = Map[String, TypeScheme]
   type ModuleEnvironment = Map[String, Environment]
-  def listOf(tp: TypeDescription): TypeConstructor = {
+  def listOf(tp: Type): TypeConstructor = {
     TypeConstructor("List", List(tp))
   }
-  def mapOf(k: TypeDescription, v: TypeDescription): TypeConstructor = {
+  def mapOf(k: Type, v: Type): TypeConstructor = {
     TypeConstructor("Map", List(k, v))
   }
-  def setOf(tp: TypeDescription): TypeConstructor = {
+  def setOf(tp: Type): TypeConstructor = {
     TypeConstructor("Set", List(tp))
   }
   val BuiltinEnvironment: Environment = {
@@ -65,20 +65,20 @@ class Typer {
     )
   }
 
-  def newInstanceFrom(scheme: TypeScheme): TypeDescription = {
+  def newInstanceFrom(scheme: TypeScheme): Type = {
     scheme.typeVariables.foldLeft(EmptySubstitution)((s, tv) => s.extend(tv, newTypeVariable())).apply(scheme.description)
   }
   private var n: Int = 0
-  def newTypeVariable(): TypeDescription = {
+  def newTypeVariable(): Type = {
     n += 1; TypeVariable("'a" + n)
   }
   val EmptySubstitution: Substitution = new Substitution(Map.empty)
-  class Substitution(val map: Map[TypeVariable, TypeDescription]) extends Function1[TypeDescription, TypeDescription] {
-    def lookup(x: TypeVariable): TypeDescription = {
+  class Substitution(val map: Map[TypeVariable, Type]) extends Function1[Type, Type] {
+    def lookup(x: TypeVariable): Type = {
       map.getOrElse(x, x)
     }
 
-    def apply(t: TypeDescription): TypeDescription = t match {
+    def apply(t: Type): Type = t match {
       case tv@TypeVariable(a) =>
         val u = lookup(tv)
         if (t == u) t else apply(u)
@@ -102,7 +102,7 @@ class Typer {
       }
     }
 
-    def extend(tv: TypeVariable, td: TypeDescription): Substitution = new Substitution(this.map + (tv -> td))
+    def extend(tv: TypeVariable, td: Type): Substitution = new Substitution(this.map + (tv -> td))
   }
 
   def lookup(x: String, environment: Environment): Option[TypeScheme] = environment.get(x) match {
@@ -110,11 +110,11 @@ class Typer {
     case None => None
   }
 
-  def generalize(t: TypeDescription, environment: Environment): TypeScheme = {
+  def generalize(t: Type, environment: Environment): TypeScheme = {
     TypeScheme(typeVariables(t) diff typeVariables(environment), t)
   }
 
-  def typeVariables(t: TypeDescription): List[TypeVariable] = t match {
+  def typeVariables(t: Type): List[TypeVariable] = t match {
     case tv @ TypeVariable(a) =>
       List(tv)
     case IntType =>
@@ -151,7 +151,7 @@ class Typer {
     environment.foldLeft(List[TypeVariable]()) { (tvs, nt) => tvs union typeVariables(nt._2) }
   }
 
-  def unify(t: TypeDescription, u: TypeDescription, s: Substitution): Substitution = (s(t), s(u)) match {
+  def unify(t: Type, u: Type, s: Substitution): Substitution = (s(t), s(u)) match {
     case (TypeVariable(a), TypeVariable(b)) if a == b =>
       s
     case (TypeVariable(a), _) if !(typeVariables(u) contains a) =>
@@ -190,7 +190,7 @@ class Typer {
   }
 
 
-  def typeOf(e: AST, environment: Environment = BuiltinEnvironment, modules: ModuleEnvironment = BuiltinModuleEnvironment): TypeDescription = {
+  def typeOf(e: AST, environment: Environment = BuiltinEnvironment, modules: ModuleEnvironment = BuiltinModuleEnvironment): Type = {
     val a = newTypeVariable()
     val r = new SyntaxRewriter
     val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, modules, None), a, EmptySubstitution)
@@ -198,7 +198,7 @@ class Typer {
   }
 
   var current: AST = null
-  def doType(e: AST, env: TypeEnvironment, t: TypeDescription, s0: Substitution): (TypedAST, Substitution) = {
+  def doType(e: AST, env: TypeEnvironment, t: Type, s0: Substitution): (TypedAST, Substitution) = {
     current = e
     e match {
       case AST.Block(location, expressions) =>

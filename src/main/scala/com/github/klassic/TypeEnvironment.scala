@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.TypeDescription._
+import com.github.klassic.Type._
 import scala.collection.mutable
 
 case class TypeEnvironment(variables: Map[String, TypeScheme], immutableVariables: Set[String], modules: Map[String, Map[String, TypeScheme]], parent: Option[TypeEnvironment]) {

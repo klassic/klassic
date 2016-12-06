@@ -1,7 +1,7 @@
 package com.github.klassic
 
 import com.github.klassic.AST.{FunctionCall, ListLiteral, MapLiteral, NewObject, _}
-import com.github.klassic.TypeDescription.{BooleanType, DynamicType}
+import com.github.klassic.Type.{BooleanType, DynamicType}
 /**
   * Created by kota_mizushima on 2016/11/17.
   */
