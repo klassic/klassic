@@ -4,7 +4,7 @@ name := "klassic"
 
 version := "0.0.1-SNAPSHOT"
 
-scalaVersion := "2.12.0"
+scalaVersion := "2.12.1"
 
 publishMavenStyle := true
 
