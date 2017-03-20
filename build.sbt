@@ -21,7 +21,7 @@ crossScalaVersions := Seq("2.11.8", "2.12.0-M5")
 
 testOptions in Test += Tests.Argument("-oI")
 
-scalacOptions <++= scalaVersion map { v =>
+scalacOptions ++= {
   Seq("-unchecked", "-deprecation", "-feature", "-language:implicitConversions")
 }
 
@@ -66,7 +66,8 @@ pomExtra := (
   </developers>
 ) 
 
-publishTo <<= version { v =>
+publishTo := {
+  val v = version.value
   val nexus = "https://oss.sonatype.org/"
   if (v.endsWith("-SNAPSHOT"))
     Some("snapshots" at nexus+"content/repositories/snapshots")
