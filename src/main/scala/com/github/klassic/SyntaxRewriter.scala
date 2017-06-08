@@ -36,6 +36,8 @@ class SyntaxRewriter {
       IfExpression(location, doRewrite(cond), doRewrite(pos), doRewrite(neg))
     case WhileExpression(location, condition, body: AST) =>
       WhileExpression(location, doRewrite(condition), doRewrite(body))
+    case RecordAccess(location, expression, member) =>
+      RecordAccess(location, doRewrite(expression), member)
     case e@ForeachExpression(location, name, collection, body) =>
       val itVariable = symbol()
       val location = e.location
