@@ -89,6 +89,8 @@ object AST {
 
   case class RecordIn(location: Location, record: RecordDeclaration, body: AST) extends AST
 
+  case class RecordNew(location: Location, name: String, members: List[(String, AST)]) extends AST
+
   case class RecordAccess(location: Location, expression: AST, member: String) extends AST
 
   case class Let(location: Location, variable: String, description: Option[Type], value: AST, body: AST, immutable: Boolean) extends AST
