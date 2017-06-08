@@ -24,6 +24,8 @@ class SyntaxRewriter {
           List(LetRec(location, name, doRewrite(expression).asInstanceOf[AST.Lambda], cleanup.map(doRewrite), Block(location, rewriteBlock(xs))))
         case (x@VariantDeclaration(_, _, _, _)) :: xs =>
           List(VariantIn(x.location, x, Block(location, rewriteBlock(xs))))
+        case (x@RecordDeclaration(_, _, _)) :: xs =>
+          List(RecordIn(x.location, x, Block(location, rewriteBlock(xs))))
         case x :: xs =>
           doRewrite(x) :: rewriteBlock(xs)
         case Nil =>
@@ -34,6 +36,10 @@ class SyntaxRewriter {
       IfExpression(location, doRewrite(cond), doRewrite(pos), doRewrite(neg))
     case WhileExpression(location, condition, body: AST) =>
       WhileExpression(location, doRewrite(condition), doRewrite(body))
+    case RecordAccess(location, expression, member) =>
+      RecordAccess(location, doRewrite(expression), member)
+    case RecordNew(location, name, members) =>
+      RecordNew(location, name, members.map({ case (m, e) => (m, doRewrite(e))}))
     case e@ForeachExpression(location, name, collection, body) =>
       val itVariable = symbol()
       val location = e.location
