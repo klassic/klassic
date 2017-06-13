@@ -165,6 +165,12 @@ class Interpreter {evaluator =>
     define("ToDo") { case Nil =>
       throw NotImplementedError("not implemented yet")
     }
+    define("url") { case List(ObjectValue(value: String)) =>
+      ObjectValue(new java.net.URL(value))
+    }
+    define("uri") { case List(ObjectValue(value: String)) =>
+      ObjectValue(new java.net.URL(value).toURI)
+    }
     define("foldLeft") { case List(ObjectValue(list: java.util.List[_])) =>
       NativeFunctionValue{ case List(init: Value) =>
         NativeFunctionValue { case List(fun: FunctionValue) =>
@@ -182,6 +188,9 @@ class Interpreter {evaluator =>
     }
     defineValue("null")(
       ObjectValue(null)
+    )
+    defineValue("desktop")(
+      ObjectValue(java.awt.Desktop.getDesktop())
     )
   }
 
