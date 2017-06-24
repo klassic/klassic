@@ -28,6 +28,8 @@ object AST {
 
   case class VariantDeclaration(location: Location, id: String, params: List[Type], constructors: List[DataConstructor]) extends AST
 
+  case class RecordDeclaration(location: Location, name: String, members: List[(String, Type)]) extends AST
+
   case class Block(location: Location, expressions: List[AST]) extends AST
 
   case class IfExpression(location: Location, condition: AST, thenExpression: AST, elseExpression: AST) extends AST
@@ -84,6 +86,12 @@ object AST {
   case class ValDeclaration(location: Location, variable: String, description: Option[Type], value: AST, immutable: Boolean) extends AST
 
   case class VariantIn(location: Location, variant: VariantDeclaration, body: AST) extends AST
+
+  case class RecordIn(location: Location, record: RecordDeclaration, body: AST) extends AST
+
+  case class RecordNew(location: Location, name: String, members: List[(String, AST)]) extends AST
+
+  case class RecordAccess(location: Location, expression: AST, member: String) extends AST
 
   case class Let(location: Location, variable: String, description: Option[Type], value: AST, body: AST, immutable: Boolean) extends AST
   object Let {

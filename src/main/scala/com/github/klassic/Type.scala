@@ -35,6 +35,8 @@ object Type {
 
   case object ErrorType extends Type("!")
 
+  case class RecordType(name: String, members: List[(String, Type)]) extends Type(s"record ${name} {${members.map{ case (m, t) => m + ": " + t}.mkString("; ")}}")
+
   case class FunctionType(paramTypes: List[Type], returnType: Type) extends Type(s"(${paramTypes.mkString(", ")}) => ${returnType}")
 
   case class TypeScheme(typeVariables: List[TypeVariable], description: Type)
