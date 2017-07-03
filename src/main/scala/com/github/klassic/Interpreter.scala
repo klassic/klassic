@@ -186,11 +186,11 @@ class Interpreter {evaluator =>
         }
       }
     }
+    define("desktop") { case Nil =>
+      ObjectValue(java.awt.Desktop.getDesktop())
+    }
     defineValue("null")(
       ObjectValue(null)
-    )
-    defineValue("desktop")(
-      ObjectValue(java.awt.Desktop.getDesktop())
     )
   }
 

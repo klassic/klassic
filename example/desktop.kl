@@ -1,1 +1,1 @@
-desktop.browse(uri("https://twitter.com/kmizu"))
+desktop().browse(uri("https://twitter.com/kmizu"))

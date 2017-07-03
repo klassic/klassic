@@ -43,7 +43,7 @@ class Typer {
       "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType),
       "foldLeft" -> TypeScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> (tv("b") ==> ((List(tv("b"), tv("a")) ==> tv("b")) ==> tv("b")))),
       "null" -> TypeScheme(List(tv("a")), tv("a")),
-      "desktop" -> TypeScheme(List(), DynamicType)
+      "desktop" -> TypeScheme(List(), Nil ==> DynamicType)
     )
   }
 
