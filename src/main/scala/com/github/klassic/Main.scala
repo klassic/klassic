@@ -19,7 +19,7 @@ object Main {
         Console.err.println(
           """
             |Usage: java -jar klassic.jar (-f <fileName> | -e <expression>)
-            |-f <fileName>   : read a program from <fileName> and execute it
+            |<fileName>   : read a program from <fileName> and execute it
             |-e <expression> : evaluate <expression>
           """.stripMargin)
     }
@@ -28,8 +28,8 @@ object Main {
   def parseCommandLine(args: Array[String]): Option[(String, String)] = {
     val parser = new Parser
     args match {
+      case Array(fileName) if fileName.endsWith("kl") => Some("-f"-> fileName)
       case Array("-e", line) => Some("-e" -> line)
-      case Array(fileName) => Some("-f"-> fileName)
       case otherwise  => None
     }
   }
