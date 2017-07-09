@@ -126,6 +126,8 @@ object AST {
 
   case class NewObject(location: Location, className: String, params: List[AST]) extends AST
 
+  case class NewRecord(location: Location, recordName: String, params: List[AST]) extends AST
+
   case class MethodCall(location: Location, self: AST, name: String, params: List[AST]) extends AST
 
   case class Casting(location: Location, target: AST, to: Type) extends AST
