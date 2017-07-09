@@ -1,5 +1,2 @@
-record Person {
-  name: String
-  age: Int
-}
+println(new #Point(10, 20))
 1

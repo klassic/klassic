@@ -82,6 +82,8 @@ object TypedAST {
 
   case class NewObject(val description: Type, val location: Location, className: String, params: List[TypedAST]) extends TypedAST
 
+  case class NewRecord(val description: Type, val location: Location, recordName: String, params: List[TypedAST]) extends TypedAST
+
   case class MethodCall(val description: Type, val location: Location, self: TypedAST, name: String, params: List[TypedAST]) extends TypedAST
 
   case class Casting(val description: Type, val location: Location, target: TypedAST, to: Type) extends TypedAST

@@ -3,7 +3,7 @@ package com.github.klassic
 import com.github.klassic.Type._
 import scala.collection.mutable
 
-case class TypeEnvironment(variables: Map[String, TypeScheme], immutableVariables: Set[String], records: Map[String, Map[String, TypeScheme]], modules: Map[String, Map[String, TypeScheme]], parent: Option[TypeEnvironment]) {
+case class TypeEnvironment(variables: Map[String, TypeScheme], immutableVariables: Set[String], records: Map[String, List[(String, TypeScheme)]], modules: Map[String, Map[String, TypeScheme]], parent: Option[TypeEnvironment]) {
   def lookup(name: String): Option[TypeScheme] = {
     val result1 = variables.get(name)
     val result2  = result1.orElse(parent.flatMap{p => p.lookup(name)})
@@ -18,7 +18,7 @@ case class TypeEnvironment(variables: Map[String, TypeScheme], immutableVariable
   def updateMutableVariable(name: String, scheme: TypeScheme): TypeEnvironment = {
     this.copy(variables = this.variables + (name -> scheme))
   }
-  def updateRecord(recordName: String, members: Map[String, TypeScheme]): TypeEnvironment = {
+  def updateRecord(recordName: String, members: List[(String, TypeScheme)]): TypeEnvironment = {
     this.copy(records = this.records + (recordName -> members))
   }
   def updateModule(moduleName: String, members: Map[String, TypeScheme]): TypeEnvironment = {
