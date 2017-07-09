@@ -341,7 +341,7 @@ class Interpreter {evaluator =>
     parser.parse(program) match {
       case parser.Success(program: Program, _) =>
         val tv = typer.newTypeVariable()
-        val (typedExpression, _) = typer.doType(rewriter.doRewrite(program.block), TypeEnvironment(typer.BuiltinEnvironment, Set.empty, typer.BuiltinModuleEnvironment, None), tv, typer.EmptySubstitution)
+        val (typedExpression, _) = typer.doType(rewriter.doRewrite(program.block), TypeEnvironment(typer.BuiltinEnvironment, Set.empty, typer.BuiltinRecordEnvironment, typer.BuiltinModuleEnvironment, None), tv, typer.EmptySubstitution)
         evaluate(typedExpression)
       case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
       case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
