@@ -22,13 +22,13 @@ object AST {
 
   case object FloatSuffix extends FloatSuffix
 
-  case class Program(location: Location, imports: List[Import], block: Block)
+  case class Program(location: Location, imports: List[Import], records: List[RecordDeclaration], block: Block)
 
   case class Import(location: Location, simpleName: String, fqcn: String)
 
-  case class VariantDeclaration(location: Location, id: String, params: List[Type], constructors: List[DataConstructor]) extends AST
+  case class RecordDeclaration(location: Location, name: String, ts: List[Type], members: List[(String, Type)])
 
-  case class RecordDeclaration(location: Location, name: String, members: List[(String, Type)]) extends AST
+  case class VariantDeclaration(location: Location, id: String, params: List[Type], constructors: List[DataConstructor]) extends AST
 
   case class Block(location: Location, expressions: List[AST]) extends AST
 
