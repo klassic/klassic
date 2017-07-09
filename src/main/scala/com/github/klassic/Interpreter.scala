@@ -194,6 +194,13 @@ class Interpreter {evaluator =>
     )
   }
 
+  object BuiltinRecordEnvironment extends RecordEnvironment() {
+    define("Point")(
+      "x" -> IntType,
+      "y" -> IntType
+    )
+  }
+
   object BuiltinModuleEnvironment extends ModuleEnvironment() {
     private final val LIST= "List"
     private final val MAP = "Map"
@@ -387,7 +394,7 @@ class Interpreter {evaluator =>
           reportError("unknown error")
       }
   }
-  private def evaluate(node: TypedAST, env: Environment, moduleEnv: ModuleEnvironment = BuiltinModuleEnvironment): Value = {
+  private def evaluate(node: TypedAST, env: Environment, recordEnv: RecordEnvironment = BuiltinRecordEnvironment, moduleEnv: ModuleEnvironment = BuiltinModuleEnvironment): Value = {
     def evalRecursive(node: TypedAST): Value = {
       node match{
         case TypedAST.Block(description, location, expressions) =>
@@ -612,7 +619,15 @@ class Interpreter {evaluator =>
               val actualParams = paramsArray.map{Value.fromKlassic}
               Value.toKlassic(constructor.newInstance(actualParams:_*).asInstanceOf[AnyRef])
             case NoConstructorFound =>
-              throw new IllegalArgumentException(s"newObject(${className}, ${params}")
+              throw new IllegalArgumentException(s"new ${className}(${params}) is not found")
+          }
+        case TypedAST.NewRecord(description, location, recordName, params) =>
+          val paramsList = params.map{evalRecursive}.toList
+          recordEnv.records.get(recordName) match {
+            case None => throw new IllegalArgumentException(s"record ${recordName} is not found")
+            case Some(argsList) =>
+              val members = (argsList zip paramsList).map{ case ((n, _), v) => n -> v }
+              RecordValue(recordName, members)
           }
         case call@TypedAST.FunctionCall(description, location, func, params) =>
           performFunction(call, env)

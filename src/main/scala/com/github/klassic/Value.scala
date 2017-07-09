@@ -36,6 +36,13 @@ case object UnitValue extends Value {
 case class ObjectValue(value: AnyRef) extends Value {
   override def toString = value.toString
 }
+case class RecordValue(name: String, members: List[(String, Value)]) extends Value {
+  override def toString =
+    s"""| record ${name} {
+        | ${members.map{ case (n, v) => s"\t${n} = ${v}"}.mkString("\n")}
+        | }
+    """.stripMargin
+}
 case class VariantValue(tag: String, items: List[Value]) extends Value {
   override def toString: String = {
     s"${tag}(${items.mkString(", ")})"

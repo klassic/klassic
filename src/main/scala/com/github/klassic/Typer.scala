@@ -10,7 +10,7 @@ import scala.collection.mutable
 class Typer {
   type Environment = Map[String, TypeScheme]
   type ModuleEnvironment = Map[String, Environment]
-  type RecordEnvironment = Map[String, Environment]
+  type RecordEnvironment = Map[String, List[(String, TypeScheme)]]
   def listOf(tp: Type): TypeConstructor = {
     TypeConstructor("List", List(tp))
   }
@@ -48,9 +48,9 @@ class Typer {
     )
   }
 
-  val BuiltinRecordEnvironment: Map[String, Environment] = {
+  val BuiltinRecordEnvironment: Map[String, List[(String, TypeScheme)]] = {
     Map(
-      "Point" -> Map(
+      "Point" -> List(
         "x" -> TypeScheme(Nil, IntType),
         "y" -> TypeScheme(Nil, IntType)
       )
@@ -103,7 +103,7 @@ class Typer {
         val u = lookup(tv)
         if (t == u) t else apply(u)
       case FunctionType(t1, t2) => FunctionType(t1.map{t => apply(t)}, apply(t2))
-      case RecordType(name, members) => RecordType(name, members.map { case (n, t) => n -> apply(t)})
+      case RecordType(name, ts) => RecordType(name, ts.map{t => apply(t)})
       case IntType => IntType
       case ShortType => ShortType
       case ByteType => ByteType
@@ -160,8 +160,8 @@ class Typer {
       Nil
     case FunctionType(t1, t2) =>
       t1.flatMap{typeVariables} union typeVariables(t2)
-    case RecordType(name, members) =>
-      List(members.flatMap{ case (n, t) => typeVariables(t)}:_*)
+    case RecordType(name, ts) =>
+      List(ts.flatMap{ case t => typeVariables(t)}:_*)
     case TypeConstructor(k, ts) =>
       ts.foldLeft(List[TypeVariable]()){(tvs, t) => tvs union typeVariables(t)}
   }
@@ -199,9 +199,9 @@ class Typer {
       s
     case (DynamicType, DynamicType) =>
       s
-    case (RecordType(n1, ms1), RecordType(n2, ms2)) if n1 == n2 =>
-      (ms1 zip ms2).foldLeft(s) { case (s, ((_, t1), (_, t2))) =>
-        unify(t1, t2, s)
+    case (RecordType(t1, t2), RecordType(u1, u2)) if u1 == u2 =>
+      (t2 zip u2).foldLeft(s) { case (s, (t, u)) =>
+        unify(t, u, s)
       }
     case (FunctionType(t1, t2), FunctionType(u1, u2)) if t1.size == u1.size =>
       unify(t2, u2, (t1 zip u1).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)})
@@ -728,6 +728,24 @@ class Typer {
         }
         val sy = unify(DynamicType, t, sx)
         (TypedAST.NewObject(DynamicType, location, className, tes.reverse), sy)
+      case AST.NewRecord(location, recordName, params) =>
+        val ts = params.map{_ => newTypeVariable()}
+        val (tes, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), (e, t)) =>
+          val (te, sx) = doType(e, env, t, s)
+          (te::tes, sx)
+        }
+        env.records.get(recordName) match {
+          case Some(members) =>
+            if(members.length != ts.length) {
+              throw TyperException(s"${location.format} length mismatch: required: ${members.length}, actual: ${ts.length}")
+            }
+            val mts = members.map{ case (_, t) => t.description}
+            val pts = tes.map { case te => te.description }
+            val sn = (mts zip pts).foldLeft(sx) { case (s, (m, p)) => unify(m, p, s)}
+            (TypedAST.NewRecord(RecordType(recordName, pts), location, recordName, tes), sn)
+          case None =>
+            throw TyperException(s"${location.format} record '$recordName' is not found")
+        }
       case AST.Casting(location, target, to) =>
         val a = newTypeVariable()
         val (typedTarget, s1) = doType(target, env, a, s0)
