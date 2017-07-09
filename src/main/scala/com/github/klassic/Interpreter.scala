@@ -1,15 +1,15 @@
 package com.github.klassic
 
 import scala.collection.JavaConverters._
-
 import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
 import java.lang.reflect.{Constructor, Method}
 import java.util
 
+import klassic.runtime._
 import com.github.klassic.AST._
 import com.github.klassic.Type._
-import com.github.klassic.runtime._
 import com.github.klassic.TypedAST.{FunctionLiteral, ValueNode}
+import klassic.runtime.{AssertionError, NotImplementedError}
 
 /**
  * @author Kota Mizushima
@@ -128,7 +128,7 @@ class Interpreter {evaluator =>
     }
 
     define("assert") { case List(BoxedBoolean(condition)) =>
-        if(!condition) throw runtime.AssertionError("assertion failure") else UnitValue
+        if(!condition) throw AssertionError("assertion failure") else UnitValue
     }
 
     define("assertResult") { case List(a: Value) =>

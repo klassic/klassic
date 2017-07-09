@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.runtime.NotImplementedError
+import klassic.runtime.NotImplementedError
 
 class ToDoSpec extends SpecHelper {
   describe("ToDo() function") {
