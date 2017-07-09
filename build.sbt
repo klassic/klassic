@@ -2,7 +2,7 @@ organization := "com.github.klassic"
 
 name := "klassic"
 
-version := "0.0.1-SNAPSHOT"
+version := "0.1-SNAPSHOT"
 
 scalaVersion := "2.12.2"
 
@@ -17,7 +17,7 @@ scalacOptions in (Compile, doc) ++= { Seq(
   "-doc-source-url", s"https://github.com/klassic/klassic/tree/${scaladocBranch.value}€{FILE_PATH}.scala"
 )}
 
-crossScalaVersions := Seq("2.11.8", "2.12.0-M5")
+crossScalaVersions := Seq("2.11.8", "2.12.2")
 
 testOptions in Test += Tests.Argument("-oI")
 
