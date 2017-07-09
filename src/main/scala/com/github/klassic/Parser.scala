@@ -76,6 +76,7 @@ class Parser extends RegexParsers {
   lazy val RBRACE  : Parser[String] = token("}")
   lazy val LBRACKET: Parser[String] = token("[")
   lazy val RBRACKET: Parser[String] = token("]")
+  lazy val SHARP   : Parser[String] = token("#")
   lazy val IF      : Parser[String] = token("if")
   lazy val ELSE    : Parser[String] = token("else")
   lazy val WHILE   : Parser[String] = token("while")
@@ -228,11 +229,19 @@ class Parser extends RegexParsers {
   | invocation
   )
 
-  lazy val invocation: Parser[AST] = % ~ application ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
+  lazy val invocation: Parser[AST] = % ~ recordAccess ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
     case location ~ self ~ Nil =>
       self
     case location ~ self ~ npList  =>
       npList.foldLeft(self){case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil))}
+  }
+
+  lazy val recordAccess: Parser[AST] = % ~ application ~ ((CL(ARROW1) ~> (% ~ ident))).* ^^ {
+    case location ~ self ~ names =>
+      val ns = names.map{ case l ~ n => (l, n.name)}
+      ns.foldLeft(self) { case (e, (l, n)) =>
+        RecordAccess(l, e, n)
+      }
   }
 
   lazy val application: Parser[AST] = % ~ pipelinable ~ (CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN)).* ^^ {
@@ -253,8 +262,8 @@ class Parser extends RegexParsers {
     case target ~ None => target
   }
 
-  //primary ::= selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | |setLiteral | newObject | functionLiteral | "(" expression ")" | "{" lines "}" | hereDocument
-  lazy val primary: Parser[AST] = selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newObject | functionLiteral | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
+  //primary ::= selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | |setLiteral | newRecord | newObject | functionLiteral | "(" expression ")" | "{" lines "}" | hereDocument
+  lazy val primary: Parser[AST] = selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newRecord | newObject | functionLiteral | CL(LPAREN) ~>expression<~ RPAREN | CL(LBRACE) ~>lines<~ RBRACE | hereDocument
 
   //integerLiteral ::= ["1"-"9"] {"0"-"9"}
   lazy val integerLiteral : Parser[AST] = (% ~ """[1-9][0-9]*|0""".r ~ opt("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix} | "S" ^^ { _ => ShortSuffix }) ^^ {
@@ -408,6 +417,12 @@ class Parser extends RegexParsers {
     case location ~ className ~ None => NewObject(location, className, List())
   }
 
+  // newRecord ::= "new" "#" fqcn "(" [param {"," param} ")"
+  lazy val newRecord: Parser[AST] = ((% <~ CL(NEW)) <~ CL(SHARP)) ~ sident ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN) ^^ {
+    case location ~ recordName ~ Some(params) => NewRecord(location, recordName, params)
+    case location ~ recordName ~ None => NewRecord(location, recordName, List())
+  }
+
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
   lazy val functionDefinition: Parser[FunctionDefinition] =
     (% <~ CL(DEF)) ~ ident ~ opt(CL(LPAREN) ~>repsep(ident ~ opt(typeAnnotation), CL(COMMA)) <~ CL(RPAREN)) ~ (opt(typeAnnotation) <~ CL(EQ)) ~ expression ~ opt(CL(CLEANUP) ~> expression) ^^ {
@@ -428,7 +443,7 @@ class Parser extends RegexParsers {
       )
   }
 
-  def parse(input: String): ParseResult[AST] = parseAll(lines, input)
+  def parseExpression(input: String): ParseResult[AST] = parseAll(lines, input)
 
-  def parseProgram(input: String): ParseResult[Program] = parseAll(program, input)
+  def parse(input: String): ParseResult[Program] = parseAll(program, input)
 }

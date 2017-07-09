@@ -339,19 +339,19 @@ class Interpreter {evaluator =>
   def evaluateString(program: String, fileName: String = "<no file>"): Value = {
     val parser = new Parser
     parser.parse(program) match {
-      case parser.Success(node: AST, _) =>
+      case parser.Success(program: Program, _) =>
         val tv = typer.newTypeVariable()
-        val (typedExpression, _) = typer.doType(rewriter.doRewrite(node), TypeEnvironment(typer.BuiltinEnvironment, Set.empty, typer.BuiltinModuleEnvironment, None), tv, typer.EmptySubstitution)
+        val (typedExpression, _) = typer.doType(rewriter.doRewrite(program.block), TypeEnvironment(typer.BuiltinEnvironment, Set.empty, typer.BuiltinModuleEnvironment, None), tv, typer.EmptySubstitution)
         evaluate(typedExpression)
       case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
       case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
     }
   }
 
-  def doParse(program: String): AST = {
+  def doParse(program: String): Program = {
     val parser = new Parser
     parser.parse(program) match {
-      case parser.Success(node: AST, _) => node
+      case parser.Success(program: Program, _) => program
       case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
       case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
     }

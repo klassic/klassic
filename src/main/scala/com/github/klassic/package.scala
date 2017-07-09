@@ -25,7 +25,7 @@ package object klassic {
   val i = new Interpreter
 
   def typeOf(input: String): Type = {
-    t.typeOf(p.parse(input).get)
+    t.typeOf(p.parseExpression(input).get)
   }
 
   def evaluate(input: String): Value = {
