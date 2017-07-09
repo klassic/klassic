@@ -24,8 +24,6 @@ class SyntaxRewriter {
           List(LetRec(location, name, doRewrite(expression).asInstanceOf[AST.Lambda], cleanup.map(doRewrite), Block(location, rewriteBlock(xs))))
         case (x@VariantDeclaration(_, _, _, _)) :: xs =>
           List(VariantIn(x.location, x, Block(location, rewriteBlock(xs))))
-        case (x@RecordDeclaration(_, _, _)) :: xs =>
-          List(RecordIn(x.location, x, Block(location, rewriteBlock(xs))))
         case x :: xs =>
           doRewrite(x) :: rewriteBlock(xs)
         case Nil =>

@@ -88,6 +88,7 @@ class Parser extends RegexParsers {
   lazy val COMMA   : Parser[String] = token(",")
   lazy val DOT     : Parser[String] = token(".")
   lazy val CLASS   : Parser[String] = token("class")
+  lazy val RECORD  : Parser[String] = token("record")
   lazy val DEF     : Parser[String] = token("def")
   lazy val MUTABLE : Parser[String] = token("mutable")
   lazy val CLEANUP : Parser[String] = token("cleanup")
@@ -133,14 +134,22 @@ class Parser extends RegexParsers {
   | token("*") ^^ {_ => DynamicType}
   )
 
-  lazy val program: Parser[Program] = (SPACING ~> %) ~ repsep(`import`, TERMINATOR) ~ (lines <~ opt(TERMINATOR)) ^^ {
-    case location ~ imports ~ block => Program(location, imports, block)
+  lazy val program: Parser[Program] = (SPACING ~> %) ~ repsep(`import`, TERMINATOR) ~ repsep(record, TERMINATOR) ~ (lines <~ opt(TERMINATOR)) ^^ {
+    case location ~ imports ~ records ~ block => Program(location, imports, records, block)
   }
 
   lazy val `import`: Parser[Import] = (% <~ CL(IMPORT)) ~ fqcn ^^ { case location ~ fqcn =>
     val fragments = fqcn.split(".")
     Import(location, fragments(fragments.length - 1), fqcn)
   }
+
+  lazy val record: Parser[RecordDeclaration] = for {
+    location <- %
+    _ <- CL(RECORD)
+    name <- sident
+    ts <- opt(LT ~> rep1sep(typeAnnotation, CL(COMMA)) <~ GT <~ EQ)
+    members <- (sident ~ CL(COLON) ~ typeAnnotation ^^ { case n ~ _ ~ t => (n, t) }).*
+  } yield RecordDeclaration(location, name, ts.getOrElse(Nil), members)
 
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
   lazy val lines: Parser[Block] = SPACING ~> (% ~ repsep(line, TERMINATOR)) <~ opt(TERMINATOR) ^^ { case location ~ expressions =>
@@ -419,5 +428,7 @@ class Parser extends RegexParsers {
       )
   }
 
-  def parse(str:String): ParseResult[AST] = parseAll(lines, str)
+  def parse(input: String): ParseResult[AST] = parseAll(lines, input)
+
+  def parseProgram(input: String): ParseResult[Program] = parseAll(program, input)
 }
