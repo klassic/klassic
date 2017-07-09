@@ -10,6 +10,7 @@ import scala.collection.mutable
 class Typer {
   type Environment = Map[String, TypeScheme]
   type ModuleEnvironment = Map[String, Environment]
+  type RecordEnvironment = Map[String, Environment]
   def listOf(tp: Type): TypeConstructor = {
     TypeConstructor("List", List(tp))
   }
@@ -44,6 +45,15 @@ class Typer {
       "foldLeft" -> TypeScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> (tv("b") ==> ((List(tv("b"), tv("a")) ==> tv("b")) ==> tv("b")))),
       "null" -> TypeScheme(List(tv("a")), tv("a")),
       "desktop" -> TypeScheme(List(), Nil ==> DynamicType)
+    )
+  }
+
+  val BuiltinRecordEnvironment: Map[String, Environment] = {
+    Map(
+      "Point" -> Map(
+        "x" -> TypeScheme(Nil, IntType),
+        "y" -> TypeScheme(Nil, IntType)
+      )
     )
   }
 
@@ -93,6 +103,7 @@ class Typer {
         val u = lookup(tv)
         if (t == u) t else apply(u)
       case FunctionType(t1, t2) => FunctionType(t1.map{t => apply(t)}, apply(t2))
+      case RecordType(name, members) => RecordType(name, members.map { case (n, t) => n -> apply(t)})
       case IntType => IntType
       case ShortType => ShortType
       case ByteType => ByteType
@@ -149,6 +160,8 @@ class Typer {
       Nil
     case FunctionType(t1, t2) =>
       t1.flatMap{typeVariables} union typeVariables(t2)
+    case RecordType(name, members) =>
+      List(members.flatMap{ case (n, t) => typeVariables(t)}:_*)
     case TypeConstructor(k, ts) =>
       ts.foldLeft(List[TypeVariable]()){(tvs, t) => tvs union typeVariables(t)}
   }
@@ -186,6 +199,10 @@ class Typer {
       s
     case (DynamicType, DynamicType) =>
       s
+    case (RecordType(n1, ms1), RecordType(n2, ms2)) if n1 == n2 =>
+      (ms1 zip ms2).foldLeft(s) { case (s, ((_, t1), (_, t2))) =>
+        unify(t1, t2, s)
+      }
     case (FunctionType(t1, t2), FunctionType(u1, u2)) if t1.size == u1.size =>
       unify(t2, u2, (t1 zip u1).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)})
     case (TypeConstructor(k1, ts), TypeConstructor(k2, us)) if k1 == k2 =>
@@ -200,10 +217,10 @@ class Typer {
   }
 
 
-  def typeOf(e: AST, environment: Environment = BuiltinEnvironment, modules: ModuleEnvironment = BuiltinModuleEnvironment): Type = {
+  def typeOf(e: AST, environment: Environment = BuiltinEnvironment, records: RecordEnvironment = BuiltinRecordEnvironment, modules: ModuleEnvironment = BuiltinModuleEnvironment): Type = {
     val a = newTypeVariable()
     val r = new SyntaxRewriter
-    val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, modules, None), a, EmptySubstitution)
+    val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, records, modules, None), a, EmptySubstitution)
     s(a)
   }
 
