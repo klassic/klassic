@@ -115,14 +115,28 @@ class Parser extends RegexParsers {
     "class", "def", "val", "mutable", "=", "==", "=>", "new", "&&", "||"
   )
 
-
   lazy val typeAnnotation: Parser[Type] = COLON ~> typeDescription
 
   lazy val castType: Parser[Type] = typeDescription
 
+  def isBuiltinType(name: String): Boolean = name match {
+    case "Byte" => true
+    case "Short" => true
+    case "Int" => true
+    case "Long" => true
+    case "Float" => true
+    case "Double" => true
+    case "Boolean" => true
+    case "Unit" => true
+    case _ => false
+  }
+
   lazy val typeDescription: Parser[Type] = (
     ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
-  | (sident <~ CL(LT)) ~ repsep(typeDescription, CL(COMMA)) <~ CL(GT) ^^ { case name ~ args => TypeConstructor(name, args) }
+  | sident.^?{ case s if !isBuiltinType(s) => s} ~ (CL(LT) ~> repsep(typeDescription, CL(COMMA)) <~ CL(GT)).? ^^ {
+      case name ~ Some(args) => TypeConstructor(name, args)
+      case name ~ None => TypeConstructor(name, Nil)
+    }
   | qident ^^ {id => TypeVariable(id) }
   | token("Byte") ^^ {_ => ByteType}
   | token("Short")  ^^ {_ => ShortType}
@@ -148,8 +162,10 @@ class Parser extends RegexParsers {
     location <- %
     _ <- CL(RECORD)
     name <- sident
-    ts <- opt(LT ~> rep1sep(typeAnnotation, CL(COMMA)) <~ GT <~ EQ)
-    members <- (sident ~ CL(COLON) ~ typeAnnotation ^^ { case n ~ _ ~ t => (n, t) }).*
+    ts <- opt(LT ~> rep1sep(typeAnnotation, CL(COMMA)) <~ CL(GT))
+    _ <- CL(LBRACE)
+    members <- (sident ~ CL(typeAnnotation) ^^ { case n ~ t => (n, t) }).*
+    _ <- CL(RBRACE)
   } yield RecordDeclaration(location, name, ts.getOrElse(Nil), members)
 
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
