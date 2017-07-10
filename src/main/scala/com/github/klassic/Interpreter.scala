@@ -1,7 +1,6 @@
 package com.github.klassic
 
 import scala.collection.JavaConverters._
-import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
 import java.lang.reflect.{Constructor, Method}
 import java.util
 
@@ -14,9 +13,7 @@ import klassic.runtime.{AssertionError, NotImplementedError}
 /**
  * @author Kota Mizushima
  */
-class Interpreter {evaluator =>
-  val typer = new Typer
-  val rewriter = new SyntaxRewriter
+class Interpreter {interpreter =>
   def reportError(message: String): Nothing = {
     throw InterpreterException(message)
   }
@@ -90,7 +87,7 @@ class Interpreter {evaluator =>
     define("thread") { case List(fun: FunctionValue) =>
       new Thread({() =>
           val env = new Environment(fun.environment)
-          evaluator.evaluate(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, Nil), env)
+          interpreter.evaluate(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, Nil), env)
       }).start()
       UnitValue
     }
@@ -102,7 +99,7 @@ class Interpreter {evaluator =>
     define("stopwatch") { case List(fun: FunctionValue) =>
       val env = new Environment(fun.environment)
       val start = System.currentTimeMillis()
-      evaluator.evaluate(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, List()), env)
+      interpreter.evaluate(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, List()), env)
       val end = System.currentTimeMillis()
       BoxedInt((end - start).toInt)
     }
@@ -339,42 +336,24 @@ class Interpreter {evaluator =>
     }
   }
 
-  def evaluateFile(file: File): Value = using(new BufferedReader(new InputStreamReader(new FileInputStream(file)))){in =>
-    val program = Iterator.continually(in.read()).takeWhile(_ != -1).map(_.toChar).mkString
-    evaluateString(program)
-  }
-  def evaluateString(program: String, fileName: String = "<no file>"): Value = {
-    val parser = new Parser
-    parser.parse(program) match {
-      case parser.Success(program: Program, _) =>
-        val tv = typer.newTypeVariable()
-        val recordEnvironment: typer.RecordEnvironment = typer.processRecords(program.records)
-        val (typedExpression, _) = typer.doType(rewriter.doRewrite(program.block), TypeEnvironment(typer.BuiltinEnvironment, Set.empty, typer.BuiltinRecordEnvironment ++ recordEnvironment, typer.BuiltinModuleEnvironment, None), tv, typer.EmptySubstitution)
-        val runtimeRecordEnvironment: RecordEnvironment = BuiltinRecordEnvironment
-        recordEnvironment.foreach { case (name, members) =>
-          val (xts, xmembers) = members
-          val rmembers = xmembers.map { case (rname, rscheme) => rname -> rscheme.description}
-          runtimeRecordEnvironment.records += (name -> rmembers)
-        }
-        evaluate(typedExpression, env = BuiltinEnvironment, recordEnv = runtimeRecordEnvironment, moduleEnv = BuiltinModuleEnvironment)
-      case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
-      case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
+  final def interpret(program: TypedAST.Program): Value = {
+    val runtimeRecordEnvironment: RecordEnvironment = BuiltinRecordEnvironment
+    program.records.foreach { case (name, members) =>
+      val (xts, xmembers) = members
+      val rmembers = xmembers.map { case (rname, rscheme) => rname -> rscheme.description}
+      runtimeRecordEnvironment.records += (name -> rmembers)
     }
+    interpreter.evaluate(program.block, env = BuiltinEnvironment, recordEnv = runtimeRecordEnvironment, moduleEnv = BuiltinModuleEnvironment)
   }
 
-  def doParse(program: String): Program = {
-    val parser = new Parser
-    parser.parse(program) match {
-      case parser.Success(program: Program, _) => program
-      case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
-      case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
-    }
+  private def evaluate(node: TypedAST): Value = {
+    evaluate(node, BuiltinEnvironment)
   }
 
-  private def evaluate(node: TypedAST): Value = evaluate(node, BuiltinEnvironment)
   private def performFunctionInternal(func: TypedAST, params: List[TypedAST], env: Environment): Value = {
     performFunction(TypedAST.FunctionCall(DynamicType, NoLocation, func, params), env)
   }
+
   private def performFunction(node: TypedAST.FunctionCall, env: Environment): Value = node match {
     case TypedAST.FunctionCall(description, location, func, params) =>
       evaluate(func, env) match {
@@ -401,6 +380,7 @@ class Interpreter {evaluator =>
           reportError("unknown error")
       }
   }
+
   private def evaluate(node: TypedAST, env: Environment, recordEnv: RecordEnvironment = BuiltinRecordEnvironment, moduleEnv: ModuleEnvironment = BuiltinModuleEnvironment): Value = {
     def evalRecursive(node: TypedAST): Value = {
       node match{

@@ -25,7 +25,7 @@ class RecordSpec extends SpecHelper {
 
     expectations.foreach{ case (in, expected) =>
       it(s"${in} evaluates to ${expected}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E.evaluateString(in))
       }
     }
   }
@@ -52,7 +52,7 @@ class RecordSpec extends SpecHelper {
 
     expectations.foreach{ case (in, expected) =>
       it(s"${in} evaluates to ${expected}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }

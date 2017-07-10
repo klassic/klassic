@@ -10,7 +10,7 @@ class FileBasedProgramSpec extends SpecHelper {
     })) {
       it(s"program ${program} runs successfully") {
         try {
-          I.evaluateFile(program)
+          E.evaluateFile(program)
           assert(true)
         }catch {
           case e:Throwable =>

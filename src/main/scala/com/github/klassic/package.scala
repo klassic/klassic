@@ -22,15 +22,17 @@ package object klassic {
 
   val p = new Parser
   val t = new Typer
-  val i = new Interpreter
+  val e = new Evaluator
 
   def typeOf(input: String): Type = {
     t.typeOf(p.parseExpression(input).get)
   }
 
   def evaluate(input: String): Value = {
-    i.evaluateString(input)
+    e.evaluateString(input)
   }
 
-  def tv(name: String): TypeVariable = TypeVariable(name)
+  def tv(name: String): TypeVariable = {
+    TypeVariable(name)
+  }
 }

@@ -6,7 +6,7 @@ import com.github.klassic.Type.{TypeConstructor, _}
 import scala.collection.mutable
 
 /**
-  * Created by kota_mizushima on 2016/06/02.
+  * @author Kota Mizushima
   */
 class Typer {
   type Environment = Map[String, TypeScheme]
@@ -253,6 +253,13 @@ class Typer {
     val r = new SyntaxRewriter
     val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, records, modules, None), a, EmptySubstitution)
     s(a)
+  }
+
+  def transform(program: AST.Program): TypedAST.Program = {
+    val tv = newTypeVariable()
+    val recordEnvironment: RecordEnvironment = processRecords(program.records)
+    val (typedExpression, _) = doType(program.block, TypeEnvironment(BuiltinEnvironment, Set.empty, BuiltinRecordEnvironment ++ recordEnvironment, BuiltinModuleEnvironment, None), tv, EmptySubstitution)
+    TypedAST.Program(program.location, Nil, typedExpression.asInstanceOf[TypedAST.Block], recordEnvironment)
   }
 
   var current: AST = null

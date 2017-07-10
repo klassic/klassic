@@ -16,7 +16,7 @@ class MapSpec extends SpecHelper {
 
     expectations.foreach{ case (in, expected) =>
       it(s"${in} evaluates to ${expected}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }
@@ -35,7 +35,7 @@ class MapSpec extends SpecHelper {
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
       it(s"expectations ${i}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }
@@ -54,7 +54,7 @@ class MapSpec extends SpecHelper {
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
       it(s"expectations ${i}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }

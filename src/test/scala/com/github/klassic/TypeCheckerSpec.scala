@@ -24,7 +24,7 @@ class TypeCheckerSpec extends SpecHelper {
 
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
       it(s"expectation  ${i}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }
@@ -39,7 +39,7 @@ class TypeCheckerSpec extends SpecHelper {
 
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
       it(s"expectation  ${i}") {
-        assertResult(expected)(I.evaluateString(in))
+        assertResult(expected)(E(in))
       }
     }
   }
@@ -60,7 +60,7 @@ class TypeCheckerSpec extends SpecHelper {
     inputs.zipWithIndex.foreach{ case (in, i) =>
       it(s"expectation  ${i}") {
         val e = intercept[TyperException] {
-          I.evaluateString(in)
+          E(in)
         }
         println(e)
       }
@@ -80,7 +80,7 @@ class TypeCheckerSpec extends SpecHelper {
 
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
       it(s"expectation  ${i}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }
@@ -97,7 +97,7 @@ class TypeCheckerSpec extends SpecHelper {
     illTypedPrograms.zipWithIndex.foreach { case (in, i) =>
       it(s"expectation  ${i}") {
         val e = intercept[TyperException] {
-          I.evaluateString(in)
+          E(in)
         }
         println(e)
       }
@@ -115,7 +115,7 @@ class TypeCheckerSpec extends SpecHelper {
     illTypedPrograms.zipWithIndex.foreach { case (in, i) =>
       it(s"expectation  ${i}") {
         val e = intercept[TyperException] {
-          I.evaluateString(in)
+          E(in)
         }
         println(e)
       }
@@ -132,7 +132,7 @@ class TypeCheckerSpec extends SpecHelper {
     illTypedPrograms.zipWithIndex.foreach { case (in, i) =>
       it(s"expectation  ${i}") {
         val e = intercept[TyperException] {
-          I.evaluateString(in)
+          E(in)
         }
         println(e)
       }
