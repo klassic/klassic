@@ -16,7 +16,7 @@ val person = new #Person("Kota Mizushima", 33)
 assertResult("Kota Mizushima")(person.name)
 assertResult(33)(person.age)
 
-val pair1 = new #Pair(1, 2)
+val pair1: #Pair<Int, Int> = new #Pair(1, 2)
 assertResult(1)(pair1._1)
 assertResult(2)(pair1._2)
 
