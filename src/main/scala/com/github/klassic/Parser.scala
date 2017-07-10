@@ -112,7 +112,7 @@ class Parser extends RegexParsers {
   lazy val KEYWORDS: Set[String]     = Set(
     "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
     "if", "else", "while", "foreach", "import", "cleanup", "true", "false", "in", ",", ".",
-    "class", "def", "val", "mutable", "=", "==", "=>", "new", "&&", "||"
+    "class", "def", "val", "mutable", "record", "=", "==", "=>", "new", "&&", "||"
   )
 
   lazy val typeAnnotation: Parser[Type] = COLON ~> typeDescription
@@ -131,8 +131,11 @@ class Parser extends RegexParsers {
     case _ => false
   }
 
+  lazy val typeVariable: Parser[Type] = qident ^^ {id => TypeVariable(id) }
+
   lazy val typeDescription: Parser[Type] = (
-    ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
+    qident ^^ {id => TypeVariable(id) }
+  | ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
   | (SHARP ~> sident).^?{ case s if !isBuiltinType(s) => s} ~ (CL(LT) ~> repsep(typeDescription, CL(COMMA)) <~ CL(GT)).? ^^ {
       case name ~ Some(args) => RecordType(name, args)
       case name ~ None => RecordType(name, Nil)
@@ -141,7 +144,6 @@ class Parser extends RegexParsers {
       case name ~ Some(args) => TypeConstructor(name, args)
       case name ~ None => TypeConstructor(name, Nil)
     }
-  | qident ^^ {id => TypeVariable(id) }
   | token("Byte") ^^ {_ => ByteType}
   | token("Short")  ^^ {_ => ShortType}
   | token("Int")  ^^ {_ => IntType}
@@ -164,12 +166,12 @@ class Parser extends RegexParsers {
 
   lazy val record: Parser[RecordDeclaration] = for {
     location <- %
-    _ <- CL(RECORD)
+    _ <- RECORD
     name <- sident
-    ts <- opt(LT ~> rep1sep(typeAnnotation, CL(COMMA)) <~ CL(GT))
+    ts <- opt(CL(LT) ~> rep1sep(typeVariable, CL(COMMA)) <~ CL(GT))
     _ <- CL(LBRACE)
     members <- (sident ~ CL(typeAnnotation) ^^ { case n ~ t => (n, t) }).*
-    _ <- CL(RBRACE)
+    _ <- RBRACE
   } yield RecordDeclaration(location, name, ts.getOrElse(Nil), members)
 
   //lines ::= line {TERMINATOR expr} [TERMINATOR]
@@ -231,7 +233,6 @@ class Parser extends RegexParsers {
     (% <~ CL(LT)) ^^ {location => (left:AST, right:AST) => BinaryExpression(location, Operator.LESS_THAN, left, right)} |
     (% <~ CL(GT)) ^^ {location => (left:AST, right:AST) => BinaryExpression(location, Operator.GREATER_THAN, left, right)}
   )
-
 
   //add ::= term {"+" term | "-" term}
   lazy val add: Parser[AST] = chainl1(term,
@@ -390,8 +391,8 @@ class Parser extends RegexParsers {
     case r@(_ ~ m ~ _ ~ n) if (!KEYWORDS(m)) && (!KEYWORDS(n)) => r
   } ^^ {case location ~ m ~ _ ~ n => Selector(location, m, n)}) <~ SPACING_WITHOUT_LF
 
-  lazy val qident:Parser[String] = ("""'[A-Za-z_][a-zA-Z0-9_]*""".r^? {
-    case  n if !KEYWORDS(n) => n
+  lazy val qident:Parser[String] = ("""[A-Za-z_][a-zA-Z0-9_]*'""".r^? {
+    case n if !KEYWORDS(n) => n
   }) <~ SPACING_WITHOUT_LF
 
   lazy val sident:Parser[String] = ("""[A-Za-z_][a-zA-Z0-9_]*""".r^? {
