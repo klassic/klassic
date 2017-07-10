@@ -24,4 +24,8 @@ val pair2 = new #Pair(1.5, 2.5)
 assertResult(1.5)(pair2._1)
 assertResult(2.5)(pair2._2)
 
+val pair3 = #Pair(true, 1)
+assertResult(true)(pair3._1)
+assertResult(1)(pair3._2)
+
 

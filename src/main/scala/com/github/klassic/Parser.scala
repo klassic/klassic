@@ -266,9 +266,8 @@ class Parser extends RegexParsers {
   }
 
   lazy val application: Parser[AST] = % ~ pipelinable ~ (CL(LPAREN) ~> repsep(CL(expression), CL(COMMA)) <~ (SPACING <~ RPAREN)).* ^^ {
-    case location ~ f ~ xs => {
-       xs.foldLeft(f){ case (e, x) => FunctionCall(e.location, e, x) }
-    }
+    case location ~ f ~ xs =>
+      xs.foldLeft(f){ case (e, x) => FunctionCall(e.location, e, x) }
   }
 
   lazy val pipelinable: Parser[AST] = % ~ castable ~ opt(CL(BAR) ~> ident) ^^ {
@@ -438,11 +437,14 @@ class Parser extends RegexParsers {
     case location ~ className ~ None => NewObject(location, className, List())
   }
 
-  // newRecord ::= "new" "#" fqcn "(" [param {"," param} ")"
-  lazy val newRecord: Parser[AST] = ((% <~ CL(NEW)) <~ CL(SHARP)) ~ sident ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN) ^^ {
+  // newRecord ::= "new" "#" sident "(" [param {"," param} ")"
+  lazy val newRecord: Parser[AST] = (((% <~ CL(NEW)) <~ CL(SHARP)) ~ sident ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN) ^^ {
     case location ~ recordName ~ Some(params) => NewRecord(location, recordName, params)
     case location ~ recordName ~ None => NewRecord(location, recordName, List())
-  }
+  }) | ((% <~ CL(SHARP)) ~ sident ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN) ^^ {
+    case location ~ recordName ~ Some(params) => NewRecord(location, recordName, params)
+    case location ~ recordName ~ None => NewRecord(location, recordName, List())
+  })
 
   // functionDefinition ::= "def" ident  ["(" [param {"," param]] ")"] "=" expression
   lazy val functionDefinition: Parser[FunctionDefinition] =
