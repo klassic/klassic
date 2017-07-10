@@ -355,8 +355,8 @@ class Interpreter {interpreter =>
   }
 
   private def performFunction(node: TypedAST.FunctionCall, env: Environment): Value = node match {
-    case TypedAST.FunctionCall(description, location, func, params) =>
-      evaluate(func, env) match {
+    case TypedAST.FunctionCall(description, location, function, params) =>
+      evaluate(function, env) match {
         case FunctionValue(TypedAST.FunctionLiteral(description, location, fparams, optionalType, proc), cleanup, cenv) =>
           val local = new Environment(cenv)
           (fparams zip params).foreach{ case (fp, ap) =>
@@ -628,7 +628,7 @@ class Interpreter {interpreter =>
             case v =>
               throw new IllegalArgumentException(s"value ${v} is not record")
           }
-        case call@TypedAST.FunctionCall(description, location, func, params) =>
+        case call@TypedAST.FunctionCall(description, location, function, params) =>
           performFunction(call, env)
         case TypedAST.Casting(description, location, target, to) =>
           evalRecursive(target)
