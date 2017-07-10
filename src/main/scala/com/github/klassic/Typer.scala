@@ -345,6 +345,11 @@ class Typer {
             (BooleanType, unify(x, y, s2))
           case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
             (BooleanType, unify(x, y, s2))
+          case (a@TypeConstructor(n1, ts1), b@TypeConstructor(n2, ts2)) if n2 == n2  && ts1.length == ts2.length =>
+            val sx = (ts1 zip ts2).foldLeft(s0) { case (s, (t1, t2)) =>
+                unify(t1, t2, s)
+            }
+            (sx(a), sx)
           case (ltype, rtype) =>
             val s3 = unify(IntType, ltype, s2)
             val s4 = unify(IntType, rtype, s3)

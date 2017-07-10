@@ -9,14 +9,14 @@ record Pair <a', b'> {
 }
 
 val point = new #Point(1000, 2000)
-assert(1000 == point->x)
-assert(2000 == point->y)
+assertResult(1000)(point->x)
+assertResult(2000)(point->y)
 
 val person = new #Person("Kota Mizushima", 33)
-println(person->name)
-println(person->age)
+assertResult("Kota Mizushima")(person->name)
+assertResult(33)(person->age)
 
 val pair = new #Pair(1, 2)
-assert(1 == pair->_1)
-assert(2 == pair->_2)
+assertResult(1)(pair->_1)
+assertResult(2)(pair->_2)
 

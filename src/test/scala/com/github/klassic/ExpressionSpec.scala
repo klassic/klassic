@@ -166,15 +166,15 @@ class ExpressionSpec extends SpecHelper {
          |fact(4)
       """.stripMargin -> BoxedInt(24),
       """
-         |def none() = 24 cleanup println("none")
+         |def none() = 24 cleanup "none"
          |none()
       """.stripMargin -> BoxedInt(24),
       """
          |def hello() = {
-         |  println("Hello")
+         |  "Hello"
          |  0
          |} cleanup {
-         |  println("World")
+         |  "World"
          |}
          |hello()
       """.stripMargin -> BoxedInt(0)
