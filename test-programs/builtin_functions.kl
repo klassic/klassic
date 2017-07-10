@@ -1,10 +1,10 @@
 val pattern = "[0-9]+"
-println(substring("FOO", 0, 1))
-println(matches("199", pattern))
-println(matches("200", pattern))
-println(matches("a", pattern))
+assertResult("F")(substring("FOO", 0, 1))
+assertResult(true)(matches("199", pattern))
+assertResult(true)(matches("200", pattern))
+assertResult(false)(matches("a", pattern))
 val sub = substring
-println(sub("BAR", 0, 1))
+assertResult("B")(sub("BAR", 0, 1))
 val add = (x, y) => {
   x + y
 }
@@ -13,10 +13,10 @@ val time = stopwatch( => {
   println("1")
 })
 println("it took #{time} milli seconds")
-println(add(2, 3))
+assertResult(5)(add(2, 3))
 val list = new java.util.ArrayList
 list.add(4)
 list.add(1)
 list.add(2)
 list.add(3)
-println(list)
+assertResult([4 1 2 3])((list :> List<Int>))
