@@ -80,6 +80,8 @@ object TypedAST {
 
   case class MapLiteral(val description: Type, val location: Location, elements: List[(TypedAST, TypedAST)]) extends TypedAST
 
+  case class AccessRecord(val description: Type, val location: Location, expression: TypedAST, member: String) extends TypedAST
+
   case class NewObject(val description: Type, val location: Location, className: String, params: List[TypedAST]) extends TypedAST
 
   case class NewRecord(val description: Type, val location: Location, recordName: String, params: List[TypedAST]) extends TypedAST

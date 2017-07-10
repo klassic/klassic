@@ -34,8 +34,8 @@ class SyntaxRewriter {
       IfExpression(location, doRewrite(cond), doRewrite(pos), doRewrite(neg))
     case WhileExpression(location, condition, body: AST) =>
       WhileExpression(location, doRewrite(condition), doRewrite(body))
-    case RecordAccess(location, expression, member) =>
-      RecordAccess(location, doRewrite(expression), member)
+    case AccessRecord(location, expression, member) =>
+      AccessRecord(location, doRewrite(expression), member)
     case NewRecord(location, name, members) =>
       NewRecord(location, name, members.map({ case e => doRewrite(e) }))
     case e@ForeachExpression(location, name, collection, body) =>
