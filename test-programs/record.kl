@@ -1,4 +1,14 @@
-val p = new #Point(1000, 2000)
-println(p->x)
-println(p->y)
+record Person {
+  name: *
+  age: Int
+}
+
+val point = new #Point(1000, 2000)
+println(point->x)
+println(point->y)
+
+val person = new #Person("Kota Mizushima", 33)
+println(person->name)
+println(person->age)
+
 

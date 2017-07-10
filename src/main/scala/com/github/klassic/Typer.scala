@@ -1,5 +1,6 @@
 package com.github.klassic
 
+import com.github.klassic.AST.RecordDeclaration
 import com.github.klassic.Type.{TypeConstructor, _}
 
 import scala.collection.mutable
@@ -216,6 +217,30 @@ class Typer {
       )
   }
 
+  def processRecords(recordDeclarations :List[RecordDeclaration]): RecordEnvironment = {
+    val headers = recordDeclarations.map{d => (d.name, d.ts) }.toMap
+    var recordEnvironment: RecordEnvironment = Map.empty
+    recordDeclarations.foreach{r =>
+      val recordName = r.name
+      val location = r.location
+      val members: List[(String, TypeScheme)] = r.members.map{ case (n, t) =>
+          t match {
+            case RecordType(rname, rtypes) if recordName == rname =>
+              val ts = headers(recordName)
+              if(ts.length != rtypes.length) {
+                throw TyperException(s"${location.format} type variables mismatch: required: ${ts.length} actual: ${rtypes.length}")
+              }
+              (n, TypeScheme(Nil, t))
+            case RecordType(rname, rtypes) if !headers.contains(rname) =>
+              throw TyperException(s"${location.format} record ${rname} is not found")
+            case _ =>
+              (n, TypeScheme(Nil, t))
+          }
+      }
+      recordEnvironment += (recordName -> members)
+    }
+    recordEnvironment
+  }
 
   def typeOf(e: AST, environment: Environment = BuiltinEnvironment, records: RecordEnvironment = BuiltinRecordEnvironment, modules: ModuleEnvironment = BuiltinModuleEnvironment): Type = {
     val a = newTypeVariable()
