@@ -203,6 +203,9 @@ class Typer {
     case (DynamicType, DynamicType) =>
       s
     case (RecordType(t1, t2), RecordType(u1, u2)) if t1 == u1 =>
+      if(t2.length != u2.length) {
+        throw TyperException(s"${current.location.format} type constructor arity mismatch: ${u2.length} != ${t2.length}")
+      }
       (t2 zip u2).foldLeft(s) { case (s, (t, u)) =>
         unify(t, u, s)
       }
