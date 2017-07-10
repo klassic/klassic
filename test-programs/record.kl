@@ -3,9 +3,9 @@ record Person {
   age: Int
 }
 
-record Pair <a', b'> {
-  _1: a'
-  _2: b'
+record Pair <'a, 'b> {
+  _1: 'a
+  _2: 'b
 }
 
 val point = new #Point(1000, 2000)
