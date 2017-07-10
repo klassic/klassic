@@ -13,7 +13,7 @@ import klassic.runtime.{AssertionError, NotImplementedError}
 /**
  * @author Kota Mizushima
  */
-class Interpreter {interpreter =>
+class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
   def reportError(message: String): Nothing = {
     throw InterpreterException(message)
   }
@@ -638,5 +638,11 @@ class Interpreter {interpreter =>
       }
     }
     evalRecursive(node)
+  }
+
+  override final val name: String = "Interpreter"
+
+  override final def process(input: TypedAST.Program): Value = {
+    interpret(input)
   }
 }

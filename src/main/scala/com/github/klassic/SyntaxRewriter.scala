@@ -4,9 +4,9 @@ import com.github.klassic.AST.{FunctionCall, ListLiteral, MapLiteral, NewObject,
 import com.github.klassic.Type.{BooleanType, DynamicType}
 
 /**
-  * @Author Kota Mizushima
+  * @author Kota Mizushima
   */
-class SyntaxRewriter {
+class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
   object SymbolGenerator {
     private[this] var counter: Int = 0
     def symbol(): String = {
@@ -18,9 +18,6 @@ class SyntaxRewriter {
 
   import SymbolGenerator.symbol
 
-  def transform(program: AST.Program): AST.Program = {
-    program.copy(block = doRewrite(program.block).asInstanceOf[AST.Block])
-  }
 
   def doRewrite(node: AST): AST = node match {
     case Block(location, expressions) =>
@@ -148,4 +145,13 @@ class SyntaxRewriter {
     case otherwise => throw RewriterPanic(otherwise.toString)
   }
 
+  def transform(program: AST.Program): AST.Program = {
+    program.copy(block = doRewrite(program.block).asInstanceOf[AST.Block])
+  }
+
+  override final val name: String = "Rewriter"
+
+  override final def process(input: Program): Program = {
+    transform(input)
+  }
 }
