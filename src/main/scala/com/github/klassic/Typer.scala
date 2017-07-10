@@ -645,6 +645,26 @@ class Typer {
         }
         val resultType = s1(t)
         (TypedAST.Selector(resultType, location, module, name), s1)
+      case AST.AccessRecord(location, expression, memberName) =>
+        val t0 = newTypeVariable()
+        val (te, s1) = doType(expression, env, t0, s0)
+        te.description match {
+          case RecordType(recordName, paramTypes)=>
+            env.records.get(recordName) match {
+              case None =>
+                throw TyperException(s"${location.format} record ${recordName} is not found")
+              case Some(members) =>
+                members.find{ case (mname, mscheme) => mname == memberName} match {
+                  case None =>
+                    throw TyperException(s"${location.format} member ${memberName} is not found in record ${recordName}")
+                  case Some((mname, mscheme)) =>
+                    val sx = unify(mscheme.description, t, s1)
+                    (TypedAST.AccessRecord(sx(t), location, te, mname), sx)
+                }
+            }
+          case t =>
+            throw TyperException(s"${location.format} ${t} is not record type")
+        }
       case AST.Lambda(location, params, optionalType, body) =>
         val b = optionalType.getOrElse(newTypeVariable())
         val ts = params.map{p => p.optionalType.getOrElse(newTypeVariable())}
@@ -730,19 +750,22 @@ class Typer {
         (TypedAST.NewObject(DynamicType, location, className, tes.reverse), sy)
       case AST.NewRecord(location, recordName, params) =>
         val ts = params.map{_ => newTypeVariable()}
-        val (tes, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), (e, t)) =>
+        val (tes1, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), (e, t)) =>
           val (te, sx) = doType(e, env, t, s)
           (te::tes, sx)
         }
+        val tes2 = tes1.reverse
         env.records.get(recordName) match {
           case Some(members) =>
             if(members.length != ts.length) {
               throw TyperException(s"${location.format} length mismatch: required: ${members.length}, actual: ${ts.length}")
             }
             val mts = members.map{ case (_, t) => t.description}
-            val pts = tes.map { case te => te.description }
+            val pts = tes2.map { case te => te.description }
             val sn = (mts zip pts).foldLeft(sx) { case (s, (m, p)) => unify(m, p, s)}
-            (TypedAST.NewRecord(RecordType(recordName, pts), location, recordName, tes), sn)
+            val rt = RecordType(recordName, pts)
+            val so = unify(t,rt, sn)
+            (TypedAST.NewRecord(rt, location, recordName, tes2), so)
           case None =>
             throw TyperException(s"${location.format} record '$recordName' is not found")
         }

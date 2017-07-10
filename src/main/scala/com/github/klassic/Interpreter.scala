@@ -622,12 +622,24 @@ class Interpreter {evaluator =>
               throw new IllegalArgumentException(s"new ${className}(${params}) is not found")
           }
         case TypedAST.NewRecord(description, location, recordName, params) =>
-          val paramsList = params.map{evalRecursive}.toList
+          val paramsList = params.map{evalRecursive}
           recordEnv.records.get(recordName) match {
             case None => throw new IllegalArgumentException(s"record ${recordName} is not found")
             case Some(argsList) =>
               val members = (argsList zip paramsList).map{ case ((n, _), v) => n -> v }
               RecordValue(recordName, members)
+          }
+        case TypedAST.AccessRecord(description, location, expression, memberName) =>
+          evalRecursive(expression) match {
+            case RecordValue(recordName, members) =>
+              members.find{ case (mname, mtype) => memberName == mname} match {
+                case None =>
+                  throw new IllegalArgumentException(s"member ${memberName} is not found in record ${recordName}")
+                case Some((_, value)) =>
+                  value
+              }
+            case v =>
+              throw new IllegalArgumentException(s"value ${v} is not record")
           }
         case call@TypedAST.FunctionCall(description, location, func, params) =>
           performFunction(call, env)

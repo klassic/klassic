@@ -87,7 +87,7 @@ object AST {
 
   case class VariantIn(location: Location, variant: VariantDeclaration, body: AST) extends AST
 
-  case class RecordAccess(location: Location, expression: AST, member: String) extends AST
+  case class AccessRecord(location: Location, expression: AST, member: String) extends AST
 
   case class Let(location: Location, variable: String, description: Option[Type], value: AST, body: AST, immutable: Boolean) extends AST
   object Let {

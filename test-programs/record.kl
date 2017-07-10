@@ -1,2 +1,4 @@
-println(new #Point(10, 20))
-1
+val p = new #Point(1000, 2000)
+println(p->x)
+println(p->y)
+

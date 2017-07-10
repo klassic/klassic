@@ -133,6 +133,10 @@ class Parser extends RegexParsers {
 
   lazy val typeDescription: Parser[Type] = (
     ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType)}
+  | (SHARP ~> sident).^?{ case s if !isBuiltinType(s) => s} ~ (CL(LT) ~> repsep(typeDescription, CL(COMMA)) <~ CL(GT)).? ^^ {
+      case name ~ Some(args) => RecordType(name, args)
+      case name ~ None => RecordType(name, Nil)
+    }
   | sident.^?{ case s if !isBuiltinType(s) => s} ~ (CL(LT) ~> repsep(typeDescription, CL(COMMA)) <~ CL(GT)).? ^^ {
       case name ~ Some(args) => TypeConstructor(name, args)
       case name ~ None => TypeConstructor(name, Nil)
@@ -252,11 +256,11 @@ class Parser extends RegexParsers {
       npList.foldLeft(self){case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil))}
   }
 
-  lazy val recordAccess: Parser[AST] = % ~ application ~ ((CL(ARROW1) ~> (% ~ ident))).* ^^ {
+  lazy val recordAccess: Parser[AST] = % ~ application ~ ((CL(ARROW2) ~> (% ~ ident))).* ^^ {
     case location ~ self ~ names =>
       val ns = names.map{ case l ~ n => (l, n.name)}
       ns.foldLeft(self) { case (e, (l, n)) =>
-        RecordAccess(l, e, n)
+        AccessRecord(l, e, n)
       }
   }
 
@@ -266,7 +270,7 @@ class Parser extends RegexParsers {
     }
   }
 
-  lazy val pipelinable: Parser[AST] = % ~ castable ~ opt(CL(ARROW2) ~> ident) ^^ {
+  lazy val pipelinable: Parser[AST] = % ~ castable ~ opt(CL(BAR) ~> ident) ^^ {
     case location ~ self ~ None =>
       self
     case location ~ self ~ Some(name) =>
