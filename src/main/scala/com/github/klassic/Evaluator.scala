@@ -18,13 +18,9 @@ class Evaluator extends (String => Value) {
   }
   def evaluateString(program: String, fileName: String = "<no file>"): Value = {
     val parser = new Parser
-    parser.parse(program) match {
-      case parser.Success(program: Program, _) =>
-        val transformedProgram = rewriter.transform(program)
-        val typedProgram = typer.transform(transformedProgram)
-        interpreter.interpret(typedProgram)
-      case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
-      case parser.Error(m, n) => throw new InterpreterException(n.pos + ":" + m)
-    }
+    val parsedProgram = parser.process(program)
+    val rewritedProgram = rewriter.process(parsedProgram)
+    val typedProgram = typer.process(rewritedProgram)
+    interpreter.process(typedProgram)
   }
 }

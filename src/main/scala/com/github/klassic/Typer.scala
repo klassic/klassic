@@ -8,7 +8,7 @@ import scala.collection.mutable
 /**
   * @author Kota Mizushima
   */
-class Typer {
+class Typer extends Processor[AST.Program, TypedAST.Program] {
   type Environment = Map[String, TypeScheme]
   type ModuleEnvironment = Map[String, Environment]
   type RecordEnvironment = Map[String, (List[TypeVariable], List[(String, TypeScheme)])]
@@ -253,13 +253,6 @@ class Typer {
     val r = new SyntaxRewriter
     val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, records, modules, None), a, EmptySubstitution)
     s(a)
-  }
-
-  def transform(program: AST.Program): TypedAST.Program = {
-    val tv = newTypeVariable()
-    val recordEnvironment: RecordEnvironment = processRecords(program.records)
-    val (typedExpression, _) = doType(program.block, TypeEnvironment(BuiltinEnvironment, Set.empty, BuiltinRecordEnvironment ++ recordEnvironment, BuiltinModuleEnvironment, None), tv, EmptySubstitution)
-    TypedAST.Program(program.location, Nil, typedExpression.asInstanceOf[TypedAST.Block], recordEnvironment)
   }
 
   var current: AST = null
@@ -835,4 +828,15 @@ class Typer {
         throw TyperPanic(otherwise.toString)
     }
   }
+
+  def transform(program: AST.Program): TypedAST.Program = {
+    val tv = newTypeVariable()
+    val recordEnvironment: RecordEnvironment = processRecords(program.records)
+    val (typedExpression, _) = doType(program.block, TypeEnvironment(BuiltinEnvironment, Set.empty, BuiltinRecordEnvironment ++ recordEnvironment, BuiltinModuleEnvironment, None), tv, EmptySubstitution)
+    TypedAST.Program(program.location, Nil, typedExpression.asInstanceOf[TypedAST.Block], recordEnvironment)
+  }
+
+  override final val name: String = "Typer"
+
+  override final def process(input: AST.Program): TypedAST.Program = transform(input)
 }
