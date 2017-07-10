@@ -131,7 +131,7 @@ class Parser extends RegexParsers {
     case _ => false
   }
 
-  lazy val typeVariable: Parser[Type] = qident ^^ {id => TypeVariable(id) }
+  lazy val typeVariable: Parser[TypeVariable] = qident ^^ {id => TypeVariable(id) }
 
   lazy val typeDescription: Parser[Type] = (
     qident ^^ {id => TypeVariable(id) }
@@ -250,14 +250,14 @@ class Parser extends RegexParsers {
   | invocation
   )
 
-  lazy val invocation: Parser[AST] = % ~ recordAccess ~ ((CL(DOT) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
+  lazy val invocation: Parser[AST] = % ~ recordAccess ~ ((CL(ARROW2) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
     case location ~ self ~ Nil =>
       self
     case location ~ self ~ npList  =>
       npList.foldLeft(self){case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil))}
   }
 
-  lazy val recordAccess: Parser[AST] = % ~ application ~ ((CL(ARROW2) ~> (% ~ ident))).* ^^ {
+  lazy val recordAccess: Parser[AST] = % ~ application ~ ((CL(DOT) ~> (% ~ ident))).* ^^ {
     case location ~ self ~ names =>
       val ns = names.map{ case l ~ n => (l, n.name)}
       ns.foldLeft(self) { case (e, (l, n)) =>

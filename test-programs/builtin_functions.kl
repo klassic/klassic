@@ -15,8 +15,8 @@ val time = stopwatch( => {
 println("it took #{time} milli seconds")
 assertResult(5)(add(2, 3))
 val list = new java.util.ArrayList
-list.add(4)
-list.add(1)
-list.add(2)
-list.add(3)
+list->add(4)
+list->add(1)
+list->add(2)
+list->add(3)
 assertResult([4 1 2 3])((list :> List<Int>))

@@ -11,7 +11,7 @@ import scala.collection.mutable
 class Typer {
   type Environment = Map[String, TypeScheme]
   type ModuleEnvironment = Map[String, Environment]
-  type RecordEnvironment = Map[String, List[(String, TypeScheme)]]
+  type RecordEnvironment = Map[String, (List[TypeVariable], List[(String, TypeScheme)])]
   def listOf(tp: Type): TypeConstructor = {
     TypeConstructor("List", List(tp))
   }
@@ -49,12 +49,12 @@ class Typer {
     )
   }
 
-  val BuiltinRecordEnvironment: Map[String, List[(String, TypeScheme)]] = {
+  val BuiltinRecordEnvironment: Map[String, (List[TypeVariable], List[(String, TypeScheme)])] = {
     Map(
-      "Point" -> List(
+      "Point" -> (Nil, List(
         "x" -> TypeScheme(Nil, IntType),
         "y" -> TypeScheme(Nil, IntType)
-      )
+      ))
     )
   }
 
@@ -125,6 +125,8 @@ class Typer {
     }
 
     def extend(tv: TypeVariable, td: Type): Substitution = new Substitution(this.map + (tv -> td))
+
+    def remove(tv: TypeVariable): Substitution = new Substitution(this.map - tv)
   }
 
   def lookup(x: String, environment: Environment): Option[TypeScheme] = environment.get(x) match {
@@ -200,7 +202,7 @@ class Typer {
       s
     case (DynamicType, DynamicType) =>
       s
-    case (RecordType(t1, t2), RecordType(u1, u2)) if u1 == u2 =>
+    case (RecordType(t1, t2), RecordType(u1, u2)) if t1 == u1 =>
       (t2 zip u2).foldLeft(s) { case (s, (t, u)) =>
         unify(t, u, s)
       }
@@ -237,7 +239,8 @@ class Typer {
               (n, TypeScheme(Nil, t))
           }
       }
-      recordEnvironment += (recordName -> members)
+      val ts = headers(recordName)
+      recordEnvironment += (recordName -> (ts, members))
     }
     recordEnvironment
   }
@@ -684,7 +687,8 @@ class Typer {
               case None =>
                 throw TyperException(s"${location.format} record ${recordName} is not found")
               case Some(members) =>
-                members.find{ case (mname, mscheme) => mname == memberName} match {
+                val (xts, xmembers) = members
+                xmembers.find{ case (mname, mscheme) => mname == memberName} match {
                   case None =>
                     throw TyperException(s"${location.format} member ${memberName} is not found in record ${recordName}")
                   case Some((mname, mscheme)) =>
@@ -709,15 +713,16 @@ class Typer {
         }
         val a = optionalType.getOrElse(newTypeVariable())
         val (typedValue, s1) = doType(value, env, a, s0)
-        val gen = generalize(s1(a), env.variables)
-        val declaredType = s1(a)
+        val s2 = unify(s1(a), typedValue.description, s1)
+        val gen = generalize(s2(a), env.variables)
+        val declaredType = s2(a)
         val newEnv = if(immutable) {
           env.updateImmuableVariable(variable, generalize(declaredType, env.variables))
         } else {
           env.updateMutableVariable(variable, generalize(declaredType, env.variables))
         }
-        val (typedBody, s2) = doType(body, newEnv, t, s1)
-        (TypedAST.LetDeclaration(typedBody.description, location, variable, declaredType, typedValue, typedBody, immutable), s2)
+        val (typedBody, s3) = doType(body, newEnv, t, s2)
+        (TypedAST.LetDeclaration(typedBody.description, location, variable, declaredType, typedValue, typedBody, immutable), s3)
       case AST.LetRec(location, variable, value, cleanup, body) =>
         if(env.variables.contains(variable)) {
           throw new InterruptedException(s"${location.format} function ${variable} is already defined")
@@ -786,16 +791,17 @@ class Typer {
         }
         val tes2 = tes1.reverse
         env.records.get(recordName) match {
-          case Some(members) =>
-            if(members.length != ts.length) {
-              throw TyperException(s"${location.format} length mismatch: required: ${members.length}, actual: ${ts.length}")
+          case Some((xts, xmembers)) =>
+            val sy = xts.foldLeft(sx) { case (s, t) => s.remove(t)}
+            if(xmembers.length != ts.length) {
+              throw TyperException(s"${location.format} length mismatch: required: ${xmembers.length}, actual: ${ts.length}")
             }
-            val mts = members.map{ case (_, t) => t.description}
-            val pts = tes2.map { case te => te.description }
-            val sn = (mts zip pts).foldLeft(sx) { case (s, (m, p)) => unify(m, p, s)}
-            val rt = RecordType(recordName, pts)
-            val so = unify(t,rt, sn)
-            (TypedAST.NewRecord(rt, location, recordName, tes2), so)
+            val memberTypes = xmembers.map{ case (_, t) => t.description}
+            val parameterTypes = tes2.map { case te => te.description }
+            val sn = (memberTypes zip parameterTypes).foldLeft(sy) { case (s, (m, p)) => unify(m, p, s)}
+            val recordType = RecordType(recordName, xts.map{t => sn(t)})
+            val so = unify(t, recordType, sn)
+            (TypedAST.NewRecord(recordType, location, recordName, tes2), so)
           case None =>
             throw TyperException(s"${location.format} record '$recordName' is not found")
         }
