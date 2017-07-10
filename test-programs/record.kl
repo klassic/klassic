@@ -3,6 +3,11 @@ record Person {
   age: Int
 }
 
+record Pair <a', b'> {
+  _1: a'
+  _2: b'
+}
+
 val point = new #Point(1000, 2000)
 println(point->x)
 println(point->y)
@@ -11,4 +16,6 @@ val person = new #Person("Kota Mizushima", 33)
 println(person->name)
 println(person->age)
 
+val pair = new #Pair(1, 2)
+println("comparison result: #{1 == pair->_1}")
 
