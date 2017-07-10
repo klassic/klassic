@@ -352,8 +352,9 @@ class Interpreter {evaluator =>
         val (typedExpression, _) = typer.doType(rewriter.doRewrite(program.block), TypeEnvironment(typer.BuiltinEnvironment, Set.empty, typer.BuiltinRecordEnvironment ++ recordEnvironment, typer.BuiltinModuleEnvironment, None), tv, typer.EmptySubstitution)
         val runtimeRecordEnvironment: RecordEnvironment = BuiltinRecordEnvironment
         recordEnvironment.foreach { case (name, members) =>
-            val rmembers = members.map { case (rname, rscheme) => rname -> rscheme.description}
-            runtimeRecordEnvironment.records += (name -> rmembers)
+          val (xts, xmembers) = members
+          val rmembers = xmembers.map { case (rname, rscheme) => rname -> rscheme.description}
+          runtimeRecordEnvironment.records += (name -> rmembers)
         }
         evaluate(typedExpression, env = BuiltinEnvironment, recordEnv = runtimeRecordEnvironment, moduleEnv = BuiltinModuleEnvironment)
       case parser.Failure(m, n) => throw new InterpreterException(n.pos + ":" + m)
