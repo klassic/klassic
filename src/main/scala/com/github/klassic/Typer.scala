@@ -204,7 +204,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       s
     case (RecordType(t1, t2), RecordType(u1, u2)) if t1 == u1 =>
       if(t2.length != u2.length) {
-        throw TyperException(s"${current.location.format} type constructor arity mismatch: ${u2.length} != ${t2.length}")
+        typeError(current.location, s"type constructor arity mismatch: ${u2.length} != ${t2.length}")
       }
       (t2 zip u2).foldLeft(s) { case (s, (t, u)) =>
         unify(t, u, s)
@@ -214,12 +214,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     case (TypeConstructor(k1, ts), TypeConstructor(k2, us)) if k1 == k2 =>
       (ts zip us).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
     case _ =>
-      throw TyperException(
-        s"""
-           | cannot unify ${s(t)} with ${s(u)}
-           | location: ${current.location.format}
-         """.stripMargin
-      )
+      typeError(current.location, s"cannot unify ${s(t)} with ${s(u)}")
   }
 
   def processRecords(recordDeclarations :List[RecordDeclaration]): RecordEnvironment = {
@@ -233,11 +228,11 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             case RecordType(rname, rtypes) if recordName == rname =>
               val ts = headers(recordName)
               if(ts.length != rtypes.length) {
-                throw TyperException(s"${location.format} type variables mismatch: required: ${ts.length} actual: ${rtypes.length}")
+                typeError(location, s"type variables length mismatch: required: ${ts.length} actual: ${rtypes.length}")
               }
               (n, TypeScheme(Nil, t))
             case RecordType(rname, rtypes) if !headers.contains(rname) =>
-              throw TyperException(s"${location.format} record ${rname} is not found")
+              typeError(location, s"record ${rname} is not found")
             case _ =>
               (n, TypeScheme(Nil, t))
           }
@@ -299,11 +294,11 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         (TypedAST.BooleanNode(newSub(t), location, value), newSub)
       case AST.SimpleAssignment(location, variable, value) =>
         if(env.immutableVariables.contains(variable)) {
-          throw TyperException(s"${location.format} variable '$variable' cannot change")
+          typeError(location, s"variable '$variable' cannot change")
         }
         env.lookup(variable) match {
           case None =>
-            throw TyperException(s"${location.format} variable $variable is not defined")
+            typeError(location, s"variable $variable is not defined")
           case Some(variableType) =>
             val (typedValue, s1) = doType(value, env, t, s0)
             val s2 = unify(variableType.description, typedValue.description, s1)
@@ -320,7 +315,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val c = newTypeVariable()
         val (typedCondition, s1) = doType(condition, env, a, s0)
         if(typedCondition.description != BooleanType) {
-          throw TyperException(s"${location.format} condition type must be Boolean, actual: ${typedCondition.description}")
+          typeError(location, s"condition type must be Boolean, actual: ${typedCondition.description}")
         } else {
           val (typedBody, s2) = doType(body, env, b, s1)
           val s3 = unify(UnitType, t, s2)
@@ -669,14 +664,14 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         (TypedAST.StringNode(DynamicType, location, value), s1)
       case AST.Id(location, name) =>
         val s1 = env.lookup(name) match {
-          case None => throw TyperException(s"${location.format} variable '${name}' is not found")
+          case None => typeError(location, s"variable '${name}' is not found")
           case Some(u) => unify(newInstanceFrom(u), t, s0)
         }
         val resultType = s1(t)
         (TypedAST.Id(resultType, location, name), s1)
       case AST.Selector(location, module, name) =>
         val s1 = env.lookupModuleMember(module, name) match {
-          case None => throw TyperException(s"${location.format} module '${module}' or member '${name}' is not found")
+          case None => typeError(location, s"module '${module}' or member '${name}' is not found")
           case Some(u) => unify(newInstanceFrom(u), t, s0)
         }
         val resultType = s1(t)
@@ -688,19 +683,19 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           case RecordType(recordName, paramTypes)=>
             env.records.get(recordName) match {
               case None =>
-                throw TyperException(s"${location.format} record ${recordName} is not found")
+                typeError(location, s"record ${recordName} is not found")
               case Some(members) =>
                 val (xts, xmembers) = members
                 xmembers.find{ case (mname, mscheme) => mname == memberName} match {
                   case None =>
-                    throw TyperException(s"${location.format} member ${memberName} is not found in record ${recordName}")
+                    throw typeError(location, s"member ${memberName} is not found in record ${recordName}")
                   case Some((mname, mscheme)) =>
                     val sx = unify(mscheme.description, t, s1)
                     (TypedAST.AccessRecord(sx(t), location, te, mname), sx)
                 }
             }
           case t =>
-            throw TyperException(s"${location.format} ${t} is not record type")
+            typeError(location, s"${t} is not record type")
         }
       case AST.Lambda(location, params, optionalType, body) =>
         val b = optionalType.getOrElse(newTypeVariable())
@@ -712,7 +707,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         (TypedAST.FunctionLiteral(s2(t), location, params, optionalType, typedBody), s2)
       case AST.Let(location, variable, optionalType, value, body, immutable) =>
         if(env.variables.contains(variable)) {
-          throw TyperException(s"${location.format} variable $variable is already defined")
+          typeError(location, s"variable $variable is already defined")
         }
         val a = optionalType.getOrElse(newTypeVariable())
         val (typedValue, s1) = doType(value, env, a, s0)
@@ -797,7 +792,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           case Some((xts, xmembers)) =>
             val sy = xts.foldLeft(sx) { case (s, t) => s.remove(t)}
             if(xmembers.length != ts.length) {
-              throw TyperException(s"${location.format} length mismatch: required: ${xmembers.length}, actual: ${ts.length}")
+              typeError(location, s"length mismatch: required: ${xmembers.length}, actual: ${ts.length}")
             }
             val memberTypes = xmembers.map{ case (_, t) => t.description}
             val parameterTypes = tes2.map { case te => te.description }
@@ -806,7 +801,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             val so = unify(t, recordType, sn)
             (TypedAST.NewRecord(recordType, location, recordName, tes2), so)
           case None =>
-            throw TyperException(s"${location.format} record '$recordName' is not found")
+            typeError(location, s"record '$recordName' is not found")
         }
       case AST.Casting(location, target, to) =>
         val a = newTypeVariable()
@@ -827,6 +822,10 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       case otherwise =>
         throw TyperPanic(otherwise.toString)
     }
+  }
+
+  def typeError(location: Location, message: String): Nothing = {
+    throw TyperException(s"${location.format} ${message}")
   }
 
   def transform(program: AST.Program): TypedAST.Program = {
