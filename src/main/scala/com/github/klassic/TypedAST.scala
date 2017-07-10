@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.Type.DynamicType
+import com.github.klassic.Type.{DynamicType, TypeScheme, TypeVariable}
 
 /**
  * @author Kota Mizushima
@@ -12,6 +12,8 @@ sealed abstract class TypedAST {
 }
 
 object TypedAST {
+  type RecordEnvironment = Map[String, (List[TypeVariable], List[(String, TypeScheme)])]
+
   sealed trait IntegerSuffix
 
   case object ByteSuffix extends IntegerSuffix
@@ -24,7 +26,7 @@ object TypedAST {
 
   case object FloatSuffix extends FloatSuffix
 
-  case class Program(val location: Location, imports: List[Import], block: Block)
+  case class Program(val location: Location, imports: List[Import], block: Block, records: RecordEnvironment)
 
   case class Import(val location: Location, simpleName: String, fqcn: String)
 

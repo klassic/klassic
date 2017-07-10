@@ -5,7 +5,7 @@ import java.util.ArrayList
 import java.util.HashMap
 
 trait SpecHelper extends FunSpec with DiagrammedAssertions {
-  val I = new Interpreter
+  val E = new Evaluator
   def listOf[T](elements: T*): ArrayList[T] = {
     val newList = new ArrayList[T]
     elements.foreach{e =>
@@ -23,7 +23,7 @@ trait SpecHelper extends FunSpec with DiagrammedAssertions {
   def expect[A, B](label: String)(expectation: (String, Value)): Unit = expectation match {
     case (actual, expected) =>
       it(label) {
-        assertResult(expected)(I.evaluateString(actual))
+        assertResult(expected)(E.evaluateString(actual))
       }
   }
 }

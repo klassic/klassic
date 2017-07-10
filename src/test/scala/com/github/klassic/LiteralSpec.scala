@@ -21,7 +21,7 @@ class LiteralSpec extends SpecHelper {
     )
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
       it(s"expectations ${i}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }
@@ -42,7 +42,7 @@ class LiteralSpec extends SpecHelper {
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
       it(s"expectations ${i}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }
@@ -59,7 +59,7 @@ class LiteralSpec extends SpecHelper {
 
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
       it(s"expectations ${i}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
 
@@ -75,7 +75,7 @@ class LiteralSpec extends SpecHelper {
 
       expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
         it(s"expectations ${i}") {
-          assert(expected == I.evaluateString(in))
+          assert(expected == E(in))
         }
       }
     }
@@ -93,7 +93,7 @@ class LiteralSpec extends SpecHelper {
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
       it(s"expectations ${i}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }
@@ -135,7 +135,7 @@ class LiteralSpec extends SpecHelper {
     )
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
       it(s"expectations ${i}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }
@@ -150,7 +150,7 @@ class LiteralSpec extends SpecHelper {
     )
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
       it(s"expectations ${i}") {
-        assert(expected == I.evaluateString(in))
+        assert(expected == E(in))
       }
     }
   }

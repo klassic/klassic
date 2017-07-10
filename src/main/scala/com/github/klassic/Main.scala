@@ -9,12 +9,12 @@ import scala.collection.Iterator.continually
  */
 object Main {
   def main(args: Array[String]): Unit = {
-    val interpreter = new Interpreter
+    val evaluator = new Evaluator
     parseCommandLine(args) match {
       case Some(("-e", line)) =>
-        println(interpreter.evaluateString(line))
+        println(evaluator.evaluateString(line))
       case Some(("-f", fileName)) =>
-        interpreter.evaluateFile(new File(fileName))
+        evaluator.evaluateFile(new File(fileName))
       case _ =>
         Console.err.println(
           """

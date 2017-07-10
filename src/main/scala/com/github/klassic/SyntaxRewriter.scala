@@ -2,8 +2,9 @@ package com.github.klassic
 
 import com.github.klassic.AST.{FunctionCall, ListLiteral, MapLiteral, NewObject, _}
 import com.github.klassic.Type.{BooleanType, DynamicType}
+
 /**
-  * Created by kota_mizushima on 2016/11/17.
+  * @Author Kota Mizushima
   */
 class SyntaxRewriter {
   object SymbolGenerator {
@@ -14,7 +15,13 @@ class SyntaxRewriter {
       name
     }
   }
+
   import SymbolGenerator.symbol
+
+  def transform(program: AST.Program): AST.Program = {
+    program.copy(block = doRewrite(program.block).asInstanceOf[AST.Block])
+  }
+
   def doRewrite(node: AST): AST = node match {
     case Block(location, expressions) =>
       def rewriteBlock(es: List[AST]): List[AST] = es match {
