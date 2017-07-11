@@ -9,10 +9,23 @@ record Profile {
   hobby: *
 }
 
+record Stub {
+  p: #GPoint<Int, Int>
+}
+
+record GPoint<'x, 'y> {
+  x: 'x
+  y: 'y
+}
+
 record Pair <'a, 'b> {
   _1: 'a
   _2: 'b
 }
+
+val stub = #Stub(#GPoint(3, 5))
+assertResult(3)(stub.p.x)
+assertResult(5)(stub.p.y)
 
 val point = #Point(1000, 2000)
 assertResult(1000)(point.x)

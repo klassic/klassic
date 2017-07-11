@@ -1,5 +1,7 @@
 package com.github.klassic
 
+import javax.lang.model.`type`.TypeVariable
+
 import com.github.klassic.AST.RecordDeclaration
 import com.github.klassic.Type.{TConstructor, _}
 
@@ -226,6 +228,15 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       s
     case (TDynamic, TDynamic) =>
       s
+    case (TRecord(ts1, row1), TRecord(ts2, row2)) =>
+      val s0 = (ts1 zip ts2).foldLeft(s){ case (s, (t1, t2)) => unify(t1, t2, s)}
+      val members1 = toList(row1)
+      val members2 = toList(row2)
+      (members1 zip members2).foldLeft(s0) { case (s, ((_, t1), (_, t2))) =>
+        // FIXME If records are deeply nested, unifications fail
+        // To fix it, fixing doTypeRecords() is needed.
+        unify(t1, t2, s)
+      }
     case (r1@TRecordReference(t1, t2), r2@TRecordReference(u1, u2)) if t1 == u1 =>
       if(t2.length != u2.length) {
         typeError(current.location, s"type constructor arity mismatch: ${r1} != ${r2}")
@@ -238,6 +249,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     case (TConstructor(k1, ts), TConstructor(k2, us)) if k1 == k2 =>
       (ts zip us).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
     case _ =>
+      new Exception().printStackTrace()
       typeError(current.location, s"cannot unify ${s(t)} with ${s(u)}")
   }
 
@@ -251,30 +263,45 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     case TRowEmpty => Nil
   }
 
-  def processRecords(recordDeclarations :List[RecordDeclaration]): RecordEnvironment = {
+  def doTypeRecords(recordDeclarations :List[RecordDeclaration]): (RecordEnvironment, Substitution) = {
     val headers = recordDeclarations.map{d => (d.name, d.ts) }.toMap
-    var recordEnvironment: RecordEnvironment = Map.empty
+    var recordEnvironmentPre: RecordEnvironment = Map.empty
+    var recordEnvironmentPost: RecordEnvironment = Map.empty
+    var s: Substitution = EmptySubstitution
     recordDeclarations.foreach{recordDeclaration =>
       val recordName = recordDeclaration.name
       val location = recordDeclaration.location
       val members: List[(String, Type)] = recordDeclaration.members.map{ case (n, t) =>
           t match {
-            case TRecordReference(rname, rtypes) if recordName == rname =>
+            case TRecordReference(rname, rtypes) if !headers.contains(rname) =>
+              typeError(location, s"record ${rname} is not found")
+            case r@TRecordReference(rname, rtypes) if recordName == rname =>
               val ts = headers(recordName)
               if(ts.length != rtypes.length) {
                 typeError(location, s"type variables length mismatch: required: ${ts.length} actual: ${rtypes.length}")
               }
+              val tv1 = newTypeVariable()
+              s = unify(tv1, r, s)
               (n, t)
-            case TRecordReference(rname, rtypes) if !headers.contains(rname) =>
-              typeError(location, s"record ${rname} is not found")
             case _ =>
               (n, t)
           }
       }
       val ts = headers(recordName)
-      recordEnvironment += (recordName -> TRecord(ts, toRow(members)))
+      recordEnvironmentPre += (recordName -> TRecord(ts, toRow(members)))
     }
-    recordEnvironment
+    recordEnvironmentPre.foreach{ case (recordName, record) =>
+        val members: List[(String, Type)] = toList(record.row)
+        val newMembers: List[(String, Type)] = members.map {
+          case (n, TRecordReference(refRecordName, _)) =>
+            val foundRecord = recordEnvironmentPre(refRecordName)
+            n -> foundRecord
+          case (n, t) =>
+            n -> t
+        }
+        recordEnvironmentPost += (recordName -> TRecord(record.ts, toRow(newMembers)))
+    }
+    (recordEnvironmentPost, s)
   }
 
   def typeOf(e: AST, environment: Environment = BuiltinEnvironment, records: RecordEnvironment = BuiltinRecordEnvironment, modules: ModuleEnvironment = BuiltinModuleEnvironment): Type = {
@@ -725,10 +752,19 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
                     throw typeError(location, s"member ${memberName} is not found in record ${recordName}")
                   case Some((mname, mtype)) =>
                     val sx = unify(mtype, t, s1)
-                    (TypedAST.AccessRecord(sx(t), location, te, mname), sx)
+                    (TypedAST.RecordSelect(sx(t), location, te, mname), sx)
                 }
             }
-          case t =>
+          case r@TRecord(ts, row) =>
+            val members = toList(row)
+            members.find{ case (mname, mtype) => memberName == mname} match {
+              case None =>
+                throw typeError(location, s"member ${memberName} is not found in record ${r}")
+              case Some((mname, mtype)) =>
+                val sx = unify(mtype, t, s1)
+                (TypedAST.RecordSelect(sx(t), location, te, mname), sx)
+            }
+          case _ =>
             typeError(location, s"${t} is not record type")
         }
       case AST.Lambda(location, params, optionalType, body) =>
@@ -743,7 +779,17 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         if(env.variables.contains(variable)) {
           typeError(location, s"variable $variable is already defined")
         }
-        val a = optionalType.getOrElse(newTypeVariable())
+        val a = optionalType.map {
+          case TRecordReference(name, _) =>
+            env.records.get(name) match {
+              case Some(record) =>
+                record
+              case None =>
+                typeError(location, s"record named ${name} is not found")
+            }
+          case otherwise =>
+            otherwise
+        }.getOrElse(newTypeVariable())
         val (typedValue, s1) = doType(value, env, a, s0)
         val s2 = unify(s1(a), typedValue.description, s1)
         val gen = generalize(s2(a), env.variables)
@@ -814,7 +860,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           (te::tes, sx)
         }
         val sy = unify(TDynamic, t, sx)
-        (TypedAST.NewObject(TDynamic, location, className, tes.reverse), sy)
+        (TypedAST.ObjectNew(TDynamic, location, className, tes.reverse), sy)
       case AST.RecordNew(location, recordName, params) =>
         val ts = params.map{_ => newTypeVariable()}
         val (tes1, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), (e, t)) =>
@@ -833,9 +879,9 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             val memberTypes = members.map{ case (_, t) => t}
             val parameterTypes = tes2.map { case te => te.description }
             val sn = (memberTypes zip parameterTypes).foldLeft(sy) { case (s, (m, p)) => unify(m, p, s)}
-            val recordType = TRecordReference(recordName, xts.map{ t => sn(t)})
+            var recordType: TRecord = env.records(recordName)
             val so = unify(t, recordType, sn)
-            (TypedAST.NewRecord(recordType, location, recordName, tes2), so)
+            (TypedAST.RecordNew(recordType, location, recordName, tes2), so)
           case None =>
             typeError(location, s"record '$recordName' is not found")
         }
@@ -866,7 +912,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
 
   def transform(program: AST.Program): TypedAST.Program = {
     val tv = newTypeVariable()
-    val recordEnvironment: RecordEnvironment = processRecords(program.records)
+    val (recordEnvironment, s) = doTypeRecords(program.records)
     val (typedExpression, _) = doType(program.block, TypeEnvironment(BuiltinEnvironment, Set.empty, BuiltinRecordEnvironment ++ recordEnvironment, BuiltinModuleEnvironment, None), tv, EmptySubstitution)
     TypedAST.Program(program.location, Nil, typedExpression.asInstanceOf[TypedAST.Block], recordEnvironment)
   }
