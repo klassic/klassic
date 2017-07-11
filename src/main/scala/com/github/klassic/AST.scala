@@ -89,7 +89,7 @@ object AST {
 
   case class VariantIn(location: Location, variant: VariantDeclaration, body: AST) extends AST
 
-  case class AccessRecord(location: Location, expression: AST, member: String) extends AST
+  case class RecordSelect(location: Location, record: AST, label: String) extends AST
 
   case class Let(location: Location, variable: String, description: Option[Type], value: AST, body: AST, immutable: Boolean) extends AST
   object Let {
@@ -107,7 +107,7 @@ object AST {
 
   case class FunctionDefinition(location: Location, name: String, body: Lambda, cleanup: Option[AST]) extends AST
 
-  case class LetRec(location: Location, name: String, e1: Lambda, cleanup: Option[AST], e2: AST) extends AST
+  case class LetRec(location: Location, name: String, function: Lambda, cleanup: Option[AST], body: AST) extends AST
   object LetRec {
     def apply(name: String, body: Lambda, expression: AST): LetRec = {
       LetRec(NoLocation, name, body, None, expression)
@@ -122,9 +122,9 @@ object AST {
 
   case class MapLiteral(location: Location, elements: List[(AST, AST)]) extends AST
 
-  case class NewObject(location: Location, className: String, params: List[AST]) extends AST
+  case class ObjectNew(location: Location, className: String, params: List[AST]) extends AST
 
-  case class NewRecord(location: Location, recordName: String, params: List[AST]) extends AST
+  case class RecordNew(location: Location, recordName: String, params: List[AST]) extends AST
 
   case class MethodCall(location: Location, self: AST, name: String, params: List[AST]) extends AST
 
