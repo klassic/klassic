@@ -12,7 +12,7 @@ sealed abstract class TypedAST {
 }
 
 object TypedAST {
-  type RecordEnvironment = Map[String, (List[TypeVariable], RecordConstructor)]
+  type RecordEnvironment = Map[String, RecordConstructor]
 
   sealed trait IntegerSuffix
 
