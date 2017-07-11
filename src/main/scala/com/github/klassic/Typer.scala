@@ -104,7 +104,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val u = lookup(tv)
         if (t == u) t else apply(u)
       case FunctionType(t1, t2) => FunctionType(t1.map{t => apply(t)}, apply(t2))
-      case RecordType(name, ts) => RecordType(name, ts.map{t => apply(t)})
+      case RecordReference(name, ts) => RecordReference(name, ts.map{ t => apply(t)})
       case IntType => IntType
       case ShortType => ShortType
       case ByteType => ByteType
@@ -163,7 +163,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       Nil
     case FunctionType(t1, t2) =>
       t1.flatMap{typeVariables} union typeVariables(t2)
-    case RecordType(name, ts) =>
+    case RecordReference(name, ts) =>
       List(ts.flatMap{ case t => typeVariables(t)}:_*)
     case TypeConstructor(k, ts) =>
       ts.foldLeft(List[TypeVariable]()){(tvs, t) => tvs union typeVariables(t)}
@@ -202,7 +202,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       s
     case (DynamicType, DynamicType) =>
       s
-    case (RecordType(t1, t2), RecordType(u1, u2)) if t1 == u1 =>
+    case (RecordReference(t1, t2), RecordReference(u1, u2)) if t1 == u1 =>
       if(t2.length != u2.length) {
         typeError(current.location, s"type constructor arity mismatch: ${u2.length} != ${t2.length}")
       }
@@ -225,13 +225,13 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       val location = r.location
       val members: List[(String, TypeScheme)] = r.members.map{ case (n, t) =>
           t match {
-            case RecordType(rname, rtypes) if recordName == rname =>
+            case RecordReference(rname, rtypes) if recordName == rname =>
               val ts = headers(recordName)
               if(ts.length != rtypes.length) {
                 typeError(location, s"type variables length mismatch: required: ${ts.length} actual: ${rtypes.length}")
               }
               (n, TypeScheme(Nil, t))
-            case RecordType(rname, rtypes) if !headers.contains(rname) =>
+            case RecordReference(rname, rtypes) if !headers.contains(rname) =>
               typeError(location, s"record ${rname} is not found")
             case _ =>
               (n, TypeScheme(Nil, t))
@@ -680,7 +680,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val t0 = newTypeVariable()
         val (te, s1) = doType(expression, env, t0, s0)
         te.description match {
-          case RecordType(recordName, paramTypes)=>
+          case RecordReference(recordName, paramTypes)=>
             env.records.get(recordName) match {
               case None =>
                 typeError(location, s"record ${recordName} is not found")
@@ -797,7 +797,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             val memberTypes = xmembers.map{ case (_, t) => t.description}
             val parameterTypes = tes2.map { case te => te.description }
             val sn = (memberTypes zip parameterTypes).foldLeft(sy) { case (s, (m, p)) => unify(m, p, s)}
-            val recordType = RecordType(recordName, xts.map{t => sn(t)})
+            val recordType = RecordReference(recordName, xts.map{ t => sn(t)})
             val so = unify(t, recordType, sn)
             (TypedAST.NewRecord(recordType, location, recordName, tes2), so)
           case None =>

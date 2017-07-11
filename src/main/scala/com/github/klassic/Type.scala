@@ -35,7 +35,7 @@ object Type {
 
   case object ErrorType extends Type("!")
 
-  case class RecordType(name: String, paramTypes: List[Type]) extends Type(
+  case class RecordReference(name: String, paramTypes: List[Type]) extends Type(
     s"#${name}${if(paramTypes == Nil) "" else s"<${paramTypes.mkString(", ")}>"}"
   )
 
