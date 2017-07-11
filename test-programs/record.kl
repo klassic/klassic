@@ -14,21 +14,21 @@ record Pair <'a, 'b> {
   _2: 'b
 }
 
-val point = new #Point(1000, 2000)
+val point = #Point(1000, 2000)
 assertResult(1000)(point.x)
 assertResult(2000)(point.y)
 
-val person = new #Person("Kota Mizushima", 33, #Profile("Software Engineer", "Programming, Running, and Video Games"))
+val person = #Person("Kota Mizushima", 33, #Profile("Software Engineer", "Programming, Running, and Video Games"))
 assertResult("Kota Mizushima")(person.name)
 assertResult(33)(person.age)
 assertResult("Software Engineer")(person.profile.description)
 assertResult("Programming, Running, and Video Games")(person.profile.hobby)
 
-val pair1: #Pair<Int, Int> = new #Pair(1, 2)
+val pair1: #Pair<Int, Int> = #Pair(1, 2)
 assertResult(1)(pair1._1)
 assertResult(2)(pair1._2)
 
-val pair2 = new #Pair(1.5, 2.5)
+val pair2 = #Pair(1.5, 2.5)
 assertResult(1.5)(pair2._1)
 assertResult(2.5)(pair2._2)
 
