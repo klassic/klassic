@@ -160,8 +160,8 @@ class Parser extends Processor[String, Program] {
       qident ^^ { id => TypeVariable(id) }
         | ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType) }
         | (SHARP ~> sident).^? { case s if !isBuiltinType(s) => s } ~ (CL(LT) ~> repsep(typeDescription, CL(COMMA)) <~ CL(GT)).? ^^ {
-        case name ~ Some(args) => RecordType(name, args)
-        case name ~ None => RecordType(name, Nil)
+        case name ~ Some(args) => RecordReference(name, args)
+        case name ~ None => RecordReference(name, Nil)
       } | sident.^? { case s if !isBuiltinType(s) => s } ~ (CL(LT) ~> repsep(typeDescription, CL(COMMA)) <~ CL(GT)).? ^^ {
         case name ~ Some(args) => TypeConstructor(name, args)
         case name ~ None => TypeConstructor(name, Nil)
