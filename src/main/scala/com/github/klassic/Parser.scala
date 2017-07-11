@@ -469,11 +469,8 @@ class Parser extends Processor[String, Program] {
       case location ~ (className ~ None) => NewObject(location, className, List())
     }
 
-    // newRecord ::= "new" "#" sident "(" [param {"," param} ")"
-    lazy val newRecord: Parser[AST] = (((% <~ CL(NEW)) <~ CL(SHARP)) ~ commit(sident ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)) ^^ {
-      case location ~ (recordName ~ Some(params)) => NewRecord(location, recordName, params)
-      case location ~ (recordName ~ None) => NewRecord(location, recordName, List())
-    }) | ((% <~ CL(SHARP)) ~ commit(sident ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)) ^^ {
+    // newRecord ::= "#" sident "(" [param {"," param} ")"
+    lazy val newRecord: Parser[AST] = ((% <~ CL(SHARP)) ~ commit(sident ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)) ^^ {
       case location ~ (recordName ~ Some(params)) => NewRecord(location, recordName, params)
       case location ~ (recordName ~ None) => NewRecord(location, recordName, List())
     })
