@@ -1,0 +1,6 @@
+def myFoldLeft(list) = (z) => (f) => {
+  if(isEmpty(list)) z else myFoldLeft(tail(list))(f(z, head(list)))(f)
+}
+assertResult(10)(myFoldLeft([1 2 3 4])(0)((x, y) => x + y))
+assertResult("ABC")(myFoldLeft(["A" "B" "C"])("")((x, y) => x + y))
+assertResult([4 3 2 1])(myFoldLeft([1 2 3 4])([])((x, y) => y #cons x))
