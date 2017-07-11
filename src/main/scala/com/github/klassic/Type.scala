@@ -45,15 +45,15 @@ object Type {
     override def toString(): String = "{}"
   }
 
-  case class RowExtension(l: String, t: Type, extension: Row) extends Row {
-    override def toString(): String = s"${l}: ${t}; ${extension}"
+  case class RowExtension(l: String, t: Type, e: Row) extends Row {
+    override def toString(): String = s"${l}: ${t}; ${e}"
   }
 
   case class TRecord(ts: List[TVariable], row: Row) extends Type(s"Record{${row}")
 
   case class TFunction(paramTypes: List[Type], returnType: Type) extends Type(s"(${paramTypes.mkString(", ")}) => ${returnType}")
 
-  case class TScheme(typeVariables: List[TVariable], description: Type)
+  case class TScheme(svariables: List[TVariable], stype: Type)
 
   case class TConstructor(name: String, ts: List[Type]) extends Type(name + "<" + ts.mkString(", ") + ">")
 }

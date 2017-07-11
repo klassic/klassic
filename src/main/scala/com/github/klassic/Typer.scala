@@ -87,7 +87,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   }
 
   def newInstanceFrom(scheme: TScheme): Type = {
-    scheme.typeVariables.foldLeft(EmptySubstitution)((s, tv) => s.extend(tv, newTypeVariable())).apply(scheme.description)
+    scheme.svariables.foldLeft(EmptySubstitution)((s, tv) => s.extend(tv, newTypeVariable())).apply(scheme.stype)
   }
   private var n: Int = 0
   def newTypeVariable(): Type = {
@@ -126,7 +126,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
 
     def apply(env: Environment): Environment = {
       env.map { case (x, ts) =>
-          x -> TScheme(typeVariables(ts), this.apply(ts.description))
+          x -> TScheme(typeVariables(ts), this.apply(ts.stype))
       }
     }
 
@@ -189,7 +189,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   }
 
   def typeVariables(ts: TScheme): List[TVariable] = {
-    typeVariables(ts.description) diff ts.typeVariables
+    typeVariables(ts.stype) diff ts.svariables
   }
 
   def typeVariables(environment: Environment): List[TVariable] = {
@@ -330,8 +330,8 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             typeError(location, s"variable $variable is not defined")
           case Some(variableType) =>
             val (typedValue, s1) = doType(value, env, t, s0)
-            val s2 = unify(variableType.description, typedValue.description, s1)
-            (TypedAST.Assignment(variableType.description, location, variable, typedValue), s2)
+            val s2 = unify(variableType.stype, typedValue.description, s1)
+            (TypedAST.Assignment(variableType.stype, location, variable, typedValue), s2)
         }
       case AST.IfExpression(location, cond, pos, neg) =>
         val (typedCondition, newSub1) = doType(cond, env, TBoolean, s0)
