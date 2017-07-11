@@ -244,12 +244,25 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       (t2 zip u2).foldLeft(s) { case (s, (t, u)) =>
         unify(t, u, s)
       }
+    case (TRecordReference(name, ts), TRecord(us, urow)) =>
+      if(ts.length != us.length) {
+        typeError(current.location, s"type constructor arity mismatch: ${ts.length} != ${us.length}")
+      }
+      val s0 = recordEnvironment(name) match { case TRecord(ts, trow) =>
+          val m1 = toList(trow)
+          val m2 = toList(urow)
+          (m1 zip m2).foldLeft(s){ case (s, ((_, t1), (_, t2))) => unify(t1, t2, s)}
+      }
+      (ts zip us).foldLeft(s0) { case (s, (t, u)) =>
+        unify(t, u, s)
+      }
+    case (r1@TRecord(_, _), r2@TRecordReference(_, _)) =>
+      unify(r2, r1, s)
     case (TFunction(t1, t2), TFunction(u1, u2)) if t1.size == u1.size =>
       unify(t2, u2, (t1 zip u1).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)})
     case (TConstructor(k1, ts), TConstructor(k2, us)) if k1 == k2 =>
       (ts zip us).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
     case _ =>
-      new Exception().printStackTrace()
       typeError(current.location, s"cannot unify ${s(t)} with ${s(u)}")
   }
 
@@ -263,10 +276,9 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     case TRowEmpty => Nil
   }
 
-  def doTypeRecords(recordDeclarations :List[RecordDeclaration]): (RecordEnvironment, Substitution) = {
+  def doTypeRecords(recordDeclarations :List[RecordDeclaration]): RecordEnvironment = {
     val headers = recordDeclarations.map{d => (d.name, d.ts) }.toMap
-    var recordEnvironmentPre: RecordEnvironment = Map.empty
-    var recordEnvironmentPost: RecordEnvironment = Map.empty
+    var recordEnvironment: RecordEnvironment = Map.empty
     var s: Substitution = EmptySubstitution
     recordDeclarations.foreach{recordDeclaration =>
       val recordName = recordDeclaration.name
@@ -280,28 +292,15 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
               if(ts.length != rtypes.length) {
                 typeError(location, s"type variables length mismatch: required: ${ts.length} actual: ${rtypes.length}")
               }
-              val tv1 = newTypeVariable()
-              s = unify(tv1, r, s)
               (n, t)
             case _ =>
               (n, t)
           }
       }
       val ts = headers(recordName)
-      recordEnvironmentPre += (recordName -> TRecord(ts, toRow(members)))
+      recordEnvironment += (recordName -> TRecord(ts, toRow(members)))
     }
-    recordEnvironmentPre.foreach{ case (recordName, record) =>
-        val members: List[(String, Type)] = toList(record.row)
-        val newMembers: List[(String, Type)] = members.map {
-          case (n, TRecordReference(refRecordName, _)) =>
-            val foundRecord = recordEnvironmentPre(refRecordName)
-            n -> foundRecord
-          case (n, t) =>
-            n -> t
-        }
-        recordEnvironmentPost += (recordName -> TRecord(record.ts, toRow(newMembers)))
-    }
-    (recordEnvironmentPost, s)
+    recordEnvironment
   }
 
   def typeOf(e: AST, environment: Environment = BuiltinEnvironment, records: RecordEnvironment = BuiltinRecordEnvironment, modules: ModuleEnvironment = BuiltinModuleEnvironment): Type = {
@@ -312,6 +311,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   }
 
   var current: AST = null
+  var recordEnvironment: RecordEnvironment = null
   def doType(e: AST, env: TypeEnvironment, t: Type, s0: Substitution): (TypedAST, Substitution) = {
     current = e
     e match {
@@ -912,7 +912,9 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
 
   def transform(program: AST.Program): TypedAST.Program = {
     val tv = newTypeVariable()
-    val (recordEnvironment, s) = doTypeRecords(program.records)
+    val s: Substitution = EmptySubstitution
+    val recordEnvironment = doTypeRecords(program.records)
+    this.recordEnvironment = recordEnvironment
     val (typedExpression, _) = doType(program.block, TypeEnvironment(BuiltinEnvironment, Set.empty, BuiltinRecordEnvironment ++ recordEnvironment, BuiltinModuleEnvironment, None), tv, EmptySubstitution)
     TypedAST.Program(program.location, Nil, typedExpression.asInstanceOf[TypedAST.Block], recordEnvironment)
   }
