@@ -343,7 +343,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
 
   final def interpret(program: TypedAST.Program): Value = {
     val runtimeRecordEnvironment: RecordEnvironment = BuiltinRecordEnvironment
-    program.records.foreach { case (name, (ts, record)) =>
+    program.records.foreach { case (name, record) =>
       val members = toList(record.row)
       val rmembers = members.map { case (n, t) => n -> t }
       runtimeRecordEnvironment.records += (name -> rmembers)

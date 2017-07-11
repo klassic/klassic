@@ -49,7 +49,7 @@ object Type {
     override def toString(): String = s"${l}: ${t}; ${extension}"
   }
 
-  case class RecordConstructor(row: Row) extends Type(s"Record{${row}")
+  case class RecordConstructor(ts: List[TypeVariable], row: Row) extends Type(s"Record{${row}")
 
   case class FunctionType(paramTypes: List[Type], returnType: Type) extends Type(s"(${paramTypes.mkString(", ")}) => ${returnType}")
 
