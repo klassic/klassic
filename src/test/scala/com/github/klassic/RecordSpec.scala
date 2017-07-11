@@ -15,9 +15,9 @@ class RecordSpec extends SpecHelper {
         |new #Person("Hoge", 7)
       """.stripMargin -> RecordValue("Person", List("name" -> ObjectValue("Hoge"), "age" -> BoxedInt(7))),
       """
-        |record Tuple<a', b'> {
-        |  _1: a'
-        |  _2: b'
+        |record Tuple<'a, 'b> {
+        |  _1: 'a
+        |  _2: 'b
         |}
         |new #Tuple(1, 2)
       """.stripMargin -> RecordValue("Tuple", List("_1" -> BoxedInt(1), "_2" -> BoxedInt(2)))
@@ -41,9 +41,9 @@ class RecordSpec extends SpecHelper {
         |p.name
       """.stripMargin -> ObjectValue("Hoge"),
       """
-        |record Tuple<a', b'> {
-        |  _1: a'
-        |  _2: b'
+        |record Tuple<'a, 'b> {
+        |  _1: 'a
+        |  _2: 'b
         |}
         |val t = new #Tuple(1, 2)
         |t._1

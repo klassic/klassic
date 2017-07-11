@@ -422,7 +422,7 @@ class Parser extends Processor[String, Program] {
       case r@(_ ~ m ~ _ ~ n) if (!KEYWORDS(m)) && (!KEYWORDS(n)) => r
     } ^^ { case location ~ m ~ _ ~ n => Selector(location, m, n) }) <~ SPACING_WITHOUT_LF
 
-    lazy val qident: Parser[String] = ("""[A-Za-z_][a-zA-Z0-9_]*'""".r ^? {
+    lazy val qident: Parser[String] = ("""'[A-Za-z_][a-zA-Z0-9_]*""".r ^? {
       case n if !KEYWORDS(n) => n
     }) <~ SPACING_WITHOUT_LF
 
