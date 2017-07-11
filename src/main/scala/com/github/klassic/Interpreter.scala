@@ -601,7 +601,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case otherwise =>
               sys.error(s"cannot reach here: ${otherwise}")
           }
-        case TypedAST.NewObject(description, location, className, params) =>
+        case TypedAST.ObjectNew(description, location, className, params) =>
           val paramsArray = params.map{evalRecursive}.toArray
           findConstructor(Class.forName(className), paramsArray) match {
             case UnboxedVersionConstructorFound(constructor) =>
@@ -613,7 +613,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case NoConstructorFound =>
               throw new IllegalArgumentException(s"new ${className}(${params}) is not found")
           }
-        case TypedAST.NewRecord(description, location, recordName, params) =>
+        case TypedAST.RecordNew(description, location, recordName, params) =>
           val paramsList = params.map{evalRecursive}
           recordEnv.records.get(recordName) match {
             case None => throw new IllegalArgumentException(s"record ${recordName} is not found")
@@ -621,7 +621,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
               val members = (argsList zip paramsList).map{ case ((n, _), v) => n -> v }
               RecordValue(recordName, members)
           }
-        case TypedAST.AccessRecord(description, location, expression, memberName) =>
+        case TypedAST.RecordSelect(description, location, expression, memberName) =>
           evalRecursive(expression) match {
             case RecordValue(recordName, members) =>
               members.find{ case (mname, mtype) => memberName == mname} match {

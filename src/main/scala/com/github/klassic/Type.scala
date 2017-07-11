@@ -42,14 +42,14 @@ object Type {
   sealed abstract class Row
 
   case object TRowEmpty extends Row {
-    override def toString(): String = "{}"
+    override def toString(): String = ""
   }
 
   case class TRowExtend(l: String, t: Type, e: Row) extends Row {
     override def toString(): String = s"${l}: ${t}; ${e}"
   }
 
-  case class TRecord(ts: List[TVariable], row: Row) extends Type(s"Record{${row}")
+  case class TRecord(ts: List[TVariable], row: Row) extends Type(s"Record{ ${row}}")
 
   case class TFunction(paramTypes: List[Type], returnType: Type) extends Type(s"(${paramTypes.mkString(", ")}) => ${returnType}")
 
