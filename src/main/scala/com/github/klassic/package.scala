@@ -2,7 +2,7 @@ package com.github
 
 import java.io.{BufferedReader, FileInputStream, InputStreamReader}
 
-import com.github.klassic.Type.{FunctionType, TypeVariable}
+import com.github.klassic.Type.{TFunction, TVariable}
 
 import scala.language.reflectiveCalls
 
@@ -32,7 +32,7 @@ package object klassic {
     e.evaluateString(input)
   }
 
-  def tv(name: String): TypeVariable = {
-    TypeVariable(name)
+  def tv(name: String): TVariable = {
+    TVariable(name)
   }
 }

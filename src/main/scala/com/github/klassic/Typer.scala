@@ -1,7 +1,7 @@
 package com.github.klassic
 
 import com.github.klassic.AST.RecordDeclaration
-import com.github.klassic.Type.{TypeConstructor, _}
+import com.github.klassic.Type.{TConstructor, _}
 
 import scala.collection.mutable
 
@@ -9,51 +9,51 @@ import scala.collection.mutable
   * @author Kota Mizushima
   */
 class Typer extends Processor[AST.Program, TypedAST.Program] {
-  type Environment = Map[String, TypeScheme]
+  type Environment = Map[String, TScheme]
   type ModuleEnvironment = Map[String, Environment]
-  type RecordEnvironment = Map[String, RecordConstructor]
-  def listOf(tp: Type): TypeConstructor = {
-    TypeConstructor("List", List(tp))
+  type RecordEnvironment = Map[String, TRecord]
+  def listOf(tp: Type): TConstructor = {
+    TConstructor("List", List(tp))
   }
-  def mapOf(k: Type, v: Type): TypeConstructor = {
-    TypeConstructor("Map", List(k, v))
+  def mapOf(k: Type, v: Type): TConstructor = {
+    TConstructor("Map", List(k, v))
   }
-  def setOf(tp: Type): TypeConstructor = {
-    TypeConstructor("Set", List(tp))
+  def setOf(tp: Type): TConstructor = {
+    TConstructor("Set", List(tp))
   }
   val BuiltinEnvironment: Environment = {
     val a = newTypeVariable()
     val b = newTypeVariable()
     Map(
-      "url" -> TypeScheme(List(), FunctionType(List(DynamicType), DynamicType)),
-      "uri" -> TypeScheme(List(), FunctionType(List(DynamicType), DynamicType)),
-      "substring" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType, IntType), DynamicType)),
-      "at" -> TypeScheme(List(), FunctionType(List(DynamicType, IntType), DynamicType)),
-      "matches" -> TypeScheme(List(), FunctionType(List(DynamicType, DynamicType), BooleanType)),
-      "thread" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), DynamicType)),
-      "println" ->  TypeScheme(List(tv("x")), FunctionType(List(tv("x")), UnitType)),
-      "stopwatch" -> TypeScheme(List(), FunctionType(List(FunctionType(List.empty, DynamicType)), IntType)),
-      "sleep" -> TypeScheme(List(), IntType ==> UnitType),
-      "isEmpty" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> BooleanType),
-      "ToDo" -> TypeScheme(List(tv("a")), FunctionType(List(), tv("a"))),
-      "assert" -> TypeScheme(List(tv("a")), BooleanType ==> UnitType),
-      "assertResult" -> TypeScheme(List(tv("a")), tv("a") ==> (tv("a") ==> UnitType)),
-      "map" -> TypeScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
-      "head" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
-      "tail" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
-      "cons" -> TypeScheme(List(tv("a")), tv("a") ==> (listOf(tv("a")) ==> listOf(tv("a")))),
-      "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType),
-      "foldLeft" -> TypeScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> (tv("b") ==> ((List(tv("b"), tv("a")) ==> tv("b")) ==> tv("b")))),
-      "null" -> TypeScheme(List(tv("a")), tv("a")),
-      "desktop" -> TypeScheme(List(), Nil ==> DynamicType)
+      "url" -> TScheme(List(), TFunction(List(TDynamic), TDynamic)),
+      "uri" -> TScheme(List(), TFunction(List(TDynamic), TDynamic)),
+      "substring" -> TScheme(List(), TFunction(List(TDynamic, TInt, TInt), TDynamic)),
+      "at" -> TScheme(List(), TFunction(List(TDynamic, TInt), TDynamic)),
+      "matches" -> TScheme(List(), TFunction(List(TDynamic, TDynamic), TBoolean)),
+      "thread" -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TDynamic)),
+      "println" ->  TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
+      "stopwatch" -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TInt)),
+      "sleep" -> TScheme(List(), TInt ==> TUnit),
+      "isEmpty" -> TScheme(List(tv("a")), listOf(tv("a")) ==> TBoolean),
+      "ToDo" -> TScheme(List(tv("a")), TFunction(List(), tv("a"))),
+      "assert" -> TScheme(List(tv("a")), TBoolean ==> TUnit),
+      "assertResult" -> TScheme(List(tv("a")), tv("a") ==> (tv("a") ==> TUnit)),
+      "map" -> TScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
+      "head" -> TScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
+      "tail" -> TScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
+      "cons" -> TScheme(List(tv("a")), tv("a") ==> (listOf(tv("a")) ==> listOf(tv("a")))),
+      "size" -> TScheme(List(tv("a")), listOf(tv("a")) ==> TInt),
+      "foldLeft" -> TScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> (tv("b") ==> ((List(tv("b"), tv("a")) ==> tv("b")) ==> tv("b")))),
+      "null" -> TScheme(List(tv("a")), tv("a")),
+      "desktop" -> TScheme(List(), Nil ==> TDynamic)
     )
   }
 
-  val BuiltinRecordEnvironment: Map[String, RecordConstructor] = {
+  val BuiltinRecordEnvironment: Map[String, TRecord] = {
     Map(
-      "Point" -> RecordConstructor(
+      "Point" -> TRecord(
         Nil,
-        RowExtension("x", IntType, RowExtension("y", IntType, EmptyRow))
+        RowExtension("x", TInt, RowExtension("y", TInt, EmptyRow))
       )
     )
   }
@@ -61,41 +61,41 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   val BuiltinModuleEnvironment: Map[String, Environment] = {
     Map(
       "List" -> Map(
-        "cons" -> TypeScheme(List(tv("a")), FunctionType(List(tv("a"), listOf(tv("a"))), listOf(tv("a")))),
-        "map" -> TypeScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
-        "head" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
-        "tail" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
-        "size" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> IntType),
-        "isEmpty" -> TypeScheme(List(tv("a")), listOf(tv("a")) ==> BooleanType)
+        "cons" -> TScheme(List(tv("a")), TFunction(List(tv("a"), listOf(tv("a"))), listOf(tv("a")))),
+        "map" -> TScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
+        "head" -> TScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
+        "tail" -> TScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
+        "size" -> TScheme(List(tv("a")), listOf(tv("a")) ==> TInt),
+        "isEmpty" -> TScheme(List(tv("a")), listOf(tv("a")) ==> TBoolean)
       ),
       "Map" -> Map(
-        "add" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (List(tv("a"), tv("b")) ==> mapOf(tv("a"), tv("b")))),
-        "containsKey" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> BooleanType)),
-        "containsValue" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("b") ==> BooleanType)),
-        "get" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> tv("b"))),
-        "size" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> IntType),
-        "isEmpty" -> TypeScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> BooleanType)
+        "add" -> TScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (List(tv("a"), tv("b")) ==> mapOf(tv("a"), tv("b")))),
+        "containsKey" -> TScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> TBoolean)),
+        "containsValue" -> TScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("b") ==> TBoolean)),
+        "get" -> TScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> (tv("a") ==> tv("b"))),
+        "size" -> TScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> TInt),
+        "isEmpty" -> TScheme(List(tv("a"), tv("b")), mapOf(tv("a"), tv("b")) ==> TBoolean)
       ),
       "Set" -> Map(
-        "add" -> TypeScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> setOf(tv("a")))),
-        "remove" -> TypeScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> setOf(tv("a")))),
-        "contains" -> TypeScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> BooleanType)),
-        "size" -> TypeScheme(List(tv("a")), setOf(tv("a")) ==> IntType),
-        "isEmpty" -> TypeScheme(List(tv("a")), setOf(tv("a")) ==> BooleanType)
+        "add" -> TScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> setOf(tv("a")))),
+        "remove" -> TScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> setOf(tv("a")))),
+        "contains" -> TScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> TBoolean)),
+        "size" -> TScheme(List(tv("a")), setOf(tv("a")) ==> TInt),
+        "isEmpty" -> TScheme(List(tv("a")), setOf(tv("a")) ==> TBoolean)
       )
     )
   }
 
-  def newInstanceFrom(scheme: TypeScheme): Type = {
+  def newInstanceFrom(scheme: TScheme): Type = {
     scheme.typeVariables.foldLeft(EmptySubstitution)((s, tv) => s.extend(tv, newTypeVariable())).apply(scheme.description)
   }
   private var n: Int = 0
   def newTypeVariable(): Type = {
-    n += 1; TypeVariable("'a" + n)
+    n += 1; TVariable("'a" + n)
   }
   val EmptySubstitution: Substitution = new Substitution(Map.empty)
-  class Substitution(val map: Map[TypeVariable, Type]) extends Function1[Type, Type] {
-    def lookup(x: TypeVariable): Type = {
+  class Substitution(val map: Map[TVariable, Type]) extends Function1[Type, Type] {
+    def lookup(x: TVariable): Type = {
       map.getOrElse(x, x)
     }
 
@@ -105,126 +105,126 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     }
 
     def apply(t: Type): Type = t match {
-      case tv@TypeVariable(a) =>
+      case tv@TVariable(a) =>
         val u = lookup(tv)
         if (t == u) t else apply(u)
-      case FunctionType(t1, t2) => FunctionType(t1.map{t => apply(t)}, apply(t2))
-      case RecordReference(name, ts) => RecordReference(name, ts.map{ t => apply(t)})
-      case RecordConstructor(ts, row) => RecordConstructor(ts, applyRow(row))
-      case IntType => IntType
-      case ShortType => ShortType
-      case ByteType => ByteType
-      case LongType => LongType
-      case FloatType => FloatType
-      case DoubleType => DoubleType
-      case BooleanType => BooleanType
-      case UnitType => UnitType
-      case DynamicType => DynamicType
-      case ErrorType => ErrorType
-      case TypeConstructor(name, args) => TypeConstructor(name, args.map{arg => apply(arg)})
+      case TFunction(t1, t2) => TFunction(t1.map{ t => apply(t)}, apply(t2))
+      case TRecordReference(name, ts) => TRecordReference(name, ts.map{ t => apply(t)})
+      case TRecord(ts, row) => TRecord(ts, applyRow(row))
+      case TInt => TInt
+      case TShort => TShort
+      case TByte => TByte
+      case TLong => TLong
+      case TFloat => TFloat
+      case TDouble => TDouble
+      case TBoolean => TBoolean
+      case TUnit => TUnit
+      case TDynamic => TDynamic
+      case TError => TError
+      case TConstructor(name, args) => TConstructor(name, args.map{ arg => apply(arg)})
     }
 
     def apply(env: Environment): Environment = {
       env.map { case (x, ts) =>
-          x -> TypeScheme(typeVariables(ts), this.apply(ts.description))
+          x -> TScheme(typeVariables(ts), this.apply(ts.description))
       }
     }
 
-    def extend(tv: TypeVariable, td: Type): Substitution = new Substitution(this.map + (tv -> td))
+    def extend(tv: TVariable, td: Type): Substitution = new Substitution(this.map + (tv -> td))
 
-    def remove(tv: TypeVariable): Substitution = new Substitution(this.map - tv)
+    def remove(tv: TVariable): Substitution = new Substitution(this.map - tv)
   }
 
-  def lookup(x: String, environment: Environment): Option[TypeScheme] = environment.get(x) match {
+  def lookup(x: String, environment: Environment): Option[TScheme] = environment.get(x) match {
     case Some(t) => Some(t)
     case None => None
   }
 
-  def generalize(t: Type, environment: Environment): TypeScheme = {
-    TypeScheme(typeVariables(t) diff typeVariables(environment), t)
+  def generalize(t: Type, environment: Environment): TScheme = {
+    TScheme(typeVariables(t) diff typeVariables(environment), t)
   }
 
-  def typeVariables(r: Row): List[TypeVariable] = r match {
+  def typeVariables(r: Row): List[TVariable] = r match {
     case RowExtension(l, t, e) => typeVariables(t) union typeVariables(e)
     case EmptyRow => Nil
   }
 
-  def typeVariables(t: Type): List[TypeVariable] = t match {
-    case tv @ TypeVariable(a) =>
+  def typeVariables(t: Type): List[TVariable] = t match {
+    case tv @ TVariable(a) =>
       List(tv)
-    case IntType =>
+    case TInt =>
       Nil
-    case ShortType =>
+    case TShort =>
       Nil
-    case ByteType =>
+    case TByte =>
       Nil
-    case LongType =>
+    case TLong =>
       Nil
-    case FloatType =>
+    case TFloat =>
       Nil
-    case DoubleType =>
+    case TDouble =>
       Nil
-    case BooleanType =>
+    case TBoolean =>
       Nil
-    case UnitType =>
+    case TUnit =>
       Nil
-    case DynamicType =>
+    case TDynamic =>
       Nil
-    case ErrorType =>
+    case TError =>
       Nil
-    case FunctionType(t1, t2) =>
+    case TFunction(t1, t2) =>
       t1.flatMap{typeVariables} union typeVariables(t2)
-    case RecordReference(name, ts) =>
+    case TRecordReference(name, ts) =>
       List(ts.flatMap{ case t => typeVariables(t)}:_*)
-    case RecordConstructor(ts, row) =>
+    case TRecord(ts, row) =>
       ts union typeVariables(row)
-    case TypeConstructor(k, ts) =>
-      ts.foldLeft(List[TypeVariable]()){(tvs, t) => tvs union typeVariables(t)}
+    case TConstructor(k, ts) =>
+      ts.foldLeft(List[TVariable]()){ (tvs, t) => tvs union typeVariables(t)}
   }
 
-  def typeVariables(ts: TypeScheme): List[TypeVariable] = {
+  def typeVariables(ts: TScheme): List[TVariable] = {
     typeVariables(ts.description) diff ts.typeVariables
   }
 
-  def typeVariables(environment: Environment): List[TypeVariable] = {
-    environment.foldLeft(List[TypeVariable]()) { (tvs, nt) => tvs union typeVariables(nt._2) }
+  def typeVariables(environment: Environment): List[TVariable] = {
+    environment.foldLeft(List[TVariable]()) { (tvs, nt) => tvs union typeVariables(nt._2) }
   }
 
   def unify(t: Type, u: Type, s: Substitution): Substitution = (s(t), s(u)) match {
-    case (TypeVariable(a), TypeVariable(b)) if a == b =>
+    case (TVariable(a), TVariable(b)) if a == b =>
       s
-    case (TypeVariable(a), _) if !(typeVariables(u) contains a) =>
-      s.extend(TypeVariable(a), u)
-    case (_, TypeVariable(a)) =>
+    case (TVariable(a), _) if !(typeVariables(u) contains a) =>
+      s.extend(TVariable(a), u)
+    case (_, TVariable(a)) =>
       unify(u, t, s)
-    case (IntType, IntType) =>
+    case (TInt, TInt) =>
       s
-    case (ShortType, ShortType) =>
+    case (TShort, TShort) =>
       s
-    case (ByteType, ByteType) =>
+    case (TByte, TByte) =>
       s
-    case (LongType, LongType) =>
+    case (TLong, TLong) =>
       s
-    case (FloatType, FloatType) =>
+    case (TFloat, TFloat) =>
       s
-    case (DoubleType, DoubleType) =>
+    case (TDouble, TDouble) =>
       s
-    case (BooleanType, BooleanType) =>
+    case (TBoolean, TBoolean) =>
       s
-    case (UnitType, UnitType) =>
+    case (TUnit, TUnit) =>
       s
-    case (DynamicType, DynamicType) =>
+    case (TDynamic, TDynamic) =>
       s
-    case (r1@RecordReference(t1, t2), r2@RecordReference(u1, u2)) if t1 == u1 =>
+    case (r1@TRecordReference(t1, t2), r2@TRecordReference(u1, u2)) if t1 == u1 =>
       if(t2.length != u2.length) {
         typeError(current.location, s"type constructor arity mismatch: ${r1} != ${r2}")
       }
       (t2 zip u2).foldLeft(s) { case (s, (t, u)) =>
         unify(t, u, s)
       }
-    case (FunctionType(t1, t2), FunctionType(u1, u2)) if t1.size == u1.size =>
+    case (TFunction(t1, t2), TFunction(u1, u2)) if t1.size == u1.size =>
       unify(t2, u2, (t1 zip u1).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)})
-    case (TypeConstructor(k1, ts), TypeConstructor(k2, us)) if k1 == k2 =>
+    case (TConstructor(k1, ts), TConstructor(k2, us)) if k1 == k2 =>
       (ts zip us).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
     case _ =>
       typeError(current.location, s"cannot unify ${s(t)} with ${s(u)}")
@@ -248,20 +248,20 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       val location = recordDeclaration.location
       val members: List[(String, Type)] = recordDeclaration.members.map{ case (n, t) =>
           t match {
-            case RecordReference(rname, rtypes) if recordName == rname =>
+            case TRecordReference(rname, rtypes) if recordName == rname =>
               val ts = headers(recordName)
               if(ts.length != rtypes.length) {
                 typeError(location, s"type variables length mismatch: required: ${ts.length} actual: ${rtypes.length}")
               }
               (n, t)
-            case RecordReference(rname, rtypes) if !headers.contains(rname) =>
+            case TRecordReference(rname, rtypes) if !headers.contains(rname) =>
               typeError(location, s"record ${rname} is not found")
             case _ =>
               (n, t)
           }
       }
       val ts = headers(recordName)
-      recordEnvironment += (recordName -> RecordConstructor(ts, toRow(members)))
+      recordEnvironment += (recordName -> TRecord(ts, toRow(members)))
     }
     recordEnvironment
   }
@@ -280,7 +280,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       case AST.Block(location, expressions) =>
         expressions match {
           case Nil =>
-            (TypedAST.Block(UnitType, location, Nil), s0)
+            (TypedAST.Block(TUnit, location, Nil), s0)
           case x::Nil =>
             val (typedX, newSub) = doType(x, env, t, s0)
             (TypedAST.Block(newSub(t), location, typedX::Nil), newSub)
@@ -295,25 +295,25 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             (TypedAST.Block(s2(ts.last), location, reversedTypedElements.reverse), s2)
         }
       case AST.IntNode(location, value) =>
-        val newSub = unify(t, IntType, s0)
+        val newSub = unify(t, TInt, s0)
         (TypedAST.IntNode(newSub(t), location, value), newSub)
       case AST.ShortNode(location, value) =>
-        val newSub = unify(t, ShortType, s0)
+        val newSub = unify(t, TShort, s0)
         (TypedAST.ShortNode(newSub(t), location, value), newSub)
       case AST.ByteNode(location, value) =>
-        val newSub = unify(t, ByteType, s0)
+        val newSub = unify(t, TByte, s0)
         (TypedAST.ByteNode(newSub(t), location, value), newSub)
       case AST.LongNode(location, value) =>
-        val newSub = unify(t, LongType, s0)
+        val newSub = unify(t, TLong, s0)
         (TypedAST.LongNode(newSub(t), location, value), newSub)
       case AST.FloatNode(location, value) =>
-        val newSub = unify(t, FloatType, s0)
+        val newSub = unify(t, TFloat, s0)
         (TypedAST.FloatNode(newSub(t), location, value), newSub)
       case AST.DoubleNode(location, value) =>
-        val newSub = unify(t, DoubleType, s0)
+        val newSub = unify(t, TDouble, s0)
         (TypedAST.DoubleNode(newSub(t), location, value), newSub)
       case AST.BooleanNode(location, value) =>
-        val newSub = unify(t, BooleanType, s0)
+        val newSub = unify(t, TBoolean, s0)
         (TypedAST.BooleanNode(newSub(t), location, value), newSub)
       case AST.SimpleAssignment(location, variable, value) =>
         if(env.immutableVariables.contains(variable)) {
@@ -328,7 +328,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             (TypedAST.Assignment(variableType.description, location, variable, typedValue), s2)
         }
       case AST.IfExpression(location, cond, pos, neg) =>
-        val (typedCondition, newSub1) = doType(cond, env, BooleanType, s0)
+        val (typedCondition, newSub1) = doType(cond, env, TBoolean, s0)
         val (posTyped, newSub2) = doType(pos, env, t, newSub1)
         val (negTyped, newSub3) = doType(neg, env, t, newSub2)
         (TypedAST.IfExpression(newSub3(t), location, typedCondition, posTyped, negTyped), newSub3)
@@ -337,201 +337,201 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val b = newTypeVariable()
         val c = newTypeVariable()
         val (typedCondition, s1) = doType(condition, env, a, s0)
-        if(typedCondition.description != BooleanType) {
+        if(typedCondition.description != TBoolean) {
           typeError(location, s"condition type must be Boolean, actual: ${typedCondition.description}")
         } else {
           val (typedBody, s2) = doType(body, env, b, s1)
-          val s3 = unify(UnitType, t, s2)
-          (TypedAST.WhileExpression(UnitType, location, typedCondition, typedBody), s3)
+          val s3 = unify(TUnit, t, s2)
+          (TypedAST.WhileExpression(TUnit, location, typedCondition, typedBody), s3)
         }
       case AST.BinaryExpression(location, Operator.EQUAL, lhs, rhs) =>
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
         val (resultType, s3) = (s2(a), s2(b)) match {
-          case (IntType, IntType) =>
-            (BooleanType, s2)
-          case (LongType, LongType) =>
-            (BooleanType, s2)
-          case (ShortType, ShortType) =>
-            (BooleanType, s2)
-          case (ByteType, ByteType) =>
-            (BooleanType, s2)
-          case (FloatType, FloatType) =>
-            (BooleanType, s2)
-          case (DoubleType, DoubleType) =>
-            (BooleanType, s2)
-          case (BooleanType, BooleanType) =>
-            (BooleanType, s2)
-          case (DynamicType, DynamicType) =>
-            (BooleanType, s2)
-          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
-            (BooleanType, unify(x, y, s2))
-          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
-            (BooleanType, unify(x, y, s2))
-          case (a@TypeConstructor(n1, ts1), b@TypeConstructor(n2, ts2)) if n2 == n2  && ts1.length == ts2.length =>
+          case (TInt, TInt) =>
+            (TBoolean, s2)
+          case (TLong, TLong) =>
+            (TBoolean, s2)
+          case (TShort, TShort) =>
+            (TBoolean, s2)
+          case (TByte, TByte) =>
+            (TBoolean, s2)
+          case (TFloat, TFloat) =>
+            (TBoolean, s2)
+          case (TDouble, TDouble) =>
+            (TBoolean, s2)
+          case (TBoolean, TBoolean) =>
+            (TBoolean, s2)
+          case (TDynamic, TDynamic) =>
+            (TBoolean, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
+          case (a@TConstructor(n1, ts1), b@TConstructor(n2, ts2)) if n2 == n2  && ts1.length == ts2.length =>
             val sx = (ts1 zip ts2).foldLeft(s0) { case (s, (t1, t2)) =>
                 unify(t1, t2, s)
             }
             (sx(a), sx)
           case (ltype, rtype) =>
-            val s3 = unify(IntType, ltype, s2)
-            val s4 = unify(IntType, rtype, s3)
-            (BooleanType, s4)
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TBoolean, s4)
         }
-        val s4 = unify(BooleanType, t, s3)
+        val s4 = unify(TBoolean, t, s3)
         (TypedAST.BinaryExpression(resultType, location, Operator.EQUAL, typedLhs, typedRhs), s4)
       case AST.BinaryExpression(location, Operator.LESS_THAN, lhs, rhs) =>
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
         val (resultType, s3) = (s2(a), s2(b)) match {
-          case (IntType, IntType) =>
-            (BooleanType, s2)
-          case (LongType, LongType) =>
-            (BooleanType, s2)
-          case (ShortType, ShortType) =>
-            (BooleanType, s2)
-          case (ByteType, ByteType) =>
-            (BooleanType, s2)
-          case (FloatType, FloatType) =>
-            (BooleanType, s2)
-          case (DoubleType, DoubleType) =>
-            (BooleanType, s2)
-          case (DynamicType, DynamicType) =>
-            (BooleanType, s2)
-          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
-            (BooleanType, unify(x, y, s2))
-          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
-            (BooleanType, unify(x, y, s2))
+          case (TInt, TInt) =>
+            (TBoolean, s2)
+          case (TLong, TLong) =>
+            (TBoolean, s2)
+          case (TShort, TShort) =>
+            (TBoolean, s2)
+          case (TByte, TByte) =>
+            (TBoolean, s2)
+          case (TFloat, TFloat) =>
+            (TBoolean, s2)
+          case (TDouble, TDouble) =>
+            (TBoolean, s2)
+          case (TDynamic, TDynamic) =>
+            (TBoolean, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
           case (ltype, rtype) =>
-            val s3 = unify(IntType, ltype, s2)
-            val s4 = unify(IntType, rtype, s3)
-            (BooleanType, s4)
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TBoolean, s4)
         }
-        val s4 = unify(BooleanType, t, s3)
+        val s4 = unify(TBoolean, t, s3)
         (TypedAST.BinaryExpression(resultType, location, Operator.LESS_THAN, typedLhs, typedRhs), s4)
       case AST.BinaryExpression(location, Operator.GREATER_THAN, lhs, rhs) =>
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
         val (resultType, s3) = (s2(a), s2(b)) match {
-          case (IntType, IntType) =>
-            (BooleanType, s2)
-          case (LongType, LongType) =>
-            (BooleanType, s2)
-          case (ShortType, ShortType) =>
-            (BooleanType, s2)
-          case (ByteType, ByteType) =>
-            (BooleanType, s2)
-          case (FloatType, FloatType) =>
-            (BooleanType, s2)
-          case (DoubleType, DoubleType) =>
-            (BooleanType, s2)
-          case (DynamicType, DynamicType) =>
-            (BooleanType, s2)
-          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
-            (BooleanType, unify(x, y, s2))
-          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
-            (BooleanType, unify(x, y, s2))
+          case (TInt, TInt) =>
+            (TBoolean, s2)
+          case (TLong, TLong) =>
+            (TBoolean, s2)
+          case (TShort, TShort) =>
+            (TBoolean, s2)
+          case (TByte, TByte) =>
+            (TBoolean, s2)
+          case (TFloat, TFloat) =>
+            (TBoolean, s2)
+          case (TDouble, TDouble) =>
+            (TBoolean, s2)
+          case (TDynamic, TDynamic) =>
+            (TBoolean, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
           case (ltype, rtype) =>
-            val s3 = unify(IntType, ltype, s2)
-            val s4 = unify(IntType, rtype, s3)
-            (BooleanType, s4)
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TBoolean, s4)
         }
-        val s4 = unify(BooleanType, t, s3)
+        val s4 = unify(TBoolean, t, s3)
         (TypedAST.BinaryExpression(resultType, location, Operator.GREATER_THAN, typedLhs, typedRhs), s4)
       case AST.BinaryExpression(location, Operator.LESS_OR_EQUAL, lhs, rhs) =>
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
         val (resultType, s3) = (s2(a), s2(b)) match {
-          case (IntType, IntType) =>
-            (BooleanType, s2)
-          case (LongType, LongType) =>
-            (BooleanType, s2)
-          case (ShortType, ShortType) =>
-            (BooleanType, s2)
-          case (ByteType, ByteType) =>
-            (BooleanType, s2)
-          case (FloatType, FloatType) =>
-            (BooleanType, s2)
-          case (DoubleType, DoubleType) =>
-            (BooleanType, s2)
-          case (DynamicType, DynamicType) =>
-            (BooleanType, s2)
-          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
-            (BooleanType, unify(x, y, s2))
-          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
-            (BooleanType, unify(x, y, s2))
+          case (TInt, TInt) =>
+            (TBoolean, s2)
+          case (TLong, TLong) =>
+            (TBoolean, s2)
+          case (TShort, TShort) =>
+            (TBoolean, s2)
+          case (TByte, TByte) =>
+            (TBoolean, s2)
+          case (TFloat, TFloat) =>
+            (TBoolean, s2)
+          case (TDouble, TDouble) =>
+            (TBoolean, s2)
+          case (TDynamic, TDynamic) =>
+            (TBoolean, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
           case (ltype, rtype) =>
-            val s3 = unify(IntType, ltype, s2)
-            val s4 = unify(IntType, rtype, s3)
-            (BooleanType, s4)
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TBoolean, s4)
         }
-        val s4 = unify(BooleanType, t, s3)
+        val s4 = unify(TBoolean, t, s3)
         (TypedAST.BinaryExpression(resultType, location, Operator.LESS_OR_EQUAL, typedLhs, typedRhs), s4)
       case AST.BinaryExpression(location, Operator.GREATER_EQUAL, lhs, rhs) =>
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
         val (resultType, s3) = (s2(a), s2(b)) match {
-          case (IntType, IntType) =>
-            (BooleanType, s2)
-          case (LongType, LongType) =>
-            (BooleanType, s2)
-          case (ShortType, ShortType) =>
-            (BooleanType, s2)
-          case (ByteType, ByteType) =>
-            (BooleanType, s2)
-          case (FloatType, FloatType) =>
-            (BooleanType, s2)
-          case (DoubleType, DoubleType) =>
-            (BooleanType, s2)
-          case (DynamicType, DynamicType) =>
-            (BooleanType, s2)
-          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
-            (BooleanType, unify(x, y, s2))
-          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
-            (BooleanType, unify(x, y, s2))
+          case (TInt, TInt) =>
+            (TBoolean, s2)
+          case (TLong, TLong) =>
+            (TBoolean, s2)
+          case (TShort, TShort) =>
+            (TBoolean, s2)
+          case (TByte, TByte) =>
+            (TBoolean, s2)
+          case (TFloat, TFloat) =>
+            (TBoolean, s2)
+          case (TDouble, TDouble) =>
+            (TBoolean, s2)
+          case (TDynamic, TDynamic) =>
+            (TBoolean, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
           case (ltype, rtype) =>
-            val s3 = unify(IntType, ltype, s2)
-            val s4 = unify(IntType, rtype, s3)
-            (BooleanType, s4)
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TBoolean, s4)
         }
-        val s4 = unify(BooleanType, t, s3)
+        val s4 = unify(TBoolean, t, s3)
         (TypedAST.BinaryExpression(resultType, location, Operator.GREATER_EQUAL, typedLhs, typedRhs), s4)
       case AST.BinaryExpression(location, Operator.ADD, lhs, rhs) =>
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
         val (resultType, s3) = (s2(a), s2(b)) match {
-          case (IntType, IntType) =>
-            (IntType, s2)
-          case (LongType, LongType) =>
-            (LongType, s2)
-          case (ShortType, ShortType) =>
-            (ShortType, s2)
-          case (ByteType, ByteType) =>
-            (ByteType, s2)
-          case (FloatType, FloatType) =>
-            (FloatType, s2)
-          case (DoubleType, DoubleType) =>
-            (DoubleType, s2)
-          case (DynamicType, DynamicType) =>
-            (DynamicType, s2)
-          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+          case (TInt, TInt) =>
+            (TInt, s2)
+          case (TLong, TLong) =>
+            (TLong, s2)
+          case (TShort, TShort) =>
+            (TShort, s2)
+          case (TByte, TByte) =>
+            (TByte, s2)
+          case (TFloat, TFloat) =>
+            (TFloat, s2)
+          case (TDouble, TDouble) =>
+            (TDouble, s2)
+          case (TDynamic, TDynamic) =>
+            (TDynamic, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
             (y, unify(x, y, s2))
-          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
             (x, unify(x, y, s2))
-          case (DynamicType, other) =>
-            (DynamicType, s2)
-          case (other, DynamicType) =>
-            (DynamicType, s2)
+          case (TDynamic, other) =>
+            (TDynamic, s2)
+          case (other, TDynamic) =>
+            (TDynamic, s2)
           case (ltype, rtype) =>
-            val s3 = unify(IntType, ltype, s2)
-            val s4 = unify(IntType, rtype, s3)
-            (IntType, s4)
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TInt, s4)
         }
         val s4 = unify(resultType, t, s3)
         (TypedAST.BinaryExpression(resultType, location, Operator.ADD, typedLhs, typedRhs), s4)
@@ -540,28 +540,28 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
         val (resultType, s3) = (s2(a), s2(b)) match {
-          case (IntType, IntType) =>
-            (IntType, s2)
-          case (LongType, LongType) =>
-            (LongType, s2)
-          case (ShortType, ShortType) =>
-            (ShortType, s2)
-          case (ByteType, ByteType) =>
-            (ByteType, s2)
-          case (FloatType, FloatType) =>
-            (FloatType, s2)
-          case (DoubleType, DoubleType) =>
-            (DoubleType, s2)
-          case (DynamicType, DynamicType) =>
-            (DynamicType, s2)
-          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+          case (TInt, TInt) =>
+            (TInt, s2)
+          case (TLong, TLong) =>
+            (TLong, s2)
+          case (TShort, TShort) =>
+            (TShort, s2)
+          case (TByte, TByte) =>
+            (TByte, s2)
+          case (TFloat, TFloat) =>
+            (TFloat, s2)
+          case (TDouble, TDouble) =>
+            (TDouble, s2)
+          case (TDynamic, TDynamic) =>
+            (TDynamic, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
             (y, unify(x, y, s2))
-          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
             (x, unify(x, y, s2))
           case (ltype, rtype) =>
-            val s3 = unify(IntType, ltype, s2)
-            val s4 = unify(IntType, rtype, s3)
-            (IntType, s4)
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TInt, s4)
         }
         val s4 = unify(resultType, t, s3)
         (TypedAST.BinaryExpression(resultType, location, Operator.SUBTRACT, typedLhs, typedRhs), s4)
@@ -570,28 +570,28 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
         val (resultType, s3) = (s2(a), s2(b)) match {
-          case (IntType, IntType) =>
-            (IntType, s2)
-          case (LongType, LongType) =>
-            (LongType, s2)
-          case (ShortType, ShortType) =>
-            (ShortType, s2)
-          case (ByteType, ByteType) =>
-            (ByteType, s2)
-          case (FloatType, FloatType) =>
-            (FloatType, s2)
-          case (DoubleType, DoubleType) =>
-            (DoubleType, s2)
-          case (DynamicType, DynamicType) =>
-            (DynamicType, s2)
-          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+          case (TInt, TInt) =>
+            (TInt, s2)
+          case (TLong, TLong) =>
+            (TLong, s2)
+          case (TShort, TShort) =>
+            (TShort, s2)
+          case (TByte, TByte) =>
+            (TByte, s2)
+          case (TFloat, TFloat) =>
+            (TFloat, s2)
+          case (TDouble, TDouble) =>
+            (TDouble, s2)
+          case (TDynamic, TDynamic) =>
+            (TDynamic, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
             (y, unify(x, y, s2))
-          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
             (x, unify(x, y, s2))
           case (ltype, rtype) =>
-            val s3 = unify(IntType, ltype, s2)
-            val s4 = unify(IntType, rtype, s3)
-            (IntType, s4)
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TInt, s4)
         }
         val s4 = unify(resultType, t, s3)
         (TypedAST.BinaryExpression(resultType, location, Operator.MULTIPLY, typedLhs, typedRhs), s4)
@@ -600,28 +600,28 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
         val (resultType, s3) = (s2(a), s2(b)) match {
-          case (IntType, IntType) =>
-            (IntType, s2)
-          case (LongType, LongType) =>
-            (LongType, s2)
-          case (ShortType, ShortType) =>
-            (ShortType, s2)
-          case (ByteType, ByteType) =>
-            (ByteType, s2)
-          case (FloatType, FloatType) =>
-            (FloatType, s2)
-          case (DoubleType, DoubleType) =>
-            (DoubleType, s2)
-          case (DynamicType, DynamicType) =>
-            (DynamicType, s2)
-          case (x: TypeVariable, y) if !y.isInstanceOf[TypeVariable] =>
+          case (TInt, TInt) =>
+            (TInt, s2)
+          case (TLong, TLong) =>
+            (TLong, s2)
+          case (TShort, TShort) =>
+            (TShort, s2)
+          case (TByte, TByte) =>
+            (TByte, s2)
+          case (TFloat, TFloat) =>
+            (TFloat, s2)
+          case (TDouble, TDouble) =>
+            (TDouble, s2)
+          case (TDynamic, TDynamic) =>
+            (TDynamic, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
             (y, unify(x, y, s2))
-          case (x, y: TypeVariable) if !x.isInstanceOf[TypeVariable] =>
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
             (x, unify(x, y, s2))
           case (ltype, rtype) =>
-            val s3 = unify(IntType, ltype, s2)
-            val s4 = unify(IntType, rtype, s3)
-            (IntType, s4)
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TInt, s4)
         }
         val s4 = unify(resultType, t, s3)
         (TypedAST.BinaryExpression(resultType, location, Operator.DIVIDE, typedLhs, typedRhs), s4)
@@ -629,62 +629,62 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val a = newTypeVariable()
         val (typedOperand, s1) = doType(operand, env, a, s0)
         val (resultType, s2) = s1(a) match {
-          case IntType  =>
-            (IntType, s1)
-          case LongType =>
-            (LongType, s1)
-          case ShortType =>
-            (ShortType, s1)
-          case ByteType =>
-            (ByteType, s1)
-          case FloatType  =>
-            (FloatType, s1)
-          case DoubleType =>
-            (DoubleType, s1)
-          case DynamicType =>
-            (DynamicType, s1)
+          case TInt  =>
+            (TInt, s1)
+          case TLong =>
+            (TLong, s1)
+          case TShort =>
+            (TShort, s1)
+          case TByte =>
+            (TByte, s1)
+          case TFloat  =>
+            (TFloat, s1)
+          case TDouble =>
+            (TDouble, s1)
+          case TDynamic =>
+            (TDynamic, s1)
           case operandType =>
-            val s2 = unify(IntType, operandType, s1)
-            (IntType, s2)
+            val s2 = unify(TInt, operandType, s1)
+            (TInt, s2)
         }
         (TypedAST.MinusOp(resultType, location, typedOperand), s2)
       case AST.PlusOp(location, operand) =>
         val a = newTypeVariable()
         val (typedOperand, s1) = doType(operand, env, a, s0)
         val (resultType, s2) = s1(a) match {
-          case IntType  =>
-            (IntType, s1)
-          case LongType =>
-            (LongType, s1)
-          case ShortType =>
-            (ShortType, s1)
-          case ByteType =>
-            (ByteType, s1)
-          case FloatType  =>
-            (FloatType, s1)
-          case DoubleType =>
-            (DoubleType, s1)
-          case DynamicType =>
-            (DynamicType, s1)
+          case TInt  =>
+            (TInt, s1)
+          case TLong =>
+            (TLong, s1)
+          case TShort =>
+            (TShort, s1)
+          case TByte =>
+            (TByte, s1)
+          case TFloat  =>
+            (TFloat, s1)
+          case TDouble =>
+            (TDouble, s1)
+          case TDynamic =>
+            (TDynamic, s1)
           case operandType =>
-            val s2 = unify(IntType, operandType, s1)
-            (IntType, s2)
+            val s2 = unify(TInt, operandType, s1)
+            (TInt, s2)
         }
         (TypedAST.PlusOp(resultType, location, typedOperand), s2)
       case AST.BinaryExpression(location, Operator.AND2, lhs, rhs) =>
-        val (typedLhs, s1) = doType(lhs, env, BooleanType, s0)
-        val (typedRhs, s2) = doType(rhs, env, BooleanType, s1)
-        val s3 = unify(BooleanType, t, s2)
-        (TypedAST.BinaryExpression(BooleanType, location, Operator.AND2, typedLhs, typedRhs), s3)
+        val (typedLhs, s1) = doType(lhs, env, TBoolean, s0)
+        val (typedRhs, s2) = doType(rhs, env, TBoolean, s1)
+        val s3 = unify(TBoolean, t, s2)
+        (TypedAST.BinaryExpression(TBoolean, location, Operator.AND2, typedLhs, typedRhs), s3)
       case AST.BinaryExpression(location, Operator.BAR2, lhs, rhs) =>
         val a, b = newTypeVariable()
-        val (typedLhs, s1) = doType(lhs, env, BooleanType, s0)
-        val (typedRhs, s2) = doType(rhs, env, BooleanType, s1)
-        val s3 = unify(BooleanType, t, s2)
-        (TypedAST.BinaryExpression(BooleanType, location, Operator.BAR2, typedLhs, typedRhs), s3)
+        val (typedLhs, s1) = doType(lhs, env, TBoolean, s0)
+        val (typedRhs, s2) = doType(rhs, env, TBoolean, s1)
+        val s3 = unify(TBoolean, t, s2)
+        (TypedAST.BinaryExpression(TBoolean, location, Operator.BAR2, typedLhs, typedRhs), s3)
       case AST.StringNode(location, value) =>
-        val s1 = unify(DynamicType, t, s0)
-        (TypedAST.StringNode(DynamicType, location, value), s1)
+        val s1 = unify(TDynamic, t, s0)
+        (TypedAST.StringNode(TDynamic, location, value), s1)
       case AST.Id(location, name) =>
         val s1 = env.lookup(name) match {
           case None => typeError(location, s"variable '${name}' is not found")
@@ -703,7 +703,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val t0 = newTypeVariable()
         val (te, s1) = doType(expression, env, t0, s0)
         te.description match {
-          case RecordReference(recordName, paramTypes)=>
+          case TRecordReference(recordName, paramTypes)=>
             env.records.get(recordName) match {
               case None =>
                 typeError(location, s"record ${recordName} is not found")
@@ -723,8 +723,8 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       case AST.Lambda(location, params, optionalType, body) =>
         val b = optionalType.getOrElse(newTypeVariable())
         val ts = params.map{p => p.optionalType.getOrElse(newTypeVariable())}
-        val as = (params zip ts).map{ case (p, t) => p.name -> TypeScheme(List(), t) }
-        val s1 = unify(t, FunctionType(ts, b), s0)
+        val as = (params zip ts).map{ case (p, t) => p.name -> TScheme(List(), t) }
+        val s1 = unify(t, TFunction(ts, b), s0)
         val env1 = as.foldLeft(env) { case (env, (name, scheme)) => env.updateImmuableVariable(name, scheme)}
         val (typedBody, s2) = doType(body, env1, b, s1)
         (TypedAST.FunctionLiteral(s2(t), location, params, optionalType, typedBody), s2)
@@ -750,7 +750,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         }
         val a = newTypeVariable()
         val b = newTypeVariable()
-        val (typedE1, s1) = doType(value, env.updateImmuableVariable(variable, TypeScheme(List(), a)), b, s0)
+        val (typedE1, s1) = doType(value, env.updateImmuableVariable(variable, TScheme(List(), a)), b, s0)
         val s2 = unify(a, b, s1)
         val (typedE2, s3) = doType(body, env.updateImmuableVariable(variable, generalize(s2(a), s2(env.variables))), t, s2)
         val x = newTypeVariable()
@@ -761,7 +761,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         (TypedAST.LetFunctionDefinition(typedE2.description, location, variable, typedE1.asInstanceOf[TypedAST.FunctionLiteral], typedCleanup, typedE2), s4)
       case AST.FunctionCall(location, e1, ps) =>
         val t2 = ps.map{_ => newTypeVariable()}
-        val (typedTarget, s1) = doType(e1, env, FunctionType(t2, t), s0)
+        val (typedTarget, s1) = doType(e1, env, TFunction(t2, t), s0)
         val (tparams, s2) = (ps zip t2).foldLeft((Nil:List[TypedAST], s1)){ case ((tparams, s), (e, t)) =>
           val (tparam, sx) = doType(e, env, t, s)
           (tparam::tparams, sx)
@@ -802,8 +802,8 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           val (te, sx) = doType(e, env, t, s)
           (te::tes, sx)
         }
-        val sy = unify(DynamicType, t, sx)
-        (TypedAST.NewObject(DynamicType, location, className, tes.reverse), sy)
+        val sy = unify(TDynamic, t, sx)
+        (TypedAST.NewObject(TDynamic, location, className, tes.reverse), sy)
       case AST.RecordNew(location, recordName, params) =>
         val ts = params.map{_ => newTypeVariable()}
         val (tes1, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), (e, t)) =>
@@ -822,7 +822,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             val memberTypes = members.map{ case (_, t) => t}
             val parameterTypes = tes2.map { case te => te.description }
             val sn = (memberTypes zip parameterTypes).foldLeft(sy) { case (s, (m, p)) => unify(m, p, s)}
-            val recordType = RecordReference(recordName, xts.map{t => sn(t)})
+            val recordType = TRecordReference(recordName, xts.map{ t => sn(t)})
             val so = unify(t, recordType, sn)
             (TypedAST.NewRecord(recordType, location, recordName, tes2), so)
           case None =>
@@ -836,14 +836,14 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       case AST.MethodCall(location, receiver, name, params) =>
         val a = newTypeVariable()
         val (typedReceiver, s1) = doType(receiver, env, a, s0)
-        val s2 = unify(s0(a), DynamicType, s1)
+        val s2 = unify(s0(a), TDynamic, s1)
         val ts = params.map{_ => newTypeVariable()}
         val (tes, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s2)){ case ((tes, s), (e, t)) =>
           val (te, sx) = doType(e, env, t, s)
           (te::tes, sx)
         }
-        val sy = unify(t, DynamicType, sx)
-        (TypedAST.MethodCall(DynamicType, location, typedReceiver, name, tes.reverse), sy)
+        val sy = unify(t, TDynamic, sx)
+        (TypedAST.MethodCall(TDynamic, location, typedReceiver, name, tes.reverse), sy)
       case otherwise =>
         throw TyperPanic(otherwise.toString)
     }
