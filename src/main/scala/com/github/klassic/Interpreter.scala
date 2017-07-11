@@ -337,8 +337,8 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
   }
 
   def toList(row: Row): List[(String, Type)] = row match {
-    case RowExtension(l, t, extension) => (l -> t) :: toList(extension)
-    case EmptyRow => Nil
+    case TRowExtend(l, t, extension) => (l -> t) :: toList(extension)
+    case TRowEmpty => Nil
   }
 
   final def interpret(program: TypedAST.Program): Value = {

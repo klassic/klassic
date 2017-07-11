@@ -12,6 +12,8 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   type Environment = Map[String, TScheme]
   type ModuleEnvironment = Map[String, Environment]
   type RecordEnvironment = Map[String, TRecord]
+  type Name = String
+  type Label = String
   def listOf(tp: Type): TConstructor = {
     TConstructor("List", List(tp))
   }
@@ -53,7 +55,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     Map(
       "Point" -> TRecord(
         Nil,
-        RowExtension("x", TInt, RowExtension("y", TInt, EmptyRow))
+        TRowExtend("x", TInt, TRowExtend("y", TInt, TRowEmpty))
       )
     )
   }
@@ -87,11 +89,14 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   }
 
   def newInstanceFrom(scheme: TScheme): Type = {
-    scheme.typeVariables.foldLeft(EmptySubstitution)((s, tv) => s.extend(tv, newTypeVariable())).apply(scheme.description)
+    scheme.svariables.foldLeft(EmptySubstitution)((s, tv) => s.extend(tv, newTypeVariable())).apply(scheme.stype)
   }
   private var n: Int = 0
   def newTypeVariable(): Type = {
     n += 1; TVariable("'a" + n)
+  }
+  def newTypeVariable(name: String) = {
+    TVariable(name)
   }
   val EmptySubstitution: Substitution = new Substitution(Map.empty)
   class Substitution(val map: Map[TVariable, Type]) extends Function1[Type, Type] {
@@ -100,8 +105,8 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     }
 
     def applyRow(r: Row): Row = r match {
-      case RowExtension(l, t, e) => RowExtension(l, apply(t), applyRow(e))
-      case EmptyRow => EmptyRow
+      case TRowExtend(l, t, e) => TRowExtend(l, apply(t), applyRow(e))
+      case TRowEmpty => TRowEmpty
     }
 
     def apply(t: Type): Type = t match {
@@ -126,7 +131,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
 
     def apply(env: Environment): Environment = {
       env.map { case (x, ts) =>
-          x -> TScheme(typeVariables(ts), this.apply(ts.description))
+          x -> TScheme(typeVariables(ts), this.apply(ts.stype))
       }
     }
 
@@ -151,8 +156,8 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   }
 
   def typeVariables(r: Row): List[TVariable] = r match {
-    case RowExtension(l, t, e) => typeVariables(t) union typeVariables(e)
-    case EmptyRow => Nil
+    case TRowExtend(l, t, e) => typeVariables(t) union typeVariables(e)
+    case TRowEmpty => Nil
   }
 
   def typeVariables(t: Type): List[TVariable] = t match {
@@ -189,7 +194,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   }
 
   def typeVariables(ts: TScheme): List[TVariable] = {
-    typeVariables(ts.description) diff ts.typeVariables
+    typeVariables(ts.stype) diff ts.svariables
   }
 
   def typeVariables(environment: Environment): List[TVariable] = {
@@ -237,13 +242,13 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   }
 
   def toRow(bindings: List[(String, Type)]): Row = bindings match {
-    case (n, t) :: tl => RowExtension(n, t, toRow(tl))
-    case Nil => EmptyRow
+    case (n, t) :: tl => TRowExtend(n, t, toRow(tl))
+    case Nil => TRowEmpty
   }
 
   def toList(row: Row): List[(String, Type)] = row match {
-    case RowExtension(l, t, extension) => (l -> t) :: toList(extension)
-    case EmptyRow => Nil
+    case TRowExtend(l, t, extension) => (l -> t) :: toList(extension)
+    case TRowEmpty => Nil
   }
 
   def processRecords(recordDeclarations :List[RecordDeclaration]): RecordEnvironment = {
@@ -330,8 +335,8 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             typeError(location, s"variable $variable is not defined")
           case Some(variableType) =>
             val (typedValue, s1) = doType(value, env, t, s0)
-            val s2 = unify(variableType.description, typedValue.description, s1)
-            (TypedAST.Assignment(variableType.description, location, variable, typedValue), s2)
+            val s2 = unify(variableType.stype, typedValue.description, s1)
+            (TypedAST.Assignment(variableType.stype, location, variable, typedValue), s2)
         }
       case AST.IfExpression(location, cond, pos, neg) =>
         val (typedCondition, newSub1) = doType(cond, env, TBoolean, s0)
