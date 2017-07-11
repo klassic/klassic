@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.AST.{FunctionCall, ListLiteral, MapLiteral, NewObject, _}
+import com.github.klassic.AST.{FunctionCall, ListLiteral, MapLiteral, ObjectNew, _}
 import com.github.klassic.Type.{BooleanType, DynamicType}
 
 /**
@@ -38,10 +38,10 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
       IfExpression(location, doRewrite(cond), doRewrite(pos), doRewrite(neg))
     case WhileExpression(location, condition, body: AST) =>
       WhileExpression(location, doRewrite(condition), doRewrite(body))
-    case AccessRecord(location, expression, member) =>
-      AccessRecord(location, doRewrite(expression), member)
-    case NewRecord(location, name, members) =>
-      NewRecord(location, name, members.map({ case e => doRewrite(e) }))
+    case RecordSelect(location, expression, member) =>
+      RecordSelect(location, doRewrite(expression), member)
+    case RecordNew(location, name, members) =>
+      RecordNew(location, name, members.map({ case e => doRewrite(e) }))
     case e@ForeachExpression(location, name, collection, body) =>
       val itVariable = symbol()
       val location = e.location
@@ -139,7 +139,7 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
     case ListLiteral(location, elements) =>  ListLiteral(location, elements.map{doRewrite})
     case SetLiteral(location, elements) =>  SetLiteral(location, elements.map{doRewrite})
     case MapLiteral(location, elements) => MapLiteral(location, elements.map{ case (k, v) => (doRewrite(k), doRewrite(v))})
-    case NewObject(location, className, params) => NewObject(location, className, params.map{doRewrite})
+    case ObjectNew(location, className, params) => ObjectNew(location, className, params.map{doRewrite})
     case MethodCall(location ,self, name, params) => MethodCall(location, doRewrite(self), name, params.map{doRewrite})
     case Casting(location, target, to) => Casting(location, doRewrite(target), to)
     case otherwise => throw RewriterPanic(otherwise.toString)

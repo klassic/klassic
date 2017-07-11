@@ -282,7 +282,7 @@ class Parser extends Processor[String, Program] {
       case location ~ self ~ names =>
         val ns = names.map { case l ~ n => (l, n.name) }
         ns.foldLeft(self) { case (e, (l, n)) =>
-          AccessRecord(l, e, n)
+          RecordSelect(l, e, n)
         }
     }
 
@@ -465,14 +465,14 @@ class Parser extends Processor[String, Program] {
 
     // newObject ::= "new" fqcn "(" [param {"," param} ")"
     lazy val newObject: Parser[AST] = (% <~ CL(NEW)) ~ commit(fqcn ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)) ^^ {
-      case location ~ (className ~ Some(params)) => NewObject(location, className, params)
-      case location ~ (className ~ None) => NewObject(location, className, List())
+      case location ~ (className ~ Some(params)) => ObjectNew(location, className, params)
+      case location ~ (className ~ None) => ObjectNew(location, className, List())
     }
 
     // newRecord ::= "#" sident "(" [param {"," param} ")"
     lazy val newRecord: Parser[AST] = ((% <~ CL(SHARP)) ~ commit(sident ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)) ^^ {
-      case location ~ (recordName ~ Some(params)) => NewRecord(location, recordName, params)
-      case location ~ (recordName ~ None) => NewRecord(location, recordName, List())
+      case location ~ (recordName ~ Some(params)) => RecordNew(location, recordName, params)
+      case location ~ (recordName ~ None) => RecordNew(location, recordName, List())
     })
 
     // functionDefinition ::= "def" ident  ["(" [param {"," param}] ")"] "=" expression

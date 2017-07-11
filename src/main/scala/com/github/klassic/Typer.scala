@@ -699,7 +699,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         }
         val resultType = s1(t)
         (TypedAST.Selector(resultType, location, module, name), s1)
-      case AST.AccessRecord(location, expression, memberName) =>
+      case AST.RecordSelect(location, expression, memberName) =>
         val t0 = newTypeVariable()
         val (te, s1) = doType(expression, env, t0, s0)
         te.description match {
@@ -796,7 +796,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         }
         val sy = unify(mapOfKV, t, sx)
         (TypedAST.MapLiteral(sy(t), location, tes.reverse), sy)
-      case AST.NewObject(location, className, params) =>
+      case AST.ObjectNew(location, className, params) =>
         val ts = params.map{_ => newTypeVariable()}
         val (tes, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), (e, t)) =>
           val (te, sx) = doType(e, env, t, s)
@@ -804,7 +804,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         }
         val sy = unify(DynamicType, t, sx)
         (TypedAST.NewObject(DynamicType, location, className, tes.reverse), sy)
-      case AST.NewRecord(location, recordName, params) =>
+      case AST.RecordNew(location, recordName, params) =>
         val ts = params.map{_ => newTypeVariable()}
         val (tes1, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), (e, t)) =>
           val (te, sx) = doType(e, env, t, s)
