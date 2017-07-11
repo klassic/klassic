@@ -24,7 +24,7 @@ case class BoxedDouble(value: Double) extends Value {
 case class BoxedFloat(value: Float) extends Value {
   override def toString = value.toString
 }
-case class FunctionValue(value: TypedAST.FunctionLiteral, cleanup: Option[TypedAST], environment: Option[Environment]) extends Value {
+case class FunctionValue(value: TypedAST.FunctionLiteral, cleanup: Option[TypedAST], environment: Option[RuntimeEnvironment]) extends Value {
   override def toString = s"<function value>"
 }
 case class NativeFunctionValue(body: PartialFunction[List[Value], Value]) extends Value {

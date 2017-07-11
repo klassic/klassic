@@ -5,7 +5,7 @@ import scala.collection.mutable
 /**
  * @author Kota Mizushima
  */
-class Environment(val parent:Option[Environment]) {
+class RuntimeEnvironment(val parent:Option[RuntimeEnvironment]) {
   val variables = mutable.Map[String, Value]()
   def apply(key: String): Value = {
     variables.getOrElse(key, parent.map(_.apply(key)).getOrElse {
@@ -13,7 +13,7 @@ class Environment(val parent:Option[Environment]) {
     })
   }
   def set(key: String, value: Value): Value = {
-    def iset(optEnv: Option[Environment]): Unit = optEnv match {
+    def iset(optEnv: Option[RuntimeEnvironment]): Unit = optEnv match {
       case Some(env) => if(env.variables.contains(key)) env(key) = value else iset(env.parent)
       case None => ()
     }

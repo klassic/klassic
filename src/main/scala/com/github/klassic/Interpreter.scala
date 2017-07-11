@@ -1,11 +1,8 @@
 package com.github.klassic
 
 import scala.collection.JavaConverters._
-import java.lang.reflect.{Constructor, Method}
-import java.util
 
-import klassic.runtime._
-import com.github.klassic.AST._
+import com.github.klassic._
 import com.github.klassic.Type._
 import com.github.klassic.TypedAST.{FunctionLiteral, ValueNode}
 import klassic.runtime.{AssertionError, NotImplementedError}
@@ -73,7 +70,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     }).getOrElse(NoConstructorFound)
   }
 
-  object BuiltinEnvironment extends Environment(None) {
+  object BuiltinEnvironment extends RuntimeEnvironment(None) {
     define("substring"){ case List(ObjectValue(s:String), begin: BoxedInt, end: BoxedInt) =>
       ObjectValue(s.substring(begin.value, end.value))
     }
@@ -86,7 +83,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
 
     define("thread") { case List(fun: FunctionValue) =>
       new Thread({() =>
-          val env = new Environment(fun.environment)
+          val env = new RuntimeEnvironment(fun.environment)
           interpreter.evaluate(TypedAST.FunctionCall(TDynamic, NoLocation, fun.value, Nil), env)
       }).start()
       UnitValue
@@ -97,7 +94,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
       param
     }
     define("stopwatch") { case List(fun: FunctionValue) =>
-      val env = new Environment(fun.environment)
+      val env = new RuntimeEnvironment(fun.environment)
       val start = System.currentTimeMillis()
       interpreter.evaluate(TypedAST.FunctionCall(TDynamic, NoLocation, fun.value, List()), env)
       val end = System.currentTimeMillis()
@@ -112,7 +109,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
       NativeFunctionValue{
         case List(fun: FunctionValue) =>
           val newList = new java.util.ArrayList[Any]
-          val env = new Environment(fun.environment)
+          val env = new RuntimeEnvironment(fun.environment)
           var i = 0
           while(i < list.size()) {
             val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
@@ -171,7 +168,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     define("foldLeft") { case List(ObjectValue(list: java.util.List[_])) =>
       NativeFunctionValue{ case List(init: Value) =>
         NativeFunctionValue { case List(fun: FunctionValue) =>
-          val env = new Environment(fun.environment)
+          val env = new RuntimeEnvironment(fun.environment)
           var i = 0
           var result: Value = init
           while(i < list.size()) {
@@ -241,7 +238,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
         NativeFunctionValue{
           case List(fun: FunctionValue) =>
             val newList = new java.util.ArrayList[Any]
-            val env = new Environment(fun.environment)
+            val env = new RuntimeEnvironment(fun.environment)
             var i = 0
             while(i < list.size()) {
               val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
@@ -255,7 +252,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
       define("foldLeft") { case List(ObjectValue(list: java.util.List[_])) =>
         NativeFunctionValue{ case List(init: Value) =>
           NativeFunctionValue { case List(fun: FunctionValue) =>
-            val env = new Environment(fun.environment)
+            val env = new RuntimeEnvironment(fun.environment)
             var i = 0
             var result: Value = init
             while(i < list.size()) {
@@ -355,15 +352,15 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     evaluate(node, BuiltinEnvironment)
   }
 
-  private def performFunctionInternal(func: TypedAST, params: List[TypedAST], env: Environment): Value = {
+  private def performFunctionInternal(func: TypedAST, params: List[TypedAST], env: RuntimeEnvironment): Value = {
     performFunction(TypedAST.FunctionCall(TDynamic, NoLocation, func, params), env)
   }
 
-  private def performFunction(node: TypedAST.FunctionCall, env: Environment): Value = node match {
+  private def performFunction(node: TypedAST.FunctionCall, env: RuntimeEnvironment): Value = node match {
     case TypedAST.FunctionCall(description, location, function, params) =>
       evaluate(function, env) match {
         case FunctionValue(TypedAST.FunctionLiteral(description, location, fparams, optionalType, proc), cleanup, cenv) =>
-          val local = new Environment(cenv)
+          val local = new RuntimeEnvironment(cenv)
           (fparams zip params).foreach{ case (fp, ap) =>
             local(fp.name) = evaluate(ap, env)
           }
@@ -386,11 +383,11 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
       }
   }
 
-  private def evaluate(node: TypedAST, env: Environment, recordEnv: RecordEnvironment = BuiltinRecordEnvironment, moduleEnv: ModuleEnvironment = BuiltinModuleEnvironment): Value = {
+  private def evaluate(node: TypedAST, env: RuntimeEnvironment, recordEnv: RecordEnvironment = BuiltinRecordEnvironment, moduleEnv: ModuleEnvironment = BuiltinModuleEnvironment): Value = {
     def evalRecursive(node: TypedAST): Value = {
       node match{
         case TypedAST.Block(description, location, expressions) =>
-          val local = new Environment(Some(env))
+          val local = new RuntimeEnvironment(Some(env))
           expressions.foldLeft(UnitValue:Value){(result, x) => evaluate(x, local)}
         case TypedAST.WhileExpression(description, location, cond, body) =>
           while(evalRecursive(cond) == BoxedBoolean(true)) {
