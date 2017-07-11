@@ -133,6 +133,12 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     def extend(tv: TVariable, td: Type): Substitution = new Substitution(this.map + (tv -> td))
 
     def remove(tv: TVariable): Substitution = new Substitution(this.map - tv)
+
+    def compose(that: Substitution): Substitution = {
+      val s1 = this
+      val s2 = that
+      new Substitution(s2.map.mapValues{t => s1.apply(t)} ++ s1.map)
+    }
   }
 
   def lookup(x: String, environment: Environment): Option[TScheme] = environment.get(x) match {
