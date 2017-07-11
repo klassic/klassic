@@ -87,7 +87,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     define("thread") { case List(fun: FunctionValue) =>
       new Thread({() =>
           val env = new Environment(fun.environment)
-          interpreter.evaluate(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, Nil), env)
+          interpreter.evaluate(TypedAST.FunctionCall(TDynamic, NoLocation, fun.value, Nil), env)
       }).start()
       UnitValue
     }
@@ -99,7 +99,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     define("stopwatch") { case List(fun: FunctionValue) =>
       val env = new Environment(fun.environment)
       val start = System.currentTimeMillis()
-      interpreter.evaluate(TypedAST.FunctionCall(DynamicType, NoLocation, fun.value, List()), env)
+      interpreter.evaluate(TypedAST.FunctionCall(TDynamic, NoLocation, fun.value, List()), env)
       val end = System.currentTimeMillis()
       BoxedInt((end - start).toInt)
     }
@@ -193,8 +193,8 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
 
   object BuiltinRecordEnvironment extends RecordEnvironment() {
     define("Point")(
-      "x" -> IntType,
-      "y" -> IntType
+      "x" -> TInt,
+      "y" -> TInt
     )
   }
 
@@ -356,7 +356,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
   }
 
   private def performFunctionInternal(func: TypedAST, params: List[TypedAST], env: Environment): Value = {
-    performFunction(TypedAST.FunctionCall(DynamicType, NoLocation, func, params), env)
+    performFunction(TypedAST.FunctionCall(TDynamic, NoLocation, func, params), env)
   }
 
   private def performFunction(node: TypedAST.FunctionCall, env: Environment): Value = node match {

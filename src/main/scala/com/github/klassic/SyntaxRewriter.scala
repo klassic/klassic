@@ -1,7 +1,7 @@
 package com.github.klassic
 
 import com.github.klassic.AST.{FunctionCall, ListLiteral, MapLiteral, ObjectNew, _}
-import com.github.klassic.Type.{BooleanType, DynamicType}
+import com.github.klassic.Type.{TBoolean, TDynamic}
 
 /**
   * @author Kota Mizushima
@@ -47,13 +47,13 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
       val location = e.location
       Block(location, List(
         Let(
-          location, itVariable, None, MethodCall(location, Casting(location, doRewrite(collection), DynamicType), "iterator", List()),
+          location, itVariable, None, MethodCall(location, Casting(location, doRewrite(collection), TDynamic), "iterator", List()),
           WhileExpression(
             location,
             BinaryExpression(
               location,
               Operator.EQUAL,
-              Casting(location, MethodCall(location, Id(location, itVariable), "hasNext", List()), BooleanType),
+              Casting(location, MethodCall(location, Id(location, itVariable), "hasNext", List()), TBoolean),
               BooleanNode(location, true)
             ),
             Block(location, List(

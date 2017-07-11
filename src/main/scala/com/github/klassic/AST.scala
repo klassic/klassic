@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.Type.TypeVariable
+import com.github.klassic.Type.TVariable
 
 /**
  * @author Kota Mizushima
@@ -28,7 +28,7 @@ object AST {
 
   case class Import(location: Location, simpleName: String, fqcn: String)
 
-  case class RecordDeclaration(location: Location, name: String, ts: List[TypeVariable], members: List[(String, Type)])
+  case class RecordDeclaration(location: Location, name: String, ts: List[TVariable], members: List[(String, Type)])
 
   case class VariantDeclaration(location: Location, id: String, params: List[Type], constructors: List[DataConstructor]) extends AST
 

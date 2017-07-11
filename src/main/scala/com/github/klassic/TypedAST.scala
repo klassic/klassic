@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.Type.{DynamicType, RecordConstructor, TypeScheme, TypeVariable}
+import com.github.klassic.Type.{TDynamic, TRecord, TScheme, TVariable}
 
 /**
  * @author Kota Mizushima
@@ -12,7 +12,7 @@ sealed abstract class TypedAST {
 }
 
 object TypedAST {
-  type RecordEnvironment = Map[String, RecordConstructor]
+  type RecordEnvironment = Map[String, TRecord]
 
   sealed trait IntegerSuffix
 
@@ -93,7 +93,7 @@ object TypedAST {
   case class Casting(val description: Type, val location: Location, target: TypedAST, to: Type) extends TypedAST
 
   case class ValueNode(value: Value) extends TypedAST {
-    override val description: Type  = DynamicType
+    override val description: Type  = TDynamic
     override val location: Location = NoLocation
   }
 }

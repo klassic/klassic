@@ -154,26 +154,26 @@ class Parser extends Processor[String, Program] {
       case _ => false
     }
 
-    lazy val typeVariable: Parser[TypeVariable] = qident ^^ { id => TypeVariable(id) }
+    lazy val typeVariable: Parser[TVariable] = qident ^^ { id => TVariable(id) }
 
     lazy val typeDescription: Parser[Type] = (
-      qident ^^ { id => TypeVariable(id) }
-        | ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => FunctionType(args, returnType) }
+      qident ^^ { id => TVariable(id) }
+        | ((CL(LPAREN) ~> repsep(typeDescription, CL(COMMA)) <~ CL(RPAREN)) <~ CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => TFunction(args, returnType) }
         | (SHARP ~> sident).^? { case s if !isBuiltinType(s) => s } ~ (CL(LT) ~> repsep(typeDescription, CL(COMMA)) <~ CL(GT)).? ^^ {
-        case name ~ Some(args) => RecordReference(name, args)
-        case name ~ None => RecordReference(name, Nil)
+        case name ~ Some(args) => TRecordReference(name, args)
+        case name ~ None => TRecordReference(name, Nil)
       } | sident.^? { case s if !isBuiltinType(s) => s } ~ (CL(LT) ~> repsep(typeDescription, CL(COMMA)) <~ CL(GT)).? ^^ {
-        case name ~ Some(args) => TypeConstructor(name, args)
-        case name ~ None => TypeConstructor(name, Nil)
-      } | token("Byte") ^^ { _ => ByteType }
-        | token("Short") ^^ { _ => ShortType }
-        | token("Int") ^^ { _ => IntType }
-        | token("Long") ^^ { _ => LongType }
-        | token("Float") ^^ { _ => FloatType }
-        | token("Double") ^^ { _ => DoubleType }
-        | token("Boolean") ^^ { _ => BooleanType }
-        | token("Unit") ^^ { _ => UnitType }
-        | token("*") ^^ { _ => DynamicType }
+        case name ~ Some(args) => TConstructor(name, args)
+        case name ~ None => TConstructor(name, Nil)
+      } | token("Byte") ^^ { _ => TByte }
+        | token("Short") ^^ { _ => TShort }
+        | token("Int") ^^ { _ => TInt }
+        | token("Long") ^^ { _ => TLong }
+        | token("Float") ^^ { _ => TFloat }
+        | token("Double") ^^ { _ => TDouble }
+        | token("Boolean") ^^ { _ => TBoolean }
+        | token("Unit") ^^ { _ => TUnit }
+        | token("*") ^^ { _ => TDynamic }
     )
 
     lazy val program: Parser[Program] = (SPACING ~> %) ~ repsep(`import`, TERMINATOR) ~ repsep(record, TERMINATOR) ~ (lines <~ opt(TERMINATOR)) ^^ {

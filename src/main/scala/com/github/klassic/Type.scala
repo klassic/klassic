@@ -1,41 +1,41 @@
 package com.github.klassic
 
 sealed abstract class Type(val image: String) {
-  def ==>(returnType: Type): Type.FunctionType = {
-    Type.FunctionType(List(this), returnType)
+  def ==>(returnType: Type): Type.TFunction = {
+    Type.TFunction(List(this), returnType)
   }
   override def toString: String = image
 }
 object Type {
   implicit class RichType(args: List[Type]) {
-    def ==>(returnType: Type): Type.FunctionType = {
-      Type.FunctionType(args, returnType)
+    def ==>(returnType: Type): Type.TFunction = {
+      Type.TFunction(args, returnType)
     }
   }
 
-  case class TypeVariable(name: String) extends Type(name)
+  case class TVariable(name: String) extends Type(name)
 
-  case object IntType extends Type("Int")
+  case object TInt extends Type("Int")
 
-  case object ShortType extends Type("Short")
+  case object TShort extends Type("Short")
 
-  case object ByteType extends Type("Byte")
+  case object TByte extends Type("Byte")
 
-  case object LongType extends Type("Long")
+  case object TLong extends Type("Long")
 
-  case object FloatType extends Type("Float")
+  case object TFloat extends Type("Float")
 
-  case object DoubleType extends Type("Double")
+  case object TDouble extends Type("Double")
 
-  case object BooleanType extends Type("Boolean")
+  case object TBoolean extends Type("Boolean")
 
-  case object UnitType extends Type("Unit")
+  case object TUnit extends Type("Unit")
 
-  case object DynamicType extends Type("*")
+  case object TDynamic extends Type("*")
 
-  case object ErrorType extends Type("!")
+  case object TError extends Type("!")
 
-  case class RecordReference(name: String, paramTypes: List[Type]) extends Type(
+  case class TRecordReference(name: String, paramTypes: List[Type]) extends Type(
     s"#${name}${if(paramTypes == Nil) "" else s"<${paramTypes.mkString(", ")}>"}"
   )
 
@@ -49,11 +49,11 @@ object Type {
     override def toString(): String = s"${l}: ${t}; ${extension}"
   }
 
-  case class RecordConstructor(ts: List[TypeVariable], row: Row) extends Type(s"Record{${row}")
+  case class TRecord(ts: List[TVariable], row: Row) extends Type(s"Record{${row}")
 
-  case class FunctionType(paramTypes: List[Type], returnType: Type) extends Type(s"(${paramTypes.mkString(", ")}) => ${returnType}")
+  case class TFunction(paramTypes: List[Type], returnType: Type) extends Type(s"(${paramTypes.mkString(", ")}) => ${returnType}")
 
-  case class TypeScheme(typeVariables: List[TypeVariable], description: Type)
+  case class TScheme(typeVariables: List[TVariable], description: Type)
 
-  case class TypeConstructor(name: String, ts: List[Type]) extends Type(name + "<" + ts.mkString(", ") + ">")
+  case class TConstructor(name: String, ts: List[Type]) extends Type(name + "<" + ts.mkString(", ") + ">")
 }
