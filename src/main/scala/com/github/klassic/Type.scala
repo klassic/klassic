@@ -39,6 +39,18 @@ object Type {
     s"#${name}${if(paramTypes == Nil) "" else s"<${paramTypes.mkString(", ")}>"}"
   )
 
+  sealed abstract class Row
+
+  case object EmptyRow extends Row {
+    override def toString(): String = "{}"
+  }
+
+  case class RowExtension(l: String, t: Type, extension: Row) extends Row {
+    override def toString(): String = s"${l}: ${t}; ${extension}"
+  }
+
+  case class RecordConstructor(row: Row) extends Type(s"Record{${row}")
+
   case class FunctionType(paramTypes: List[Type], returnType: Type) extends Type(s"(${paramTypes.mkString(", ")}) => ${returnType}")
 
   case class TypeScheme(typeVariables: List[TypeVariable], description: Type)

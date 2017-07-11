@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.Type.{DynamicType, TypeScheme, TypeVariable}
+import com.github.klassic.Type.{DynamicType, RecordConstructor, TypeScheme, TypeVariable}
 
 /**
  * @author Kota Mizushima
@@ -12,7 +12,7 @@ sealed abstract class TypedAST {
 }
 
 object TypedAST {
-  type RecordEnvironment = Map[String, (List[TypeVariable], List[(String, TypeScheme)])]
+  type RecordEnvironment = Map[String, (List[TypeVariable], RecordConstructor)]
 
   sealed trait IntegerSuffix
 
