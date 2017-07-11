@@ -62,7 +62,6 @@ class TypeCheckerSpec extends SpecHelper {
         val e = intercept[TyperException] {
           E(in)
         }
-        println(e)
       }
     }
   }
@@ -99,7 +98,6 @@ class TypeCheckerSpec extends SpecHelper {
         val e = intercept[TyperException] {
           E(in)
         }
-        println(e)
       }
     }
   }
@@ -117,7 +115,6 @@ class TypeCheckerSpec extends SpecHelper {
         val e = intercept[TyperException] {
           E(in)
         }
-        println(e)
       }
     }
   }
@@ -134,7 +131,6 @@ class TypeCheckerSpec extends SpecHelper {
         val e = intercept[TyperException] {
           E(in)
         }
-        println(e)
       }
     }
   }
