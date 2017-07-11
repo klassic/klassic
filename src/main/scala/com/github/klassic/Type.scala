@@ -41,11 +41,11 @@ object Type {
 
   sealed abstract class Row
 
-  case object EmptyRow extends Row {
+  case object TRowEmpty extends Row {
     override def toString(): String = "{}"
   }
 
-  case class RowExtension(l: String, t: Type, e: Row) extends Row {
+  case class TRowExtend(l: String, t: Type, e: Row) extends Row {
     override def toString(): String = s"${l}: ${t}; ${e}"
   }
 
