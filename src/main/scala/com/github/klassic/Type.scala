@@ -13,7 +13,7 @@ object Type {
     }
   }
 
-  case class TVariable(name: String) extends Type(name)
+  case class TVariable(name: String) extends Row(name)
 
   case object TInt extends Type("Int")
 
@@ -39,17 +39,15 @@ object Type {
     s"#${name}${if(paramTypes == Nil) "" else s"<${paramTypes.mkString(", ")}>"}"
   )
 
-  sealed abstract class Row
+  sealed abstract class Row(image: String) extends Type(image)
 
-  case object TRowEmpty extends Row {
-    override def toString(): String = ""
-  }
+  case object TRowEmpty extends Row("")
 
-  case class TRowExtend(l: String, t: Type, e: Row) extends Row {
-    override def toString(): String = s"${l}: ${t}; ${e}"
-  }
+  case class TRowExtend(l: String, t: Type, e: Type) extends Row(
+    s"${l}: ${t}; ${e}"
+  )
 
-  case class TRecord(ts: List[TVariable], row: Row) extends Type(s"Record{ ${row}}")
+  case class TRecord(ts: List[TVariable], row: Type) extends Type(s"Record{ ${row}}")
 
   case class TFunction(paramTypes: List[Type], returnType: Type) extends Type(s"(${paramTypes.mkString(", ")}) => ${returnType}")
 

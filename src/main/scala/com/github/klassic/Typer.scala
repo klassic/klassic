@@ -111,8 +111,6 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     TScheme(typeVariables(t) diff typeVariables(environment), t)
   }
 
-
-
   def unify(t: Type, u: Type, s: Substitution): Substitution = (s(t), s(u)) match {
     case (TVariable(a), TVariable(b)) if a == b =>
       s
@@ -140,12 +138,17 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       s
     case (TRecord(ts1, row1), TRecord(ts2, row2)) =>
       val s0 = (ts1 zip ts2).foldLeft(s){ case (s, (t1, t2)) => unify(t1, t2, s)}
-      val members1 = toList(row1)
-      val members2 = toList(row2)
-      (members1 zip members2).foldLeft(s0) { case (s, ((_, t1), (_, t2))) =>
-        // FIXME If records are deeply nested, unifications fail
-        // To fix it, fixing doTypeRecords() is needed.
-        unify(t1, t2, s)
+      unify(row1, row2, s0)
+    case (TRowEmpty, TRowEmpty) => s
+    case (TRowExtend(label1, type1, rowTail1), row2@TRowExtend(_, _, _)) =>
+      val (type2, rowTail2, theta1) = rewriteRow(row2, label1, s)
+      rowToList(rowTail1)._2 match {
+        case Some(tv) if theta1.contains(tv) => typeError(current.location, "recursive row type")
+        case _ =>
+          val theta2: Substitution = unify(theta1.apply(type1), theta1.apply(type2), theta1)
+          val s2 = theta2 ++++ theta1
+          val theta3 = unify(s2.apply(rowTail1), s2.apply(rowTail2), s2)
+          theta3 ++++ s2
       }
     case (r1@TRecordReference(t1, t2), r2@TRecordReference(u1, u2)) if t1 == u1 =>
       if(t2.length != u2.length) {
@@ -154,18 +157,12 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       (t2 zip u2).foldLeft(s) { case (s, (t, u)) =>
         unify(t, u, s)
       }
-    case (TRecordReference(name, ts), TRecord(us, urow)) =>
+    case (TRecordReference(name, ts), record2@TRecord(us, _)) =>
       if(ts.length != us.length) {
         typeError(current.location, s"type constructor arity mismatch: ${ts.length} != ${us.length}")
       }
-      val s0 = recordEnvironment(name) match { case TRecord(ts, trow) =>
-          val m1 = toList(trow)
-          val m2 = toList(urow)
-          (m1 zip m2).foldLeft(s){ case (s, ((_, t1), (_, t2))) => unify(t1, t2, s)}
-      }
-      (ts zip us).foldLeft(s0) { case (s, (t, u)) =>
-        unify(t, u, s)
-      }
+      val record1 = recordEnvironment(name)
+      unify(record1, record2, s)
     case (r1@TRecord(_, _), r2@TRecordReference(_, _)) =>
       unify(r2, r1, s)
     case (TFunction(t1, t2), TFunction(u1, u2)) if t1.size == u1.size =>
@@ -181,9 +178,35 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     case Nil => TRowEmpty
   }
 
-  def toList(row: Row): List[(String, Type)] = row match {
+  def rowToList(row: Type): (List[(String, Type)], Option[TVariable]) = row match {
+    case tv@TVariable(_) => (Nil, Some(tv))
+    case TRowEmpty => (Nil, None)
+    case TRowExtend(l, t, r) =>
+      val (ls, mv) = rowToList(r)
+      ((l -> t) :: ls, mv)
+    case otherwise => throw TyperPanic("Unexpected: " + otherwise)
+  }
+
+  def toList(row: Type): List[(String, Type)] = row match {
+    case tv@TVariable(_) => sys.error("cannot reach here")
     case TRowExtend(l, t, extension) => (l -> t) :: toList(extension)
     case TRowEmpty => Nil
+    case otherwise => throw TyperPanic("Unexpected: " + otherwise)
+  }
+
+  def rewriteRow(row: Type, newLabel: Label, s: Substitution): (Type, Type, Substitution) = row match {
+    case TRowEmpty => typeError(current.location, s"label ${newLabel} cannot be inserted")
+    case TRowExtend(label, labelType, rowTail) if newLabel == label =>
+      (labelType, rowTail, s)
+    case TRowExtend(label, labelType, alpha@TVariable(_)) =>
+      val beta = newTypeVariable("r")
+      val gamma = newTypeVariable("a")
+      (gamma, TRowExtend(label, labelType, beta), s.extend(alpha, TRowExtend(newLabel, gamma, beta)))
+    case TRowExtend(label, labelType, rowTail) =>
+      val (labelType_, rowTail_, s_) = rewriteRow(rowTail, newLabel, s)
+      (labelType_, TRowExtend(label, labelType, rowTail_), s_)
+    case row =>
+      typeError(current.location, s"Unexpect type: ${row}")
   }
 
   def doTypeRecords(recordDeclarations :List[RecordDeclaration]): RecordEnvironment = {

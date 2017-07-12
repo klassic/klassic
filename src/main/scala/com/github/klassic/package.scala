@@ -45,18 +45,15 @@ package object klassic {
       self.getOrElse(x, x)
     }
 
-    def applyRow(r: Row): Row = r match {
-      case TRowExtend(l, t, e) => TRowExtend(l, apply(t), applyRow(e))
-      case TRowEmpty => TRowEmpty
-    }
-
     def apply(t: Type): Type = t match {
       case tv@TVariable(a) =>
         val u = lookup(tv)
         if (t == u) t else apply(u)
       case TFunction(t1, t2) => TFunction(t1.map{ t => apply(t)}, apply(t2))
       case TRecordReference(name, ts) => TRecordReference(name, ts.map{ t => apply(t)})
-      case TRecord(ts, row) => TRecord(ts, applyRow(row))
+      case TRecord(ts, row) => TRecord(ts, apply(row))
+      case TRowEmpty => t
+      case TRowExtend(l, t, r) => TRowExtend(l, apply(t), apply(r))
       case TInt => TInt
       case TShort => TShort
       case TByte => TByte
@@ -80,7 +77,7 @@ package object klassic {
 
     def remove(tv: TVariable): Substitution = self - tv
 
-    def compose(that: Substitution): Substitution = {
+    def ++++(that: Substitution): Substitution = {
       val s1 = self
       val s2 = that
       s2.mapValues{t => s1.apply(t)} ++ s1
@@ -90,6 +87,7 @@ package object klassic {
   def typeVariables(r: Row): List[TVariable] = r match {
     case TRowExtend(l, t, e) => typeVariables(t) union typeVariables(e)
     case TRowEmpty => Nil
+    case tv@TVariable(_) => List(tv)
   }
 
   def typeVariables(t: Type): List[TVariable] = t match {
@@ -119,6 +117,10 @@ package object klassic {
       t1.flatMap{typeVariables} union typeVariables(t2)
     case TRecordReference(name, ts) =>
       List(ts.flatMap{ case t => typeVariables(t)}:_*)
+    case TRowEmpty =>
+      Nil
+    case TRowExtend(l, t, r) =>
+      typeVariables(r) union typeVariables(t)
     case TRecord(ts, row) =>
       ts union typeVariables(row)
     case TConstructor(k, ts) =>
