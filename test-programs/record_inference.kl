@@ -1,0 +1,9 @@
+record P {
+  x: Int
+  y: Int
+  z: Int
+}
+def add_xy(o) = {
+  o.x + o.y
+}
+assert(3 == add_xy(#P(1, 2, 3)))

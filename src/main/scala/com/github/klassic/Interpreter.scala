@@ -333,9 +333,11 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     }
   }
 
-  def toList(row: Row): List[(String, Type)] = row match {
+  def toList(row: Type): List[(String, Type)] = row match {
+    case tv@TVariable(_) => sys.error("cannot reach here")
     case TRowExtend(l, t, extension) => (l -> t) :: toList(extension)
     case TRowEmpty => Nil
+    case otherwise => throw TyperPanic("Unexpected: " + otherwise)
   }
 
   final def interpret(program: TypedAST.Program): Value = {
