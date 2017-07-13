@@ -271,18 +271,24 @@ class Parser extends Processor[String, Program] {
     | invocation
     )
 
-    lazy val invocation: Parser[AST] = % ~ recordAccess ~ ((CL(ARROW2) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
+    lazy val invocation: Parser[AST] = % ~ recordSelect ~ ((CL(ARROW2) ~> ident) ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)).* ^^ {
       case location ~ self ~ Nil =>
         self
       case location ~ self ~ npList =>
         npList.foldLeft(self) { case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil)) }
     }
 
-    lazy val recordAccess: Parser[AST] = % ~ application ~ ((CL(DOT) ~> (% ~ ident))).* ^^ {
+    lazy val recordSelect: Parser[AST] = % ~ application ~ ((CL(DOT) ~> (% ~ ident ~ opt(CL(LPAREN) ~> repsep(expression, CL(COMMA)) <~ RPAREN)))).* ^^ {
       case location ~ self ~ names =>
-        val ns = names.map { case l ~ n => (l, n.name) }
-        ns.foldLeft(self) { case (e, (l, n)) =>
-          RecordSelect(l, e, n)
+        val ns = names.map {
+          case l ~ n ~ Some(params) => (l, n.name, Some(params))
+          case l ~ n ~ None => (l, n.name, None)
+        }
+        ns.foldLeft(self) { case (e, (l, n, optParams)) =>
+          optParams match {
+            case Some(params) => RecordCall(l, e, n, params)
+            case None => RecordSelect(l, e, n)
+          }
         }
     }
 

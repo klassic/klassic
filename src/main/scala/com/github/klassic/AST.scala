@@ -91,6 +91,8 @@ object AST {
 
   case class RecordSelect(location: Location, record: AST, label: String) extends AST
 
+  case class RecordCall(location: Location, self: AST, name: String, params: List[AST]) extends AST
+
   case class Let(location: Location, variable: String, description: Option[Type], value: AST, body: AST, immutable: Boolean) extends AST
   object Let {
     def apply(variable: String, description: Option[Type], value: AST, body: AST): Let = {

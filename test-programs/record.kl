@@ -21,6 +21,11 @@ record X2 {
   g: #GPoint<Int, Int>
 }
 
+record S {
+  v: Int
+  to_string: (*) => *
+}
+
 record GPoint<'x, 'y> {
   x: 'x
   y: 'y
@@ -30,6 +35,12 @@ record Pair <'a, 'b> {
   _1: 'a
   _2: 'b
 }
+
+val s = #S(100, (this) => {
+  "#{(this :> #S).v}"
+})
+
+assert("100" == s.to_string())
 
 val stub = #Stub(#GPoint(3, 5))
 assertResult(3)(stub.p.x)
