@@ -5,15 +5,20 @@
 Klassic **is** Yet Another Programming Language.  Although Klassic is a dynamically-typed
 language currently, it will be a statically typed programming language.  Klassic has: 
 
-* type system, which is based on Hindley-Milner type system
-* lexically-scoped variables
-* first-class functions
-* here documents
-* loop expression
-* cleanup clause
-* space-sensitive and line-sensitive list literals
-* space-sensitive and line-sensitive map literals
-* space-sensitive and line-sensitive set literals
+* Powerful Type System
+  * is based on Hindley-Milner type system
+  * supports object system based on row polymorphism
+* Lexically-scoped Fariables
+* First-class Functions
+* Here Documents
+  * found in Ruby, Scala, Kotlin, etc.
+* Loop Expression
+  * while and foreach
+* Cleanup Expression
+* Space-sensitive and Line-sensitive Syntaxes
+  * list literals
+  * map literals
+  * set literals
 * Java FFI
 * , etc.
 
@@ -84,14 +89,15 @@ fact(5) // 120
 
 ```
 val list = new java.util.ArrayList
-list.add(1)
-list.add(2)
-list.add(3)
-list.add(4)
+list->add(1)
+list->add(2)
+list->add(3)
+list->add(4)
 println(list)
 ```
 
-Currently, only method invocations to Java objects are acceptable.  Boxing of primitive types is automatically done.
+Currently, only method invocations to Java objects are acceptable.  Boxing of primitive types 
+is automatically done.
 
 ### Function Invocation
 
@@ -160,7 +166,7 @@ val set1 = %(1, 2, 3)
 ```
 
 ```
-val set2 = %(1 2 3) // spae is omitted
+val set2 = %(1 2 3) // space is omitted
 ```
 
 ```
@@ -173,7 +179,7 @@ val set3 = %(
 
 The type of set literal is a instance of special type constructor `Set<'a>`.
 
-### Cleanup Clause
+### Cleanup Expression
 
 Cleanup clauses are executed after the blocks are executed.  For example,
 
@@ -272,4 +278,51 @@ Klassic provides two kinds of comment
 ```
 1 + // comment
     2 // => 3
+```
+
+## Type System
+
+Klassic is a statically-typed programming language.  A characteristic of type
+system of Klassic is `restricted` subtyping.  `restricted` means that implicit
+upcast is not allowed and it must be specified explicitly if you need it.
+
+### Hindley-Milner Type Inference
+
+Klassic's type inference is based on HM.  It means that type annotations
+is not required in many cases:
+
+```
+def fold_left(list) = (z) => (f) => {
+  if(isEmpty(list)) z else fold_left(tail(list))(f(z, head(list)))(f)
+}
+// The result of type inference: List<'a> => 'b => (('b, 'a) => 'b) => 'b
+```
+
+### Row Polymorphism
+
+Klassic has simple object system based on row polymorphism.  For example,
+
+```
+def add(o) = {
+  o.x + o.y
+}
+```
+
+the type of above program is inferred:
+
+```
+add: { x: Int; y: Int; ... } 
+```
+
+It means that `add` function accepts any object that has field `x` and field `y`.
+Although it is not subtyping strictly, many situations that need subtypings are
+covered.
+
+### Type Cast
+
+In some cases, escape hatches from type system is required. In such a case,
+user can insert cast explicitly.
+
+```
+val s: * = (100 :> *) // 100 is casted to dynamic type ( `*` )
 ```
