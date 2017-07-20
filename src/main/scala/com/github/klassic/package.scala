@@ -38,21 +38,23 @@ package object klassic {
 
   type Environment = Map[String, TScheme]
 
-  class Substitution(val map: Map[TVariable, Type]) extends AnyVal {
+  type Substitution = Map[TVariable, Type]
+
+  implicit class RichSubstitution(val self: Map[TVariable, Type]) extends AnyVal {
     def lookup(x: TVariable): Type = {
-      map.getOrElse(x, x)
+      self.getOrElse(x, x)
     }
 
-    def apply(ty: Type): Type = ty match {
+    def replace(ty: Type): Type = ty match {
       case tv@TVariable(a) =>
         val u = lookup(tv)
-        if (ty == u) ty else apply(u)
-      case TFunction(t1, t2) => TFunction(t1.map{ t => apply(t)}, apply(t2))
-      case TRecordReference(name, ts) => TRecordReference(name, ts.map{ t => apply(t)})
-      case TRecord(ts, row) => TRecord(ts, apply(row))
+        if (ty == u) ty else replace(u)
+      case TFunction(t1, t2) => TFunction(t1.map{ t => replace(t)}, replace(t2))
+      case TRecordReference(name, ts) => TRecordReference(name, ts.map{ t => replace(t)})
+      case TRecord(ts, row) => TRecord(ts, replace(row))
       case TRowEmpty => ty
       case tr@TRowExtend(l, t, r) =>
-        TRowExtend(l, apply(t), apply(r))
+        TRowExtend(l, replace(t), replace(r))
       case TInt => TInt
       case TShort => TShort
       case TByte => TByte
@@ -63,28 +65,26 @@ package object klassic {
       case TUnit => TUnit
       case TDynamic => TDynamic
       case TError => TError
-      case TConstructor(name, args) => TConstructor(name, args.map{ arg => apply(arg)})
+      case TConstructor(name, args) => TConstructor(name, args.map{ arg => replace(arg)})
     }
 
     def apply(env: Environment): Environment = {
       env.map { case (x, ts) =>
-        x -> TScheme(typeVariables(ts), this.apply(ts.stype))
+        x -> TScheme(typeVariables(ts), replace(ts.stype))
       }
     }
 
     def extend(tv: TVariable, td: Type): Substitution = {
-      new Substitution(this.map + (tv -> td))
+      self + (tv -> td)
     }
 
-    def remove(tv: TVariable): Substitution = new Substitution(this.map - tv)
+    def remove(tv: TVariable): Substitution = self - tv
 
-    def ++++(that: Substitution): Substitution = {
-      val s1 = this
+    def union(that: Substitution): Substitution = {
+      val s1 = self
       val s2 = that
-      new Substitution(s2.map.mapValues{t => s1.apply(t)} ++ s1.map)
+      s2.mapValues{t => s1.replace(t)} ++ s1
     }
-
-    override def toString(): String = map.toString()
   }
 
   def typeVariables(r: Row): List[TVariable] = r match {
