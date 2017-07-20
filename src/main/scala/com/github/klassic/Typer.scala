@@ -91,7 +91,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   }
 
   def newInstanceFrom(scheme: TScheme): Type = {
-    scheme.svariables.foldLeft(EmptySubstitution)((s, tv) => s.extend(tv, newTypeVariable())).apply(scheme.stype)
+    scheme.svariables.foldLeft(EmptySubstitution)((s, tv) => s.extend(tv, newTypeVariable())).replace(scheme.stype)
   }
   private var n: Int = 0
   private var m: Int = 0
@@ -101,7 +101,8 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   def newTypeVariable(name: String) = {
     m += 1; TVariable(name + m)
   }
-  val EmptySubstitution: Substitution = new Substitution(Map.empty)
+
+  val EmptySubstitution: Substitution = Map.empty
 
   def lookup(x: String, environment: Environment): Option[TScheme] = environment.get(x) match {
     case Some(t) => Some(t)
@@ -112,7 +113,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     TScheme(typeVariables(t) diff typeVariables(environment), t)
   }
 
-  def unify(t: Type, u: Type, s: Substitution): Substitution = (s(t), s(u)) match {
+  def unify(t: Type, u: Type, s: Substitution): Substitution = (s.replace(t), s.replace(u)) match {
     case (TVariable(a), TVariable(b)) if a == b =>
       s
     case (TVariable(a), _) if !(typeVariables(u) contains a) =>
@@ -144,12 +145,12 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     case (TRowExtend(label1, type1, rowTail1), row2@TRowExtend(_, _, _)) =>
       val (type2, rowTail2, theta1) = rewriteRow(row2, label1, s)
       toList(rowTail1)._2 match {
-        case Some(tv) if theta1.map.contains(tv) => typeError(current.location, "recursive row type")
+        case Some(tv) if theta1.contains(tv) => typeError(current.location, "recursive row type")
         case _ =>
-          val theta2: Substitution = unify(theta1.apply(type1), theta1.apply(type2), theta1)
-          val s2 = theta2 ++++ theta1
-          val theta3 = unify(s2.apply(rowTail1), s2.apply(rowTail2), s2)
-          theta3 ++++ s2
+          val theta2: Substitution = unify(theta1.replace(type1), theta1.replace(type2), theta1)
+          val s2 = theta2 union theta1
+          val theta3 = unify(s2.replace(rowTail1), s2.replace(rowTail2), s2)
+          theta3 union s2
       }
     case (r1@TRecordReference(t1, t2), r2@TRecordReference(u1, u2)) if t1 == u1 =>
       if(t2.length != u2.length) {
@@ -171,7 +172,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     case (TConstructor(k1, ts), TConstructor(k2, us)) if k1 == k2 =>
       (ts zip us).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
     case _ =>
-      typeError(current.location, s"cannot unify ${s(t)} with ${s(u)}")
+      typeError(current.location, s"cannot unify ${s.replace(t)} with ${s.replace(u)}")
   }
 
   def toRow(bindings: List[(String, Type)]): Row = bindings match {
@@ -234,7 +235,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     val a = newTypeVariable()
     val r = new SyntaxRewriter
     val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, records, modules, None), a, EmptySubstitution)
-    s(a)
+    s.replace(a)
   }
 
   def insertMember(record: TRecord, l1: Label, l1Type: Type, rowVariable: TVariable, s: Substitution): (TRecord, Substitution) = {
@@ -242,7 +243,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       case r@TRowExtend(l2, l2Type, rowTail) if l1 == l2 =>
         val (r, sx) = insert(rowTail)
         val sy = unify(l1Type, l2Type, sx)
-        (TRowExtend(l1, sy(l2Type), r), sy)
+        (TRowExtend(l1, sy.replace(l2Type), r), sy)
       case TRowExtend(l2, l2Type, rowTail) =>
         val (r, sx) = insert(rowTail)
         (TRowExtend(l2, l2Type, r), sx)
@@ -266,7 +267,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             (TypedAST.Block(TUnit, location, Nil), s0)
           case x::Nil =>
             val (typedX, newSub) = doType(x, env, t, s0)
-            (TypedAST.Block(newSub(t), location, typedX::Nil), newSub)
+            (TypedAST.Block(newSub.replace(t), location, typedX::Nil), newSub)
           case x::xs =>
             val t = newTypeVariable()
             val ts = xs.map{_ => newTypeVariable()}
@@ -275,29 +276,29 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
               val (e2, s2) = doType(e, env, t, s)
               (e2::a, s2)
             }
-            (TypedAST.Block(s2(ts.last), location, reversedTypedElements.reverse), s2)
+            (TypedAST.Block(s2.replace(ts.last), location, reversedTypedElements.reverse), s2)
         }
       case AST.IntNode(location, value) =>
         val newSub = unify(t, TInt, s0)
-        (TypedAST.IntNode(newSub(t), location, value), newSub)
+        (TypedAST.IntNode(newSub.replace(t), location, value), newSub)
       case AST.ShortNode(location, value) =>
         val newSub = unify(t, TShort, s0)
-        (TypedAST.ShortNode(newSub(t), location, value), newSub)
+        (TypedAST.ShortNode(newSub.replace(t), location, value), newSub)
       case AST.ByteNode(location, value) =>
         val newSub = unify(t, TByte, s0)
-        (TypedAST.ByteNode(newSub(t), location, value), newSub)
+        (TypedAST.ByteNode(newSub.replace(t), location, value), newSub)
       case AST.LongNode(location, value) =>
         val newSub = unify(t, TLong, s0)
-        (TypedAST.LongNode(newSub(t), location, value), newSub)
+        (TypedAST.LongNode(newSub.replace(t), location, value), newSub)
       case AST.FloatNode(location, value) =>
         val newSub = unify(t, TFloat, s0)
-        (TypedAST.FloatNode(newSub(t), location, value), newSub)
+        (TypedAST.FloatNode(newSub.replace(t), location, value), newSub)
       case AST.DoubleNode(location, value) =>
         val newSub = unify(t, TDouble, s0)
-        (TypedAST.DoubleNode(newSub(t), location, value), newSub)
+        (TypedAST.DoubleNode(newSub.replace(t), location, value), newSub)
       case AST.BooleanNode(location, value) =>
         val newSub = unify(t, TBoolean, s0)
-        (TypedAST.BooleanNode(newSub(t), location, value), newSub)
+        (TypedAST.BooleanNode(newSub.replace(t), location, value), newSub)
       case AST.SimpleAssignment(location, variable, value) =>
         if(env.immutableVariables.contains(variable)) {
           typeError(location, s"variable '$variable' cannot change")
@@ -314,7 +315,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val (typedCondition, newSub1) = doType(cond, env, TBoolean, s0)
         val (posTyped, newSub2) = doType(pos, env, t, newSub1)
         val (negTyped, newSub3) = doType(neg, env, t, newSub2)
-        (TypedAST.IfExpression(newSub3(t), location, typedCondition, posTyped, negTyped), newSub3)
+        (TypedAST.IfExpression(newSub3.replace(t), location, typedCondition, posTyped, negTyped), newSub3)
       case AST.WhileExpression(location, condition, body) =>
         val a = newTypeVariable()
         val b = newTypeVariable()
@@ -331,7 +332,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
-        val (resultType, s3) = (s2(a), s2(b)) match {
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
           case (TInt, TInt) =>
             (TBoolean, s2)
           case (TLong, TLong) =>
@@ -356,7 +357,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             val sx = (ts1 zip ts2).foldLeft(s0) { case (s, (t1, t2)) =>
                 unify(t1, t2, s)
             }
-            (sx(a), sx)
+            (sx.replace(a), sx)
           case (ltype, rtype) =>
             val s3 = unify(TInt, ltype, s2)
             val s4 = unify(TInt, rtype, s3)
@@ -368,7 +369,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
-        val (resultType, s3) = (s2(a), s2(b)) match {
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
           case (TInt, TInt) =>
             (TBoolean, s2)
           case (TLong, TLong) =>
@@ -398,7 +399,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
-        val (resultType, s3) = (s2(a), s2(b)) match {
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
           case (TInt, TInt) =>
             (TBoolean, s2)
           case (TLong, TLong) =>
@@ -428,7 +429,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
-        val (resultType, s3) = (s2(a), s2(b)) match {
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
           case (TInt, TInt) =>
             (TBoolean, s2)
           case (TLong, TLong) =>
@@ -458,7 +459,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
-        val (resultType, s3) = (s2(a), s2(b)) match {
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
           case (TInt, TInt) =>
             (TBoolean, s2)
           case (TLong, TLong) =>
@@ -488,7 +489,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
-        val (resultType, s3) = (s2(a), s2(b)) match {
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
           case (TInt, TInt) =>
             (TInt, s2)
           case (TLong, TLong) =>
@@ -522,7 +523,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
-        val (resultType, s3) = (s2(a), s2(b)) match {
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
           case (TInt, TInt) =>
             (TInt, s2)
           case (TLong, TLong) =>
@@ -552,7 +553,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
-        val (resultType, s3) = (s2(a), s2(b)) match {
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
           case (TInt, TInt) =>
             (TInt, s2)
           case (TLong, TLong) =>
@@ -582,7 +583,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
-        val (resultType, s3) = (s2(a), s2(b)) match {
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
           case (TInt, TInt) =>
             (TInt, s2)
           case (TLong, TLong) =>
@@ -611,7 +612,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       case AST.MinusOp(location, operand) =>
         val a = newTypeVariable()
         val (typedOperand, s1) = doType(operand, env, a, s0)
-        val (resultType, s2) = s1(a) match {
+        val (resultType, s2) = s1.replace(a) match {
           case TInt  =>
             (TInt, s1)
           case TLong =>
@@ -634,7 +635,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       case AST.PlusOp(location, operand) =>
         val a = newTypeVariable()
         val (typedOperand, s1) = doType(operand, env, a, s0)
-        val (resultType, s2) = s1(a) match {
+        val (resultType, s2) = s1.replace(a) match {
           case TInt  =>
             (TInt, s1)
           case TLong =>
@@ -673,14 +674,14 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           case None => typeError(location, s"variable '${name}' is not found")
           case Some(u) => unify(newInstanceFrom(u), t, s0)
         }
-        val resultType = s1(t)
+        val resultType = s1.replace(t)
         (TypedAST.Id(resultType, location, name), s1)
       case AST.Selector(location, module, name) =>
         val s1 = env.lookupModuleMember(module, name) match {
           case None => typeError(location, s"module '${module}' or member '${name}' is not found")
           case Some(u) => unify(newInstanceFrom(u), t, s0)
         }
-        val resultType = s1(t)
+        val resultType = s1.replace(t)
         (TypedAST.Selector(resultType, location, module, name), s1)
       case AST.RecordSelect(location, expression, memberName) =>
         val t0 = newTypeVariable()
@@ -698,14 +699,14 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
                     val (newRecord, s2) = insertMember(record, memberName, a, r, s1)
                     val s3 = unify(record, newRecord, s2)
                     val s4 = unify(t, a, s3)
-                    (TypedAST.RecordSelect(s4(a), location, te, memberName), s4)
+                    (TypedAST.RecordSelect(s4.replace(a), location, te, memberName), s4)
                   case (members, None) =>
                     members.find{ case (mname, mtype) => memberName == mname} match {
                       case None =>
                         throw typeError(location, s"member ${memberName} is not found in record ${recordName}")
                       case Some((mname, mtype)) =>
                         val sx = unify(mtype, t, s1)
-                        (TypedAST.RecordSelect(sx(t), location, te, mname), sx)
+                        (TypedAST.RecordSelect(sx.replace(t), location, te, mname), sx)
                     }
                 }
             }
@@ -717,7 +718,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             )
             val s3 = unify(tv, record, s2)
             val s4 = unify(t, a, s3)
-            (TypedAST.RecordSelect(s4(a), location, te, memberName), s4)
+            (TypedAST.RecordSelect(s4.replace(a), location, te, memberName), s4)
           case record@TRecord(ts, row) =>
             toList(row) match {
               case (members, None) =>
@@ -726,7 +727,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
                     throw typeError(location, s"member ${memberName} is not found in record ${record}")
                   case Some((mname, mtype)) =>
                     val sx = unify(mtype, t, s1)
-                    (TypedAST.RecordSelect(sx(t), location, te, mname), sx)
+                    (TypedAST.RecordSelect(sx.replace(t), location, te, mname), sx)
                 }
               case (members, Some(_)) =>
                 val a = newTypeVariable("a")
@@ -734,7 +735,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
                 val (newRecord, s2) = insertMember(record, memberName, a, r, s1)
                 val s3 = unify(record, newRecord, s2)
                 val s4 = unify(t, a, s3)
-                (TypedAST.RecordSelect(s4(a), location, te, memberName), s4)
+                (TypedAST.RecordSelect(s4.replace(a), location, te, memberName), s4)
             }
           case _ =>
             typeError(location, s"${t} is not record type")
@@ -746,7 +747,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val s1 = unify(t, TFunction(ts, b), s0)
         val env1 = as.foldLeft(env) { case (env, (name, scheme)) => env.updateImmuableVariable(name, scheme)}
         val (typedBody, s2) = doType(body, env1, b, s1)
-        (TypedAST.FunctionLiteral(s2(t), location, params, optionalType, typedBody), s2)
+        (TypedAST.FunctionLiteral(s2.replace(t), location, params, optionalType, typedBody), s2)
       case AST.Let(location, variable, optionalType, value, body, immutable) =>
         if(env.variables.contains(variable)) {
           typeError(location, s"variable $variable is already defined")
@@ -763,9 +764,9 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             otherwise
         }.getOrElse(newTypeVariable())
         val (typedValue, s1) = doType(value, env, a, s0)
-        val s2 = unify(s1(a), typedValue.description, s1)
-        val gen = generalize(s2(a), env.variables)
-        val declaredType = s2(a)
+        val s2 = unify(s1.replace(a), typedValue.description, s1)
+        val gen = generalize(s2.replace(a), env.variables)
+        val declaredType = s2.replace(a)
         val newEnv = if(immutable) {
           env.updateImmuableVariable(variable, generalize(declaredType, env.variables))
         } else {
@@ -781,7 +782,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val b = newTypeVariable()
         val (typedE1, s1) = doType(value, env.updateImmuableVariable(variable, TScheme(List(), a)), b, s0)
         val s2 = unify(a, b, s1)
-        val (typedE2, s3) = doType(body, env.updateImmuableVariable(variable, generalize(s2(a), s2(env.variables))), t, s2)
+        val (typedE2, s3) = doType(body, env.updateImmuableVariable(variable, generalize(s2.replace(a), s2(env.variables))), t, s2)
         val x = newTypeVariable()
         val (typedCleanup, s4) = cleanup.map{c => doType(c, env, x, s3)} match {
           case Some((c, s)) => (Some(c), s)
@@ -795,7 +796,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           val (tparam, sx) = doType(e, env, t, s)
           (tparam::tparams, sx)
         }
-        (TypedAST.FunctionCall(s2(t), location, typedTarget, tparams.reverse), s2)
+        (TypedAST.FunctionCall(s2.replace(t), location, typedTarget, tparams.reverse), s2)
       case AST.ListLiteral(location, elements) =>
         val a = newTypeVariable()
         val listOfA = listOf(a)
@@ -804,7 +805,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           (te::tes, sx)
         }
         val sy = unify(listOfA, t, sx)
-        (TypedAST.ListLiteral(sy(t), location, tes.reverse), sy)
+        (TypedAST.ListLiteral(sy.replace(t), location, tes.reverse), sy)
       case AST.SetLiteral(location, elements) =>
         val a = newTypeVariable()
         val setOfA = setOf(a)
@@ -813,7 +814,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           (te::tes, sx)
         }
         val sy = unify(setOfA, t, sx)
-        (TypedAST.SetLiteral(sy(t), location, tes.reverse), sy)
+        (TypedAST.SetLiteral(sy.replace(t), location, tes.reverse), sy)
       case AST.MapLiteral(location, elements) =>
         val kt = newTypeVariable()
         val vt = newTypeVariable()
@@ -824,7 +825,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           ((typedK -> typedY)::tes, sy)
         }
         val sy = unify(mapOfKV, t, sx)
-        (TypedAST.MapLiteral(sy(t), location, tes.reverse), sy)
+        (TypedAST.MapLiteral(sy.replace(t), location, tes.reverse), sy)
       case AST.ObjectNew(location, className, params) =>
         val ts = params.map{_ => newTypeVariable()}
         val (tes, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s0)){ case ((tes, s), (e, t)) =>
@@ -865,7 +866,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       case AST.MethodCall(location, receiver, name, params) =>
         val a = newTypeVariable()
         val (typedReceiver, s1) = doType(receiver, env, a, s0)
-        val s2 = unify(s0(a), TDynamic, s1)
+        val s2 = unify(s0.replace(a), TDynamic, s1)
         val ts = params.map{_ => newTypeVariable()}
         val (tes, sx) = (params zip ts).foldLeft((Nil:List[TypedAST], s2)){ case ((tes, s), (e, t)) =>
           val (te, sx) = doType(e, env, t, s)
