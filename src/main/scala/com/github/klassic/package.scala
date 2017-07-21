@@ -2,7 +2,7 @@ package com.github
 
 import java.io.{BufferedReader, FileInputStream, InputStreamReader}
 
-import com.github.klassic.Type.{Row, TBoolean, TByte, TConstructor, TDouble, TDynamic, TError, TFloat, TFunction, TInt, TLong, TRecord, TRecordReference, TRowEmpty, TRowExtend, TScheme, TShort, TUnit, TVariable}
+import com.github.klassic.Type.{Row, TBoolean, TByte, TConstructor, TDouble, TDynamic, TError, TFloat, TFunction, TInt, TLong, TRecord, TRecordReference, TRowEmpty, TRowExtend, TScheme, TShort, TString, TUnit, TVariable}
 
 import scala.language.reflectiveCalls
 
@@ -63,6 +63,7 @@ package object klassic {
       case TDouble => TDouble
       case TBoolean => TBoolean
       case TUnit => TUnit
+      case TString => TString
       case TDynamic => TDynamic
       case TError => TError
       case TConstructor(name, args) => TConstructor(name, args.map{ arg => replace(arg)})
@@ -111,6 +112,8 @@ package object klassic {
     case TBoolean =>
       Nil
     case TUnit =>
+      Nil
+    case TString =>
       Nil
     case TDynamic =>
       Nil
