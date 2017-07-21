@@ -134,6 +134,12 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       s
     case (TBoolean, TBoolean) =>
       s
+    case (TString, TString) =>
+      s
+    case (TString, TDynamic) =>
+      s
+    case (TDynamic, TString) =>
+      s
     case (TUnit, TUnit) =>
       s
     case (TDynamic, TDynamic) =>
@@ -347,6 +353,12 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             (TBoolean, s2)
           case (TBoolean, TBoolean) =>
             (TBoolean, s2)
+          case (TString, TString) =>
+            (TBoolean, s2)
+          case (TString, TDynamic) =>
+            (TBoolean, s2)
+          case (TDynamic, TString) =>
+            (TBoolean, s2)
           case (TDynamic, TDynamic) =>
             (TBoolean, s2)
           case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
@@ -508,6 +520,10 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             (y, unify(x, y, s2))
           case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
             (x, unify(x, y, s2))
+          case (TString, other) =>
+            (TString, s2)
+          case (other, TString) =>
+            (TString, s2)
           case (TDynamic, other) =>
             (TDynamic, s2)
           case (other, TDynamic) =>
@@ -667,7 +683,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val s3 = unify(TBoolean, t, s2)
         (TypedAST.BinaryExpression(TBoolean, location, Operator.BAR2, typedLhs, typedRhs), s3)
       case AST.StringNode(location, value) =>
-        val s1 = unify(TDynamic, t, s0)
+        val s1 = unify(TString, t, s0)
         (TypedAST.StringNode(TDynamic, location, value), s1)
       case AST.Id(location, name) =>
         val s1 = env.lookup(name) match {

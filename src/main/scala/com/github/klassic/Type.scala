@@ -31,6 +31,8 @@ object Type {
 
   case object TUnit extends Type("Unit")
 
+  case object TString extends Type("String")
+
   case object TDynamic extends Type("*")
 
   case object TError extends Type("!")
