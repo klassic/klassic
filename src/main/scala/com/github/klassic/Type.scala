@@ -46,10 +46,13 @@ object Type {
   case object TRowEmpty extends Row("")
 
   case class TRowExtend(l: String, t: Type, e: Type) extends Row(
-    s"${l}: ${t}; ${e}"
+    e match {
+      case TVariable(_) => s"${l}: ${t}; ..."
+      case _ => s"${l}: ${t}; ${e}"
+    }
   )
 
-  case class TRecord(ts: List[TVariable], row: Type) extends Type(s"Record{ ${row}}")
+  case class TRecord(ts: List[TVariable], row: Type) extends Type(s"record { ${row}}")
 
   case class TFunction(paramTypes: List[Type], returnType: Type) extends Type(s"(${paramTypes.mkString(", ")}) => ${returnType}")
 
