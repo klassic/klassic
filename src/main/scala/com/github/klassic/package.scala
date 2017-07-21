@@ -49,23 +49,38 @@ package object klassic {
       case tv@TVariable(a) =>
         val u = lookup(tv)
         if (ty == u) ty else replace(u)
-      case TFunction(t1, t2) => TFunction(t1.map{ t => replace(t)}, replace(t2))
-      case TRecordReference(name, ts) => TRecordReference(name, ts.map{ t => replace(t)})
-      case TRecord(ts, row) => TRecord(ts, replace(row))
-      case TRowEmpty => ty
+      case TFunction(t1, t2) =>
+        TFunction(t1.map{ t => replace(t)}, replace(t2))
+      case TRecordReference(name, ts) =>
+        TRecordReference(name, ts.map{ t => replace(t)})
+      case TRecord(ts, row) =>
+        TRecord(ts, replace(row))
+      case TRowEmpty =>
+        ty
       case tr@TRowExtend(l, t, r) =>
         TRowExtend(l, replace(t), replace(r))
-      case TInt => TInt
-      case TShort => TShort
-      case TByte => TByte
-      case TLong => TLong
-      case TFloat => TFloat
-      case TDouble => TDouble
-      case TBoolean => TBoolean
-      case TUnit => TUnit
-      case TString => TString
-      case TDynamic => TDynamic
-      case TError => TError
+      case TInt =>
+        TInt
+      case TShort =>
+        TShort
+      case TByte =>
+        TByte
+      case TLong =>
+        TLong
+      case TFloat =>
+        TFloat
+      case TDouble =>
+        TDouble
+      case TBoolean =>
+        TBoolean
+      case TUnit =>
+        TUnit
+      case TString =>
+        TString
+      case TDynamic =>
+        TDynamic
+      case TError =>
+        TError
       case TConstructor(name, args) => TConstructor(name, args.map{ arg => replace(arg)})
     }
 
