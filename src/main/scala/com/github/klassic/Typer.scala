@@ -684,7 +684,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         (TypedAST.BinaryExpression(TBoolean, location, Operator.BAR2, typedLhs, typedRhs), s3)
       case AST.StringNode(location, value) =>
         val s1 = unify(TString, t, s0)
-        (TypedAST.StringNode(TDynamic, location, value), s1)
+        (TypedAST.StringNode(TString, location, value), s1)
       case AST.Id(location, name) =>
         val s1 = env.lookup(name) match {
           case None => typeError(location, s"variable '${name}' is not found")
