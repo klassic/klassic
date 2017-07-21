@@ -29,11 +29,11 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     val a = newTypeVariable()
     val b = newTypeVariable()
     Map(
-      "url" -> TScheme(List(), TFunction(List(TDynamic), TDynamic)),
-      "uri" -> TScheme(List(), TFunction(List(TDynamic), TDynamic)),
-      "substring" -> TScheme(List(), TFunction(List(TDynamic, TInt, TInt), TDynamic)),
+      "url" -> TScheme(List(), TFunction(List(TString), TDynamic)),
+      "uri" -> TScheme(List(), TFunction(List(TString), TDynamic)),
+      "substring" -> TScheme(List(), TFunction(List(TString, TInt, TInt), TString)),
       "at" -> TScheme(List(), TFunction(List(TDynamic, TInt), TDynamic)),
-      "matches" -> TScheme(List(), TFunction(List(TDynamic, TDynamic), TBoolean)),
+      "matches" -> TScheme(List(), TFunction(List(TString, TString), TBoolean)),
       "thread" -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TDynamic)),
       "println" ->  TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
       "stopwatch" -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TInt)),
