@@ -699,63 +699,8 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         }
         val resultType = s.replace(t)
         (TypedAST.Selector(resultType, location, module, name), s)
-      case AST.RecordSelect(location, expression, memberName) =>
-        val t0 = newTypeVariable()
-        val (te, s1) = doType(expression, env, t0, s0)
-        te.description match {
-          case TRecordReference(recordName, paramTypes)=>
-            env.records.get(recordName) match {
-              case None =>
-                typeError(location, s"record ${recordName} is not found")
-              case Some(record) =>
-                toList(record.row) match {
-                  case (members, Some(_)) =>
-                    val a = newTypeVariable("a")
-                    val r = newTypeVariable("r")
-                    val (newRecord, s2) = insertMember(record, memberName, a, r, s1)
-                    val s3 = unify(record, newRecord, s2)
-                    val s4 = unify(t, a, s3)
-                    (TypedAST.RecordSelect(s4.replace(a), location, te, memberName), s4)
-                  case (members, None) =>
-                    members.find{ case (mname, mtype) => memberName == mname} match {
-                      case None =>
-                        throw typeError(location, s"member ${memberName} is not found in record ${recordName}")
-                      case Some((mname, mtype)) =>
-                        val s = unify(mtype, t, s1)
-                        (TypedAST.RecordSelect(s.replace(t), location, te, mname), s)
-                    }
-                }
-            }
-          case tv@(TVariable(_)) =>
-            val a = newTypeVariable("a")
-            val r = newTypeVariable("r")
-            val (record, s2) = insertMember(
-              TRecord(Nil, r), memberName, a, r, s1
-            )
-            val s3 = unify(tv, record, s2)
-            val s = unify(t, a, s3)
-            (TypedAST.RecordSelect(s.replace(a), location, te, memberName), s)
-          case record@TRecord(ts, row) =>
-            toList(row) match {
-              case (members, None) =>
-                members.find{ case (mname, mtype) => memberName == mname} match {
-                  case None =>
-                    throw typeError(location, s"member ${memberName} is not found in record ${record}")
-                  case Some((mname, mtype)) =>
-                    val s = unify(mtype, t, s1)
-                    (TypedAST.RecordSelect(s.replace(t), location, te, mname), s)
-                }
-              case (members, Some(_)) =>
-                val a = newTypeVariable("a")
-                val r = newTypeVariable("r")
-                val (newRecord, s2) = insertMember(record, memberName, a, r, s1)
-                val s3 = unify(record, newRecord, s2)
-                val s = unify(t, a, s3)
-                (TypedAST.RecordSelect(s.replace(a), location, te, memberName), s)
-            }
-          case _ =>
-            typeError(location, s"${t} is not record type")
-        }
+      case node@AST.RecordSelect(_, _, _) =>
+        doTypeRecordSelect(node, env, t, s0)
       case AST.Lambda(location, params, optionalType, body) =>
         val b = optionalType.getOrElse(newTypeVariable())
         val ts = params.map{p => p.optionalType.getOrElse(newTypeVariable())}
@@ -892,6 +837,68 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         (TypedAST.MethodCall(TDynamic, location, typedReceiver, name, tes.reverse), s)
       case otherwise =>
         throw TyperPanic(otherwise.toString)
+    }
+  }
+
+  private def doTypeRecordSelect(node: AST.RecordSelect, environment: TypeEnvironment, t: Type, s0: Substitution): (TypedAST, Substitution) = {
+    val location = node.location
+    val expression = node.record
+    val memberName = node.label
+    val t0 = newTypeVariable()
+    val (te, s1) = doType(expression, environment, t0, s0)
+    te.description match {
+      case TRecordReference(recordName, paramTypes) =>
+        environment.records.get(recordName) match {
+          case None =>
+            typeError(location, s"record ${recordName} is not found")
+          case Some(record) =>
+            toList(record.row) match {
+              case (members, Some(_)) =>
+                val a = newTypeVariable("a")
+                val r = newTypeVariable("r")
+                val (newRecord, s2) = insertMember(record, memberName, a, r, s1)
+                val s3 = unify(record, newRecord, s2)
+                val s4 = unify(t, a, s3)
+                (TypedAST.RecordSelect(s4.replace(a), location, te, memberName), s4)
+              case (members, None) =>
+                members.find { case (mname, mtype) => memberName == mname } match {
+                  case None =>
+                    throw typeError(location, s"member ${memberName} is not found in record ${recordName}")
+                  case Some((mname, mtype)) =>
+                    val s = unify(mtype, t, s1)
+                    (TypedAST.RecordSelect(s.replace(t), location, te, mname), s)
+                }
+            }
+        }
+      case tv@(TVariable(_)) =>
+        val a = newTypeVariable("a")
+        val r = newTypeVariable("r")
+        val (record, s2) = insertMember(
+          TRecord(Nil, r), memberName, a, r, s1
+        )
+        val s3 = unify(tv, record, s2)
+        val s = unify(t, a, s3)
+        (TypedAST.RecordSelect(s.replace(a), location, te, memberName), s)
+      case record@TRecord(ts, row) =>
+        toList(row) match {
+          case (members, None) =>
+            members.find { case (mname, mtype) => memberName == mname } match {
+              case None =>
+                throw typeError(location, s"member ${memberName} is not found in record ${record}")
+              case Some((mname, mtype)) =>
+                val s = unify(mtype, t, s1)
+                (TypedAST.RecordSelect(s.replace(t), location, te, mname), s)
+            }
+          case (members, Some(_)) =>
+            val a = newTypeVariable("a")
+            val r = newTypeVariable("r")
+            val (newRecord, s2) = insertMember(record, memberName, a, r, s1)
+            val s3 = unify(record, newRecord, s2)
+            val s = unify(t, a, s3)
+            (TypedAST.RecordSelect(s.replace(a), location, te, memberName), s)
+        }
+      case _ =>
+        typeError(location, s"${t} is not record type")
     }
   }
 
