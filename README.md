@@ -1,28 +1,29 @@
-# Klassic: Klass-based Programming Language
+# Klassic: A Programming Language which enables Object-Functional Programming
 
 [![Build Status](https://travis-ci.org/klassic/klassic.png?branch=master)](https://travis-ci.org/klassic/klassic)
 
-Klassic **is** Yet Another Programming Language.  Although Klassic is a dynamically-typed
-language currently, it will be a statically typed programming language.  Klassic has: 
+Klassic is yet another statically typed programming language.  Klassic has: 
 
 * Powerful Type System
-  * is based on Hindley-Milner type system
-  * supports object system based on row polymorphism
-* Lexically-scoped Fariables
+  * based on Hindley-Milner type system
+  * support object system based on row polymorphism
+* Lexically-scoped Variables
 * First-class Functions
-* Here Documents
+* Here Document
+  * found in Ruby
+* String Interpolation
   * found in Ruby, Scala, Kotlin, etc.
 * Loop Expression
-  * while and foreach
+  * `while` and `foreach`
 * Cleanup Expression
-* Space-sensitive and Line-sensitive Syntaxes
+* Space-sensitive and Line-sensitive Syntax
   * list literals
   * map literals
   * set literals
 * Java FFI
 * , etc.
 
-Klassic will enable Object-Functional Programming.
+Klassic will enable object-functional programming.
 
 ## Syntax
 
@@ -315,12 +316,12 @@ add: { x: Int; y: Int; ... }
 ```
 
 It means that `add` function accepts any object that has field `x` and field `y`.
-Although it is not subtyping strictly, many situations that need subtypings are
+Although it is not subtyping strictly, many situations that need subtyping are
 covered.
 
 ### Type Cast
 
-In some cases, escape hatches from type system is required. In such a case,
+In some cases, escape hatches from type system are required. In such cases,
 user can insert cast explicitly.
 
 ```
