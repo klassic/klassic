@@ -5,186 +5,184 @@ package com.github.klassic
   */
 class ExpressionSpec extends SpecHelper {
   describe("assignment") {
-    val expectations: List[(String, Value)] = List(
-      """
-        |mutable a=1
-        |a
-      """.stripMargin -> BoxedInt(1),
-      """
-        |mutable a=1
-        |a = a + 1
-        |a
-      """.stripMargin -> BoxedInt(2),
-      """
-        |mutable a=1
-        |a += 1
-        |a
-      """.stripMargin -> BoxedInt(2),
-      """
-        |mutable a=1
-        |a -= 1
-        |a
-      """.stripMargin -> BoxedInt(0),
-      """
-        |mutable a=3
-        |a *= 2
-        |a
-      """.stripMargin -> BoxedInt(6),
-      """
-        |mutable a=5
-        |a /= 2
-        |a
-      """.stripMargin -> BoxedInt(2)
-
-    )
-
-    expectations.foreach{ case (in, expected) =>
-      it(s"${in} evaluates to ${expected}") {
-        assert(expected == E(in))
-      }
+    it("is evaluated correctly") {
+      assertResult(
+        E(
+          """
+            |mutable a=1
+            |a
+          """.stripMargin))(BoxedInt(1))
+      assertResult(
+        E(
+          """
+            |mutable a=1
+            |a = a + 1
+            |a
+          """.stripMargin))(BoxedInt(2))
+      assertResult(
+        E(
+          """
+            |mutable a=1
+            |a += 1
+            |a
+          """.stripMargin))(BoxedInt(2))
+      assertResult(
+        E(
+          """
+            |mutable a=1
+            |a -= 1
+            |a
+          """.stripMargin))(BoxedInt(0))
+      assertResult(
+        E(
+          """
+            |mutable a=3
+            |a *= 2
+            |a
+          """.stripMargin))(BoxedInt(6))
+      assertResult(
+        E(
+          """
+            |mutable a=5
+            |a /= 2
+            |a
+          """.stripMargin))(BoxedInt(2))
     }
   }
 
   describe("while expression") {
-    val expectations: List[(String, Value)] = List(
-      """
-        |mutable i = 1
-        |while(i < 10) {
-        |  i = i + 1
-        |}
-        |i
-      """.stripMargin -> BoxedInt(10),
-      """
-        |mutable i = 10
-        |while(i >= 0) {
-        |  i = i - 1
-        |}
-        |i
-      """.stripMargin -> BoxedInt(-1),
-      s"""
-        |val buf = new java.lang.StringBuffer
-        |mutable i = 0
-        |while(i <= 5) {
-        |  buf->append("#{i}")
-        |  i = i + 1
-        |}
-        |buf->toString()
-      """.stripMargin -> ObjectValue("012345")
-
-    )
-    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
-        assert(expected == E(in))
-      }
+    it("is evaluated correctly") {
+      assertResult(
+        E(
+          """
+            |mutable i = 1
+            |while(i < 10) {
+            |  i = i + 1
+            |}
+            |i
+          """.stripMargin))(BoxedInt(10))
+      assertResult(
+        E(
+          """
+            |mutable i = 10
+            |while(i >= 0) {
+            |  i = i - 1
+            |}
+            |i
+          """.stripMargin))(BoxedInt(-1))
+      assertResult(
+        E(
+          s"""
+             |val buf = new java.lang.StringBuffer
+             |mutable i = 0
+             |while(i <= 5) {
+             |  buf->append("#{i}")
+             |  i = i + 1
+             |}
+             |buf->toString()
+      """.stripMargin))(ObjectValue("012345"))
     }
   }
 
   describe("anonymous function") {
-    val expectations: List[(String, Value)] = List(
-      """
-        |val add = (x, y) => x + y
-        |add(3, 3)
-      """.stripMargin -> BoxedInt(6)
-    )
-
-    expectations.zipWithIndex.foreach { case ((in, expected), i) =>
-      it(s"expectations ${i}") {
-        assert(expected == E(in))
-      }
+    it("is evaluated correctly") {
+      assertResult(
+        E("""
+            |val add = (x, y) => x + y
+            |add(3, 3)
+          """.stripMargin))(BoxedInt(6))
     }
   }
 
   describe("logical expression") {
-    val expectations: List[(String, Value)] = List(
-      """
-        |val i = 1
-        |0 <= i && i <= 10
-      """.stripMargin -> BoxedBoolean(true),
-      """
-        |val i = -1
-        |0 <= i && i <= 10
-      """.stripMargin -> BoxedBoolean(false),
-      """
-        |val i = -1
-        |i < 0 || i > 10
-      """.stripMargin -> BoxedBoolean(true),
-      """
-        |val i = 1
-        |i < 0 || i > 10
-      """.stripMargin -> BoxedBoolean(false)
-    )
-    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
-        assert(expected == E(in))
+    it("is evaluated correctly"){
+      assertResult(
+        E(
+          """
+            |val i = 1
+            |0 <= i && i <= 10
+          """.stripMargin))(BoxedBoolean(true))
+      assertResult(
+        E(
+          """
+            |val i = -1
+            |0 <= i && i <= 10
+          """.stripMargin))(BoxedBoolean(false))
+      assertResult(
+        E(
+          """
+            |val i = -1
+            |i < 0 || i > 10
+          """.stripMargin))(BoxedBoolean(true))
+      assertResult(
+        E(
+          """
+            |val i = 1
+            |i < 0 || i > 10
+          """.stripMargin))(BoxedBoolean(false))
+    }
+
+    describe("foreach expression") {
+      it("is evaluated correctly") {
+        assertResult(
+          E(
+            """
+              |val newList = new java.util.ArrayList
+              |foreach(a in [1, 2, 3, 4, 5]) {
+              |  newList->add((a :> Int) * 2)
+              |}
+              |newList
+            """.stripMargin))(ObjectValue(listOf(2, 4, 6, 8, 10)))
+      }
+    }
+
+    describe("if expression") {
+      it("is evaluated correctly") {
+        assertResult(
+          E(
+            """
+              |if(true) 1.0 else 2.0
+            """.stripMargin))(BoxedDouble(1.0))
+        assertResult(
+          E(
+            """
+              |if(false) 1.0 else 2.0
+            """.stripMargin))(BoxedDouble(2.0))
+      }
+    }
+
+    describe("function definition") {
+      it("is evaluated correctly") {
+        assertResult(
+          E(
+            """
+              |def add(x, y) = x + y
+              |add(2, 3)
+            """.stripMargin))(BoxedInt(5))
+        assertResult(
+          E(
+            """
+              |def fact(n) = if(n < 2) 1 else (n * fact(n - 1))
+              |fact(4)
+            """.stripMargin))(BoxedInt(24))
+        assertResult(
+          E(
+            """
+              |def none() = 24 cleanup "none"
+              |none()
+            """.stripMargin))(BoxedInt(24))
+        assertResult(
+          E(
+            """
+              |def hello() = {
+              |  "Hello"
+              |  0
+              |} cleanup {
+              |  "World"
+              |}
+              |hello()
+            """.stripMargin))(BoxedInt(0))
       }
     }
   }
-
-  describe("foreach expression") {
-    val expectations: List[(String, Value)] = List(
-      """
-         |val newList = new java.util.ArrayList
-         |foreach(a in [1, 2, 3, 4, 5]) {
-         |  newList->add((a :> Int) * 2)
-         |}
-         |newList
-      """.stripMargin -> ObjectValue(listOf(2, 4, 6, 8, 10))
-    )
-
-    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
-        assertResult(expected)(E(in))
-      }
-    }
-  }
-
-  describe("if expression") {
-    val expectations: List[(String, Value)] = List(
-      """
-         |if(true) 1.0 else 2.0
-      """.stripMargin -> BoxedDouble(1.0),
-      """
-         |if(false) 1.0 else 2.0
-      """.stripMargin -> BoxedDouble(2.0)
-    )
-
-    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
-        assertResult(expected)(E(in))
-      }
-    }
-  }
-
-  describe("function definition") {
-    val expectations: List[(String, Value)] = List(
-      """
-         |def add(x, y) = x + y
-         |add(2, 3)
-      """.stripMargin -> BoxedInt(5),
-      """
-         |def fact(n) = if(n < 2) 1 else (n * fact(n - 1))
-         |fact(4)
-      """.stripMargin -> BoxedInt(24),
-      """
-         |def none() = 24 cleanup "none"
-         |none()
-      """.stripMargin -> BoxedInt(24),
-      """
-         |def hello() = {
-         |  "Hello"
-         |  0
-         |} cleanup {
-         |  "World"
-         |}
-         |hello()
-      """.stripMargin -> BoxedInt(0)
-    )
-
-    expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
-        assertResult(expected)(E(in))
-      }
-    }
-  }
-
 }
