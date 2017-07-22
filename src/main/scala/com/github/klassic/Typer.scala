@@ -244,24 +244,6 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     s.replace(a)
   }
 
-  def insertMember(record: TRecord, l1: Label, l1Type: Type, rowVariable: TVariable, s: Substitution): (TRecord, Substitution) = {
-    def insert(row: Type): (TRowExtend, Substitution) = row match {
-      case r@TRowExtend(l2, l2Type, rowTail) if l1 == l2 =>
-        val (r, sx) = insert(rowTail)
-        val sy = unify(l1Type, l2Type, sx)
-        (TRowExtend(l1, sy.replace(l2Type), r), sy)
-      case TRowExtend(l2, l2Type, rowTail) =>
-        val (r, sx) = insert(rowTail)
-        (TRowExtend(l2, l2Type, r), sx)
-      case tv@TVariable(_) =>
-        (TRowExtend(l1, l1Type, rowVariable), s)
-      case t =>
-        sys.error("cannot reach here in insertMember: " + t)
-    }
-    val (r, sx) = insert(record.row)
-    (TRecord(record.ts, r), sx)
-  }
-
   var current: AST = null
   var recordEnvironment: RecordEnvironment = null
   def doType(e: AST, env: TypeEnvironment, t: Type, s0: Substitution): (TypedAST, Substitution) = {
@@ -841,6 +823,23 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   }
 
   private def doTypeRecordSelect(node: AST.RecordSelect, environment: TypeEnvironment, t: Type, s0: Substitution): (TypedAST, Substitution) = {
+    def insert(record: TRecord, l1: Label, l1Type: Type, rowVariable: TVariable, s: Substitution): (TRecord, Substitution) = {
+      def go(row: Type): (TRowExtend, Substitution) = row match {
+        case r@TRowExtend(l2, l2Type, rowTail) if l1 == l2 =>
+          val (r, sx) = go(rowTail)
+          val sy = unify(l1Type, l2Type, sx)
+          (TRowExtend(l1, sy.replace(l2Type), r), sy)
+        case TRowExtend(l2, l2Type, rowTail) =>
+          val (r, sx) = go(rowTail)
+          (TRowExtend(l2, l2Type, r), sx)
+        case tv@TVariable(_) =>
+          (TRowExtend(l1, l1Type, rowVariable), s)
+        case t =>
+          sys.error("cannot reach here in insertMember: " + t)
+      }
+      val (r, sx) = go(record.row)
+      (TRecord(record.ts, r), sx)
+    }
     val location = node.location
     val expression = node.record
     val memberName = node.label
@@ -856,7 +855,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
               case (members, Some(_)) =>
                 val a = newTypeVariable("a")
                 val r = newTypeVariable("r")
-                val (newRecord, s2) = insertMember(record, memberName, a, r, s1)
+                val (newRecord, s2) = insert(record, memberName, a, r, s1)
                 val s3 = unify(record, newRecord, s2)
                 val s4 = unify(t, a, s3)
                 (TypedAST.RecordSelect(s4.replace(a), location, te, memberName), s4)
@@ -873,9 +872,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       case tv@(TVariable(_)) =>
         val a = newTypeVariable("a")
         val r = newTypeVariable("r")
-        val (record, s2) = insertMember(
-          TRecord(Nil, r), memberName, a, r, s1
-        )
+        val (record, s2) = insert(TRecord(Nil, r), memberName, a, r, s1)
         val s3 = unify(tv, record, s2)
         val s = unify(t, a, s3)
         (TypedAST.RecordSelect(s.replace(a), location, te, memberName), s)
@@ -892,7 +889,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           case (members, Some(_)) =>
             val a = newTypeVariable("a")
             val r = newTypeVariable("r")
-            val (newRecord, s2) = insertMember(record, memberName, a, r, s1)
+            val (newRecord, s2) = insert(record, memberName, a, r, s1)
             val s3 = unify(record, newRecord, s2)
             val s = unify(t, a, s3)
             (TypedAST.RecordSelect(s.replace(a), location, te, memberName), s)
