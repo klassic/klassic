@@ -108,18 +108,24 @@ class ExpressionSpec extends SpecHelper {
             |val i = -1
             |0 <= i && i <= 10
           """.stripMargin))(BoxedBoolean(false))
-      assertResult(
-        E(
-          """
+      var input =
+        """
             |val i = -1
             |i < 0 || i > 10
-          """.stripMargin))(BoxedBoolean(true))
+        """.stripMargin
       assertResult(
-        E(
-          """
-            |val i = 1
-            |i < 0 || i > 10
-          """.stripMargin))(BoxedBoolean(false))
+        E(input)
+      )(
+        BoxedBoolean(true)
+      )
+      input =
+        """
+          |val i = 1
+          |i < 0 || i > 10
+        """.stripMargin
+      assertResult(
+        E(input)
+      )(BoxedBoolean(false))
     }
 
     describe("foreach expression") {

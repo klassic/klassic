@@ -9,8 +9,6 @@ Klassic is yet another statically typed programming language.  Klassic has:
   * support object system based on row polymorphism
 * Lexically-scoped Variables
 * First-class Functions
-* Here Document
-  * found in Ruby
 * String Interpolation
   * found in Ruby, Scala, Kotlin, etc.
 * Loop Expression

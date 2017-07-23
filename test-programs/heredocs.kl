@@ -1,5 +1,0 @@
-println(<<TAG1 + <<TAG2);
-tag1
-TAG1
-tag2
-TAG2
