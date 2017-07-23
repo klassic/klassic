@@ -25,7 +25,13 @@ scalacOptions ++= {
   Seq("-unchecked", "-deprecation", "-feature", "-language:implicitConversions")
 }
 
+resolvers ++= Seq(
+  "Sonatype OSS Releases"  at "https://oss.sonatype.org/content/repositories/releases/",
+  "Sonatype OSS Snapshots" at "https://oss.sonatype.org/content/repositories/snapshots/"
+)
+
 libraryDependencies ++= Seq(
+  "com.github.kmizu" %% "scomb" % "0.5",
   "org.scala-lang.modules" %% "scala-parser-combinators" % "1.0.4",
   "org.ow2.asm" % "asm" % "5.0.4",
   "junit" % "junit" % "4.7" % "test",
