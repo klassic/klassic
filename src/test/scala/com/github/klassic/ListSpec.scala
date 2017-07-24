@@ -34,7 +34,7 @@ class ListSpec extends SpecHelper {
       """.stripMargin -> ObjectValue(listOf(2, 1))
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }
@@ -57,7 +57,7 @@ class ListSpec extends SpecHelper {
     )
 
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }
@@ -79,7 +79,7 @@ class ListSpec extends SpecHelper {
       """.stripMargin -> BoxedInt(3)
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }
@@ -101,7 +101,7 @@ class ListSpec extends SpecHelper {
       """.stripMargin -> BoxedBoolean(false)
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }

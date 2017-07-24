@@ -23,7 +23,7 @@ class TypeCheckerSpec extends SpecHelper {
     )
 
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
-      it(s"expectation  ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }
@@ -38,8 +38,8 @@ class TypeCheckerSpec extends SpecHelper {
       """.stripMargin -> BoxedInt(5))
 
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
-      it(s"expectation  ${i}") {
-        assertResult(expected)(E(in))
+      it(s"${in} evaluates to ${expected}") {
+        assert(expected == E(in))
       }
     }
   }
