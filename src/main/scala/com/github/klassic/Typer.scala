@@ -36,6 +36,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       "matches" -> TScheme(List(), TFunction(List(TString, TString), TBoolean)),
       "thread" -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TDynamic)),
       "println" ->  TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
+      "printlnError" ->  TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
       "stopwatch" -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TInt)),
       "sleep" -> TScheme(List(), TInt ==> TUnit),
       "isEmpty" -> TScheme(List(tv("a")), listOf(tv("a")) ==> TBoolean),

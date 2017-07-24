@@ -13,6 +13,7 @@ val time = stopwatch( => {
   println("1")
 })
 println("it took #{time} milli seconds")
+printlnError("this param is displayed into standard error")
 assertResult(5)(add(2, 3))
 val list = new java.util.ArrayList
 list->add(4)

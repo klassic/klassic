@@ -93,6 +93,12 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
       println(param)
       param
     }
+
+    define("printlnError") { case List(param) =>
+      Console.err.println(param)
+      param
+    }
+
     define("stopwatch") { case List(fun: FunctionValue) =>
       val env = new RuntimeEnvironment(fun.environment)
       val start = System.currentTimeMillis()
