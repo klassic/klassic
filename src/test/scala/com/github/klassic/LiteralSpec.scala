@@ -20,7 +20,7 @@ class LiteralSpec extends SpecHelper {
       s"-${Int.MaxValue}" -> BoxedInt(-Int.MaxValue)
     )
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }
@@ -41,7 +41,7 @@ class LiteralSpec extends SpecHelper {
       s"${Long.MinValue + 1}L" -> BoxedLong(Long.MinValue + 1)
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }
@@ -58,7 +58,7 @@ class LiteralSpec extends SpecHelper {
     )
 
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }
@@ -74,7 +74,7 @@ class LiteralSpec extends SpecHelper {
       )
 
       expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-        it(s"expectations ${i}") {
+        it(s"${in} evaluates to ${expected}") {
           assert(expected == E(in))
         }
       }
@@ -92,7 +92,7 @@ class LiteralSpec extends SpecHelper {
       """"\\"""" -> ObjectValue("\\")
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }
@@ -134,7 +134,7 @@ class LiteralSpec extends SpecHelper {
       )
     )
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }
@@ -149,7 +149,7 @@ class LiteralSpec extends SpecHelper {
       | "c":"d"]""".stripMargin -> ObjectValue(mapOf("a" -> "b", "c" -> "d"))
     )
     expectations.zipWithIndex.foreach { case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }

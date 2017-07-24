@@ -34,7 +34,7 @@ class MapSpec extends SpecHelper {
       """.stripMargin -> BoxedBoolean(false)
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }
@@ -53,7 +53,7 @@ class MapSpec extends SpecHelper {
       """.stripMargin -> ObjectValue(null)
     )
     expectations.zipWithIndex.foreach{ case ((in, expected), i) =>
-      it(s"expectations ${i}") {
+      it(s"${in} evaluates to ${expected}") {
         assert(expected == E(in))
       }
     }

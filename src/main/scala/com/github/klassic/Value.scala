@@ -34,7 +34,7 @@ case object UnitValue extends Value {
   override def toString = "()"
 }
 case class ObjectValue(value: AnyRef) extends Value {
-  override def toString = value.toString
+  override def toString = if(value eq null) "null" else value.toString
 }
 case class RecordValue(name: String, members: List[(String, Value)]) extends Value {
   override def toString =
