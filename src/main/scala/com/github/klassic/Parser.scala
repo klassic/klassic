@@ -194,8 +194,9 @@ class Parser extends Processor[String, Program] {
       ts <- commit((CL(LT) >> typeVariable.repeat1By(CL(COMMA)) << CL(GT)).?)
       _ <- commit(CL(LBRACE))
       members <- commit((sident ~ CL(typeAnnotation) ^^ { case n ~ t => (n, t) }).*)
+      methods <- commit(methodDefinition.repeat0By(TERMINATOR))
       _ <- commit(RBRACE)
-    } yield RecordDeclaration(location, name, ts.getOrElse(Nil), members)
+    } yield RecordDeclaration(location, name, ts.getOrElse(Nil), members, methods)
 
     //lines ::= line {TERMINATOR expr} [TERMINATOR]
     lazy val lines: Parser[Block] = SPACING >> (%% ~ line.repeat0By(TERMINATOR) << TERMINATOR.? ^^ { case location ~ expressions =>
@@ -423,6 +424,27 @@ class Parser extends Processor[String, Program] {
       case location ~ (recordName ~ Some(params)) => RecordNew(location, recordName, params)
       case location ~ (recordName ~ None) => RecordNew(location, recordName, List())
     })
+
+    // methodDefinition ::= "def" ident  ["(" [param {"," param}] ")"] "=" expression
+    lazy val methodDefinition: Parser[MethodDefinition] = {
+      (%% << CL(DEF)) ~ commit(ident ~ (CL(LPAREN) >> (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) << CL(RPAREN)).? ~ (typeAnnotation.? << CL(EQ)) ~ expression ~ (CL(CLEANUP) >> expression).?) ^^ {
+        case location ~ (functionName ~ params ~ optionalType ~ body ~ cleanup) =>
+          val ps = params match {
+            case Some(xs) =>
+              xs.map {
+                case name ~ Some(annotation) => FormalParameterOptional(name.name, Some(annotation))
+                case name ~ None => FormalParameterOptional(name.name, None)
+              }
+            case None => Nil
+          }
+          MethodDefinition(
+            location,
+            functionName.name,
+            Lambda(body.location, ps, optionalType, body),
+            cleanup
+          )
+      }
+    }
 
     // functionDefinition ::= "def" ident  ["(" [param {"," param}] ")"] "=" expression
     lazy val functionDefinition: Parser[FunctionDefinition] = {

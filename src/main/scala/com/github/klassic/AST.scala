@@ -28,7 +28,7 @@ object AST {
 
   case class Import(location: Location, simpleName: String, fqcn: String)
 
-  case class RecordDeclaration(location: Location, name: String, ts: List[TVariable], members: List[(String, Type)])
+  case class RecordDeclaration(location: Location, name: String, ts: List[TVariable], members: List[(String, Type)], methods: List[MethodDefinition])
 
   case class VariantDeclaration(location: Location, id: String, params: List[Type], constructors: List[DataConstructor]) extends AST
 
@@ -108,6 +108,8 @@ object AST {
   }
 
   case class FunctionDefinition(location: Location, name: String, body: Lambda, cleanup: Option[AST]) extends AST
+
+  case class MethodDefinition(location: Location, name: String, body: Lambda, cleanup: Option[AST]) extends AST
 
   case class LetRec(location: Location, name: String, function: Lambda, cleanup: Option[AST], body: AST) extends AST
   object LetRec {
