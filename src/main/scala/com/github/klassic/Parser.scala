@@ -456,7 +456,7 @@ class Parser extends Processor[String, Program] {
             Lambda(
               location,
               params.map {
-                case name ~ Some(description) => FormalParameterOptional(name.name, Some(description))
+                case name ~ Some(type_) => FormalParameterOptional(name.name, Some(type_))
                 case name ~ None => FormalParameterOptional(name.name, None)
               },
               optionalType,
@@ -472,7 +472,7 @@ class Parser extends Processor[String, Program] {
         Lambda(
           location,
           params.map {
-            case name ~ Some(description) => FormalParameterOptional(name.name, Some(description))
+            case name ~ Some(type_) => FormalParameterOptional(name.name, Some(type_))
             case name ~ None => FormalParameterOptional(name.name, None)
           },
           optionalType,
