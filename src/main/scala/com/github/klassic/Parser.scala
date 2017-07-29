@@ -333,10 +333,17 @@ class Parser extends Processor[String, Program] {
         }
     })
 
-    lazy val application: Parser[AST] = rule(%% ~ pipelinable ~ (CL(LPAREN) >> CL(expression).repeat0By(CL(COMMA)) << (SPACING << RPAREN)).* ^^ {
-      case location ~ f ~ xs =>
-        xs.foldLeft(f) { case (e, x) => FunctionCall(e.location, e, x) }
-    })
+    lazy val application: Parser[AST] = rule{
+      %% ~ pipelinable ~ (
+        blockFunctionParameter
+      | parenthesizedParameter
+      ).* ^^ {
+        case location ~ f ~ params =>
+          params.foldLeft(f:AST) {(f, params) =>
+            FunctionCall(location, f, params)
+          }
+      }
+    }
 
     lazy val pipelinable: Parser[AST] = rule(%% ~ castable ~ (CL(BAR) >> ident).? ^^ {
       case location ~ self ~ None =>
@@ -434,7 +441,32 @@ class Parser extends Processor[String, Program] {
       case location ~ immutable ~ (valName ~ optionalType ~ value) => ValDeclaration(location, valName.name, optionalType, value, immutable)
     })
 
-    // anonnymousFunction ::= "(" [param {"," param}] ")" "=>" expression
+    // parenthesizedParameter ::= "(" [param {"," param}] ")"
+    lazy val parenthesizedParameter: Parser[List[AST]] = rule{
+      CL(LPAREN) >> CL(expression).repeat0By(CL(COMMA)) << (SPACING << RPAREN) ^^ {
+        case xs => xs
+      }
+    }
+
+    // blockFunctionParameter ::= "{" [param {"," param}] "=>" expression "}"
+    lazy val blockFunctionParameter: Parser[List[AST]] = rule{
+      (%% << CL(LBRACE)) ~ (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) ~ (typeAnnotation.? << CL(ARROW1)) ~ (expression << RBRACE) ^^ {
+        case location ~ params ~ optionalType ~ body =>
+          List(
+            Lambda(
+              location,
+              params.map {
+                case name ~ Some(description) => FormalParameterOptional(name.name, Some(description))
+                case name ~ None => FormalParameterOptional(name.name, None)
+              },
+              optionalType,
+              body
+            )
+          )
+      }
+    }
+
+    // functionLiteral ::= "(" [param {"," param}] ")" "=>" expression
     lazy val functionLiteral: Parser[AST] = rule(%% ~ (CL(LPAREN) >> (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) << CL(RPAREN)).? ~ (typeAnnotation.? << CL(ARROW1)) ~ expression ^^ {
       case location ~ Some(params) ~ optionalType ~ body =>
         Lambda(
