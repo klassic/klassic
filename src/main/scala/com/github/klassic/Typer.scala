@@ -297,7 +297,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             typeError(location, s"variable $variable is not defined")
           case Some(variableType) =>
             val (typedValue, s1) = doType(value, env, t, s0)
-            val s2 = unify(variableType.stype, typedValue.description, s1)
+            val s2 = unify(variableType.stype, typedValue.type_, s1)
             (TypedAST.Assignment(variableType.stype, location, variable, typedValue), s2)
         }
       case AST.IfExpression(location, cond, pos, neg) =>
@@ -310,8 +310,8 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         val b = newTypeVariable()
         val c = newTypeVariable()
         val (typedCondition, s1) = doType(condition, env, a, s0)
-        if(typedCondition.description != TBoolean) {
-          typeError(location, s"condition type must be Boolean, actual: ${typedCondition.description}")
+        if(typedCondition.type_ != TBoolean) {
+          typeError(location, s"condition type must be Boolean, actual: ${typedCondition.type_}")
         } else {
           val (typedBody, s2) = doType(body, env, b, s1)
           val s3 = unify(TUnit, t, s2)
@@ -708,7 +708,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
             otherwise
         }.getOrElse(newTypeVariable())
         val (typedValue, s1) = doType(value, env, a, s0)
-        val s2 = unify(s1.replace(a), typedValue.description, s1)
+        val s2 = unify(s1.replace(a), typedValue.type_, s1)
         val gen = generalize(s2.replace(a), env.variables)
         val declaredType = s2.replace(a)
         val newEnv = if(immutable) {
@@ -717,7 +717,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           env.updateMutableVariable(variable, generalize(declaredType, env.variables))
         }
         val (typedBody, s) = doType(body, newEnv, t, s2)
-        (TypedAST.LetDeclaration(typedBody.description, location, variable, declaredType, typedValue, typedBody, immutable), s)
+        (TypedAST.LetDeclaration(typedBody.type_, location, variable, declaredType, typedValue, typedBody, immutable), s)
       case AST.LetRec(location, variable, value, cleanup, body) =>
         if(env.variables.contains(variable)) {
           throw new InterruptedException(s"${location.format} function ${variable} is already defined")
@@ -732,7 +732,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
           case Some((c, s)) => (Some(c), s)
           case None => (None, s3)
         }
-        (TypedAST.LetFunctionDefinition(typedE2.description, location, variable, typedE1.asInstanceOf[TypedAST.FunctionLiteral], typedCleanup, typedE2), s)
+        (TypedAST.LetFunctionDefinition(typedE2.type_, location, variable, typedE1.asInstanceOf[TypedAST.FunctionLiteral], typedCleanup, typedE2), s)
       case AST.FunctionCall(location, e1, ps) =>
         val t2 = ps.map{_ => newTypeVariable()}
         val (typedTarget, s1) = doType(e1, env, TFunction(t2, t), s0)
@@ -794,7 +794,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
               typeError(location, s"length mismatch: required: ${members.length}, actual: ${ts.length}")
             }
             val memberTypes = members.map{ case (_, t) => t}
-            val parameterTypes = tes2.map { case te => te.description }
+            val parameterTypes = tes2.map { case te => te.type_ }
             val sn = (memberTypes zip parameterTypes).foldLeft(sy) { case (s, (m, p)) => unify(m, p, s)}
             var recordType: TRecord = env.records(recordName)
             val s = unify(t, recordType, sn)
@@ -846,7 +846,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     val memberName = node.label
     val t0 = newTypeVariable()
     val (te, s1) = doType(expression, environment, t0, s0)
-    te.description match {
+    te.type_ match {
       case TRecordReference(recordName, paramTypes) =>
         environment.records.get(recordName) match {
           case None =>

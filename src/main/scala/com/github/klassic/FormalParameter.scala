@@ -1,3 +1,3 @@
 package com.github.klassic
 
-case class FormalParameter(name: String, description: Type)
+case class FormalParameter(name: String, type_ : Type)

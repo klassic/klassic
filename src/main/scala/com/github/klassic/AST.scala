@@ -85,7 +85,7 @@ object AST {
 
   case class DivisionAssignment(location: Location, variable: String, value: AST) extends Assignment
 
-  case class ValDeclaration(location: Location, variable: String, description: Option[Type], value: AST, immutable: Boolean) extends AST
+  case class ValDeclaration(location: Location, variable: String, type_ : Option[Type], value: AST, immutable: Boolean) extends AST
 
   case class VariantIn(location: Location, variant: VariantDeclaration, body: AST) extends AST
 
@@ -93,10 +93,10 @@ object AST {
 
   case class RecordCall(location: Location, self: AST, name: String, params: List[AST]) extends AST
 
-  case class Let(location: Location, variable: String, description: Option[Type], value: AST, body: AST, immutable: Boolean) extends AST
+  case class Let(location: Location, variable: String, type_ : Option[Type], value: AST, body: AST, immutable: Boolean) extends AST
   object Let {
-    def apply(variable: String, description: Option[Type], value: AST, body: AST): Let = {
-      Let(NoLocation, variable, description, value, body, true)
+    def apply(variable: String, type_ :Option[Type], value: AST, body: AST): Let = {
+      Let(NoLocation, variable, type_, value, body, true)
     }
   }
 

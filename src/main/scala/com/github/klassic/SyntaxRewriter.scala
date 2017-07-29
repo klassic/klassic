@@ -22,8 +22,8 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
   def doRewrite(node: AST): AST = node match {
     case Block(location, expressions) =>
       def rewriteBlock(es: List[AST]): List[AST] = es match {
-        case ValDeclaration(location, variable, description, value, immutable) :: xs =>
-          List(Let(location, variable, description, doRewrite(value), Block(location, rewriteBlock(xs)), immutable))
+        case ValDeclaration(location, variable, type_, value, immutable) :: xs =>
+          List(Let(location, variable, type_, doRewrite(value), Block(location, rewriteBlock(xs)), immutable))
         case FunctionDefinition(loation, name, expression, cleanup) :: xs =>
           List(LetRec(location, name, doRewrite(expression).asInstanceOf[AST.Lambda], cleanup.map(doRewrite), Block(location, rewriteBlock(xs))))
         case (x@VariantDeclaration(_, _, _, _)) :: xs =>
