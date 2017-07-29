@@ -36,27 +36,37 @@ class Parser extends Processor[String, Program] {
       _.toString
     }
 
-    lazy val SPACING: Parser[String] = (COMMENT | "\r\n" | "\r" | "\n" | " " | "\t" | "\b" | "\f").* ^^ {
-      _.mkString
+    lazy val SPACING: Parser[String] = rule {
+      (COMMENT | "\r\n" | "\r" | "\n" | " " | "\t" | "\b" | "\f").* ^^ {
+        _.mkString
+      }
     }
 
-    lazy val SPACING_WITHOUT_LF: Parser[String] = (COMMENT | "\t" | " " | "\b" | "\f").* ^^ {
-      _.mkString
+    lazy val SPACING_WITHOUT_LF: Parser[String] = rule {
+      (COMMENT | "\t" | " " | "\b" | "\f").* ^^ {
+        _.mkString
+      }
     }
 
-    lazy val TERMINATOR: Parser[String] = (LINEFEED | SEMICOLON | EOF) << SPACING
+    lazy val TERMINATOR: Parser[String] = rule {
+      (LINEFEED | SEMICOLON | EOF) << SPACING
+    }
 
-    lazy val SEPARATOR: Parser[String] = (LINEFEED | COMMA | EOF | SPACING_WITHOUT_LF) << SPACING
+    lazy val SEPARATOR: Parser[String] = rule {
+      (LINEFEED | COMMA | EOF | SPACING_WITHOUT_LF) << SPACING
+    }
 
-    lazy val BLOCK_COMMENT: Parser[Any] = (
+    lazy val BLOCK_COMMENT: Parser[Any] = rule {
       "/*" ~ (not("*/") ~ (BLOCK_COMMENT | ANY)).* ~ "*/"
-      )
+    }
 
-    lazy val LINE_COMMENT: Parser[Any] = (
+    lazy val LINE_COMMENT: Parser[Any] = rule {
       "//" ~ (not(LINEFEED) ~ ANY).* ~ LINEFEED
-      )
+    }
 
-    lazy val COMMENT: Parser[Any] = BLOCK_COMMENT | LINE_COMMENT
+    lazy val COMMENT: Parser[Any] = rule{
+      BLOCK_COMMENT | LINE_COMMENT
+    }
 
     def CL[T](parser: Parser[T]): Parser[T] = parser << SPACING
 
@@ -156,7 +166,7 @@ class Parser extends Processor[String, Program] {
 
     lazy val typeVariable: Parser[TVariable] = qident ^^ { id => TVariable(id) }
 
-    lazy val typeDescription: Parser[Type] = (
+    lazy val typeDescription: Parser[Type] = rule(
       qident ^^ { id => TVariable(id) }
         | ((CL(LPAREN) >> typeDescription.repeat0By(CL(COMMA)) << CL(RPAREN)) << CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => TFunction(args, returnType) }
         | (SHARP >> sident).filter{s => !isBuiltinType(s)} ~ (CL(LT) >> typeDescription.repeat0By(CL(COMMA)) << CL(GT)).? ^^ {
@@ -176,114 +186,140 @@ class Parser extends Processor[String, Program] {
         | token("*") ^^ { _ => TDynamic }
     )
 
-    override def root: Parser[Program] = program
+    override def root: Parser[Program] = rule(program)
 
-    lazy val program: Parser[Program] = (SPACING >> %%) ~ `import`.repeat0By(TERMINATOR) ~ record.repeat0By(TERMINATOR) ~ (lines << (TERMINATOR).?) << EOF ^^ {
-      case location ~ imports ~ records ~ block => Program(location, imports, records, block)
+    lazy val program: Parser[Program] = rule{
+      (SPACING >> %%) ~ `import`.repeat0By(TERMINATOR) ~ record.repeat0By(TERMINATOR) ~ (lines << (TERMINATOR).?) << EOF ^^ {
+        case location ~ imports ~ records ~ block => Program(location, imports, records, block)
+      }
     }
 
-    lazy val `import`: Parser[Import] = (%% << CL(IMPORT)) ~ fqcn.commit ^^ { case location ~ fqcn =>
-      val fragments = fqcn.split(".")
-      Import(location, fragments(fragments.length - 1), fqcn)
+    lazy val `import`: Parser[Import] = rule{
+      (%% << CL(IMPORT)) ~ fqcn.commit ^^ { case location ~ fqcn =>
+        val fragments = fqcn.split(".")
+        Import(location, fragments(fragments.length - 1), fqcn)
+      }
     }
 
-    lazy val record: Parser[RecordDeclaration] = for {
-      location <- %%
-      _ <- RECORD
-      name <- commit(sident)
-      ts <- commit((CL(LT) >> typeVariable.repeat1By(CL(COMMA)) << CL(GT)).?)
-      _ <- commit(CL(LBRACE))
-      members <- commit((sident ~ CL(typeAnnotation) ^^ { case n ~ t => (n, t) }).*)
-      methods <- commit(methodDefinition.repeat0By(TERMINATOR))
-      _ <- commit(RBRACE)
-    } yield RecordDeclaration(location, name, ts.getOrElse(Nil), members, methods)
+    lazy val record: Parser[RecordDeclaration] = rule {
+      for {
+        location <- %%
+        _ <- RECORD
+        name <- commit(sident)
+        ts <- commit((CL(LT) >> typeVariable.repeat1By(CL(COMMA)) << CL(GT)).?)
+        _ <- commit(CL(LBRACE))
+        members <- commit((sident ~ CL(typeAnnotation) ^^ { case n ~ t => (n, t) }).*)
+        methods <- commit(methodDefinition.repeat0By(TERMINATOR))
+        _ <- commit(RBRACE)
+      } yield RecordDeclaration(location, name, ts.getOrElse(Nil), members, methods)
+    }
 
     //lines ::= line {TERMINATOR expr} [TERMINATOR]
-    lazy val lines: Parser[Block] = SPACING >> (%% ~ line.repeat0By(TERMINATOR) << TERMINATOR.? ^^ { case location ~ expressions =>
-      Block(location, expressions)
-    })
+    lazy val lines: Parser[Block] = rule {
+      SPACING >> (%% ~ line.repeat0By(TERMINATOR) << TERMINATOR.? ^^ { case location ~ expressions =>
+        Block(location, expressions)
+      })
+    }
 
-    lazy val variantDeclaration: Parser[VariantDeclaration] = for {
-      location <- %%
-      _ <- CL(VARIANT)
-      name <- sident
-      ts <- (LT >> typeAnnotation.repeat1By(CL(COMMA)) << GT << EQ).?
-      cs <- dataConstructor.*
-    } yield VariantDeclaration(location, name, ts.getOrElse(Nil), cs)
+    lazy val variantDeclaration: Parser[VariantDeclaration] = rule {
+      for {
+        location <- %%
+        _ <- CL(VARIANT)
+        name <- sident
+        ts <- (LT >> typeAnnotation.repeat1By(CL(COMMA)) << GT << EQ).?
+        cs <- dataConstructor.*
+      } yield VariantDeclaration(location, name, ts.getOrElse(Nil), cs)
+    }
 
-    lazy val dataConstructor: Parser[DataConstructor] = (
+    lazy val dataConstructor: Parser[DataConstructor] = rule {
       (BAR >> sident) ~ (LPAREN >> ((sident << CL(COLON)) ~ typeAnnotation ^^ { case i ~ t => FormalParameter(i, t) }).repeat1By(CL(COMMA)) << RPAREN).? ^^ {
         case name ~ Some(params) => DataConstructor(name, params)
         case name ~ None => DataConstructor(name, Nil)
       }
-    )
+    }
 
     //line ::= expression | valDeclaration | functionDefinition
-    lazy val line: Parser[AST] = variantDeclaration | expression | valDeclaration | functionDefinition
+    lazy val line: Parser[AST] = rule(variantDeclaration | expression | valDeclaration | functionDefinition)
 
     //expression ::= assignment | infix | ifExpression | whileEpression | foreachExpression
-    lazy val expression: Parser[AST] = assignment | infix | ifExpression | whileExpression | foreachExpression
+    lazy val expression: Parser[AST] = rule(assignment | infix | ifExpression | whileExpression | foreachExpression)
 
     //ifExpression ::= "if" "(" expression ")" expression "else" expression
-    lazy val ifExpression: Parser[AST] = (%% << CL(IF) << CL(LPAREN)) ~ commit(expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression) ^^ {
-      case location ~ (condition ~ _ ~ positive ~ _ ~ negative) => IfExpression(location, condition, positive, negative)
+    lazy val ifExpression: Parser[AST] = rule{
+      (%% << CL(IF) << CL(LPAREN)) ~ commit(expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression) ^^ {
+        case location ~ (condition ~ _ ~ positive ~ _ ~ negative) => IfExpression(location, condition, positive, negative)
+      }
     }
 
     //whileExpression ::= "while" "(" expression ")" expression
-    lazy val whileExpression: Parser[AST] = (%% << CL(WHILE) << CL(LPAREN)) ~ commit(expression ~ (CL(RPAREN) >> expression)) ^^ {
-      case location ~ (condition ~ body) => WhileExpression(location, condition, body)
+    lazy val whileExpression: Parser[AST] = rule{
+      (%% << CL(WHILE) << CL(LPAREN)) ~ commit(expression ~ (CL(RPAREN) >> expression)) ^^ {
+        case location ~ (condition ~ body) => WhileExpression(location, condition, body)
+      }
     }
 
     //foreachExpression ::= "foreach" "(" ident "in" expression ")" expression
-    lazy val foreachExpression: Parser[AST] = (%% << CL(FOREACH) << CL(LPAREN)) ~ commit((CL(ident) << CL(IN)) ~ (expression << CL(RPAREN)) ~ expression) ^^ {
-      case location ~ (variable ~ collection ~ body) => ForeachExpression(location, variable.name, collection, body)
+    lazy val foreachExpression: Parser[AST] = rule {
+      (%% << CL(FOREACH) << CL(LPAREN)) ~ commit((CL(ident) << CL(IN)) ~ (expression << CL(RPAREN)) ~ expression) ^^ {
+        case location ~ (variable ~ collection ~ body) => ForeachExpression(location, variable.name, collection, body)
+      }
     }
 
-    lazy val infix: Parser[AST] = chainl(logical)(
-      (%% ~ CL(operator)) ^^ { case location ~ op => (lhs: AST, rhs: AST) => FunctionCall(location, FunctionCall(location, Id(location, op), List(lhs)), List(rhs)) }
-    | (%% ~ CL(selector)) ^^ { case location ~ sl => (lhs: AST, rhs: AST) => FunctionCall(location, FunctionCall(location, sl, List(lhs)), List(rhs)) }
-    )
+    lazy val infix: Parser[AST] = rule {
+      chainl(logical)(
+        (%% ~ CL(operator)) ^^ { case location ~ op => (lhs: AST, rhs: AST) => FunctionCall(location, FunctionCall(location, Id(location, op), List(lhs)), List(rhs)) }
+          | (%% ~ CL(selector)) ^^ { case location ~ sl => (lhs: AST, rhs: AST) => FunctionCall(location, FunctionCall(location, sl, List(lhs)), List(rhs)) }
+      )
+    }
 
-    lazy val logical: Parser[AST] = chainl(conditional)(
-      (%% << CL(AMP2)) ^^ { location => (lhs: AST, rhs: AST) => BinaryExpression(location, Operator.AND2, lhs, rhs) }
-    | (%% << CL(BAR2)) ^^ { location => (lhs: AST, rhs: AST) => BinaryExpression(location, Operator.BAR2, lhs, rhs) }
-    )
+    lazy val logical: Parser[AST] = rule {
+      chainl(conditional)(
+        (%% << CL(AMP2)) ^^ { location => (lhs: AST, rhs: AST) => BinaryExpression(location, Operator.AND2, lhs, rhs) }
+          | (%% << CL(BAR2)) ^^ { location => (lhs: AST, rhs: AST) => BinaryExpression(location, Operator.BAR2, lhs, rhs) }
+      )
+    }
 
-    //conditional ::= add {"<" add | ">" add | "<=" add | ">=" add}
-    lazy val conditional: Parser[AST] = chainl(add)(
-      (%% << CL(EQEQ)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.EQUAL, left, right) } |
-      (%% << CL(LTE)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right) } |
-      (%% << CL(GTE)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.GREATER_EQUAL, left, right) } |
-      (%% << CL(LT)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.LESS_THAN, left, right) } |
-      (%% << CL(GT)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.GREATER_THAN, left, right) }
-    )
+    //conditional ::= add {"==" add | "<=" add | "=>" add | "<" add | ">" add}
+    lazy val conditional: Parser[AST] = rule{
+      chainl(add)(
+        (%% << CL(EQEQ)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.EQUAL, left, right) } |
+          (%% << CL(LTE)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right) } |
+          (%% << CL(GTE)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.GREATER_EQUAL, left, right) } |
+          (%% << CL(LT)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.LESS_THAN, left, right) } |
+          (%% << CL(GT)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.GREATER_THAN, left, right) }
+      )
+    }
 
     //add ::= term {"+" term | "-" term}
-    lazy val add: Parser[AST] = chainl(term)(
-      (%% << CL(PLUS)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.ADD, left, right) } |
-      (%% << CL(MINUS)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.SUBTRACT, left, right) }
-    )
+    lazy val add: Parser[AST] = rule{
+      chainl(term)(
+        (%% << CL(PLUS)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.ADD, left, right) } |
+          (%% << CL(MINUS)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.SUBTRACT, left, right) }
+      )
+    }
 
     //term ::= factor {"*" factor | "/" factor}
-    lazy val term: Parser[AST] = chainl(unary)(
-      (%% << CL(ASTER)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.MULTIPLY, left, right) } |
-      (%% << CL(SLASH)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.DIVIDE, left, right) }
-    )
+    lazy val term: Parser[AST] = rule{
+      chainl(unary)(
+        (%% << CL(ASTER)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.MULTIPLY, left, right) } |
+          (%% << CL(SLASH)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.DIVIDE, left, right) }
+      )
+    }
 
-    lazy val unary: Parser[AST] = (
+    lazy val unary: Parser[AST] = rule(
       %% ~ CL(MINUS) ~ unary ^^ { case location ~ _ ~ operand => MinusOp(location, operand) }
     | %% ~ CL(PLUS) ~ unary ^^ { case location ~ _ ~ operand => PlusOp(location, operand) }
     | invocation
     )
 
-    lazy val invocation: Parser[AST] = %% ~ recordSelect ~ ((CL(ARROW2) >> ident) ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?).* ^^ {
+    lazy val invocation: Parser[AST] = rule(%% ~ recordSelect ~ ((CL(ARROW2) >> ident) ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?).* ^^ {
       case location ~ self ~ Nil =>
         self
       case location ~ self ~ npList =>
         npList.foldLeft(self) { case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil)) }
-    }
+    })
 
-    lazy val recordSelect: Parser[AST] = %% ~ application ~ ((CL(DOT) >> (%% ~ ident ~ (CL(LPAREN) >> expression.repeat0By((COMMA)) << RPAREN).?))).* ^^ {
+    lazy val recordSelect: Parser[AST] = rule(%% ~ application ~ ((CL(DOT) >> (%% ~ ident ~ (CL(LPAREN) >> expression.repeat0By((COMMA)) << RPAREN).?))).* ^^ {
       case location ~ self ~ names =>
         val ns = names.map {
           case l ~ n ~ Some(params) => (l, n.name, Some(params))
@@ -295,27 +331,27 @@ class Parser extends Processor[String, Program] {
             case None => RecordSelect(l, e, n)
           }
         }
-    }
+    })
 
-    lazy val application: Parser[AST] = %% ~ pipelinable ~ (CL(LPAREN) >> CL(expression).repeat0By(CL(COMMA)) << (SPACING << RPAREN)).* ^^ {
+    lazy val application: Parser[AST] = rule(%% ~ pipelinable ~ (CL(LPAREN) >> CL(expression).repeat0By(CL(COMMA)) << (SPACING << RPAREN)).* ^^ {
       case location ~ f ~ xs =>
         xs.foldLeft(f) { case (e, x) => FunctionCall(e.location, e, x) }
-    }
+    })
 
-    lazy val pipelinable: Parser[AST] = %% ~ castable ~ (CL(BAR) >> ident).? ^^ {
+    lazy val pipelinable: Parser[AST] = rule(%% ~ castable ~ (CL(BAR) >> ident).? ^^ {
       case location ~ self ~ None =>
         self
       case location ~ self ~ Some(name) =>
         FunctionCall(location, name, List(self))
-    }
+    })
 
-    lazy val castable: Parser[AST] = primary ~ ((%% << CL(COLONGT)) ~ CL(castType)).? ^^ {
+    lazy val castable: Parser[AST] = rule(primary ~ ((%% << CL(COLONGT)) ~ CL(castType)).? ^^ {
       case target ~ Some((location ~ castType)) => Casting(location, target, castType)
       case target ~ None => target
-    }
+    })
 
     //primary ::= selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | |setLiteral | newRecord | newObject | functionLiteral | "(" expression ")" | "{" lines "}"
-    lazy val primary: Parser[AST] = selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newRecord | newObject | functionLiteral | CL(LPAREN) >> expression << RPAREN | CL(LBRACE) >> lines << RBRACE
+    lazy val primary: Parser[AST] = rule(selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newRecord | newObject | functionLiteral | CL(LPAREN) >> expression << RPAREN | CL(LBRACE) >> lines << RBRACE)
 
     //integerLiteral ::= ["1"-"9"] {"0"-"9"}
     lazy val integerLiteral: Parser[AST] = (%% ~ """[1-9][0-9]*|0""".r ~ ("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix } | "S" ^^ { _ => ShortSuffix }).? ^^ {
@@ -346,17 +382,17 @@ class Parser extends Processor[String, Program] {
         values.foldLeft(StringNode(NoLocation, ""): AST) { (node, content) => BinaryExpression(content.location, Operator.ADD, node, content) }
       }) << SPACING_WITHOUT_LF
 
-    lazy val listLiteral: Parser[AST] = %% ~ (CL(LBRACKET) >> commit((CL(expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RBRACKET)) ^^ {
+    lazy val listLiteral: Parser[AST] = rule(%% ~ (CL(LBRACKET) >> commit((CL(expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RBRACKET)) ^^ {
       case location ~ contents => ListLiteral(location, contents)
-    }
+    })
 
-    lazy val setLiteral: Parser[AST] = %% ~ (CL(SET_OPEN) >> commit((CL(expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RPAREN)) ^^ {
+    lazy val setLiteral: Parser[AST] = rule(%% ~ (CL(SET_OPEN) >> commit((CL(expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RPAREN)) ^^ {
       case location ~ contents => SetLiteral(location, contents)
-    }
+    })
 
-    lazy val mapLiteral: Parser[AST] = %% ~ (CL(MAP_OPEN) >> commit((CL(expression ~ COLON ~ expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RBRACKET)) ^^ {
+    lazy val mapLiteral: Parser[AST] = rule(%% ~ (CL(MAP_OPEN) >> commit((CL(expression ~ COLON ~ expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RBRACKET)) ^^ {
       case location ~ contents => MapLiteral(location, contents.map { case k ~ colon ~ v => (k, v) })
-    }
+    })
 
     lazy val fqcn: Parser[String] = (ident ~ (CL(DOT) ~ ident).*) ^^ {
       case id ~ ids => ids.foldLeft(id.name) { case (a, d ~ e) => a + d + e.name }
@@ -368,9 +404,9 @@ class Parser extends Processor[String, Program] {
       !KEYWORDS(n)
     } ^^ { case location ~ name => Id(location, name) }) << SPACING_WITHOUT_LF
 
-    def selector: Parser[Selector] = ((%% ~ component ~ "#" ~ component).filter{ case (_ ~ m ~ _ ~ n) =>
+    def selector: Parser[Selector] = rule(((%% ~ component ~ "#" ~ component).filter{ case (_ ~ m ~ _ ~ n) =>
       (!KEYWORDS(m)) && (!KEYWORDS(n))
-    } ^^ { case location ~ m ~ _ ~ n => Selector(location, m, n) }) << SPACING_WITHOUT_LF
+    } ^^ { case location ~ m ~ _ ~ n => Selector(location, m, n) }) << SPACING_WITHOUT_LF)
 
     lazy val qident: Parser[String] = (regularExpression("""'[A-Za-z_][a-zA-Z0-9_]*""".r).filter{n =>
       !KEYWORDS(n)
@@ -384,22 +420,22 @@ class Parser extends Processor[String, Program] {
       !KEYWORDS(n.substring(1))
     }.map{n => n.substring(1)}) << SPACING_WITHOUT_LF
 
-    lazy val assignment: Parser[Assignment] = ident ~ CL(PLUSEQ | MINUSEQ | ASTEREQ | SLASHEQ | EQ) ~ commit(expression) ^^ {
+    lazy val assignment: Parser[Assignment] = rule(ident ~ CL(PLUSEQ | MINUSEQ | ASTEREQ | SLASHEQ | EQ) ~ commit(expression) ^^ {
       case v ~ "=" ~ value => SimpleAssignment(v.location, v.name, value)
       case v ~ "+=" ~ value => PlusAssignment(v.location, v.name, value)
       case v ~ "-=" ~ value => MinusAssignment(v.location, v.name, value)
       case v ~ "*=" ~ value => MultiplicationAssignment(v.location, v.name, value)
       case v ~ "/=" ~ value => DivisionAssignment(v.location, v.name, value)
       case _ ~ op ~ _ => sys.error(s"unknown assignment operator ${op}")
-    }
+    })
 
     // valDeclaration ::= "val" ident "=" expression
-    lazy val valDeclaration: Parser[ValDeclaration] = (%% ~ CL(MUTABLE ^^ { _ => false } | VAL ^^ { _ => true })) ~ commit(ident ~ (typeAnnotation.? << CL(EQ)) ~ expression) ^^ {
+    lazy val valDeclaration: Parser[ValDeclaration] = rule((%% ~ CL(MUTABLE ^^ { _ => false } | VAL ^^ { _ => true })) ~ commit(ident ~ (typeAnnotation.? << CL(EQ)) ~ expression) ^^ {
       case location ~ immutable ~ (valName ~ optionalType ~ value) => ValDeclaration(location, valName.name, optionalType, value, immutable)
-    }
+    })
 
     // anonnymousFunction ::= "(" [param {"," param}] ")" "=>" expression
-    lazy val functionLiteral: Parser[AST] = %% ~ (CL(LPAREN) >> (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) << CL(RPAREN)).? ~ (typeAnnotation.? << CL(ARROW1)) ~ expression ^^ {
+    lazy val functionLiteral: Parser[AST] = rule(%% ~ (CL(LPAREN) >> (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) << CL(RPAREN)).? ~ (typeAnnotation.? << CL(ARROW1)) ~ expression ^^ {
       case location ~ Some(params) ~ optionalType ~ body =>
         Lambda(
           location,
@@ -411,22 +447,22 @@ class Parser extends Processor[String, Program] {
           body
         )
       case location ~ None ~ optionalType ~ body => Lambda(location, List(), optionalType, body)
-    }
+    })
 
     // newObject ::= "new" fqcn "(" [param {"," param} ")"
-    lazy val newObject: Parser[AST] = (%% << CL(NEW)) ~ commit(fqcn ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?) ^^ {
+    lazy val newObject: Parser[AST] = rule((%% << CL(NEW)) ~ commit(fqcn ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?) ^^ {
       case location ~ (className ~ Some(params)) => ObjectNew(location, className, params)
       case location ~ (className ~ None) => ObjectNew(location, className, List())
-    }
+    })
 
     // newRecord ::= "#" sident "(" [param {"," param} ")"
-    lazy val newRecord: Parser[AST] = ((%% << CL(SHARP)) ~ commit(sident ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?) ^^ {
+    lazy val newRecord: Parser[AST] = rule((%% << CL(SHARP)) ~ commit(sident ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?) ^^ {
       case location ~ (recordName ~ Some(params)) => RecordNew(location, recordName, params)
       case location ~ (recordName ~ None) => RecordNew(location, recordName, List())
     })
 
     // methodDefinition ::= "def" ident  ["(" [param {"," param}] ")"] "=" expression
-    lazy val methodDefinition: Parser[MethodDefinition] = {
+    lazy val methodDefinition: Parser[MethodDefinition] = rule {
       (%% << CL(DEF)) ~ commit(ident ~ (CL(LPAREN) >> (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) << CL(RPAREN)).? ~ (typeAnnotation.? << CL(EQ)) ~ expression ~ (CL(CLEANUP) >> expression).?) ^^ {
         case location ~ (functionName ~ params ~ optionalType ~ body ~ cleanup) =>
           val ps = params match {
@@ -447,7 +483,7 @@ class Parser extends Processor[String, Program] {
     }
 
     // functionDefinition ::= "def" ident  ["(" [param {"," param}] ")"] "=" expression
-    lazy val functionDefinition: Parser[FunctionDefinition] = {
+    lazy val functionDefinition: Parser[FunctionDefinition] = rule {
       (%% << CL(DEF)) ~ commit(ident ~ (CL(LPAREN) >> (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) << CL(RPAREN)).? ~ (typeAnnotation.? << CL(EQ)) ~ expression ~ (CL(CLEANUP) >> expression).?) ^^ {
         case location ~ (functionName ~ params ~ optionalType ~ body ~ cleanup) =>
           val ps = params match {
