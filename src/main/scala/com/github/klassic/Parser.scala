@@ -161,6 +161,7 @@ class Parser extends Processor[String, Program] {
       case "Double" => true
       case "Boolean" => true
       case "Unit" => true
+      case "String" => true
       case _ => false
     }
 
@@ -183,6 +184,7 @@ class Parser extends Processor[String, Program] {
         | token("Double") ^^ { _ => TDouble }
         | token("Boolean") ^^ { _ => TBoolean }
         | token("Unit") ^^ { _ => TUnit }
+        | token("String") ^^ {_ => TString }
         | token("*") ^^ { _ => TDynamic }
     )
 
@@ -208,7 +210,7 @@ class Parser extends Processor[String, Program] {
         name <- commit(sident)
         ts <- commit((CL(LT) >> typeVariable.repeat1By(CL(COMMA)) << CL(GT)).?)
         _ <- commit(CL(LBRACE))
-        members <- commit((sident ~ CL(typeAnnotation) ^^ { case n ~ t => (n, t) }).*)
+        members <- commit(((sident ~ CL(typeAnnotation << SEMICOLON.?)) ^^ { case n ~ t => (n, t) }).*)
         methods <- commit(methodDefinition.repeat0By(TERMINATOR))
         _ <- commit(RBRACE)
       } yield RecordDeclaration(location, name, ts.getOrElse(Nil), members, methods)

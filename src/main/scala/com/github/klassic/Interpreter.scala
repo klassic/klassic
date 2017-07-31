@@ -74,11 +74,33 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     define("substring"){ case List(ObjectValue(s:String), begin: BoxedInt, end: BoxedInt) =>
       ObjectValue(s.substring(begin.value, end.value))
     }
+
     define("at") { case List(ObjectValue(s:String), index: BoxedInt) =>
       ObjectValue(s.substring(index.value, index.value + 1))
     }
+
     define("matches") { case List(ObjectValue(s: String), ObjectValue(regex: String)) =>
       BoxedBoolean(s.matches(regex))
+    }
+
+    define("sqrt") { case List(BoxedDouble(value)) =>
+      BoxedDouble(math.sqrt(value))
+    }
+
+    define("int") { case List(BoxedDouble(value)) =>
+      BoxedInt(value.toInt)
+    }
+
+    define("double") { case List(BoxedInt(value)) =>
+      BoxedDouble(value.toDouble)
+    }
+
+    define("floor") { case List(BoxedDouble(value)) =>
+      BoxedInt(value.toInt)
+    }
+
+    define("abs") { case List(BoxedDouble(value)) =>
+      BoxedDouble(math.abs(value))
     }
 
     define("thread") { case List(fun: FunctionValue) =>

@@ -26,31 +26,34 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
     TConstructor("Set", List(tp))
   }
   val BuiltinEnvironment: Environment = {
-    val a = newTypeVariable()
-    val b = newTypeVariable()
     Map(
-      "url" -> TScheme(List(), TFunction(List(TString), TDynamic)),
-      "uri" -> TScheme(List(), TFunction(List(TString), TDynamic)),
-      "substring" -> TScheme(List(), TFunction(List(TString, TInt, TInt), TString)),
-      "at" -> TScheme(List(), TFunction(List(TDynamic, TInt), TDynamic)),
-      "matches" -> TScheme(List(), TFunction(List(TString, TString), TBoolean)),
-      "thread" -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TDynamic)),
-      "println" ->  TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
-      "printlnError" ->  TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
-      "stopwatch" -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TInt)),
-      "sleep" -> TScheme(List(), TInt ==> TUnit),
-      "isEmpty" -> TScheme(List(tv("a")), listOf(tv("a")) ==> TBoolean),
-      "ToDo" -> TScheme(List(tv("a")), TFunction(List(), tv("a"))),
-      "assert" -> TScheme(List(tv("a")), TBoolean ==> TUnit),
+      "url"          -> TScheme(List(), TFunction(List(TString), TDynamic)),
+      "uri"          -> TScheme(List(), TFunction(List(TString), TDynamic)),
+      "substring"    -> TScheme(List(), TFunction(List(TString, TInt, TInt), TString)),
+      "at"           -> TScheme(List(), TFunction(List(TDynamic, TInt), TDynamic)),
+      "matches"      -> TScheme(List(), TFunction(List(TString, TString), TBoolean)),
+      "thread"       -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TDynamic)),
+      "println"      -> TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
+      "printlnError" -> TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
+      "stopwatch"    -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TInt)),
+      "sleep"        -> TScheme(List(), TInt ==> TUnit),
+      "isEmpty"      -> TScheme(List(tv("a")), listOf(tv("a")) ==> TBoolean),
+      "ToDo"         -> TScheme(List(tv("a")), TFunction(List(), tv("a"))),
+      "assert"       -> TScheme(List(tv("a")), TBoolean ==> TUnit),
       "assertResult" -> TScheme(List(tv("a")), tv("a") ==> (tv("a") ==> TUnit)),
-      "map" -> TScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
-      "head" -> TScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
-      "tail" -> TScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
-      "cons" -> TScheme(List(tv("a")), tv("a") ==> (listOf(tv("a")) ==> listOf(tv("a")))),
-      "size" -> TScheme(List(tv("a")), listOf(tv("a")) ==> TInt),
-      "foldLeft" -> TScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> (tv("b") ==> ((List(tv("b"), tv("a")) ==> tv("b")) ==> tv("b")))),
-      "null" -> TScheme(List(tv("a")), tv("a")),
-      "desktop" -> TScheme(List(), Nil ==> TDynamic)
+      "map"          -> TScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
+      "head"         -> TScheme(List(tv("a")), listOf(tv("a")) ==> tv("a")),
+      "tail"         -> TScheme(List(tv("a")), listOf(tv("a")) ==> listOf(tv("a"))),
+      "cons"         -> TScheme(List(tv("a")), tv("a") ==> (listOf(tv("a")) ==> listOf(tv("a")))),
+      "double"       -> TScheme(Nil, TInt ==> TDouble),
+      "int"          -> TScheme(Nil, TDouble ==> TInt),
+      "floor"        -> TScheme(Nil, TDouble ==> TInt),
+      "sqrt"         -> TScheme(Nil, TDouble ==> TDouble),
+      "abs"          -> TScheme(Nil, TDouble ==> TDouble),
+      "size"         -> TScheme(List(tv("a")), listOf(tv("a")) ==> TInt),
+      "foldLeft"     -> TScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> (tv("b") ==> ((List(tv("b"), tv("a")) ==> tv("b")) ==> tv("b")))),
+      "null"         -> TScheme(List(tv("a")), tv("a")),
+      "desktop"      -> TScheme(List(), Nil ==> TDynamic)
     )
   }
 
