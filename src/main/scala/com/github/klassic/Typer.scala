@@ -839,7 +839,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         case tv@TVariable(_) =>
           (TRowExtend(l1, l1Type, rowVariable), s)
         case t =>
-          sys.error("cannot reach here in insertMember: " + t)
+          sys.error("cannot reach here in insert: " + t)
       }
       val (r, sx) = go(record.row)
       (TRecord(record.ts, r), sx)
