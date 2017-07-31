@@ -357,8 +357,25 @@ class Parser extends Processor[String, Program] {
       case target ~ None => target
     })
 
-    //primary ::= selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | |setLiteral | newRecord | newObject | functionLiteral | "(" expression ")" | "{" lines "}"
-    lazy val primary: Parser[AST] = rule(selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newRecord | newObject | functionLiteral | CL(LPAREN) >> expression << RPAREN | CL(LBRACE) >> lines << RBRACE)
+    //primary ::= selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newRecord | newObject | functionLiteral | "(" expression ")" | "{" lines "}"
+    lazy val primary: Parser[AST] = rule{(
+      selector
+    | booleanLiteral
+    | ident
+    | floatLiteral
+    | integerLiteral
+    | newRecord
+    | newObject
+    | functionLiteral
+    | predict(
+        '%' -> mapLiteral,
+        '#' -> setLiteral,
+        '"' -> stringLiteral,
+        '[' -> listLiteral,
+        '(' -> (CL(LPAREN) >> expression << RPAREN),
+        '{' -> (CL(LBRACE) >> lines << RBRACE)
+      )
+    )}
 
     //integerLiteral ::= ["1"-"9"] {"0"-"9"}
     lazy val integerLiteral: Parser[AST] = (%% ~ """[1-9][0-9]*|0""".r ~ ("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix } | "S" ^^ { _ => ShortSuffix }).? ^^ {
