@@ -79,13 +79,13 @@ object Value {
   def classesOfValues(values: Array[Value]):  Array[java.lang.Class[_]] = values.map(classOfValue)
 
   def fromKlassic(value: Value): AnyRef = value match {
-    case BoxedBoolean(v) => new java.lang.Boolean(v)
-    case BoxedByte(v) => new java.lang.Byte(v)
-    case BoxedShort(v) => new java.lang.Short(v)
-    case BoxedInt(v) => new java.lang.Integer(v)
-    case BoxedLong(v) => new java.lang.Long(v)
-    case BoxedFloat(v) => new java.lang.Float(v)
-    case BoxedDouble(v) => new java.lang.Double(v)
+    case BoxedBoolean(v) => java.lang.Boolean.valueOf(v)
+    case BoxedByte(v) => java.lang.Byte.valueOf(v)
+    case BoxedShort(v) => java.lang.Short.valueOf(v)
+    case BoxedInt(v) => java.lang.Integer.valueOf(v)
+    case BoxedLong(v) => java.lang.Long.valueOf(v)
+    case BoxedFloat(v) => java.lang.Float.valueOf(v)
+    case BoxedDouble(v) => java.lang.Double.valueOf(v)
     case ObjectValue(v) => v
     case UnitValue => UnitValue
     case otherwise => otherwise
