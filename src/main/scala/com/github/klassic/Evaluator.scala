@@ -3,6 +3,7 @@ package com.github.klassic
 import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
 
 import com.github.klassic.AST.Program
+import com.github.scaruby.SFile
 
 class Evaluator extends (String => Value) {
   val parser = new Parser
@@ -12,10 +13,13 @@ class Evaluator extends (String => Value) {
   override final def apply(program: String): Value = {
     evaluateString(program)
   }
-  def evaluateFile(file: File): Value = using(new BufferedReader(new InputStreamReader(new FileInputStream(file)))){in =>
-    val program = Iterator.continually(in.read()).takeWhile(_ != -1).map(_.toChar).mkString
-    evaluateString(program, file.getName)
-  }
+  def evaluateFile(file: SFile): Value =
+    for {
+      in <- file.openReader()
+    } {
+      val program = in.readAll()
+      evaluateString(program, file.name)
+    }
   def evaluateString(program: String, fileName: String = "<no file>"): Value = {
     val parser = new Parser
     val parsedProgram = parser.process(program)
