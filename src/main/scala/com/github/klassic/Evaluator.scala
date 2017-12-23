@@ -15,9 +15,9 @@ class Evaluator extends (String => Value) {
   }
   def evaluateFile(file: SFile): Value =
     for {
-      in <- file.open()
+      in <- file.openReader()
     } {
-      val program = Iterator.continually(in.read()).takeWhile(_ != -1).map(_.toChar).mkString
+      val program = in.readAll()
       evaluateString(program, file.name)
     }
   def evaluateString(program: String, fileName: String = "<no file>"): Value = {
