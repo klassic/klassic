@@ -7,7 +7,6 @@ import com.github.scaruby.SFile
 class FileBasedProgramSpec extends SpecHelper {
   val directory = new SFile("test-programs")
   describe(s"run Klassic programs under ${directory}") {
-    directory.list
     for(program <- directory.listFiles{file => file.name.endsWith(".kl")}) {
       it(s"program ${program} runs successfully") {
         try {
