@@ -23,8 +23,8 @@ class Evaluator extends (String => Value) {
   def evaluateString(program: String, fileName: String = "<no file>"): Value = {
     val parser = new Parser
     val parsedProgram = parser.process(program)
-    val rewritedProgram = rewriter.process(parsedProgram)
-    val typedProgram = typer.process(rewritedProgram)
+    val rewrittenProgram = rewriter.process(parsedProgram)
+    val typedProgram = typer.process(rewrittenProgram)
     interpreter.process(typedProgram)
   }
 }

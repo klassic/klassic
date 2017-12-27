@@ -87,11 +87,11 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
     case SimpleAssignment(location, variable, value) => SimpleAssignment(location, variable, doRewrite(value))
     case PlusAssignment(location, variable, value) =>
       val generatedSymbol = symbol()
-      val rewritedValue = doRewrite(value)
+      val rewrittenValue = doRewrite(value)
       Block(
         location,
         List(
-          Let(location, generatedSymbol, None, rewritedValue,
+          Let(location, generatedSymbol, None, rewrittenValue,
             SimpleAssignment(location, variable,
               BinaryExpression(location, Operator.ADD, Id(location, variable), Id(location, generatedSymbol) )
             ),
@@ -101,11 +101,11 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
       )
     case MinusAssignment(location, variable, value) =>
       val generatedSymbol = symbol()
-      val rewritedValue = doRewrite(value)
+      val rewrittenValue = doRewrite(value)
       Block(
         location,
         List(
-          Let(location, generatedSymbol, None, rewritedValue,
+          Let(location, generatedSymbol, None, rewrittenValue,
             SimpleAssignment(location, variable,
               BinaryExpression(location, Operator.SUBTRACT, Id(location, variable), Id(location, generatedSymbol) )
             ),
@@ -115,11 +115,11 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
       )
     case MultiplicationAssignment(location, variable, value) =>
       val generatedSymbol = symbol()
-      val rewritedValue = doRewrite(value)
+      val rewrittenValue = doRewrite(value)
       Block(
         location,
         List(
-          Let(location, generatedSymbol, None, rewritedValue,
+          Let(location, generatedSymbol, None, rewrittenValue,
             SimpleAssignment(location, variable,
               BinaryExpression(location, Operator.MULTIPLY, Id(location, variable), Id(location, generatedSymbol) )
             ),
@@ -129,11 +129,11 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
       )
     case DivisionAssignment(location, variable, value) =>
       val generatedSymbol = symbol()
-      val rewritedValue = doRewrite(value)
+      val rewrittenValue = doRewrite(value)
       Block(
         location,
         List(
-          Let(location, generatedSymbol, None, rewritedValue,
+          Let(location, generatedSymbol, None, rewrittenValue,
             SimpleAssignment(location, variable,
               BinaryExpression(location, Operator.DIVIDE, Id(location, variable), Id(location, generatedSymbol) )
             ),
