@@ -2,6 +2,8 @@ package com.github.klassic
 
 import java.io.File
 
+import com.github.scaruby.SFile
+
 import scala.collection.Iterator.continually
 
 /**
@@ -14,7 +16,7 @@ object Main {
       case Some(("-e", line)) =>
         println(evaluator.evaluateString(line))
       case Some(("-f", fileName)) =>
-        evaluator.evaluateFile(new File(fileName))
+        evaluator.evaluateFile(new SFile(fileName))
       case _ =>
         Console.err.println(
           """
