@@ -27,18 +27,18 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
   }
   val BuiltinEnvironment: Environment = {
     Map(
-      "url"          -> TScheme(List(), TFunction(List(TString), TDynamic)),
-      "uri"          -> TScheme(List(), TFunction(List(TString), TDynamic)),
-      "substring"    -> TScheme(List(), TFunction(List(TString, TInt, TInt), TString)),
-      "at"           -> TScheme(List(), TFunction(List(TDynamic, TInt), TDynamic)),
-      "matches"      -> TScheme(List(), TFunction(List(TString, TString), TBoolean)),
-      "thread"       -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TDynamic)),
+      "url"          -> TScheme(Nil, TFunction(List(TString), TDynamic)),
+      "uri"          -> TScheme(Nil, TFunction(List(TString), TDynamic)),
+      "substring"    -> TScheme(Nil, TFunction(List(TString, TInt, TInt), TString)),
+      "at"           -> TScheme(Nil, TFunction(List(TDynamic, TInt), TDynamic)),
+      "matches"      -> TScheme(Nil, TFunction(List(TString, TString), TBoolean)),
+      "thread"       -> TScheme(Nil, TFunction(List(TFunction(List.empty, TDynamic)), TDynamic)),
       "println"      -> TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
       "printlnError" -> TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
-      "stopwatch"    -> TScheme(List(), TFunction(List(TFunction(List.empty, TDynamic)), TInt)),
-      "sleep"        -> TScheme(List(), TInt ==> TUnit),
+      "stopwatch"    -> TScheme(Nil, TFunction(List(TFunction(List.empty, TDynamic)), TInt)),
+      "sleep"        -> TScheme(Nil, TInt ==> TUnit),
       "isEmpty"      -> TScheme(List(tv("a")), listOf(tv("a")) ==> TBoolean),
-      "ToDo"         -> TScheme(List(tv("a")), TFunction(List(), tv("a"))),
+      "ToDo"         -> TScheme(List(tv("a")), TFunction(Nil, tv("a"))),
       "assert"       -> TScheme(List(tv("a")), TBoolean ==> TUnit),
       "assertResult" -> TScheme(List(tv("a")), tv("a") ==> (tv("a") ==> TUnit)),
       "map"          -> TScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> ((tv("a") ==> tv("b"))  ==> listOf(tv("b")))),
@@ -53,7 +53,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       "size"         -> TScheme(List(tv("a")), listOf(tv("a")) ==> TInt),
       "foldLeft"     -> TScheme(List(tv("a"), tv("b")), listOf(tv("a")) ==> (tv("b") ==> ((List(tv("b"), tv("a")) ==> tv("b")) ==> tv("b")))),
       "null"         -> TScheme(List(tv("a")), tv("a")),
-      "desktop"      -> TScheme(List(), Nil ==> TDynamic)
+      "desktop"      -> TScheme(Nil, Nil ==> TDynamic)
     )
   }
 
@@ -690,7 +690,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       case AST.Lambda(location, params, optionalType, body) =>
         val b = optionalType.getOrElse(newTypeVariable())
         val ts = params.map{p => p.optionalType.getOrElse(newTypeVariable())}
-        val as = (params zip ts).map{ case (p, t) => p.name -> TScheme(List(), t) }
+        val as = (params zip ts).map{ case (p, t) => p.name -> TScheme(Nil, t) }
         val s1 = unify(t, TFunction(ts, b), s0)
         val env1 = as.foldLeft(env) { case (env, (name, scheme)) => env.updateImmuableVariable(name, scheme)}
         val (typedBody, s) = doType(body, env1, b, s1)
@@ -727,7 +727,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
         }
         val a = newTypeVariable()
         val b = newTypeVariable()
-        val (typedE1, s1) = doType(value, env.updateImmuableVariable(variable, TScheme(List(), a)), b, s0)
+        val (typedE1, s1) = doType(value, env.updateImmuableVariable(variable, TScheme(Nil, a)), b, s0)
         val s2 = unify(a, b, s1)
         val (typedE2, s3) = doType(body, env.updateImmuableVariable(variable, generalize(s2.replace(a), s2(env.variables))), t, s2)
         val x = newTypeVariable()
