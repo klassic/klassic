@@ -48,6 +48,7 @@ class Typer extends Processor[AST.Program, TypedAST.Program] {
       "double"       -> TScheme(Nil, TInt ==> TDouble),
       "int"          -> TScheme(Nil, TDouble ==> TInt),
       "floor"        -> TScheme(Nil, TDouble ==> TInt),
+      "ceil"         -> TScheme(Nil, TDouble ==> TInt),
       "sqrt"         -> TScheme(Nil, TDouble ==> TDouble),
       "abs"          -> TScheme(Nil, TDouble ==> TDouble),
       "size"         -> TScheme(List(tv("a")), listOf(tv("a")) ==> TInt),

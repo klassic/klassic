@@ -99,6 +99,10 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
       BoxedInt(value.toInt)
     }
 
+    define("ceil") { case List(BoxedDouble(value)) =>
+      BoxedInt(math.ceil(value).toInt)
+    }
+
     define("abs") { case List(BoxedDouble(value)) =>
       BoxedDouble(math.abs(value))
     }
