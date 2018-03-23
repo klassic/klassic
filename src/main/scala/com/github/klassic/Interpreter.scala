@@ -20,7 +20,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     val nameMatchedMethods = selfClass.getMethods.filter {
       _.getName == name
     }
-    nameMatchedMethods.find { m =>
+    val maybeUnboxedMethod = nameMatchedMethods.find { m =>
       val parameterCountMatches = m.getParameterCount == params.length
       val parameterTypes = Value.classesOfValues(params)
       val parameterTypesMatches = (m.getParameterTypes zip parameterTypes).forall{ case (arg, param) =>
@@ -30,7 +30,8 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     }.map{m =>
       m.setAccessible(true)
       UnboxedVersionMethodFound(m)
-    }.orElse({
+    }
+    val maybeBoxedMethod = {
       nameMatchedMethods.find{m =>
         val parameterCountMatches = m.getParameterCount == params.length
         val boxedParameterTypes = Value.boxedClassesOfValues(params)
@@ -42,12 +43,13 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     }.map{m =>
       m.setAccessible(true)
       BoxedVersionMethodFound(m)
-    }).getOrElse(NoMethodFound)
+    }
+    maybeUnboxedMethod.orElse(maybeBoxedMethod).getOrElse(NoMethodFound)
   }
 
   def findConstructor(target: Class[_], params: Array[Value]): ConstructorSearchResult = {
     val constructors = target.getConstructors
-    constructors.find{c =>
+    val maybeUnboxedConstructor = constructors.find{c =>
       val parameterCountMatches = c.getParameterCount == params.length
       val unboxedParameterTypes = Value.classesOfValues(params)
       val parameterTypesMatches  = (c.getParameterTypes zip unboxedParameterTypes).forall{ case (arg, param) =>
@@ -56,7 +58,8 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
       parameterCountMatches && parameterTypesMatches
     }.map{c =>
       UnboxedVersionConstructorFound(c)
-    }.orElse({
+    }
+    val maybeBoxedConstructor = {
       constructors.find{c =>
         val parameterCountMatches = c.getParameterCount == params.length
         val boxedParameterTypes = Value.boxedClassesOfValues(params)
@@ -67,7 +70,8 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
       }
     }.map { c =>
       BoxedVersionConstructorFound(c)
-    }).getOrElse(NoConstructorFound)
+    }
+    maybeUnboxedConstructor.orElse(maybeBoxedConstructor).getOrElse(NoConstructorFound)
   }
 
   object BuiltinEnvironment extends RuntimeEnvironment(None) {
