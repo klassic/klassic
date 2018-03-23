@@ -55,5 +55,29 @@ class RecordSpec extends SpecHelper {
         assert(expected == E(in))
       }
     }
+
+    intercept[TyperException] {
+      E {
+        """
+          | record Person {
+          |   name: *
+          |   age: Int
+          | }
+          | val p = #Person("Hoge", 1.0)
+        """.stripMargin
+      }
+    }
+    intercept[TyperException] {
+      E {
+        """
+          | record Tuple<'a, 'b> {
+          |   _1: 'a
+          |   _2: 'b
+          | }
+          | val t = #Tuple(1, 2)
+          | val k: Double = t._1
+        """.stripMargin
+      }
+    }
   }
 }
