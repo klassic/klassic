@@ -128,6 +128,8 @@ class Parser extends Processor[String, Program] {
     lazy val CLEANUP: Parser[String] = token("cleanup")
     lazy val VAL: Parser[String] = token("val")
     lazy val EQ: Parser[String] = token("=")
+    lazy val BEGIN_MSTR: Parser[String] = token("<<<")
+    lazy val END_MSTR: Parser[String] = token(">>>")
     lazy val PLUSEQ: Parser[String] = token("+=")
     lazy val MINUSEQ: Parser[String] = token("-=")
     lazy val ASTEREQ: Parser[String] = token("*=")
