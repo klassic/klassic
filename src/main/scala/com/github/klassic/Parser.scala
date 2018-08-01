@@ -115,7 +115,7 @@ class Parser extends Processor[String, Program] {
     lazy val WHILE: Parser[String] = token("while")
     lazy val FOREACH: Parser[String] = token("foreach")
     lazy val IMPORT: Parser[String] = token("import")
-    lazy val VARIANT: Parser[String] = token("variant")
+    lazy val ENUM: Parser[String] = token("enum")
     lazy val TRUE: Parser[String] = token("true")
     lazy val FALSE: Parser[String] = token("false")
     lazy val IN: Parser[String] = token("in")
@@ -225,14 +225,14 @@ class Parser extends Processor[String, Program] {
       })
     }
 
-    lazy val variantDeclaration: Parser[VariantDeclaration] = rule {
+    lazy val variantDeclaration: Parser[EnumDeclaration] = rule {
       for {
         location <- %%
-        _ <- CL(VARIANT)
+        _ <- CL(ENUM)
         name <- sident
         ts <- (LT >> typeAnnotation.repeat1By(CL(COMMA)) << GT << EQ).?
         cs <- dataConstructor.*
-      } yield VariantDeclaration(location, name, ts.getOrElse(Nil), cs)
+      } yield EnumDeclaration(location, name, ts.getOrElse(Nil), cs)
     }
 
     lazy val dataConstructor: Parser[DataConstructor] = rule {

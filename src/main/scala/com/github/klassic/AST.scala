@@ -30,7 +30,7 @@ object AST {
 
   case class RecordDeclaration(location: Location, name: String, ts: List[TVariable], members: List[(String, Type)], methods: List[MethodDefinition])
 
-  case class VariantDeclaration(location: Location, id: String, params: List[Type], constructors: List[DataConstructor]) extends AST
+  case class EnumDeclaration(location: Location, id: String, params: List[Type], constructors: List[DataConstructor]) extends AST
 
   case class Block(location: Location, expressions: List[AST]) extends AST
 
@@ -87,7 +87,7 @@ object AST {
 
   case class ValDeclaration(location: Location, variable: String, type_ : Option[Type], value: AST, immutable: Boolean) extends AST
 
-  case class VariantIn(location: Location, variant: VariantDeclaration, body: AST) extends AST
+  case class EnumIn(location: Location, variant: EnumDeclaration, body: AST) extends AST
 
   case class RecordSelect(location: Location, record: AST, label: String) extends AST
 
