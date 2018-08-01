@@ -26,8 +26,8 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
           List(Let(location, variable, type_, doRewrite(value), Block(location, rewriteBlock(xs)), immutable))
         case FunctionDefinition(loation, name, expression, cleanup) :: xs =>
           List(LetRec(location, name, doRewrite(expression).asInstanceOf[AST.Lambda], cleanup.map(doRewrite), Block(location, rewriteBlock(xs))))
-        case (x@VariantDeclaration(_, _, _, _)) :: xs =>
-          List(VariantIn(x.location, x, Block(location, rewriteBlock(xs))))
+        case (x@EnumDeclaration(_, _, _, _)) :: xs =>
+          List(EnumIn(x.location, x, Block(location, rewriteBlock(xs))))
         case x :: xs =>
           doRewrite(x) :: rewriteBlock(xs)
         case Nil =>

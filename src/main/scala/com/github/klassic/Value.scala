@@ -43,7 +43,7 @@ case class RecordValue(name: String, members: List[(String, Value)]) extends Val
         | }
     """.stripMargin
 }
-case class VariantValue(tag: String, items: List[Value]) extends Value {
+case class EnumValue(tag: String, items: List[Value]) extends Value {
   override def toString: String = {
     s"${tag}(${items.mkString(", ")})"
   }
