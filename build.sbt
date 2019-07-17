@@ -4,7 +4,7 @@ name := "klassic"
 
 version := "0.1-SNAPSHOT"
 
-scalaVersion := "2.12.6"
+scalaVersion := "2.13.0"
 
 publishMavenStyle := true
 
@@ -16,8 +16,6 @@ scalacOptions in (Compile, doc) ++= { Seq(
   "-sourcepath", baseDirectory.value.getAbsolutePath,
   "-doc-source-url", s"https://github.com/klassic/klassic/tree/${scaladocBranch.value}€{FILE_PATH}.scala"
 )}
-
-crossScalaVersions := Seq("2.11.11", scalaVersion.value)
 
 testOptions in Test += Tests.Argument("-oI")
 
@@ -31,11 +29,11 @@ resolvers ++= Seq(
 )
 
 libraryDependencies ++= Seq(
-  "com.github.kmizu" %% "scomb" % "0.6",
-  "com.github.scaruby" %% "scaruby" % "0.5",
+  "com.github.kmizu" %% "scomb" % "0.8.1",
+  "com.github.scaruby" %% "scaruby" % "0.6",
   "org.ow2.asm" % "asm" % "5.0.4",
   "junit" % "junit" % "4.7" % "test",
-  "org.scalatest" %% "scalatest" %  "3.0.0"
+  "org.scalatest" %% "scalatest" %  "3.0.8"
 )
 
 assemblyJarName in assembly := "klassic.jar"

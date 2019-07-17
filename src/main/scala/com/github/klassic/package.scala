@@ -99,7 +99,7 @@ package object klassic {
     def union(that: Substitution): Substitution = {
       val s1 = self
       val s2 = that
-      s2.mapValues{t => s1.replace(t)} ++ s1
+      s2.mapValues{t => s1.replace(t)}.toMap ++ s1
     }
   }
 
