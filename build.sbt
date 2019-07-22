@@ -2,7 +2,7 @@ organization := "com.github.klassic"
 
 name := "klassic"
 
-version := "0.1-SNAPSHOT"
+version := "0.1.0-alpha"
 
 scalaVersion := "2.13.0"
 
