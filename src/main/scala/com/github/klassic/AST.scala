@@ -66,6 +66,10 @@ object AST {
   object Id {
     def apply(name: String): Id = Id(NoLocation, name)
   }
+  case class Placeholder(location: Location) extends AST
+  object Placeholder{
+    def apply(): Placeholder= Placeholder(NoLocation)
+  }
 
   case class Selector(location: Location, module: String, name: String) extends AST
 
