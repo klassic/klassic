@@ -8,6 +8,7 @@ import com.github.scaruby.SFile
 class Evaluator extends (String => Value) {
   val parser = new Parser
   val typer = new Typer
+  val placeholderDesugerer = new PlaceholderDesugerer
   val rewriter = new SyntaxRewriter
   val interpreter = new Interpreter
   override final def apply(program: String): Value = {
@@ -23,7 +24,8 @@ class Evaluator extends (String => Value) {
   def evaluateString(program: String, fileName: String = "<no file>"): Value = {
     val parser = new Parser
     val parsedProgram = parser.process(program)
-    val rewrittenProgram = rewriter.process(parsedProgram)
+    val placeHolderIsDesugaredProgram = placeholderDesugerer.process(parsedProgram)
+    val rewrittenProgram = rewriter.process(placeHolderIsDesugaredProgram)
     val typedProgram = typer.process(rewrittenProgram)
     interpreter.process(typedProgram)
   }

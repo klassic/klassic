@@ -23,6 +23,33 @@ Klassic is yet another statically typed programming language.  Klassic has:
 
 Klassic will enable object-functional programming.
 
+## Instalattion and Quick Start
+It requires Java 8 or later.
+
+You can download the binary distribution (executable jar) from the [release page](https://github.com/klassic/klassic/releases/tag/releases%2Fv0.1.0-alpha).  Put the file on an directory and execute the klassic.jar by `java -jar` command:
+
+```
+$ java -jar klassic.jar
+
+Usage: java -jar klassic.jar (-f <fileName> | -e <expression>)
+<fileName>   : read a program from <fileName> and execute it
+-e <expression> : evaluate <expression>
+```
+
+Write the folowing lines and save it to `hello.kl`
+
+```scala
+println("Hello, World!")
+```
+
+And run the interpreter by `java -jar klassic.jar hello.kl`:
+
+```
+$ java -jar klassic.jar hello.kl
+
+Hello, World!
+```
+
 ## Syntax
 
 ### Variable Declaration

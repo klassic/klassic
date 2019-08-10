@@ -28,11 +28,14 @@ object Main {
   }
 
   def parseCommandLine(args: Array[String]): Option[(String, String)] = {
-    val parser = new Parser
+    val paser = new Parser
     args match {
-      case Array(fileName) if fileName.endsWith("kl") => Some("-f"-> fileName)
-      case Array("-e", line) => Some("-e" -> line)
-      case otherwise  => None
+      case Array(fileName) if fileName.endsWith("kl") =>
+        Some("-f"-> fileName)
+      case Array("-e", line) =>
+        Some("-e" -> line)
+      case otherwise =>
+        None
     }
   }
 }

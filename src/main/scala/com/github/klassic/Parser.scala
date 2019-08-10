@@ -97,6 +97,7 @@ class Parser extends Processor[String, Program] {
     lazy val GTE: Parser[String] = token(">=")
     lazy val MAP_OPEN: Parser[String] = token("%[")
     lazy val SET_OPEN: Parser[String] = token("%(")
+    lazy val UNDERSCORE: Parser[String] = token("_")
     lazy val PLUS: Parser[String] = token("+")
     lazy val MINUS: Parser[String] = token("-")
     lazy val ASTER: Parser[String] = token("*")
@@ -143,7 +144,7 @@ class Parser extends Processor[String, Program] {
     lazy val BAR2: Parser[String] = token("||")
     lazy val BAR: Parser[String] = token("|")
     lazy val KEYWORDS: Set[String] = Set(
-      "<", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
+      "<", "_", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
       "if", "else", "while", "foreach", "import", "cleanup", "true", "false", "in", ",", ".",
       "class", "def", "val", "mutable", "record", "=", "==", "=>", "new", "&", "|", "&&", "||"
     )
@@ -363,6 +364,7 @@ class Parser extends Processor[String, Program] {
     lazy val primary: Parser[AST] = rule{(
       selector
     | booleanLiteral
+    | placeholder
     | ident
     | floatLiteral
     | integerLiteral
@@ -425,6 +427,8 @@ class Parser extends Processor[String, Program] {
     }
 
     lazy val component: Parser[String] = """[A-Za-z_][a-zA-Z0-9_]*""".r
+
+    lazy val placeholder: Parser[Placeholder] = ((%% ~ UNDERSCORE) ^^ { case location ~ _ => Placeholder(location) }) << SPACING_WITHOUT_LF
 
     lazy val ident: Parser[Id] = (%% ~ component.filter{n =>
       !KEYWORDS(n)

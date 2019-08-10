@@ -4,7 +4,7 @@ cache:
   directories:
   - $HOME/.ivy2/cache
   - $HOME/.sbt/launchers
-jdk: oraclejdk8
+jdk: openjdk8
 script:
 - sbt ++$TRAVIS_SCALA_VERSION test
 - sbt ++$TRAVIS_SCALA_VERSION assembly
