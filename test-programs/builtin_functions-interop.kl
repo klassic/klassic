@@ -10,8 +10,8 @@ val uri2 = uri("https://github.com/klassic/klassic")
 println(uri2)
 assertResult(uri1)(uri2)
 
-// desktop()
-val dt = desktop();
-println(dt)
-println(dt->isDesktopSupported())
+// desktop() -- not supported in Travis CI environment
+//val dt = desktop();
+//println(dt)
+//println(dt->isDesktopSupported())
 // dt->mail()
