@@ -32,10 +32,29 @@ class PlaceholderDesugerer extends Processor[AST.Program, AST.Program] {
   def doRewrite(node: AST): AST = node match {
     case Block(location, expressions) =>
       def rewriteBlock(es: List[AST]): List[AST] = es match {
+         // val f = _ is rewritten to val f = ($0) => $0
         case (x@ValDeclaration(location, variable, type_, value, immutable)) :: xs =>
-          x.copy(value = doRewrite(x.value)) :: rewriteBlock(xs)
+          val xValue = doRewrite(value)
+          val init: AST = if(manager.hasPlaceholder) {
+            val formalParameters = manager.placeholders.map{name => FormalParameterOptional(name, None)}
+            val lambda = Lambda(location, formalParameters, None, xValue)
+            manager.reset()
+            lambda
+          } else {
+            xValue
+          }
+          x.copy(value = init) :: rewriteBlock(xs)
         case (x@FunctionDefinition(loation, name, expression, cleanup)) :: xs =>
-          x.copy(body = doRewrite(x.body).asInstanceOf[AST.Lambda], cleanup  = x.cleanup.map{doRewrite}) :: xs
+          val xExpression = doRewrite(expression)
+          val xBody: AST = if(manager.hasPlaceholder) {
+            val formalParameters = manager.placeholders.map{name => FormalParameterOptional(name, None)}
+            val lambda = Lambda(location, formalParameters, None, xExpression)
+            manager.reset()
+            lambda
+          } else {
+            xExpression
+          }
+          x.copy(body = xBody.asInstanceOf[AST.Lambda], cleanup  = x.cleanup.map{doRewrite}) :: xs
         case x :: xs =>
           doRewrite(x) :: rewriteBlock(xs)
         case Nil =>
@@ -115,8 +134,8 @@ class PlaceholderDesugerer extends Processor[AST.Program, AST.Program] {
       MultiplicationAssignment(location, variable, doRewrite(value))
     case DivisionAssignment(location, variable, value) =>
       DivisionAssignment(location, variable, doRewrite(value))
-    case ValDeclaration(location, variable, optionalType, value, immutable) =>
-      ValDeclaration(location, variable, optionalType, doRewrite(value), immutable)
+    case ValDeclaration(_, _, _, _, _) =>
+      sys.error("cannot reach here")
     case Lambda(location, params, optionalType, proc) =>
       Lambda(location, params, optionalType, doRewrite(proc))
     case FunctionCall(location, func, params) =>

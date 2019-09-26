@@ -51,4 +51,22 @@ class PlaceholderSpec extends TestSuiteHelper {
     )
     assertResult(result)(ObjectValue(listOf(1, 2, 3)))
   }
+  test("variable declaration has one placeholder") {
+    val result = E(
+      """
+        |val id = _
+        |map([1])(id)
+      """.stripMargin
+    )
+    assertResult(result)(ObjectValue(listOf(1)))
+  }
+  test("function declaration has one placeholder") {
+    val result = E(
+      """
+        |def f(x) = _
+        |map([1])(f(1))
+      """.stripMargin
+    )
+    assertResult(result)(ObjectValue(listOf(1)))
+  }
 }
