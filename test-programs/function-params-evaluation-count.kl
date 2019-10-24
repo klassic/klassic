@@ -1,0 +1,14 @@
+mutable count = 0
+
+val add = (x, y) => {
+  count = count + 1
+  x + y
+}
+
+// OK: add(1, 2) is called once
+val num = add(1, 2)
+assertResult(1)(count)
+
+// NG: add(1, 2) is called twice
+// -> klassic.runtime.AssertionError: expected: 2, actual: 3
+assertResult(2)(add(1, 2))
