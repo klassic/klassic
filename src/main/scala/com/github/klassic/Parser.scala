@@ -4,6 +4,7 @@ package com.github.klassic
 import scala.util.matching.Regex
 import com.github.klassic.AST._
 import com.github.klassic.Type._
+import com.github.klassic.macro_peg.Parser.Fragment
 import com.github.kmizu.scomb
 import com.github.kmizu.scomb.{Result, SCombinator}
 
@@ -13,7 +14,7 @@ import scala.collection.mutable
  * @author Kota Mizushima
  */
 class Parser extends Processor[String, Program] {
-  private object KlassicParsers extends SCombinator[Program] {
+  private object KlassicParsers extends SCombinator[Any] {
     def publicLocations: mutable.Map[Int, scomb.Location] = locations
 
     implicit def stringToParser(literal: String): Parser[String] = $(literal)
@@ -563,14 +564,17 @@ class Parser extends Processor[String, Program] {
 
   def parseExpression(input: String): AST = {
     parse(input) match {
-      case Result.Success(program) => program.block
+      case Result.Success(programAny) =>
+        val program = programAny.asInstanceOf[Program]
+        program.block
       case Result.Failure(location, message) => throw new InterpreterException(s"${location}:${message}")
     }
   }
 
   def parseAll(input: String): Program = {
     parse(input) match {
-      case Result.Success(program) => program
+      case Result.Success(programAny) =>
+        programAny.asInstanceOf[Program]
       case Result.Failure(location, message) => throw new InterpreterException(s"${location}:${message}")
     }
   }
