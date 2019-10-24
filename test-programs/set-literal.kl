@@ -1,8 +1,6 @@
-// NG: com.github.klassic.InterpreterException: Location(2,12):expected:`foreach` actual:`%`
 val set1 = %(1, 2, 3)
 println(set1)
 
-// comma is omitted
 val set2 = %(1 2 3)
 println(set2)
 

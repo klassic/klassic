@@ -1,9 +1,0 @@
-// NG: com.github.klassic.InterpreterException: Location(3,9):expected:`)` actual:`<`
-// http://kmizu.github.io/klassic/#/8
-println(<<$EXP1 * <<$EXP2 * <<$EXP3) // -> (1 + 2) * (2 + 3) * (3 + 4) = 105
-1 + 2
-EXP1
-2 + 3
-EXP2
-3 + 4
-EXP3

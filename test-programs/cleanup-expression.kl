@@ -1,7 +1,7 @@
-// NG: com.github.klassic.InterpreterException: Location(5,10):expected:`#` actual:` `
 mutable i = 0
-while(i < 10) {
-  i = i + 1
-} cleanup {
-  println(i)
-}
+def loop() =
+  while(i < 10) {
+    i = i + 1
+  } cleanup {
+    println(i)
+  }

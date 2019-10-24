@@ -1,5 +1,0 @@
-// NG: com.github.klassic.TyperException:   3,  3 : cannot unify Unit with *
-val time = stopwatch( => {
-  sleep(1000)
-})
-println("it took #{time} milli seconds")

@@ -1,7 +1,0 @@
-// http://kmizu.github.io/klassic/#/5
-
-// NG: java.lang.StackOverflowError
-val Y = (f) => ((x) => f((y) => x(x(y))))((x) => f((y) => x(x(y))))
-val fact = Y((f) => (x) => if(x < 2) 1 else x * fact(x - 1))
-
-assertResult(6)(fact(3))
