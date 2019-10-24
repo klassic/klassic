@@ -1,0 +1,16 @@
+// NG: com.github.klassic.InterpreterException: Location(3,12):expected:`foreach` actual:`<`
+// http://kmizu.github.io/klassic/#/7
+println("#{<<TAG1 + 1} #{<<TAG2 + 2} #{<<TAG3 + 3}")
+tag1
+TAG1
+tag2
+TAG2
+tag3
+TAG3
+
+// http://kmizu.hatenablog.com/entry/2017/05/25/192959
+println(<<TAGA1 + <<TAGA2);
+tag1
+TAGA1
+tag2
+TAGA2
