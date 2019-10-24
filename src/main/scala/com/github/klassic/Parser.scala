@@ -373,8 +373,7 @@ class Parser extends Processor[String, Program] {
     | newObject
     | functionLiteral
     | predict(
-        '%' -> mapLiteral,
-        '#' -> setLiteral,
+        '%' -> (mapLiteral | setLiteral),
         '"' -> stringLiteral,
         '[' -> listLiteral,
         '(' -> (CL(LPAREN) >> expression << RPAREN),
@@ -519,7 +518,7 @@ class Parser extends Processor[String, Program] {
 
     // methodDefinition ::= "def" ident  ["(" [param {"," param}] ")"] "=" expression
     lazy val methodDefinition: Parser[MethodDefinition] = rule {
-      (%% << CL(DEF)) ~ commit(ident ~ (CL(LPAREN) >> (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) << CL(RPAREN)).? ~ (typeAnnotation.? << CL(EQ)) ~ expression ~ (CL(CLEANUP) >> expression).?) ^^ {
+      (%% << CL(DEF)) ~ commit(ident ~ (CL(LPAREN) >> (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) << CL(RPAREN)).? ~ (typeAnnotation.? << CL(EQ)) ~ expression ~ (CLEANUP >> expression).?) ^^ {
         case location ~ (functionName ~ params ~ optionalType ~ body ~ cleanup) =>
           val ps = params match {
             case Some(xs) =>

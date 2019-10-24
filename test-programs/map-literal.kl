@@ -1,0 +1,12 @@
+val map1 = %["A": 1, "B": 2]
+assertResult(1)(map1 Map#get "A") 
+assertResult(2)(map1 Map#get "B")
+assertResult(null)(map1 Map#get "C")
+
+val map2 = %[
+    "A" : 1
+    "B" : 2
+]
+assertResult(map1)(map2)
+
+val map3 = %["A": 1, "B": 2]
