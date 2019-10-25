@@ -1,5 +1,7 @@
 package com.github.klassic.macro_peg
 
+import com.github.klassic.{Parser => KlassicParser}
+
 object Runner {
   def main(args: Array[String]): Unit = {
     evalGrammar(
@@ -141,7 +143,8 @@ object Runner {
     * @return sequence of results
     */
   def evalGrammar(source: String, inputs: Seq[String], strategy: EvaluationStrategy = EvaluationStrategy.CallByName): Seq[EvaluationResult] = {
-    val grammar = Parser.parse(source)
+    val parser = new KlassicParser
+    val grammar = parser.parsePeg(source)
     val evaluator = Evaluator(grammar, strategy)
     for(input <- inputs) yield evaluator.evaluate(input, 'S)
   }
