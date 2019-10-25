@@ -24,7 +24,7 @@ object AST {
 
   case object FloatSuffix extends FloatSuffix
 
-  case class Program(location: Location, imports: List[Import], records: List[RecordDeclaration], block: Block)
+  case class Program(location: Location, grammar: Option[macro_peg.Ast.Grammar], imports: List[Import], records: List[RecordDeclaration], block: Block)
 
   case class Import(location: Location, simpleName: String, fqcn: String)
 
