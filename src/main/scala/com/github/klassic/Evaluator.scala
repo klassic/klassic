@@ -2,7 +2,7 @@ package com.github.klassic
 
 import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
 
-import com.github.klassic.AST.Program
+import com.github.klassic.Ast.Program
 import com.github.scaruby.SFile
 
 class Evaluator extends (String => Value) {

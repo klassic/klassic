@@ -2,7 +2,7 @@ package com.github.klassic
 
 
 import scala.util.matching.Regex
-import com.github.klassic.AST._
+import com.github.klassic.Ast._
 import com.github.klassic.Type._
 import com.github.klassic.macro_peg.Parser.Fragment
 import com.github.kmizu.scomb
@@ -247,87 +247,87 @@ class Parser extends Processor[String, Program] {
       }
 
       //line ::= expression | valDeclaration | functionDefinition
-      lazy val line: Parser[AST] = rule(variantDeclaration | expression | valDeclaration | functionDefinition)
+      lazy val line: Parser[Ast.Node] = rule(variantDeclaration | expression | valDeclaration | functionDefinition)
 
       //expression ::= assignment | infix | ifExpression | whileEpression | foreachExpression
-      lazy val expression: Parser[AST] = rule(assignment | infix | ifExpression | whileExpression | foreachExpression)
+      lazy val expression: Parser[Ast.Node] = rule(assignment | infix | ifExpression | whileExpression | foreachExpression)
 
       //ifExpression ::= "if" "(" expression ")" expression "else" expression
-      lazy val ifExpression: Parser[AST] = rule {
+      lazy val ifExpression: Parser[Ast.Node] = rule {
         (%% << CL(IF) << CL(LPAREN)) ~ commit(expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression) ^^ {
           case location ~ (condition ~ _ ~ positive ~ _ ~ negative) => IfExpression(location, condition, positive, negative)
         }
       }
 
       //whileExpression ::= "while" "(" expression ")" expression
-      lazy val whileExpression: Parser[AST] = rule {
+      lazy val whileExpression: Parser[Ast.Node] = rule {
         (%% << CL(WHILE) << CL(LPAREN)) ~ commit(expression ~ (CL(RPAREN) >> expression)) ^^ {
           case location ~ (condition ~ body) => WhileExpression(location, condition, body)
         }
       }
 
       //foreachExpression ::= "foreach" "(" ident "in" expression ")" expression
-      lazy val foreachExpression: Parser[AST] = rule {
+      lazy val foreachExpression: Parser[Ast.Node] = rule {
         (%% << CL(FOREACH) << CL(LPAREN)) ~ commit((CL(ident) << CL(IN)) ~ (expression << CL(RPAREN)) ~ expression) ^^ {
           case location ~ (variable ~ collection ~ body) => ForeachExpression(location, variable.name, collection, body)
         }
       }
 
-      lazy val infix: Parser[AST] = rule {
+      lazy val infix: Parser[Ast.Node] = rule {
         chainl(logical)(
-          (%% ~ CL(operator)) ^^ { case location ~ op => (lhs: AST, rhs: AST) => FunctionCall(location, FunctionCall(location, Id(location, op), List(lhs)), List(rhs)) }
-            | (%% ~ CL(selector)) ^^ { case location ~ sl => (lhs: AST, rhs: AST) => FunctionCall(location, FunctionCall(location, sl, List(lhs)), List(rhs)) }
+          (%% ~ CL(operator)) ^^ { case location ~ op => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, Id(location, op), List(lhs)), List(rhs)) }
+            | (%% ~ CL(selector)) ^^ { case location ~ sl => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, sl, List(lhs)), List(rhs)) }
         )
       }
 
-      lazy val logical: Parser[AST] = rule {
+      lazy val logical: Parser[Ast.Node] = rule {
         chainl(conditional)(
-          (%% << CL(AMP2)) ^^ { location => (lhs: AST, rhs: AST) => BinaryExpression(location, Operator.AND2, lhs, rhs) }
-            | (%% << CL(BAR2)) ^^ { location => (lhs: AST, rhs: AST) => BinaryExpression(location, Operator.BAR2, lhs, rhs) }
+          (%% << CL(AMP2)) ^^ { location => (lhs: Ast.Node, rhs: Ast.Node) => BinaryExpression(location, Operator.AND2, lhs, rhs) }
+            | (%% << CL(BAR2)) ^^ { location => (lhs: Ast.Node, rhs: Ast.Node) => BinaryExpression(location, Operator.BAR2, lhs, rhs) }
         )
       }
 
       //conditional ::= add {"==" add | "<=" add | "=>" add | "<" add | ">" add}
-      lazy val conditional: Parser[AST] = rule {
+      lazy val conditional: Parser[Ast.Node] = rule {
         chainl(add)(
-          (%% << CL(EQEQ)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.EQUAL, left, right) } |
-            (%% << CL(LTE)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right) } |
-            (%% << CL(GTE)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.GREATER_EQUAL, left, right) } |
-            (%% << CL(LT)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.LESS_THAN, left, right) } |
-            (%% << CL(GT)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.GREATER_THAN, left, right) }
+          (%% << CL(EQEQ)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.EQUAL, left, right) } |
+            (%% << CL(LTE)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right) } |
+            (%% << CL(GTE)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.GREATER_EQUAL, left, right) } |
+            (%% << CL(LT)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.LESS_THAN, left, right) } |
+            (%% << CL(GT)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.GREATER_THAN, left, right) }
         )
       }
 
       //add ::= term {"+" term | "-" term}
-      lazy val add: Parser[AST] = rule {
+      lazy val add: Parser[Ast.Node] = rule {
         chainl(term)(
-          (%% << CL(PLUS)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.ADD, left, right) } |
-            (%% << CL(MINUS)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.SUBTRACT, left, right) }
+          (%% << CL(PLUS)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.ADD, left, right) } |
+            (%% << CL(MINUS)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.SUBTRACT, left, right) }
         )
       }
 
       //term ::= factor {"*" factor | "/" factor}
-      lazy val term: Parser[AST] = rule {
+      lazy val term: Parser[Ast.Node] = rule {
         chainl(unary)(
-          (%% << CL(ASTER)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.MULTIPLY, left, right) } |
-            (%% << CL(SLASH)) ^^ { location => (left: AST, right: AST) => BinaryExpression(location, Operator.DIVIDE, left, right) }
+          (%% << CL(ASTER)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.MULTIPLY, left, right) } |
+            (%% << CL(SLASH)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.DIVIDE, left, right) }
         )
       }
 
-      lazy val unary: Parser[AST] = rule(
+      lazy val unary: Parser[Ast.Node] = rule(
         %% ~ CL(MINUS) ~ unary ^^ { case location ~ _ ~ operand => MinusOp(location, operand) }
           | %% ~ CL(PLUS) ~ unary ^^ { case location ~ _ ~ operand => PlusOp(location, operand) }
           | invocation
       )
 
-      lazy val invocation: Parser[AST] = rule(%% ~ recordSelect ~ ((CL(ARROW2) >> ident) ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?).* ^^ {
+      lazy val invocation: Parser[Ast.Node] = rule(%% ~ recordSelect ~ ((CL(ARROW2) >> ident) ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?).* ^^ {
         case location ~ self ~ Nil =>
           self
         case location ~ self ~ npList =>
           npList.foldLeft(self) { case (self, name ~ params) => MethodCall(location, self, name.name, params.getOrElse(Nil)) }
       })
 
-      lazy val recordSelect: Parser[AST] = rule(%% ~ application ~ ((CL(DOT) >> (%% ~ ident ~ (CL(LPAREN) >> expression.repeat0By((COMMA)) << RPAREN).?))).* ^^ {
+      lazy val recordSelect: Parser[Ast.Node] = rule(%% ~ application ~ ((CL(DOT) >> (%% ~ ident ~ (CL(LPAREN) >> expression.repeat0By((COMMA)) << RPAREN).?))).* ^^ {
         case location ~ self ~ names =>
           val ns = names.map {
             case l ~ n ~ Some(params) => (l, n.name, Some(params))
@@ -341,32 +341,32 @@ class Parser extends Processor[String, Program] {
           }
       })
 
-      lazy val application: Parser[AST] = rule {
+      lazy val application: Parser[Ast.Node] = rule {
         %% ~ pipelinable ~ (
           blockFunctionParameter
             | parenthesizedParameter
           ).* ^^ {
           case location ~ f ~ params =>
-            params.foldLeft(f: AST) { (f, params) =>
+            params.foldLeft(f: Ast.Node) { (f, params) =>
               FunctionCall(location, f, params)
             }
         }
       }
 
-      lazy val pipelinable: Parser[AST] = rule(%% ~ castable ~ (CL(BAR) >> ident).? ^^ {
+      lazy val pipelinable: Parser[Ast.Node] = rule(%% ~ castable ~ (CL(BAR) >> ident).? ^^ {
         case location ~ self ~ None =>
           self
         case location ~ self ~ Some(name) =>
           FunctionCall(location, name, List(self))
       })
 
-      lazy val castable: Parser[AST] = rule(primary ~ ((%% << CL(COLONGT)) ~ CL(castType)).? ^^ {
+      lazy val castable: Parser[Ast.Node] = rule(primary ~ ((%% << CL(COLONGT)) ~ CL(castType)).? ^^ {
         case target ~ Some((location ~ castType)) => Casting(location, target, castType)
         case target ~ None => target
       })
 
       //primary ::= selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newRecord | newObject | functionLiteral | "(" expression ")" | "{" lines "}"
-      lazy val primary: Parser[AST] = rule {
+      lazy val primary: Parser[Ast.Node] = rule {
         (
           selector
             | booleanLiteral
@@ -388,43 +388,43 @@ class Parser extends Processor[String, Program] {
       }
 
       //integerLiteral ::= ["1"-"9"] {"0"-"9"}
-      lazy val integerLiteral: Parser[AST] = (%% ~ """[1-9][0-9]*|0""".r ~ ("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix } | "S" ^^ { _ => ShortSuffix }).? ^^ {
+      lazy val integerLiteral: Parser[Ast.Node] = (%% ~ """[1-9][0-9]*|0""".r ~ ("BY" ^^ { _ => ByteSuffix } | "L" ^^ { _ => LongSuffix } | "S" ^^ { _ => ShortSuffix }).? ^^ {
         case location ~ value ~ None => IntNode(location, value.toLong.toInt)
         case location ~ value ~ Some(LongSuffix) => LongNode(location, value.toLong)
         case location ~ value ~ Some(ShortSuffix) => ShortNode(location, value.toShort)
         case location ~ value ~ Some(ByteSuffix) => ByteNode(location, value.toByte)
       }) << SPACING_WITHOUT_LF
 
-      lazy val floatLiteral: Parser[AST] = ((%% ~ "([1-9][0-9]*|0)\\.[0-9]*".r ~ ("F" ^^ { _ => FloatSuffix }).?) ^^ {
+      lazy val floatLiteral: Parser[Ast.Node] = ((%% ~ "([1-9][0-9]*|0)\\.[0-9]*".r ~ ("F" ^^ { _ => FloatSuffix }).?) ^^ {
         case location ~ value ~ None => DoubleNode(location, value.toDouble)
         case location ~ value ~ Some(FloatSuffix) => FloatNode(location, value.toFloat)
       }) << SPACING_WITHOUT_LF
 
-      lazy val booleanLiteral: Parser[AST] = %% ~ (TRUE ^^ { _ => true } | FALSE ^^ { _ => false }) ^^ {
+      lazy val booleanLiteral: Parser[Ast.Node] = %% ~ (TRUE ^^ { _ => true } | FALSE ^^ { _ => false }) ^^ {
         case location ~ true => BooleanNode(location, true)
         case location ~ false => BooleanNode(location, false)
       }
 
       //stringLiteral ::= "\"" ((?!")(\[rntfb"'\\]|[^\\]))* "\""
-      lazy val stringLiteral: Parser[AST] =
+      lazy val stringLiteral: Parser[Ast.Node] =
         ("\"" >>
           (%% ~ """((?!("|#\{))(\\[rntfb"'\\]|[^\\]))+""".r ^^ { case location ~ in =>
             StringNode(location, unescape(in))
           } | "#{" >> expression << "}"
             ).*
           << "\"" ^^ { values =>
-          values.foldLeft(StringNode(NoLocation, ""): AST) { (node, content) => BinaryExpression(content.location, Operator.ADD, node, content) }
+          values.foldLeft(StringNode(NoLocation, ""): Ast.Node) { (node, content) => BinaryExpression(content.location, Operator.ADD, node, content) }
         }) << SPACING_WITHOUT_LF
 
-      lazy val listLiteral: Parser[AST] = rule(%% ~ (CL(LBRACKET) >> commit((CL(expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RBRACKET)) ^^ {
+      lazy val listLiteral: Parser[Ast.Node] = rule(%% ~ (CL(LBRACKET) >> commit((CL(expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RBRACKET)) ^^ {
         case location ~ contents => ListLiteral(location, contents)
       })
 
-      lazy val setLiteral: Parser[AST] = rule(%% ~ (CL(SET_OPEN) >> commit((CL(expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RPAREN)) ^^ {
+      lazy val setLiteral: Parser[Ast.Node] = rule(%% ~ (CL(SET_OPEN) >> commit((CL(expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RPAREN)) ^^ {
         case location ~ contents => SetLiteral(location, contents)
       })
 
-      lazy val mapLiteral: Parser[AST] = rule(%% ~ (CL(MAP_OPEN) >> commit((CL(expression ~ COLON ~ expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RBRACKET)) ^^ {
+      lazy val mapLiteral: Parser[Ast.Node] = rule(%% ~ (CL(MAP_OPEN) >> commit((CL(expression ~ COLON ~ expression).repeat0By(SEPARATOR) << SEPARATOR.?) << RBRACKET)) ^^ {
         case location ~ contents => MapLiteral(location, contents.map { case k ~ colon ~ v => (k, v) })
       })
 
@@ -471,14 +471,14 @@ class Parser extends Processor[String, Program] {
       })
 
       // parenthesizedParameter ::= "(" [param {"," param}] ")"
-      lazy val parenthesizedParameter: Parser[List[AST]] = rule {
+      lazy val parenthesizedParameter: Parser[List[Ast.Node]] = rule {
         CL(LPAREN) >> CL(expression).repeat0By(CL(COMMA)) << (SPACING << RPAREN) ^^ {
           case xs => xs
         }
       }
 
       // blockFunctionParameter ::= "{" [param {"," param}] "=>" expression "}"
-      lazy val blockFunctionParameter: Parser[List[AST]] = rule {
+      lazy val blockFunctionParameter: Parser[List[Ast.Node]] = rule {
         (%% << CL(LBRACE)) ~ (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) ~ (typeAnnotation.? << CL(ARROW1)) ~ (expression << RBRACE) ^^ {
           case location ~ params ~ optionalType ~ body =>
             List(
@@ -496,7 +496,7 @@ class Parser extends Processor[String, Program] {
       }
 
       // functionLiteral ::= "(" [param {"," param}] ")" "=>" expression
-      lazy val functionLiteral: Parser[AST] = rule(%% ~ (CL(LPAREN) >> (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) << CL(RPAREN)).? ~ (typeAnnotation.? << CL(ARROW1)) ~ expression ^^ {
+      lazy val functionLiteral: Parser[Ast.Node] = rule(%% ~ (CL(LPAREN) >> (ident ~ typeAnnotation.?).repeat0By(CL(COMMA)) << CL(RPAREN)).? ~ (typeAnnotation.? << CL(ARROW1)) ~ expression ^^ {
         case location ~ Some(params) ~ optionalType ~ body =>
           Lambda(
             location,
@@ -511,13 +511,13 @@ class Parser extends Processor[String, Program] {
       })
 
       // newObject ::= "new" fqcn "(" [param {"," param} ")"
-      lazy val newObject: Parser[AST] = rule((%% << CL(NEW)) ~ commit(fqcn ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?) ^^ {
+      lazy val newObject: Parser[Ast.Node] = rule((%% << CL(NEW)) ~ commit(fqcn ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?) ^^ {
         case location ~ (className ~ Some(params)) => ObjectNew(location, className, params)
         case location ~ (className ~ None) => ObjectNew(location, className, List())
       })
 
       // newRecord ::= "#" sident "(" [param {"," param} ")"
-      lazy val newRecord: Parser[AST] = rule((%% << CL(SHARP)) ~ commit(sident ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?) ^^ {
+      lazy val newRecord: Parser[Ast.Node] = rule((%% << CL(SHARP)) ~ commit(sident ~ (CL(LPAREN) >> expression.repeat0By(CL(COMMA)) << RPAREN).?) ^^ {
         case location ~ (recordName ~ Some(params)) => RecordNew(location, recordName, params)
         case location ~ (recordName ~ None) => RecordNew(location, recordName, List())
       })
@@ -575,7 +575,7 @@ class Parser extends Processor[String, Program] {
     }
   }
 
-  def parseExpression(input: String): AST = {
+  def parseExpression(input: String): Ast.Node = {
     parse(Klassic.root, input) match {
       case Result.Success(program) => program.block
       case Result.Failure(location, message) => throw new InterpreterException(s"${location}:${message}")

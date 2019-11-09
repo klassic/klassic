@@ -1,12 +1,12 @@
 package com.github.klassic
 
-import com.github.klassic.AST.{FunctionCall, ListLiteral, MapLiteral, ObjectNew, _}
+import com.github.klassic.Ast.{FunctionCall, ListLiteral, MapLiteral, ObjectNew, _}
 import com.github.klassic.Type.{TBoolean, TDynamic}
 
 /**
   * @author Kota Mizushima
   */
-class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
+class SyntaxRewriter extends Processor[Ast.Program, Ast.Program] {
   object SymbolGenerator {
     private[this] var counter: Int = 0
     def symbol(): String = {
@@ -19,13 +19,13 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
   import SymbolGenerator.symbol
 
 
-  def doRewrite(node: AST): AST = node match {
+  def doRewrite(node: Ast.Node): Ast.Node = node match {
     case Block(location, expressions) =>
-      def rewriteBlock(es: List[AST]): List[AST] = es match {
+      def rewriteBlock(es: List[Ast.Node]): List[Ast.Node] = es match {
         case ValDeclaration(location, variable, type_, value, immutable) :: xs =>
           List(Let(location, variable, type_, doRewrite(value), Block(location, rewriteBlock(xs)), immutable))
         case FunctionDefinition(loation, name, expression, cleanup) :: xs =>
-          List(LetRec(location, name, doRewrite(expression).asInstanceOf[AST.Lambda], cleanup.map(doRewrite), Block(location, rewriteBlock(xs))))
+          List(LetRec(location, name, doRewrite(expression).asInstanceOf[Ast.Lambda], cleanup.map(doRewrite), Block(location, rewriteBlock(xs))))
         case (x@EnumDeclaration(_, _, _, _)) :: xs =>
           List(EnumIn(x.location, x, Block(location, rewriteBlock(xs))))
         case x :: xs =>
@@ -36,7 +36,7 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
       Block(location, rewriteBlock(expressions))
     case IfExpression(location, cond, pos, neg) =>
       IfExpression(location, doRewrite(cond), doRewrite(pos), doRewrite(neg))
-    case WhileExpression(location, condition, body: AST) =>
+    case WhileExpression(location, condition, body: Ast.Node) =>
       WhileExpression(location, doRewrite(condition), doRewrite(body))
     case RecordSelect(location, expression, member) =>
       RecordSelect(location, doRewrite(expression), member)
@@ -153,8 +153,8 @@ class SyntaxRewriter extends Processor[AST.Program, AST.Program] {
     case otherwise => throw RewriterPanic(otherwise.toString)
   }
 
-  def transform(program: AST.Program): AST.Program = {
-    program.copy(block = doRewrite(program.block).asInstanceOf[AST.Block])
+  def transform(program: Ast.Program): Ast.Program = {
+    program.copy(block = doRewrite(program.block).asInstanceOf[Ast.Block])
   }
 
   override final val name: String = "Rewriter"
