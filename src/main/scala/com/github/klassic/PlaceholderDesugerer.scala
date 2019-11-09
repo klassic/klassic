@@ -160,6 +160,8 @@ class PlaceholderDesugerer extends Processor[Ast.Program, Ast.Program] {
       x.copy(value = doRewrite(x.value), body = doRewrite(x.body))
     case x@LetRec(location, name, function, cleanup, body) =>
       x.copy(function = x.function.copy(body = doRewrite(x.function.body)), cleanup = x.cleanup.map{doRewrite}, body = doRewrite(body))
+    case x@TernaryExpression(_, _, _, _) =>
+      x.copy(condition = doRewrite(x.condition), thenExpression = doRewrite(x.thenExpression), elseExpression = doRewrite(x.elseExpression))
     case Placeholder(location) =>
       Id(location, manager.generate())
     case otherwise =>

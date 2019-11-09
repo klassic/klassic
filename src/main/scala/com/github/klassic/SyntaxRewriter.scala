@@ -150,6 +150,7 @@ class SyntaxRewriter extends Processor[Ast.Program, Ast.Program] {
     case ObjectNew(location, className, params) => ObjectNew(location, className, params.map{doRewrite})
     case MethodCall(location ,self, name, params) => MethodCall(location, doRewrite(self), name, params.map{doRewrite})
     case Casting(location, target, to) => Casting(location, doRewrite(target), to)
+    case TernaryExpression(location, cond, th, el) => TernaryExpression(location, doRewrite(cond), doRewrite(th), doRewrite(el))
     case otherwise => throw RewriterPanic(otherwise.toString)
   }
 

@@ -35,6 +35,8 @@ object Ast {
 
   case class BinaryExpression(location: Location, operator: Operator, lhs: Ast.Node, rhs: Ast.Node) extends Node
 
+  case class TernaryExpression(location: Location, condition: Ast.Node, thenExpression: Ast.Node, elseExpression: Ast.Node) extends Node
+
   case class WhileExpression(location: Location, condition: Ast.Node, body: Ast.Node) extends Node
 
   case class MinusOp(location: Location, operand: Ast.Node) extends Node

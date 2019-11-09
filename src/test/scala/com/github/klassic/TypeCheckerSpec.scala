@@ -102,7 +102,7 @@ class TypeCheckerSpec extends SpecHelper {
     }
   }
 
-  describe("val channot change its value") {
+  describe("val cannot change its value") {
     val illTypedPrograms: List[String] = List(
       """
         |val a = 1

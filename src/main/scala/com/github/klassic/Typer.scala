@@ -311,6 +311,11 @@ class Typer extends Processor[Ast.Program, TypedAst.Program] {
         val (posTyped, newSub2) = doType(pos, env, t, newSub1)
         val (negTyped, newSub3) = doType(neg, env, t, newSub2)
         (TypedAst.IfExpression(newSub3.replace(t), location, typedCondition, posTyped, negTyped), newSub3)
+      case Ast.TernaryExpression(location, cond, pos, neg) =>
+        val (typedCondition, newSub1) = doType(cond, env, TBoolean, s0)
+        val (posTyped, newSub2) = doType(pos, env, t, newSub1)
+        val (negTyped, newSub3) = doType(neg, env, t, newSub2)
+        (TypedAst.IfExpression(newSub3.replace(t), location, typedCondition, posTyped, negTyped), newSub3)
       case Ast.WhileExpression(location, condition, body) =>
         val a = newTypeVariable()
         val b = newTypeVariable()
