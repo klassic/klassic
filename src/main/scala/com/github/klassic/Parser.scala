@@ -113,6 +113,7 @@ class Parser extends Processor[String, Program] {
       lazy val SHARP: Parser[String] = token("#")
       lazy val IF: Parser[String] = token("if")
       lazy val ELSE: Parser[String] = token("else")
+      lazy val THEN: Parser[String] = token("then")
       lazy val WHILE: Parser[String] = token("while")
       lazy val FOREACH: Parser[String] = token("foreach")
       lazy val IMPORT: Parser[String] = token("import")
@@ -148,7 +149,7 @@ class Parser extends Processor[String, Program] {
       lazy val BAR: Parser[String] = token("|")
       lazy val KEYWORDS: Set[String] = Set(
         "<", "_", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
-        "if", "rule", "else", "while", "foreach", "import", "cleanup", "true", "false", "in", ",", ".",
+        "if", "rule", "then", "else", "while", "foreach", "import", "cleanup", "true", "false", "in", ",", ".",
         "class", "def", "val", "mutable", "record", "=", "==", "=>", "new", "&", "|", "&&", "||"
       )
 
@@ -249,8 +250,8 @@ class Parser extends Processor[String, Program] {
       //line ::= expression | valDeclaration | functionDefinition
       lazy val line: Parser[Ast.Node] = rule(variantDeclaration | expression | valDeclaration | functionDefinition)
 
-      //expression ::= assignment | infix | ifExpression | whileEpression | foreachExpression
-      lazy val expression: Parser[Ast.Node] = rule(assignment | infix | ifExpression | whileExpression | foreachExpression)
+      //expression ::= assignment | ternary | ifExpression | whileEpression | foreachExpression
+      lazy val expression: Parser[Ast.Node] = rule(assignment | ternary | ifExpression | whileExpression | foreachExpression)
 
       //ifExpression ::= "if" "(" expression ")" expression "else" expression
       lazy val ifExpression: Parser[Ast.Node] = rule {
@@ -270,6 +271,17 @@ class Parser extends Processor[String, Program] {
       lazy val foreachExpression: Parser[Ast.Node] = rule {
         (%% << CL(FOREACH) << CL(LPAREN)) ~ commit((CL(ident) << CL(IN)) ~ (expression << CL(RPAREN)) ~ expression) ^^ {
           case location ~ (variable ~ collection ~ body) => ForeachExpression(location, variable.name, collection, body)
+        }
+      }
+
+      lazy val ternary: Parser[Ast.Node] = rule {
+        for(
+          location <- %%;
+          condition <- infix;
+          opt <- ((CL(THEN) ~> infix) ~ (CL(ELSE) ~> infix)).?
+        ) yield opt match {
+          case Some(th ~ el) => TernaryExpression(location, condition, th, el)
+          case None => condition
         }
       }
 
@@ -456,7 +468,7 @@ class Parser extends Processor[String, Program] {
         !KEYWORDS(n.substring(1))
       }.map { n => n.substring(1) }) << SPACING_WITHOUT_LF
 
-      lazy val assignment: Parser[Assignment] = rule(ident ~ CL(PLUSEQ | MINUSEQ | ASTEREQ | SLASHEQ | EQ) ~ commit(expression) ^^ {
+      lazy val assignment: Parser[Assignment] = rule(ident ~ CL(PLUSEQ | MINUSEQ | ASTEREQ | SLASHEQ | EQ) ~ expression ^^ {
         case v ~ "=" ~ value => SimpleAssignment(v.location, v.name, value)
         case v ~ "+=" ~ value => PlusAssignment(v.location, v.name, value)
         case v ~ "-=" ~ value => MinusAssignment(v.location, v.name, value)

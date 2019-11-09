@@ -157,6 +157,23 @@ class ExpressionSpec extends SpecHelper {
       }
     }
 
+    describe("ternary expression") {
+      it("is evaluated correctly") {
+        assertResult(
+          E(
+            """
+              |val x = 1
+              |x < 2 then "A" else "B"
+            """.stripMargin))(ObjectValue("A"))
+        assertResult(
+          E(
+            """
+              |val x = 2
+              |x < 2 then "A" else "B"
+            """.stripMargin))(ObjectValue("B"))
+      }
+    }
+
     describe("function definition") {
       it("is evaluated correctly") {
         assertResult(
