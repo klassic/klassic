@@ -4,13 +4,13 @@ import scala.collection.JavaConverters._
 
 import com.github.klassic._
 import com.github.klassic.Type._
-import com.github.klassic.TypedAST.{FunctionLiteral, ValueNode}
+import com.github.klassic.TypedAst.{TypedNode, FunctionLiteral, ValueNode}
 import klassic.runtime.{AssertionError, NotImplementedError}
 
 /**
  * @author Kota Mizushima
  */
-class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
+class Interpreter extends Processor[TypedAst.Program, Value] {interpreter =>
   def reportError(message: String): Nothing = {
     throw InterpreterException(message)
   }
@@ -114,7 +114,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     define("thread") { case List(fun: FunctionValue) =>
       new Thread({() =>
           val env = new RuntimeEnvironment(fun.environment)
-          interpreter.evaluate(TypedAST.FunctionCall(TDynamic, NoLocation, fun.value, Nil), env)
+          interpreter.evaluate(TypedAst.FunctionCall(TDynamic, NoLocation, fun.value, Nil), env)
       }).start()
       UnitValue
     }
@@ -132,7 +132,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     define("stopwatch") { case List(fun: FunctionValue) =>
       val env = new RuntimeEnvironment(fun.environment)
       val start = System.currentTimeMillis()
-      interpreter.evaluate(TypedAST.FunctionCall(TDynamic, NoLocation, fun.value, List()), env)
+      interpreter.evaluate(TypedAst.FunctionCall(TDynamic, NoLocation, fun.value, List()), env)
       val end = System.currentTimeMillis()
       BoxedInt((end - start).toInt)
     }
@@ -208,7 +208,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
           var i = 0
           var result: Value = init
           while(i < list.size()) {
-            val params: List[TypedAST] = List(ValueNode(result), ValueNode(Value.toKlassic(list.get(i).asInstanceOf[AnyRef])))
+            val params: List[TypedNode] = List(ValueNode(result), ValueNode(Value.toKlassic(list.get(i).asInstanceOf[AnyRef])))
             result = performFunctionInternal(fun.value, params, env)
             i += 1
           }
@@ -292,7 +292,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             var i = 0
             var result: Value = init
             while(i < list.size()) {
-              val params: List[TypedAST] = List(ValueNode(result), ValueNode(Value.toKlassic(list.get(i).asInstanceOf[AnyRef])))
+              val params: List[TypedNode] = List(ValueNode(result), ValueNode(Value.toKlassic(list.get(i).asInstanceOf[AnyRef])))
               result = performFunctionInternal(fun.value, params, env)
               i += 1
             }
@@ -376,7 +376,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     case otherwise => throw TyperPanic("Unexpected: " + otherwise)
   }
 
-  final def interpret(program: TypedAST.Program): Value = {
+  final def interpret(program: TypedAst.Program): Value = {
     val runtimeRecordEnvironment: RecordEnvironment = BuiltinRecordEnvironment
     program.records.foreach { case (name, record) =>
       val members = toList(record.row)
@@ -386,18 +386,18 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
     interpreter.evaluate(program.block, env = BuiltinEnvironment, recordEnv = runtimeRecordEnvironment, moduleEnv = BuiltinModuleEnvironment)
   }
 
-  private def evaluate(node: TypedAST): Value = {
+  private def evaluate(node: TypedNode): Value = {
     evaluate(node, BuiltinEnvironment)
   }
 
-  private def performFunctionInternal(func: TypedAST, params: List[TypedAST], env: RuntimeEnvironment): Value = {
-    performFunction(TypedAST.FunctionCall(TDynamic, NoLocation, func, params), env)
+  private def performFunctionInternal(func: TypedNode, params: List[TypedNode], env: RuntimeEnvironment): Value = {
+    performFunction(TypedAst.FunctionCall(TDynamic, NoLocation, func, params), env)
   }
 
-  private def performFunction(node: TypedAST.FunctionCall, env: RuntimeEnvironment): Value = node match {
-    case TypedAST.FunctionCall(type_, location, function, params) =>
+  private def performFunction(node: TypedAst.FunctionCall, env: RuntimeEnvironment): Value = node match {
+    case TypedAst.FunctionCall(type_, location, function, params) =>
       evaluate(function, env) match {
-        case FunctionValue(TypedAST.FunctionLiteral(type_, location, fparams, optionalType, proc), cleanup, cenv) =>
+        case FunctionValue(TypedAst.FunctionLiteral(type_, location, fparams, optionalType, proc), cleanup, cenv) =>
           val local = new RuntimeEnvironment(cenv)
           (fparams zip params).foreach{ case (fp, ap) =>
             local(fp.name) = evaluate(ap, env)
@@ -421,36 +421,36 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
       }
   }
 
-  private def evaluate(node: TypedAST, env: RuntimeEnvironment, recordEnv: RecordEnvironment = BuiltinRecordEnvironment, moduleEnv: ModuleEnvironment = BuiltinModuleEnvironment): Value = {
-    def evalRecursive(node: TypedAST): Value = {
+  private def evaluate(node: TypedNode, env: RuntimeEnvironment, recordEnv: RecordEnvironment = BuiltinRecordEnvironment, moduleEnv: ModuleEnvironment = BuiltinModuleEnvironment): Value = {
+    def evalRecursive(node: TypedNode): Value = {
       node match{
-        case TypedAST.Block(type_, location, expressions) =>
+        case TypedAst.Block(type_, location, expressions) =>
           val local = new RuntimeEnvironment(Some(env))
           expressions.foldLeft(UnitValue:Value){(result, x) => evaluate(x, local)}
-        case TypedAST.WhileExpression(type_, location, cond, body) =>
+        case TypedAst.WhileExpression(type_, location, cond, body) =>
           while(evalRecursive(cond) == BoxedBoolean(true)) {
             evalRecursive(body)
           }
           UnitValue
-        case TypedAST.IfExpression(type_, location, condition, pos, neg) =>
+        case TypedAst.IfExpression(type_, location, condition, pos, neg) =>
           evalRecursive(condition) match {
             case BoxedBoolean(true) => evalRecursive(pos)
             case BoxedBoolean(false) => evalRecursive(neg)
             case _ => reportError("type error")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.AND2, lhs, rhs) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.AND2, lhs, rhs) =>
           evalRecursive(lhs) match {
             case BoxedBoolean(true) => evalRecursive(rhs)
             case BoxedBoolean(false) => BoxedBoolean(false)
             case _ => reportError("type error")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.BAR2, lhs, rhs) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.BAR2, lhs, rhs) =>
           evalRecursive(lhs) match {
             case BoxedBoolean(false) => evalRecursive(rhs)
             case BoxedBoolean(true) => BoxedBoolean(true)
             case _ => reportError("type error")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.EQUAL, left, right) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval == rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval == rval)
@@ -464,7 +464,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case (ObjectValue(lval), ObjectValue(rval)) => BoxedBoolean(lval == rval)
             case _ => reportError("comparation must be done between same types")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.LESS_THAN, left, right) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.LESS_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval < rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval < rval)
@@ -474,7 +474,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval < rval)
             case _ => reportError("comparation must be done between numeric types")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.GREATER_THAN, left, right) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.GREATER_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval > rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval > rval)
@@ -484,7 +484,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval > rval)
             case _ => reportError("comparation must be done between numeric types")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.LESS_OR_EQUAL, left, right) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.LESS_OR_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval <= rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval <= rval)
@@ -494,7 +494,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval <= rval)
             case _ => reportError("comparation must be done between numeric types")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.GREATER_EQUAL, left, right) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.GREATER_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval >= rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval >= rval)
@@ -504,7 +504,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval >= rval)
             case _ => reportError("comparation must be done between numeric types")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.ADD, left, right) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.ADD, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval + rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval + rval)
@@ -516,7 +516,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval + rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.SUBTRACT, left, right) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.SUBTRACT, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval - rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval - rval)
@@ -526,7 +526,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval - rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.MULTIPLY, left, right) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.MULTIPLY, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval * rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval * rval)
@@ -536,7 +536,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval * rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
-        case TypedAST.BinaryExpression(type_, location, Operator.DIVIDE, left, right) =>
+        case TypedAst.BinaryExpression(type_, location, Operator.DIVIDE, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
             case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval / rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval / rval)
@@ -546,7 +546,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval / rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
-        case TypedAST.MinusOp(type_, location, operand) =>
+        case TypedAst.MinusOp(type_, location, operand) =>
           evalRecursive(operand) match {
             case BoxedInt(value) => BoxedInt(-value)
             case BoxedLong(value) => BoxedLong(-value)
@@ -556,7 +556,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case BoxedDouble(value) => BoxedDouble(-value)
             case _ => reportError("- cannot be applied to non-integer value")
           }
-        case TypedAST.PlusOp(type_, location, operand) =>
+        case TypedAst.PlusOp(type_, location, operand) =>
           evalRecursive(operand) match {
             case BoxedInt(value) => BoxedInt(value)
             case BoxedLong(value) => BoxedLong(value)
@@ -566,37 +566,37 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case BoxedDouble(value) => BoxedDouble(value)
             case _ => reportError("+ cannot be applied to non-integer value")
           }
-        case TypedAST.IntNode(type_, location, value) =>
+        case TypedAst.IntNode(type_, location, value) =>
           BoxedInt(value)
-        case TypedAST.StringNode(type_, location, value) =>
+        case TypedAst.StringNode(type_, location, value) =>
           ObjectValue(value)
-        case TypedAST.LongNode(type_, location, value) =>
+        case TypedAst.LongNode(type_, location, value) =>
           BoxedLong(value)
-        case TypedAST.ShortNode(type_, location, value) =>
+        case TypedAst.ShortNode(type_, location, value) =>
           BoxedShort(value)
-        case TypedAST.ByteNode(type_, location, value) =>
+        case TypedAst.ByteNode(type_, location, value) =>
           BoxedByte(value)
-        case TypedAST.DoubleNode(type_, location, value) =>
+        case TypedAst.DoubleNode(type_, location, value) =>
           BoxedDouble(value)
-        case TypedAST.FloatNode(type_, location, value) =>
+        case TypedAst.FloatNode(type_, location, value) =>
           BoxedFloat(value)
-        case TypedAST.BooleanNode(type_, location, value) =>
+        case TypedAst.BooleanNode(type_, location, value) =>
           BoxedBoolean(value)
-        case TypedAST.ListLiteral(type_, location, elements) =>
+        case TypedAst.ListLiteral(type_, location, elements) =>
           val params = elements.map{e => Value.fromKlassic(evalRecursive(e))}
           val newList = new java.util.ArrayList[Any]
           params.foreach{param =>
             newList.add(param)
           }
           ObjectValue(newList)
-        case TypedAST.SetLiteral(type_, location, elements) =>
+        case TypedAst.SetLiteral(type_, location, elements) =>
           val params = elements.map{e => Value.fromKlassic(evalRecursive(e))}
           val newSet = new java.util.HashSet[Any]
           params.foreach{param =>
             newSet.add(param)
           }
           ObjectValue(newSet)
-        case TypedAST.MapLiteral(type_, location, elements) =>
+        case TypedAst.MapLiteral(type_, location, elements) =>
           val params = elements.map{ case (k, v) =>
             (Value.fromKlassic(evalRecursive(k)), Value.fromKlassic(evalRecursive(v)))
           }
@@ -605,21 +605,21 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             newMap.put(k, v)
           }
           ObjectValue(newMap)
-        case TypedAST.Id(type_, location, name) =>
+        case TypedAst.Id(type_, location, name) =>
           env(name)
-        case TypedAST.Selector(type_, location, module, name) =>
+        case TypedAst.Selector(type_, location, module, name) =>
           moduleEnv(module)(name)
-        case TypedAST.LetDeclaration(type_, location, vr, optVariableType, value, body, immutable) =>
+        case TypedAst.LetDeclaration(type_, location, vr, optVariableType, value, body, immutable) =>
           env(vr) = evalRecursive(value)
           evalRecursive(body)
-        case TypedAST.Assignment(type_, location, vr, value) =>
+        case TypedAst.Assignment(type_, location, vr, value) =>
           env.set(vr, evalRecursive(value))
-        case literal@TypedAST.FunctionLiteral(type_, location, _, _, _) =>
+        case literal@TypedAst.FunctionLiteral(type_, location, _, _, _) =>
           FunctionValue(literal, None, Some(env))
-        case TypedAST.LetFunctionDefinition(type_, location, name, body, cleanup, expression) =>
+        case TypedAst.LetFunctionDefinition(type_, location, name, body, cleanup, expression) =>
           env(name) = FunctionValue(body, cleanup, Some(env)): Value
           evalRecursive(expression)
-        case TypedAST.MethodCall(type_, location, self, name, params) =>
+        case TypedAst.MethodCall(type_, location, self, name, params) =>
           evalRecursive(self) match {
             case ObjectValue(value) =>
               val paramsArray = params.map{p => evalRecursive(p)}.toArray
@@ -636,7 +636,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case otherwise =>
               sys.error(s"cannot reach here: ${otherwise}")
           }
-        case TypedAST.ObjectNew(type_, location, className, params) =>
+        case TypedAst.ObjectNew(type_, location, className, params) =>
           val paramsArray = params.map{evalRecursive}.toArray
           findConstructor(Class.forName(className), paramsArray) match {
             case UnboxedVersionConstructorFound(constructor) =>
@@ -648,7 +648,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case NoConstructorFound =>
               throw new IllegalArgumentException(s"new ${className}(${params}) is not found")
           }
-        case TypedAST.RecordNew(type_, location, recordName, params) =>
+        case TypedAst.RecordNew(type_, location, recordName, params) =>
           val paramsList = params.map{evalRecursive}
           recordEnv.records.get(recordName) match {
             case None => throw new IllegalArgumentException(s"record ${recordName} is not found")
@@ -656,7 +656,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
               val members = (argsList zip paramsList).map{ case ((n, _), v) => n -> v }
               RecordValue(recordName, members)
           }
-        case TypedAST.RecordSelect(type_, location, expression, memberName) =>
+        case TypedAst.RecordSelect(type_, location, expression, memberName) =>
           evalRecursive(expression) match {
             case RecordValue(recordName, members) =>
               members.find{ case (mname, mtype) => memberName == mname} match {
@@ -668,13 +668,13 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
             case v =>
               throw new IllegalArgumentException(s"value ${v} is not record")
           }
-        case call@TypedAST.FunctionCall(type_, location, function, params) =>
+        case call@TypedAst.FunctionCall(type_, location, function, params) =>
           performFunction(call, env)
-        case TypedAST.Casting(type_, location, target, to) =>
+        case TypedAst.Casting(type_, location, target, to) =>
           evalRecursive(target)
-        case TypedAST.ValueNode(value) =>
+        case TypedAst.ValueNode(value) =>
           value
-        case otherwise@TypedAST.ForeachExpression(type_, location, _, _, _) => sys.error(s"cannot reach here: ${otherwise}")
+        case otherwise@TypedAst.ForeachExpression(type_, location, _, _, _) => sys.error(s"cannot reach here: ${otherwise}")
       }
     }
     evalRecursive(node)
@@ -682,7 +682,7 @@ class Interpreter extends Processor[TypedAST.Program, Value] {interpreter =>
 
   override final val name: String = "Interpreter"
 
-  override final def process(input: TypedAST.Program): Value = {
+  override final def process(input: TypedAst.Program): Value = {
     interpret(input)
   }
 }

@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import com.github.klassic.AST.{FunctionCall, ListLiteral, MapLiteral, ObjectNew, _}
+import com.github.klassic.Ast.{FunctionCall, ListLiteral, MapLiteral, ObjectNew, _}
 import com.github.klassic.Type.{TBoolean, TDynamic}
 
 import scala.collection.mutable
@@ -8,7 +8,7 @@ import scala.collection.mutable
 /**
   * @author Kota Mizushima
   */
-class PlaceholderDesugerer extends Processor[AST.Program, AST.Program] {
+class PlaceholderDesugerer extends Processor[Ast.Program, Ast.Program] {
   private object PlaceholderManager {
     private[this] var counter: Int = 0
     private[this] def nameOf(index: Int): String = "$" + index
@@ -29,13 +29,13 @@ class PlaceholderDesugerer extends Processor[AST.Program, AST.Program] {
   }
   private val manager = PlaceholderManager
 
-  def doRewrite(node: AST): AST = node match {
+  def doRewrite(node: Ast.Node): Ast.Node = node match {
     case Block(location, expressions) =>
-      def rewriteBlock(es: List[AST]): List[AST] = es match {
+      def rewriteBlock(es: List[Ast.Node]): List[Ast.Node] = es match {
          // val f = _ is rewritten to val f = ($0) => $0
         case (x@ValDeclaration(location, variable, type_, value, immutable)) :: xs =>
           val xValue = doRewrite(value)
-          val init: AST = if(manager.hasPlaceholder) {
+          val init: Ast.Node = if(manager.hasPlaceholder) {
             val formalParameters = manager.placeholders.map{name => FormalParameterOptional(name, None)}
             val lambda = Lambda(location, formalParameters, None, xValue)
             manager.reset()
@@ -46,7 +46,7 @@ class PlaceholderDesugerer extends Processor[AST.Program, AST.Program] {
           x.copy(value = init) :: rewriteBlock(xs)
         case (x@FunctionDefinition(loation, name, expression, cleanup)) :: xs =>
           val xExpression = doRewrite(expression)
-          val xBody: AST = if(manager.hasPlaceholder) {
+          val xBody: Ast.Node = if(manager.hasPlaceholder) {
             val formalParameters = manager.placeholders.map{name => FormalParameterOptional(name, None)}
             val lambda = Lambda(location, formalParameters, None, xExpression)
             manager.reset()
@@ -54,7 +54,7 @@ class PlaceholderDesugerer extends Processor[AST.Program, AST.Program] {
           } else {
             xExpression
           }
-          x.copy(body = xBody.asInstanceOf[AST.Lambda], cleanup  = x.cleanup.map{doRewrite}) :: xs
+          x.copy(body = xBody.asInstanceOf[Ast.Lambda], cleanup  = x.cleanup.map{doRewrite}) :: xs
         case x :: xs =>
           doRewrite(x) :: rewriteBlock(xs)
         case Nil =>
@@ -63,7 +63,7 @@ class PlaceholderDesugerer extends Processor[AST.Program, AST.Program] {
       Block(location, rewriteBlock(expressions))
     case IfExpression(location, cond, pos, neg) =>
       IfExpression(location, doRewrite(cond), doRewrite(pos), doRewrite(neg))
-    case WhileExpression(location, condition, body: AST) =>
+    case WhileExpression(location, condition, body: Ast.Node) =>
       WhileExpression(location, doRewrite(condition), doRewrite(body))
     case RecordSelect(location, expression, member) =>
       RecordSelect(location, doRewrite(expression), member)
@@ -166,8 +166,8 @@ class PlaceholderDesugerer extends Processor[AST.Program, AST.Program] {
       throw RewriterPanic(otherwise.toString)
   }
 
-  def transform(program: AST.Program): AST.Program = {
-    program.copy(block = doRewrite(program.block).asInstanceOf[AST.Block])
+  def transform(program: Ast.Program): Ast.Program = {
+    program.copy(block = doRewrite(program.block).asInstanceOf[Ast.Block])
   }
 
   override final val name: String = "PlaceholderDesugerer"
