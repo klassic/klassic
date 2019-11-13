@@ -2,7 +2,7 @@ organization := "com.github.klassic"
 
 name := "klassic"
 
-version := "0.1.0-alpha"
+version := "0.1.0-beta1"
 
 scalaVersion := "2.13.0"
 
@@ -43,7 +43,7 @@ mainClass in assembly := Some("com.github.klassic.Main")
 initialCommands in console += {
   Iterator(
     "com.github.klassic._",
-    "com.github.klassic.AST._",
+    "com.github.klassic.Ast._",
     "com.github.klassic.Type._"
   ).map("import "+).mkString("\n")
 }
