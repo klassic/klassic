@@ -1,11 +1,14 @@
 package com.github.klassic
 
 import scala.collection.JavaConverters._
-
 import com.github.klassic._
 import com.github.klassic.Type._
-import com.github.klassic.TypedAst.{TypedNode, FunctionLiteral, ValueNode}
+import com.github.klassic.TypedAst.{FunctionLiteral, TypedNode, ValueNode}
+import com.pi4j.io.gpio.{GpioController, GpioFactory, GpioPinDigitalInput, GpioPinDigitalOutput, Pin, PinState, RaspiPin}
+import com.pi4j.wiringpi.Gpio
 import klassic.runtime.{AssertionError, NotImplementedError}
+
+import scala.runtime.BoxedUnit
 
 /**
  * @author Kota Mizushima
@@ -235,6 +238,7 @@ class Interpreter extends Processor[TypedAst.Program, Value] {interpreter =>
     private final val LIST= "List"
     private final val MAP = "Map"
     private final val SET = "Set"
+    private final val GPIO = "GPIO"
     enter(LIST) {
       define("head") { case List(ObjectValue(list: java.util.List[_])) =>
         Value.toKlassic(list.get(0).asInstanceOf[AnyRef])
@@ -299,6 +303,75 @@ class Interpreter extends Processor[TypedAst.Program, Value] {interpreter =>
             result
           }
         }
+      }
+    }
+    enter(GPIO) {
+      define("pin") { case List(BoxedInt(pinNumber)) =>
+        ObjectValue(pinNumber match {
+          case 0 => RaspiPin.GPIO_00
+          case 1 => RaspiPin.GPIO_01
+          case 2 => RaspiPin.GPIO_02
+          case 3 => RaspiPin.GPIO_03
+          case 4 => RaspiPin.GPIO_04
+          case 5 => RaspiPin.GPIO_05
+          case 6 => RaspiPin.GPIO_06
+          case 7 => RaspiPin.GPIO_07
+          case 8 => RaspiPin.GPIO_08
+          case 9 => RaspiPin.GPIO_09
+          case 10 => RaspiPin.GPIO_10
+          case 11 => RaspiPin.GPIO_11
+          case 12 => RaspiPin.GPIO_12
+          case 13 => RaspiPin.GPIO_13
+          case 14 => RaspiPin.GPIO_14
+          case 15 => RaspiPin.GPIO_15
+          case 16 => RaspiPin.GPIO_16
+          case 17 => RaspiPin.GPIO_17
+          case 18 => RaspiPin.GPIO_18
+          case 19 => RaspiPin.GPIO_19
+          case 20 => RaspiPin.GPIO_20
+          case 21 => RaspiPin.GPIO_21
+          case 22 => RaspiPin.GPIO_22
+          case 23 => RaspiPin.GPIO_23
+          case 24 => RaspiPin.GPIO_24
+          case 25 => RaspiPin.GPIO_25
+          case 26 => RaspiPin.GPIO_26
+          case 27 => RaspiPin.GPIO_27
+          case 28 => RaspiPin.GPIO_28
+          case 29 => RaspiPin.GPIO_29
+          case 30 => RaspiPin.GPIO_30
+          case 31 => RaspiPin.GPIO_31
+        })
+      }
+      define("setup") { case List() =>
+        Gpio.wiringPiSetupGpio()
+        ObjectValue(GpioFactory.getInstance())
+      }
+      define("inputOf") { case List(ObjectValue(gpio:GpioController), ObjectValue(pin:Pin)) =>
+        val input: GpioPinDigitalInput = gpio.provisionDigitalInputPin(pin.asInstanceOf[Pin])
+        ObjectValue(input)
+      }
+      define("outputOf") { case List(ObjectValue(gpio: GpioController), ObjectValue(pin: Pin), BoxedBoolean(high)) =>
+        val state = if (high) PinState.HIGH else PinState.LOW
+        val output: GpioPinDigitalOutput = gpio.provisionDigitalOutputPin(pin, state)
+        ObjectValue(output)
+      }
+      define("toggle") { case List(ObjectValue(output:GpioPinDigitalOutput)) =>
+        output.toggle()
+        UnitValue
+      }
+      define("toHigh") { case List(ObjectValue(output:GpioPinDigitalOutput)) =>
+        output.high()
+        UnitValue
+      }
+      define("toLow") { case List(ObjectValue(output:GpioPinDigitalOutput)) =>
+        output.low()
+        UnitValue
+      }
+      define("isHigh") { case List(ObjectValue(input:GpioPinDigitalInput)) =>
+        BoxedBoolean(input.isHigh)
+      }
+      define("isLow") { case List(ObjectValue(input:GpioPinDigitalInput)) =>
+        BoxedBoolean(input.isLow)
       }
     }
     enter(MAP) {
