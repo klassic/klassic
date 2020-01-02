@@ -13,7 +13,7 @@ import scala.collection.mutable
 /**
  * @author Kota Mizushima
  */
-class Parser extends Processor[String, Program] {
+class Parser extends Processor[String, Program, InteractiveSession] {
   object Core extends SCombinator with macro_peg.Parser.Fragment {
     object Klassic {
       def publicLocations: mutable.Map[Int, scomb.Location] = locations
@@ -603,5 +603,5 @@ class Parser extends Processor[String, Program] {
 
   override final val name: String = "Parser"
 
-  override final def process(input: String): Program = parseAll(input)
+  override final def process(input: String, session: InteractiveSession): Program = parseAll(input)
 }

@@ -99,12 +99,12 @@ package object klassic {
     def union(that: Substitution): Substitution = {
       val s1 = self
       val s2 = that
-      s2.mapValues{t => s1.replace(t)}.toMap ++ s1
+      s2.view.mapValues{t => s1.replace(t)}.toMap ++ s1
     }
   }
 
   def typeVariables(r: Row): List[TVariable] = r match {
-    case TRowExtend(l, t, e) => typeVariables(t) union typeVariables(e)
+    case TRowExtend(l, t, e) => typeVariables(t) concat typeVariables(e)
     case TRowEmpty => Nil
     case tv@TVariable(_) => List(tv)
   }
@@ -135,17 +135,17 @@ package object klassic {
     case TError =>
       Nil
     case TFunction(t1, t2) =>
-      t1.flatMap{typeVariables} union typeVariables(t2)
+      t1.flatMap{typeVariables} concat typeVariables(t2)
     case TRecordReference(name, ts) =>
       List(ts.flatMap{ case t => typeVariables(t)}:_*)
     case TRowEmpty =>
       Nil
     case TRowExtend(l, t, r) =>
-      typeVariables(r) union typeVariables(t)
+      typeVariables(r) concat typeVariables(t)
     case TRecord(ts, row) =>
-      ts union typeVariables(row)
+      ts concat typeVariables(row)
     case TConstructor(k, ts) =>
-      ts.foldLeft(List[TVariable]()){ (tvs, t) => tvs union typeVariables(t)}
+      ts.foldLeft(List[TVariable]()){ (tvs, t) => tvs concat typeVariables(t)}
   }
 
   def typeVariables(ts: TScheme): List[TVariable] = {
@@ -153,6 +153,6 @@ package object klassic {
   }
 
   def typeVariables(environment: Environment): List[TVariable] = {
-    environment.foldLeft(List[TVariable]()) { (tvs, nt) => tvs union typeVariables(nt._2) }
+    environment.foldLeft(List[TVariable]()) { (tvs, nt) => tvs concat typeVariables(nt._2) }
   }
 }

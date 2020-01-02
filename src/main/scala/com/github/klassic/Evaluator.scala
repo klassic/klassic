@@ -22,11 +22,12 @@ class Evaluator extends (String => Value) {
       evaluateString(program, file.name)
     }
   def evaluateString(program: String, fileName: String = "<no file>"): Value = {
+    val session = new InteractiveSession
     val parser = new Parser
-    val parsedProgram = parser.process(program)
-    val placeHolderIsDesugaredProgram = placeholderDesugerer.process(parsedProgram)
-    val rewrittenProgram = rewriter.process(placeHolderIsDesugaredProgram)
-    val typedProgram = typer.process(rewrittenProgram)
-    interpreter.process(typedProgram)
+    val parsedProgram = parser.process(program, session)
+    val placeHolderIsDesugaredProgram = placeholderDesugerer.process(parsedProgram, session)
+    val rewrittenProgram = rewriter.process(placeHolderIsDesugaredProgram, session)
+    val typedProgram = typer.process(rewrittenProgram, session)
+    interpreter.process(typedProgram, session)
   }
 }
