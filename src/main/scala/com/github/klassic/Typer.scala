@@ -93,6 +93,17 @@ class Typer extends Processor[Ast.Program, TypedAst.Program] {
         "contains" -> TScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> TBoolean)),
         "size" -> TScheme(List(tv("a")), setOf(tv("a")) ==> TInt),
         "isEmpty" -> TScheme(List(tv("a")), setOf(tv("a")) ==> TBoolean)
+      ),
+      "GPIO" -> Map(
+        "pin" -> TScheme(Nil, List(TInt) ==> TDynamic),
+        "setup" -> TScheme(Nil, List() ==> TDynamic),
+        "outputOf" -> TScheme(Nil, List(TDynamic, TDynamic, TBoolean) ==> TDynamic),
+        "inputOf" -> TScheme(Nil, List(TDynamic, TDynamic) ==> TDynamic),
+        "isHigh" -> TScheme(Nil, List(TDynamic) ==> TBoolean),
+        "isLow" -> TScheme(Nil, List(TDynamic) ==> TBoolean),
+        "toggle" -> TScheme(Nil, List(TDynamic) ==> TUnit),
+        "toHigh" -> TScheme(Nil, List(TDynamic) ==> TUnit),
+        "toLow" -> TScheme(Nil, List(TDynamic) ==> TUnit)
       )
     )
   }
