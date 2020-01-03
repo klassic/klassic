@@ -6,7 +6,7 @@ import com.github.klassic.Type.{TBoolean, TDynamic}
 /**
   * @author Kota Mizushima
   */
-class SyntaxRewriter extends Processor[Ast.Program, Ast.Program] {
+class SyntaxRewriter extends Processor[Ast.Program, Ast.Program, InteractiveSession] {
   object SymbolGenerator {
     private[this] var counter: Int = 0
     def symbol(): String = {
@@ -160,7 +160,7 @@ class SyntaxRewriter extends Processor[Ast.Program, Ast.Program] {
 
   override final val name: String = "Rewriter"
 
-  override final def process(input: Program): Program = {
+  override final def process(input: Program, session: InteractiveSession): Program = {
     transform(input)
   }
 }

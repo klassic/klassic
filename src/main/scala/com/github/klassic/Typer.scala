@@ -13,7 +13,7 @@ import scala.collection.mutable
 /**
   * @author Kota Mizushima
   */
-class Typer extends Processor[Ast.Program, TypedAst.Program] {
+class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession] {
   type ModuleEnvironment = Map[String, Environment]
   type RecordEnvironment = Map[String, TRecord]
   type Name = String
@@ -937,5 +937,5 @@ class Typer extends Processor[Ast.Program, TypedAst.Program] {
 
   override final val name: String = "Typer"
 
-  override final def process(input: Ast.Program): TypedAst.Program = transform(input)
+  override final def process(input: Ast.Program, session :InteractiveSession): TypedAst.Program = transform(input)
 }

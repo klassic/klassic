@@ -8,7 +8,7 @@ import scala.collection.mutable
 /**
   * @author Kota Mizushima
   */
-class PlaceholderDesugerer extends Processor[Ast.Program, Ast.Program] {
+class PlaceholderDesugerer extends Processor[Ast.Program, Ast.Program, InteractiveSession] {
   private object PlaceholderManager {
     private[this] var counter: Int = 0
     private[this] def nameOf(index: Int): String = "$" + index
@@ -174,7 +174,7 @@ class PlaceholderDesugerer extends Processor[Ast.Program, Ast.Program] {
 
   override final val name: String = "PlaceholderDesugerer"
 
-  override final def process(input: Program): Program = {
+  override final def process(input: Program, session: InteractiveSession): Program = {
     transform(input)
   }
 }

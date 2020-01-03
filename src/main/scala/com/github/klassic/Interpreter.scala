@@ -1,6 +1,6 @@
 package com.github.klassic
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import com.github.klassic._
 import com.github.klassic.Type._
 import com.github.klassic.TypedAst.{FunctionLiteral, TypedNode, ValueNode}
@@ -13,7 +13,7 @@ import scala.runtime.BoxedUnit
 /**
  * @author Kota Mizushima
  */
-class Interpreter extends Processor[TypedAst.Program, Value] {interpreter =>
+class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession] {interpreter =>
   def reportError(message: String): Nothing = {
     throw InterpreterException(message)
   }
@@ -449,7 +449,7 @@ class Interpreter extends Processor[TypedAst.Program, Value] {interpreter =>
     case otherwise => throw TyperPanic("Unexpected: " + otherwise)
   }
 
-  final def interpret(program: TypedAst.Program): Value = {
+  final def interpret(program: TypedAst.Program, session: InteractiveSession): Value = {
     val runtimeRecordEnvironment: RecordEnvironment = BuiltinRecordEnvironment
     program.records.foreach { case (name, record) =>
       val members = toList(record.row)
@@ -584,7 +584,7 @@ class Interpreter extends Processor[TypedAst.Program, Value] {interpreter =>
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval + rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval + rval).toByte)
             case (ObjectValue(lval:String), rval) => ObjectValue(lval + rval)
-            case (lval, ObjectValue(rval:String)) => ObjectValue(lval + rval)
+            case (lval, ObjectValue(rval:String)) => ObjectValue(lval.toString + rval)
             case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedFloat((lval + rval))
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval + rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
@@ -755,7 +755,7 @@ class Interpreter extends Processor[TypedAst.Program, Value] {interpreter =>
 
   override final val name: String = "Interpreter"
 
-  override final def process(input: TypedAst.Program): Value = {
-    interpret(input)
+  override final def process(input: TypedAst.Program, session: InteractiveSession): Value = {
+    interpret(input, session)
   }
 }

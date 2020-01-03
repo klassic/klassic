@@ -146,6 +146,6 @@ object Runner {
     val parser = new KlassicParser
     val grammar = parser.parsePeg(source)
     val evaluator = Evaluator(grammar, strategy)
-    for(input <- inputs) yield evaluator.evaluate(input, 'S)
+    for(input <- inputs) yield evaluator.evaluate(input, Symbol("S"))
   }
 }

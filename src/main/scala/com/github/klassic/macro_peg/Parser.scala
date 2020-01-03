@@ -18,7 +18,7 @@ object Parser {
    * @param pos the position where the parsing failed
    * @param msg error message
    */
-  case class ParseException(pos: Ast.Position, msg: String) extends Exception(pos.line + ", " + pos.column + ":" + msg)
+  case class ParseException(pos: Ast.Position, msg: String) extends Exception(s"${pos.line}, ${pos.column}: ${msg}")
   
   trait Fragment extends SCombinator {
     object MacroPeg {
