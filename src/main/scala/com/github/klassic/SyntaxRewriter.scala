@@ -151,7 +151,10 @@ class SyntaxRewriter extends Processor[Ast.Program, Ast.Program, InteractiveSess
     case MethodCall(location ,self, name, params) => MethodCall(location, doRewrite(self), name, params.map{doRewrite})
     case Casting(location, target, to) => Casting(location, doRewrite(target), to)
     case TernaryExpression(location, cond, th, el) => TernaryExpression(location, doRewrite(cond), doRewrite(th), doRewrite(el))
-    case otherwise => throw RewriterPanic(otherwise.toString)
+    case x@(EnumDeclaration(_, _, _, _) | EnumIn(_, _, _)
+      |  FunctionDefinition(_, _, _, _) | Let(_, _, _, _, _, _)
+      |  LetRec(_, _, _, _, _) | MethodDefinition(_, _, _, _) | Placeholder(_)) =>
+      throw new RewriterPanic(x.toString)
   }
 
   def transform(program: Ast.Program): Ast.Program = {

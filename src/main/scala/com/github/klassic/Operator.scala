@@ -16,4 +16,7 @@ object Operator {
   case object GREATER_EQUAL extends Operator(">=")
   case object AND2 extends Operator("&&")
   case object BAR2 extends Operator("||")
+  case object AND extends Operator("&")
+  case object OR extends Operator("|")
+  case object XOR extends Operator("^")
 }

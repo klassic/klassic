@@ -619,6 +619,30 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
             case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedDouble(lval / rval)
             case _ => reportError("arithmetic operation must be done between the same numeric types")
           }
+        case TypedAst.BinaryExpression(type_, location, Operator.AND, left, right) =>
+          (evalRecursive(left), evalRecursive(right)) match {
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval & rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval & rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval & rval).toShort)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval & rval).toByte)
+            case _ => reportError("arithmetic operation must be done between the same numeric types")
+          }
+        case TypedAst.BinaryExpression(type_, location, Operator.OR, left, right) =>
+          (evalRecursive(left), evalRecursive(right)) match {
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval | rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval | rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval | rval).toShort)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval | rval).toByte)
+            case _ => reportError("arithmetic operation must be done between the same numeric types")
+          }
+        case TypedAst.BinaryExpression(type_, location, Operator.XOR, left, right) =>
+          (evalRecursive(left), evalRecursive(right)) match {
+            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval ^ rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval ^ rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval ^ rval).toShort)
+            case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval ^ rval).toByte)
+            case _ => reportError("arithmetic operation must be done between the same numeric types")
+          }
         case TypedAst.MinusOp(type_, location, operand) =>
           evalRecursive(operand) match {
             case BoxedInt(value) => BoxedInt(-value)
