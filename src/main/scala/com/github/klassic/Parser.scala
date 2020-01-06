@@ -147,8 +147,11 @@ class Parser extends Processor[String, Program, InteractiveSession] {
       lazy val AMP2: Parser[String] = token("&&")
       lazy val BAR2: Parser[String] = token("||")
       lazy val BAR: Parser[String] = token("|")
+      lazy val AMP: Parser[String] = token("&")
+      lazy val HAT: Parser[String] = token("^")
       lazy val KEYWORDS: Set[String] = Set(
-        "<", "_", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?",
+        "&&", "||",
+        "<", "_", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?", "^", "|", "&",
         "if", "rule", "then", "else", "while", "foreach", "import", "cleanup", "true", "false", "in", ",", ".",
         "class", "def", "val", "mutable", "record", "=", "==", "=>", "new", "&", "|", "&&", "||"
       )
@@ -286,16 +289,39 @@ class Parser extends Processor[String, Program, InteractiveSession] {
       }
 
       lazy val infix: Parser[Ast.Node] = rule {
-        chainl(logical)(
+        chainl(logicalOr)(
           (%% ~ CL(operator)) ^^ { case location ~ op => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, Id(location, op), List(lhs)), List(rhs)) }
             | (%% ~ CL(selector)) ^^ { case location ~ sl => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, sl, List(lhs)), List(rhs)) }
         )
       }
 
-      lazy val logical: Parser[Ast.Node] = rule {
-        chainl(conditional)(
+      lazy val logicalOr: Parser[Ast.Node] = rule {
+        chainl(logicalAnd)(
+          (%% << CL(BAR2)) ^^ { location => (lhs: Ast.Node, rhs: Ast.Node) => BinaryExpression(location, Operator.BAR2, lhs, rhs) }
+        )
+      }
+
+      lazy val logicalAnd: Parser[Ast.Node] = rule {
+        chainl(bitOr)(
           (%% << CL(AMP2)) ^^ { location => (lhs: Ast.Node, rhs: Ast.Node) => BinaryExpression(location, Operator.AND2, lhs, rhs) }
-            | (%% << CL(BAR2)) ^^ { location => (lhs: Ast.Node, rhs: Ast.Node) => BinaryExpression(location, Operator.BAR2, lhs, rhs) }
+        )
+      }
+
+      lazy val bitOr: Parser[Ast.Node] = rule {
+        chainl(bitXor)(
+          (%% << CL(BAR)) ^^ { location => (lhs: Ast.Node, rhs: Ast.Node) => BinaryExpression(location, Operator.OR, lhs, rhs) }
+        )
+      }
+
+      lazy val bitXor: Parser[Ast.Node] = rule {
+        chainl(bitAnd)(
+          (%% << CL(HAT)) ^^ { location => (lhs: Ast.Node, rhs: Ast.Node) => BinaryExpression(location, Operator.XOR, lhs, rhs) }
+        )
+      }
+
+      lazy val bitAnd: Parser[Ast.Node] = rule {
+        chainl(conditional)(
+          (%% << CL(AMP)) ^^ { location => (lhs: Ast.Node, rhs: Ast.Node) => BinaryExpression(location, Operator.AND, lhs, rhs) }
         )
       }
 

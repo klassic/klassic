@@ -600,8 +600,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         }
         val s4 = unify(resultType, t, s3)
         (TypedAst.BinaryExpression(resultType, location, Operator.MULTIPLY, typedLhs, typedRhs), s4)
-      case Ast.BinaryExpression(location, Operator.DIVIDE, lhs, rhs) =>
-        val a, b = newTypeVariable()
+      case Ast.BinaryExpression(location, Operator.DIVIDE, lhs, rhs) => val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
         val (typedRhs, s2) = doType(rhs, env, b, s1)
         val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
@@ -630,6 +629,81 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         }
         val s4 = unify(resultType, t, s3)
         (TypedAst.BinaryExpression(resultType, location, Operator.DIVIDE, typedLhs, typedRhs), s4)
+      case Ast.BinaryExpression(location, Operator.AND, lhs, rhs) => val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
+          case (TInt, TInt) =>
+            (TInt, s2)
+          case (TLong, TLong) =>
+            (TLong, s2)
+          case (TShort, TShort) =>
+            (TShort, s2)
+          case (TByte, TByte) =>
+            (TByte, s2)
+          case (TDynamic, TDynamic) =>
+            (TDynamic, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
+            (y, unify(x, y, s2))
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
+            (x, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TInt, s4)
+        }
+        val s4 = unify(resultType, t, s3)
+        (TypedAst.BinaryExpression(resultType, location, Operator.AND, typedLhs, typedRhs), s4)
+      case Ast.BinaryExpression(location, Operator.OR, lhs, rhs) => val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
+          case (TInt, TInt) =>
+            (TInt, s2)
+          case (TLong, TLong) =>
+            (TLong, s2)
+          case (TShort, TShort) =>
+            (TShort, s2)
+          case (TByte, TByte) =>
+            (TByte, s2)
+          case (TDynamic, TDynamic) =>
+            (TDynamic, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
+            (y, unify(x, y, s2))
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
+            (x, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TInt, s4)
+        }
+        val s4 = unify(resultType, t, s3)
+        (TypedAst.BinaryExpression(resultType, location, Operator.OR, typedLhs, typedRhs), s4)
+      case Ast.BinaryExpression(location, Operator.XOR, lhs, rhs) => val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
+          case (TInt, TInt) =>
+            (TInt, s2)
+          case (TLong, TLong) =>
+            (TLong, s2)
+          case (TShort, TShort) =>
+            (TShort, s2)
+          case (TByte, TByte) =>
+            (TByte, s2)
+          case (TDynamic, TDynamic) =>
+            (TDynamic, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
+            (y, unify(x, y, s2))
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
+            (x, unify(x, y, s2))
+          case (ltype, rtype) =>
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TInt, s4)
+        }
+        val s4 = unify(resultType, t, s3)
+        (TypedAst.BinaryExpression(resultType, location, Operator.XOR, typedLhs, typedRhs), s4)
       case Ast.MinusOp(location, operand) =>
         val a = newTypeVariable()
         val (typedOperand, s1) = doType(operand, env, a, s0)
