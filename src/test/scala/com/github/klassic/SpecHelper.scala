@@ -1,10 +1,11 @@
 package com.github.klassic
 
-import org.scalatest.{DiagrammedAssertions, FunSpec}
 import java.util.ArrayList
 import java.util.HashMap
+import org.scalatest.diagrams.Diagrams
+import org.scalatest.funspec.AnyFunSpec
 
-trait SpecHelper extends FunSpec with DiagrammedAssertions {
+trait SpecHelper extends AnyFunSpec with Diagrams {
   val E = new Evaluator
   def listOf[T](elements: T*): ArrayList[T] = {
     val newList = new ArrayList[T]

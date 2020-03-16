@@ -2,9 +2,10 @@ package com.github.klassic
 
 import java.util.{ArrayList, HashMap}
 
-import org.scalatest.{DiagrammedAssertions, FunSpec, FunSuite}
+import org.scalatest.diagrams.Diagrams
+import org.scalatest.funsuite.AnyFunSuite
 
-trait TestSuiteHelper extends FunSuite with DiagrammedAssertions {
+trait TestSuiteHelper extends AnyFunSuite with Diagrams {
   val E = new Evaluator
   def listOf[T](elements: T*): ArrayList[T] = {
     val newList = new ArrayList[T]
