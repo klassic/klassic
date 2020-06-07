@@ -1,5 +1,10 @@
 package com.github.klassic
 
+import java.io.BufferedReader
+import java.nio.file.{Files, Path, Paths}
+import java.util
+import java.util.stream.Collectors
+
 import scala.jdk.CollectionConverters._
 import com.github.klassic._
 import com.github.klassic.Type._
@@ -232,13 +237,21 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
       "x" -> TInt,
       "y" -> TInt
     )
+    define("InStream")(
+      "core" -> TDynamic
+    )
+    define("OutStream")(
+      "core" -> TDynamic
+    )
   }
 
   object BuiltinModuleEnvironment extends ModuleEnvironment() {
-    private final val LIST= "List"
-    private final val MAP = "Map"
-    private final val SET = "Set"
-    private final val GPIO = "GPIO"
+    private final val LIST         = "List"
+    private final val MAP          = "Map"
+    private final val SET          = "Set"
+    private final val GPIO         = "GPIO"
+    private final val FILE_INPUT   = "FileInput"
+
     enter(LIST) {
       define("head") { case List(ObjectValue(list: java.util.List[_])) =>
         Value.toKlassic(list.get(0).asInstanceOf[AnyRef])
@@ -303,6 +316,48 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
             result
           }
         }
+      }
+    }
+    enter(FILE_INPUT) {
+      define("open") { case List(ObjectValue(path: String)) =>
+        val reader = Files.newBufferedReader(Path.of(path))
+        NativeFunctionValue { case List(fun: FunctionValue) =>
+          val env = new RuntimeEnvironment(fun.environment)
+          val reader = Files.newBufferedReader(Path.of(path))
+          try {
+            val inStream = RecordValue("InStream", List("core" -> ObjectValue(reader)))
+            val params: List[TypedNode] = List(ValueNode(inStream))
+            performFunctionInternal(fun.value, params, env)
+          } finally {
+            reader.close()
+          }
+        }
+      }
+      define("all") { case List(ObjectValue(path: String)) =>
+        val result = Files.readString(Path.of(path))
+        Value.toKlassic(result)
+      }
+      define("lines") { case List(ObjectValue(path: String)) =>
+        val result = Files.lines(Path.of(path)).collect(Collectors.toList())
+        Value.toKlassic(result)
+      }
+      define("readLines") { case List(inStream: RecordValue) =>
+        val reader = Value.fromKlassic(inStream.members.find( { case (name, value) => name == "core"}).get._2).asInstanceOf[BufferedReader]
+        val newList = new util.ArrayList[String]
+        var line: String = null
+        while({line = reader.readLine(); line } != null) {
+          newList.add(line)
+        }
+        Value.toKlassic(newList)
+      }
+      define("readAll") { case List(inStream: RecordValue) =>
+        val reader = Value.fromKlassic(inStream.members.find( { case (name, value) => name == "core"}).get._2).asInstanceOf[BufferedReader]
+        val builder = new StringBuilder
+        var ch: Int = -1
+        while({ch = reader.read(); ch } != -1) {
+          builder.append(ch.asInstanceOf[Char])
+        }
+        Value.toKlassic((builder.toString()))
       }
     }
     enter(GPIO) {
