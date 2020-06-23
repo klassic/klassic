@@ -1,10 +1,11 @@
 package com.github.klassic.macro_peg
 
-import org.scalatest.{DiagrammedAssertions, FunSpec}
 import EvaluationResult._
 import Runner._
+import org.scalatest.diagrams.Diagrams
+import org.scalatest.funspec.AnyFunSpec
 
-class MacroPegCallByNameSpec extends FunSpec with DiagrammedAssertions {
+class MacroPegCallByNameSpec extends AnyFunSpec with Diagrams {
   describe("Macro PEG with call by name example") {
     it("palindrome") {
       val results = evalGrammar(
