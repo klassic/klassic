@@ -1,0 +1,4 @@
+val text = "src/test/resources/hello.txt" FileInput#open {(stream) =>
+  FileInput#readAll(stream)
+}
+assertResult("Hello, World!")(text)
