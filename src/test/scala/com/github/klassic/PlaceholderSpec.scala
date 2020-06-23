@@ -1,6 +1,5 @@
 package com.github.klassic
 
-import org.scalatest.{FlatSpec, FunSuite}
 
 /**
   * Created by Mizushima on 2016/05/30.
