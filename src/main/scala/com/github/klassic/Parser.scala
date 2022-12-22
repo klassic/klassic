@@ -70,7 +70,25 @@ class Parser extends Processor[String, Program, InteractiveSession] {
 
       def CL[T](parser: Parser[T]): Parser[T] = parser << SPACING
 
-      def token(parser: String): Parser[String] = parser << SPACING_WITHOUT_LF
+      private[this] val tokenNames = mutable.Set.empty[String]
+
+      /**
+        * Define a *keywork token*, which is regarded as a keyword
+        * Note that this method must not called lazily since this method
+        * has side effects.
+        * @param name token name. it must not have spaces
+        */
+      def kwToken(name: String): Parser[String] = {
+        tokenNames += name
+        name << SPACING_WITHOUT_LF
+      }
+
+      /**
+        * Define a *special token*, which is *not* regarded as a keyword
+        * @param parser
+        * @return
+        */
+      def spToken(parser: String): Parser[String] = parser << SPACING_WITHOUT_LF
 
       def unescape(input: String): String = {
         val builder = new java.lang.StringBuilder
@@ -93,68 +111,66 @@ class Parser extends Processor[String, Program, InteractiveSession] {
         new String(builder)
       }
 
-      lazy val LT: Parser[String] = token("<")
-      lazy val GT: Parser[String] = token(">")
-      lazy val LTE: Parser[String] = token("<=")
-      lazy val GTE: Parser[String] = token(">=")
-      lazy val MAP_OPEN: Parser[String] = token("%[")
-      lazy val SET_OPEN: Parser[String] = token("%(")
-      lazy val UNDERSCORE: Parser[String] = token("_")
-      lazy val PLUS: Parser[String] = token("+")
-      lazy val MINUS: Parser[String] = token("-")
-      lazy val ASTER: Parser[String] = token("*")
-      lazy val SLASH: Parser[String] = token("/")
-      lazy val LPAREN: Parser[String] = token("(")
-      lazy val RPAREN: Parser[String] = token(")")
-      lazy val LBRACE: Parser[String] = token("{")
-      lazy val RBRACE: Parser[String] = token("}")
-      lazy val LBRACKET: Parser[String] = token("[")
-      lazy val RBRACKET: Parser[String] = token("]")
-      lazy val SHARP: Parser[String] = token("#")
-      lazy val IF: Parser[String] = token("if")
-      lazy val ELSE: Parser[String] = token("else")
-      lazy val THEN: Parser[String] = token("then")
-      lazy val WHILE: Parser[String] = token("while")
-      lazy val FOREACH: Parser[String] = token("foreach")
-      lazy val IMPORT: Parser[String] = token("import")
-      lazy val ENUM: Parser[String] = token("enum")
-      lazy val TRUE: Parser[String] = token("true")
-      lazy val FALSE: Parser[String] = token("false")
-      lazy val IN: Parser[String] = token("in")
-      lazy val COMMA: Parser[String] = token(",")
-      lazy val DOT: Parser[String] = token(".")
-      lazy val CLASS: Parser[String] = token("class")
-      lazy val RECORD: Parser[String] = token("record")
-      lazy val DEF: Parser[String] = token("def")
-      lazy val MUTABLE: Parser[String] = token("mutable")
-      lazy val CLEANUP: Parser[String] = token("cleanup")
-      lazy val VAL: Parser[String] = token("val")
-      lazy val EQ: Parser[String] = token("=")
-      lazy val RULE: Parser[String] = token("rule")
-      lazy val BEGIN_MSTR: Parser[String] = token("<<<")
-      lazy val END_MSTR: Parser[String] = token(">>>")
-      lazy val PLUSEQ: Parser[String] = token("+=")
-      lazy val MINUSEQ: Parser[String] = token("-=")
-      lazy val ASTEREQ: Parser[String] = token("*=")
-      lazy val SLASHEQ: Parser[String] = token("/=")
-      lazy val COLONGT: Parser[String] = token(":>")
-      lazy val EQEQ: Parser[String] = token("==")
-      lazy val ARROW1: Parser[String] = token("=>")
-      lazy val ARROW2: Parser[String] = token("->")
-      lazy val COLON: Parser[String] = token(":")
-      lazy val NEW: Parser[String] = token("new")
-      lazy val QUES: Parser[String] = token("?")
-      lazy val AMP2: Parser[String] = token("&&")
-      lazy val BAR2: Parser[String] = token("||")
-      lazy val BAR: Parser[String] = token("|")
-      lazy val AMP: Parser[String] = token("&")
-      lazy val HAT: Parser[String] = token("^")
-      lazy val KEYWORDS: Set[String] = Set(
-        "&&", "||",
-        "<", "_", ">", "<=", ">=", "+", "-", "*", "/", "{", "}", "[", "]", ":", "?", "^", "|", "&",
-        "if", "rule", "then", "else", "while", "foreach", "import", "cleanup", "true", "false", "in", ",", ".",
-        "class", "def", "val", "mutable", "record", "=", "==", "=>", "new", "&", "|", "&&", "||"
-      )
+      //begin token definition
+      val LT: Parser[String]               = kwToken("<")
+      val GT: Parser[String]               = kwToken(">")
+      val LTE: Parser[String]              = kwToken("<=")
+      val GTE: Parser[String]              = kwToken(">=")
+      val MAP_OPEN: Parser[String]         = kwToken("%[")
+      val SET_OPEN: Parser[String]         = kwToken("%(")
+      val UNDERSCORE: Parser[String]       = kwToken("_")
+      val PLUS: Parser[String]             = kwToken("+")
+      val MINUS: Parser[String]            = kwToken("-")
+      val ASTER: Parser[String]            = kwToken("*")
+      val SLASH: Parser[String]            = kwToken("/")
+      val LPAREN: Parser[String]           = kwToken("(")
+      val RPAREN: Parser[String]           = kwToken(")")
+      val LBRACE: Parser[String]           = kwToken("{")
+      val RBRACE: Parser[String]           = kwToken("}")
+      val LBRACKET: Parser[String]         = kwToken("[")
+      val RBRACKET: Parser[String]         = kwToken("]")
+      val SHARP: Parser[String]            = kwToken("#")
+      val IF: Parser[String]               = kwToken("if")
+      val ELSE: Parser[String]             = kwToken("else")
+      val THEN: Parser[String]             = kwToken("then")
+      val WHILE: Parser[String]            = kwToken("while")
+      val FOREACH: Parser[String]          = kwToken("foreach")
+      val IMPORT: Parser[String]           = kwToken("import")
+      val ENUM: Parser[String]             = kwToken("enum")
+      val TRUE: Parser[String]             = kwToken("true")
+      val FALSE: Parser[String]            = kwToken("false")
+      val IN: Parser[String]               = kwToken("in")
+      val COMMA: Parser[String]            = kwToken(",")
+      val DOT: Parser[String]              = kwToken(".")
+      val CLASS: Parser[String]            = kwToken("class")
+      val RECORD: Parser[String]           = kwToken("record")
+      val DEF: Parser[String]              = kwToken("def")
+      val MUTABLE: Parser[String]          = kwToken("mutable")
+      val CLEANUP: Parser[String]          = kwToken("cleanup")
+      val VAL: Parser[String]              = kwToken("val")
+      val EQ: Parser[String]               = kwToken("=")
+      val RULE: Parser[String]             = kwToken("rule")
+      val BEGIN_MSTR: Parser[String]       = kwToken("<<<")
+      val END_MSTR: Parser[String]         = kwToken(">>>")
+      val PLUSEQ: Parser[String]           = kwToken("+=")
+      val MINUSEQ: Parser[String]          = kwToken("-=")
+      val ASTEREQ: Parser[String]          = kwToken("*=")
+      val SLASHEQ: Parser[String]          = kwToken("/=")
+      val COLONGT: Parser[String]          = kwToken(":>")
+      val EQEQ: Parser[String]             = kwToken("==")
+      val ARROW1: Parser[String]           = kwToken("=>")
+      val ARROW2: Parser[String]           = kwToken("->")
+      val COLON: Parser[String]            = kwToken(":")
+      val NEW: Parser[String]              = kwToken("new")
+      val QUES: Parser[String]             = kwToken("?")
+      val AMP2: Parser[String]             = kwToken("&&")
+      val BAR2: Parser[String]             = kwToken("||")
+      val BAR: Parser[String]              = kwToken("|")
+      val AMP: Parser[String]              = kwToken("&")
+      val HAT: Parser[String]              = kwToken("^")
+      // end token definition
+
+      lazy val KEYWORDS: Set[String] = tokenNames.toSet
 
       lazy val typeAnnotation: Parser[Type] = COLON >> typeDescription
 
@@ -184,16 +200,16 @@ class Parser extends Processor[String, Program, InteractiveSession] {
         } | sident.filter { s => !isBuiltinType(s) } ~ (CL(LT) >> typeDescription.repeat0By(CL(COMMA)) << CL(GT)).? ^^ {
           case name ~ Some(args) => TConstructor(name, args)
           case name ~ None => TConstructor(name, Nil)
-        } | token("Byte") ^^ { _ => TByte }
-          | token("Short") ^^ { _ => TShort }
-          | token("Int") ^^ { _ => TInt }
-          | token("Long") ^^ { _ => TLong }
-          | token("Float") ^^ { _ => TFloat }
-          | token("Double") ^^ { _ => TDouble }
-          | token("Boolean") ^^ { _ => TBoolean }
-          | token("Unit") ^^ { _ => TUnit }
-          | token("String") ^^ { _ => TString }
-          | token("*") ^^ { _ => TDynamic }
+        } | kwToken("Byte") ^^ { _ => TByte }
+          | kwToken("Short") ^^ { _ => TShort }
+          | kwToken("Int") ^^ { _ => TInt }
+          | kwToken("Long") ^^ { _ => TLong }
+          | kwToken("Float") ^^ { _ => TFloat }
+          | kwToken("Double") ^^ { _ => TDouble }
+          | kwToken("Boolean") ^^ { _ => TBoolean }
+          | kwToken("Unit") ^^ { _ => TUnit }
+          | kwToken("String") ^^ { _ => TString }
+          | kwToken("*") ^^ { _ => TDynamic }
       )
 
       def root: Parser[Program] = rule(program)
@@ -258,8 +274,9 @@ class Parser extends Processor[String, Program, InteractiveSession] {
 
       //ifExpression ::= "if" "(" expression ")" expression "else" expression
       lazy val ifExpression: Parser[Ast.Node] = rule {
-        (%% << CL(IF) << CL(LPAREN)) ~ commit(expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression) ^^ {
-          case location ~ (condition ~ _ ~ positive ~ _ ~ negative) => IfExpression(location, condition, positive, negative)
+        (%% << CL(IF) << CL(LPAREN)) ~ commit(expression ~ (CL(RPAREN) ~> expression) ~ (CL(ELSE) ~> expression).?) ^^ {
+          case location ~ (condition ~ positive ~ Some(negative)) => IfExpression(location, condition, positive, negative)
+          case location ~ (condition ~ positive ~ None) => IfExpression(location, condition, positive, UnitNode(location))
         }
       }
 

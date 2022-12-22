@@ -56,6 +56,8 @@ object TypedAst {
 
   case class FloatNode(type_ : Type, location: Location, value: Float) extends TypedNode
 
+  case class UnitNode(type_ : Type, location: Location) extends TypedNode
+
   case class Id(type_ : Type, location: Location, name: String) extends TypedNode
 
   case class Selector(type_ : Type, location: Location, module: String, name: String) extends TypedNode

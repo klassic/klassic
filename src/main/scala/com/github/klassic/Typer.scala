@@ -18,6 +18,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
   type RecordEnvironment = Map[String, TRecord]
   type Name = String
   type Label = String
+
   def listOf(tp: Type): TConstructor = {
     TConstructor("List", List(tp))
   }
@@ -60,12 +61,24 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
     )
   }
 
+  val TOutStream: TRecord = TRecord(
+    Nil,
+    TRowExtend("core", TDynamic, TRowEmpty)
+  )
+
+  val TInStream : TRecord = TRecord(
+    Nil,
+    TRowExtend("core", TDynamic, TRowEmpty)
+  )
+
   val BuiltinRecordEnvironment: Map[String, TRecord] = {
     Map(
       "Point" -> TRecord(
         Nil,
         TRowExtend("x", TInt, TRowExtend("y", TInt, TRowEmpty))
-      )
+      ),
+      "InStream" -> TInStream,
+      "OutStream" -> TOutStream,
     )
   }
 
@@ -93,6 +106,13 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         "contains" -> TScheme(List(tv("a")), setOf(tv("a")) ==> (tv("a") ==> TBoolean)),
         "size" -> TScheme(List(tv("a")), setOf(tv("a")) ==> TInt),
         "isEmpty" -> TScheme(List(tv("a")), setOf(tv("a")) ==> TBoolean)
+      ),
+      "FileInput" -> Map(
+        "open" -> TScheme(List(tv("a")), TString ==> ((TInStream ==> tv("a")) ==> tv("a"))),
+        "readAll" -> TScheme(List(), TInStream ==> TString),
+        "readLines" -> TScheme(List(), TInStream ==> TString),
+        "all" -> TScheme(List(), TString ==> TString),
+        "lines" -> TScheme(List(), TString ==> listOf(TString)),
       ),
       "GPIO" -> Map(
         "pin" -> TScheme(Nil, List(TInt) ==> TDynamic),
@@ -305,6 +325,9 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
       case Ast.BooleanNode(location, value) =>
         val newSub = unify(t, TBoolean, s0)
         (TypedAst.BooleanNode(newSub.replace(t), location, value), newSub)
+      case Ast.UnitNode(location) =>
+        val newSub = unify(t, TUnit, s0)
+        (TypedAst.UnitNode(newSub.replace(t), location), newSub)
       case Ast.SimpleAssignment(location, variable, value) =>
         if(env.immutableVariables.contains(variable)) {
           typeError(location, s"variable '$variable' cannot change")
