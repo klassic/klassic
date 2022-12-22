@@ -35,11 +35,11 @@ libraryDependencies ++= Seq(
   "org.scalatest" %% "scalatest" %  "3.1.1"
 )
 libraryDependencies ++= Seq(
-  "com.pi4j" % "pi4j-core" % "1.2",
-  "com.pi4j" % "pi4j-device" % "1.2",
-  "com.pi4j" % "pi4j-gpio-extension" % "1.2",
+  "com.pi4j" % "pi4j-core" % "1.3",
+  "com.pi4j" % "pi4j-device" % "1.3",
+  "com.pi4j" % "pi4j-gpio-extension" % "1.3",
   "com.pi4j" % "pi4j-service" % "1.1",
-  "com.pi4j" % "pi4j-native" % "1.2" pomOnly()
+  "com.pi4j" % "pi4j-native" % "1.3" pomOnly()
 )
 
 assembly / assemblyJarName := "klassic.jar"
