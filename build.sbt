@@ -1,10 +1,9 @@
 organization := "com.github.klassic"
 
 name := "klassic"
+version := "0.1.0-snapshot"
 
-version := "0.1.0-beta1"
-
-scalaVersion := "2.13.1"
+scalaVersion := "2.13.10"
 
 publishMavenStyle := true
 
@@ -12,12 +11,12 @@ val scaladocBranch = settingKey[String]("branch name for scaladoc -doc-source-ur
 
 scaladocBranch := "master"
 
-scalacOptions in (Compile, doc) ++= { Seq(
+Compile / doc / scalacOptions ++= { Seq(
   "-sourcepath", baseDirectory.value.getAbsolutePath,
   "-doc-source-url", s"https://github.com/klassic/klassic/tree/${scaladocBranch.value}€{FILE_PATH}.scala"
 )}
 
-testOptions in Test += Tests.Argument("-oI")
+Test / testOptions += Tests.Argument("-oI")
 
 scalacOptions ++= {
   Seq("-unchecked", "-deprecation", "-feature", "-language:implicitConversions")
@@ -32,22 +31,22 @@ libraryDependencies ++= Seq(
   "com.github.kmizu" %% "scomb" % "0.9.0",
   "com.github.scaruby" %% "scaruby" % "0.6",
   "org.ow2.asm" % "asm" % "5.2",
-  "junit" % "junit" % "4.13" % "test",
-  "org.scalatest" %% "scalatest" %  "3.1.1"
+  "junit" % "junit" % "4.13.2" % "test",
+  "org.scalatest" %% "scalatest" %  "3.1.4"
 )
 libraryDependencies ++= Seq(
-  "com.pi4j" % "pi4j-core" % "1.2",
-  "com.pi4j" % "pi4j-device" % "1.2",
-  "com.pi4j" % "pi4j-gpio-extension" % "1.2",
+  "com.pi4j" % "pi4j-core" % "1.3",
+  "com.pi4j" % "pi4j-device" % "1.3",
+  "com.pi4j" % "pi4j-gpio-extension" % "1.3",
   "com.pi4j" % "pi4j-service" % "1.1",
-  "com.pi4j" % "pi4j-native" % "1.2" pomOnly()
+  "com.pi4j" % "pi4j-native" % "1.3" pomOnly()
 )
 
-assemblyJarName in assembly := "klassic.jar"
+assembly / assemblyJarName := "klassic.jar"
 
-mainClass in assembly := Some("com.github.klassic.Main")
+assembly / mainClass := Some("com.github.klassic.Main")
 
-initialCommands in console += {
+console / initialCommands += {
   Iterator(
     "com.github.klassic._",
     "com.github.klassic.Ast._",
