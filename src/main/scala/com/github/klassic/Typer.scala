@@ -305,6 +305,9 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
       case Ast.BooleanNode(location, value) =>
         val newSub = unify(t, TBoolean, s0)
         (TypedAst.BooleanNode(newSub.replace(t), location, value), newSub)
+      case Ast.UnitNode(location) =>
+        val newSub = unify(t, TUnit, s0)
+        (TypedAst.UnitNode(newSub.replace(t), location), newSub)
       case Ast.SimpleAssignment(location, variable, value) =>
         if(env.immutableVariables.contains(variable)) {
           typeError(location, s"variable '$variable' cannot change")

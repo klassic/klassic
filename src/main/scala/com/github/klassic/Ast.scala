@@ -57,6 +57,11 @@ object Ast {
 
   case class DoubleNode(location: Location, value: Double) extends Node
 
+  case class UnitNode(location: Location) extends Node
+  object UnitNode {
+    def apply(): UnitNode = UnitNode(NoLocation)
+  }
+
   case class FloatNode(location: Location, value: Float) extends Node
 
   case class Id(location: Location, name: String) extends Node

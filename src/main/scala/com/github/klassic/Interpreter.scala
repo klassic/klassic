@@ -124,12 +124,12 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
 
     define("println") { case List(param) =>
       println(param)
-      param
+      UnitValue
     }
 
     define("printlnError") { case List(param) =>
       Console.err.println(param)
-      param
+      UnitValue
     }
 
     define("stopwatch") { case List(fun: FunctionValue) =>
@@ -679,6 +679,8 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           BoxedFloat(value)
         case TypedAst.BooleanNode(type_, location, value) =>
           BoxedBoolean(value)
+        case TypedAst.UnitNode(type_, location) =>
+          UnitValue
         case TypedAst.ListLiteral(type_, location, elements) =>
           val params = elements.map{e => Value.fromKlassic(evalRecursive(e))}
           val newList = new java.util.ArrayList[Any]
