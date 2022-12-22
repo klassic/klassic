@@ -1,10 +1,9 @@
 organization := "com.github.klassic"
 
 name := "klassic"
+version := "0.1.0-snapshot"
 
-version := "0.1.0-beta1"
-
-scalaVersion := "2.13.1"
+scalaVersion := "2.13.10"
 
 publishMavenStyle := true
 
@@ -12,12 +11,12 @@ val scaladocBranch = settingKey[String]("branch name for scaladoc -doc-source-ur
 
 scaladocBranch := "master"
 
-scalacOptions in (Compile, doc) ++= { Seq(
+Compile / doc / scalacOptions ++= { Seq(
   "-sourcepath", baseDirectory.value.getAbsolutePath,
   "-doc-source-url", s"https://github.com/klassic/klassic/tree/${scaladocBranch.value}€{FILE_PATH}.scala"
 )}
 
-testOptions in Test += Tests.Argument("-oI")
+Test / testOptions += Tests.Argument("-oI")
 
 scalacOptions ++= {
   Seq("-unchecked", "-deprecation", "-feature", "-language:implicitConversions")
@@ -43,11 +42,11 @@ libraryDependencies ++= Seq(
   "com.pi4j" % "pi4j-native" % "1.2" pomOnly()
 )
 
-assemblyJarName in assembly := "klassic.jar"
+assembly / assemblyJarName := "klassic.jar"
 
-mainClass in assembly := Some("com.github.klassic.Main")
+assembly / mainClass := Some("com.github.klassic.Main")
 
-initialCommands in console += {
+console / initialCommands += {
   Iterator(
     "com.github.klassic._",
     "com.github.klassic.Ast._",
