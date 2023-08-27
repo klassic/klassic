@@ -274,8 +274,9 @@ class Parser extends Processor[String, Program, InteractiveSession] {
 
       //ifExpression ::= "if" "(" expression ")" expression "else" expression
       lazy val ifExpression: Parser[Ast.Node] = rule {
-        (%% << CL(IF) << CL(LPAREN)) ~ commit(expression ~ CL(RPAREN) ~ expression ~ CL(ELSE) ~ expression) ^^ {
-          case location ~ (condition ~ _ ~ positive ~ _ ~ negative) => IfExpression(location, condition, positive, negative)
+        (%% << CL(IF) << CL(LPAREN)) ~ commit(expression ~ (CL(RPAREN) ~> expression) ~ (CL(ELSE) ~> expression).?) ^^ {
+          case location ~ (condition ~ positive ~ Some(negative)) => IfExpression(location, condition, positive, negative)
+          case location ~ (condition ~ positive ~ None) => IfExpression(location, condition, positive, UnitNode(location))
         }
       }
 

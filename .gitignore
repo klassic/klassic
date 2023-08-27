@@ -16,3 +16,4 @@ dist
 .bin
 *.swp
 .cache-main
+.bsp/
