@@ -19,6 +19,7 @@ Compile / scalacOptions ++= Seq(
   "-doc-source-url", s"https://github.com/klassic/klassic/tree/${scaladocBranch.value}€{FILE_PATH}.scala"
 )
 
+Test/ fork := true
 Test / testOptions += Tests.Argument("-oI")
 Test/ fork := true
 
@@ -49,15 +50,14 @@ libraryDependencies ++= Seq(
 libraryDependencies ++= Seq(
   "org.ow2.asm" % "asm" % "5.0.4",
   "junit" % "junit" % "4.13" % Test,
-  "com.pi4j" % "pi4j-core" % "1.2",
-  "com.pi4j" % "pi4j-device" % "1.2",
-  "com.pi4j" % "pi4j-gpio-extension" % "1.2",
+  "com.pi4j" % "pi4j-core" % "1.3",
+  "com.pi4j" % "pi4j-device" % "1.3",
+  "com.pi4j" % "pi4j-gpio-extension" % "1.3",
   "com.pi4j" % "pi4j-service" % "1.1",
   "com.pi4j" % "pi4j-native" % "1.3" pomOnly()
 )
 
 assembly / assemblyJarName := "klassic.jar"
-
 assembly / mainClass := Some("com.github.klassic.Main")
 
 assembly / mainClass := Some("com.github.klassic.Main")
