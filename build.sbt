@@ -51,8 +51,8 @@ libraryDependencies ++= Seq(
   "org.ow2.asm" % "asm" % "5.0.4",
   "junit" % "junit" % "4.13" % Test,
   "com.pi4j" % "pi4j-core" % "1.2",
-  "com.pi4j" % "pi4j-device" % "1.2",
-  "com.pi4j" % "pi4j-gpio-extension" % "1.2",
+  "com.pi4j" % "pi4j-device" % "1.3",
+  "com.pi4j" % "pi4j-gpio-extension" % "1.3",
   "com.pi4j" % "pi4j-service" % "1.1",
   "com.pi4j" % "pi4j-native" % "1.3" pomOnly()
 )
