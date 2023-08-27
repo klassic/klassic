@@ -1,5 +1,6 @@
 project/project/target
 project/target
+.bsp/
 target
 tmp
 .history

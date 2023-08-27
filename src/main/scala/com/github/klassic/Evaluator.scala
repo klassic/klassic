@@ -19,9 +19,12 @@ class Evaluator extends (String => Value) {
       in <- file.openReader()
     } {
       val program = in.readAll()
-      evaluateString(program, file.name)
+      evaluateStringInFile(program, file.name)
     }
-  def evaluateString(program: String, fileName: String = "<no file>"): Value = {
+  def evaluateString(program: String): Value = {
+    evaluateStringInFile(program, "<no file>")
+  }
+  def evaluateStringInFile(program: String, fileName: String): Value = {
     val session = new InteractiveSession
     val parser = new Parser
     val parsedProgram = parser.process(program, session)
