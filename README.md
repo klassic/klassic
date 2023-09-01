@@ -1,6 +1,6 @@
 # Klassic: A Programming Language which enables Object-Functional Programming
 
-[![Build Status](https://travis-ci.org/klassic/klassic.png?branch=master)](https://travis-ci.org/klassic/klassic)
+![Build Status](https://github.com/klassic/klassic/actions/workflows/ci.yml/badge.svg)
 
 Klassic is yet another statically typed programming language.  Klassic has: 
 
