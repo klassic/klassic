@@ -11,12 +11,8 @@ scalaVersion := "3.3.0"
 
 publishMavenStyle := true
 
-val scaladocBranch = settingKey[String]("branch name for scaladoc -doc-source-url")
-scaladocBranch := "master"
-
 Compile / scalacOptions ++= Seq(
-  "-sourcepath", (Compile / baseDirectory).value.getAbsolutePath,
-  "-doc-source-url", s"https://github.com/klassic/klassic/tree/${scaladocBranch.value}€{FILE_PATH}.scala"
+  "-sourcepath", (Compile / baseDirectory).value.getAbsolutePath
 )
 
 Test / testOptions += Tests.Argument("-oI")
