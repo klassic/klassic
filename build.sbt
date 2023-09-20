@@ -40,7 +40,7 @@ libraryDependencies ++= Seq(
 ).map(_.cross(CrossVersion.for3Use2_13))
 
 libraryDependencies ++= Seq(
-  "org.scalatest" %% "scalatest" %  "3.2.16"
+  "org.scalatest" %% "scalatest" %  "3.2.17"
 )
 
 libraryDependencies ++= Seq(
