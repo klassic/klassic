@@ -7,7 +7,7 @@ version := "0.1.0-snapshot"
 
 version := "0.1.0-beta1"
 
-scalaVersion := "3.3.0"
+scalaVersion := "3.3.1"
 
 publishMavenStyle := true
 
