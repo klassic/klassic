@@ -3,11 +3,10 @@ import sbt.librarymanagement.Developer
 organization := "com.github.klassic"
 
 name := "klassic"
+
 version := "0.1.0-snapshot"
 
-version := "0.1.0-beta1"
-
-scalaVersion := "3.3.0"
+scalaVersion := "2.13.13"
 
 publishMavenStyle := true
 
@@ -40,7 +39,7 @@ libraryDependencies ++= Seq(
 ).map(_.cross(CrossVersion.for3Use2_13))
 
 libraryDependencies ++= Seq(
-  "org.scalatest" %% "scalatest" %  "3.2.16"
+  "org.scalatest" %% "scalatest" %  "3.2.18"
 )
 
 libraryDependencies ++= Seq(

@@ -307,8 +307,8 @@ class Parser extends Processor[String, Program, InteractiveSession] {
 
       lazy val infix: Parser[Ast.Node] = rule {
         chainl(logicalOr)(
-          (%% ~ CL(operator)) ^^ { case location ~ op => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, Id(location, op), List(lhs)), List(rhs)) }
-            | (%% ~ CL(selector)) ^^ { case location ~ sl => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, sl, List(lhs)), List(rhs)) }
+            (%% ~ CL(operator)) ^^ { case location ~ op => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, Id(location, op), List(lhs)), List(rhs)) }
+          | (%% ~ CL(selector)) ^^ { case location ~ sl => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, sl, List(lhs)), List(rhs)) }
         )
       }
 
@@ -415,10 +415,25 @@ class Parser extends Processor[String, Program, InteractiveSession] {
           FunctionCall(location, name, List(self))
       })
 
-      lazy val castable: Parser[Ast.Node] = rule(primary ~ ((%% << CL(COLONGT)) ~ CL(castType)).? ^^ {
+      lazy val castable: Parser[Ast.Node] = rule(mappable ~ ((%% << CL(COLONGT)) ~ CL(castType)).? ^^ {
         case target ~ Some((location ~ castType)) => Casting(location, target, castType)
         case target ~ None => target
       })
+
+      lazy val mappable: Parser[Ast.Node] = rule {
+        primary ~ (CL(component.filter(_ == "map")) ~> (ident.? ~< CL(ARROW1)) ~ expression).? ^^ {
+          case target ~ Some(Some(name) ~ body) =>
+            val lambda = Lambda(List(name.name), body)
+            val mapPartial = FunctionCall(target.location, Ast.Id("map"), List(target))
+            FunctionCall(target.location, mapPartial, List(lambda))
+          case target ~ Some(None ~ body) =>
+            val lambda = Lambda(List("e"), body)
+            val mapPartial = FunctionCall(target.location, Ast.Id("map"), List(target))
+            FunctionCall(target.location, mapPartial, List(lambda))
+          case target ~ None =>
+            target
+        }
+      }
 
       //primary ::= selector | booleanLiteral | ident | floatLiteral | integerLiteral | mapLiteral | stringLiteral | listLiteral | setLiteral | newRecord | newObject | functionLiteral | "(" expression ")" | "{" lines "}"
       lazy val primary: Parser[Ast.Node] = rule {
