@@ -1,0 +1,1 @@
+assertResult(6)([1 2 3] reduce 0 => r + e)

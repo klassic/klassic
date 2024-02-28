@@ -421,17 +421,31 @@ class Parser extends Processor[String, Program, InteractiveSession] {
       })
 
       lazy val mappable: Parser[Ast.Node] = rule {
-        primary ~ (CL(component.filter(_ == "map")) ~> (ident.? ~< CL(ARROW1)) ~ expression).? ^^ {
-          case target ~ Some(Some(name) ~ body) =>
-            val lambda = Lambda(List(name.name), body)
-            val mapPartial = FunctionCall(target.location, Ast.Id("map"), List(target))
-            FunctionCall(target.location, mapPartial, List(lambda))
-          case target ~ Some(None ~ body) =>
-            val lambda = Lambda(List("e"), body)
-            val mapPartial = FunctionCall(target.location, Ast.Id("map"), List(target))
-            FunctionCall(target.location, mapPartial, List(lambda))
-          case target ~ None =>
-            target
+        primary.flatMap{target =>
+          (
+            CL(component.filter(_ == "map")) ~> (ident.? ~< CL(ARROW1)) ~ expression ^^ {
+              case Some(name) ~ body =>
+                val lambda = Lambda(List(name.name), body)
+                val mapPartial = FunctionCall(target.location, Ast.Id("map"), List(target))
+                FunctionCall(target.location, mapPartial, List(lambda))
+              case None ~ body =>
+                val lambda = Lambda(List("e"), body)
+                val mapPartial = FunctionCall(target.location, Ast.Id("map"), List(target))
+                FunctionCall(target.location, mapPartial, List(lambda))
+            }
+          | CL(component.filter(_ == "reduce")) ~> expression ~ (COMMA ~> LPAREN ~> (ident ~< COMMA ~ ident) ~< RPAREN).? ~< CL(ARROW1) ~ expression ^^ {
+              case result ~ params ~ body =>
+                val lambda = params match {
+                  case Some(r ~ e) =>
+                    Lambda(List(r.name, e.name), body)
+                  case None =>
+                    Lambda(List("r", "e"), body)
+                }
+                val part1 = FunctionCall(target.location, Ast.Id("foldLeft"), List(target))
+                val part2 = FunctionCall(target.location, part1, List(result))
+                FunctionCall(target.location, part2, List(lambda))
+            }
+          ).?.map(_.getOrElse(target))
         }
       }
 
