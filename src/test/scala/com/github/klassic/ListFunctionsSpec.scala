@@ -1,6 +1,6 @@
 package com.github.klassic
 
-class ListSpec extends SpecHelper {
+class ListFunctionsSpec extends SpecHelper {
   describe("head") {
     val expectations: List[(String, Value)] = List(
       """
@@ -135,6 +135,24 @@ class ListSpec extends SpecHelper {
       """
         |[1 2 3] map =>e + 1
 """.stripMargin, ObjectValue(listOf(2, 3, 4))
+    )
+  }
+
+  describe("reduce syntax") {
+    expect("with an empty list and result:0 returns 0")(
+      """
+        |[] reduce 0, (r, e) => r + e
+  """.stripMargin, BoxedInt(0)
+    )
+    expect("with a list and block that calculate e to r returns sum of elements")(
+      """
+        |[1 2 3] reduce 0, (r, e) => r + e
+  """.stripMargin, BoxedInt(6)
+    )
+    expect("with a list and parameter-less block that calculate r + e returns sum of elements")(
+      """
+        |[1 2 3 4] reduce 0 => r + e
+""".stripMargin, BoxedInt(10)
     )
   }
 }
