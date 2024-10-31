@@ -137,7 +137,7 @@ object Parser {
         }
           | not(META) ~> any ^^ { case c => c }
         )
-      lazy val Debug = string("Debug") <~ Spacing
+      lazy val Debug: Parser[String] = string("Debug") <~ Spacing
       lazy val LPAREN = chr('(') <~ Spacing
       lazy val RPAREN = chr(')') <~ Spacing
       lazy val LBRACKET = chr('[') <~ Spacing
@@ -159,13 +159,13 @@ object Parser {
       lazy val CLOSE = chr(')') <~ Spacing
       lazy val DOT = chr('.') <~ Spacing
       lazy val ARROW = chr('-') <~ chr('>') <~ Spacing
-      lazy val Spacing = (Space | Comment).*
-      lazy val Comment = (
+      lazy val Spacing: Parser[List[Any]] = (Space | Comment).*
+      lazy val Comment: Parser[Char ~ Char ~ List[Any ~ Char] ~ Any] = (
         chr('/') ~ chr('/') ~ (not(EndOfLine) ~ any).* ~ EndOfLine
-        )
-      lazy val Space = chr(' ') | chr('\t') | EndOfLine
-      lazy val EndOfLine = chr('\r') ~ chr('\n') | chr('\n') | chr('\r')
-      lazy val EndOfFile = not(any)
+      )
+      lazy val Space: Parser[Any] = chr(' ') | chr('\t') | EndOfLine
+      lazy val EndOfLine: Parser[Any] = chr('\r') ~ chr('\n') | chr('\n') | chr('\r')
+      lazy val EndOfFile: Parser[Any] = not(any)
     }
   }
 

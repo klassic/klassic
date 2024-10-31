@@ -136,7 +136,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
   def newTypeVariable(): Type = {
     n += 1; TVariable("'a" + n)
   }
-  def newTypeVariable(name: String) = {
+  def newTypeVariable(name: String): TVariable = {
     m += 1; TVariable(name + m)
   }
 
