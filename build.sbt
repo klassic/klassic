@@ -6,7 +6,7 @@ name := "klassic"
 
 version := "0.1.0-snapshot"
 
-scalaVersion := "2.13.14"
+scalaVersion := "3.3.3"
 
 publishMavenStyle := true
 
@@ -35,7 +35,7 @@ resolvers ++= Seq(
 
 libraryDependencies ++= Seq(
   "com.github.kmizu" %% "scomb" % "0.9.0",
-  "com.github.scaruby" %% "scaruby" % "0.6",
+  "com.github.scaruby" %% "scaruby" % "0.6"
 ).map(_.cross(CrossVersion.for3Use2_13))
 
 libraryDependencies ++= Seq(

@@ -6,7 +6,7 @@ import scala.collection.mutable
  * @author Kota Mizushima
  */
 class RuntimeEnvironment(val parent:Option[RuntimeEnvironment]) {
-  val variables = mutable.Map[String, Value]()
+  val variables: mutable.Map[String,Value] = mutable.Map[String, Value]()
   def apply(key: String): Value = {
     variables.getOrElse(key, parent.map(_.apply(key)).getOrElse {
       throw new Exception("symbol'%s' not found".format(key))
