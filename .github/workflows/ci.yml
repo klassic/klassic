@@ -6,6 +6,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+    - name: Install sbt
+      uses: sbt/setup-sbt@v1
     - name: Checkout
       uses: actions/checkout@v3
     - name: Setup JDK
