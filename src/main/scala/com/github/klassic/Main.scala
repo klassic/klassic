@@ -11,18 +11,38 @@ import scala.collection.Iterator.continually
  */
 object Main {
   class REPL(val evaluator: Evaluator) {
+    private val history = scala.collection.mutable.ArrayBuffer.empty[String]
+    private var buffer = new StringBuilder
+    
     def start(): Unit = {
       var nextLineIsRequested = true
       while(nextLineIsRequested) {
-        Console.print("> ")
+        Console.print(if(buffer.isEmpty) "> " else "| ")
         Console.flush()
         val line = Console.in.readLine()
         Console.flush()
+        
         if(line.stripLineEnd == ":exit") {
           nextLineIsRequested = false
+        } else if(line.stripLineEnd == ":history") {
+          history.zipWithIndex.foreach { case (cmd, idx) =>
+            println(s"${idx + 1}: $cmd")
+          }
         } else {
-          val value: Value = evaluator.evaluateString(line)
-          println(s"value = ${value}")
+          buffer.append(line)
+          try {
+            val value = evaluator.evaluateString(buffer.toString)
+            println(s"value = ${value}")
+            history += buffer.toString
+            buffer.clear()
+          } catch {
+            case e: Exception =>
+              // If parsing fails, wait for more input
+              if(!e.getMessage.contains("unexpected end of input")) {
+                println(s"Error: ${e.getMessage}")
+                buffer.clear()
+              }
+          }
         }
       }
     }
@@ -58,4 +78,3 @@ object Main {
     }
   }
 }
-
