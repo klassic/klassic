@@ -6,7 +6,7 @@ name := "klassic"
 
 version := "0.1.0-snapshot"
 
-scalaVersion := "3.3.4"
+scalaVersion := "3.3.6"
 
 publishMavenStyle := true
 
