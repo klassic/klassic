@@ -11,6 +11,7 @@ class Evaluator extends (String => Value) {
   val placeholderDesugerer = new PlaceholderDesugerer
   val rewriter = new SyntaxRewriter
   val interpreter = new Interpreter
+  val vmInterpreter = new vm.VmInterpreter
   override final def apply(program: String): Value = {
     evaluateString(program)
   }
@@ -32,5 +33,14 @@ class Evaluator extends (String => Value) {
     val rewrittenProgram = rewriter.process(placeHolderIsDesugaredProgram, session)
     val typedProgram = typer.process(rewrittenProgram, session)
     interpreter.process(typedProgram, session)
+  }
+
+  def evaluateStringWithVm(program: String): Value = {
+    val session = new InteractiveSession
+    val parsedProgram = parser.process(program, session)
+    val placeHolderIsDesugaredProgram = placeholderDesugerer.process(parsedProgram, session)
+    val rewrittenProgram = rewriter.process(placeHolderIsDesugaredProgram, session)
+    val typedProgram = typer.process(rewrittenProgram, session)
+    vmInterpreter.process(typedProgram, session)
   }
 }
