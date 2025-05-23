@@ -5,6 +5,7 @@ import java.io.{BufferedReader, FileInputStream, InputStreamReader}
 import com.github.klassic.Type.{Row, TBoolean, TByte, TConstructor, TDouble, TDynamic, TError, TFloat, TFunction, TInt, TLong, TRecord, TRecordReference, TRowEmpty, TRowExtend, TScheme, TShort, TString, TUnit, TVariable}
 
 import scala.language.reflectiveCalls
+import scala.collection.mutable
 
 /**
  * @author Kota Mizushima
@@ -38,69 +39,70 @@ package object klassic {
 
   type Environment = Map[String, TScheme]
 
-  type Substitution = Map[TVariable, Type]
+  type Substitution = mutable.Map[TVariable, Type]
 
-  implicit class RichSubstitution(val self: Map[TVariable, Type]) extends AnyVal {
-    def lookup(x: TVariable): Type = {
-      self.getOrElse(x, x)
+  def newEmptySubstitution(): Substitution = mutable.Map.empty[TVariable, Type]
+
+  def cloneSubstitution(s: Substitution): Substitution = s.clone()
+
+  def lookupSubstitution(sub: Substitution, x: TVariable): Type = sub.getOrElse(x, x)
+
+  def replaceInType(sub: Substitution, ty: Type): Type = ty match {
+    case tv@TVariable(a) =>
+      val u = lookupSubstitution(sub, tv)
+      if (ty == u) ty else replaceInType(sub, u)
+    case TFunction(t1, t2) =>
+      TFunction(t1.map{ t => replaceInType(sub, t)}, replaceInType(sub, t2))
+    case TRecordReference(name, ts) =>
+      TRecordReference(name, ts.map{ t => replaceInType(sub, t)})
+    case TRecord(ts, row) =>
+      TRecord(ts, replaceInType(sub, row))
+    case TRowEmpty =>
+      ty
+    case tr@TRowExtend(l, t, r) =>
+      TRowExtend(l, replaceInType(sub, t), replaceInType(sub, r))
+    case TInt =>
+      TInt
+    case TShort =>
+      TShort
+    case TByte =>
+      TByte
+    case TLong =>
+      TLong
+    case TFloat =>
+      TFloat
+    case TDouble =>
+      TDouble
+    case TBoolean =>
+      TBoolean
+    case TUnit =>
+      TUnit
+    case TString =>
+      TString
+    case TDynamic =>
+      TDynamic
+    case TError =>
+      TError
+    case TConstructor(name, args) => TConstructor(name, args.map{ arg => replaceInType(sub, arg)})
+  }
+
+  def applySubstitution(sub: Substitution, env: Environment): Environment = {
+    env.map { case (x, ts) =>
+      x -> TScheme(typeVariables(ts), replaceInType(sub, ts.stype))
     }
+  }
 
-    def replace(ty: Type): Type = ty match {
-      case tv@TVariable(a) =>
-        val u = lookup(tv)
-        if (ty == u) ty else replace(u)
-      case TFunction(t1, t2) =>
-        TFunction(t1.map{ t => replace(t)}, replace(t2))
-      case TRecordReference(name, ts) =>
-        TRecordReference(name, ts.map{ t => replace(t)})
-      case TRecord(ts, row) =>
-        TRecord(ts, replace(row))
-      case TRowEmpty =>
-        ty
-      case tr@TRowExtend(l, t, r) =>
-        TRowExtend(l, replace(t), replace(r))
-      case TInt =>
-        TInt
-      case TShort =>
-        TShort
-      case TByte =>
-        TByte
-      case TLong =>
-        TLong
-      case TFloat =>
-        TFloat
-      case TDouble =>
-        TDouble
-      case TBoolean =>
-        TBoolean
-      case TUnit =>
-        TUnit
-      case TString =>
-        TString
-      case TDynamic =>
-        TDynamic
-      case TError =>
-        TError
-      case TConstructor(name, args) => TConstructor(name, args.map{ arg => replace(arg)})
-    }
+  def extendSubstitution(sub: Substitution, tv: TVariable, td: Type): Unit = {
+    sub(tv) = td
+  }
 
-    def apply(env: Environment): Environment = {
-      env.map { case (x, ts) =>
-        x -> TScheme(typeVariables(ts), replace(ts.stype))
-      }
-    }
+  def removeSubstitution(sub: Substitution, tv: TVariable): Unit = {
+    sub -= tv
+  }
 
-    def extend(tv: TVariable, td: Type): Substitution = {
-      self + (tv -> td)
-    }
-
-    def remove(tv: TVariable): Substitution = self - tv
-
-    def union(that: Substitution): Substitution = {
-      val s1 = self
-      val s2 = that
-      s2.view.mapValues{t => s1.replace(t)}.toMap ++ s1
-    }
+  def unionSubstitutions(target: Substitution, source: Substitution): Unit = {
+    val sourceTransformed = source.map { case (k, v) => k -> replaceInType(target, v) }
+    sourceTransformed.foreach { case (k, v) => target.getOrElseUpdate(k, v) }
   }
 
   def typeVariables(r: Row): List[TVariable] = r match {
