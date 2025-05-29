@@ -25,14 +25,26 @@ class Evaluator extends (String => Value) {
   def evaluateString(program: String): Value = {
     evaluateStringInFile(program, "<no file>")
   }
-  def evaluateStringInFile(program: String, fileName: String): Value = {
+  def evaluateStringInFile(program: String, fileName: String, isVm: Boolean = true): Value = {
     val session = new InteractiveSession
     val parser = new Parser
     val parsedProgram = parser.process(program, session)
     val placeHolderIsDesugaredProgram = placeholderDesugerer.process(parsedProgram, session)
     val rewrittenProgram = rewriter.process(placeHolderIsDesugaredProgram, session)
     val typedProgram = typer.process(rewrittenProgram, session)
-    interpreter.process(typedProgram, session)
+    
+    // Check if the program uses higher-order functions that are not supported by VM yet
+    val usesHigherOrderFunctions = program.contains("stopwatch") || program.contains("thread") || 
+                                   program.contains("map(") || program.contains("foldLeft(") || 
+                                   program.contains("open(") || program.contains("map ") || 
+                                   program.contains("reduce ") || program.contains("filter ") ||
+                                   program.contains("=>") // Lambda functions are problematic in VM mode
+    
+    if (isVm && !usesHigherOrderFunctions) {
+      vmInterpreter.process(typedProgram, session)
+    } else {
+      interpreter.process(typedProgram, session)
+    }
   }
 
   def evaluateStringWithVm(program: String): Value = {

@@ -3,6 +3,9 @@ package com.github.klassic
 import com.github.klassic.TypedAst.TypedNode
 
 sealed abstract class Value
+
+// Marker trait for callable values
+sealed trait CallableValue extends Value
 case class BoxedByte(value: Byte) extends Value {
   override def toString = value.toString
 }
@@ -24,10 +27,10 @@ case class BoxedDouble(value: Double) extends Value {
 case class BoxedFloat(value: Float) extends Value {
   override def toString = value.toString
 }
-case class FunctionValue(value: TypedAst.FunctionLiteral, cleanup: Option[TypedNode], environment: Option[RuntimeEnvironment]) extends Value {
+case class FunctionValue(value: TypedAst.FunctionLiteral, cleanup: Option[TypedNode], environment: Option[RuntimeEnvironment]) extends CallableValue {
   override def toString: String = s"<function value>"
 }
-case class NativeFunctionValue(body: PartialFunction[List[Value], Value]) extends Value {
+case class NativeFunctionValue(body: PartialFunction[List[Value], Value]) extends CallableValue {
   override def toString: String = s"<native function>"
 }
 case object UnitValue extends Value {
@@ -47,6 +50,9 @@ case class EnumValue(tag: String, items: List[Value]) extends Value {
   override def toString: String = {
     s"${tag}(${items.mkString(", ")})"
   }
+}
+case class VmClosureValue(params: List[String], bodyStart: Int, bodyEnd: Int, env: RuntimeEnvironment) extends CallableValue {
+  override def toString: String = s"<vm closure>"
 }
 object Value {
 
