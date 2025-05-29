@@ -151,72 +151,85 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
     TScheme(typeVariables(t) diff typeVariables(environment), t)
   }
 
-  def unify(t: Type, u: Type, s: Substitution): Substitution = (s.replace(t), s.replace(u)) match {
-    case (TVariable(a), TVariable(b)) if a == b =>
-      s
-    case (TVariable(a), _) if !(typeVariables(u) contains a) =>
-      s.extend(TVariable(a), u)
-    case (_, TVariable(a)) =>
-      unify(u, t, s)
-    case (TInt, TInt) =>
-      s
-    case (TShort, TShort) =>
-      s
-    case (TByte, TByte) =>
-      s
-    case (TLong, TLong) =>
-      s
-    case (TFloat, TFloat) =>
-      s
-    case (TDouble, TDouble) =>
-      s
-    case (TBoolean, TBoolean) =>
-      s
-    case (TString, TString) =>
-      s
-    case (TString, TDynamic) =>
-      s
-    case (TDynamic, TString) =>
-      s
-    case (TUnit, TUnit) =>
-      s
-    case (TDynamic, TDynamic) =>
-      s
-    case (TRecord(ts1, row1), TRecord(ts2, row2)) =>
-      val s0 = (ts1 zip ts2).foldLeft(s){ case (s, (t1, t2)) => unify(t1, t2, s)}
-      unify(row1, row2, s0)
-    case (TRowEmpty, TRowEmpty) => s
-    case (TRowExtend(label1, type1, rowTail1), row2@TRowExtend(_, _, _)) =>
-      val (type2, rowTail2, theta1) = rewriteRow(row2, label1, s)
-      toList(rowTail1)._2 match {
-        case Some(tv) if theta1.contains(tv) => typeError(current.location, "recursive row type")
-        case _ =>
-          val theta2: Substitution = unify(theta1.replace(type1), theta1.replace(type2), theta1)
-          val s2 = theta2 union theta1
-          val theta3 = unify(s2.replace(rowTail1), s2.replace(rowTail2), s2)
-          theta3 union s2
+  def unify(t: Type, u: Type, s: Substitution): Substitution = {
+    var current_s = s
+    var worklist: List[(Type, Type)] = List((current_s.replace(t), current_s.replace(u)))
+
+    while(worklist.nonEmpty) {
+      worklist match {
+        case (TInt, TInt) :: rest =>
+          worklist = rest
+        case (TShort, TShort) :: rest =>
+          worklist = rest
+        case (TByte, TByte) :: rest =>
+          worklist = rest
+        case (TLong, TLong) :: rest =>
+          worklist = rest
+        case (TFloat, TFloat) :: rest =>
+          worklist = rest
+        case (TDouble, TDouble) :: rest =>
+          worklist = rest
+        case (TBoolean, TBoolean) :: rest =>
+          worklist = rest
+        case (TString, TString) :: rest =>
+          worklist = rest
+        case (TString, TDynamic) :: rest =>
+          worklist = rest
+        case (TDynamic, TString) :: rest =>
+          worklist = rest
+        case (TUnit, TUnit) :: rest =>
+          worklist = rest
+        case (TDynamic, TDynamic) :: rest =>
+          worklist = rest
+        case (TVariable(a), TVariable(b)) :: rest if a == b =>
+          worklist = rest
+        case (TVariable(a), other) :: rest if !(typeVariables(other) contains a) =>
+          current_s = current_s.extend(TVariable(a), other)
+          worklist = rest.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (other, TVariable(a)) :: rest =>
+          worklist = ((TVariable(a), other) :: rest).map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (TRecord(ts1, row1), TRecord(ts2, row2)) :: rest =>
+          val next_worklist = (ts1 zip ts2).map{ case (t1, t2) => (t1, t2)} ::: ((row1, row2) :: rest)
+          worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (TRowEmpty, TRowEmpty) :: rest =>
+          worklist = rest
+        case (TRowExtend(label1, type1, rowTail1), row2@TRowExtend(_, _, _)) :: rest =>
+          val (type2, rowTail2, theta1) = rewriteRow(row2, label1, current_s)
+          toList(rowTail1)._2 match {
+            case Some(tv) if theta1.contains(tv) => typeError(current.location, "recursive row type")
+            case _ =>
+              val theta2: Substitution = unify(theta1.replace(type1), theta1.replace(type2), theta1)
+              val s2 = theta2 union theta1
+              val theta3 = unify(s2.replace(rowTail1), s2.replace(rowTail2), s2)
+              current_s = theta3 union s2
+          }
+          worklist = rest.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (r1@TRecordReference(t1, t2), r2@TRecordReference(u1, u2)) :: rest if t1 == u1 =>
+          if(t2.length != u2.length) {
+            typeError(current.location, s"type constructor arity mismatch: ${r1} != ${r2}")
+          }
+          val next_worklist = (t2 zip u2).map{ case (t, u) => (t, u)} ::: rest
+          worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (TRecordReference(name, ts), record2@TRecord(us, _)) :: rest =>
+          if(ts.length != us.length) {
+            typeError(current.location, s"type constructor arity mismatch: ${ts.length} != ${us.length}")
+          }
+          val record1 = recordEnvironment(name)
+          worklist = ((record1, record2) :: rest).map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (r1@TRecord(_, _), r2@TRecordReference(_, _)) :: rest =>
+          worklist = ((r2, r1) :: rest).map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (TFunction(t1, t2), TFunction(u1, u2)) :: rest if t1.size == u1.size =>
+          val next_worklist = (t1 zip u1).map{ case (t1, u1) => (t1, u1)} ::: ((t2, u2) :: rest)
+          worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (TConstructor(k1, ts), TConstructor(k2, us)) :: rest if k1 == k2 =>
+          val next_worklist = (ts zip us).map{ case (t, u) => (t, u)} ::: rest
+          worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (t, u) :: _ =>
+          typeError(current.location, s"cannot unify ${current_s.replace(t)} with ${current_s.replace(u)}")
+        case Nil => // This case should not be reached, but to exhaustively match
       }
-    case (r1@TRecordReference(t1, t2), r2@TRecordReference(u1, u2)) if t1 == u1 =>
-      if(t2.length != u2.length) {
-        typeError(current.location, s"type constructor arity mismatch: ${r1} != ${r2}")
-      }
-      (t2 zip u2).foldLeft(s) { case (s, (t, u)) =>
-        unify(t, u, s)
-      }
-    case (TRecordReference(name, ts), record2@TRecord(us, _)) =>
-      if(ts.length != us.length) {
-        typeError(current.location, s"type constructor arity mismatch: ${ts.length} != ${us.length}")
-      }
-      val record1 = recordEnvironment(name)
-      unify(record1, record2, s)
-    case (r1@TRecord(_, _), r2@TRecordReference(_, _)) =>
-      unify(r2, r1, s)
-    case (TFunction(t1, t2), TFunction(u1, u2)) if t1.size == u1.size =>
-      unify(t2, u2, (t1 zip u1).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)})
-    case (TConstructor(k1, ts), TConstructor(k2, us)) if k1 == k2 =>
-      (ts zip us).foldLeft(s){ case (s, (t, u)) => unify(t, u, s)}
-    case _ =>
-      typeError(current.location, s"cannot unify ${s.replace(t)} with ${s.replace(u)}")
+    }
+    current_s
   }
 
   def toRow(bindings: List[(String, Type)]): Row = bindings match {
