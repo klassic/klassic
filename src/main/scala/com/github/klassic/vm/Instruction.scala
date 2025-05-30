@@ -6,6 +6,7 @@ sealed trait Instruction
 case class Push(value: Value) extends Instruction
 case class Load(name: String) extends Instruction
 case class Store(name: String) extends Instruction
+case class Assign(name: String) extends Instruction
 case object Add extends Instruction
 case object Sub extends Instruction
 case object Mul extends Instruction

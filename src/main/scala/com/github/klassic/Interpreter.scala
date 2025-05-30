@@ -23,6 +23,22 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
     throw InterpreterException(message)
   }
 
+  // Helper method to execute VM closures with arguments
+  private def executeVmClosure(closure: VmClosureValue, args: List[Value]): Value = {
+    val VmClosureValue(params, bodyStart, bodyEnd, closureEnv, instructions) = closure
+    val virtualMachine = new vm.VirtualMachine(interpreter, BuiltinModuleEnvironment, BuiltinRecordEnvironment)
+    val newEnv = new RuntimeEnvironment(Some(closureEnv))
+    
+    // Bind arguments to parameters
+    params.zip(args).foreach { case (param, arg) =>
+      newEnv.update(param, arg)
+    }
+    
+    // Execute the closure's instructions range
+    val closureCode = instructions.slice(bodyStart, bodyEnd + 1)
+    virtualMachine.run(closureCode, newEnv)
+  }
+
   def findMethod(self: AnyRef, name: String, params: Array[Value]): MethodSearchResult = {
     val selfClass = self.getClass
     val nameMatchedMethods = selfClass.getMethods.filter {
@@ -128,8 +144,12 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
             ()
           }).start()
           UnitValue
-        case VmClosureValue(_, _, _, _) =>
-          throw new RuntimeException("VM closures cannot be executed in native functions yet")
+        case closure: VmClosureValue =>
+          new Thread({() =>
+            executeVmClosure(closure, List())
+            ()
+          }).start()
+          UnitValue
         case _ =>
           throw new RuntimeException("unexpected callable value type")
       }
@@ -153,8 +173,11 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           interpreter.evaluate(TypedAst.FunctionCall(TDynamic, NoLocation, value, List()), env)
           val end = System.currentTimeMillis()
           BoxedInt((end - start).toInt)
-        case VmClosureValue(_, _, _, _) =>
-          throw new RuntimeException("VM closures cannot be executed in native functions yet")
+        case closure: VmClosureValue =>
+          val start = System.currentTimeMillis()
+          executeVmClosure(closure, List())
+          val end = System.currentTimeMillis()
+          BoxedInt((end - start).toInt)
         case _ =>
           throw new RuntimeException("unexpected callable value type")
       }
@@ -177,16 +200,14 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
             i += 1
           }
           ObjectValue(newList)
-        case List(fun: VmClosureValue) =>
-          // For VM closures, create a special value that the VM will handle
-          // This is a temporary workaround
+        case List(closure: VmClosureValue) =>
           val newList = new java.util.ArrayList[Any]
           var i = 0
           while(i < list.size()) {
-            // We can't execute the VM closure here, so we'll need VM support
-            // For now, just throw a more descriptive error
-            throw new RuntimeException(s"VM closures in native functions like 'map' are not yet supported. " +
-              s"This requires VM execution context to be available in native functions.")
+            val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
+            val result: Value = executeVmClosure(closure, List(param))
+            newList.add(Value.fromKlassic(result))
+            i += 1
           }
           ObjectValue(newList)
       }
@@ -250,8 +271,15 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
                 i += 1
               }
               result
-            case VmClosureValue(_, _, _, _) =>
-              throw new RuntimeException("VM closures cannot be executed in native functions yet")
+            case closure: VmClosureValue =>
+              var i = 0
+              var result: Value = init
+              while(i < list.size()) {
+                val element = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
+                result = executeVmClosure(closure, List(result, element))
+                i += 1
+              }
+              result
             case _ =>
               throw new RuntimeException("unexpected callable value type")
           }
@@ -336,8 +364,16 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
                   i += 1
                 }
                 ObjectValue(newList)
-              case VmClosureValue(_, _, _, _) =>
-                throw new RuntimeException("VM closures cannot be executed in native functions yet")
+              case closure: VmClosureValue =>
+                val newList = new java.util.ArrayList[Any]
+                var i = 0
+                while(i < list.size()) {
+                  val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
+                  val result: Value = executeVmClosure(closure, List(param))
+                  newList.add(Value.fromKlassic(result))
+                  i += 1
+                }
+                ObjectValue(newList)
               case _ =>
                 throw new RuntimeException("unexpected callable value type")
             }
@@ -357,8 +393,16 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
                   i += 1
                 }
                 result
-              case VmClosureValue(_, _, _, _) =>
-                throw new RuntimeException("VM closures cannot be executed in native functions yet")
+              case closure: VmClosureValue =>
+                val newList = new java.util.ArrayList[Any]
+                var i = 0
+                while(i < list.size()) {
+                  val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
+                  val result: Value = executeVmClosure(closure, List(param))
+                  newList.add(Value.fromKlassic(result))
+                  i += 1
+                }
+                ObjectValue(newList)
               case _ =>
                 throw new RuntimeException("unexpected callable value type")
             }
@@ -381,8 +425,14 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
               } finally {
                 reader.close()
               }
-            case VmClosureValue(_, _, _, _) =>
-              throw new RuntimeException("VM closures cannot be executed in native functions yet")
+            case closure: VmClosureValue =>
+              val reader = Files.newBufferedReader(Path.of(path))
+              try {
+                val inStream = RecordValue("InStream", List("core" -> ObjectValue(reader)))
+                executeVmClosure(closure, List(inStream))
+              } finally {
+                reader.close()
+              }
             case _ =>
               throw new RuntimeException("unexpected callable value type")
           }

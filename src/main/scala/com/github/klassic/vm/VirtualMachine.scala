@@ -31,6 +31,10 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
           currentEnv.update(name, stack.pop())
           pc += 1
           
+        case Assign(name) =>
+          currentEnv.set(name, stack.pop())
+          pc += 1
+          
         case Add =>
           val b = stack.pop()
           val a = stack.pop()
@@ -269,14 +273,14 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
           pc += 1
           
         case MakeClosure(params, bodyStart, bodyEnd) =>
-          stack.push(VmClosureValue(params, bodyStart, bodyEnd, currentEnv))
+          stack.push(VmClosureValue(params, bodyStart, bodyEnd, currentEnv, code))
           pc += 1
           
         case Call(arity) =>
           val func = stack.pop()
           val args = (0 until arity).map(_ => stack.pop()).reverse
           func match {
-            case VmClosureValue(params, bodyStart, bodyEnd, closureEnv) =>
+            case VmClosureValue(params, bodyStart, bodyEnd, closureEnv, _) =>
               callStack.push((pc + 1, currentEnv))
               val newEnv = new RuntimeEnvironment(Some(closureEnv))
               params.zip(args).foreach { case (param, arg) =>

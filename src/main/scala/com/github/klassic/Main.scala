@@ -71,6 +71,8 @@ object Main {
     args match {
       case Array(fileName) if fileName.endsWith("kl") =>
         Some("-f"-> fileName)
+      case Array("-f", fileName) =>
+        Some("-f" -> fileName)
       case Array("-e", line) =>
         Some("-e" -> line)
       case otherwise =>

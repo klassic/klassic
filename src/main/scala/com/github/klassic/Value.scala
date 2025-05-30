@@ -51,7 +51,7 @@ case class EnumValue(tag: String, items: List[Value]) extends Value {
     s"${tag}(${items.mkString(", ")})"
   }
 }
-case class VmClosureValue(params: List[String], bodyStart: Int, bodyEnd: Int, env: RuntimeEnvironment) extends CallableValue {
+case class VmClosureValue(params: List[String], bodyStart: Int, bodyEnd: Int, env: RuntimeEnvironment, instructions: Vector[vm.Instruction]) extends CallableValue {
   override def toString: String = s"<vm closure>"
 }
 object Value {

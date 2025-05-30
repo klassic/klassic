@@ -33,14 +33,8 @@ class Evaluator extends (String => Value) {
     val rewrittenProgram = rewriter.process(placeHolderIsDesugaredProgram, session)
     val typedProgram = typer.process(rewrittenProgram, session)
     
-    // Check if the program uses higher-order functions that are not supported by VM yet
-    val usesHigherOrderFunctions = program.contains("stopwatch") || program.contains("thread") || 
-                                   program.contains("map(") || program.contains("foldLeft(") || 
-                                   program.contains("open(") || program.contains("map ") || 
-                                   program.contains("reduce ") || program.contains("filter ") ||
-                                   program.contains("=>") // Lambda functions are problematic in VM mode
-    
-    if (isVm && !usesHigherOrderFunctions) {
+    // VM mode now supports all features including lambdas and higher-order functions
+    if (isVm) {
       vmInterpreter.process(typedProgram, session)
     } else {
       interpreter.process(typedProgram, session)

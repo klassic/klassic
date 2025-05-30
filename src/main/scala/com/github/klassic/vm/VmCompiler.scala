@@ -29,7 +29,7 @@ class VmCompiler {
     case Selector(_, _, module, name) => code += LoadModule(module, name)
     case Assignment(_, _, name, value) =>
       compileNode(value, code)
-      code += Store(name)
+      code += Assign(name)
       code += Push(UnitValue)
     case LetDeclaration(_, _, name, _, value, body, _) =>
       compileNode(value, code)
