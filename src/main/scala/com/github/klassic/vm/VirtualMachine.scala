@@ -4,7 +4,7 @@ import scala.collection.mutable
 import com.github.klassic._
 import scala.annotation.switch
 
-class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, recordEnv: RecordEnvironment) {
+class VirtualMachine(moduleEnv: ModuleEnvironment, recordEnv: RecordEnvironment) {
   // Pre-allocate stack for better performance
   private val INITIAL_STACK_SIZE = 1024
   private val stack = mutable.ArrayBuffer[Value]()
@@ -164,7 +164,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
   
   // Method/Constructor resolution
   private def callMethod(obj: AnyRef, name: String, args: Array[Value]): Value = {
-    interpreter.findMethod(obj, name, args) match {
+    BuiltinEnvironments.findMethod(obj, name, args) match {
       case UnboxedVersionMethodFound(m) =>
         val actualParams = args.map(Value.fromKlassic)
         Value.toKlassic(m.invoke(obj, actualParams: _*))
@@ -177,7 +177,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
   }
   
   private def newObject(className: String, args: Array[Value]): Value = {
-    interpreter.findConstructor(Class.forName(className), args) match {
+    BuiltinEnvironments.findConstructor(Class.forName(className), args) match {
       case UnboxedVersionConstructorFound(constructor) =>
         val actualParams = args.map(Value.fromKlassic)
         Value.toKlassic(constructor.newInstance(actualParams: _*).asInstanceOf[AnyRef])

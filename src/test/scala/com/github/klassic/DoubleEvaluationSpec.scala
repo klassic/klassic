@@ -22,8 +22,7 @@ class DoubleEvaluationSpec extends AnyFunSpec with Matchers {
           |// Counter should be 1, not 2
           |counter
         """.stripMargin, 
-        "test.kl",
-        isVm = false  // Test tree-walking interpreter
+        "test.kl"
       )
       result shouldBe BoxedInt(1)
     }

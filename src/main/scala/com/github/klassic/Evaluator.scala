@@ -10,7 +10,6 @@ class Evaluator extends (String => Value) {
   val typer = new Typer
   val placeholderDesugerer = new PlaceholderDesugerer
   val rewriter = new SyntaxRewriter
-  val interpreter = new Interpreter
   val vmInterpreter = new vm.VmInterpreter
   override final def apply(program: String): Value = {
     evaluateString(program)
@@ -25,7 +24,7 @@ class Evaluator extends (String => Value) {
   def evaluateString(program: String): Value = {
     evaluateStringInFile(program, "<no file>")
   }
-  def evaluateStringInFile(program: String, fileName: String, isVm: Boolean = true): Value = {
+  def evaluateStringInFile(program: String, fileName: String): Value = {
     val session = new InteractiveSession
     val parser = new Parser
     val parsedProgram = parser.process(program, session)
@@ -33,12 +32,7 @@ class Evaluator extends (String => Value) {
     val rewrittenProgram = rewriter.process(placeHolderIsDesugaredProgram, session)
     val typedProgram = typer.process(rewrittenProgram, session)
     
-    // VM mode now supports all features including lambdas and higher-order functions
-    if (isVm) {
-      vmInterpreter.process(typedProgram, session)
-    } else {
-      interpreter.process(typedProgram, session)
-    }
+    vmInterpreter.process(typedProgram, session)
   }
 
   def evaluateStringWithVm(program: String): Value = {

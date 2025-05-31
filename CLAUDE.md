@@ -44,13 +44,12 @@ The language implementation follows a standard compiler pipeline:
 2. **PlaceholderDesugerer** (`PlaceholderDesugerer.scala`) - Desugars placeholder syntax
 3. **SyntaxRewriter** (`SyntaxRewriter.scala`) - Rewrites syntax (e.g., foreach to while)
 4. **Typer** (`Typer.scala`) - Type inference using Hindley-Milner with row polymorphism
-5. **Interpreter** (`Interpreter.scala`) - Tree-walking interpreter
-6. **VmInterpreter** (`vm/VmInterpreter.scala`) - Optional VM-based interpreter
+6. **VmInterpreter** (`vm/VmInterpreter.scala`) - VM-based interpreter
 
 ### Key Components
 
 - **Type System**: Based on Hindley-Milner with extensions for row polymorphism and type constructors
-- **Built-in Functions**: Defined in `Interpreter.scala` (BuiltinEnvironment)
+- **Built-in Functions**: Defined in BuiltinEnvironment
 - **Module System**: Supports modules like List, Map, Set, FileInput, GPIO
 - **Java Interop**: Automatic boxing/unboxing and method resolution via reflection
 
