@@ -25,6 +25,9 @@ class VirtualMachine(moduleEnv: ModuleEnvironment, recordEnv: RecordEnvironment)
   }
   
   private def pop(): Value = {
+    if (stackPtr <= 0) {
+      throw new RuntimeException(s"Stack underflow: attempting to pop from empty stack (stackPtr=$stackPtr)")
+    }
     stackPtr -= 1
     stack(stackPtr)
   }
@@ -480,13 +483,15 @@ class VirtualMachine(moduleEnv: ModuleEnvironment, recordEnv: RecordEnvironment)
           }
           
         case Return =>
-          result = if (stackPtr > 0) pop() else UnitValue
           if (callStack.nonEmpty) {
+            result = if (stackPtr > 0) pop() else UnitValue
             val (returnPc, prevEnv) = callStack.remove(callStack.length - 1)
             pc = returnPc
             currentEnv = prevEnv
             push(result)
           } else {
+            // Top-level return - get result from stack and stop execution
+            result = if (stackPtr > 0) pop() else UnitValue
             running = false
           }
           

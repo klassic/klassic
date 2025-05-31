@@ -1,5 +1,7 @@
 import sbt.librarymanagement.Developer
 
+enablePlugins(JmhPlugin)
+
 organization := "com.github.klassic"
 
 name := "klassic"
