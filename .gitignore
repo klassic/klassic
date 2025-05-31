@@ -1,6 +1,7 @@
 project/project
 project/metals.sbt
 project/target
+.scala-build/
 .bsp/
 target
 tmp
