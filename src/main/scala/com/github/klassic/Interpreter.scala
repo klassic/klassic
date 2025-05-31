@@ -27,7 +27,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
   private def executeVmClosure(closure: VmClosureValue, args: List[Value]): Value = {
     val VmClosureValue(params, bodyStart, bodyEnd, closureEnv, instructions) = closure
     val virtualMachine = new vm.VirtualMachine(interpreter, BuiltinModuleEnvironment, BuiltinRecordEnvironment)
-    val newEnv = new RuntimeEnvironment(Some(closureEnv))
+    val newEnv = RuntimeEnvironment.pooled(Some(closureEnv))
     
     // Bind arguments to parameters
     params.zip(args).foreach { case (param, arg) =>
@@ -108,7 +108,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
     }
 
     define("matches") { case List(ObjectValue(s: String), ObjectValue(regex: String)) =>
-      BoxedBoolean(s.matches(regex))
+      Value.boxBoolean(s.matches(regex))
     }
 
     define("sqrt") { case List(BoxedDouble(value)) =>
@@ -139,7 +139,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
       fun match {
         case FunctionValue(value, _, environment) =>
           new Thread({() =>
-            val env = new RuntimeEnvironment(environment)
+            val env = RuntimeEnvironment.pooled(environment)
             interpreter.evaluate(TypedAst.FunctionCall(TDynamic, NoLocation, value, Nil), env)
             ()
           }).start()
@@ -168,7 +168,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
     define("stopwatch") { case List(fun: CallableValue) =>
       fun match {
         case FunctionValue(value, _, environment) =>
-          val env = new RuntimeEnvironment(environment)
+          val env = RuntimeEnvironment.pooled(environment)
           val start = System.currentTimeMillis()
           interpreter.evaluate(TypedAst.FunctionCall(TDynamic, NoLocation, value, List()), env)
           val end = System.currentTimeMillis()
@@ -191,7 +191,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
       NativeFunctionValue{
         case List(fun: FunctionValue) =>
           val newList = new java.util.ArrayList[Any]
-          val env = new RuntimeEnvironment(fun.environment)
+          val env = RuntimeEnvironment.pooled(fun.environment)
           var i = 0
           while(i < list.size()) {
             val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
@@ -232,13 +232,9 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
     }
     define("cons") { case List(value: Value) =>
       NativeFunctionValue{ case List(ObjectValue(list: java.util.List[_])) =>
-        val newList = new java.util.ArrayList[Any]
-        var i = 0
+        val newList = new java.util.ArrayList[Any](list.size() + 1)
         newList.add(Value.fromKlassic(value))
-        while(i < list.size()) {
-          newList.add(list.get(i))
-          i += 1
-        }
+        newList.addAll(list)
         Value.toKlassic(newList)
       }
     }
@@ -246,7 +242,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
       BoxedInt(list.size())
     }
     define("isEmpty") { case List(ObjectValue(list: java.util.List[_])) =>
-      BoxedBoolean(list.isEmpty)
+      Value.boxBoolean(list.isEmpty)
     }
     define("ToDo") { case Nil =>
       throw NotImplementedError("not implemented yet")
@@ -262,7 +258,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
         NativeFunctionValue { case List(fun: CallableValue) =>
           fun match {
             case FunctionValue(value, _, environment) =>
-              val env = new RuntimeEnvironment(environment)
+              val env = RuntimeEnvironment.pooled(environment)
               var i = 0
               var result: Value = init
               while(i < list.size()) {
@@ -323,22 +319,15 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
       }
       define("cons") { case List(value: Value) =>
         NativeFunctionValue { case List(ObjectValue(list: java.util.List[_])) =>
-          val newList = new java.util.ArrayList[Any]
-          var i = 0
+          val newList = new java.util.ArrayList[Any](list.size() + 1)
           newList.add(Value.fromKlassic(value))
-          while (i < list.size()) {
-            newList.add(list.get(i))
-            i += 1
-          }
+          newList.addAll(list)
           Value.toKlassic(newList)
         }
       }
       define("remove") { case List(ObjectValue(self: java.util.List[_])) =>
         NativeFunctionValue{ case List(a: Value) =>
-          val newList = new java.util.ArrayList[Any]
-          for(v <- self.asScala) {
-            newList.add(v)
-          }
+          val newList = new java.util.ArrayList[Any](self)
           newList.remove(Value.fromKlassic(a))
           ObjectValue(newList)
         }
@@ -347,7 +336,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
         BoxedInt(list.size())
       }
       define("isEmpty") { case List(ObjectValue(list: java.util.List[_])) =>
-        BoxedBoolean(list.isEmpty)
+        Value.boxBoolean(list.isEmpty)
       }
       define("map") { case List(ObjectValue(list: java.util.List[_])) =>
         NativeFunctionValue{
@@ -355,7 +344,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
             fun match {
               case FunctionValue(value, _, environment) =>
                 val newList = new java.util.ArrayList[Any]
-                val env = new RuntimeEnvironment(environment)
+                val env = RuntimeEnvironment.pooled(environment)
                 var i = 0
                 while(i < list.size()) {
                   val param: Value = Value.toKlassic(list.get(i).asInstanceOf[AnyRef])
@@ -384,7 +373,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           NativeFunctionValue { case List(fun: CallableValue) =>
             fun match {
               case FunctionValue(value, _, environment) =>
-                val env = new RuntimeEnvironment(environment)
+                val env = RuntimeEnvironment.pooled(environment)
                 var i = 0
                 var result: Value = init
                 while(i < list.size()) {
@@ -416,7 +405,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
         NativeFunctionValue { case List(fun: CallableValue) =>
           fun match {
             case FunctionValue(value, _, environment) =>
-              val env = new RuntimeEnvironment(environment)
+              val env = RuntimeEnvironment.pooled(environment)
               val reader = Files.newBufferedReader(Path.of(path))
               try {
                 val inStream = RecordValue("InStream", List("core" -> ObjectValue(reader)))
@@ -528,31 +517,28 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
         UnitValue
       }
       define("isHigh") { case List(ObjectValue(input:GpioPinDigitalInput)) =>
-        BoxedBoolean(input.isHigh)
+        Value.boxBoolean(input.isHigh)
       }
       define("isLow") { case List(ObjectValue(input:GpioPinDigitalInput)) =>
-        BoxedBoolean(input.isLow)
+        Value.boxBoolean(input.isLow)
       }
     }
     enter(MAP) {
       define("add") { case List(ObjectValue(self: java.util.Map[_, _])) =>
         NativeFunctionValue{ case List(a: Value, b: Value) =>
-          val newMap = new java.util.HashMap[Any, Any]()
-          for((k, v) <- self.asScala) {
-            newMap.put(k, v)
-          }
+          val newMap = new java.util.HashMap[Any, Any](self)
           newMap.put(Value.fromKlassic(a), Value.fromKlassic(b))
           ObjectValue(newMap)
         }
       }
       define("containsKey") { case List(ObjectValue(self: java.util.Map[_, _])) =>
         NativeFunctionValue{ case List(k: Value) =>
-          BoxedBoolean(self.containsKey(Value.fromKlassic(k)))
+          Value.boxBoolean(self.containsKey(Value.fromKlassic(k)))
         }
       }
       define("containsValue") { case List(ObjectValue(self: java.util.Map[_, _])) =>
         NativeFunctionValue{ case List(v: Value) =>
-          BoxedBoolean(self.containsValue(Value.fromKlassic(v)))
+          Value.boxBoolean(self.containsValue(Value.fromKlassic(v)))
         }
       }
       define("get") { case List(ObjectValue(self: java.util.Map[_, _])) =>
@@ -564,40 +550,34 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
         BoxedInt(self.size())
       }
       define("isEmpty") { case List(ObjectValue(map: java.util.Map[_, _])) =>
-        BoxedBoolean(map.isEmpty)
+        Value.boxBoolean(map.isEmpty)
       }
     }
     enter(SET) {
       define("add") { case List(ObjectValue(self: java.util.Set[_])) =>
         NativeFunctionValue{ case List(a: Value) =>
-          val newSet = new java.util.HashSet[Any]()
-          for(v <- self.asScala) {
-            newSet.add(v)
-          }
+          val newSet = new java.util.HashSet[Any](self)
           newSet.add(Value.fromKlassic(a))
           ObjectValue(newSet)
         }
       }
       define("remove") { case List(ObjectValue(self: java.util.Set[_])) =>
         NativeFunctionValue{ case List(a: Value) =>
-          val newSet = new java.util.HashSet[Any]()
-          for(v <- self.asScala) {
-            newSet.add(v)
-          }
+          val newSet = new java.util.HashSet[Any](self)
           newSet.remove(Value.fromKlassic(a))
           ObjectValue(newSet)
         }
       }
       define("contains") { case List(ObjectValue(self: java.util.Set[_])) =>
         NativeFunctionValue { case List(a: Value) =>
-          BoxedBoolean(self.contains(Value.fromKlassic(a)))
+          Value.boxBoolean(self.contains(Value.fromKlassic(a)))
         }
       }
       define("size") { case List(ObjectValue(self: java.util.Set[_])) =>
         BoxedInt(self.size())
       }
       define("isEmpty") { case List(ObjectValue(self: java.util.Set[_])) =>
-        BoxedBoolean(self.isEmpty)
+        Value.boxBoolean(self.isEmpty)
       }
     }
   }
@@ -631,7 +611,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
     case TypedAst.FunctionCall(type_, location, function, params) =>
       evaluate(function, env) match {
         case FunctionValue(TypedAst.FunctionLiteral(type_, location, fparams, optionalType, proc), cleanup, cenv) =>
-          val local = new RuntimeEnvironment(cenv)
+          val local = RuntimeEnvironment.pooled(cenv)
           (fparams zip params).foreach{ case (fp, ap) =>
             local(fp.name) = evaluate(ap, env)
           }
@@ -658,7 +638,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
     def evalRecursive(node: TypedNode): Value = {
       node match{
         case TypedAst.Block(type_, location, expressions) =>
-          val local = new RuntimeEnvironment(Some(env))
+          val local = RuntimeEnvironment.pooled(Some(env))
           expressions.foldLeft(UnitValue:Value){(result, x) => evaluate(x, local)}
         case TypedAst.WhileExpression(type_, location, cond, body) =>
           while(evalRecursive(cond) == BoxedBoolean(true)) {
@@ -674,72 +654,72 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
         case TypedAst.BinaryExpression(type_, location, Operator.AND2, lhs, rhs) =>
           evalRecursive(lhs) match {
             case BoxedBoolean(true) => evalRecursive(rhs)
-            case BoxedBoolean(false) => BoxedBoolean(false)
+            case BoxedBoolean(false) => Value.boxBoolean(false)
             case _ => reportError("type error")
           }
         case TypedAst.BinaryExpression(type_, location, Operator.BAR2, lhs, rhs) =>
           evalRecursive(lhs) match {
             case BoxedBoolean(false) => evalRecursive(rhs)
-            case BoxedBoolean(true) => BoxedBoolean(true)
+            case BoxedBoolean(true) => Value.boxBoolean(true)
             case _ => reportError("type error")
           }
         case TypedAst.BinaryExpression(type_, location, Operator.EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval == rval)
-            case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval == rval)
-            case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval == rval)
-            case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval == rval)
-            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedBoolean(lval == rval)
-            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval == rval)
-            case (BoxedBoolean(lval), BoxedBoolean(rval)) => BoxedBoolean(lval == rval)
-            case (BoxedBoolean(lval), ObjectValue(rval:java.lang.Boolean)) => BoxedBoolean(lval == rval.booleanValue())
-            case (ObjectValue(lval:java.lang.Boolean), BoxedBoolean(rval)) => BoxedBoolean(lval.booleanValue() == rval)
-            case (ObjectValue(lval), ObjectValue(rval)) => BoxedBoolean(lval == rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxBoolean(lval == rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => Value.boxBoolean(lval == rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => Value.boxBoolean(lval == rval)
+            case (BoxedByte(lval), BoxedByte(rval)) => Value.boxBoolean(lval == rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => Value.boxBoolean(lval == rval)
+            case (BoxedDouble(lval), BoxedDouble(rval)) => Value.boxBoolean(lval == rval)
+            case (BoxedBoolean(lval), BoxedBoolean(rval)) => Value.boxBoolean(lval == rval)
+            case (BoxedBoolean(lval), ObjectValue(rval:java.lang.Boolean)) => Value.boxBoolean(lval == rval.booleanValue())
+            case (ObjectValue(lval:java.lang.Boolean), BoxedBoolean(rval)) => Value.boxBoolean(lval.booleanValue() == rval)
+            case (ObjectValue(lval), ObjectValue(rval)) => Value.boxBoolean(lval == rval)
             case _ => reportError("comparation must be done between same types")
           }
         case TypedAst.BinaryExpression(type_, location, Operator.LESS_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval < rval)
-            case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval < rval)
-            case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval < rval)
-            case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval < rval)
-            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedBoolean(lval < rval)
-            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval < rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxBoolean(lval < rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => Value.boxBoolean(lval < rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => Value.boxBoolean(lval < rval)
+            case (BoxedByte(lval), BoxedByte(rval)) => Value.boxBoolean(lval < rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => Value.boxBoolean(lval < rval)
+            case (BoxedDouble(lval), BoxedDouble(rval)) => Value.boxBoolean(lval < rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case TypedAst.BinaryExpression(type_, location, Operator.GREATER_THAN, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval > rval)
-            case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval > rval)
-            case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval > rval)
-            case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval > rval)
-            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedBoolean(lval > rval)
-            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval > rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxBoolean(lval > rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => Value.boxBoolean(lval > rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => Value.boxBoolean(lval > rval)
+            case (BoxedByte(lval), BoxedByte(rval)) => Value.boxBoolean(lval > rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => Value.boxBoolean(lval > rval)
+            case (BoxedDouble(lval), BoxedDouble(rval)) => Value.boxBoolean(lval > rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case TypedAst.BinaryExpression(type_, location, Operator.LESS_OR_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval <= rval)
-            case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval <= rval)
-            case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval <= rval)
-            case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval <= rval)
-            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedBoolean(lval <= rval)
-            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval <= rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxBoolean(lval <= rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => Value.boxBoolean(lval <= rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => Value.boxBoolean(lval <= rval)
+            case (BoxedByte(lval), BoxedByte(rval)) => Value.boxBoolean(lval <= rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => Value.boxBoolean(lval <= rval)
+            case (BoxedDouble(lval), BoxedDouble(rval)) => Value.boxBoolean(lval <= rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case TypedAst.BinaryExpression(type_, location, Operator.GREATER_EQUAL, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedBoolean(lval >= rval)
-            case (BoxedLong(lval), BoxedLong(rval)) => BoxedBoolean(lval >= rval)
-            case (BoxedShort(lval), BoxedShort(rval)) => BoxedBoolean(lval >= rval)
-            case (BoxedByte(lval), BoxedByte(rval)) => BoxedBoolean(lval >= rval)
-            case (BoxedFloat(lval), BoxedFloat(rval)) => BoxedBoolean(lval >= rval)
-            case (BoxedDouble(lval), BoxedDouble(rval)) => BoxedBoolean(lval >= rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxBoolean(lval >= rval)
+            case (BoxedLong(lval), BoxedLong(rval)) => Value.boxBoolean(lval >= rval)
+            case (BoxedShort(lval), BoxedShort(rval)) => Value.boxBoolean(lval >= rval)
+            case (BoxedByte(lval), BoxedByte(rval)) => Value.boxBoolean(lval >= rval)
+            case (BoxedFloat(lval), BoxedFloat(rval)) => Value.boxBoolean(lval >= rval)
+            case (BoxedDouble(lval), BoxedDouble(rval)) => Value.boxBoolean(lval >= rval)
             case _ => reportError("comparation must be done between numeric types")
           }
         case TypedAst.BinaryExpression(type_, location, Operator.ADD, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval + rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxInt(lval + rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval + rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval + rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval + rval).toByte)
@@ -751,7 +731,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           }
         case TypedAst.BinaryExpression(type_, location, Operator.SUBTRACT, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval - rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxInt(lval - rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval - rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval - rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval - rval).toByte)
@@ -761,7 +741,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           }
         case TypedAst.BinaryExpression(type_, location, Operator.MULTIPLY, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match{
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval * rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxInt(lval * rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval * rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval * rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval * rval).toByte)
@@ -771,7 +751,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           }
         case TypedAst.BinaryExpression(type_, location, Operator.DIVIDE, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval / rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxInt(lval / rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval / rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval / rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval / rval).toByte)
@@ -781,7 +761,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           }
         case TypedAst.BinaryExpression(type_, location, Operator.AND, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval & rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxInt(lval & rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval & rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval & rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval & rval).toByte)
@@ -789,7 +769,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           }
         case TypedAst.BinaryExpression(type_, location, Operator.OR, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval | rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxInt(lval | rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval | rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval | rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval | rval).toByte)
@@ -797,7 +777,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           }
         case TypedAst.BinaryExpression(type_, location, Operator.XOR, left, right) =>
           (evalRecursive(left), evalRecursive(right)) match {
-            case (BoxedInt(lval), BoxedInt(rval)) => BoxedInt(lval ^ rval)
+            case (BoxedInt(lval), BoxedInt(rval)) => Value.boxInt(lval ^ rval)
             case (BoxedLong(lval), BoxedLong(rval)) => BoxedLong(lval ^ rval)
             case (BoxedShort(lval), BoxedShort(rval)) => BoxedShort((lval ^ rval).toShort)
             case (BoxedByte(lval), BoxedByte(rval)) => BoxedByte((lval ^ rval).toByte)
@@ -805,7 +785,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           }
         case TypedAst.MinusOp(type_, location, operand) =>
           evalRecursive(operand) match {
-            case BoxedInt(value) => BoxedInt(-value)
+            case BoxedInt(value) => Value.boxInt(-value)
             case BoxedLong(value) => BoxedLong(-value)
             case BoxedShort(value) => BoxedShort((-value).toShort)
             case BoxedByte(value) => BoxedByte((-value).toByte)
@@ -815,7 +795,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
           }
         case TypedAst.PlusOp(type_, location, operand) =>
           evalRecursive(operand) match {
-            case BoxedInt(value) => BoxedInt(value)
+            case BoxedInt(value) => Value.boxInt(value)
             case BoxedLong(value) => BoxedLong(value)
             case BoxedShort(value) => BoxedShort(value)
             case BoxedByte(value) => BoxedByte(value)
@@ -824,7 +804,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
             case _ => reportError("+ cannot be applied to non-integer value")
           }
         case TypedAst.IntNode(type_, location, value) =>
-          BoxedInt(value)
+          Value.boxInt(value)
         case TypedAst.StringNode(type_, location, value) =>
           ObjectValue(value)
         case TypedAst.LongNode(type_, location, value) =>
@@ -838,7 +818,7 @@ class Interpreter extends Processor[TypedAst.Program, Value, InteractiveSession]
         case TypedAst.FloatNode(type_, location, value) =>
           BoxedFloat(value)
         case TypedAst.BooleanNode(type_, location, value) =>
-          BoxedBoolean(value)
+          Value.boxBoolean(value)
         case TypedAst.UnitNode(type_, location) =>
           UnitValue
         case TypedAst.ListLiteral(type_, location, elements) =>

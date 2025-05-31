@@ -55,6 +55,35 @@ case class VmClosureValue(params: List[String], bodyStart: Int, bodyEnd: Int, en
   override def toString: String = s"<vm closure>"
 }
 object Value {
+  // Cache for commonly used integer values to reduce allocations
+  private val INT_CACHE_LOW = -128
+  private val INT_CACHE_HIGH = 127
+  private val intCache: Array[BoxedInt] = {
+    val cache = new Array[BoxedInt](INT_CACHE_HIGH - INT_CACHE_LOW + 1)
+    var i = INT_CACHE_LOW
+    while (i <= INT_CACHE_HIGH) {
+      cache(i - INT_CACHE_LOW) = new BoxedInt(i)
+      i += 1
+    }
+    cache
+  }
+  
+  // Cache for boolean values
+  private val TRUE = BoxedBoolean(true)
+  private val FALSE = BoxedBoolean(false)
+  
+  // Factory methods with caching
+  def boxInt(value: Int): BoxedInt = {
+    if (value >= INT_CACHE_LOW && value <= INT_CACHE_HIGH) {
+      intCache(value - INT_CACHE_LOW)
+    } else {
+      BoxedInt(value)
+    }
+  }
+  
+  def boxBoolean(value: Boolean): BoxedBoolean = {
+    if (value) TRUE else FALSE
+  }
 
   def classOfValue(value: Value): java.lang.Class[_]= value match {
     case BoxedBoolean(v) => classOf[Boolean]
@@ -98,11 +127,11 @@ object Value {
   }
 
   def toKlassic(value: AnyRef): Value = value match {
-    case v:java.lang.Boolean => BoxedBoolean(v.booleanValue())
+    case v:java.lang.Boolean => boxBoolean(v.booleanValue())
     case v:java.lang.Byte => BoxedByte(v.byteValue())
     case v:java.lang.Short => BoxedShort(v.shortValue())
-    case v:java.lang.Integer => BoxedInt(v.intValue())
-    case v:java.lang.Long => BoxedLong(v.intValue())
+    case v:java.lang.Integer => boxInt(v.intValue())
+    case v:java.lang.Long => BoxedLong(v.longValue())
     case v:java.lang.Float => BoxedFloat(v.floatValue())
     case v:java.lang.Double => BoxedDouble(v.doubleValue())
     case UnitValue => UnitValue

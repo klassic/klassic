@@ -32,7 +32,7 @@ class VmNativeFunctionSpec extends AnyFunSpec with Matchers {
       result shouldBe BoxedInt(1)
     }
 
-    ignore("should handle functions returning functions") {
+    it("should handle functions returning functions") {
       val result = evaluator.evaluateStringWithVm(
         """
           |val list = [1, 2, 3]
@@ -49,7 +49,7 @@ class VmNativeFunctionSpec extends AnyFunSpec with Matchers {
       }
     }
 
-    ignore("should handle curried native functions") {
+    it("should handle curried native functions") {
       val result = evaluator.evaluateStringWithVm(
         """
           |val list = [1, 2, 3]

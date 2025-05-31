@@ -5,8 +5,13 @@ import com.github.klassic._
 import scala.annotation.switch
 
 class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, recordEnv: RecordEnvironment) {
-  // Use ArrayBuffer for better performance than Stack
+  // Pre-allocate stack for better performance
+  private val INITIAL_STACK_SIZE = 1024
   private val stack = mutable.ArrayBuffer[Value]()
+  stack.sizeHint(INITIAL_STACK_SIZE)
+  // Pre-populate with null to avoid resize during execution
+  for (i <- 0 until INITIAL_STACK_SIZE) stack += null
+  
   private val callStack = mutable.ArrayBuffer[(Int, RuntimeEnvironment)]()
   private var stackPtr = 0
 
@@ -28,7 +33,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
   
   // Arithmetic operations
   private def performAdd(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedInt(x + y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxInt(x + y)
     case (BoxedLong(x), BoxedLong(y)) => BoxedLong(x + y)
     case (BoxedShort(x), BoxedShort(y)) => BoxedShort((x + y).toShort)
     case (BoxedByte(x), BoxedByte(y)) => BoxedByte((x + y).toByte)
@@ -40,7 +45,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
   }
   
   private def performSub(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedInt(x - y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxInt(x - y)
     case (BoxedLong(x), BoxedLong(y)) => BoxedLong(x - y)
     case (BoxedShort(x), BoxedShort(y)) => BoxedShort((x - y).toShort)
     case (BoxedByte(x), BoxedByte(y)) => BoxedByte((x - y).toByte)
@@ -50,7 +55,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
   }
   
   private def performMul(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedInt(x * y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxInt(x * y)
     case (BoxedLong(x), BoxedLong(y)) => BoxedLong(x * y)
     case (BoxedShort(x), BoxedShort(y)) => BoxedShort((x * y).toShort)
     case (BoxedByte(x), BoxedByte(y)) => BoxedByte((x * y).toByte)
@@ -60,7 +65,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
   }
   
   private def performDiv(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedInt(x / y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxInt(x / y)
     case (BoxedLong(x), BoxedLong(y)) => BoxedLong(x / y)
     case (BoxedShort(x), BoxedShort(y)) => BoxedShort((x / y).toShort)
     case (BoxedByte(x), BoxedByte(y)) => BoxedByte((x / y).toByte)
@@ -70,7 +75,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
   }
   
   private def performNeg(a: Value): Value = a match {
-    case BoxedInt(x) => BoxedInt(-x)
+    case BoxedInt(x) => Value.boxInt(-x)
     case BoxedLong(x) => BoxedLong(-x)
     case BoxedShort(x) => BoxedShort((-x).toShort)
     case BoxedByte(x) => BoxedByte((-x).toByte)
@@ -81,60 +86,60 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
   
   // Comparison operations
   private def performEqual(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedBoolean(x == y)
-    case (BoxedLong(x), BoxedLong(y)) => BoxedBoolean(x == y)
-    case (BoxedShort(x), BoxedShort(y)) => BoxedBoolean(x == y)
-    case (BoxedByte(x), BoxedByte(y)) => BoxedBoolean(x == y)
-    case (BoxedFloat(x), BoxedFloat(y)) => BoxedBoolean(x == y)
-    case (BoxedDouble(x), BoxedDouble(y)) => BoxedBoolean(x == y)
-    case (BoxedBoolean(x), BoxedBoolean(y)) => BoxedBoolean(x == y)
-    case (ObjectValue(x), ObjectValue(y)) => BoxedBoolean(x == y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxBoolean(x == y)
+    case (BoxedLong(x), BoxedLong(y)) => Value.boxBoolean(x == y)
+    case (BoxedShort(x), BoxedShort(y)) => Value.boxBoolean(x == y)
+    case (BoxedByte(x), BoxedByte(y)) => Value.boxBoolean(x == y)
+    case (BoxedFloat(x), BoxedFloat(y)) => Value.boxBoolean(x == y)
+    case (BoxedDouble(x), BoxedDouble(y)) => Value.boxBoolean(x == y)
+    case (BoxedBoolean(x), BoxedBoolean(y)) => Value.boxBoolean(x == y)
+    case (ObjectValue(x), ObjectValue(y)) => Value.boxBoolean(x == y)
     case _ => throw new RuntimeException("type error on equal")
   }
   
   private def performLessThan(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedBoolean(x < y)
-    case (BoxedLong(x), BoxedLong(y)) => BoxedBoolean(x < y)
-    case (BoxedShort(x), BoxedShort(y)) => BoxedBoolean(x < y)
-    case (BoxedByte(x), BoxedByte(y)) => BoxedBoolean(x < y)
-    case (BoxedFloat(x), BoxedFloat(y)) => BoxedBoolean(x < y)
-    case (BoxedDouble(x), BoxedDouble(y)) => BoxedBoolean(x < y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxBoolean(x < y)
+    case (BoxedLong(x), BoxedLong(y)) => Value.boxBoolean(x < y)
+    case (BoxedShort(x), BoxedShort(y)) => Value.boxBoolean(x < y)
+    case (BoxedByte(x), BoxedByte(y)) => Value.boxBoolean(x < y)
+    case (BoxedFloat(x), BoxedFloat(y)) => Value.boxBoolean(x < y)
+    case (BoxedDouble(x), BoxedDouble(y)) => Value.boxBoolean(x < y)
     case _ => throw new RuntimeException("type error on less than")
   }
   
   private def performLessOrEqual(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedBoolean(x <= y)
-    case (BoxedLong(x), BoxedLong(y)) => BoxedBoolean(x <= y)
-    case (BoxedShort(x), BoxedShort(y)) => BoxedBoolean(x <= y)
-    case (BoxedByte(x), BoxedByte(y)) => BoxedBoolean(x <= y)
-    case (BoxedFloat(x), BoxedFloat(y)) => BoxedBoolean(x <= y)
-    case (BoxedDouble(x), BoxedDouble(y)) => BoxedBoolean(x <= y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxBoolean(x <= y)
+    case (BoxedLong(x), BoxedLong(y)) => Value.boxBoolean(x <= y)
+    case (BoxedShort(x), BoxedShort(y)) => Value.boxBoolean(x <= y)
+    case (BoxedByte(x), BoxedByte(y)) => Value.boxBoolean(x <= y)
+    case (BoxedFloat(x), BoxedFloat(y)) => Value.boxBoolean(x <= y)
+    case (BoxedDouble(x), BoxedDouble(y)) => Value.boxBoolean(x <= y)
     case _ => throw new RuntimeException("type error on less or equal")
   }
   
   private def performGreaterThan(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedBoolean(x > y)
-    case (BoxedLong(x), BoxedLong(y)) => BoxedBoolean(x > y)
-    case (BoxedShort(x), BoxedShort(y)) => BoxedBoolean(x > y)
-    case (BoxedByte(x), BoxedByte(y)) => BoxedBoolean(x > y)
-    case (BoxedFloat(x), BoxedFloat(y)) => BoxedBoolean(x > y)
-    case (BoxedDouble(x), BoxedDouble(y)) => BoxedBoolean(x > y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxBoolean(x > y)
+    case (BoxedLong(x), BoxedLong(y)) => Value.boxBoolean(x > y)
+    case (BoxedShort(x), BoxedShort(y)) => Value.boxBoolean(x > y)
+    case (BoxedByte(x), BoxedByte(y)) => Value.boxBoolean(x > y)
+    case (BoxedFloat(x), BoxedFloat(y)) => Value.boxBoolean(x > y)
+    case (BoxedDouble(x), BoxedDouble(y)) => Value.boxBoolean(x > y)
     case _ => throw new RuntimeException("type error on greater than")
   }
   
   private def performGreaterOrEqual(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedBoolean(x >= y)
-    case (BoxedLong(x), BoxedLong(y)) => BoxedBoolean(x >= y)
-    case (BoxedShort(x), BoxedShort(y)) => BoxedBoolean(x >= y)
-    case (BoxedByte(x), BoxedByte(y)) => BoxedBoolean(x >= y)
-    case (BoxedFloat(x), BoxedFloat(y)) => BoxedBoolean(x >= y)
-    case (BoxedDouble(x), BoxedDouble(y)) => BoxedBoolean(x >= y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxBoolean(x >= y)
+    case (BoxedLong(x), BoxedLong(y)) => Value.boxBoolean(x >= y)
+    case (BoxedShort(x), BoxedShort(y)) => Value.boxBoolean(x >= y)
+    case (BoxedByte(x), BoxedByte(y)) => Value.boxBoolean(x >= y)
+    case (BoxedFloat(x), BoxedFloat(y)) => Value.boxBoolean(x >= y)
+    case (BoxedDouble(x), BoxedDouble(y)) => Value.boxBoolean(x >= y)
     case _ => throw new RuntimeException("type error on greater or equal")
   }
   
   // Bitwise operations
   private def performAnd(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedInt(x & y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxInt(x & y)
     case (BoxedLong(x), BoxedLong(y)) => BoxedLong(x & y)
     case (BoxedShort(x), BoxedShort(y)) => BoxedShort((x & y).toShort)
     case (BoxedByte(x), BoxedByte(y)) => BoxedByte((x & y).toByte)
@@ -142,7 +147,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
   }
   
   private def performOr(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedInt(x | y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxInt(x | y)
     case (BoxedLong(x), BoxedLong(y)) => BoxedLong(x | y)
     case (BoxedShort(x), BoxedShort(y)) => BoxedShort((x | y).toShort)
     case (BoxedByte(x), BoxedByte(y)) => BoxedByte((x | y).toByte)
@@ -150,7 +155,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
   }
   
   private def performXor(a: Value, b: Value): Value = (a, b) match {
-    case (BoxedInt(x), BoxedInt(y)) => BoxedInt(x ^ y)
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxInt(x ^ y)
     case (BoxedLong(x), BoxedLong(y)) => BoxedLong(x ^ y)
     case (BoxedShort(x), BoxedShort(y)) => BoxedShort((x ^ y).toShort)
     case (BoxedByte(x), BoxedByte(y)) => BoxedByte((x ^ y).toByte)
@@ -184,7 +189,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
     }
   }
   
-  def run(code: Vector[Instruction], env: RuntimeEnvironment = new RuntimeEnvironment(None)): Value = {
+  def run(code: Vector[Instruction], env: RuntimeEnvironment = RuntimeEnvironment.pooled(None)): Value = {
     var pc = 0
     var currentEnv = env
     var running = true
@@ -216,27 +221,67 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
           pc += 1
           
         case Add =>
-          val b = pop()
-          val a = pop()
-          push(performAdd(a, b))
+          // Optimize for common int + int case
+          if (stackPtr >= 2) {
+            val b = stack(stackPtr - 1)
+            val a = stack(stackPtr - 2)
+            (a, b) match {
+              case (BoxedInt(x), BoxedInt(y)) =>
+                stackPtr -= 2
+                push(Value.boxInt(x + y))
+              case _ =>
+                stackPtr -= 2
+                push(performAdd(a, b))
+            }
+          }
           pc += 1
           
         case Sub =>
-          val b = pop()
-          val a = pop()
-          push(performSub(a, b))
+          // Optimize for common int - int case
+          if (stackPtr >= 2) {
+            val b = stack(stackPtr - 1)
+            val a = stack(stackPtr - 2)
+            (a, b) match {
+              case (BoxedInt(x), BoxedInt(y)) =>
+                stackPtr -= 2
+                push(Value.boxInt(x - y))
+              case _ =>
+                stackPtr -= 2
+                push(performSub(a, b))
+            }
+          }
           pc += 1
           
         case Mul =>
-          val b = pop()
-          val a = pop()
-          push(performMul(a, b))
+          // Optimize for common int * int case
+          if (stackPtr >= 2) {
+            val b = stack(stackPtr - 1)
+            val a = stack(stackPtr - 2)
+            (a, b) match {
+              case (BoxedInt(x), BoxedInt(y)) =>
+                stackPtr -= 2
+                push(Value.boxInt(x * y))
+              case _ =>
+                stackPtr -= 2
+                push(performMul(a, b))
+            }
+          }
           pc += 1
           
         case Div =>
-          val b = pop()
-          val a = pop()
-          push(performDiv(a, b))
+          // Optimize for common int / int case
+          if (stackPtr >= 2) {
+            val b = stack(stackPtr - 1)
+            val a = stack(stackPtr - 2)
+            (a, b) match {
+              case (BoxedInt(x), BoxedInt(y)) =>
+                stackPtr -= 2
+                push(Value.boxInt(x / y))
+              case _ =>
+                stackPtr -= 2
+                push(performDiv(a, b))
+            }
+          }
           pc += 1
           
         case Neg =>
@@ -353,7 +398,7 @@ class VirtualMachine(interpreter: Interpreter, moduleEnv: ModuleEnvironment, rec
           func match {
             case VmClosureValue(params, bodyStart, bodyEnd, closureEnv, _) =>
               callStack += ((pc + 1, currentEnv))
-              val newEnv = new RuntimeEnvironment(Some(closureEnv))
+              val newEnv = RuntimeEnvironment.pooled(Some(closureEnv))
               var i = 0
               var argPtr = stackPtr - arity
               while (i < arity) {

@@ -2,7 +2,7 @@ package com.github.klassic
 
 class VmInterpreterSpec extends VmSpecHelper {
   describe("function call") {
-    ignore("evaluates function literal") {
+    it("evaluates function literal") {
       assertResult(BoxedInt(6))(
         V(
           """|
@@ -15,7 +15,7 @@ class VmInterpreterSpec extends VmSpecHelper {
   }
 
   describe("method call") {
-    ignore("invokes a Java method") {
+    it("invokes a Java method") {
       assertResult(ObjectValue("hello"))(
         V(
           """|
@@ -30,7 +30,7 @@ class VmInterpreterSpec extends VmSpecHelper {
   }
 
   describe("object creation") {
-    ignore("creates new object") {
+    it("creates new object") {
       assertResult(ObjectValue("abc"))(
         V("new java.lang.String(\"abc\")")
       )
@@ -38,7 +38,7 @@ class VmInterpreterSpec extends VmSpecHelper {
   }
 
   describe("closure") {
-    ignore("captures outer variable") {
+    it("captures outer variable") {
       assertResult(BoxedInt(3))(
         V(
           """|

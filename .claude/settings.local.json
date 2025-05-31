@@ -6,7 +6,8 @@
       "Bash(rg:*)",
       "Bash(rm:*)",
       "Bash(grep:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(sed:*)"
     ]
   },
   "enableAllProjectMcpServers": false
