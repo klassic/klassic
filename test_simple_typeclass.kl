@@ -13,12 +13,6 @@ instance Show<String> where {
   def show(x: String): String = "String: " + x
 }
 
-// Instance for List of Int
-instance Show<List<Int>> where {
-  def show(xs: List<Int>): String = "List[" + size(xs) + " elements]"
-}
-
-// Test it directly without generic display function
+// Test it
 println(show(42))
 println(show("Hello"))
-println(show([1, 2, 3]))

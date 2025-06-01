@@ -158,6 +158,7 @@ class Parser extends Processor[String, Program, InteractiveSession] {
       val SLASHEQ: Parser[String]          = kwToken("/=")
       val COLONGT: Parser[String]          = kwToken(":>")
       val EQEQ: Parser[String]             = kwToken("==")
+      val NEQ: Parser[String]              = kwToken("!=")
       val ARROW1: Parser[String]           = kwToken("=>")
       val ARROW2: Parser[String]           = kwToken("->")
       val COLON: Parser[String]            = kwToken(":")
@@ -224,9 +225,28 @@ class Parser extends Processor[String, Program, InteractiveSession] {
 
       def grammar: Parser[macro_peg.Ast.Grammar] = (CL(RULE) >> CL(LBRACE)) >> MacroPeg.EMBEDDED_GRAMMAR<< CL(RBRACE)
 
+      lazy val topLevelElement: Parser[Either[Any, Ast.Node]] = rule(
+        (`import` ^^ (Left(_))) 
+      | (record ^^ (Left(_)))
+      | (typeClass ^^ (Left(_)))
+      | (instance ^^ (Left(_)))
+      | (line ^^ (Right(_)))
+      )
+
       lazy val program: Parser[Program] = rule {
-        (SPACING >> %%) ~ grammar.? ~ `import`.repeat0By(TERMINATOR) ~ record.repeat0By(TERMINATOR) ~ typeClass.repeat0By(TERMINATOR) ~ (TERMINATOR.? >> instance).repeat0By(TERMINATOR) ~ (TERMINATOR.? >> lines << (TERMINATOR).?) << EOF ^^ {
-          case location ~ grammar ~ imports ~ records ~ typeClasses ~ instances ~ block => Program(location, grammar, imports, records, typeClasses, instances, block)
+        (SPACING >> %%) ~ grammar.? ~ ((topLevelElement << TERMINATOR.?).* << EOF) ^^ {
+          case location ~ grammar ~ elements =>
+            val (topLevel, lines) = elements.partition(_.isLeft)
+            val topLevelDecls = topLevel.map(_.swap.getOrElse(throw new RuntimeException("Expected Left")))
+            val lineNodes = elements.collect { case Right(node) => node }
+            
+            val imports = topLevelDecls.collect { case i: Import => i }
+            val records = topLevelDecls.collect { case r: RecordDeclaration => r }
+            val typeClasses = topLevelDecls.collect { case tc: TypeClassDeclaration => tc }
+            val instances = topLevelDecls.collect { case i: InstanceDeclaration => i }
+            val block = Block(location, lineNodes)
+            
+            Program(location, grammar, imports, records, typeClasses, instances, block)
         }
       }
 
@@ -373,10 +393,11 @@ class Parser extends Processor[String, Program, InteractiveSession] {
         )
       }
 
-      //conditional ::= add {"==" add | "<=" add | "=>" add | "<" add | ">" add}
+      //conditional ::= add {"==" add | "!=" add | "<=" add | "=>" add | "<" add | ">" add}
       lazy val conditional: Parser[Ast.Node] = rule {
         chainl(add)(
           (%% << CL(EQEQ)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.EQUAL, left, right) } |
+            (%% << CL(NEQ)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.NOT_EQUAL, left, right) } |
             (%% << CL(LTE)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.LESS_OR_EQUAL, left, right) } |
             (%% << CL(GTE)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.GREATER_EQUAL, left, right) } |
             (%% << CL(LT)) ^^ { location => (left: Ast.Node, right: Ast.Node) => BinaryExpression(location, Operator.LESS_THAN, left, right) } |

@@ -100,6 +100,18 @@ class VirtualMachine(moduleEnv: ModuleEnvironment, recordEnv: RecordEnvironment)
     case _ => throw new RuntimeException("type error on equal")
   }
   
+  private def performNotEqual(a: Value, b: Value): Value = (a, b) match {
+    case (BoxedInt(x), BoxedInt(y)) => Value.boxBoolean(x != y)
+    case (BoxedLong(x), BoxedLong(y)) => Value.boxBoolean(x != y)
+    case (BoxedShort(x), BoxedShort(y)) => Value.boxBoolean(x != y)
+    case (BoxedByte(x), BoxedByte(y)) => Value.boxBoolean(x != y)
+    case (BoxedFloat(x), BoxedFloat(y)) => Value.boxBoolean(x != y)
+    case (BoxedDouble(x), BoxedDouble(y)) => Value.boxBoolean(x != y)
+    case (BoxedBoolean(x), BoxedBoolean(y)) => Value.boxBoolean(x != y)
+    case (ObjectValue(x), ObjectValue(y)) => Value.boxBoolean(x != y)
+    case _ => throw new RuntimeException("type error on not equal")
+  }
+  
   private def performLessThan(a: Value, b: Value): Value = (a, b) match {
     case (BoxedInt(x), BoxedInt(y)) => Value.boxBoolean(x < y)
     case (BoxedLong(x), BoxedLong(y)) => Value.boxBoolean(x < y)
@@ -295,6 +307,12 @@ class VirtualMachine(moduleEnv: ModuleEnvironment, recordEnv: RecordEnvironment)
           val b = pop()
           val a = pop()
           push(performEqual(a, b))
+          pc += 1
+          
+        case NotEqual =>
+          val b = pop()
+          val a = pop()
+          push(performNotEqual(a, b))
           pc += 1
           
         case LessThan =>

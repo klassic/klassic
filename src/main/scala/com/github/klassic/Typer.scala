@@ -428,6 +428,49 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         }
         val s4 = unify(TBoolean, t, s3)
         (TypedAst.BinaryExpression(resultType, location, Operator.EQUAL, typedLhs, typedRhs), s4)
+      case Ast.BinaryExpression(location, Operator.NOT_EQUAL, lhs, rhs) =>
+        val a, b = newTypeVariable()
+        val (typedLhs, s1) = doType(lhs, env, a, s0)
+        val (typedRhs, s2) = doType(rhs, env, b, s1)
+        val (resultType, s3) = (s2.replace(a), s2.replace(b)) match {
+          case (TInt, TInt) =>
+            (TBoolean, s2)
+          case (TLong, TLong) =>
+            (TBoolean, s2)
+          case (TShort, TShort) =>
+            (TBoolean, s2)
+          case (TByte, TByte) =>
+            (TBoolean, s2)
+          case (TFloat, TFloat) =>
+            (TBoolean, s2)
+          case (TDouble, TDouble) =>
+            (TBoolean, s2)
+          case (TBoolean, TBoolean) =>
+            (TBoolean, s2)
+          case (TString, TString) =>
+            (TBoolean, s2)
+          case (TString, TDynamic) =>
+            (TBoolean, s2)
+          case (TDynamic, TString) =>
+            (TBoolean, s2)
+          case (TDynamic, TDynamic) =>
+            (TBoolean, s2)
+          case (x: TVariable, y) if !y.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
+          case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
+            (TBoolean, unify(x, y, s2))
+          case (a@TConstructor(n1, ts1), b@TConstructor(n2, ts2)) if n2 == n2  && ts1.length == ts2.length =>
+            val sx = (ts1 zip ts2).foldLeft(s0) { case (s, (t1, t2)) =>
+                unify(t1, t2, s)
+            }
+            (sx.replace(a), sx)
+          case (ltype, rtype) =>
+            val s3 = unify(TInt, ltype, s2)
+            val s4 = unify(TInt, rtype, s3)
+            (TBoolean, s4)
+        }
+        val s4 = unify(TBoolean, t, s3)
+        (TypedAst.BinaryExpression(resultType, location, Operator.NOT_EQUAL, typedLhs, typedRhs), s4)
       case Ast.BinaryExpression(location, Operator.LESS_THAN, lhs, rhs) =>
         val a, b = newTypeVariable()
         val (typedLhs, s1) = doType(lhs, env, a, s0)
@@ -928,14 +971,13 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
                     // Create a reference to the instance method
                     val instanceMethod = instance.methods.get(name) match {
                       case Some(methodType) =>
-                        // Create access to the instance's method
-                        val dictName = s"${tc.name}_${normalizeTypeName(firstArgType)}_dict"
-                        val dictAccess = TypedAst.Id(TDynamic, location, dictName)
-                        val methodAccess = TypedAst.RecordSelect(methodType, location, dictAccess, name)
+                        // For now, we'll create a special marker that the runtime will resolve
+                        // In a real implementation, this would be dictionary passing or method resolution
+                        val methodId = TypedAst.Id(methodType, location, s"${tc.name}_${normalizeTypeName(firstArgType)}_${name}")
                         
                         // Type the method call
                         val s2 = unify(methodType, TFunction(argTypes, t), s1)
-                        (TypedAst.FunctionCall(s2.replace(t), location, methodAccess, typedArgsRev), s2)
+                        (TypedAst.FunctionCall(s2.replace(t), location, methodId, typedArgsRev), s2)
                         
                       case None =>
                         typeError(location, s"Instance for ${tc.name}[${firstArgType}] doesn't implement method $name")
@@ -1137,14 +1179,30 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
   
   def processInstances(instances: List[Ast.InstanceDeclaration], typeClasses: Map[String, TTypeClass]): Map[(String, Type), TInstance] = {
     instances.map { inst =>
+      // Look up the type class to get expected method signatures
+      val typeClass = typeClasses.get(inst.className) match {
+        case Some(tc) => tc
+        case None => 
+          throw TyperException(s"${inst.location.format} Type class ${inst.className} not found")
+      }
+      
       val methodTypes = inst.methods.map { m =>
-        // For now, use a simple type inference for instance methods
-        val funcType = m.body.optionalType.getOrElse {
-          val paramTypes = m.body.params.map(_ => newTypeVariable())
-          val returnType = newTypeVariable()
-          TFunction(paramTypes, returnType)
+        // Get the expected type from the type class
+        val expectedType = typeClass.methods.find(_._1 == m.name) match {
+          case Some((_, TScheme(typeParams, methodType, _))) =>
+            // Substitute the instance's type for the type class parameter
+            val substitution: Substitution = if (typeParams.nonEmpty) {
+              Map(typeParams.head -> inst.forType)
+            } else {
+              EmptySubstitution
+            }
+            substitution.replace(methodType)
+          case None =>
+            throw TyperException(s"${m.location.format} Method ${m.name} not found in type class ${inst.className}")
         }
-        m.name -> funcType
+        
+        // Use the expected type from the type class
+        m.name -> expectedType
       }.toMap
       
       (inst.className, inst.forType) -> TInstance(inst.className, inst.forType, methodTypes)
@@ -1201,6 +1259,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
     case TFloat => "Float"
     case TDouble => "Double"
     case TUnit => "Unit"
+    case TConstructor("List", List(TInt)) => "List<Int>"
     case TConstructor(name, _) => name
     case _ => "Unknown"
   }

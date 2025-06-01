@@ -1,0 +1,14 @@
+typeclass Show<'a> where {
+  show: ('a) => String
+}
+
+instance Show<Int> where {
+  def show(x: Int): String = "Int(" + x + ")"
+}
+
+instance Show<String> where {
+  def show(x: String): String = "String(" + x + ")"
+}
+
+// Direct method call - should resolve to correct instance
+show(42)

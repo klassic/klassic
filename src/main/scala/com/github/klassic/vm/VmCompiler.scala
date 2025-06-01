@@ -47,6 +47,8 @@ class VmCompiler {
       compileNode(l, code); compileNode(r, code); code += Div
     case BinaryExpression(_, _, Operator.EQUAL, l, r) =>
       compileNode(l, code); compileNode(r, code); code += Equal
+    case BinaryExpression(_, _, Operator.NOT_EQUAL, l, r) =>
+      compileNode(l, code); compileNode(r, code); code += NotEqual
     case BinaryExpression(_, _, Operator.LESS_THAN, l, r) =>
       compileNode(l, code); compileNode(r, code); code += LessThan
     case BinaryExpression(_, _, Operator.LESS_OR_EQUAL, l, r) =>
