@@ -1,0 +1,27 @@
+// Define a Show type class
+typeclass Show<'a> where {
+  show: ('a) => String
+}
+
+// Instance for Int
+instance Show<Int> where {
+  def show(x: Int): String = "Int: " + x
+}
+
+// Instance for String
+instance Show<String> where {
+  def show(x: String): String = "String: " + x
+}
+
+// Instance for List
+instance Show<List<'a>> where {
+  def show(xs: List<'a>): String = "List[" + size(xs) + " elements]"
+}
+
+// Using type class constraints
+def display(x: 'a): Unit = println(show(x))
+
+// Test it
+display(42)
+display("Hello")
+display([1, 2, 3])

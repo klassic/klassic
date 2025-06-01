@@ -168,6 +168,9 @@ class Parser extends Processor[String, Program, InteractiveSession] {
       val BAR: Parser[String]              = kwToken("|")
       val AMP: Parser[String]              = kwToken("&")
       val HAT: Parser[String]              = kwToken("^")
+      val TYPECLASS: Parser[String]        = kwToken("typeclass")
+      val INSTANCE: Parser[String]         = kwToken("instance")
+      val WHERE: Parser[String]            = kwToken("where")
       // end token definition
 
       lazy val KEYWORDS: Set[String] = tokenNames.toSet
@@ -192,7 +195,8 @@ class Parser extends Processor[String, Program, InteractiveSession] {
       lazy val typeVariable: Parser[TVariable] = qident ^^ { id => TVariable(id) }
 
       lazy val typeDescription: Parser[Type] = rule(
-        qident ^^ { id => TVariable(id) }
+        constraint.repeat1By(CL(COMMA)) ~ (CL(ARROW1) >> typeDescription) ^^ { case constraints ~ baseType => TQualified(constraints, baseType) }
+          | qident ^^ { id => TVariable(id) }
           | ((CL(LPAREN) >> typeDescription.repeat0By(CL(COMMA)) << CL(RPAREN)) << CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => TFunction(args, returnType) }
           | (SHARP >> sident).filter { s => !isBuiltinType(s) } ~ (CL(LT) >> typeDescription.repeat0By(CL(COMMA)) << CL(GT)).? ^^ {
           case name ~ Some(args) => TRecordReference(name, args)
@@ -212,13 +216,17 @@ class Parser extends Processor[String, Program, InteractiveSession] {
           | kwToken("*") ^^ { _ => TDynamic }
       )
 
+      lazy val constraint: Parser[TConstraint] = rule(
+        sident ~ CL(LBRACKET) ~ typeVariable ~ CL(RBRACKET) ^^ { case className ~ _ ~ typeVar ~ _ => TConstraint(className, typeVar) }
+      )
+
       def root: Parser[Program] = rule(program)
 
       def grammar: Parser[macro_peg.Ast.Grammar] = (CL(RULE) >> CL(LBRACE)) >> MacroPeg.EMBEDDED_GRAMMAR<< CL(RBRACE)
 
       lazy val program: Parser[Program] = rule {
-        (SPACING >> %%) ~ grammar.? ~ `import`.repeat0By(TERMINATOR) ~ record.repeat0By(TERMINATOR) ~ (lines << (TERMINATOR).?) << EOF ^^ {
-          case location ~ grammar ~ imports ~ records ~ block => Program(location, grammar, imports, records, block)
+        (SPACING >> %%) ~ grammar.? ~ `import`.repeat0By(TERMINATOR) ~ record.repeat0By(TERMINATOR) ~ typeClass.repeat0By(TERMINATOR) ~ (TERMINATOR.? >> instance).repeat0By(TERMINATOR) ~ (TERMINATOR.? >> lines << (TERMINATOR).?) << EOF ^^ {
+          case location ~ grammar ~ imports ~ records ~ typeClasses ~ instances ~ block => Program(location, grammar, imports, records, typeClasses, instances, block)
         }
       }
 
@@ -240,6 +248,29 @@ class Parser extends Processor[String, Program, InteractiveSession] {
           methods <- commit(methodDefinition.repeat0By(TERMINATOR))
           _ <- commit(RBRACE)
         } yield RecordDeclaration(location, name, ts.getOrElse(Nil), members, methods)
+      }
+
+      lazy val typeClass: Parser[TypeClassDeclaration] = rule {
+        (%% << TYPECLASS) ~ sident ~ ((CL(LT) >> typeVariable.repeat1By(CL(COMMA)) << CL(GT)).? << CL(WHERE) << CL(LBRACE)) ~ (typeClassMethod.repeat0By(TERMINATOR) << TERMINATOR.?) << CL(RBRACE) ^^ {
+          case location ~ name ~ typeParams ~ methods =>
+            TypeClassDeclaration(location, name, typeParams.getOrElse(List(TVariable("a"))), methods)
+        }
+      }
+
+      lazy val typeClassMethod: Parser[TypeClassMethod] = rule {
+        for {
+          location <- %%
+          name <- ident
+          _ <- COLON
+          typeSignature <- typeDescription
+        } yield TypeClassMethod(location, name.name, typeSignature)
+      }
+
+      lazy val instance: Parser[InstanceDeclaration] = rule {
+        (%% << INSTANCE) ~ sident ~ (CL(LT) >> typeDescription << CL(GT) << CL(WHERE) << CL(LBRACE)) ~ (methodDefinition.repeat0By(TERMINATOR) << TERMINATOR.?) << CL(RBRACE) ^^ {
+          case location ~ className ~ forType ~ methods =>
+            InstanceDeclaration(location, className, forType, methods)
+        }
       }
 
       //lines ::= line {TERMINATOR expr} [TERMINATOR]

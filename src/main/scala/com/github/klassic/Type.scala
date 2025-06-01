@@ -56,7 +56,18 @@ object Type {
 
   case class TFunction(paramTypes: List[Type], returnType: Type) extends Type(s"(${paramTypes.mkString(", ")}) => ${returnType}")
 
-  case class TScheme(svariables: List[TVariable], stype: Type)
+  case class TScheme(svariables: List[TVariable], stype: Type, constraints: List[TConstraint] = Nil)
 
   case class TConstructor(name: String, ts: List[Type]) extends Type(name + "<" + ts.mkString(", ") + ">")
+
+  case class TConstraint(className: String, typeVar: TVariable) extends Type(s"${className}[${typeVar.name}]")
+
+  case class TQualified(constraints: List[TConstraint], baseType: Type) extends Type(
+    if (constraints.isEmpty) baseType.image
+    else s"(${constraints.map(_.image).mkString(", ")}) => ${baseType.image}"
+  )
+
+  case class TTypeClass(name: String, typeParams: List[TVariable], methods: List[(String, TScheme)]) extends Type(s"class ${name}")
+
+  case class TInstance(className: String, forType: Type, methods: Map[String, Type]) extends Type(s"instance ${className}[${forType}]")
 }

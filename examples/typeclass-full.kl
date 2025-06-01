@@ -1,0 +1,48 @@
+// Full Type Class Example with Dictionary Passing
+
+// Define Show type class
+typeclass Show<a> where {
+  show: (a) => String
+}
+
+// Define Eq type class  
+typeclass Eq<a> where {
+  equals: (a, a) => Boolean
+  notEquals: (a, a) => Boolean
+}
+
+// Instance of Show for Int
+instance Show[Int] where {
+  def show(x: Int): String = "Int(" + x + ")"
+}
+
+// Instance of Show for String
+instance Show[String] where {
+  def show(x: String): String = "\"" + x + "\""
+}
+
+// Instance of Eq for Int
+instance Eq[Int] where {
+  def equals(x: Int, y: Int): Boolean = x == y
+  def notEquals(x: Int, y: Int): Boolean = !(x == y)
+}
+
+// Generic function using type class constraint
+def display<a>(x: a): String where Show[a] = {
+  show(x)
+}
+
+// Function using multiple constraints
+def showEqual<a>(x: a, y: a): String where (Show[a], Eq[a]) = {
+  if (equals(x, y)) {
+    show(x) + " equals " + show(y)
+  } else {
+    show(x) + " not equals " + show(y)
+  }
+}
+
+// Usage
+println(display(42))
+println(display("Hello"))
+println(showEqual(5, 5))
+println(showEqual(3, 7))

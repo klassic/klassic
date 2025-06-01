@@ -19,7 +19,7 @@ object Ast {
 
   case object FloatSuffix extends FloatSuffix
 
-  case class Program(location: Location, grammar: Option[macro_peg.Ast.Grammar], imports: List[Import], records: List[RecordDeclaration], block: Block)
+  case class Program(location: Location, grammar: Option[macro_peg.Ast.Grammar], imports: List[Import], records: List[RecordDeclaration], typeClasses: List[TypeClassDeclaration], instances: List[InstanceDeclaration], block: Block)
 
   case class Import(location: Location, simpleName: String, fqcn: String)
 
@@ -139,4 +139,12 @@ object Ast {
   case class MethodCall(location: Location, self: Ast.Node, name: String, params: List[Ast.Node]) extends Node
 
   case class Casting(location: Location, target: Ast.Node, to: Type) extends Node
+
+  case class TypeClassDeclaration(location: Location, name: String, typeParams: List[TVariable], methods: List[TypeClassMethod]) extends Node
+
+  case class TypeClassMethod(location: Location, name: String, typeSignature: Type)
+
+  case class InstanceDeclaration(location: Location, className: String, forType: Type, methods: List[MethodDefinition]) extends Node
+
+  case class ConstrainedLambda(location: Location, constraints: List[Type.TConstraint], params: List[FormalParameterOptional], optionalType: Option[Type], body: Ast.Node) extends Node
 }

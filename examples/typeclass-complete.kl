@@ -1,0 +1,43 @@
+// Complete Type Class Example with Proper Dictionary Passing
+
+// Define Show type class
+typeclass Show<'a> where {
+  show: ('a) => String;
+}
+
+// Define Eq type class  
+typeclass Eq<'a> where {
+  equals: ('a, 'a) => Boolean;
+}
+
+// Instance of Show for Int
+instance Show<Int> where {
+  def show(x: Int): String = "Int(" + x + ")"
+}
+
+// Instance of Show for String
+instance Show<String> where {
+  def show(x: String): String = "\"" + x + "\""
+}
+
+// Instance of Eq for Int
+instance Eq<Int> where {
+  def equals(x: Int, y: Int): Boolean = x == y
+}
+
+// Simulate the dictionary-passing transformation
+// In a real implementation, this would be automatic
+val Show_Int_dict = record { show: (x: Int) => "Int(" + x + ")" }
+val Show_String_dict = record { show: (x: String) => "\"" + x + "\"" }
+val Eq_Int_dict = record { equals: (x: Int, y: Int) => x == y }
+
+// Define functions that use type classes
+// These would be transformed to take dictionary parameters
+def showValue(dict: record { show: ('a) => String }, x: 'a): String = dict.show(x)
+def areEqual(dict: record { equals: ('a, 'a) => Boolean }, x: 'a, y: 'a): Boolean = dict.equals(x, y)
+
+// Usage - in real implementation, the dictionaries would be passed implicitly
+println(showValue(Show_Int_dict, 42))
+println(showValue(Show_String_dict, "Hello"))
+println(areEqual(Eq_Int_dict, 5, 5))
+println(areEqual(Eq_Int_dict, 3, 7))

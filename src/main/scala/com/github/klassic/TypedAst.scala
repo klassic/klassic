@@ -22,7 +22,7 @@ object TypedAst {
 
   case object FloatSuffix extends FloatSuffix
 
-  case class Program(location: Location, imports: List[Import], block: Block, records: RecordEnvironment)
+  case class Program(location: Location, imports: List[Import], block: Block, records: RecordEnvironment, typeClasses: Map[String, Type.TTypeClass], instances: Map[(String, Type), Type.TInstance])
 
   case class Import(location: Location, simpleName: String, fqcn: String)
 
@@ -94,4 +94,8 @@ object TypedAst {
     override val type_   : Type     = TDynamic
     override val location: Location = NoLocation
   }
+
+  case class DictionaryAccess(type_ : Type, location: Location, dictionary: TypedNode, methodName: String) extends TypedNode
+
+  case class DictionaryCall(type_ : Type, location: Location, dictionary: TypedNode, methodName: String, params: List[TypedNode]) extends TypedNode
 }

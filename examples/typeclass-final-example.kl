@@ -1,0 +1,108 @@
+// Complete Type Class Example with Dictionary Passing
+// This shows what the user writes and what it transforms to
+
+// ===== USER CODE =====
+
+// Type class declaration
+typeclass Show<'a> where {
+  show: ('a) => String;
+}
+
+typeclass Eq<'a> where {
+  equals: ('a, 'a) => Boolean;
+}
+
+// Instance declarations
+instance Show<Int> where {
+  def show(x: Int): String = "Int(" + x + ")"
+}
+
+instance Show<String> where {
+  def show(x: String): String = "String(\"" + x + "\")"
+}
+
+instance Show<List<'a>> where Show<'a> {
+  def show(xs: List<'a>): String = {
+    "[" + map(xs, (x) => show(x)).join(", ") + "]"
+  }
+}
+
+instance Eq<Int> where {
+  def equals(x: Int, y: Int): Boolean = x == y
+}
+
+instance Eq<String> where {
+  def equals(x: String, y: String): Boolean = x == y
+}
+
+// Functions using type classes
+def display<'a>(x: 'a): Unit where Show<'a> = {
+  println(show(x))
+}
+
+def displayPair<'a>(x: 'a, y: 'a): Unit where (Show<'a>, Eq<'a>) = {
+  if (equals(x, y)) {
+    println(show(x) + " is equal to " + show(y))
+  } else {
+    println(show(x) + " is not equal to " + show(y))
+  }
+}
+
+// ===== TRANSFORMED CODE (What the compiler generates) =====
+
+// Dictionary definitions
+val Show_Int_dict = {
+  show: (x: Int) => "Int(" + x + ")"
+}
+
+val Show_String_dict = {
+  show: (x: String) => "String(\"" + x + "\")"
+}
+
+val Show_List_dict = (Show_a_dict: { show: ('a) => String }) => {
+  show: (xs: List<'a>) => {
+    "[" + map(xs, (x) => Show_a_dict.show(x)).join(", ") + "]"
+  }
+}
+
+val Eq_Int_dict = {
+  equals: (x: Int, y: Int) => x == y
+}
+
+val Eq_String_dict = {
+  equals: (x: String, y: String) => x == y
+}
+
+// Transformed functions
+def display_impl<'a>(Show_dict: { show: ('a) => String }, x: 'a): Unit = {
+  println(Show_dict.show(x))
+}
+
+def displayPair_impl<'a>(
+  Show_dict: { show: ('a) => String },
+  Eq_dict: { equals: ('a, 'a) => Boolean },
+  x: 'a,
+  y: 'a
+): Unit = {
+  if (Eq_dict.equals(x, y)) {
+    println(Show_dict.show(x) + " is equal to " + Show_dict.show(y))
+  } else {
+    println(Show_dict.show(x) + " is not equal to " + Show_dict.show(y))
+  }
+}
+
+// ===== USAGE =====
+
+// What the user writes:
+display(42)
+display("Hello")
+display([1, 2, 3])
+displayPair(5, 5)
+displayPair("foo", "bar")
+
+// What it transforms to:
+display_impl(Show_Int_dict, 42)
+display_impl(Show_String_dict, "Hello")
+display_impl(Show_List_dict(Show_Int_dict), [1, 2, 3])
+displayPair_impl(Show_Int_dict, Eq_Int_dict, 5, 5)
+displayPair_impl(Show_String_dict, Eq_String_dict, "foo", "bar")

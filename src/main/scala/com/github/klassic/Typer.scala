@@ -18,6 +18,16 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
   type RecordEnvironment = Map[String, TRecord]
   type Name = String
   type Label = String
+  
+  // Track constraints that need to be resolved
+  case class ConstraintSet(constraints: List[TConstraint]) {
+    def add(constraint: TConstraint): ConstraintSet = ConstraintSet(constraint :: constraints)
+    def addAll(cs: List[TConstraint]): ConstraintSet = ConstraintSet(cs ++ constraints)
+    def merge(other: ConstraintSet): ConstraintSet = ConstraintSet(other.constraints ++ constraints)
+  }
+  object ConstraintSet {
+    val empty: ConstraintSet = ConstraintSet(Nil)
+  }
 
   def listOf(tp: Type): TConstructor = {
     TConstructor("List", List(tp))
@@ -291,7 +301,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
   def typeOf(e: Ast.Node, environment: Environment = BuiltinEnvironment, records: RecordEnvironment = BuiltinRecordEnvironment, modules: ModuleEnvironment = BuiltinModuleEnvironment): Type = {
     val a = newTypeVariable()
     val r = new SyntaxRewriter
-    val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, records, modules, None), a, EmptySubstitution)
+    val (typedE, s) = doType(r.doRewrite(e), TypeEnvironment(environment, Set.empty, records, modules, Map.empty, Map.empty, None), a, EmptySubstitution)
     s.replace(a)
   }
 
@@ -806,12 +816,30 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         val s = unify(TString, t, s0)
         (TypedAst.StringNode(TString, location, value), s)
       case Ast.Id(location, name) =>
-        val s = env.lookup(name) match {
-          case None => typeError(location, s"variable '${name}' is not found")
-          case Some(u) => unify(newInstanceFrom(u), t, s0)
+        env.lookup(name) match {
+          case None =>
+            // Check if it's a type class method
+            val typeClassMethod = env.typeClasses.values.find { tc =>
+              tc.methods.exists(_._1 == name)
+            }
+            
+            typeClassMethod match {
+              case Some(tc) =>
+                // Found a type class method - return it as a placeholder
+                // The actual resolution will happen in function calls
+                val methodScheme = tc.methods.find(_._1 == name).get._2
+                val instanceType = newInstanceFrom(methodScheme)
+                val s = unify(instanceType, t, s0)
+                (TypedAst.Id(s.replace(t), location, name), s)
+                
+              case None =>
+                typeError(location, s"variable '${name}' is not found")
+            }
+          case Some(u) =>
+            val s = unify(newInstanceFrom(u), t, s0)
+            val resultType = s.replace(t)
+            (TypedAst.Id(resultType, location, name), s)
         }
-        val resultType = s.replace(t)
-        (TypedAst.Id(resultType, location, name), s)
       case Ast.Selector(location, module, name) =>
         val s = env.lookupModuleMember(module, name) match {
           case None => typeError(location, s"module '${module}' or member '${name}' is not found")
@@ -871,13 +899,74 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         }
         (TypedAst.LetFunctionDefinition(typedE2.type_, location, variable, typedE1.asInstanceOf[TypedAst.FunctionLiteral], typedCleanup, typedE2), s)
       case Ast.FunctionCall(location, e1, ps) =>
-        val t2 = ps.map{_ => newTypeVariable()}
-        val (typedTarget, s1) = doType(e1, env, TFunction(t2, t), s0)
-        val (tparams, s) = (ps zip t2).foldLeft((Nil:List[TypedNode], s1)){ case ((tparams, s), (e, t)) =>
-          val (tparam, sx) = doType(e, env, t, s)
-          (tparam::tparams, sx)
+        // Check if this is a type class method call
+        e1 match {
+          case Ast.Id(_, name) =>
+            val typeClassOpt = env.typeClasses.values.find(tc => tc.methods.exists(_._1 == name))
+            typeClassOpt match {
+              case Some(tc) =>
+                // This is a type class method call - need to resolve the instance
+                if (ps.isEmpty) {
+                  typeError(location, s"Type class method $name requires at least one argument")
+                }
+                
+                // Type check the arguments first
+                val argTypes = ps.map(_ => newTypeVariable())
+                val (typedArgs, s1) = (ps zip argTypes).foldLeft((Nil:List[TypedNode], s0)) { 
+                  case ((args, s), (e, t)) =>
+                    val (arg, sx) = doType(e, env, t, s)
+                    (arg :: args, sx)
+                }
+                val typedArgsRev = typedArgs.reverse
+                
+                // Get the type of the first argument to determine which instance to use
+                val firstArgType = s1.replace(argTypes.head)
+                
+                // Find the matching instance
+                env.findMatchingInstance(tc.name, firstArgType) match {
+                  case Some(instance) =>
+                    // Create a reference to the instance method
+                    val instanceMethod = instance.methods.get(name) match {
+                      case Some(methodType) =>
+                        // Create access to the instance's method
+                        val dictName = s"${tc.name}_${normalizeTypeName(firstArgType)}_dict"
+                        val dictAccess = TypedAst.Id(TDynamic, location, dictName)
+                        val methodAccess = TypedAst.RecordSelect(methodType, location, dictAccess, name)
+                        
+                        // Type the method call
+                        val s2 = unify(methodType, TFunction(argTypes, t), s1)
+                        (TypedAst.FunctionCall(s2.replace(t), location, methodAccess, typedArgsRev), s2)
+                        
+                      case None =>
+                        typeError(location, s"Instance for ${tc.name}[${firstArgType}] doesn't implement method $name")
+                    }
+                    instanceMethod
+                    
+                  case None =>
+                    typeError(location, s"No instance for ${tc.name}[${firstArgType}]")
+                }
+                
+              case None =>
+                // Regular function call
+                val t2 = ps.map{_ => newTypeVariable()}
+                val (typedTarget, s1) = doType(e1, env, TFunction(t2, t), s0)
+                val (tparams, s) = (ps zip t2).foldLeft((Nil:List[TypedNode], s1)){ case ((tparams, s), (e, t)) =>
+                  val (tparam, sx) = doType(e, env, t, s)
+                  (tparam::tparams, sx)
+                }
+                (TypedAst.FunctionCall(s.replace(t), location, typedTarget, tparams.reverse), s)
+            }
+            
+          case _ =>
+            // Regular function call
+            val t2 = ps.map{_ => newTypeVariable()}
+            val (typedTarget, s1) = doType(e1, env, TFunction(t2, t), s0)
+            val (tparams, s) = (ps zip t2).foldLeft((Nil:List[TypedNode], s1)){ case ((tparams, s), (e, t)) =>
+              val (tparam, sx) = doType(e, env, t, s)
+              (tparam::tparams, sx)
+            }
+            (TypedAst.FunctionCall(s.replace(t), location, typedTarget, tparams.reverse), s)
         }
-        (TypedAst.FunctionCall(s.replace(t), location, typedTarget, tparams.reverse), s)
       case Ast.ListLiteral(location, elements) =>
         val a = newTypeVariable()
         val listOfA = listOf(a)
@@ -1037,6 +1126,85 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
     }
   }
 
+  def processTypeClasses(typeClasses: List[Ast.TypeClassDeclaration]): Map[String, TTypeClass] = {
+    typeClasses.map { tc =>
+      val methods = tc.methods.map { m =>
+        (m.name, TScheme(tc.typeParams, m.typeSignature))
+      }
+      tc.name -> TTypeClass(tc.name, tc.typeParams, methods)
+    }.toMap
+  }
+  
+  def processInstances(instances: List[Ast.InstanceDeclaration], typeClasses: Map[String, TTypeClass]): Map[(String, Type), TInstance] = {
+    instances.map { inst =>
+      val methodTypes = inst.methods.map { m =>
+        // For now, use a simple type inference for instance methods
+        val funcType = m.body.optionalType.getOrElse {
+          val paramTypes = m.body.params.map(_ => newTypeVariable())
+          val returnType = newTypeVariable()
+          TFunction(paramTypes, returnType)
+        }
+        m.name -> funcType
+      }.toMap
+      
+      (inst.className, inst.forType) -> TInstance(inst.className, inst.forType, methodTypes)
+    }.toMap
+  }
+
+  // Instance resolution
+  def resolveInstance(env: TypeEnvironment, constraint: TConstraint, substitution: Substitution): Option[(TInstance, Substitution)] = {
+    val TConstraint(className, typeVar) = constraint
+    val targetType = substitution.replace(typeVar)
+    
+    env.findMatchingInstance(className, targetType) match {
+      case Some(instance) =>
+        // Unify the instance type with the target type to get proper substitutions
+        val freshVars = mutable.Map[TVariable, TVariable]()
+        def freshen(t: Type): Type = t match {
+          case tv@TVariable(name) =>
+            freshVars.getOrElseUpdate(tv, newTypeVariable(name))
+          case TConstructor(name, args) =>
+            TConstructor(name, args.map(freshen))
+          case TFunction(params, ret) =>
+            TFunction(params.map(freshen), freshen(ret))
+          case other => other
+        }
+        
+        val freshInstanceType = freshen(instance.forType)
+        try {
+          val s = unify(freshInstanceType, targetType, substitution)
+          Some((instance, s))
+        } catch {
+          case _: TyperException => None
+        }
+      case None => None
+    }
+  }
+  
+  // Resolve all constraints for a type
+  def resolveConstraints(env: TypeEnvironment, constraints: List[TConstraint], substitution: Substitution, location: Location): (Map[TConstraint, TInstance], Substitution) = {
+    constraints.foldLeft((Map.empty[TConstraint, TInstance], substitution)) { case ((resolved, s), constraint) =>
+      resolveInstance(env, constraint, s) match {
+        case Some((instance, s2)) =>
+          (resolved + (constraint -> instance), s2)
+        case None =>
+          val targetType = s.replace(constraint.typeVar)
+          typeError(location, s"No instance for ${constraint.className}[${targetType}]")
+      }
+    }
+  }
+
+  def normalizeTypeName(t: Type): String = t match {
+    case TInt => "Int"
+    case TString => "String"
+    case TBoolean => "Boolean"
+    case TFloat => "Float"
+    case TDouble => "Double"
+    case TUnit => "Unit"
+    case TConstructor(name, _) => name
+    case _ => "Unknown"
+  }
+
   def typeError(location: Location, message: String): Nothing = {
     throw TyperException(s"${location.format} ${message}")
   }
@@ -1046,8 +1214,25 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
     val s: Substitution = EmptySubstitution
     val recordEnvironment = doTypeRecords(program.records)
     this.recordEnvironment = recordEnvironment
-    val (typedExpression, _) = doType(program.block, TypeEnvironment(BuiltinEnvironment, Set.empty, BuiltinRecordEnvironment ++ recordEnvironment, BuiltinModuleEnvironment, None), tv, EmptySubstitution)
-    TypedAst.Program(program.location, Nil, typedExpression.asInstanceOf[TypedAst.Block], recordEnvironment)
+    
+    // Process type classes
+    val typeClasses = processTypeClasses(program.typeClasses)
+    
+    // Process instances
+    val instances = processInstances(program.instances, typeClasses)
+    
+    val env = TypeEnvironment(
+      BuiltinEnvironment, 
+      Set.empty, 
+      BuiltinRecordEnvironment ++ recordEnvironment, 
+      BuiltinModuleEnvironment, 
+      typeClasses,
+      instances,
+      None
+    )
+    
+    val (typedExpression, _) = doType(program.block, env, tv, EmptySubstitution)
+    TypedAst.Program(program.location, Nil, typedExpression.asInstanceOf[TypedAst.Block], recordEnvironment, typeClasses, instances)
   }
 
   override final val name: String = "Typer"
