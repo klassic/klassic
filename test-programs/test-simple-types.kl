@@ -1,0 +1,7 @@
+// Test simple types
+typeclass Test<'a> where {
+  f1: Int
+  f2: List<Int>
+}
+
+println("Simple types work")

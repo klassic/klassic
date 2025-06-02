@@ -1,0 +1,6 @@
+// Test higher-kinded type application
+typeclass Functor<'f: * => *> where {
+  map: (('a) => 'b, 'f<'a>) => 'f<'b>
+}
+
+println("Higher-kinded type application parsed successfully")

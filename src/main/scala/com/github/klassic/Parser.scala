@@ -193,11 +193,28 @@ class Parser extends Processor[String, Program, InteractiveSession] {
         case _ => false
       }
 
-      lazy val typeVariable: Parser[TVariable] = qident ^^ { id => TVariable(id) }
+      // Parse kind annotations: * or * -> * or (* -> *) -> *
+      lazy val kind: Parser[Kind] = rule {
+        CL(LPAREN) >> kind << CL(RPAREN)
+          | CL(ASTER) ~ (CL(ARROW1) >> kind).? ^^ {
+          case _ ~ Some(k2) => Kind.Arrow(Kind.Star, k2)
+          case _ ~ None => Kind.Star
+        }
+      }
+
+      lazy val typeVariable: Parser[TVariable] = rule {
+        qident ~ (CL(COLON) >> kind).? ^^ { 
+          case id ~ Some(k) => TVariable(id, k)
+          case id ~ None => TVariable(id)
+        }
+      }
 
       lazy val typeDescription: Parser[Type] = rule(
         constraint.repeat1By(CL(COMMA)) ~ (CL(ARROW1) >> typeDescription) ^^ { case constraints ~ baseType => TQualified(constraints, baseType) }
-          | qident ^^ { id => TVariable(id) }
+          | qident ~ (CL(LT) >> typeDescription.repeat0By(CL(COMMA)) << CL(GT)).? ^^ {
+            case id ~ Some(args) => TConstructor(id, args)  // Type variable applied to arguments
+            case id ~ None => TVariable(id)
+          }
           | ((CL(LPAREN) >> typeDescription.repeat0By(CL(COMMA)) << CL(RPAREN)) << CL(ARROW1)) ~ typeDescription ^^ { case args ~ returnType => TFunction(args, returnType) }
           | (SHARP >> sident).filter { s => !isBuiltinType(s) } ~ (CL(LT) >> typeDescription.repeat0By(CL(COMMA)) << CL(GT)).? ^^ {
           case name ~ Some(args) => TRecordReference(name, args)
@@ -219,6 +236,7 @@ class Parser extends Processor[String, Program, InteractiveSession] {
 
       lazy val constraint: Parser[TConstraint] = rule(
         sident ~ CL(LBRACKET) ~ typeVariable ~ CL(RBRACKET) ^^ { case className ~ _ ~ typeVar ~ _ => TConstraint(className, typeVar) }
+          | sident ~ CL(LT) ~ typeVariable ~ CL(GT) ^^ { case className ~ _ ~ typeVar ~ _ => TConstraint(className, typeVar) }
       )
 
       def root: Parser[Program] = rule(program)

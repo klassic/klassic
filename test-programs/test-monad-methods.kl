@@ -1,0 +1,7 @@
+// Test monad method signatures
+typeclass Monad<'m: * => *> where {
+  bind: Int
+  unit: Int
+}
+
+println("Monad methods work")

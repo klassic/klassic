@@ -1,0 +1,14 @@
+// Complete higher-kinded typeclass example
+
+// Functor typeclass
+typeclass Functor<'f: * => *> where {
+  map: (('a) => 'b, 'f<'a>) => 'f<'b>
+}
+
+// Monad typeclass
+typeclass Monad<'m: * => *> where {
+  bind: ('m<'a>, ('a) => 'm<'b>) => 'm<'b>;
+  pure: ('a) => 'm<'a>
+}
+
+println("Higher-kinded typeclasses parsed successfully")

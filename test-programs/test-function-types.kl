@@ -1,0 +1,7 @@
+// Test function types
+typeclass Test<'a> where {
+  f1: (Int) => Int
+  f2: (Int, Int) => Int
+}
+
+println("Function types work")

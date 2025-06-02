@@ -1,0 +1,5 @@
+// Simple debug
+
+val numbers = [1, 2, 3]
+val doubled = map(numbers)((x) => x * 2)
+println("Result: " + doubled)

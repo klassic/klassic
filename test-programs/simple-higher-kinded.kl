@@ -1,0 +1,4 @@
+// Simple test for kind parsing
+typeclass Functor<'f: *> where {
+  map: Int
+}

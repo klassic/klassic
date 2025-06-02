@@ -149,6 +149,41 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
   def newTypeVariable(name: String): TVariable = {
     m += 1; TVariable(name + m)
   }
+  def newTypeVariable(kind: Kind): Type = {
+    n += 1; TVariable("'a" + n, kind)
+  }
+
+  // Extract the type constructor from a type
+  // For example: List<Int> -> List, Option<String> -> Option
+  def extractTypeConstructor(t: Type): Option[(String, List[Type])] = t match {
+    case TConstructor(name, args, _) if name.startsWith("'") => 
+      // This is a type variable applied to arguments (e.g., 'f<'a>)
+      Some((name, args))
+    case TConstructor(name, args, _) => 
+      // This is a concrete type constructor (e.g., List<Int>)
+      Some((name, args))
+    case _ => None
+  }
+
+  // Find which argument position contains the typeclass parameter
+  def findTypeClassParameterPosition(methodType: Type, typeClassParam: TVariable): Option[Int] = {
+    def containsTypeParam(t: Type, param: TVariable): Boolean = t match {
+      case TVariable(name, _) => name == param.name
+      case TConstructor(name, args, _) => 
+        name == param.name || args.exists(containsTypeParam(_, param))
+      case TFunction(params, ret) => 
+        params.exists(containsTypeParam(_, param)) || containsTypeParam(ret, param)
+      case _ => false
+    }
+    
+    methodType match {
+      case TFunction(params, _) =>
+        params.zipWithIndex.find { case (paramType, _) => 
+          containsTypeParam(paramType, typeClassParam)
+        }.map(_._2)
+      case _ => None
+    }
+  }
 
   val EmptySubstitution: Substitution = Map.empty
 
@@ -191,12 +226,12 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
           worklist = rest
         case (TDynamic, TDynamic) :: rest =>
           worklist = rest
-        case (TVariable(a), TVariable(b)) :: rest if a == b =>
+        case (TVariable(a, _), TVariable(b, _)) :: rest if a == b =>
           worklist = rest
-        case (TVariable(a), other) :: rest if !(typeVariables(other) contains a) =>
+        case (TVariable(a, _), other) :: rest if !(typeVariables(other) contains a) =>
           current_s = current_s.extend(TVariable(a), other)
           worklist = rest.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
-        case (other, TVariable(a)) :: rest =>
+        case (other, TVariable(a, _)) :: rest =>
           worklist = ((TVariable(a), other) :: rest).map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
         case (TRecord(ts1, row1), TRecord(ts2, row2)) :: rest =>
           val next_worklist = (ts1 zip ts2).map{ case (t1, t2) => (t1, t2)} ::: ((row1, row2) :: rest)
@@ -231,7 +266,20 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         case (TFunction(t1, t2), TFunction(u1, u2)) :: rest if t1.size == u1.size =>
           val next_worklist = (t1 zip u1).map{ case (t1, u1) => (t1, u1)} ::: ((t2, u2) :: rest)
           worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
-        case (TConstructor(k1, ts), TConstructor(k2, us)) :: rest if k1 == k2 =>
+        // Handle type constructor with type variable (e.g., 'f<Int> with List<Int>)
+        case (TConstructor(k1, ts, _), TConstructor(k2, us, _)) :: rest if k1.startsWith("'") && ts.length == us.length =>
+          // k1 is a type variable applied to arguments, unify it with the constructor k2
+          val typeVar = TVariable(k1)
+          current_s = current_s.extend(typeVar, TConstructor(k2, Nil))
+          val next_worklist = (ts zip us).map{ case (t, u) => (t, u)} ::: rest
+          worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (TConstructor(k1, ts, _), TConstructor(k2, us, _)) :: rest if k2.startsWith("'") && ts.length == us.length =>
+          // k2 is a type variable applied to arguments, unify it with the constructor k1
+          val typeVar = TVariable(k2)
+          current_s = current_s.extend(typeVar, TConstructor(k1, Nil))
+          val next_worklist = (ts zip us).map{ case (t, u) => (t, u)} ::: rest
+          worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (TConstructor(k1, ts, _), TConstructor(k2, us, _)) :: rest if k1 == k2 =>
           val next_worklist = (ts zip us).map{ case (t, u) => (t, u)} ::: rest
           worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
         case (t, u) :: _ =>
@@ -248,7 +296,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
   }
 
   def toList(row: Type): (List[(String, Type)], Option[TVariable]) = row match {
-    case tv@TVariable(_) => (Nil, Some(tv))
+    case tv@TVariable(_, _) => (Nil, Some(tv))
     case TRowEmpty => (Nil, None)
     case TRowExtend(l, t, r) =>
       val (ls, mv) = toList(r)
@@ -260,7 +308,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
     case TRowEmpty => typeError(current.location, s"label ${newLabel} cannot be inserted")
     case TRowExtend(label, labelType, rowTail) if newLabel == label =>
       (labelType, rowTail, s)
-    case TRowExtend(label, labelType, alpha@TVariable(_)) =>
+    case TRowExtend(label, labelType, alpha@TVariable(_, _)) =>
       val beta = newTypeVariable("r")
       val gamma = newTypeVariable("a")
       (gamma, TRowExtend(label, labelType, beta), s.extend(alpha, TRowExtend(newLabel, gamma, beta)))
@@ -416,7 +464,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
             (TBoolean, unify(x, y, s2))
           case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
             (TBoolean, unify(x, y, s2))
-          case (a@TConstructor(n1, ts1), b@TConstructor(n2, ts2)) if n2 == n2  && ts1.length == ts2.length =>
+          case (a@TConstructor(n1, ts1, _), b@TConstructor(n2, ts2, _)) if n2 == n2  && ts1.length == ts2.length =>
             val sx = (ts1 zip ts2).foldLeft(s0) { case (s, (t1, t2)) =>
                 unify(t1, t2, s)
             }
@@ -459,7 +507,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
             (TBoolean, unify(x, y, s2))
           case (x, y: TVariable) if !x.isInstanceOf[TVariable] =>
             (TBoolean, unify(x, y, s2))
-          case (a@TConstructor(n1, ts1), b@TConstructor(n2, ts2)) if n2 == n2  && ts1.length == ts2.length =>
+          case (a@TConstructor(n1, ts1, _), b@TConstructor(n2, ts2, _)) if n2 == n2  && ts1.length == ts2.length =>
             val sx = (ts1 zip ts2).foldLeft(s0) { case (s, (t1, t2)) =>
                 unify(t1, t2, s)
             }
@@ -962,30 +1010,68 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
                 }
                 val typedArgsRev = typedArgs.reverse
                 
-                // Get the type of the first argument to determine which instance to use
-                val firstArgType = s1.replace(argTypes.head)
+                // Find the method signature in the typeclass
+                val methodScheme = tc.methods.find(_._1 == name).map(_._2).getOrElse {
+                  typeError(location, s"Method $name not found in typeclass ${tc.name}")
+                }
+                
+                // Determine which argument contains the typeclass parameter
+                val tcParam = tc.typeParams.headOption.getOrElse {
+                  typeError(location, s"Typeclass ${tc.name} has no type parameters")
+                }
+                
+                val argPosition = findTypeClassParameterPosition(methodScheme.stype, tcParam).getOrElse(0)
+                
+                // Get the type constructor from the appropriate argument
+                val instanceType = if (argPosition < argTypes.length) {
+                  val argType = s1.replace(argTypes(argPosition))
+                  // For higher-kinded typeclasses, we need just the constructor
+                  // For regular typeclasses, we need the full type
+                  if (tcParam.kind != Kind.Star) {
+                    // Higher-kinded typeclass - extract just the constructor
+                    extractTypeConstructor(argType) match {
+                      case Some((name, _)) if name.startsWith("'") =>
+                        // It's a type variable, we need to look at the actual type
+                        argType match {
+                          case TConstructor(n, _, _) => TConstructor(n, Nil)  // Just the constructor
+                          case _ => argType
+                        }
+                      case Some((name, _)) =>
+                        // It's a concrete type constructor
+                        TConstructor(name, Nil)
+                      case None =>
+                        // Not a type constructor application, use the whole type
+                        argType
+                    }
+                  } else {
+                    // Regular typeclass - use the full type
+                    argType
+                  }
+                } else {
+                  s1.replace(argTypes.head)
+                }
                 
                 // Find the matching instance
-                env.findMatchingInstance(tc.name, firstArgType) match {
+                env.findMatchingInstance(tc.name, instanceType) match {
                   case Some(instance) =>
                     // Create a reference to the instance method
                     val instanceMethod = instance.methods.get(name) match {
                       case Some(methodType) =>
                         // For now, we'll create a special marker that the runtime will resolve
                         // In a real implementation, this would be dictionary passing or method resolution
-                        val methodId = TypedAst.Id(methodType, location, s"${tc.name}_${normalizeTypeName(firstArgType)}_${name}")
+                        val methodId = TypedAst.Id(methodType, location, s"${tc.name}_${normalizeTypeName(instanceType)}_${name}")
                         
                         // Type the method call
                         val s2 = unify(methodType, TFunction(argTypes, t), s1)
                         (TypedAst.FunctionCall(s2.replace(t), location, methodId, typedArgsRev), s2)
                         
                       case None =>
-                        typeError(location, s"Instance for ${tc.name}[${firstArgType}] doesn't implement method $name")
+                        typeError(location, s"Instance for ${tc.name}[${instanceType}] doesn't implement method $name")
                     }
                     instanceMethod
                     
                   case None =>
-                    typeError(location, s"No instance for ${tc.name}[${firstArgType}]")
+                    typeError(location, s"No instance for ${tc.name}[${instanceType}]")
                 }
                 
               case None =>
@@ -1101,7 +1187,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         case TRowExtend(l2, l2Type, rowTail) =>
           val (r, sx) = go(rowTail)
           (TRowExtend(l2, l2Type, r), sx)
-        case tv@TVariable(_) =>
+        case tv@TVariable(_, _) =>
           (TRowExtend(l1, l1Type, rowVariable), s)
         case t =>
           sys.error("cannot reach here in insert: " + t)
@@ -1138,7 +1224,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
                 }
             }
         }
-      case tv@(TVariable(_)) =>
+      case tv@(TVariable(_, _)) =>
         val a = newTypeVariable("a")
         val r = newTypeVariable("r")
         val (record, s2) = insert(TRecord(Nil, r), memberName, a, r, s1)
@@ -1219,9 +1305,9 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         // Unify the instance type with the target type to get proper substitutions
         val freshVars = mutable.Map[TVariable, TVariable]()
         def freshen(t: Type): Type = t match {
-          case tv@TVariable(name) =>
+          case tv@TVariable(name, _) =>
             freshVars.getOrElseUpdate(tv, newTypeVariable(name))
-          case TConstructor(name, args) =>
+          case TConstructor(name, args, _) =>
             TConstructor(name, args.map(freshen))
           case TFunction(params, ret) =>
             TFunction(params.map(freshen), freshen(ret))
@@ -1259,8 +1345,11 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
     case TFloat => "Float"
     case TDouble => "Double"
     case TUnit => "Unit"
-    case TConstructor("List", List(TInt)) => "List<Int>"
-    case TConstructor(name, _) => name
+    case TConstructor("List", args, _) if args.nonEmpty => 
+      s"List<${args.map(normalizeTypeName).mkString(", ")}>"
+    case TConstructor(name, Nil, _) => name
+    case TConstructor(name, args, _) => 
+      s"$name<${args.map(normalizeTypeName).mkString(", ")}>"
     case _ => "Unknown"
   }
 

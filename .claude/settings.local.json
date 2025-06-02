@@ -10,7 +10,10 @@
       "Bash(sed:*)",
       "Bash(mkdir:*)",
       "Bash(mv:*)",
-      "Bash(scala:*)"
+      "Bash(scala:*)",
+      "Bash(java:*)",
+      "Bash(true)",
+      "Bash(ls:*)"
     ]
   },
   "enableAllProjectMcpServers": false

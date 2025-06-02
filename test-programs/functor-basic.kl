@@ -1,0 +1,13 @@
+// Basic Functor test
+
+// For now, let's use the existing syntax
+typeclass Functor<'f> where {
+  map: Int  // Simplified for now
+}
+
+// Instance for List
+instance Functor<List> where {
+  def map(x: Int): Int = x
+}
+
+println("Basic functor works")

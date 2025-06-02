@@ -1,0 +1,7 @@
+// Test multiple methods in typeclass
+typeclass Test<'a> where {
+  foo: Int
+  bar: String
+}
+
+println("Multiple methods work")

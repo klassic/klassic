@@ -22,7 +22,7 @@ object BuiltinEnvironments {
   }
 
   def toList(row: Type): List[(String, Type)] = row match {
-    case tv@TVariable(_) => sys.error("cannot reach here")
+    case tv@TVariable(_, _) => sys.error("cannot reach here")
     case TRowExtend(l, t, extension) => (l -> t) :: toList(extension)
     case TRowEmpty => Nil
     case otherwise => throw TyperPanic("Unexpected: " + otherwise)

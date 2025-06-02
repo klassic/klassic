@@ -1,0 +1,15 @@
+// Test higher-kinded typeclasses
+
+// Define a Functor typeclass with a higher-kinded type parameter
+typeclass Functor<'f: * => *> where {
+  map: (('a) => 'b, 'f<'a>) => 'f<'b>
+}
+
+// Define a Monad typeclass
+typeclass Monad<'m: * => *> where {
+  bind: ('m<'a>, ('a) => 'm<'b>) => 'm<'b>;
+  pure: ('a) => 'm<'a>
+}
+
+// Test passes if typeclasses can be parsed successfully
+println("Higher-kinded typeclasses parsed successfully")

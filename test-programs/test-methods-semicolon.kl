@@ -1,0 +1,7 @@
+// Test methods with semicolon
+typeclass Test<'a> where {
+  method1: Int;
+  method2: Int
+}
+
+println("Semicolon works")

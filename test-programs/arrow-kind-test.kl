@@ -1,0 +1,6 @@
+// Test arrow kind parsing
+typeclass Test<'f: * => *> where {
+  foo: Int
+}
+
+println("Arrow kind parsed successfully")

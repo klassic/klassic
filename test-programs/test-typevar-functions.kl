@@ -1,0 +1,6 @@
+// Test function types with type variables
+typeclass Functor<'f> where {
+  map: ('a, 'b) => 'f<'a>
+}
+
+println("Type variable functions work")

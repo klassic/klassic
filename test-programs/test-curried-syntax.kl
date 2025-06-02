@@ -1,0 +1,7 @@
+// Test curried function syntax
+typeclass Functor<'f> where {
+  // Using parentheses for arguments
+  map: (('a) => 'b, 'f<'a>) => 'f<'b>
+}
+
+println("Curried syntax works")

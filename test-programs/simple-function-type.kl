@@ -1,0 +1,5 @@
+// Test function type parsing
+val f: ('a) => 'b = null
+val g: (('a) => 'b) => 'c = null
+
+println("Function types parsed")

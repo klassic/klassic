@@ -109,7 +109,7 @@ class DictionaryTransformer {
       case (TInt, TInt) => true
       case (TString, TString) => true
       case (TBoolean, TBoolean) => true
-      case (TConstructor(n1, args1), TConstructor(n2, args2)) if n1 == n2 =>
+      case (TConstructor(n1, args1, _), TConstructor(n2, args2, _)) if n1 == n2 =>
         args1.zip(args2).forall { case (t1, t2) => typesMatch(t1, t2) }
       case _ => false
     }
@@ -119,7 +119,7 @@ class DictionaryTransformer {
     case TInt => "Int"
     case TString => "String"
     case TBoolean => "Boolean"
-    case TConstructor(name, _) => name
+    case TConstructor(name, _, _) => name
     case _ => "Unknown"
   }
 }

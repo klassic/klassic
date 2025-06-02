@@ -1,5 +1,15 @@
 package com.github.klassic
 
+// Kind system for higher-kinded types
+sealed abstract class Kind
+object Kind {
+  case object Star extends Kind { override def toString = "*" }
+  case class Arrow(from: Kind, to: Kind) extends Kind { override def toString = s"($from -> $to)" }
+  
+  // Helper to create arrow kinds
+  def arrow(kinds: Kind*): Kind = kinds.reduceRight(Arrow(_, _))
+}
+
 sealed abstract class Type(val image: String) {
   def ==>(returnType: Type): Type.TFunction = {
     Type.TFunction(List(this), returnType)
@@ -13,7 +23,7 @@ object Type {
     }
   }
 
-  case class TVariable(name: String) extends Row(name)
+  case class TVariable(name: String, kind: Kind = Kind.Star) extends Row(name)
 
   case object TInt extends Type("Int")
 
@@ -47,7 +57,7 @@ object Type {
 
   case class TRowExtend(l: String, t: Type, e: Type) extends Row(
     e match {
-      case TVariable(_) => s"${l}: ${t}; ..."
+      case TVariable(_, _) => s"${l}: ${t}; ..."
       case _ => s"${l}: ${t}; ${e}"
     }
   )
@@ -58,7 +68,7 @@ object Type {
 
   case class TScheme(svariables: List[TVariable], stype: Type, constraints: List[TConstraint] = Nil)
 
-  case class TConstructor(name: String, ts: List[Type]) extends Type(name + "<" + ts.mkString(", ") + ">")
+  case class TConstructor(name: String, ts: List[Type], kind: Kind = Kind.Star) extends Type(name + "<" + ts.mkString(", ") + ">")
 
   case class TConstraint(className: String, typeVar: TVariable) extends Type(s"${className}[${typeVar.name}]")
 

@@ -1,0 +1,7 @@
+// Test monad bind signature
+typeclass Monad<'m: * => *> where {
+  bind: ('m<'a>, ('a) => 'm<'b>) => 'm<'b>;
+  unit: ('a) => 'm<'a>
+}
+
+println("Monad bind works")

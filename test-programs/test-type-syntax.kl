@@ -1,0 +1,8 @@
+// Test various type syntaxes
+typeclass Test<'a> where {
+  f1: ('a, 'b) => 'c;
+  f2: List<'a> => List<'b>;
+  f3: ('a, 'b) => 'c
+}
+
+println("Type syntaxes work")

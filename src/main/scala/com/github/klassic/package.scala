@@ -2,7 +2,7 @@ package com.github
 
 import java.io.{BufferedReader, FileInputStream, InputStreamReader}
 
-import com.github.klassic.Type.{Row, TBoolean, TByte, TConstructor, TDouble, TDynamic, TError, TFloat, TFunction, TInt, TLong, TRecord, TRecordReference, TRowEmpty, TRowExtend, TScheme, TShort, TString, TUnit, TVariable}
+import com.github.klassic.Type.{Row, TBoolean, TByte, TConstructor, TConstraint, TDouble, TDynamic, TError, TFloat, TFunction, TInstance, TInt, TLong, TQualified, TRecord, TRecordReference, TRowEmpty, TRowExtend, TScheme, TShort, TString, TTypeClass, TUnit, TVariable}
 
 import scala.language.reflectiveCalls
 
@@ -46,7 +46,7 @@ package object klassic {
     }
 
     def replace(ty: Type): Type = ty match {
-      case tv@TVariable(a) =>
+      case tv@TVariable(a, _) =>
         val u = lookup(tv)
         if (ty == u) ty else replace(u)
       case TFunction(t1, t2) =>
@@ -81,7 +81,31 @@ package object klassic {
         TDynamic
       case TError =>
         TError
-      case TConstructor(name, args) => TConstructor(name, args.map{ arg => replace(arg)})
+      case TConstructor(name, args, kind) => 
+        // Check if the constructor name is a type variable that we need to substitute
+        if (name.startsWith("'")) {
+          self.get(TVariable(name)) match {
+            case Some(TConstructor(newName, _, _)) =>
+              // Replace the type variable with the constructor
+              TConstructor(newName, args.map(replace), kind)
+            case Some(other) =>
+              // This shouldn't happen in well-typed programs
+              TConstructor(name, args.map(replace), kind)
+            case None =>
+              // No substitution for this type variable
+              TConstructor(name, args.map(replace), kind)
+          }
+        } else {
+          TConstructor(name, args.map(replace), kind)
+        }
+      case TConstraint(className, typeVar) =>
+        TConstraint(className, replace(typeVar).asInstanceOf[TVariable])
+      case TQualified(constraints, baseType) =>
+        TQualified(constraints.map(c => replace(c).asInstanceOf[TConstraint]), replace(baseType))
+      case TTypeClass(name, typeParams, methods) =>
+        TTypeClass(name, typeParams, methods)
+      case TInstance(className, forType, methods) =>
+        TInstance(className, replace(forType), methods.view.mapValues(replace).toMap)
     }
 
     def apply(env: Environment): Environment = {
@@ -106,11 +130,11 @@ package object klassic {
   def typeVariables(r: Row): List[TVariable] = r match {
     case TRowExtend(l, t, e) => typeVariables(t) concat typeVariables(e)
     case TRowEmpty => Nil
-    case tv@TVariable(_) => List(tv)
+    case tv@TVariable(_, _) => List(tv)
   }
 
   def typeVariables(t: Type): List[TVariable] = t match {
-    case tv @ TVariable(a) =>
+    case tv @ TVariable(a, _) =>
       List(tv)
     case TInt =>
       Nil
@@ -144,8 +168,18 @@ package object klassic {
       typeVariables(r) concat typeVariables(t)
     case TRecord(ts, row) =>
       ts concat typeVariables(row)
-    case TConstructor(k, ts) =>
-      ts.foldLeft(List[TVariable]()){ (tvs, t) => tvs concat typeVariables(t)}
+    case TConstructor(k, ts, _) =>
+      // If the constructor name is a type variable, include it
+      val ctorVars = if (k.startsWith("'")) List(TVariable(k)) else Nil
+      ctorVars ++ ts.flatMap(typeVariables)
+    case TConstraint(_, tv) =>
+      List(tv)
+    case TQualified(constraints, baseType) =>
+      constraints.flatMap(c => typeVariables(c)) ++ typeVariables(baseType)
+    case TTypeClass(_, typeParams, _) =>
+      typeParams
+    case TInstance(_, forType, _) =>
+      typeVariables(forType)
   }
 
   def typeVariables(ts: TScheme): List[TVariable] = {

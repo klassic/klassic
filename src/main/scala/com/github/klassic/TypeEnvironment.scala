@@ -68,8 +68,8 @@ case class TypeEnvironment(
   
   private def canMatch(instanceType: Type, targetType: Type): Boolean = {
     (instanceType, targetType) match {
-      case (TVariable(_), _) => true // Type variables match anything
-      case (TConstructor(n1, args1), TConstructor(n2, args2)) if n1 == n2 && args1.length == args2.length =>
+      case (TVariable(_, _), _) => true // Type variables match anything
+      case (TConstructor(n1, args1, _), TConstructor(n2, args2, _)) if n1 == n2 && args1.length == args2.length =>
         args1.zip(args2).forall { case (t1, t2) => canMatch(t1, t2) }
       case (t1, t2) => t1 == t2
     }

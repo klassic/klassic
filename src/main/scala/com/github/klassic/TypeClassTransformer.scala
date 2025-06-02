@@ -90,7 +90,7 @@ class TypeClassTransformer {
     case TFloat => "Float"
     case TDouble => "Double"
     case TUnit => "Unit"
-    case TConstructor(name, _) => name
+    case TConstructor(name, _, _) => name
     case _ => "Unknown"
   }
   

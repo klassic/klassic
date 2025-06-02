@@ -1,0 +1,30 @@
+// Higher-kinded typeclasses without constrained functions
+
+// Functor typeclass
+typeclass Functor<'f: * => *> where {
+  map: (('a) => 'b, 'f<'a>) => 'f<'b>
+}
+
+// Monad typeclass  
+typeclass Monad<'m: * => *> where {
+  bind: ('m<'a>, ('a) => 'm<'b>) => 'm<'b>;
+  unit: ('a) => 'm<'a>
+}
+
+// Instance of Functor for List
+instance Functor<List> where {
+  def map(f: ('a) => 'b, xs: List<'a>): List<'b> = {
+    xs.map(f)
+  }
+}
+
+// Test function - no constraints for now
+def doubleAll(xs: List<Int>): List<Int> = {
+  map((x) => x * 2, xs)
+}
+
+// Test
+val numbers = [1, 2, 3, 4, 5]
+val doubled = doubleAll(numbers)
+println("Original: " + numbers)
+println("Doubled: " + doubled)

@@ -43,7 +43,7 @@ class TypeClassResolver {
     case TBoolean => "Boolean"
     case TFloat => "Float"
     case TDouble => "Double"
-    case TConstructor(name, _) => name
+    case TConstructor(name, _, _) => name
     case _ => "Unknown"
   }
   
