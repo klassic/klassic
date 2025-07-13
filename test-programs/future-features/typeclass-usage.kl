@@ -1,0 +1,89 @@
+// Practical type class usage example
+
+// Define Show type class
+typeclass Show<'a> where {
+  show: ('a) => String
+}
+
+// Define Eq type class  
+typeclass Eq<'a> where {
+  eq: ('a, 'a) => Boolean
+  neq: ('a, 'a) => Boolean
+}
+
+// Instance for Int
+instance Show<Int> where {
+  def show(x: Int): String = x.toString()
+}
+
+instance Eq<Int> where {
+  def eq(x: Int, y: Int): Boolean = x == y
+  def neq(x: Int, y: Int): Boolean = x != y
+}
+
+// Instance for String
+instance Show<String> where {
+  def show(x: String): String = "\"" + x + "\""
+}
+
+instance Eq<String> where {
+  def eq(x: String, y: String): Boolean = x == y
+  def neq(x: String, y: String): Boolean = x != y
+}
+
+// Custom record type
+record Point {
+  x: Int
+  y: Int
+}
+
+// Instance for Point
+instance Show<Point> where {
+  def show(p: Point): String = 
+    "Point(" + show(p.x) + ", " + show(p.y) + ")"
+}
+
+instance Eq<Point> where {
+  def eq(p1: Point, p2: Point): Boolean = 
+    eq(p1.x, p2.x) && eq(p1.y, p2.y)
+  def neq(p1: Point, p2: Point): Boolean = 
+    !eq(p1, p2)
+}
+
+// Using type class methods
+println("=== Show examples ===")
+println(show(42))
+println(show("Hello"))
+val p1 = #Point(10, 20)
+val p2 = #Point(10, 20)
+val p3 = #Point(5, 10)
+println(show(p1))
+
+println("\n=== Eq examples ===")
+println("42 == 42: " + eq(42, 42))
+println("42 != 43: " + neq(42, 43))
+println("p1 == p2: " + eq(p1, p2))
+println("p1 != p3: " + neq(p1, p3))
+
+// Simulating polymorphic behavior manually
+// (since constraint syntax might not be fully implemented)
+def showPair(x: *, y: *): String = {
+  // In a real implementation with constraints, this would be:
+  // def showPair<'a>(x: 'a, y: 'a): String where Show<'a>
+  "(" + show(x) + ", " + show(y) + ")"
+}
+
+println("\n=== Using showPair ===")
+println(showPair(1, 2))
+println(showPair("foo", "bar"))
+println(showPair(p1, p3))
+
+// List of showable items
+val items = [
+  show(100),
+  show("Klassic"),
+  show(#Point(3, 4))
+]
+
+println("\n=== List of shown items ===")
+println(join(items, " | "))

@@ -22,7 +22,7 @@ object TypedAst {
 
   case object FloatSuffix extends FloatSuffix
 
-  case class Program(location: Location, imports: List[Import], block: Block, records: RecordEnvironment, typeClasses: Map[String, Type.TTypeClass], instances: Map[(String, Type), Type.TInstance])
+  case class Program(location: Location, imports: List[Import], block: Block, records: RecordEnvironment, typeClasses: Map[String, Type.TTypeClass], instances: Map[(String, Type), Type.TInstance], instanceDeclarations: List[Ast.InstanceDeclaration] = Nil)
 
   case class Import(location: Location, simpleName: String, fqcn: String)
 
@@ -39,6 +39,8 @@ object TypedAst {
   case class MinusOp(type_ : Type, location: Location, operand: TypedNode) extends TypedNode
 
   case class PlusOp(type_ : Type, location: Location, operand: TypedNode) extends TypedNode
+  
+  case class NotOp(type_ : Type, location: Location, operand: TypedNode) extends TypedNode
 
   case class StringNode(type_ : Type, location: Location, value: String) extends TypedNode
 

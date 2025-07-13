@@ -10,6 +10,7 @@ class Evaluator extends (String => Value) {
   val typer = new Typer
   val placeholderDesugerer = new PlaceholderDesugerer
   val rewriter = new SyntaxRewriter
+  val typeClassTransformer = new TypeClassTransformer
   val vmInterpreter = new vm.VmInterpreter
   override final def apply(program: String): Value = {
     evaluateString(program)
@@ -30,6 +31,7 @@ class Evaluator extends (String => Value) {
     val parsedProgram = parser.process(program, session)
     val placeHolderIsDesugaredProgram = placeholderDesugerer.process(parsedProgram, session)
     val rewrittenProgram = rewriter.process(placeHolderIsDesugaredProgram, session)
+    // val transformedProgram = typeClassTransformer.transform(rewrittenProgram) 
     val typedProgram = typer.process(rewrittenProgram, session)
     
     vmInterpreter.process(typedProgram, session)
@@ -40,6 +42,7 @@ class Evaluator extends (String => Value) {
     val parsedProgram = parser.process(program, session)
     val placeHolderIsDesugaredProgram = placeholderDesugerer.process(parsedProgram, session)
     val rewrittenProgram = rewriter.process(placeHolderIsDesugaredProgram, session)
+    // val transformedProgram = typeClassTransformer.transform(rewrittenProgram) 
     val typedProgram = typer.process(rewrittenProgram, session)
     vmInterpreter.process(typedProgram, session)
   }

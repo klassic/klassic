@@ -1,0 +1,61 @@
+// Comprehensive type class demo showing polymorphic usage
+
+typeclass Show<'a> where {
+  show: ('a) => String
+}
+
+instance Show<Int> where {
+  def show(x: Int): String = "Int(" + x + ")"
+}
+
+instance Show<String> where {
+  def show(x: String): String = "String(\"" + x + "\")"
+}
+
+instance Show<Boolean> where {
+  def show(x: Boolean): String = "Bool(" + x + ")"
+}
+
+// Test direct calls
+println("Direct calls:")
+println(show(42))
+println(show("hello"))
+println(show(true))
+
+// Test with a polymorphic function
+def showTwice(x) = show(x) + ", " + show(x)
+
+println("\nPolymorphic function:")
+println(showTwice(123))
+println(showTwice("world"))
+
+// Test with lists
+def showList(xs) = {
+  val items = xs.map(show)
+  "[" + items.join(", ") + "]"
+}
+
+println("\nShowing lists:")
+println(showList([1, 2, 3]))
+println(showList(["a", "b", "c"]))
+
+// Multiple type class example
+typeclass Eq<'a> where {
+  equals: ('a, 'a) => Boolean
+}
+
+instance Eq<Int> where {
+  def equals(x: Int, y: Int): Boolean = x == y
+}
+
+instance Eq<String> where {
+  def equals(x: String, y: String): Boolean = x == y
+}
+
+println("\nEquality tests:")
+println(equals(5, 5))
+println(equals(5, 6))
+println(equals("foo", "foo"))
+println(equals("foo", "bar"))
+
+"Success!"

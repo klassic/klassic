@@ -303,6 +303,13 @@ class VirtualMachine(moduleEnv: ModuleEnvironment, recordEnv: RecordEnvironment)
           push(performNeg(pop()))
           pc += 1
           
+        case Not =>
+          pop() match {
+            case BoxedBoolean(b) => push(BoxedBoolean(!b))
+            case _ => throw new RuntimeException("type error on not")
+          }
+          pc += 1
+          
         case Equal =>
           val b = pop()
           val a = pop()

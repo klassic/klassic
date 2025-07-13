@@ -89,6 +89,8 @@ class VmCompiler {
       compileNode(op, code); code += Neg
     case PlusOp(_, _, op) =>
       compileNode(op, code)
+    case NotOp(_, _, op) =>
+      compileNode(op, code); code += Not
     case IfExpression(_, _, cond, thenN, elseN) =>
       compileNode(cond, code)
       val jmpFalsePos = code.length
@@ -159,5 +161,13 @@ class VmCompiler {
     case ValueNode(v) => code += Push(v)
     case ForeachExpression(_, _, _, _, _) =>
       throw new RuntimeException("ForeachExpression should have been desugared")
+    case DictionaryAccess(_, _, dictionary, methodName) =>
+      compileNode(dictionary, code)
+      code += GetField(methodName)
+    case DictionaryCall(_, _, dictionary, methodName, params) =>
+      compileNode(dictionary, code)
+      code += GetField(methodName)
+      params.foreach(compileNode(_, code))
+      code += Call(params.length)
   }
 }

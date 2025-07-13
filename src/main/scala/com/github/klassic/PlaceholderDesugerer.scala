@@ -104,6 +104,16 @@ class PlaceholderDesugerer extends Processor[Ast.Program, Ast.Program, Interacti
       } else {
         x.copy(operand = xOperand)
       }
+    case x@NotOp(location, operand) =>
+      val xOperand = doRewrite(x.operand)
+      if(manager.hasPlaceholder) {
+        val formalParameters = manager.placeholders.map{name => FormalParameterOptional(name, None)}
+        val result = Lambda(location, formalParameters, None, x.copy(operand = xOperand))
+        manager.reset()
+        result
+      } else {
+        x.copy(operand = xOperand)
+      }
     case literal@StringNode(location, value) =>
       literal
     case literal@IntNode(location, value) =>

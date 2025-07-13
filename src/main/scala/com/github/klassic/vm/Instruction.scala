@@ -12,6 +12,7 @@ case object Sub extends Instruction
 case object Mul extends Instruction
 case object Div extends Instruction
 case object Neg extends Instruction
+case object Not extends Instruction
 case object Equal extends Instruction
 case object NotEqual extends Instruction
 case object LessThan extends Instruction

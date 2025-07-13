@@ -1,0 +1,98 @@
+// Type class example with polymorphic functions
+
+// Define Show type class
+typeclass Show<'a> where {
+  show: ('a) => String
+}
+
+// Define Eq type class
+typeclass Eq<'a> where {
+  eq: ('a, 'a) => Boolean
+}
+
+// Instances for Int
+instance Show<Int> where {
+  def show(x: Int): String = "Int(" + x + ")"
+}
+
+instance Eq<Int> where {
+  def eq(x: Int, y: Int): Boolean = x == y
+}
+
+// Instances for String
+instance Show<String> where {
+  def show(x: String): String = "\"" + x + "\""
+}
+
+instance Eq<String> where {
+  def eq(x: String, y: String): Boolean = x == y
+}
+
+// Instance for Boolean
+instance Show<Boolean> where {
+  def show(x: Boolean): String = if(x) "true" else "false"
+}
+
+// Polymorphic function using Show constraint
+def display<'a>(x: 'a): Unit where Show<'a> = {
+  println("Displaying: " + show(x))
+}
+
+// Polymorphic function using multiple constraints
+def showIfEqual<'a>(x: 'a, y: 'a): String where Show<'a>, Eq<'a> = {
+  if(eq(x, y)) {
+    "They are equal: " + show(x)
+  } else {
+    show(x) + " != " + show(y)
+  }
+}
+
+// Test polymorphic functions
+println("=== Testing polymorphic display ===")
+display(42)
+display("Hello, Klassic!")
+display(true)
+
+println("\n=== Testing showIfEqual ===")
+println(showIfEqual(10, 10))
+println(showIfEqual(10, 20))
+println(showIfEqual("foo", "foo"))
+println(showIfEqual("foo", "bar"))
+
+// Polymorphic function that creates a list of string representations
+def showList<'a>(items: List<'a>): List<String> where Show<'a> = {
+  map(items)((item) => show(item))
+}
+
+println("\n=== Testing showList ===")
+val numbers = [1, 2, 3, 4, 5]
+val strings = showList(numbers)
+println("Original: " + show(numbers))  // This would need Show<List<Int>>
+println("As strings: " + join(strings, ", "))
+
+// Define a custom type
+record Person {
+  name: String
+  age: Int
+}
+
+// Instance for Person
+instance Show<Person> where {
+  def show(p: Person): String = 
+    "Person(name=" + show(p.name) + ", age=" + show(p.age) + ")"
+}
+
+instance Eq<Person> where {
+  def eq(p1: Person, p2: Person): Boolean = 
+    eq(p1.name, p2.name) && eq(p1.age, p2.age)
+}
+
+println("\n=== Testing with custom type ===")
+val alice = #Person("Alice", 30)
+val bob = #Person("Bob", 25)
+val alice2 = #Person("Alice", 30)
+
+display(alice)
+display(bob)
+println(showIfEqual(alice, alice2))
+println(showIfEqual(alice, bob))

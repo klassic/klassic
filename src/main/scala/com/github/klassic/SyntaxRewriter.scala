@@ -74,6 +74,7 @@ class SyntaxRewriter extends Processor[Ast.Program, Ast.Program, InteractiveSess
       BinaryExpression(location, operator, doRewrite(lhs), doRewrite(rhs))
     case MinusOp(location, operand) => MinusOp(location, doRewrite(operand))
     case PlusOp(location, operand) => PlusOp(location, doRewrite(operand))
+    case NotOp(location, operand) => NotOp(location, doRewrite(operand))
     case literal@StringNode(location, value) => literal
     case literal@IntNode(location, value) => literal
     case literal@LongNode(location, value)  => literal
@@ -154,7 +155,9 @@ class SyntaxRewriter extends Processor[Ast.Program, Ast.Program, InteractiveSess
     case TernaryExpression(location, cond, th, el) => TernaryExpression(location, doRewrite(cond), doRewrite(th), doRewrite(el))
     case x@(EnumDeclaration(_, _, _, _) | EnumIn(_, _, _)
       |  FunctionDefinition(_, _, _, _) | Let(_, _, _, _, _, _)
-      |  LetRec(_, _, _, _, _) | MethodDefinition(_, _, _, _) | Placeholder(_)) =>
+      |  LetRec(_, _, _, _, _) | MethodDefinition(_, _, _, _) | Placeholder(_)
+      |  TypeClassDeclaration(_, _, _, _) | InstanceDeclaration(_, _, _, _)
+      |  ConstrainedLambda(_, _, _, _, _)) =>
       throw new RewriterPanic(x.toString)
   }
 

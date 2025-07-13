@@ -1,7 +1,8 @@
 package com.github.klassic
 
 import java.io.BufferedReader
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{Files, Path, Paths, StandardOpenOption}
+import java.nio.charset.StandardCharsets
 import java.util
 import java.util.stream.Collectors
 
@@ -98,6 +99,98 @@ object BuiltinEnvironments {
 
     define("matches") { case List(ObjectValue(s: String), ObjectValue(regex: String)) =>
       Value.boxBoolean(s.matches(regex))
+    }
+
+    define("split") { case List(ObjectValue(s: String), ObjectValue(delimiter: String)) =>
+      val parts = s.split(java.util.regex.Pattern.quote(delimiter))
+      Value.toKlassic(java.util.Arrays.asList(parts: _*))
+    }
+
+    define("join") { case List(ObjectValue(list: java.util.List[_]), ObjectValue(delimiter: String)) =>
+      val strings = list.asScala.map {
+        case ObjectValue(s: String) => s
+        case v => v.toString
+      }
+      ObjectValue(strings.mkString(delimiter))
+    }
+
+    define("trim") { case List(ObjectValue(s: String)) =>
+      ObjectValue(s.trim)
+    }
+
+    define("trimLeft") { case List(ObjectValue(s: String)) =>
+      ObjectValue(s.replaceAll("^\\s+", ""))
+    }
+
+    define("trimRight") { case List(ObjectValue(s: String)) =>
+      ObjectValue(s.replaceAll("\\s+$", ""))
+    }
+
+    define("replace") { case List(ObjectValue(s: String), ObjectValue(target: String), ObjectValue(replacement: String)) =>
+      ObjectValue(s.replace(target, replacement))
+    }
+
+    define("replaceAll") { case List(ObjectValue(s: String), ObjectValue(regex: String), ObjectValue(replacement: String)) =>
+      ObjectValue(s.replaceAll(regex, replacement))
+    }
+
+    define("toLowerCase") { case List(ObjectValue(s: String)) =>
+      ObjectValue(s.toLowerCase)
+    }
+
+    define("toUpperCase") { case List(ObjectValue(s: String)) =>
+      ObjectValue(s.toUpperCase)
+    }
+
+    define("startsWith") { case List(ObjectValue(s: String), ObjectValue(prefix: String)) =>
+      Value.boxBoolean(s.startsWith(prefix))
+    }
+
+    define("endsWith") { case List(ObjectValue(s: String), ObjectValue(suffix: String)) =>
+      Value.boxBoolean(s.endsWith(suffix))
+    }
+
+    define("contains") { case List(ObjectValue(s: String), ObjectValue(substring: String)) =>
+      Value.boxBoolean(s.contains(substring))
+    }
+
+    define("indexOf") { case List(ObjectValue(s: String), ObjectValue(substring: String)) =>
+      BoxedInt(s.indexOf(substring))
+    }
+
+    define("lastIndexOf") { case List(ObjectValue(s: String), ObjectValue(substring: String)) =>
+      BoxedInt(s.lastIndexOf(substring))
+    }
+
+    define("length") { case List(ObjectValue(s: String)) =>
+      BoxedInt(s.length)
+    }
+
+    define("isEmptyString") { case List(ObjectValue(s: String)) =>
+      Value.boxBoolean(s.isEmpty)
+    }
+
+    define("repeat") { case List(ObjectValue(s: String), BoxedInt(times)) =>
+      ObjectValue(s * times)
+    }
+
+    define("reverse") { case List(ObjectValue(s: String)) =>
+      ObjectValue(s.reverse)
+    }
+
+    define("format") { case args: List[Value] if args.nonEmpty =>
+      args.head match {
+        case ObjectValue(format: String) =>
+          val formatArgs = args.tail.map {
+            case ObjectValue(v) => v
+            case BoxedInt(v) => v.asInstanceOf[AnyRef]
+            case BoxedDouble(v) => v.asInstanceOf[AnyRef]
+            case BoxedBoolean(v) => v.asInstanceOf[AnyRef]
+            case v => v.toString
+          }
+          ObjectValue(format.format(formatArgs: _*))
+        case _ => throw InterpreterException("format: first argument must be a string")
+      }
     }
 
     define("sqrt") { case List(BoxedDouble(value)) =>
@@ -286,6 +379,8 @@ object BuiltinEnvironments {
     private final val SET          = "Set"
     private final val GPIO         = "GPIO"
     private final val FILE_INPUT   = "FileInput"
+    private final val FILE_OUTPUT  = "FileOutput"
+    private final val DIR          = "Dir"
 
     enter(LIST) {
       define("head") { case List(ObjectValue(list: java.util.List[_])) =>
@@ -535,6 +630,159 @@ object BuiltinEnvironments {
       }
       define("isEmpty") { case List(ObjectValue(self: java.util.Set[_])) =>
         Value.boxBoolean(self.isEmpty)
+      }
+    }
+    enter(FILE_OUTPUT) {
+      define("write") { case List(ObjectValue(path: String), ObjectValue(content: String)) =>
+        try {
+          Files.write(Paths.get(path), content.getBytes(StandardCharsets.UTF_8))
+          UnitValue
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to write file '$path': ${e.getMessage}")
+        }
+      }
+      
+      define("append") { case List(ObjectValue(path: String), ObjectValue(content: String)) =>
+        try {
+          Files.write(
+            Paths.get(path), 
+            content.getBytes(StandardCharsets.UTF_8),
+            StandardOpenOption.CREATE,
+            StandardOpenOption.APPEND
+          )
+          UnitValue
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to append to file '$path': ${e.getMessage}")
+        }
+      }
+      
+      define("writeLines") { case List(ObjectValue(path: String), ObjectValue(lines: java.util.List[_])) =>
+        try {
+          val stringLines = lines.asScala.map {
+            case ObjectValue(s: String) => s
+            case v => v.toString
+          }.asJava
+          Files.write(Paths.get(path), stringLines, StandardCharsets.UTF_8)
+          UnitValue
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to write lines to '$path': ${e.getMessage}")
+        }
+      }
+      
+      define("exists") { case List(ObjectValue(path: String)) =>
+        Value.boxBoolean(Files.exists(Paths.get(path)))
+      }
+      
+      define("delete") { case List(ObjectValue(path: String)) =>
+        try {
+          Files.deleteIfExists(Paths.get(path))
+          UnitValue
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to delete file '$path': ${e.getMessage}")
+        }
+      }
+    }
+    enter(DIR) {
+      define("list") { case List(ObjectValue(path: String)) =>
+        try {
+          val files = Files.list(Paths.get(path))
+            .map(_.getFileName.toString)
+            .collect(Collectors.toList())
+          Value.toKlassic(files)
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to list directory '$path': ${e.getMessage}")
+        }
+      }
+      
+      define("listFull") { case List(ObjectValue(path: String)) =>
+        try {
+          val files = Files.list(Paths.get(path))
+            .map(_.toString)
+            .collect(Collectors.toList())
+          Value.toKlassic(files)
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to list directory '$path': ${e.getMessage}")
+        }
+      }
+      
+      define("mkdir") { case List(ObjectValue(path: String)) =>
+        try {
+          Files.createDirectory(Paths.get(path))
+          UnitValue
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to create directory '$path': ${e.getMessage}")
+        }
+      }
+      
+      define("mkdirs") { case List(ObjectValue(path: String)) =>
+        try {
+          Files.createDirectories(Paths.get(path))
+          UnitValue
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to create directories '$path': ${e.getMessage}")
+        }
+      }
+      
+      define("exists") { case List(ObjectValue(path: String)) =>
+        Value.boxBoolean(Files.exists(Paths.get(path)))
+      }
+      
+      define("isDirectory") { case List(ObjectValue(path: String)) =>
+        Value.boxBoolean(Files.isDirectory(Paths.get(path)))
+      }
+      
+      define("isFile") { case List(ObjectValue(path: String)) =>
+        Value.boxBoolean(Files.isRegularFile(Paths.get(path)))
+      }
+      
+      define("delete") { case List(ObjectValue(path: String)) =>
+        try {
+          Files.deleteIfExists(Paths.get(path))
+          UnitValue
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to delete '$path': ${e.getMessage}")
+        }
+      }
+      
+      define("copy") { case List(ObjectValue(source: String), ObjectValue(target: String)) =>
+        try {
+          Files.copy(Paths.get(source), Paths.get(target))
+          UnitValue
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to copy '$source' to '$target': ${e.getMessage}")
+        }
+      }
+      
+      define("move") { case List(ObjectValue(source: String), ObjectValue(target: String)) =>
+        try {
+          Files.move(Paths.get(source), Paths.get(target))
+          UnitValue
+        } catch {
+          case e: Exception =>
+            throw InterpreterException(s"Failed to move '$source' to '$target': ${e.getMessage}")
+        }
+      }
+      
+      define("current") { case List() =>
+        ObjectValue(System.getProperty("user.dir"))
+      }
+      
+      define("home") { case List() =>
+        ObjectValue(System.getProperty("user.home"))
+      }
+      
+      define("temp") { case List() =>
+        ObjectValue(System.getProperty("java.io.tmpdir"))
       }
     }
   }

@@ -1,0 +1,30 @@
+// Test FileOutput module functionality
+
+// Test basic file writing
+FileOutput#write("test-output.txt", "Hello, Klassic!")
+println("File written successfully")
+
+// Test appending to file
+FileOutput#append("test-output.txt", "\nAppended line")
+println("Content appended successfully")
+
+// Test file existence check
+val exists = FileOutput#exists("test-output.txt")
+println("File exists: #{exists}")
+
+// Test writing multiple lines
+val lines = ["Line 1", "Line 2", "Line 3"]
+FileOutput#writeLines("test-lines.txt", lines)
+println("Multiple lines written")
+
+// Read back to verify
+val content = FileInput#all("test-output.txt")
+println("File content: #{content}")
+
+val readLines = FileInput#lines("test-lines.txt")
+println("Lines read: #{readLines}")
+
+// Clean up
+FileOutput#delete("test-output.txt")
+FileOutput#delete("test-lines.txt")
+println("Test files cleaned up")
