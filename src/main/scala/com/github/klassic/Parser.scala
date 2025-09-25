@@ -136,6 +136,8 @@ class Parser extends Processor[String, Program, InteractiveSession] {
       val WHILE: Parser[String]            = kwToken("while")
       val FOREACH: Parser[String]          = kwToken("foreach")
       val IMPORT: Parser[String]           = kwToken("import")
+      val AS: Parser[String]               = kwToken("as")
+      val MODULE: Parser[String]           = kwToken("module")
       val ENUM: Parser[String]             = kwToken("enum")
       val TRUE: Parser[String]             = kwToken("true")
       val FALSE: Parser[String]            = kwToken("false")
@@ -251,27 +253,46 @@ class Parser extends Processor[String, Program, InteractiveSession] {
       | (line ^^ (Right(_)))
       )
 
+      lazy val moduleDecl: Parser[String] = rule {
+        (CL(MODULE) >> fqcn) << TERMINATOR.?
+      }
+
       lazy val program: Parser[Program] = rule {
-        (SPACING >> %%) ~ grammar.? ~ ((topLevelElement << TERMINATOR.?).* << EOF) ^^ {
-          case location ~ grammar ~ elements =>
-            val (topLevel, lines) = elements.partition(_.isLeft)
+        (SPACING >> %%) ~ moduleDecl.? ~ grammar.? ~ ((topLevelElement << TERMINATOR.?).* << EOF) ^^ {
+          case location ~ moduleOpt ~ grammarOpt ~ elements =>
+            val (topLevel, _) = elements.partition(_.isLeft)
             val topLevelDecls = topLevel.map(_.swap.getOrElse(throw new RuntimeException("Expected Left")))
             val lineNodes = elements.collect { case Right(node) => node }
-            
+
             val imports = topLevelDecls.collect { case i: Import => i }
             val records = topLevelDecls.collect { case r: RecordDeclaration => r }
             val typeClasses = topLevelDecls.collect { case tc: TypeClassDeclaration => tc }
             val instances = topLevelDecls.collect { case i: InstanceDeclaration => i }
             val block = Block(location, lineNodes)
-            
-            Program(location, grammar, imports, records, typeClasses, instances, block)
+
+            Program(location, moduleOpt, grammarOpt, imports, records, typeClasses, instances, block)
+        }
+      }
+
+      lazy val importItems: Parser[(List[String], Set[String])] = rule {
+        ((CL(DOT).?) >> CL(LBRACE) >> ((ident ~ (CL(ARROW1) >> UNDERSCORE).?).repeat1By(CL(COMMA))) << CL(RBRACE)) ^^ {
+          case items =>
+            val (incs, excs) = items.foldLeft((List.empty[String], Set.empty[String])) {
+              case ((ins, exs), id ~ Some(_)) => (ins, exs + id.name)
+              case ((ins, exs), id ~ None)    => (id.name :: ins, exs)
+            }
+            (incs.reverse, excs)
         }
       }
 
       lazy val `import`: Parser[Import] = rule {
-        (%% << CL(IMPORT)) ~ fqcn.commit ^^ { case location ~ fqcn =>
-          val fragments = fqcn.split(".")
-          Import(location, fragments(fragments.length - 1), fqcn)
+        (%% << CL(IMPORT)) ~ fqcn.commit ~ (CL(AS) >> ident).? ~ importItems.? ^^ {
+          case location ~ fqcn ~ aliasOpt ~ itemsOpt =>
+            val fragments = fqcn.split("\\.")
+            val simple = if (fragments.nonEmpty) fragments(fragments.length - 1) else fqcn
+            val only = itemsOpt.flatMap { case (incs, _) => if (incs.nonEmpty) Some(incs) else None }
+            val excludes = itemsOpt.map(_._2).getOrElse(Set.empty[String])
+            Import(location, simple, fqcn, aliasOpt.map(_.name), only, excludes)
         }
       }
 
@@ -377,7 +398,7 @@ class Parser extends Processor[String, Program, InteractiveSession] {
       lazy val infix: Parser[Ast.Node] = rule {
         chainl(logicalOr)(
             (%% ~ CL(operator)) ^^ { case location ~ op => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, Id(location, op), List(lhs)), List(rhs)) }
-          | (%% ~ CL(selector)) ^^ { case location ~ sl => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, sl, List(lhs)), List(rhs)) }
+          | (%% ~ CL(selectorToken)) ^^ { case location ~ (m, n) => (lhs: Ast.Node, rhs: Ast.Node) => FunctionCall(location, FunctionCall(location, Selector(location, m, n), List(lhs)), List(rhs)) }
         )
       }
 
@@ -595,9 +616,14 @@ class Parser extends Processor[String, Program, InteractiveSession] {
         !KEYWORDS(n)
       } ^^ { case location ~ name => Id(location, name) }) << SPACING_WITHOUT_LF
 
-      def selector: Parser[Selector] = rule(((%% ~ component ~ "#" ~ component).filter { case (_ ~ m ~ _ ~ n) =>
-        (!KEYWORDS(m)) && (!KEYWORDS(n))
-      } ^^ { case location ~ m ~ _ ~ n => Selector(location, m, n) }) << SPACING_WITHOUT_LF)
+      lazy val selectorToken: Parser[(String, String)] = (regularExpression("""[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*#[A-Za-z_][A-Za-z0-9_]*""".r) ^^ { s =>
+        val idx = s.lastIndexOf('#')
+        val mod = s.substring(0, idx)
+        val name = s.substring(idx + 1)
+        (mod, name)
+      }) << SPACING_WITHOUT_LF
+
+      def selector: Parser[Selector] = rule(((%% ~ selectorToken) ^^ { case location ~ (m, n) => Selector(location, m, n) }) << SPACING_WITHOUT_LF)
 
       lazy val qident: Parser[String] = (regularExpression("""'[A-Za-z_][a-zA-Z0-9_]*""".r).filter { n =>
         !KEYWORDS(n)

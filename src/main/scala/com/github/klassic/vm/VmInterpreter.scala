@@ -127,8 +127,9 @@ class VmInterpreter extends Processor[TypedAst.Program, Value, InteractiveSessio
                         val session = new InteractiveSession
                         val methodProgram = Ast.Program(
                           methodDef.location,
-                          None,
-                          Nil,
+                          None, // module
+                          None, // grammar
+                          Nil,  // imports
                           input.records.map { case (name, record) =>
                             // Convert TRecord back to Ast.RecordDeclaration for typing
                             val members = BuiltinEnvironments.toList(record.row)
@@ -205,9 +206,60 @@ class VmInterpreter extends Processor[TypedAst.Program, Value, InteractiveSessio
       }
     }
     
+    // Import semantics at runtime: add imported module members as unqualified functions, and support alias modules
+    if (input.imports.nonEmpty) {
+      val modEnv = BuiltinEnvironments.BuiltinModuleEnvironment
+      input.imports.foreach { imp =>
+        // Resolve module key (prefer fqcn if present)
+        val sourceKey = if (modEnv.modules.contains(imp.fqcn)) imp.fqcn else imp.simpleName
+        modEnv.modules.get(sourceKey).foreach { membersMap =>
+          // Bind unqualified names with filtering
+          val names = imp.only match {
+            case Some(onlyList) => onlyList.toSet
+            case None => membersMap.keySet
+          }
+          val effective = names.diff(imp.excludes)
+          effective.foreach { name =>
+            val v = modEnv(sourceKey)(name)
+            runtimeEnv.update(name, v)
+          }
+          // Create alias module if requested
+          imp.alias.foreach { aliasName =>
+            modEnv.enter(aliasName) {
+              membersMap.foreach { case (name, _) =>
+                val v = modEnv(sourceKey)(name)
+                modEnv.update(name, v)
+              }
+            }
+          }
+        }
+      }
+    }
+
     val vm = new VirtualMachine(BuiltinEnvironments.BuiltinModuleEnvironment, runtimeRecordEnvironment)
     val code = compiler.compile(input.block)
-    vm.run(code, runtimeEnv)
+    val result = vm.run(code, runtimeEnv)
+
+    // If this program declares a module, export current top-level bindings into that module
+    input.module.foreach { moduleFqcn =>
+      val modEnv = BuiltinEnvironments.BuiltinModuleEnvironment
+      // Register under full name and simple name for convenience
+      val simple = moduleFqcn.split("\\.").lastOption.getOrElse(moduleFqcn)
+      modEnv.enter(moduleFqcn) {
+        runtimeEnv.variables.foreach { case (name, value) =>
+          modEnv.update(name, value)
+        }
+      }
+      if (simple != moduleFqcn) {
+        modEnv.enter(simple) {
+          runtimeEnv.variables.foreach { case (name, value) =>
+            modEnv.update(name, value)
+          }
+        }
+      }
+    }
+
+    result
   }
   
   private def normalizeTypeName(t: Type): String = t match {

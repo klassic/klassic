@@ -20,5 +20,7 @@ dist
 .cache-main
 .bsp/
 .bloop/
+.sbtboot/
+.sbtglobal/
 .metals/
 .vscode/
