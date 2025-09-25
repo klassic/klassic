@@ -45,6 +45,25 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
       "substring"    -> TScheme(Nil, TFunction(List(TString, TInt, TInt), TString)),
       "at"           -> TScheme(Nil, TFunction(List(TDynamic, TInt), TDynamic)),
       "matches"      -> TScheme(Nil, TFunction(List(TString, TString), TBoolean)),
+      "split"        -> TScheme(Nil, TFunction(List(TString, TString), listOf(TString))),
+      "join"         -> TScheme(Nil, TFunction(List(listOf(TString), TString), TString)),
+      "trim"         -> TScheme(Nil, TFunction(List(TString), TString)),
+      "trimLeft"     -> TScheme(Nil, TFunction(List(TString), TString)),
+      "trimRight"    -> TScheme(Nil, TFunction(List(TString), TString)),
+      "replace"      -> TScheme(Nil, TFunction(List(TString, TString, TString), TString)),
+      "replaceAll"   -> TScheme(Nil, TFunction(List(TString, TString, TString), TString)),
+      "toLowerCase"  -> TScheme(Nil, TFunction(List(TString), TString)),
+      "toUpperCase"  -> TScheme(Nil, TFunction(List(TString), TString)),
+      "startsWith"   -> TScheme(Nil, TFunction(List(TString, TString), TBoolean)),
+      "endsWith"     -> TScheme(Nil, TFunction(List(TString, TString), TBoolean)),
+      "contains"     -> TScheme(Nil, TFunction(List(TString, TString), TBoolean)),
+      "indexOf"      -> TScheme(Nil, TFunction(List(TString, TString), TInt)),
+      "lastIndexOf"  -> TScheme(Nil, TFunction(List(TString, TString), TInt)),
+      "length"       -> TScheme(Nil, TFunction(List(TString), TInt)),
+      "isEmptyString"-> TScheme(Nil, TFunction(List(TString), TBoolean)),
+      "repeat"       -> TScheme(Nil, TFunction(List(TString, TInt), TString)),
+      "reverse"      -> TScheme(Nil, TFunction(List(TString), TString)),
+      "format"       -> TScheme(Nil, TDynamic),
       "thread"       -> TScheme(Nil, TFunction(List(TFunction(List.empty, TDynamic)), TDynamic)),
       "println"      -> TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
       "printlnError" -> TScheme(List(tv("x")), TFunction(List(tv("x")), TUnit)),
@@ -134,6 +153,28 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         "toggle" -> TScheme(Nil, List(TDynamic) ==> TUnit),
         "toHigh" -> TScheme(Nil, List(TDynamic) ==> TUnit),
         "toLow" -> TScheme(Nil, List(TDynamic) ==> TUnit)
+      ),
+      "FileOutput" -> Map(
+        "write" -> TScheme(Nil, List(TString, TString) ==> TUnit),
+        "append" -> TScheme(Nil, List(TString, TString) ==> TUnit),
+        "writeLines" -> TScheme(Nil, List(TString, listOf(TString)) ==> TUnit),
+        "exists" -> TScheme(Nil, List(TString) ==> TBoolean),
+        "delete" -> TScheme(Nil, List(TString) ==> TUnit)
+      ),
+      "Dir" -> Map(
+        "list" -> TScheme(Nil, List(TString) ==> listOf(TString)),
+        "listFull" -> TScheme(Nil, List(TString) ==> listOf(TString)),
+        "mkdir" -> TScheme(Nil, List(TString) ==> TUnit),
+        "mkdirs" -> TScheme(Nil, List(TString) ==> TUnit),
+        "exists" -> TScheme(Nil, List(TString) ==> TBoolean),
+        "isDirectory" -> TScheme(Nil, List(TString) ==> TBoolean),
+        "isFile" -> TScheme(Nil, List(TString) ==> TBoolean),
+        "delete" -> TScheme(Nil, List(TString) ==> TUnit),
+        "copy" -> TScheme(Nil, List(TString, TString) ==> TUnit),
+        "move" -> TScheme(Nil, List(TString, TString) ==> TUnit),
+        "current" -> TScheme(Nil, List() ==> TString),
+        "home" -> TScheme(Nil, List() ==> TString),
+        "temp" -> TScheme(Nil, List() ==> TString)
       )
     )
   }
@@ -281,6 +322,13 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
           worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
         case (TConstructor(k1, ts, _), TConstructor(k2, us, _)) :: rest if k1 == k2 =>
           val next_worklist = (ts zip us).map{ case (t, u) => (t, u)} ::: rest
+          worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        // Handle unification between TConstructor (from instance declarations) and TRecordReference (from record creation)
+        case (TConstructor(name1, args1, _), TRecordReference(name2, args2)) :: rest if name1 == name2 =>
+          val next_worklist = (args1 zip args2).map{ case (t, u) => (t, u)} ::: rest
+          worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
+        case (TRecordReference(name1, args1), TConstructor(name2, args2, _)) :: rest if name1 == name2 =>
+          val next_worklist = (args1 zip args2).map{ case (t, u) => (t, u)} ::: rest
           worklist = next_worklist.map{ case (t, u) => (current_s.replace(t), current_s.replace(u))}
         case (t, u) :: _ =>
           typeError(current.location, s"cannot unify ${current_s.replace(t)} with ${current_s.replace(u)}")
@@ -892,6 +940,9 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
             (TInt, s2)
         }
         (TypedAst.PlusOp(resultType, location, typedOperand), s)
+      case Ast.NotOp(location, operand) =>
+        val (typedOperand, s1) = doType(operand, env, TBoolean, s0)
+        (TypedAst.NotOp(TBoolean, location, typedOperand), s1)
       case Ast.BinaryExpression(location, Operator.AND2, lhs, rhs) =>
         val (typedLhs, s1) = doType(lhs, env, TBoolean, s0)
         val (typedRhs, s2) = doType(rhs, env, TBoolean, s1)
@@ -1150,9 +1201,11 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
             val memberTypes = members.map{ case (_, t) => t}
             val parameterTypes = tes2.map { case te => te.type_ }
             val sn = (memberTypes zip parameterTypes).foldLeft(sy) { case (s, (m, p)) => unify(m, p, s)}
-            var recordType: TRecord = env.records(recordName)
-            val s = unify(t, recordType, sn)
-            (TypedAst.RecordNew(recordType, location, recordName, tes2), s)
+            val structuralRecordType: TRecord = env.records(recordName)
+            // Use TRecordReference (nominal type) instead of TRecord (structural type)
+            val nominalRecordType = TRecordReference(recordName, structuralRecordType.ts)
+            val s = unify(t, nominalRecordType, sn)
+            (TypedAst.RecordNew(nominalRecordType, location, recordName, tes2), s)
           case None =>
             typeError(location, s"record '$recordName' is not found")
         }
@@ -1348,8 +1401,11 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
     case TConstructor("List", args, _) if args.nonEmpty => 
       s"List<${args.map(normalizeTypeName).mkString(", ")}>"
     case TConstructor(name, Nil, _) => name
-    case TConstructor(name, args, _) => 
+    case TConstructor(name, args, _) =>
       s"$name<${args.map(normalizeTypeName).mkString(", ")}>"
+    case TRecordReference(name, _) => name
+    case TRecord(_, _) => "Record"
+    case TVariable(name, _) => name
     case _ => "Unknown"
   }
 
@@ -1380,7 +1436,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
     )
     
     val (typedExpression, _) = doType(program.block, env, tv, EmptySubstitution)
-    TypedAst.Program(program.location, Nil, typedExpression.asInstanceOf[TypedAst.Block], recordEnvironment, typeClasses, instances)
+    TypedAst.Program(program.location, Nil, typedExpression.asInstanceOf[TypedAst.Block], recordEnvironment, typeClasses, instances, program.instances)
   }
 
   override final val name: String = "Typer"

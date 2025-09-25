@@ -71,6 +71,15 @@ case class TypeEnvironment(
       case (TVariable(_, _), _) => true // Type variables match anything
       case (TConstructor(n1, args1, _), TConstructor(n2, args2, _)) if n1 == n2 && args1.length == args2.length =>
         args1.zip(args2).forall { case (t1, t2) => canMatch(t1, t2) }
+      case (TRecordReference(name1, _), TRecordReference(name2, _)) => name1 == name2
+      case (TRecordReference(_, _), TRecord(_, _)) => true // Record reference can match structural record
+      case (TRecord(_, _), TRecordReference(_, _)) => true // Structural record can match record reference
+      case (TRecord(_, _), TRecord(_, _)) => true // Structural records can match each other (simplified for now)
+      // Handle mismatch between instance declaration parsing (TConstructor) and record creation (TRecordReference)
+      case (TConstructor(name1, args1, _), TRecordReference(name2, args2)) if name1 == name2 => 
+        args1.length == args2.length && args1.zip(args2).forall { case (t1, t2) => canMatch(t1, t2) }
+      case (TRecordReference(name1, args1), TConstructor(name2, args2, _)) if name1 == name2 => 
+        args1.length == args2.length && args1.zip(args2).forall { case (t1, t2) => canMatch(t1, t2) }
       case (t1, t2) => t1 == t2
     }
   }

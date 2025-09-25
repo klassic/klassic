@@ -1,0 +1,46 @@
+// Type class implementation - current state
+
+typeclass Show<'a> where {
+  show: ('a) => String
+}
+
+instance Show<Int> where {
+  def show(x: Int): String = "Int: " + x
+}
+
+instance Show<String> where {
+  def show(x: String): String = "String: " + x
+}
+
+// What works: Direct calls with concrete types
+println("=== What works ===")
+println("Direct calls:")
+println(show(42))
+println(show("hello"))
+
+// Multiple instances can coexist
+typeclass Eq<'a> where {
+  equals: ('a, 'a) => Boolean
+}
+
+instance Eq<Int> where {
+  def equals(x: Int, y: Int): Boolean = x == y
+}
+
+instance Eq<String> where {
+  def equals(x: String, y: String): Boolean = x == y
+}
+
+println("\nMultiple type classes:")
+println("5 == 5: " + equals(5, 5))
+println("\"foo\" == \"bar\": " + equals("foo", "bar"))
+
+// What doesn't work yet: Polymorphic functions with constraints
+// This would require syntax like:
+// def showTwice<'a>(x: 'a) where Show<'a> = show(x) + ", " + show(x)
+println("\n=== What doesn't work yet ===")
+println("Polymorphic functions with type class constraints")
+println("Type class constraints in function signatures")
+println("Constraint propagation through generic code")
+
+"Current implementation status"

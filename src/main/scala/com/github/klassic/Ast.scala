@@ -42,6 +42,8 @@ object Ast {
   case class MinusOp(location: Location, operand: Ast.Node) extends Node
 
   case class PlusOp(location: Location, operand: Ast.Node) extends Node
+  
+  case class NotOp(location: Location, operand: Ast.Node) extends Node
 
   case class StringNode(location: Location, value: String) extends Node
 

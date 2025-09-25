@@ -442,6 +442,7 @@ class Parser extends Processor[String, Program, InteractiveSession] {
       lazy val unary: Parser[Ast.Node] = rule(
         %% ~ CL(MINUS) ~ unary ^^ { case location ~ _ ~ operand => MinusOp(location, operand) }
           | %% ~ CL(PLUS) ~ unary ^^ { case location ~ _ ~ operand => PlusOp(location, operand) }
+          | %% ~ "!" ~ unary ^^ { case location ~ _ ~ operand => NotOp(location, operand) }
           | invocation
       )
 
