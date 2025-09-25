@@ -22,9 +22,7 @@ object TypedAst {
 
   case object FloatSuffix extends FloatSuffix
 
-  case class Program(location: Location, imports: List[Import], block: Block, records: RecordEnvironment, typeClasses: Map[String, Type.TTypeClass], instances: Map[(String, Type), Type.TInstance], instanceDeclarations: List[Ast.InstanceDeclaration] = Nil)
-
-  case class Import(location: Location, simpleName: String, fqcn: String)
+  case class Program(location: Location, module: Option[String], imports: List[Ast.Import], block: Block, records: RecordEnvironment, typeClasses: Map[String, Type.TTypeClass], instances: Map[(String, Type), Type.TInstance], instanceDeclarations: List[Ast.InstanceDeclaration] = Nil)
 
   case class Block(type_ : Type, location: Location, expressions: List[TypedNode]) extends TypedNode
 

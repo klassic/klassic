@@ -12,8 +12,9 @@ class FileBasedProgramSpec extends SpecHelper {
         try {
           E.evaluateFile(program)
           assert(true)
-        }catch {
-          case e:Throwable =>
+        } catch {
+          case e: Throwable =>
+            println(s"FAILED program: ${program}")
             e.printStackTrace()
             assert(false)
         }

@@ -19,9 +19,9 @@ object Ast {
 
   case object FloatSuffix extends FloatSuffix
 
-  case class Program(location: Location, grammar: Option[macro_peg.Ast.Grammar], imports: List[Import], records: List[RecordDeclaration], typeClasses: List[TypeClassDeclaration], instances: List[InstanceDeclaration], block: Block)
+  case class Program(location: Location, module: Option[String], grammar: Option[macro_peg.Ast.Grammar], imports: List[Import], records: List[RecordDeclaration], typeClasses: List[TypeClassDeclaration], instances: List[InstanceDeclaration], block: Block)
 
-  case class Import(location: Location, simpleName: String, fqcn: String)
+  case class Import(location: Location, simpleName: String, fqcn: String, alias: Option[String] = None, only: Option[List[String]] = None, excludes: Set[String] = Set.empty)
 
   case class RecordDeclaration(location: Location, name: String, ts: List[TVariable], members: List[(String, Type)], methods: List[MethodDefinition])
 

@@ -984,8 +984,25 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
         }
       case Ast.Selector(location, module, name) =>
         val s = env.lookupModuleMember(module, name) match {
-          case None => typeError(location, s"module '${module}' or member '${name}' is not found")
           case Some(u) => unify(newInstanceFrom(u), t, s0)
+          case None =>
+            // Try runtime-discovered modules (user-defined from previous runs)
+            BuiltinEnvironments.BuiltinModuleEnvironment.modules.get(module) match {
+              case Some(runtimeMembers) =>
+                runtimeMembers.get(name) match {
+                  case Some(value) =>
+                    val stype: Type = value match {
+                      case VmClosureValue(params, _, _, _, _) =>
+                        val as = params.map(_ => newTypeVariable())
+                        TFunction(as, newTypeVariable())
+                      case NativeFunctionValue(_) => TFunction(List(newTypeVariable()), newTypeVariable())
+                      case _ => newTypeVariable()
+                    }
+                    unify(stype, t, s0)
+                  case None => typeError(location, s"module '${module}' or member '${name}' is not found")
+                }
+              case None => typeError(location, s"module '${module}' or member '${name}' is not found")
+            }
         }
         val resultType = s.replace(t)
         (TypedAst.Selector(resultType, location, module, name), s)
@@ -1425,7 +1442,7 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
     // Process instances
     val instances = processInstances(program.instances, typeClasses)
     
-    val env = TypeEnvironment(
+    var env = TypeEnvironment(
       BuiltinEnvironment, 
       Set.empty, 
       BuiltinRecordEnvironment ++ recordEnvironment, 
@@ -1434,9 +1451,59 @@ class Typer extends Processor[Ast.Program, TypedAst.Program, InteractiveSession]
       instances,
       None
     )
+
+    // Apply import semantics: bring imported module members into scope as unqualified names
+    if (program.imports.nonEmpty) {
+      var vars = env.variables
+      var modulesMap = env.modules
+      program.imports.foreach { imp =>
+        val moduleName = imp.simpleName // last segment
+        // collect module member schemes from type env or runtime discovery
+        val memberSchemesOpt: Option[Map[String, TScheme]] = env.modules.get(moduleName) match {
+          case some@Some(_) => some
+          case None =>
+            val runtimeMembersOpt = BuiltinEnvironments.BuiltinModuleEnvironment.modules.get(moduleName)
+            runtimeMembersOpt.map { runtimeMembers =>
+              runtimeMembers.map { case (name, value) =>
+                val stype: Type = value match {
+                  case VmClosureValue(params, _, _, _, _) =>
+                    val as = params.map(_ => newTypeVariable())
+                    TFunction(as, newTypeVariable())
+                  case NativeFunctionValue(_) => TFunction(List(newTypeVariable()), newTypeVariable())
+                  case _ => newTypeVariable()
+                }
+                name -> TScheme(Nil, stype)
+              }.toMap
+            }
+        }
+
+        memberSchemesOpt match {
+          case Some(memberSchemes) =>
+            // filter unqualified bindings by only/excludes
+            val filtered: Map[String, TScheme] = {
+              val base = imp.only match {
+                case Some(onlyList) => memberSchemes.view.filterKeys(onlyList.toSet).toMap
+                case None => memberSchemes
+              }
+              base.filterNot { case (n, _) => imp.excludes.contains(n) }
+            }
+            vars = vars ++ filtered
+            // register alias module mapping for selector typing
+            imp.alias.foreach { aliasName =>
+              modulesMap = modulesMap + (aliasName -> memberSchemes)
+            }
+            // also register FQCN module mapping for selector typing if discovered at runtime
+            if (!modulesMap.contains(imp.fqcn)) {
+              modulesMap = modulesMap + (imp.fqcn -> memberSchemes)
+            }
+          case None => ()
+        }
+      }
+      env = env.copy(variables = vars, modules = modulesMap)
+    }
     
     val (typedExpression, _) = doType(program.block, env, tv, EmptySubstitution)
-    TypedAst.Program(program.location, Nil, typedExpression.asInstanceOf[TypedAst.Block], recordEnvironment, typeClasses, instances, program.instances)
+    TypedAst.Program(program.location, program.module, program.imports, typedExpression.asInstanceOf[TypedAst.Block], recordEnvironment, typeClasses, instances, program.instances)
   }
 
   override final val name: String = "Typer"

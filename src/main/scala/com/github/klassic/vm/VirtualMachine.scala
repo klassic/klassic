@@ -424,19 +424,36 @@ class VirtualMachine(moduleEnv: ModuleEnvironment, recordEnv: RecordEnvironment)
         case Call(arity) =>
           val func = pop()
           func match {
-            case VmClosureValue(params, bodyStart, bodyEnd, closureEnv, _) =>
-              callStack += ((pc + 1, currentEnv))
-              val newEnv = RuntimeEnvironment.pooled(Some(closureEnv))
-              var i = 0
-              var argPtr = stackPtr - arity
-              while (i < arity) {
-                newEnv.update(params(i), stack(argPtr))
-                i += 1
-                argPtr += 1
+            case VmClosureValue(params, bodyStart, bodyEnd, closureEnv, closureCode) =>
+              if (closureCode.asInstanceOf[AnyRef] eq code.asInstanceOf[AnyRef]) {
+                // Same code vector: jump into body and return back
+                callStack += ((pc + 1, currentEnv))
+                val newEnv = RuntimeEnvironment.pooled(Some(closureEnv))
+                var i = 0
+                var argPtr = stackPtr - arity
+                while (i < arity) {
+                  newEnv.update(params(i), stack(argPtr))
+                  i += 1
+                  argPtr += 1
+                }
+                stackPtr -= arity
+                currentEnv = newEnv
+                pc = bodyStart
+              } else {
+                // Different code vector (e.g., imported user module): run in a separate VM
+                val newEnv = RuntimeEnvironment.pooled(Some(closureEnv))
+                var i = arity - 1
+                while (i >= 0) {
+                  val arg = pop()
+                  newEnv.update(params(i), arg)
+                  i -= 1
+                }
+                val subCode = closureCode.slice(bodyStart, bodyEnd + 1)
+                val vm = new VirtualMachine(moduleEnv, recordEnv)
+                val result = vm.run(subCode, newEnv)
+                push(result)
+                pc += 1
               }
-              stackPtr -= arity
-              currentEnv = newEnv
-              pc = bodyStart
             case NativeFunctionValue(body) =>
               val args = new Array[Value](arity)
               var i = arity - 1
