@@ -19,11 +19,16 @@ use klassic_types::{
 };
 
 mod builtin_registry;
+mod builtin_support;
 mod ops;
 mod runtime_types;
 mod value;
 
 use builtin_registry::{builtin_arity, builtin_name, value_method_builtin_name};
+use builtin_support::{
+    clamp_index, ensure_arity, expect_int, expect_list, expect_map, expect_non_negative_int,
+    expect_set, expect_string, simple_regex_is_match, simple_regex_replace_all,
+};
 use ops::{eval_binary, eval_unary};
 use runtime_types::{
     constraint_runtime_type_name, dynamic_type_name, infer_constraint_substitutions,
@@ -2593,83 +2598,6 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
     }
 }
 
-fn ensure_arity(
-    name: &str,
-    arguments: &[Value],
-    expected: usize,
-    span: Span,
-) -> Result<(), Diagnostic> {
-    if arguments.len() == expected {
-        Ok(())
-    } else {
-        Err(Diagnostic::runtime(
-            span,
-            format!(
-                "{name} expects {expected} arguments but got {}",
-                arguments.len()
-            ),
-        ))
-    }
-}
-
-fn expect_string<'a>(value: &'a Value, name: &str, span: Span) -> Result<&'a str, Diagnostic> {
-    match value {
-        Value::String(text) => Ok(text.as_str()),
-        _ => Err(Diagnostic::runtime(
-            span,
-            format!("{name} expects a string"),
-        )),
-    }
-}
-
-fn expect_int(value: &Value, name: &str, span: Span) -> Result<usize, Diagnostic> {
-    match value {
-        Value::Int(number) if *number >= 0 => Ok(*number as usize),
-        Value::Int(_) => Err(Diagnostic::runtime(
-            span,
-            format!("{name} expects a non-negative integer index"),
-        )),
-        Value::Long(number) if *number >= 0 => Ok(*number as usize),
-        Value::Long(_) => Err(Diagnostic::runtime(
-            span,
-            format!("{name} expects a non-negative integer index"),
-        )),
-        _ => Err(Diagnostic::runtime(
-            span,
-            format!("{name} expects an integer"),
-        )),
-    }
-}
-
-fn expect_non_negative_int(value: &Value, name: &str, span: Span) -> Result<usize, Diagnostic> {
-    expect_int(value, name, span)
-}
-
-fn expect_list<'a>(value: &'a Value, name: &str, span: Span) -> Result<&'a [Value], Diagnostic> {
-    match value {
-        Value::List(values) => Ok(values.as_slice()),
-        _ => Err(Diagnostic::runtime(span, format!("{name} expects a list"))),
-    }
-}
-
-fn expect_map<'a>(
-    value: &'a Value,
-    name: &str,
-    span: Span,
-) -> Result<&'a [(Value, Value)], Diagnostic> {
-    match value {
-        Value::Map(entries) => Ok(entries.as_slice()),
-        _ => Err(Diagnostic::runtime(span, format!("{name} expects a map"))),
-    }
-}
-
-fn expect_set<'a>(value: &'a Value, name: &str, span: Span) -> Result<&'a [Value], Diagnostic> {
-    match value {
-        Value::Set(values) => Ok(values.as_slice()),
-        _ => Err(Diagnostic::runtime(span, format!("{name} expects a set"))),
-    }
-}
-
 fn prefer_instance_dispatch(name: &str, argument_values: &[Value]) -> bool {
     match (name, argument_values) {
         (
@@ -2681,10 +2609,6 @@ fn prefer_instance_dispatch(name: &str, argument_values: &[Value]) -> bool {
         ) => true,
         _ => false,
     }
-}
-
-fn clamp_index(index: usize, len: usize) -> usize {
-    index.min(len)
 }
 
 fn interpolate_string(
@@ -2758,31 +2682,6 @@ fn strip_dynamic_cast(expression: &str) -> String {
         prefix.trim_end().to_string()
     } else {
         trimmed.to_string()
-    }
-}
-
-fn simple_regex_is_match(input: &str, pattern: &str) -> bool {
-    match pattern {
-        ".*" => true,
-        "[0-9]+" => !input.is_empty() && input.chars().all(|ch| ch.is_ascii_digit()),
-        "[0-9]" => input.chars().count() == 1 && input.chars().all(|ch| ch.is_ascii_digit()),
-        _ => input == pattern,
-    }
-}
-
-fn simple_regex_replace_all(input: &str, pattern: &str, replacement: &str) -> String {
-    match pattern {
-        "[0-9]" => input
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_digit() {
-                    replacement.to_string()
-                } else {
-                    ch.to_string()
-                }
-            })
-            .collect(),
-        _ => input.replace(pattern, replacement),
     }
 }
 
