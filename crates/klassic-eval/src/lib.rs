@@ -20,6 +20,7 @@ use klassic_types::{
 
 mod builtin_registry;
 mod builtin_support;
+mod environment;
 mod ops;
 mod runtime_types;
 mod value;
@@ -29,6 +30,7 @@ use builtin_support::{
     clamp_index, ensure_arity, expect_int, expect_list, expect_map, expect_non_negative_int,
     expect_set, expect_string, simple_regex_is_match, simple_regex_replace_all,
 };
+use environment::{AssignmentFailure, Binding, Environment};
 use ops::{eval_binary, eval_unary};
 use runtime_types::{
     constraint_runtime_type_name, dynamic_type_name, infer_constraint_substitutions,
@@ -126,136 +128,6 @@ impl fmt::Display for EvaluationError {
 }
 
 impl std::error::Error for EvaluationError {}
-
-#[derive(Clone, Debug)]
-struct Binding {
-    mutable: bool,
-    storage: BindingStorage,
-}
-
-type BindingRef = Rc<RefCell<Binding>>;
-
-#[derive(Clone, Debug)]
-enum BindingStorage {
-    Local(Value),
-    Shared(Arc<Mutex<ThreadValueSnapshot>>),
-}
-
-impl Binding {
-    fn with_value(mutable: bool, value: Value) -> Self {
-        Self {
-            mutable,
-            storage: BindingStorage::Local(value),
-        }
-    }
-
-    fn placeholder(mutable: bool) -> Self {
-        Self::with_value(mutable, Value::Unit)
-    }
-
-    fn current_value(&self) -> Value {
-        match &self.storage {
-            BindingStorage::Local(value) => value.clone(),
-            BindingStorage::Shared(cell) => {
-                restore_thread_value(cell.lock().expect("shared binding lock").clone())
-            }
-        }
-    }
-
-    fn set_value(&mut self, value: Value) {
-        match &mut self.storage {
-            BindingStorage::Local(slot) => *slot = value,
-            BindingStorage::Shared(cell) => {
-                *cell.lock().expect("shared binding lock") = snapshot_value_for_thread(&value);
-            }
-        }
-    }
-
-    fn shared_snapshot_cell(&mut self) -> Arc<Mutex<ThreadValueSnapshot>> {
-        match &mut self.storage {
-            BindingStorage::Shared(cell) => cell.clone(),
-            BindingStorage::Local(value) => {
-                let cell = Arc::new(Mutex::new(snapshot_value_for_thread(value)));
-                self.storage = BindingStorage::Shared(cell.clone());
-                cell
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct Environment {
-    scopes: Vec<HashMap<String, BindingRef>>,
-}
-
-impl Environment {
-    fn new() -> Self {
-        Self {
-            scopes: vec![HashMap::new()],
-        }
-    }
-
-    fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
-    }
-
-    fn pop_scope(&mut self) {
-        self.scopes.pop();
-    }
-
-    fn declare_with_value(&mut self, name: String, mutable: bool, value: Value) {
-        self.declare_binding(
-            name,
-            Rc::new(RefCell::new(Binding::with_value(mutable, value))),
-        );
-    }
-
-    fn declare_placeholder(&mut self, name: String, mutable: bool) -> BindingRef {
-        let binding = Rc::new(RefCell::new(Binding::placeholder(mutable)));
-        self.declare_binding(name, binding.clone());
-        binding
-    }
-
-    fn declare_binding(&mut self, name: String, binding: BindingRef) {
-        self.scopes
-            .last_mut()
-            .expect("at least one scope always exists")
-            .insert(name, binding);
-    }
-
-    fn get_binding(&self, name: &str) -> Option<BindingRef> {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name).cloned())
-    }
-
-    fn lookup_value(&self, name: &str) -> Option<Value> {
-        self.get_binding(name)
-            .map(|binding| binding.borrow().current_value())
-    }
-
-    fn assign(&mut self, name: &str, value: Value) -> Result<Value, AssignmentFailure> {
-        let Some(binding) = self.get_binding(name) else {
-            return Err(AssignmentFailure::Undefined);
-        };
-        let mut binding = binding.borrow_mut();
-        if !binding.mutable {
-            return Err(AssignmentFailure::Immutable);
-        }
-        binding.set_value(value.clone());
-        Ok(value)
-    }
-
-    fn root_exports(&self) -> HashMap<String, Value> {
-        self.scopes
-            .first()
-            .into_iter()
-            .flat_map(|scope| scope.iter())
-            .map(|(name, binding)| (name.clone(), binding.borrow().current_value()))
-            .collect()
-    }
-}
 
 fn snapshot_value_for_thread(value: &Value) -> ThreadValueSnapshot {
     match value {
@@ -412,10 +284,9 @@ fn restore_thread_environment(snapshot: ThreadEnvironmentSnapshot) -> Environmen
                             ThreadBindingSnapshot::Local { mutable, value } => {
                                 Binding::with_value(mutable, restore_thread_value(value))
                             }
-                            ThreadBindingSnapshot::Shared { mutable, value } => Binding {
-                                mutable,
-                                storage: BindingStorage::Shared(value),
-                            },
+                            ThreadBindingSnapshot::Shared { mutable, value } => {
+                                Binding::with_shared_snapshot(mutable, value)
+                            }
                         };
                         (name, Rc::new(RefCell::new(binding)))
                     })
@@ -559,11 +430,6 @@ fn join_active_threads() {
     for handle in handles {
         let _ = handle.join();
     }
-}
-
-enum AssignmentFailure {
-    Undefined,
-    Immutable,
 }
 
 type ModuleExports = HashMap<String, Value>;
