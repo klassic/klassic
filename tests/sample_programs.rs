@@ -120,7 +120,16 @@ true\n\
 10\n\
 2\n\
 true\n\
-true\n",
+true\n\
+[3, 2, 1]\n\
+[2, 4, 6]\n\
+6\n\
+[1, 2, 3, 4]\n\
+[1, 2, 3, 4, 5]\n\
+true\n\
+false\n\
+2\n\
+-1\n",
         ),
         "simple-function-type.kl" => Some("Function types parsed\n"),
         "test-curried-syntax.kl" => Some("Curried syntax works\n"),

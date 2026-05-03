@@ -47,3 +47,19 @@ def stdlibMod(n, m) = n - (n / m) * m
 def stdlibIsEven(n) = stdlibMod(n, 2) == 0
 
 def stdlibIsOdd(n) = stdlibMod(n, 2) == 1
+
+def stdlibReverse(xs) = foldLeft(xs)([])((acc, x) => cons(x)(acc))
+
+def stdlibMap(xs, f) = if(isEmpty(xs)) [] else cons(f(head(xs)))(stdlibMap(tail(xs), f))
+
+def stdlibFoldRight(xs, seed, f) = if(isEmpty(xs)) seed else f(head(xs), stdlibFoldRight(tail(xs), seed, f))
+
+def stdlibConcat(xs, ys) = if(isEmpty(xs)) ys else cons(head(xs))(stdlibConcat(tail(xs), ys))
+
+def stdlibFlatten(xss) = foldLeft(xss)([])((acc, xs) => stdlibConcat(acc, xs))
+
+def stdlibContains(xs, target) = if(isEmpty(xs)) false else if(head(xs) == target) true else stdlibContains(tail(xs), target)
+
+def stdlibIndexOfHelper(xs, target, i) = if(isEmpty(xs)) -1 else if(head(xs) == target) i else stdlibIndexOfHelper(tail(xs), target, i + 1)
+
+def stdlibIndexOf(xs, target) = stdlibIndexOfHelper(xs, target, 0)

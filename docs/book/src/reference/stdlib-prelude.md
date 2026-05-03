@@ -64,9 +64,13 @@ empty list would call `head` on `[]` and produce a runtime error).
 | `stdlibAny(xs, p)` | `(List<'a>, ('a) => Boolean) => Boolean` | `stdlibAny([1, 2, 3], (x) => x > 2)` → `true` |
 | `stdlibAll(xs, p)` | `(List<'a>, ('a) => Boolean) => Boolean` | `stdlibAll([2, 4, 6], stdlibIsEven)` → `true` |
 | `stdlibCount(xs, p)` | `(List<'a>, ('a) => Boolean) => Int` | `stdlibCount([1, 2, 3, 4, 5], stdlibIsEven)` → `2` |
+| `stdlibContains(xs, target)` | `(List<'a>, 'a) => Boolean` | `stdlibContains([1, 2, 3], 2)` → `true` |
+| `stdlibIndexOf(xs, target)` | `(List<'a>, 'a) => Int` | `stdlibIndexOf([10, 20, 30], 20)` → `1` |
 
-`stdlibFind` returns `null` if no element matches. The other
-helpers all yield total values for any input.
+`stdlibFind` returns `null` if no element matches. `stdlibIndexOf`
+returns `-1` for "not found"; both `stdlibContains` and
+`stdlibIndexOf` use Klassic's structural equality, so they work
+uniformly across primitives and records.
 
 ## List reductions
 
@@ -74,10 +78,26 @@ helpers all yield total values for any input.
 | --- | --- | --- |
 | `stdlibSum(xs)` | `(List<Int>) => Int` | `stdlibSum([1, 2, 3, 4, 5])` → `15` |
 | `stdlibProduct(xs)` | `(List<Int>) => Int` | `stdlibProduct([1, 2, 3, 4])` → `24` |
+| `stdlibFoldRight(xs, seed, f)` | `(List<'a>, 'b, ('a, 'b) => 'b) => 'b` | `stdlibFoldRight([1, 2, 3], 0, (x, acc) => x + acc)` → `6` |
 
-Both are thin wrappers around `foldLeft(xs)(seed)((acc, x) => ...)`
-— exactly the form you would write by hand. Use them when you want
-the call site to read like a verb rather than a fold.
+`stdlibSum` / `stdlibProduct` are thin wrappers around
+`foldLeft(xs)(seed)((acc, x) => ...)` — exactly the form you would
+write by hand. `stdlibFoldRight` is recursive in shape (the
+combining function sees `head(xs)` first), so it composes well
+with right-associative operators (e.g. building lists).
+
+## List transformations
+
+| Helper | Type sketch | Example |
+| --- | --- | --- |
+| `stdlibMap(xs, f)` | `(List<'a>, ('a) => 'b) => List<'b>` | `stdlibMap([1, 2, 3], (x) => x * 2)` → `[2, 4, 6]` |
+| `stdlibReverse(xs)` | `(List<'a>) => List<'a>` | `stdlibReverse([1, 2, 3])` → `[3, 2, 1]` |
+| `stdlibConcat(xs, ys)` | `(List<'a>, List<'a>) => List<'a>` | `stdlibConcat([1, 2], [3, 4])` → `[1, 2, 3, 4]` |
+| `stdlibFlatten(xss)` | `(List<List<'a>>) => List<'a>` | `stdlibFlatten([[1, 2], [3], [4, 5]])` → `[1, 2, 3, 4, 5]` |
+
+A `map` builtin already exists; `stdlibMap` is here for naming
+consistency. `stdlibReverse` runs in O(n) using a `foldLeft`-cons
+pattern; `stdlibConcat` is recursive on the left list.
 
 ## Sample program
 
