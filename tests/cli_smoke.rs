@@ -16831,6 +16831,169 @@ fn native_runtime_error_reports_user_line_numbers() {
     );
 }
 
+/// `Time#nowMillis()` returns wall-clock milliseconds since the
+/// UNIX epoch. The eval-mode and native-mode implementations share
+/// a contract: a positive Int that is at least the test author's
+/// hand-picked sentinel (a safely-in-the-past millisecond timestamp
+/// that any non-clock-skewed system will exceed).
+const TIME_NOW_MILLIS_SENTINEL: i64 = 1_700_000_000_000; // 2023-11-14T22:13:20Z
+
+#[test]
+fn evaluator_time_now_millis_is_recent() {
+    let output = Command::new(klassic_bin())
+        .args(["-e", "Time#nowMillis()"])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "Time#nowMillis() failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: i64 = stdout
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("expected an integer, got {stdout:?}"));
+    assert!(
+        value >= TIME_NOW_MILLIS_SENTINEL,
+        "Time#nowMillis() returned {value} which is older than {TIME_NOW_MILLIS_SENTINEL}"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_time_now_millis_is_recent() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-time-now-millis-{unique}.kl"));
+    let exec_path = std::env::temp_dir().join(format!("klassic-time-now-millis-bin-{unique}"));
+    fs::write(&source_path, "println(Time#nowMillis())\n").expect("temp source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            exec_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("native build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let output = Command::new(&exec_path)
+        .output()
+        .expect("native executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exec_path);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: i64 = stdout
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("expected an integer, got {stdout:?}"));
+    assert!(
+        value >= TIME_NOW_MILLIS_SENTINEL,
+        "native Time#nowMillis() returned {value} which is older than {TIME_NOW_MILLIS_SENTINEL}"
+    );
+}
+
+#[test]
+fn evaluator_math_pow_int_handles_common_cases() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println(Math#powInt(2, 10))\n\
+             println(Math#powInt(3, 4))\n\
+             println(Math#powInt(7, 0))\n\
+             println(Math#powInt(0, 5))\n\
+             println(Math#powInt(-2, 3))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "Math#powInt eval failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The last expression's value (`()` from println) is also
+    // printed in eval mode — see RunAction::EvaluateExpression.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "1024\n81\n1\n0\n-8\n()\n"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_math_pow_int_handles_common_cases() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-math-pow-{unique}.kl"));
+    let exec_path = std::env::temp_dir().join(format!("klassic-math-pow-bin-{unique}"));
+    fs::write(
+        &source_path,
+        "println(Math#powInt(2, 10))\n\
+         println(Math#powInt(3, 4))\n\
+         println(Math#powInt(7, 0))\n\
+         println(Math#powInt(0, 5))\n\
+         println(Math#powInt(-2, 3))\n",
+    )
+    .expect("temp source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            exec_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("native build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let output = Command::new(&exec_path)
+        .output()
+        .expect("native executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exec_path);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "1024\n81\n1\n0\n-8\n"
+    );
+}
+
+#[test]
+fn evaluator_math_pow_int_rejects_negative_exponent() {
+    let output = Command::new(klassic_bin())
+        .args(["-e", "Math#powInt(2, -1)"])
+        .output()
+        .expect("binary should run");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Math#powInt expects a non-negative"),
+        "stderr should explain the contract; got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Regression: a recursive `def` declared in user code (in addition
 /// to the prelude's recursive helpers) must coexist with `thread()`.
 /// The fix this guards covered two distinct bugs:

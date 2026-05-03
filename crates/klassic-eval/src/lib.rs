@@ -2304,6 +2304,54 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             let _ = apply_callable(arguments[0].clone(), Vec::new(), span)?;
             Ok(Value::Int(start.elapsed().as_millis() as i64))
         }
+        "Time#nowMillis" => {
+            ensure_arity(name, arguments, 0, span)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| {
+                    Diagnostic::runtime(
+                        span,
+                        format!("Time#nowMillis failed to read system clock: {error}"),
+                    )
+                })?;
+            Ok(Value::Int(now.as_millis() as i64))
+        }
+        "Math#powInt" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let mut base = match arguments[0] {
+                Value::Int(value) => value,
+                _ => {
+                    return Err(Diagnostic::runtime(span, "Math#powInt expects an Int base"));
+                }
+            };
+            let mut exponent = match arguments[1] {
+                Value::Int(value) => value,
+                _ => {
+                    return Err(Diagnostic::runtime(
+                        span,
+                        "Math#powInt expects an Int exponent",
+                    ));
+                }
+            };
+            if exponent < 0 {
+                return Err(Diagnostic::runtime(
+                    span,
+                    "Math#powInt expects a non-negative exponent",
+                ));
+            }
+            // Square-and-multiply: O(log exponent) integer pow.
+            let mut result: i64 = 1;
+            while exponent > 0 {
+                if exponent & 1 == 1 {
+                    result = result.wrapping_mul(base);
+                }
+                exponent >>= 1;
+                if exponent > 0 {
+                    base = base.wrapping_mul(base);
+                }
+            }
+            Ok(Value::Int(result))
+        }
         "double" => {
             ensure_arity(name, arguments, 1, span)?;
             match &arguments[0] {

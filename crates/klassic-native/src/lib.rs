@@ -1529,7 +1529,8 @@ impl NativeCodeGenerator {
             | "CommandLine#args"
             | "Dir#current"
             | "Dir#home"
-            | "Dir#temp" => Some(0),
+            | "Dir#temp"
+            | "Time#nowMillis" => Some(0),
             "println"
             | "printlnError"
             | "sleep"
@@ -1598,7 +1599,8 @@ impl NativeCodeGenerator {
             | "FileOutput#writeLines"
             | "FileInput#open"
             | "Dir#copy"
-            | "Dir#move" => Some(2),
+            | "Dir#move"
+            | "Math#powInt" => Some(2),
             "substring" | "replace" | "replaceAll" => Some(3),
             _ => None,
         }
@@ -2892,6 +2894,8 @@ impl NativeCodeGenerator {
             "sleep" => self.compile_sleep(arguments, span),
             "thread" => self.compile_thread(arguments, span),
             "stopwatch" => self.compile_stopwatch(arguments, span),
+            "Time#nowMillis" => self.compile_time_now_millis(arguments, span),
+            "Math#powInt" => self.compile_math_pow_int(arguments, span),
             "__gc_alloc" => self.compile_gc_alloc(arguments, span),
             "__gc_record" => self.compile_gc_record(arguments, span),
             "__gc_array" => self.compile_gc_array(arguments, span),
@@ -3646,6 +3650,8 @@ impl NativeCodeGenerator {
             "sleep" => self.compile_sleep(arguments, span).map(Some),
             "thread" => self.compile_thread(arguments, span).map(Some),
             "stopwatch" => self.compile_stopwatch(arguments, span).map(Some),
+            "Time#nowMillis" => self.compile_time_now_millis(arguments, span).map(Some),
+            "Math#powInt" => self.compile_math_pow_int(arguments, span).map(Some),
             "__gc_alloc" => self.compile_gc_alloc(arguments, span).map(Some),
             "__gc_record" => self.compile_gc_record(arguments, span).map(Some),
             "__gc_array" => self.compile_gc_array(arguments, span).map(Some),
@@ -12163,6 +12169,117 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rdi, 1);
         self.asm.mov_data_addr(Reg::Rsi, output);
         self.asm.syscall();
+    }
+
+    /// `Time#nowMillis()` — wall-clock time in milliseconds since the
+    /// UNIX epoch. Implemented via the same `clock_gettime` syscall
+    /// the stopwatch builtin uses, but with `CLOCK_REALTIME` instead
+    /// of `CLOCK_MONOTONIC`. The output struct is `{ tv_sec, tv_nsec }`
+    /// laid out as two i64s; we fold it down to milliseconds in
+    /// registers and leave the result in `Rax` (NativeValue::Int).
+    fn compile_time_now_millis(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if !arguments.is_empty() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "Time#nowMillis expects 0 arguments but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let now = self.asm.data_label_with_i64s(&[0, 0]);
+        self.asm.mov_imm64(Reg::Rax, 228);
+        self.asm.mov_imm64(Reg::Rdi, 0); // CLOCK_REALTIME
+        self.asm.mov_data_addr(Reg::Rsi, now);
+        self.asm.syscall();
+        // Rax := &now; Rcx := tv_sec; Rcx *= 1000; Rax := tv_nsec /
+        // 1_000_000; Rax += Rcx.
+        self.asm.mov_data_addr(Reg::Rax, now);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rax, 0);
+        self.asm.mov_imm64(Reg::Rbx, 1000);
+        self.asm.imul_reg_reg(Reg::Rcx, Reg::Rbx);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 8);
+        self.asm.cqo();
+        self.asm.mov_imm64(Reg::Rbx, 1_000_000);
+        self.asm.idiv_reg(Reg::Rbx);
+        self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
+        Ok(NativeValue::Int)
+    }
+
+    /// `Math#powInt(base, exp)` — integer exponentiation by squaring.
+    /// `exp` must be non-negative; a runtime check writes a stderr
+    /// diagnostic and exits with code 1 otherwise. Result is left in
+    /// `Rax` (NativeValue::Int) and uses 64-bit wrapping multiply
+    /// — overflow is the caller's problem, identical to the
+    /// evaluator's behavior.
+    fn compile_math_pow_int(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 2 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "Math#powInt expects 2 arguments but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let base_value = self.compile_expr(&arguments[0])?;
+        if base_value != NativeValue::Int {
+            return Err(unsupported(span, "native Math#powInt for non-Int base"));
+        }
+        // Stash base on the stack while we evaluate the exponent.
+        self.asm.push_reg(Reg::Rax);
+        self.next_stack_offset += 8;
+        let exp_value = self.compile_expr(&arguments[1])?;
+        if exp_value != NativeValue::Int {
+            return Err(unsupported(span, "native Math#powInt for non-Int exponent"));
+        }
+        // Rax = exp; pop R8 = base.
+        self.asm.pop_reg(Reg::R8);
+        self.next_stack_offset -= 8;
+        // Reject negative exponents at runtime (mirrors the eval-mode
+        // contract; tests pin the wording).
+        let exp_ok = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, exp_ok);
+        self.emit_runtime_error(span, "Math#powInt expects a non-negative exponent");
+        self.asm.bind_text_label(exp_ok);
+        // Rcx = exp, R8 = base, R9 = result (initially 1).
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.mov_imm64(Reg::R9, 1);
+        let loop_top = self.asm.create_text_label();
+        let skip_mul = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.bind_text_label(loop_top);
+        // exit when exp == 0 (also catches the rare path where exp was
+        // already 0 when we entered — `7 ^ 0 = 1`).
+        self.asm.cmp_reg_imm8(Reg::Rcx, 0);
+        self.asm.jcc_label(Condition::LessEqual, done);
+        // if (exp & 1) == 0 skip the multiply.
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rcx);
+        self.asm.and_reg_imm32(Reg::Rdi, 1);
+        self.asm.cmp_reg_imm8(Reg::Rdi, 0);
+        self.asm.jcc_label(Condition::Equal, skip_mul);
+        // result *= base.
+        self.asm.imul_reg_reg(Reg::R9, Reg::R8);
+        self.asm.bind_text_label(skip_mul);
+        // exp >>= 1.
+        self.asm.shr_reg_imm8(Reg::Rcx, 1);
+        // base *= base only if there is another iteration to go.
+        self.asm.cmp_reg_imm8(Reg::Rcx, 0);
+        self.asm.jcc_label(Condition::LessEqual, done);
+        self.asm.imul_reg_reg(Reg::R8, Reg::R8);
+        self.asm.jmp_label(loop_top);
+        self.asm.bind_text_label(done);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R9);
+        Ok(NativeValue::Int)
     }
 
     fn emit_elapsed_millis(&mut self, start: DataLabel, end: DataLabel) {
@@ -23324,6 +23441,8 @@ impl NativeCodeGenerator {
                 | "CommandLine"
                 | "Process"
                 | "Dir"
+                | "Time"
+                | "Math"
         )
     }
 
@@ -23416,6 +23535,8 @@ impl NativeCodeGenerator {
                 | "Dir#delete"
                 | "Dir#copy"
                 | "Dir#move"
+                | "Time#nowMillis"
+                | "Math#powInt"
         )
     }
 
@@ -32821,6 +32942,7 @@ fn static_expr_is_pure(expr: &Expr) -> bool {
                         | "Dir#delete"
                         | "Dir#copy"
                         | "Dir#move"
+                        | "Time#nowMillis"
                 )
             {
                 return false;

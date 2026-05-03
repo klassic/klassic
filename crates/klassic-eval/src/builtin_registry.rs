@@ -83,6 +83,8 @@ pub(crate) fn builtin_name(name: &str) -> Option<&'static str> {
         "Set#contains" => Some("Set#contains"),
         "Set#isEmpty" => Some("Set#isEmpty"),
         "Set#size" => Some("Set#size"),
+        "Time#nowMillis" => Some("Time#nowMillis"),
+        "Math#powInt" => Some("Math#powInt"),
         "__gc_alloc" => Some("__gc_alloc"),
         "__gc_record" => Some("__gc_record"),
         "__gc_array" => Some("__gc_array"),
@@ -267,6 +269,7 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         | "Map#containsValue"
         | "Map#get"
         | "Set#contains" => Some(2),
+        "Math#powInt" => Some(2),
         "StandardInput#all"
         | "StandardInput#lines"
         | "Environment#vars"
@@ -274,6 +277,7 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         | "Dir#current"
         | "Dir#home"
         | "Dir#temp"
+        | "Time#nowMillis"
         | "ToDo" => Some(0),
         _ => None,
     }
