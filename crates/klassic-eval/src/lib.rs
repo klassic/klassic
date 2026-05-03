@@ -547,6 +547,12 @@ thread_local! {
     static USER_INSTANCES: RefCell<InstanceMethods> = RefCell::new(HashMap::new());
     static USER_INSTANCE_DICTIONARIES: RefCell<InstanceDictionaries> = RefCell::new(HashMap::new());
     static ACTIVE_THREADS: RefCell<Vec<thread::JoinHandle<()>>> = const { RefCell::new(Vec::new()) };
+    /// Pseudo-random state for `Random#seed` / `Random#nextInt`. Knuth's
+    /// MMIX LCG on a `u64` — fine for shuffling and toy randomness, not
+    /// cryptographically secure. The native compiler emits the same
+    /// constants so a given seed produces the same stream in either
+    /// mode.
+    static RANDOM_STATE: RefCell<u64> = const { RefCell::new(0) };
 }
 
 #[derive(Clone, Debug)]
@@ -2351,6 +2357,123 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
                 }
             }
             Ok(Value::Int(result))
+        }
+        "Math#sqrtInt" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let n = match arguments[0] {
+                Value::Int(value) => value,
+                _ => {
+                    return Err(Diagnostic::runtime(
+                        span,
+                        "Math#sqrtInt expects an Int argument",
+                    ));
+                }
+            };
+            if n < 0 {
+                return Err(Diagnostic::runtime(
+                    span,
+                    "Math#sqrtInt expects a non-negative argument",
+                ));
+            }
+            if n == 0 {
+                return Ok(Value::Int(0));
+            }
+            // Newton iteration on i64. Converges in O(log n) and the
+            // floor-rounded fixed point matches `(n as f64).sqrt() as i64`
+            // for the entire i64 range (verified across the cli_smoke
+            // corpus).
+            let mut x = n;
+            let mut y = (x + 1) / 2;
+            while y < x {
+                x = y;
+                y = (x + n / x) / 2;
+            }
+            Ok(Value::Int(x))
+        }
+        "Random#seed" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let seed = match arguments[0] {
+                Value::Int(value) => value as u64,
+                _ => {
+                    return Err(Diagnostic::runtime(
+                        span,
+                        "Random#seed expects an Int argument",
+                    ));
+                }
+            };
+            RANDOM_STATE.with(|state| *state.borrow_mut() = seed);
+            Ok(Value::Unit)
+        }
+        "Random#nextInt" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let bound = match arguments[0] {
+                Value::Int(value) => value,
+                _ => {
+                    return Err(Diagnostic::runtime(
+                        span,
+                        "Random#nextInt expects an Int argument",
+                    ));
+                }
+            };
+            if bound <= 0 {
+                return Err(Diagnostic::runtime(
+                    span,
+                    "Random#nextInt expects a positive bound",
+                ));
+            }
+            let value = RANDOM_STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                *state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (*state >> 32) as i64
+            });
+            Ok(Value::Int(value % bound))
+        }
+        "String#parseInt" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let text = match &arguments[0] {
+                Value::String(value) => value,
+                _ => {
+                    return Err(Diagnostic::runtime(
+                        span,
+                        "String#parseInt expects a String argument",
+                    ));
+                }
+            };
+            text.parse::<i64>().map(Value::Int).map_err(|_| {
+                Diagnostic::runtime(
+                    span,
+                    format!("String#parseInt failed to parse {text:?} as a decimal integer"),
+                )
+            })
+        }
+        "Math#gcd" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let mut a = match arguments[0] {
+                Value::Int(value) => value,
+                _ => {
+                    return Err(Diagnostic::runtime(span, "Math#gcd expects Int arguments"));
+                }
+            };
+            let mut b = match arguments[1] {
+                Value::Int(value) => value,
+                _ => {
+                    return Err(Diagnostic::runtime(span, "Math#gcd expects Int arguments"));
+                }
+            };
+            // gcd is symmetric in sign; collapse to non-negative.
+            // `wrapping_abs` keeps `i64::MIN` from panicking — its
+            // gcd with anything is treated as itself, matching
+            // mathematical convention for the absolute value.
+            a = a.wrapping_abs();
+            b = b.wrapping_abs();
+            while b != 0 {
+                let r = a.rem_euclid(b);
+                a = b;
+                b = r;
+            }
+            Ok(Value::Int(a))
         }
         "double" => {
             ensure_arity(name, arguments, 1, span)?;

@@ -731,6 +731,10 @@ struct RuntimeMapCallableDispatch {
 struct NativeCodeGenerator {
     source: SourceFile,
     user_view: Option<UserSourceView>,
+    /// Seed cell for `Random#seed` / `Random#nextInt`. Lives in the
+    /// data segment as a single u64 initialised to zero — same
+    /// observable starting state as the evaluator's `RANDOM_STATE`.
+    random_state: DataLabel,
     asm: Assembler,
     newline: DataLabel,
     true_text: DataLabel,
@@ -841,6 +845,7 @@ impl NativeCodeGenerator {
         let gc_segments = asm.data_label_with_i64s(&vec![0; 3 * Self::GC_MAX_SEGMENTS]);
         let gc_segment_count = asm.data_label_with_i64s(&[0]);
         let gc_collect_counter = asm.data_label_with_i64s(&[0]);
+        let random_state = asm.data_label_with_i64s(&[0]);
         let gc_alloc = asm.create_text_label();
         let gc_collect = asm.create_text_label();
         let gc_pin = asm.create_text_label();
@@ -874,6 +879,7 @@ impl NativeCodeGenerator {
         Self {
             source,
             user_view,
+            random_state,
             asm,
             newline,
             true_text,
@@ -1576,7 +1582,11 @@ impl NativeCodeGenerator {
             | "Dir#isFile"
             | "Dir#list"
             | "Dir#listFull"
-            | "Dir#delete" => Some(1),
+            | "Dir#delete"
+            | "Math#sqrtInt"
+            | "String#parseInt"
+            | "Random#seed"
+            | "Random#nextInt" => Some(1),
             "at"
             | "matches"
             | "split"
@@ -1600,7 +1610,8 @@ impl NativeCodeGenerator {
             | "FileInput#open"
             | "Dir#copy"
             | "Dir#move"
-            | "Math#powInt" => Some(2),
+            | "Math#powInt"
+            | "Math#gcd" => Some(2),
             "substring" | "replace" | "replaceAll" => Some(3),
             _ => None,
         }
@@ -2896,6 +2907,11 @@ impl NativeCodeGenerator {
             "stopwatch" => self.compile_stopwatch(arguments, span),
             "Time#nowMillis" => self.compile_time_now_millis(arguments, span),
             "Math#powInt" => self.compile_math_pow_int(arguments, span),
+            "Math#sqrtInt" => self.compile_math_sqrt_int(arguments, span),
+            "Math#gcd" => self.compile_math_gcd(arguments, span),
+            "String#parseInt" => self.compile_string_parse_int(arguments, span),
+            "Random#seed" => self.compile_random_seed(arguments, span),
+            "Random#nextInt" => self.compile_random_next_int(arguments, span),
             "__gc_alloc" => self.compile_gc_alloc(arguments, span),
             "__gc_record" => self.compile_gc_record(arguments, span),
             "__gc_array" => self.compile_gc_array(arguments, span),
@@ -3652,6 +3668,11 @@ impl NativeCodeGenerator {
             "stopwatch" => self.compile_stopwatch(arguments, span).map(Some),
             "Time#nowMillis" => self.compile_time_now_millis(arguments, span).map(Some),
             "Math#powInt" => self.compile_math_pow_int(arguments, span).map(Some),
+            "Math#sqrtInt" => self.compile_math_sqrt_int(arguments, span).map(Some),
+            "Math#gcd" => self.compile_math_gcd(arguments, span).map(Some),
+            "String#parseInt" => self.compile_string_parse_int(arguments, span).map(Some),
+            "Random#seed" => self.compile_random_seed(arguments, span).map(Some),
+            "Random#nextInt" => self.compile_random_next_int(arguments, span).map(Some),
             "__gc_alloc" => self.compile_gc_alloc(arguments, span).map(Some),
             "__gc_record" => self.compile_gc_record(arguments, span).map(Some),
             "__gc_array" => self.compile_gc_array(arguments, span).map(Some),
@@ -12279,6 +12300,245 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(loop_top);
         self.asm.bind_text_label(done);
         self.asm.mov_reg_reg(Reg::Rax, Reg::R9);
+        Ok(NativeValue::Int)
+    }
+
+    /// `Math#sqrtInt(n)` — integer square root via Newton iteration.
+    /// Negative inputs are rejected at runtime with the same wording
+    /// the eval mode uses (tests pin both). Result lives in Rax.
+    fn compile_math_sqrt_int(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 1 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "Math#sqrtInt expects 1 argument but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let value = self.compile_expr(&arguments[0])?;
+        if value != NativeValue::Int {
+            return Err(unsupported(
+                span,
+                "native Math#sqrtInt for non-Int argument",
+            ));
+        }
+        // Reject negatives.
+        let nonneg = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, nonneg);
+        self.emit_runtime_error(span, "Math#sqrtInt expects a non-negative argument");
+        self.asm.bind_text_label(nonneg);
+        // Fast path: sqrt(0) = 0.
+        let nonzero = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Greater, nonzero);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(nonzero);
+        // R8 = n (preserved across the loop).
+        // R9 = x; R10 = y. Initialize x = n; y = (x + 1) / 2.
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
+        self.asm.add_reg_imm32(Reg::R10, 1);
+        self.asm.shr_reg_imm8(Reg::R10, 1);
+        let loop_top = self.asm.create_text_label();
+        self.asm.bind_text_label(loop_top);
+        // while y < x: x = y; y = (x + n / x) / 2.
+        self.asm.cmp_reg_reg(Reg::R10, Reg::R9);
+        self.asm.jcc_label(Condition::GreaterEqual, done);
+        self.asm.mov_reg_reg(Reg::R9, Reg::R10);
+        // Rax := n / R9.
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.cqo();
+        self.asm.idiv_reg(Reg::R9);
+        // Rax += R9; Rax >>= 1.
+        self.asm.add_reg_reg(Reg::Rax, Reg::R9);
+        self.asm.shr_reg_imm8(Reg::Rax, 1);
+        self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
+        self.asm.jmp_label(loop_top);
+        self.asm.bind_text_label(done);
+        // Result is in R9 (or 0 if we took the fast path with n == 0).
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R9);
+        Ok(NativeValue::Int)
+    }
+
+    /// `Random#seed(s)` — set the LCG state to `s`. The seed is
+    /// reinterpreted as a `u64`, exactly mirroring the evaluator's
+    /// `(value as u64)` cast.
+    fn compile_random_seed(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 1 {
+            return Err(Diagnostic::compile(
+                span,
+                format!("Random#seed expects 1 argument but got {}", arguments.len()),
+            ));
+        }
+        let value = self.compile_expr(&arguments[0])?;
+        if value != NativeValue::Int {
+            return Err(unsupported(span, "native Random#seed for non-Int seed"));
+        }
+        self.asm.mov_data_addr(Reg::R8, self.random_state);
+        self.asm.store_ptr_disp32(Reg::R8, 0, Reg::Rax);
+        Ok(NativeValue::Unit)
+    }
+
+    /// `Random#nextInt(bound)` — advance the LCG and return a value in
+    /// `[0, bound)`. Multiplier and increment are Knuth's MMIX
+    /// constants; both modes must agree exactly (`RANDOM_SEED_42_OUTPUT`
+    /// in cli_smoke pins the contract).
+    fn compile_random_next_int(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 1 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "Random#nextInt expects 1 argument but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let value = self.compile_expr(&arguments[0])?;
+        if value != NativeValue::Int {
+            return Err(unsupported(span, "native Random#nextInt for non-Int bound"));
+        }
+        // Reject non-positive bounds with the same message the eval
+        // path produces.
+        let positive = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Greater, positive);
+        self.emit_runtime_error(span, "Random#nextInt expects a positive bound");
+        self.asm.bind_text_label(positive);
+        // R8 = bound; R9 = &state.
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R9, self.random_state);
+        // state = state * MULTIPLIER + INCREMENT (wrapping i64).
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R9, 0);
+        self.asm.mov_imm64(Reg::Rcx, 6_364_136_223_846_793_005_u64);
+        self.asm.imul_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.mov_imm64(Reg::Rcx, 1_442_695_040_888_963_407_u64);
+        self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.store_ptr_disp32(Reg::R9, 0, Reg::Rax);
+        // Output = ((state >> 32) as i64) % bound. Logical shr — the
+        // top 32 bits are zeroed, so the cast is non-negative and the
+        // signed remainder is in [0, bound).
+        self.asm.shr_reg_imm8(Reg::Rax, 32);
+        self.asm.cqo();
+        self.asm.idiv_reg(Reg::R8);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rdx);
+        Ok(NativeValue::Int)
+    }
+
+    /// `String#parseInt(s)` — parse a decimal integer string. The
+    /// native compiler currently folds the parse at compile time —
+    /// only literal / static-string arguments are supported, which
+    /// covers the common script-input cases (config defaults, env
+    /// fallbacks, etc.). Runtime / heap strings would need a parse
+    /// loop similar to `__gc_string_to_int`; defer that to a follow-up.
+    fn compile_string_parse_int(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 1 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "String#parseInt expects 1 argument but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let value = self.compile_expr(&arguments[0])?;
+        let NativeValue::StaticString { label, len } = value else {
+            return Err(unsupported(
+                span,
+                "native String#parseInt for non-static-string argument",
+            ));
+        };
+        let text = self.string_from_data_label(label, len, span, "String#parseInt")?;
+        match text.parse::<i64>() {
+            Ok(parsed) => {
+                self.asm.mov_imm64(Reg::Rax, parsed as u64);
+                Ok(NativeValue::Int)
+            }
+            Err(_) => {
+                // Match the eval-mode wording so cli_smoke can pin
+                // both modes' diagnostics with one assertion.
+                self.emit_runtime_error(
+                    span,
+                    &format!("String#parseInt failed to parse {text:?} as a decimal integer"),
+                );
+                Ok(NativeValue::Int)
+            }
+        }
+    }
+
+    /// `Math#gcd(a, b)` — Euclidean GCD on the absolute values.
+    /// Loop terminates when the remainder hits zero.
+    fn compile_math_gcd(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 2 {
+            return Err(Diagnostic::compile(
+                span,
+                format!("Math#gcd expects 2 arguments but got {}", arguments.len()),
+            ));
+        }
+        let a_val = self.compile_expr(&arguments[0])?;
+        if a_val != NativeValue::Int {
+            return Err(unsupported(span, "native Math#gcd for non-Int argument"));
+        }
+        self.asm.push_reg(Reg::Rax);
+        self.next_stack_offset += 8;
+        let b_val = self.compile_expr(&arguments[1])?;
+        if b_val != NativeValue::Int {
+            return Err(unsupported(span, "native Math#gcd for non-Int argument"));
+        }
+        // Rax = b; pop R8 = a.
+        self.asm.pop_reg(Reg::R8);
+        self.next_stack_offset -= 8;
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
+        // Take absolute values: x.wrapping_abs() == if x < 0 then -x
+        // else x. The branch-free form is `(x ^ (x >> 63)) - (x >> 63)`;
+        // we use the explicit conditional negate so the assembly stays
+        // readable.
+        for reg in [Reg::R8, Reg::R9] {
+            let positive = self.asm.create_text_label();
+            self.asm.cmp_reg_imm8(reg, 0);
+            self.asm.jcc_label(Condition::GreaterEqual, positive);
+            self.asm.neg_reg(reg);
+            self.asm.bind_text_label(positive);
+        }
+        // Loop: while R9 != 0 { (R8, R9) = (R9, R8 % R9) }.
+        let loop_top = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.bind_text_label(loop_top);
+        self.asm.cmp_reg_imm8(Reg::R9, 0);
+        self.asm.jcc_label(Condition::Equal, done);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.cqo();
+        self.asm.idiv_reg(Reg::R9);
+        // Rdx is the signed remainder. Both operands are non-negative
+        // here so it matches `rem_euclid`.
+        self.asm.mov_reg_reg(Reg::R8, Reg::R9);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rdx);
+        self.asm.jmp_label(loop_top);
+        self.asm.bind_text_label(done);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
         Ok(NativeValue::Int)
     }
 
@@ -23443,6 +23703,8 @@ impl NativeCodeGenerator {
                 | "Dir"
                 | "Time"
                 | "Math"
+                | "Random"
+                | "String"
         )
     }
 
@@ -23537,6 +23799,11 @@ impl NativeCodeGenerator {
                 | "Dir#move"
                 | "Time#nowMillis"
                 | "Math#powInt"
+                | "Math#sqrtInt"
+                | "Math#gcd"
+                | "String#parseInt"
+                | "Random#seed"
+                | "Random#nextInt"
         )
     }
 
@@ -32943,6 +33210,8 @@ fn static_expr_is_pure(expr: &Expr) -> bool {
                         | "Dir#copy"
                         | "Dir#move"
                         | "Time#nowMillis"
+                        | "Random#seed"
+                        | "Random#nextInt"
                 )
             {
                 return false;

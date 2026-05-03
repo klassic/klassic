@@ -2152,6 +2152,31 @@ impl TypeChecker {
             Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int)),
         );
         self.declare_poly(
+            "Math#sqrtInt".to_string(),
+            false,
+            Type::Function(vec![Type::Int], Box::new(Type::Int)),
+        );
+        self.declare_poly(
+            "Math#gcd".to_string(),
+            false,
+            Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int)),
+        );
+        self.declare_poly(
+            "String#parseInt".to_string(),
+            false,
+            Type::Function(vec![Type::String], Box::new(Type::Int)),
+        );
+        self.declare_poly(
+            "Random#seed".to_string(),
+            false,
+            Type::Function(vec![Type::Int], Box::new(Type::Unit)),
+        );
+        self.declare_poly(
+            "Random#nextInt".to_string(),
+            false,
+            Type::Function(vec![Type::Int], Box::new(Type::Int)),
+        );
+        self.declare_poly(
             "double".to_string(),
             false,
             Type::Function(vec![Type::Dynamic], Box::new(Type::Double)),

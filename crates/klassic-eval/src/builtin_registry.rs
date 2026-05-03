@@ -85,6 +85,11 @@ pub(crate) fn builtin_name(name: &str) -> Option<&'static str> {
         "Set#size" => Some("Set#size"),
         "Time#nowMillis" => Some("Time#nowMillis"),
         "Math#powInt" => Some("Math#powInt"),
+        "Math#sqrtInt" => Some("Math#sqrtInt"),
+        "Math#gcd" => Some("Math#gcd"),
+        "String#parseInt" => Some("String#parseInt"),
+        "Random#seed" => Some("Random#seed"),
+        "Random#nextInt" => Some("Random#nextInt"),
         "__gc_alloc" => Some("__gc_alloc"),
         "__gc_record" => Some("__gc_record"),
         "__gc_array" => Some("__gc_array"),
@@ -269,7 +274,8 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         | "Map#containsValue"
         | "Map#get"
         | "Set#contains" => Some(2),
-        "Math#powInt" => Some(2),
+        "Math#powInt" | "Math#gcd" => Some(2),
+        "Math#sqrtInt" | "String#parseInt" | "Random#seed" | "Random#nextInt" => Some(1),
         "StandardInput#all"
         | "StandardInput#lines"
         | "Environment#vars"

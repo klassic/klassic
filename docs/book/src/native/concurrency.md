@@ -74,3 +74,42 @@ using square-and-multiply (O(log exp) multiplies). Result wraps on
 i64 overflow — same as the rest of Klassic's integer arithmetic.
 Negative exponents are rejected at runtime with a stderr
 diagnostic.
+
+```kl
+println(Math#sqrtInt(99))     //   9 (floor)
+println(Math#sqrtInt(100))    //  10
+println(Math#gcd(12, 18))     //   6
+println(Math#gcd(-12, 18))    //   6 (operates on |a|, |b|)
+```
+
+`Math#sqrtInt(n)` floors the integer square root via Newton iteration
+(O(log n) i64 divides). Negative `n` is a runtime error.
+`Math#gcd(a, b)` is the Euclidean algorithm on the absolute values;
+`Math#gcd(0, 0)` is `0`.
+
+## String parsing
+
+```kl
+println(String#parseInt("42"))   // 42
+println(String#parseInt("-7"))   // -7
+```
+
+`String#parseInt(s)` reads a decimal integer (leading `+`/`-`
+optional, no surrounding whitespace). Malformed input is a runtime
+error. Native build currently folds the parse at compile time —
+literal/static-string arguments work; arbitrary runtime strings will
+arrive in a follow-up.
+
+## Pseudo-random numbers
+
+```kl
+Random#seed(42)
+println(Random#nextInt(100))    // 69 — deterministic
+println(Random#nextInt(100))    // 53
+```
+
+`Random#seed(s)` and `Random#nextInt(bound)` share a single LCG state
+(Knuth's MMIX constants). The same seed produces the same sequence in
+both eval and native modes — the cli_smoke suite pins this. The
+generator is fine for shuffling and toy randomness; it is **not**
+cryptographically secure.

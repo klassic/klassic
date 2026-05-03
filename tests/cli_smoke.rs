@@ -16994,6 +16994,372 @@ fn evaluator_math_pow_int_rejects_negative_exponent() {
     );
 }
 
+/// Determinism contract: `Random#seed(42)` followed by five
+/// `Random#nextInt(...)` calls must produce this exact sequence in
+/// both the evaluator and the native compiler. The constants are
+/// Knuth's MMIX LCG (multiplier 6364136223846793005, increment
+/// 1442695040888963407); changing them would silently break user
+/// programs that rely on reproducibility.
+const RANDOM_SEED_42_OUTPUT: &str = "69\n53\n77\n7\n588\n";
+
+#[test]
+fn evaluator_random_seed_produces_deterministic_sequence() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "Random#seed(42)\n\
+             println(Random#nextInt(100))\n\
+             println(Random#nextInt(100))\n\
+             println(Random#nextInt(100))\n\
+             println(Random#nextInt(1000))\n\
+             println(Random#nextInt(1000))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "Random eval failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let body = stdout
+        .strip_suffix("()\n")
+        .expect("eval prints final () after the last expression");
+    assert_eq!(body, RANDOM_SEED_42_OUTPUT);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_random_seed_matches_evaluator_sequence() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-random-{unique}.kl"));
+    let exec_path = std::env::temp_dir().join(format!("klassic-random-bin-{unique}"));
+    fs::write(
+        &source_path,
+        "Random#seed(42)\n\
+         println(Random#nextInt(100))\n\
+         println(Random#nextInt(100))\n\
+         println(Random#nextInt(100))\n\
+         println(Random#nextInt(1000))\n\
+         println(Random#nextInt(1000))\n",
+    )
+    .expect("temp source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            exec_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("native build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let output = Command::new(&exec_path)
+        .output()
+        .expect("native executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exec_path);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        RANDOM_SEED_42_OUTPUT
+    );
+}
+
+#[test]
+fn evaluator_random_next_int_rejects_non_positive_bound() {
+    for bad in ["0", "-1"] {
+        let output = Command::new(klassic_bin())
+            .args(["-e", &format!("Random#seed(1); Random#nextInt({bad})")])
+            .output()
+            .expect("binary should run");
+        assert!(
+            !output.status.success(),
+            "bound {bad} should fail; stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Random#nextInt expects a positive"),
+            "stderr should explain the contract; got:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn evaluator_string_parse_int_handles_typical_inputs() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println(String#parseInt(\"0\"))\n\
+             println(String#parseInt(\"42\"))\n\
+             println(String#parseInt(\"-7\"))\n\
+             println(String#parseInt(\"1234567890\"))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "String#parseInt eval failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "0\n42\n-7\n1234567890\n()\n"
+    );
+}
+
+#[test]
+fn evaluator_string_parse_int_rejects_garbage() {
+    // We mirror Rust's `i64::parse` semantics on the eval side, so
+    // leading "+" is accepted (e.g. `"+5" → 5`). Surrounding spaces
+    // and any non-digit body are rejected.
+    for bad in ["", "abc", "12abc", " 5", "5 "] {
+        let output = Command::new(klassic_bin())
+            .args(["-e", &format!("String#parseInt({bad:?})")])
+            .output()
+            .expect("binary should run");
+        assert!(
+            !output.status.success(),
+            "input {bad:?} should fail; stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("String#parseInt"),
+            "stderr should mention String#parseInt; got:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_string_parse_int_handles_typical_inputs() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-parse-int-{unique}.kl"));
+    let exec_path = std::env::temp_dir().join(format!("klassic-parse-int-bin-{unique}"));
+    fs::write(
+        &source_path,
+        "println(String#parseInt(\"0\"))\n\
+         println(String#parseInt(\"42\"))\n\
+         println(String#parseInt(\"-7\"))\n\
+         println(String#parseInt(\"1234567890\"))\n",
+    )
+    .expect("temp source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            exec_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("native build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let output = Command::new(&exec_path)
+        .output()
+        .expect("native executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exec_path);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "0\n42\n-7\n1234567890\n"
+    );
+}
+
+#[test]
+fn evaluator_math_sqrt_int_floors_towards_zero() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println(Math#sqrtInt(0))\n\
+             println(Math#sqrtInt(1))\n\
+             println(Math#sqrtInt(2))\n\
+             println(Math#sqrtInt(15))\n\
+             println(Math#sqrtInt(16))\n\
+             println(Math#sqrtInt(99))\n\
+             println(Math#sqrtInt(100))\n\
+             println(Math#sqrtInt(1000000))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "Math#sqrtInt eval failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "0\n1\n1\n3\n4\n9\n10\n1000\n()\n"
+    );
+}
+
+#[test]
+fn evaluator_math_sqrt_int_rejects_negative() {
+    let output = Command::new(klassic_bin())
+        .args(["-e", "Math#sqrtInt(-1)"])
+        .output()
+        .expect("binary should run");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Math#sqrtInt expects a non-negative"),
+        "stderr should explain the contract; got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_math_sqrt_int_floors_towards_zero() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-sqrt-int-{unique}.kl"));
+    let exec_path = std::env::temp_dir().join(format!("klassic-sqrt-int-bin-{unique}"));
+    fs::write(
+        &source_path,
+        "println(Math#sqrtInt(0))\n\
+         println(Math#sqrtInt(1))\n\
+         println(Math#sqrtInt(2))\n\
+         println(Math#sqrtInt(15))\n\
+         println(Math#sqrtInt(16))\n\
+         println(Math#sqrtInt(99))\n\
+         println(Math#sqrtInt(100))\n\
+         println(Math#sqrtInt(1000000))\n",
+    )
+    .expect("temp source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            exec_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("native build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let output = Command::new(&exec_path)
+        .output()
+        .expect("native executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exec_path);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "0\n1\n1\n3\n4\n9\n10\n1000\n"
+    );
+}
+
+#[test]
+fn evaluator_math_gcd_handles_typical_cases() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println(Math#gcd(12, 18))\n\
+             println(Math#gcd(18, 12))\n\
+             println(Math#gcd(7, 13))\n\
+             println(Math#gcd(0, 5))\n\
+             println(Math#gcd(5, 0))\n\
+             println(Math#gcd(0, 0))\n\
+             println(Math#gcd(-12, 18))\n\
+             println(Math#gcd(12, -18))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "Math#gcd eval failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "6\n6\n1\n5\n5\n0\n6\n6\n()\n"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_math_gcd_handles_typical_cases() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-gcd-{unique}.kl"));
+    let exec_path = std::env::temp_dir().join(format!("klassic-gcd-bin-{unique}"));
+    fs::write(
+        &source_path,
+        "println(Math#gcd(12, 18))\n\
+         println(Math#gcd(18, 12))\n\
+         println(Math#gcd(7, 13))\n\
+         println(Math#gcd(0, 5))\n\
+         println(Math#gcd(5, 0))\n\
+         println(Math#gcd(0, 0))\n\
+         println(Math#gcd(-12, 18))\n\
+         println(Math#gcd(12, -18))\n",
+    )
+    .expect("temp source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            exec_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("native build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let output = Command::new(&exec_path)
+        .output()
+        .expect("native executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exec_path);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "6\n6\n1\n5\n5\n0\n6\n6\n"
+    );
+}
+
 /// Regression: a recursive `def` declared in user code (in addition
 /// to the prelude's recursive helpers) must coexist with `thread()`.
 /// The fix this guards covered two distinct bugs:
