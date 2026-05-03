@@ -49,5 +49,6 @@
 
 # Reference
 
+- [Standard Prelude](./reference/stdlib-prelude.md)
 - [Native Compiler Coverage](./reference/native-coverage.md)
 - [Architecture Overview](./reference/architecture.md)
