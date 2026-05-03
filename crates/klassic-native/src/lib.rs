@@ -16,15 +16,32 @@ pub struct NativeCompilerConfig {
     pub warn_trust: bool,
 }
 
+/// Optional view that lets the compiler report user-facing line numbers
+/// when the source has a stdlib prelude prepended in front of user code.
+#[derive(Clone, Debug)]
+struct UserSourceView {
+    source: SourceFile,
+    prelude_byte_offset: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeCompileError {
     source: SourceFile,
+    user_view: Option<UserSourceView>,
     diagnostic: Diagnostic,
 }
 
 impl NativeCompileError {
-    fn new(source: SourceFile, diagnostic: Diagnostic) -> Self {
-        Self { source, diagnostic }
+    fn with_view(
+        source: SourceFile,
+        user_view: Option<UserSourceView>,
+        diagnostic: Diagnostic,
+    ) -> Self {
+        Self {
+            source,
+            user_view,
+            diagnostic,
+        }
     }
 
     pub fn diagnostic(&self) -> &Diagnostic {
@@ -34,6 +51,30 @@ impl NativeCompileError {
 
 impl fmt::Display for NativeCompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let (Some(view), Some(span)) = (&self.user_view, self.diagnostic.span)
+            && span.start >= view.prelude_byte_offset
+        {
+            let user_start = span.start - view.prelude_byte_offset;
+            let (line, column) = view.source.line_col(user_start);
+            return match self.diagnostic.severity {
+                klassic_span::Severity::Error => write!(
+                    f,
+                    "{}:{}:{}: {}",
+                    view.source.name(),
+                    line,
+                    column,
+                    self.diagnostic.message
+                ),
+                klassic_span::Severity::Warning => write!(
+                    f,
+                    "{}:{}:{}: warning: {}",
+                    view.source.name(),
+                    line,
+                    column,
+                    self.diagnostic.message
+                ),
+            };
+        }
         write!(f, "{}", self.diagnostic.render(&self.source))
     }
 }
@@ -47,16 +88,53 @@ pub fn compile_source_to_elf(
     config: NativeCompilerConfig,
 ) -> Result<Vec<u8>, NativeCompileError> {
     let source = SourceFile::new(name, text);
-    let expr = parse_source(&source)
-        .map_err(|diagnostic| NativeCompileError::new(source.clone(), diagnostic))?;
+    compile_internal(source, None, config)
+}
+
+/// Compile `user_text` as if `prelude_text` were prepended in front of it.
+/// User-facing diagnostics and runtime error messages are remapped so user
+/// line numbers stay 1-based — the prelude is invisible to the user.
+#[allow(clippy::result_large_err)]
+pub fn compile_source_with_prelude_to_elf(
+    name: &str,
+    prelude_text: &str,
+    user_text: &str,
+    config: NativeCompilerConfig,
+) -> Result<Vec<u8>, NativeCompileError> {
+    let mut bundled = String::with_capacity(prelude_text.len() + user_text.len() + 1);
+    bundled.push_str(prelude_text);
+    if !prelude_text.ends_with('\n') {
+        bundled.push('\n');
+    }
+    let prelude_byte_offset = bundled.len();
+    bundled.push_str(user_text);
+    let source = SourceFile::new("<bundled>", bundled);
+    let user_view = UserSourceView {
+        source: SourceFile::new(name, user_text),
+        prelude_byte_offset,
+    };
+    compile_internal(source, Some(user_view), config)
+}
+
+#[allow(clippy::result_large_err)]
+fn compile_internal(
+    source: SourceFile,
+    user_view: Option<UserSourceView>,
+    config: NativeCompilerConfig,
+) -> Result<Vec<u8>, NativeCompileError> {
+    let expr = parse_source(&source).map_err(|diagnostic| {
+        NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
+    })?;
     let expr = rewrite_expression(expr);
-    typecheck_program(&expr)
-        .map_err(|diagnostic| NativeCompileError::new(source.clone(), diagnostic))?;
-    analyze_proofs(&expr, config)
-        .map_err(|diagnostic| NativeCompileError::new(source.clone(), diagnostic))?;
-    let object = NativeCodeGenerator::new(source.clone())
+    typecheck_program(&expr).map_err(|diagnostic| {
+        NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
+    })?;
+    analyze_proofs(&expr, config).map_err(|diagnostic| {
+        NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
+    })?;
+    let object = NativeCodeGenerator::new(source.clone(), user_view.clone())
         .compile(&expr)
-        .map_err(|diagnostic| NativeCompileError::new(source, diagnostic))?;
+        .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic))?;
     Ok(elf::write_executable(object))
 }
 
@@ -652,6 +730,7 @@ struct RuntimeMapCallableDispatch {
 
 struct NativeCodeGenerator {
     source: SourceFile,
+    user_view: Option<UserSourceView>,
     asm: Assembler,
     newline: DataLabel,
     true_text: DataLabel,
@@ -730,7 +809,7 @@ struct NativeCodeGenerator {
 }
 
 impl NativeCodeGenerator {
-    fn new(source: SourceFile) -> Self {
+    fn new(source: SourceFile, user_view: Option<UserSourceView>) -> Self {
         let mut asm = Assembler::new();
         let newline = asm.data_label_with_bytes(b"\n");
         let true_text = asm.data_label_with_bytes(b"true");
@@ -794,6 +873,7 @@ impl NativeCodeGenerator {
         );
         Self {
             source,
+            user_view,
             asm,
             newline,
             true_text,
@@ -30926,6 +31006,13 @@ impl NativeCodeGenerator {
     }
 
     fn runtime_error_prefix(&self, span: Span) -> String {
+        if let Some(view) = &self.user_view
+            && span.start >= view.prelude_byte_offset
+        {
+            let user_start = span.start - view.prelude_byte_offset;
+            let (line, column) = view.source.line_col(user_start);
+            return format!("{}:{line}:{column}: ", view.source.name());
+        }
         let (line, column) = self.source.line_col(span.start);
         format!("{}:{line}:{column}: ", self.source.name())
     }

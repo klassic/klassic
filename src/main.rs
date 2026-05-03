@@ -7,8 +7,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::ExitCode;
 
 use cli::{ExecutionConfig, ParsedCommand, RunAction, parse_command_line, usage};
-use klassic_eval::{Evaluator, EvaluatorConfig, evaluate_text_with_config};
-use klassic_native::{NativeCompilerConfig, compile_source_to_elf};
+use klassic_eval::{Evaluator, EvaluatorConfig};
+use klassic_native::{NativeCompilerConfig, compile_source_with_prelude_to_elf};
+
+/// The standard prelude is bundled into the compiler at build time. It is
+/// loaded as a separate translation unit so user code is parsed in its own
+/// SourceFile — line numbers in diagnostics and runtime error messages
+/// stay 1-based for the user's view of their .kl file.
+const STDLIB_PRELUDE: &str = include_str!("../stdlib/prelude.kl");
+const STDLIB_PRELUDE_NAME: &str = "<stdlib>";
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -37,7 +44,12 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
             };
-            let bytes = match compile_source_to_elf(&input.display().to_string(), &text, config) {
+            let bytes = match compile_source_with_prelude_to_elf(
+                &input.display().to_string(),
+                STDLIB_PRELUDE,
+                &text,
+                config,
+            ) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     eprintln!("{error}");
@@ -60,7 +72,12 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
             };
-            match evaluate_text_with_config("<expression>", &expression, config) {
+            let mut evaluator = Evaluator::with_config(config);
+            if let Err(error) = evaluator.evaluate_text(STDLIB_PRELUDE_NAME, STDLIB_PRELUDE) {
+                eprintln!("{error}");
+                return Err(1);
+            }
+            match evaluator.evaluate_text("<expression>", &expression) {
                 Ok(value) => {
                     println!("{value}");
                     Ok(())
@@ -83,7 +100,12 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
             };
-            match evaluate_text_with_config(&path.display().to_string(), &text, config) {
+            let mut evaluator = Evaluator::with_config(config);
+            if let Err(error) = evaluator.evaluate_text(STDLIB_PRELUDE_NAME, STDLIB_PRELUDE) {
+                eprintln!("{error}");
+                return Err(1);
+            }
+            match evaluator.evaluate_text(&path.display().to_string(), &text) {
                 Ok(_) => Ok(()),
                 Err(error) => {
                     eprintln!("{error}");
@@ -105,6 +127,10 @@ fn start_repl(config: ExecutionConfig) {
         deny_trust: config.deny_trust,
         warn_trust: config.warn_trust,
     });
+    if let Err(error) = evaluator.evaluate_text(STDLIB_PRELUDE_NAME, STDLIB_PRELUDE) {
+        eprintln!("failed to load stdlib prelude: {error}");
+        return;
+    }
 
     loop {
         print!("{}", if buffer.is_empty() { "> " } else { "| " });

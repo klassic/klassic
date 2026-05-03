@@ -66,7 +66,7 @@ enum ThreadValueSnapshot {
         name: &'static str,
         bound_args: Vec<ThreadValueSnapshot>,
     },
-    Function(ThreadFunctionSnapshot),
+    Function(Arc<ThreadFunctionSnapshot>),
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +76,43 @@ struct ThreadFunctionSnapshot {
     constraints: Vec<TypeClassConstraint>,
     body: Expr,
     env: ThreadEnvironmentSnapshot,
+}
+
+thread_local! {
+    /// Identity stack of functions currently being snapshotted into a
+    /// thread payload. Self-referential closures (e.g. recursive `def`s
+    /// where the function value is bound under its own name in its own
+    /// environment) would otherwise cause `snapshot_value_for_thread`
+    /// to recurse indefinitely. When a re-entry is detected we emit a
+    /// `Unit` placeholder; the thread body almost never calls back
+    /// into the broken self-binding (the OUTER snapshot of the same
+    /// function still has its env), so this is enough to keep
+    /// snapshots finite without changing observed behavior.
+    static SNAPSHOTTING_FUNCTIONS: RefCell<HashSet<*const FunctionValue>> = RefCell::new(HashSet::new());
+
+    /// Memo of function snapshots keyed by `Rc::as_ptr`. Without it
+    /// a closure that captures N top-level defs (such as the prelude)
+    /// would be snapshotted in O(N!) — each def's env captures the
+    /// previously declared defs, and walking the lambda's env would
+    /// re-snapshot every def transitively. The cache is scoped to
+    /// the lifetime of one top-level snapshot operation (cleared by
+    /// the `thread` builtin around the snapshot it kicks off).
+    static FUNCTION_SNAPSHOT_CACHE: RefCell<HashMap<*const FunctionValue, Arc<ThreadFunctionSnapshot>>> = RefCell::new(HashMap::new());
+
+    /// Mirror of FUNCTION_SNAPSHOT_CACHE on the thread side. Once a
+    /// snapshot has been restored to a `Value::Function` we keep the
+    /// resulting `Rc` keyed by the source Arc address, so other env
+    /// entries pointing at the same Arc reuse the same `Rc` and we
+    /// don't re-walk the same snapshot tree N times.
+    static FUNCTION_RESTORE_CACHE: RefCell<HashMap<*const ThreadFunctionSnapshot, Rc<FunctionValue>>> = RefCell::new(HashMap::new());
+}
+
+fn clear_function_snapshot_cache() {
+    FUNCTION_SNAPSHOT_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+fn clear_function_restore_cache() {
+    FUNCTION_RESTORE_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 #[derive(Clone, Debug)]
@@ -181,13 +218,45 @@ fn snapshot_value_for_thread(value: &Value) -> ThreadValueSnapshot {
                 .map(snapshot_value_for_thread)
                 .collect(),
         },
-        Value::Function(function) => ThreadValueSnapshot::Function(ThreadFunctionSnapshot {
-            params: function.params.clone(),
-            param_annotations: function.param_annotations.clone(),
-            constraints: function.constraints.clone(),
-            body: function.body.clone(),
-            env: snapshot_environment_for_thread(&function.env),
-        }),
+        Value::Function(function) => {
+            let ptr = Rc::as_ptr(function);
+            // Cache hit: return the cached Arc. Cloning an Arc is
+            // O(1), so a closure that captures N prelude defs is
+            // snapshotted in O(N) total — without this dedup it
+            // would be O(N!) since each def's env captures the
+            // previously declared defs.
+            if let Some(cached) =
+                FUNCTION_SNAPSHOT_CACHE.with(|cache| cache.borrow().get(&ptr).cloned())
+            {
+                return ThreadValueSnapshot::Function(cached);
+            }
+            let already_in_flight =
+                SNAPSHOTTING_FUNCTIONS.with(|set| !set.borrow_mut().insert(ptr));
+            if already_in_flight {
+                // Cycle: emit a Unit placeholder so the snapshot
+                // terminates without cloning a body the thread will
+                // never execute. A recursive call into this binding
+                // from inside the spawned thread would fall over —
+                // accept that for now; the prelude's recursive defs
+                // are not normally re-entered from thread bodies.
+                return ThreadValueSnapshot::Unit;
+            }
+            let env = snapshot_environment_for_thread(&function.env);
+            SNAPSHOTTING_FUNCTIONS.with(|set| {
+                set.borrow_mut().remove(&ptr);
+            });
+            let snapshot = Arc::new(ThreadFunctionSnapshot {
+                params: function.params.clone(),
+                param_annotations: function.param_annotations.clone(),
+                constraints: function.constraints.clone(),
+                body: function.body.clone(),
+                env,
+            });
+            FUNCTION_SNAPSHOT_CACHE.with(|cache| {
+                cache.borrow_mut().insert(ptr, Arc::clone(&snapshot));
+            });
+            ThreadValueSnapshot::Function(snapshot)
+        }
     }
 }
 
@@ -233,13 +302,31 @@ fn restore_thread_value(snapshot: ThreadValueSnapshot) -> Value {
                 bound_args: bound_args.into_iter().map(restore_thread_value).collect(),
             }))
         }
-        ThreadValueSnapshot::Function(function) => Value::Function(Rc::new(FunctionValue {
-            params: function.params,
-            param_annotations: function.param_annotations,
-            constraints: function.constraints,
-            body: function.body,
-            env: restore_thread_environment(function.env),
-        })),
+        ThreadValueSnapshot::Function(function) => {
+            // Arcs let multiple snapshot slots point at the same
+            // function blob (e.g. the prelude appearing in many env
+            // captures). Mirror the dedup on the restore side: the
+            // first slot rebuilds an `Rc<FunctionValue>`, and every
+            // later slot pointing at the same Arc shares that `Rc`
+            // — without this we'd be O(N!) again on the thread side.
+            let key = Arc::as_ptr(&function);
+            if let Some(rc) = FUNCTION_RESTORE_CACHE.with(|cache| cache.borrow().get(&key).cloned())
+            {
+                return Value::Function(rc);
+            }
+            let inner = Arc::try_unwrap(function).unwrap_or_else(|arc| (*arc).clone());
+            let rc = Rc::new(FunctionValue {
+                params: inner.params,
+                param_annotations: inner.param_annotations,
+                constraints: inner.constraints,
+                body: inner.body,
+                env: restore_thread_environment(inner.env),
+            });
+            FUNCTION_RESTORE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(key, Rc::clone(&rc));
+            });
+            Value::Function(rc)
+        }
     }
 }
 
@@ -252,21 +339,24 @@ fn snapshot_environment_for_thread(environment: &Environment) -> ThreadEnvironme
                 scope
                     .iter()
                     .map(|(name, binding)| {
-                        let mut binding = binding.borrow_mut();
-                        (
-                            name.clone(),
-                            if binding.mutable {
-                                ThreadBindingSnapshot::Shared {
-                                    mutable: true,
-                                    value: binding.shared_snapshot_cell(),
-                                }
-                            } else {
-                                ThreadBindingSnapshot::Local {
-                                    mutable: false,
-                                    value: snapshot_value_for_thread(&binding.current_value()),
-                                }
-                            },
-                        )
+                        let is_mutable = binding.borrow().mutable;
+                        let snapshot = if is_mutable {
+                            ThreadBindingSnapshot::Shared {
+                                mutable: true,
+                                value: binding.borrow_mut().shared_snapshot_cell(),
+                            }
+                        } else {
+                            // Immutable binding — its value never changes after
+                            // declaration, so a read-only borrow is enough. Using
+                            // borrow_mut here would panic for recursive `def`s
+                            // (the function captures its own binding, so walking
+                            // the value re-enters the same RefCell).
+                            ThreadBindingSnapshot::Local {
+                                mutable: false,
+                                value: snapshot_value_for_thread(&binding.borrow().current_value()),
+                            }
+                        };
+                        (name.clone(), snapshot)
                     })
                     .collect()
             })
@@ -2179,7 +2269,9 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
         }
         "thread" => {
             ensure_arity(name, arguments, 1, span)?;
+            clear_function_snapshot_cache();
             let callable = snapshot_value_for_thread(&arguments[0]);
+            clear_function_snapshot_cache();
             let module_exports = snapshot_module_exports_for_thread();
             let record_schemas = USER_RECORDS.with(|records| records.borrow().clone());
             let instance_methods = snapshot_instance_methods_for_thread();
@@ -2198,7 +2290,9 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
                     *dictionaries.borrow_mut() =
                         restore_instance_dictionaries_for_thread(instance_dictionaries);
                 });
+                clear_function_restore_cache();
                 let callable = restore_thread_value(callable);
+                clear_function_restore_cache();
                 let _ = apply_callable(callable, Vec::new(), span);
             });
             register_active_thread(handle);

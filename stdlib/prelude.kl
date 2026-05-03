@@ -1,0 +1,49 @@
+// Klassic standard prelude.
+//
+// Auto-prepended to every user program so the names below are
+// available without an explicit import. They live at the top level
+// rather than inside a `module stdlib` block because the evaluator
+// currently treats each .kl file as a single export namespace —
+// real `import stdlib.<name>` resolution from a separate file is on
+// the roadmap.
+//
+// Implementation policy: plain Klassic only — no `__gc_*` builtins.
+// Names are prefixed with `stdlib` to keep collisions with user code
+// rare; they will move to a `stdlib.*` namespace once module
+// resolution from disk lands.
+
+def stdlibRange(start, end) = if((start >= end)) [] else cons(start)(stdlibRange(start + 1, end))
+
+def stdlibRangeInclusive(start, end) = stdlibRange(start, end + 1)
+
+def stdlibTake(xs, n) = if((n <= 0)) [] else if(isEmpty(xs)) [] else cons(head(xs))(stdlibTake(tail(xs), n - 1))
+
+def stdlibDrop(xs, n) = if((n <= 0)) xs else if(isEmpty(xs)) xs else stdlibDrop(tail(xs), n - 1)
+
+def stdlibFilter(xs, p) = if(isEmpty(xs)) [] else if(p(head(xs))) cons(head(xs))(stdlibFilter(tail(xs), p)) else stdlibFilter(tail(xs), p)
+
+def stdlibFind(xs, p) = if(isEmpty(xs)) null else if(p(head(xs))) head(xs) else stdlibFind(tail(xs), p)
+
+def stdlibAny(xs, p) = if(isEmpty(xs)) false else if(p(head(xs))) true else stdlibAny(tail(xs), p)
+
+def stdlibAll(xs, p) = if(isEmpty(xs)) true else if(p(head(xs))) stdlibAll(tail(xs), p) else false
+
+def stdlibCount(xs, p) = foldLeft(xs)(0)((acc, x) => if(p(x)) acc + 1 else acc)
+
+def stdlibReplicate(n, x) = if((n <= 0)) [] else cons(x)(stdlibReplicate(n - 1, x))
+
+def stdlibLast(xs) = if(isEmpty(tail(xs))) head(xs) else stdlibLast(tail(xs))
+
+def stdlibSum(xs) = foldLeft(xs)(0)((acc, x) => acc + x)
+
+def stdlibProduct(xs) = foldLeft(xs)(1)((acc, x) => acc * x)
+
+def stdlibMax(a, b) = if((a >= b)) a else b
+
+def stdlibMin(a, b) = if((a <= b)) a else b
+
+def stdlibMod(n, m) = n - (n / m) * m
+
+def stdlibIsEven(n) = stdlibMod(n, 2) == 0
+
+def stdlibIsOdd(n) = stdlibMod(n, 2) == 1
