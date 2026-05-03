@@ -16746,3 +16746,126 @@ fn repl_buffers_multiline_input_until_complete() {
     assert!(stdout.contains("value = ()"));
     assert!(stdout.contains("value = 3"));
 }
+
+/// Regression: the bundled stdlib prelude must NOT shift user line
+/// numbers in either evaluator runtime errors or native-binary
+/// runtime errors. Before the fix, `assert(false)` on user line 2
+/// would surface as `:52:1:` (offset by the ~50-line prelude).
+#[test]
+fn evaluator_runtime_error_reports_user_line_numbers() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-prelude-eval-{unique}.kl"));
+    fs::write(
+        &source_path,
+        "println(\"hello\")\nassert(false)\nprintln(\"unreached\")\n",
+    )
+    .expect("temp source should be writable");
+
+    let output = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(":2:1: assertion failed"),
+        "stderr should pin the user's line 2; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(":52:"),
+        "stderr should not leak prelude-shifted line numbers; got:\n{stderr}"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_runtime_error_reports_user_line_numbers() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-prelude-native-{unique}.kl"));
+    let exec_path = std::env::temp_dir().join(format!("klassic-prelude-native-bin-{unique}"));
+    fs::write(
+        &source_path,
+        "println(\"hello\")\nassert(false)\nprintln(\"unreached\")\n",
+    )
+    .expect("temp source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            exec_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("native build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let output = Command::new(&exec_path)
+        .output()
+        .expect("native executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exec_path);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(":2:1: assertion failed"),
+        "native stderr should pin the user's line 2; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(":52:"),
+        "native stderr should not leak prelude-shifted line numbers; got:\n{stderr}"
+    );
+}
+
+/// Regression: a recursive `def` declared in user code (in addition
+/// to the prelude's recursive helpers) must coexist with `thread()`.
+/// The fix this guards covered two distinct bugs:
+///
+/// * `snapshot_environment_for_thread` used to take a `borrow_mut`
+///   that aliased itself when walking a recursive function value's
+///   own env, panicking with "RefCell already borrowed".
+/// * Even after that, snapshotting was O(N!) for N captured top-level
+///   defs because each def's env was re-walked once per env slot.
+///   The Arc-based cache plus restore-side dedup brings it back to
+///   O(N), but only if the recursive cycle break stays correct.
+#[test]
+fn recursive_user_def_coexists_with_thread_spawn() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "def loop(n) = if(n <= 0) 0 else loop(n - 1)\n\
+             mutable counter = 0\n\
+             thread(() => {\n  sleep(1)\n  counter = counter + 1\n})\n\
+             sleep(200)\n\
+             counter",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr should be empty; got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

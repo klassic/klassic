@@ -47,6 +47,7 @@ fn sample_programs() -> Vec<&'static str> {
         "reduce_syntax.kl",
         "set-literal.kl",
         "simple-debug.kl",
+        "stdlib_prelude.kl",
         "simple-function-type.kl",
         "simple-higher-kinded.kl",
         "string-interpolation.kl",
@@ -101,6 +102,26 @@ Test files cleaned up\n",
         ),
         "set-literal.kl" => Some("%(1, 2, 3)\n%(1, 2, 3)\n%(1, 2, 3)\n"),
         "simple-debug.kl" => Some("Result: [2, 4, 6]\n"),
+        "stdlib_prelude.kl" => Some(
+            "[0, 1, 2, 3, 4]\n\
+[1, 2, 3, 4]\n\
+[10, 20, 30]\n\
+[30, 40, 50]\n\
+[2, 4, 6]\n\
+3\n\
+true\n\
+true\n\
+2\n\
+[7, 7, 7]\n\
+3\n\
+15\n\
+24\n\
+20\n\
+10\n\
+2\n\
+true\n\
+true\n",
+        ),
         "simple-function-type.kl" => Some("Function types parsed\n"),
         "test-curried-syntax.kl" => Some("Curried syntax works\n"),
         "test-function-types.kl" => Some("Function types work\n"),

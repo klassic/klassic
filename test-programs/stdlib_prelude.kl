@@ -1,0 +1,26 @@
+// Smoke test for the auto-loaded stdlib prelude. Every helper in
+// stdlib/prelude.kl is exercised once so a regression in the prelude
+// (or in how the prelude is plumbed into the evaluator and native
+// compiler) shows up here. Both `tests/sample_programs.rs` and the
+// native counterpart run this file and assert against the expected
+// stdout — keep prints in declaration order so the assertion stays
+// readable.
+
+println(stdlibRange(0, 5))
+println(stdlibRangeInclusive(1, 4))
+println(stdlibTake([10, 20, 30, 40, 50], 3))
+println(stdlibDrop([10, 20, 30, 40, 50], 2))
+println(stdlibFilter([1, 2, 3, 4, 5, 6], (x) => stdlibIsEven(x)))
+println(stdlibFind([1, 2, 3, 4], (x) => x > 2))
+println(stdlibAny([1, 2, 3], (x) => x > 2))
+println(stdlibAll([2, 4, 6], (x) => stdlibIsEven(x)))
+println(stdlibCount([1, 2, 3, 4, 5], (x) => stdlibIsEven(x)))
+println(stdlibReplicate(3, 7))
+println(stdlibLast([1, 2, 3]))
+println(stdlibSum([1, 2, 3, 4, 5]))
+println(stdlibProduct([1, 2, 3, 4]))
+println(stdlibMax(10, 20))
+println(stdlibMin(10, 20))
+println(stdlibMod(17, 5))
+println(stdlibIsEven(4))
+println(stdlibIsOdd(7))
