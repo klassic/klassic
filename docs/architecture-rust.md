@@ -728,8 +728,11 @@ cargo run -- -e "1 + 2"
   qword access, including scalar reads, pointer- or heap-string-provenance
   reads, and `Int`, `HeapPointer`, or `HeapString` stores (which doubles as
   record-field and array-slot access since both share the same packed-pointer
-  layout). String-keyed maps use `__gc_smap_get` for generic pointer values and
-  `__gc_smap_get_string` when a present value is known to hold a heap string.
+  layout). String-keyed maps validate that their backing pointer-list length is
+  non-negative, in range, and even before scanning interleaved key/value slots;
+  key string lengths are checked before equality scans. They use
+  `__gc_smap_get` for generic pointer values and `__gc_smap_get_string` when a
+  present value is known to hold a heap string.
   Marking uses an iterative
   worklist keyed off the type-tag header field: the
   `gc_mark_visit` subroutine sets the mark bit and pushes the

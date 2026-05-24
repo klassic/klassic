@@ -12288,6 +12288,7 @@ impl NativeCodeGenerator {
             ));
         }
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        self.emit_gc_smap_length_check(span, "__gc_smap_size", Reg::Rax);
         self.asm.shr_reg_imm8(Reg::Rax, 1);
         Ok(NativeValue::Int)
     }
@@ -12301,8 +12302,9 @@ impl NativeCodeGenerator {
         m_slot: VarSlot,
         key_slot: VarSlot,
         i_slot: VarSlot,
-        match_label: TextLabel,
-        not_found_label: TextLabel,
+        labels: (TextLabel, TextLabel),
+        span: Span,
+        name: &str,
     ) {
         // i = 0
         self.asm.mov_imm64(Reg::Rax, 0);
@@ -12313,10 +12315,11 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(scan_loop);
         self.asm.load_rbp_slot(Reg::R10, m_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_smap_length_check(span, name, Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.load_rbp_slot(Reg::Rcx, i_slot.offset);
         self.asm.cmp_reg_reg(Reg::Rcx, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, not_found_label);
+        self.asm.jcc_label(Condition::AboveOrEqual, labels.1);
 
         // candidate = map[i]
         self.asm.mov_reg_reg(Reg::Rdx, Reg::Rcx);
@@ -12327,17 +12330,19 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
         self.asm.load_rbp_slot(Reg::R9, key_slot.offset);
         self.asm.load_ptr_disp32(Reg::Rdx, Reg::R9, 0);
+        self.emit_gc_string_length_check(span, name, Reg::Rax);
+        self.emit_gc_string_length_check(span, name, Reg::Rdx);
         self.asm.cmp_reg_reg(Reg::Rax, Reg::Rdx);
         self.asm.jcc_label(Condition::NotEqual, next_iter);
         self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, match_label);
+        self.asm.jcc_label(Condition::Equal, labels.0);
         self.asm.mov_reg_reg(Reg::Rsi, Reg::R8);
         self.asm.add_reg_imm32(Reg::Rsi, 8);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
         self.asm.add_reg_imm32(Reg::Rdi, 8);
         self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
         self.asm.repe_cmpsb();
-        self.asm.jcc_label(Condition::Equal, match_label);
+        self.asm.jcc_label(Condition::Equal, labels.0);
 
         self.asm.bind_text_label(next_iter);
         self.asm.load_rbp_slot(Reg::Rcx, i_slot.offset);
@@ -12379,12 +12384,22 @@ impl NativeCodeGenerator {
         }
         let key_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(key_slot.offset, Reg::Rax);
+        self.asm.load_rbp_slot(Reg::R10, key_slot.offset);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_smap_has", Reg::R11);
         let i_slot = self.allocate_anonymous_slot(NativeValue::Int);
 
         let match_label = self.asm.create_text_label();
         let not_found = self.asm.create_text_label();
         let done = self.asm.create_text_label();
-        self.emit_smap_scan(m_slot, key_slot, i_slot, match_label, not_found);
+        self.emit_smap_scan(
+            m_slot,
+            key_slot,
+            i_slot,
+            (match_label, not_found),
+            span,
+            "__gc_smap_has",
+        );
         self.asm.bind_text_label(not_found);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.jmp_label(done);
@@ -12425,12 +12440,22 @@ impl NativeCodeGenerator {
         }
         let key_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(key_slot.offset, Reg::Rax);
+        self.asm.load_rbp_slot(Reg::R10, key_slot.offset);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, name, Reg::R11);
         let i_slot = self.allocate_anonymous_slot(NativeValue::Int);
 
         let match_label = self.asm.create_text_label();
         let not_found = self.asm.create_text_label();
         let done = self.asm.create_text_label();
-        self.emit_smap_scan(m_slot, key_slot, i_slot, match_label, not_found);
+        self.emit_smap_scan(
+            m_slot,
+            key_slot,
+            i_slot,
+            (match_label, not_found),
+            span,
+            name,
+        );
         self.asm.bind_text_label(not_found);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.jmp_label(done);
@@ -12508,6 +12533,9 @@ impl NativeCodeGenerator {
         }
         let key_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(key_slot.offset, Reg::Rax);
+        self.asm.load_rbp_slot(Reg::R10, key_slot.offset);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_smap_set", Reg::R11);
         let value = self.compile_expr(&arguments[2])?;
         if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
@@ -12530,7 +12558,14 @@ impl NativeCodeGenerator {
         let match_label = self.asm.create_text_label();
         let after_scan = self.asm.create_text_label();
         let not_found = self.asm.create_text_label();
-        self.emit_smap_scan(m_slot, key_slot, i_slot, match_label, not_found);
+        self.emit_smap_scan(
+            m_slot,
+            key_slot,
+            i_slot,
+            (match_label, not_found),
+            span,
+            "__gc_smap_set",
+        );
         self.asm.bind_text_label(match_label);
         // found = i_slot
         self.asm.load_rbp_slot(Reg::Rax, i_slot.offset);
@@ -12555,6 +12590,7 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
         self.asm.add_reg_imm32(Reg::R11, 2);
         self.asm.bind_text_label(allocate);
+        self.emit_gc_list_transform_size_check(span, "__gc_smap_set", Reg::R11);
         self.asm.store_rbp_slot(new_len_slot.offset, Reg::R11);
         // payload_size = 8 + new_len * 8
         self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
@@ -12666,6 +12702,7 @@ impl NativeCodeGenerator {
         // pair_count = map_len / 2
         self.asm.load_rbp_slot(Reg::R10, m_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_smap_length_check(span, label, Reg::R11);
         self.asm.shr_reg_imm8(Reg::R11, 1);
         self.asm.store_rbp_slot(pair_count_slot.offset, Reg::R11);
 
@@ -32564,6 +32601,24 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(ok);
         self.asm.bind_text_label(overflow);
         self.emit_runtime_error(span, &format!("{name} string length overflow"));
+        self.asm.bind_text_label(ok);
+    }
+
+    fn emit_gc_smap_length_check(&mut self, span: Span, name: &str, len: Reg) {
+        let ok = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(len, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_MAX_LIST_LENGTH);
+        self.asm.cmp_reg_reg(len, Reg::Rdi);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.mov_reg_reg(Reg::Rdi, len);
+        self.asm.and_reg_imm32(Reg::Rdi, 1);
+        self.asm.cmp_reg_imm8(Reg::Rdi, 0);
+        self.asm.jcc_label(Condition::NotEqual, overflow);
+        self.asm.jmp_label(ok);
+        self.asm.bind_text_label(overflow);
+        self.emit_runtime_error(span, &format!("{name} map length overflow"));
         self.asm.bind_text_label(ok);
     }
 

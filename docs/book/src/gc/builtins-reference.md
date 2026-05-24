@@ -107,13 +107,13 @@ binary.
 | Builtin | Returns | Description |
 |---|---|---|
 | `__gc_smap_new()` | map | Empty map. |
-| `__gc_smap_size(m)` | Int | Pair count. |
-| `__gc_smap_has(m, key)` | Bool | Membership. |
-| `__gc_smap_get(m, key)` | HeapPointer | Value, or 0 (null) when absent. |
-| `__gc_smap_get_string(m, key)` | HeapString | Value when it is known to be a heap string. |
-| `__gc_smap_set(m, key, value)` | map | Fresh map (replace or append). |
-| `__gc_smap_keys(m)` | list_ptr | Every key. |
-| `__gc_smap_values(m)` | list_ptr | Every value. |
+| `__gc_smap_size(m)` | Int | Pair count; invalid stored map length aborts. |
+| `__gc_smap_has(m, key)` | Bool | Membership; invalid map or key length aborts. |
+| `__gc_smap_get(m, key)` | HeapPointer | Value, or 0 (null) when absent; invalid map or key length aborts. |
+| `__gc_smap_get_string(m, key)` | HeapString | Value when it is known to be a heap string; invalid map or key length aborts. |
+| `__gc_smap_set(m, key, value)` | map | Fresh map (replace or append); invalid map or key length aborts. |
+| `__gc_smap_keys(m)` | list_ptr | Every key; invalid stored map length aborts. |
+| `__gc_smap_values(m)` | list_ptr | Every value; invalid stored map length aborts. |
 
 ## Observability
 
@@ -139,4 +139,5 @@ exits with status 1:
 | Size/count would overflow allocation math | `<builtin> allocation size overflow` |
 | Stored string length is negative or too large | `<builtin> string length overflow` |
 | Stored list length is negative or too large | `<builtin> list length overflow` |
+| Stored map payload length is negative, too large, or odd | `<builtin> map length overflow` |
 | Out-of-bounds index in any length-aware op | `klassic gc: index out of bounds` |

@@ -4789,6 +4789,186 @@ __gc_list_int_to_string(xs, sep)
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn builds_native_executable_for_gc_smap_length_overflow_runtime_errors() {
+    let cases = [
+        (
+            r#"val m = __gc_smap_new()
+__gc_write(m, 0, 1)
+__gc_smap_size(m)
+"#,
+            "__gc_smap_size",
+        ),
+        (
+            r#"val m = __gc_smap_new()
+__gc_write(m, 0, 1152921504606846460)
+__gc_smap_size(m)
+"#,
+            "__gc_smap_size",
+        ),
+        (
+            r#"val m = __gc_smap_new()
+__gc_write(m, 0, 1152921504606846460)
+__gc_smap_has(m, __gc_string("x"))
+"#,
+            "__gc_smap_has",
+        ),
+        (
+            r#"val m = __gc_smap_new()
+__gc_write(m, 0, 1152921504606846460)
+__gc_smap_get(m, __gc_string("x"))
+"#,
+            "__gc_smap_get",
+        ),
+        (
+            r#"val m = __gc_smap_new()
+__gc_write(m, 0, 1152921504606846460)
+__gc_smap_get_string(m, __gc_string("x"))
+"#,
+            "__gc_smap_get_string",
+        ),
+        (
+            r#"val m = __gc_smap_new()
+__gc_write(m, 0, 1152921504606846460)
+__gc_smap_set(m, __gc_string("x"), __gc_string("y"))
+"#,
+            "__gc_smap_set",
+        ),
+        (
+            r#"val m = __gc_smap_new()
+__gc_write(m, 0, 1152921504606846460)
+__gc_smap_keys(m)
+"#,
+            "__gc_smap_keys",
+        ),
+        (
+            r#"val m = __gc_smap_new()
+__gc_write(m, 0, 1152921504606846460)
+__gc_smap_values(m)
+"#,
+            "__gc_smap_values",
+        ),
+    ];
+    for (index, (source, builtin_name)) in cases.iter().enumerate() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-smap-length-overflow-{index}-{unique}.kl"
+        ));
+        let output_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-smap-length-overflow-{index}-{unique}"
+        ));
+        fs::write(&source_path, source).expect("source should write");
+
+        let build = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_string_lossy().as_ref(),
+                "-o",
+                output_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .expect("klassic build should run");
+        assert!(
+            build.status.success(),
+            "gc smap length overflow build failed for {builtin_name}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let run = Command::new(&output_path)
+            .output()
+            .expect("generated executable should run");
+
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&output_path);
+
+        assert_eq!(run.status.code(), Some(1), "{builtin_name} should fail");
+        assert!(run.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!(
+                "{}:3:1: {builtin_name} map length overflow\n",
+                source_path.display()
+            )
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_gc_smap_key_length_overflow_runtime_errors() {
+    let cases = [
+        (
+            r#"val k = __gc_string_alloc(0)
+__gc_write(k, 0, 9223372036854771667)
+__gc_smap_has(__gc_smap_new(), k)
+"#,
+            "__gc_smap_has",
+            3,
+        ),
+        (
+            r#"val k = __gc_string_alloc(0)
+mutable m = __gc_smap_new()
+m = __gc_smap_set(m, k, __gc_string("value"))
+__gc_write(k, 0, 9223372036854771667)
+__gc_smap_has(m, __gc_string(""))
+"#,
+            "__gc_smap_has",
+            5,
+        ),
+    ];
+    for (index, (source, builtin_name, line)) in cases.iter().enumerate() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-smap-key-overflow-{index}-{unique}.kl"
+        ));
+        let output_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-smap-key-overflow-{index}-{unique}"
+        ));
+        fs::write(&source_path, source).expect("source should write");
+
+        let build = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_string_lossy().as_ref(),
+                "-o",
+                output_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .expect("klassic build should run");
+        assert!(
+            build.status.success(),
+            "gc smap key overflow build failed for {builtin_name}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let run = Command::new(&output_path)
+            .output()
+            .expect("generated executable should run");
+
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&output_path);
+
+        assert_eq!(run.status.code(), Some(1), "{builtin_name} should fail");
+        assert!(run.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!(
+                "{}:{line}:1: {builtin_name} string length overflow\n",
+                source_path.display()
+            )
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_list_indexed_length_overflow_runtime_errors() {
     let cases = [
         (
