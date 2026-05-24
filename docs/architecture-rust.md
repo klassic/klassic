@@ -626,7 +626,8 @@ cargo run -- -e "1 + 2"
   before the destination allocation runs);
   `__gc_string_repeat(s, n)` (concatenates `s` with itself `n`
   times in a single allocation; negative `n` jumps to
-  `gc_bounds_error`);
+  `gc_bounds_error`, and total length is checked before allocation
+  size arithmetic);
   `__gc_string_index_of(s, byte)` (returns the first index of
   the low-byte of `byte` in `s`, or `-1` if absent — no
   allocation, just a movzx/cmp loop);
@@ -753,7 +754,8 @@ cargo run -- -e "1 + 2"
   `val`, so the only reason the children survive a heap-pressure
   collection is the list's mark-phase trace through its slots,
   plus a seven-test sweep of higher-level operations:
-  `__gc_string_repeat` (basic + negative-count rejection),
+  `__gc_string_repeat` (basic, empty-source fast path,
+  negative-count rejection, and size-overflow rejection),
   `__gc_string_index_of` (start / mid / end / missing / empty),
   `__gc_string_to_int` (positive, zero, negative, empty,
   partial-parse, invalid-leading, large), `__gc_list_int_pop`

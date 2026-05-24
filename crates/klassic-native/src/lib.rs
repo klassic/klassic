@@ -10093,13 +10093,46 @@ impl NativeCodeGenerator {
         self.asm.cmp_reg_imm8(Reg::R10, 0);
         self.asm.jcc_label(Condition::Less, self.gc_bounds_error);
 
-        // total_len = s_len * n
-        self.asm.load_rbp_slot(Reg::Rax, s_slot.offset);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
-        self.asm.load_rbp_slot(Reg::Rcx, n_slot.offset);
-        self.asm.imul_reg_reg(Reg::Rax, Reg::Rcx);
+        let total_len_slot = self.allocate_anonymous_slot(NativeValue::Int);
+        let zero_total = self.asm.create_text_label();
+        let checked_total = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        let loop_done = self.asm.create_text_label();
+
+        // total_len = s_len * n, guarded before payload-size arithmetic.
+        // Empty source or zero count returns an empty string without
+        // iterating `n` times.
+        self.asm.load_rbp_slot(Reg::R10, s_slot.offset);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
+        self.asm.load_rbp_slot(Reg::R9, n_slot.offset);
+        self.asm.test_reg_reg(Reg::R8, Reg::R8);
+        self.asm.jcc_label(Condition::Equal, zero_total);
+        self.asm.test_reg_reg(Reg::R9, Reg::R9);
+        self.asm.jcc_label(Condition::Equal, zero_total);
+
+        // if n > GC_MAX_STRING_ALLOC_SIZE / s_len: overflow
+        self.asm.mov_imm64(Reg::Rax, Self::GC_MAX_STRING_ALLOC_SIZE);
+        self.asm.mov_imm64(Reg::Rdx, 0);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R8);
+        self.asm.div_reg(Reg::Rcx);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::Rax);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.imul_reg_reg(Reg::Rax, Reg::R9);
+        self.asm.jmp_label(checked_total);
+
+        self.asm.bind_text_label(zero_total);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.jmp_label(checked_total);
+
+        self.asm.bind_text_label(overflow);
+        self.emit_runtime_error(span, "__gc_string_repeat allocation size overflow");
+
+        self.asm.bind_text_label(checked_total);
+        self.asm.store_rbp_slot(total_len_slot.offset, Reg::Rax);
 
         // payload_size = 8 + align_up(total_len, 8)
+        self.asm.load_rbp_slot(Reg::Rax, total_len_slot.offset);
         self.asm.add_reg_imm32(Reg::Rax, 8 + 7);
         self.asm.and_reg_imm32(Reg::Rax, -8);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -10109,18 +10142,18 @@ impl NativeCodeGenerator {
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
 
-        // Recompute total_len and store at [new+0].
-        self.asm.load_rbp_slot(Reg::Rax, s_slot.offset);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::Rax, 0);
-        self.asm.load_rbp_slot(Reg::Rcx, n_slot.offset);
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
-        self.asm.imul_reg_reg(Reg::Rax, Reg::Rcx);
+        // Store the checked total length at [new+0].
+        self.asm.load_rbp_slot(Reg::Rax, total_len_slot.offset);
         self.asm.load_rbp_slot(Reg::R10, new_slot.offset);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
 
         // Loop registers: r8 = s_len, r9 = s + 8, r10 = dst cursor,
         // r11 = remaining iterations. rep movsb only touches rsi/rdi/rcx
         // and flags, so the loop state survives each iteration.
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, loop_done);
+        self.asm.load_rbp_slot(Reg::Rax, s_slot.offset);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::Rax, 0);
         self.asm.load_rbp_slot(Reg::R9, s_slot.offset);
         self.asm.add_reg_imm32(Reg::R9, 8);
         self.asm.load_rbp_slot(Reg::R10, new_slot.offset);
@@ -10128,7 +10161,6 @@ impl NativeCodeGenerator {
         self.asm.load_rbp_slot(Reg::R11, n_slot.offset);
 
         let loop_start = self.asm.create_text_label();
-        let loop_done = self.asm.create_text_label();
         self.asm.bind_text_label(loop_start);
         self.asm.test_reg_reg(Reg::R11, Reg::R11);
         self.asm.jcc_label(Condition::Equal, loop_done);
