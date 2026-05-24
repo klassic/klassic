@@ -92,13 +92,14 @@ println(Math#gcd(-12, 18))    //   6 (operates on |a|, |b|)
 ```kl
 println(String#parseInt("42"))   // 42
 println(String#parseInt("-7"))   // -7
+println(String#parseInt("" + 5)) // 5
 ```
 
 `String#parseInt(s)` reads a decimal integer (leading `+`/`-`
 optional, no surrounding whitespace). Malformed input is a runtime
-error. Native build currently folds the parse at compile time —
-literal/static-string arguments work; arbitrary runtime strings will
-arrive in a follow-up.
+error. Native build folds literal/static-string arguments at compile
+time and emits a strict parser for fixed-buffer runtime strings such
+as concatenation or input-derived values.
 
 ## Pseudo-random numbers
 

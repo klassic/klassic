@@ -18620,6 +18620,111 @@ fn native_string_parse_int_handles_typical_inputs() {
     );
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_string_parse_int_handles_runtime_strings() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-parse-int-runtime-{unique}.kl"));
+    let exec_path = std::env::temp_dir().join(format!("klassic-parse-int-runtime-bin-{unique}"));
+    fs::write(
+        &source_path,
+        "println(String#parseInt(\"\" + 42))\n\
+         println(String#parseInt(\"-\" + 7))\n\
+         println(String#parseInt(\"+\" + 5))\n\
+         println(String#parseInt(\"922337203685477580\" + 7))\n\
+         println(String#parseInt(\"-922337203685477580\" + 8))\n",
+    )
+    .expect("temp source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            exec_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("native build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let output = Command::new(&exec_path)
+        .output()
+        .expect("native executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exec_path);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "42\n-7\n5\n9223372036854775807\n-9223372036854775808\n"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_string_parse_int_rejects_bad_runtime_strings() {
+    let cases = [
+        (
+            "klassic-parse-int-runtime-garbage",
+            "String#parseInt(\"12\" + true)\n",
+        ),
+        (
+            "klassic-parse-int-runtime-overflow",
+            "String#parseInt(\"922337203685477580\" + 8)\n",
+        ),
+    ];
+    for (prefix, source) in cases {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!("{prefix}-{unique}.kl"));
+        let exec_path = std::env::temp_dir().join(format!("{prefix}-bin-{unique}"));
+        fs::write(&source_path, source).expect("temp source should be writable");
+
+        let build = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_string_lossy().as_ref(),
+                "-o",
+                exec_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .expect("native build should run");
+        assert!(
+            build.status.success(),
+            "native build failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let output = Command::new(&exec_path)
+            .output()
+            .expect("native executable should run");
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&exec_path);
+
+        assert!(
+            !output.status.success(),
+            "runtime parse should fail for {source:?}; stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("String#parseInt"),
+            "stderr should mention String#parseInt; got:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn evaluator_math_sqrt_int_floors_towards_zero() {
     let output = Command::new(klassic_bin())

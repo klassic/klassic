@@ -13038,12 +13038,10 @@ impl NativeCodeGenerator {
         Ok(NativeValue::Int)
     }
 
-    /// `String#parseInt(s)` — parse a decimal integer string. The
-    /// native compiler currently folds the parse at compile time —
-    /// only literal / static-string arguments are supported, which
-    /// covers the common script-input cases (config defaults, env
-    /// fallbacks, etc.). Runtime / heap strings would need a parse
-    /// loop similar to `__gc_string_to_int`; defer that to a follow-up.
+    /// `String#parseInt(s)` — parse a decimal integer string. Static
+    /// strings fold at compile time; fixed-buffer runtime strings are
+    /// parsed in the emitted executable so concat/input-derived strings
+    /// follow the same strict contract.
     fn compile_string_parse_int(
         &mut self,
         arguments: &[Expr],
@@ -13059,28 +13057,113 @@ impl NativeCodeGenerator {
             ));
         }
         let value = self.compile_expr(&arguments[0])?;
-        let NativeValue::StaticString { label, len } = value else {
+        if let NativeValue::StaticString { label, len } = value {
+            let text = self.string_from_data_label(label, len, span, "String#parseInt")?;
+            return match text.parse::<i64>() {
+                Ok(parsed) => {
+                    self.asm.mov_imm64(Reg::Rax, parsed as u64);
+                    Ok(NativeValue::Int)
+                }
+                Err(_) => {
+                    // Match the eval-mode wording so cli_smoke can pin
+                    // both modes' diagnostics with one assertion.
+                    self.emit_runtime_error(
+                        span,
+                        &format!("String#parseInt failed to parse {text:?} as a decimal integer"),
+                    );
+                    Ok(NativeValue::Int)
+                }
+            };
+        }
+        let Some(input) = self.native_string_ref(value) else {
             return Err(unsupported(
                 span,
-                "native String#parseInt for non-static-string argument",
+                "native String#parseInt for non-string argument",
             ));
         };
-        let text = self.string_from_data_label(label, len, span, "String#parseInt")?;
-        match text.parse::<i64>() {
-            Ok(parsed) => {
-                self.asm.mov_imm64(Reg::Rax, parsed as u64);
-                Ok(NativeValue::Int)
-            }
-            Err(_) => {
-                // Match the eval-mode wording so cli_smoke can pin
-                // both modes' diagnostics with one assertion.
-                self.emit_runtime_error(
-                    span,
-                    &format!("String#parseInt failed to parse {text:?} as a decimal integer"),
-                );
-                Ok(NativeValue::Int)
-            }
-        }
+        self.emit_runtime_string_parse_int(input, span);
+        Ok(NativeValue::Int)
+    }
+
+    fn emit_runtime_string_parse_int(&mut self, input: NativeStringRef, span: Span) {
+        let fail = self.asm.create_text_label();
+        let plus_check = self.asm.create_text_label();
+        let parse_loop = self.asm.create_text_label();
+        let positive_remainder = self.asm.create_text_label();
+        let accumulate = self.asm.create_text_label();
+        let end = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+
+        self.asm.mov_data_addr(Reg::Rsi, input.data);
+        self.emit_load_native_string_len(Reg::Rdx, input.len);
+        self.asm.cmp_reg_imm8(Reg::Rdx, 0);
+        self.asm.jcc_label(Condition::Equal, fail);
+
+        self.asm.mov_imm64(Reg::R8, 0); // index
+        self.asm.mov_imm64(Reg::R9, 0); // unsigned magnitude accumulator
+        self.asm.mov_imm64(Reg::R10, 0); // negative flag
+        self.asm.mov_imm64(Reg::R11, 0); // saw at least one digit
+
+        self.asm.movzx_byte_indexed(Reg::Rdi, Reg::Rsi, Reg::R8);
+        self.asm.cmp_reg_imm8(Reg::Rdi, b'-' as i8);
+        self.asm.jcc_label(Condition::NotEqual, plus_check);
+        self.asm.mov_imm64(Reg::R10, 1);
+        self.asm.mov_imm64(Reg::R8, 1);
+        self.asm.jmp_label(parse_loop);
+
+        self.asm.bind_text_label(plus_check);
+        self.asm.cmp_reg_imm8(Reg::Rdi, b'+' as i8);
+        self.asm.jcc_label(Condition::NotEqual, parse_loop);
+        self.asm.mov_imm64(Reg::R8, 1);
+
+        self.asm.bind_text_label(parse_loop);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::Rdx);
+        self.asm.jcc_label(Condition::Equal, end);
+        self.asm.movzx_byte_indexed(Reg::Rdi, Reg::Rsi, Reg::R8);
+        self.asm.cmp_reg_imm8(Reg::Rdi, b'0' as i8);
+        self.asm.jcc_label(Condition::Below, fail);
+        self.asm.cmp_reg_imm8(Reg::Rdi, b'9' as i8);
+        self.asm.jcc_label(Condition::Above, fail);
+        self.asm.sub_reg_imm8(Reg::Rdi, b'0' as i8);
+        self.asm.mov_imm64(Reg::R11, 1);
+
+        self.asm.mov_imm64(Reg::Rcx, 922_337_203_685_477_580_u64);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, fail);
+        self.asm.jcc_label(Condition::Below, accumulate);
+        self.asm.cmp_reg_imm8(Reg::R10, 0);
+        self.asm.jcc_label(Condition::Equal, positive_remainder);
+        self.asm.cmp_reg_imm8(Reg::Rdi, 8);
+        self.asm.jcc_label(Condition::Above, fail);
+        self.asm.jmp_label(accumulate);
+
+        self.asm.bind_text_label(positive_remainder);
+        self.asm.cmp_reg_imm8(Reg::Rdi, 7);
+        self.asm.jcc_label(Condition::Above, fail);
+
+        self.asm.bind_text_label(accumulate);
+        self.asm.mov_imm64(Reg::Rcx, 10);
+        self.asm.imul_reg_reg(Reg::R9, Reg::Rcx);
+        self.asm.add_reg_reg(Reg::R9, Reg::Rdi);
+        self.asm.inc_reg(Reg::R8);
+        self.asm.jmp_label(parse_loop);
+
+        self.asm.bind_text_label(end);
+        self.asm.cmp_reg_imm8(Reg::R11, 0);
+        self.asm.jcc_label(Condition::Equal, fail);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::R10, 0);
+        self.asm.jcc_label(Condition::Equal, done);
+        self.asm.neg_reg(Reg::Rax);
+        self.asm.jmp_label(done);
+
+        self.asm.bind_text_label(fail);
+        self.emit_runtime_error(
+            span,
+            "String#parseInt failed to parse runtime string as a decimal integer",
+        );
+
+        self.asm.bind_text_label(done);
     }
 
     /// `Math#gcd(a, b)` — Euclidean GCD on the absolute values.
