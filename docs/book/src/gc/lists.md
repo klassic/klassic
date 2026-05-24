@@ -26,7 +26,7 @@ println(__gc_list_int_max(scores))           // 30
 | Builtin | Notes |
 |---|---|
 | `__gc_list_int(n)` | n zero-init Int slots |
-| `__gc_list_int_len(lst)` | stored length |
+| `__gc_list_int_len(lst)` | validated stored length |
 | `__gc_list_int_push(lst, v)` | functional append (returns a fresh list) |
 | `__gc_list_int_pop(lst)` | functional drop-last (empty aborts) |
 | `__gc_list_int_get(lst, i)` / `_set(lst, i, v)` | bounds-checked access |
@@ -48,7 +48,7 @@ println(__gc_list_ptr_join(parts, __gc_string(", ")))  // "hello, world"
 | Builtin | Notes |
 |---|---|
 | `__gc_list_ptr(n)` | n zero-init pointer slots (tag 4) |
-| `__gc_list_ptr_len(lst)` | length stored at offset 0 |
+| `__gc_list_ptr_len(lst)` | validated length stored at offset 0 |
 | `__gc_list_ptr_push(lst, ptr)` | functional append |
 | `__gc_list_ptr_pop(lst)` | functional drop-last |
 | `__gc_list_ptr_get(lst, i)` / `_set(lst, i, ptr)` | bounds-checked access |

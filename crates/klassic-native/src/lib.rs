@@ -8848,6 +8848,7 @@ impl NativeCodeGenerator {
             ));
         }
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_len", Reg::Rax);
         Ok(NativeValue::Int)
     }
 
@@ -9145,6 +9146,7 @@ impl NativeCodeGenerator {
             ));
         }
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_len", Reg::Rax);
         Ok(NativeValue::Int)
     }
 
@@ -9632,6 +9634,7 @@ impl NativeCodeGenerator {
             ));
         }
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        self.emit_gc_list_iteration_length_check(span, "__gc_list_ptr_len", Reg::Rax);
         Ok(NativeValue::Int)
     }
 

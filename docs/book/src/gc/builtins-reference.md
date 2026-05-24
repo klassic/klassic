@@ -54,7 +54,7 @@ binary.
 | `__gc_string_to_lower(s)` | HeapString | ASCII A–Z → a–z; invalid stored length aborts. |
 | `__gc_string_to_upper(s)` | HeapString | ASCII a–z → A–Z; invalid stored length aborts. |
 | `__gc_string_println(g)` | Unit | Bytes plus newline; invalid stored length aborts. |
-| `__gc_string_len(s)` | Int | Byte length. |
+| `__gc_string_len(s)` | Int | Byte length; invalid stored length aborts. |
 | `__gc_string_eq(a, b)` | Bool | Byte equality; invalid stored length aborts. |
 | `__gc_string_starts_with(s, prefix)` | Bool | Length + bytes; invalid stored length aborts. |
 | `__gc_string_ends_with(s, suffix)` | Bool | Length + bytes; invalid stored length aborts. |
@@ -74,7 +74,7 @@ binary.
 | Builtin | Returns | Description |
 |---|---|---|
 | `__gc_list_int(n)` | list | n zero-init Int slots. |
-| `__gc_list_int_len(lst)` | Int | Stored length. |
+| `__gc_list_int_len(lst)` | Int | Stored length; invalid stored length aborts. |
 | `__gc_list_int_get(lst, idx)` | Int | Bounds-checked read; invalid stored length aborts. |
 | `__gc_list_int_set(lst, idx, v)` | Unit | Bounds-checked write; invalid stored length aborts. |
 | `__gc_list_int_push(lst, v)` | list | Functional append; size overflow aborts. |
@@ -92,7 +92,7 @@ binary.
 | Builtin | Returns | Description |
 |---|---|---|
 | `__gc_list_ptr(n)` | list | n zero-init pointer slots (tag 4). |
-| `__gc_list_ptr_len(lst)` | Int | Length at offset 0. |
+| `__gc_list_ptr_len(lst)` | Int | Length at offset 0; invalid stored length aborts. |
 | `__gc_list_ptr_get(lst, idx)` | HeapPointer | Bounds-checked read; invalid stored length aborts. |
 | `__gc_list_ptr_get_string(lst, idx)` | HeapString | Bounds-checked read when the slot stores a heap string; invalid stored length aborts. |
 | `__gc_list_ptr_set(lst, idx, ptr)` | Unit | Bounds-checked write; invalid stored length aborts. |

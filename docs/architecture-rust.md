@@ -620,7 +620,8 @@ cargo run -- -e "1 + 2"
   top-level or method-style `toString` copies heap bytes back into a
   fixed-buffer runtime `String` for ordinary string helpers; runtime string
   interpolation can append `HeapString` fragments into its fixed buffer;
-  `__gc_string_len(s)` (returns the byte length stored at offset 0);
+  `__gc_string_len(s)` (validates and returns the byte length stored at
+  offset 0);
   `__gc_string_alloc(n)` (reserves an `n`-byte zero-filled string for
   byte-by-byte construction); `__gc_string_get_byte(s, idx)` /
   `__gc_string_set_byte(s, idx, byte)` (single-byte access after
@@ -677,7 +678,8 @@ cargo run -- -e "1 + 2"
   currently mmap'd);
   `__gc_list_ptr(n)` (a heap-backed pointer list using a new tag-4
   layout `[len, ptr_0, ...]` whose mark phase skips the leading
-  length qword); `__gc_list_ptr_len(lst)` /
+  length qword); `__gc_list_ptr_len(lst)` validates and returns the
+  stored length;
   `__gc_list_ptr_set(lst, idx, ptr)` /
   `__gc_list_ptr_get(lst, idx)` /
   `__gc_list_ptr_get_string(lst, idx)` (length and indexed pointer access
@@ -700,8 +702,8 @@ cargo run -- -e "1 + 2"
   allocation;
   `__gc_list_int(n)` (a heap-backed integer list of length `n`,
   zero-initialized via a runtime fill loop so a free-list reuse
-  cannot surface stale bytes); `__gc_list_int_len(lst)` (stored
-  length read); `__gc_list_int_set(lst, idx, value)`
+  cannot surface stale bytes); `__gc_list_int_len(lst)` (validated
+  stored length read); `__gc_list_int_set(lst, idx, value)`
   and `__gc_list_int_get(lst, idx)` (untrusted-index element
   access, mirroring `__gc_read`/`__gc_write` for the dedicated
   list layout after validating stored length);
