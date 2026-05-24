@@ -6734,6 +6734,8 @@ println(a == c)
 println(a != c)
 assert(a == b)
 assert(a != c)
+assertResult(a)(b)
+assertResult(__gc_string("same!"))(c)
 "#,
     )
     .expect("source should write");

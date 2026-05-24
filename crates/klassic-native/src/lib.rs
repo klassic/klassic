@@ -4141,10 +4141,28 @@ impl NativeCodeGenerator {
         }
         let expected = self.compile_expr(&expected_arguments[0])?;
         match expected {
-            NativeValue::Int
-            | NativeValue::Bool
-            | NativeValue::HeapPointer
-            | NativeValue::HeapString => {
+            NativeValue::HeapString => {
+                self.push_temp_reg(Reg::Rax);
+                let actual = self.compile_expr(&actual_arguments[0])?;
+                if actual != NativeValue::HeapString {
+                    return Err(unsupported(
+                        span,
+                        "native assertResult for values with different types",
+                    ));
+                }
+                self.pop_temp_reg(Reg::R10);
+                self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+                self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11);
+                let ok = self.asm.create_text_label();
+                self.asm.cmp_reg_imm8(Reg::Rax, 0);
+                self.asm.jcc_label(Condition::NotEqual, ok);
+                self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
+                self.asm.mov_reg_reg(Reg::Rcx, Reg::R10);
+                self.emit_assert_result_failed_runtime(span, NativeValue::HeapString);
+                self.asm.bind_text_label(ok);
+                Ok(NativeValue::Unit)
+            }
+            NativeValue::Int | NativeValue::Bool | NativeValue::HeapPointer => {
                 self.push_temp_reg(Reg::Rax);
                 let actual = self.compile_expr(&actual_arguments[0])?;
                 if actual != expected {

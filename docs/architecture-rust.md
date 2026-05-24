@@ -604,7 +604,7 @@ cargo run -- -e "1 + 2"
   allocation in the middle cannot reclaim them); `__gc_string_println(g)`
   (writes the heap string's bytes followed by `\n` to stdout); native `+`
   over `HeapString` operands lowers through the same heap concatenation path,
-  and native `==` / `!=` reuse the byte-content equality scan;
+  and native `==` / `!=` plus `assertResult` reuse the byte-content equality scan;
   `__gc_string_len(s)` (returns the byte length stored at offset 0);
   `__gc_string_alloc(n)` (reserves an `n`-byte zero-filled string for
   byte-by-byte construction); `__gc_string_get_byte(s, idx)` /

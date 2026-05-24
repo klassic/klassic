@@ -19,7 +19,7 @@ diagnostic; there is no silent fallback to the evaluator.
 - Fixed-buffer runtime strings, line lists, runtime lists, and
   runtime records, with explicit runtime `String` to `HeapString`
   lifting through `__gc_string` and heap-backed `+` for `HeapString`
-  operands, plus content equality for heap strings.
+  operands, plus content equality and `assertResult` for heap strings.
 - Static maps and sets, plus runtime-key lookups that copy entries
   into runtime storage without losing the selected length.
 - Linux file / directory / process / environment / stdin / argv
