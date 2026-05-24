@@ -57,7 +57,7 @@ cargo run -- -e "1 + 2"
 - REPL/session state
 
 ### `klassic-native`
-- Batch native compilation through `klassic build [--target linux-x86_64] <file.kl> -o <output>`
+- Batch native compilation through `klassic build [--target linux-x86_64|native] <file.kl> -o <output>`
 - Reuses the Rust parser, rewrite pass, typechecker, and proof/trust analysis
 - Emits Linux x86_64 machine code directly
 - Carries an explicit `NativeTarget`; the only implemented target is currently
