@@ -42,7 +42,11 @@ cargo run -- build program.kl -o program
 That path now carries an explicit native target. The only implemented target is
 Linux x86_64, which emits ELF64 executables directly from Rust without invoking
 an external assembler, linker, Java, Scala, sbt, or the JVM. The native compiler
-reuses the parser, rewrite pass, typechecker, and proof/trust checks, then emits
+keeps Linux syscall numbers and OS ABI constants behind a target-platform
+boundary, so future target work can change fds, open modes, errno values, stat
+masks, clocks, mmap flags, and transfer limits without editing expression
+codegen directly. It reuses the parser, rewrite pass, typechecker, and
+proof/trust checks, then emits
 handwritten x64 for the subset it currently supports. That subset now
 includes annotated boolean arguments and returns for native functions, simple
 unannotated integer/boolean return inference, immutable static string/list
