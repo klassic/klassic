@@ -61,7 +61,8 @@ klassic build path/to/program.kl -o program
 ./program
 ```
 
-Pass `--target linux-x86_64` to select the native target explicitly. Linux
+Pass `--target linux-x86_64` or `--target x86_64-unknown-linux-gnu` to select
+the native target explicitly, or `--target native` on a matching host. Linux
 x86_64 is currently the only implemented target.
 
 Start the REPL:
@@ -86,7 +87,8 @@ proof graph that depends on a trusted theorem or axiom.
 
 The native compiler lowers a growing slice of the language directly to a
 selected native target. The only implemented target is currently Linux x86_64,
-which emits ELF64 without an external linker. Highlights:
+selectable as `linux-x86_64`, `x86_64-unknown-linux-gnu`, or `native` on a
+matching host, and it emits ELF64 without an external linker. Highlights:
 
 - Core integer / boolean / string / list expressions, control flow, and
   recursive `def`s (including annotated `String` and `List<String>` parameters).

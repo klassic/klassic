@@ -29,11 +29,12 @@ impl Default for NativeTarget {
 }
 
 impl NativeTarget {
-    pub const SUPPORTED_NAMES: &'static [&'static str] = &["linux-x86_64", "native"];
+    pub const SUPPORTED_NAMES: &'static [&'static str] =
+        &["linux-x86_64", "x86_64-unknown-linux-gnu", "native"];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name {
-            "linux-x86_64" => Some(Self::LinuxX86_64),
+            "linux-x86_64" | "x86_64-unknown-linux-gnu" => Some(Self::LinuxX86_64),
             "native" => Self::host(),
             _ => None,
         }
@@ -35424,9 +35425,16 @@ mod tests {
             NativeTarget::parse("linux-x86_64"),
             Some(NativeTarget::LinuxX86_64)
         );
+        assert_eq!(
+            NativeTarget::parse("x86_64-unknown-linux-gnu"),
+            Some(NativeTarget::LinuxX86_64)
+        );
         assert_eq!(NativeTarget::parse("native"), NativeTarget::host());
         assert_eq!(NativeTarget::parse("linux-aarch64"), None);
-        assert_eq!(NativeTarget::SUPPORTED_NAMES, &["linux-x86_64", "native"]);
+        assert_eq!(
+            NativeTarget::SUPPORTED_NAMES,
+            &["linux-x86_64", "x86_64-unknown-linux-gnu", "native"]
+        );
     }
 
     #[test]

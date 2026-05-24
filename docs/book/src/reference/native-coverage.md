@@ -1,6 +1,8 @@
 # Native Compiler Coverage
 
-The native compiler lowers a growing slice of the language to ELF.
+The native compiler lowers a growing slice of the language to ELF. The current
+Linux x86_64 target is selectable as `linux-x86_64`,
+`x86_64-unknown-linux-gnu`, or `native` on a matching host.
 The exhaustive feature matrix lives in
 [`docs/native-coverage.md`](https://github.com/klassic/klassic/blob/main/docs/native-coverage.md)
 in the source tree — broken down by section (core surface, function

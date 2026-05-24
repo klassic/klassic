@@ -87,7 +87,7 @@ pub fn usage() -> &'static str {
      Options:\n\
        --deny-trust   : reject programs that depend on trusted proofs\n\
        --warn-trust   : warn when trusted proofs are used\n\
-       --target <target>: native build target (supported: linux-x86_64, native)\n\
+       --target <target>: native build target (supported: linux-x86_64, x86_64-unknown-linux-gnu, native)\n\
        <fileName>     : read a program from <fileName> and execute it\n\
        -e <expression>: evaluate <expression>\n\
        build <fileName> -o <output>: compile <fileName> to a native Linux x86_64 executable\n"
@@ -157,22 +157,24 @@ mod tests {
 
     #[test]
     fn parses_native_build_invocation_with_explicit_target() {
-        let args = vec![
-            "build".to_string(),
-            "--target".to_string(),
-            "linux-x86_64".to_string(),
-            "sample.kl".to_string(),
-            "-o".to_string(),
-            "sample".to_string(),
-        ];
-        let parsed = parse_command_line(&args).expect("build command should parse");
-        assert_eq!(parsed.config.native_target, NativeTarget::LinuxX86_64);
-        match parsed.action {
-            RunAction::BuildFile { input, output } => {
-                assert_eq!(input.to_string_lossy(), "sample.kl");
-                assert_eq!(output.to_string_lossy(), "sample");
+        for target in ["linux-x86_64", "x86_64-unknown-linux-gnu"] {
+            let args = vec![
+                "build".to_string(),
+                "--target".to_string(),
+                target.to_string(),
+                "sample.kl".to_string(),
+                "-o".to_string(),
+                "sample".to_string(),
+            ];
+            let parsed = parse_command_line(&args).expect("build command should parse");
+            assert_eq!(parsed.config.native_target, NativeTarget::LinuxX86_64);
+            match parsed.action {
+                RunAction::BuildFile { input, output } => {
+                    assert_eq!(input.to_string_lossy(), "sample.kl");
+                    assert_eq!(output.to_string_lossy(), "sample");
+                }
+                other => panic!("unexpected action: {other:?}"),
             }
-            other => panic!("unexpected action: {other:?}"),
         }
     }
 

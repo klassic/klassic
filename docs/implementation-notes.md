@@ -37,13 +37,16 @@ Klassic also has an initial native compiler path:
 
 ```bash
 cargo run -- build --target linux-x86_64 program.kl -o program
+cargo run -- build --target x86_64-unknown-linux-gnu program.kl -o program
 cargo run -- build --target native program.kl -o program
 ```
 
-That path now carries an explicit native target, with `native` resolving to the
-host target when the host is implemented. The only implemented concrete target
-is Linux x86_64, which emits ELF64 executables directly from Rust without
-invoking an external assembler, linker, Java, Scala, sbt, or the JVM. The native
+That path now carries an explicit native target. `linux-x86_64` is the compact
+Klassic name, `x86_64-unknown-linux-gnu` is accepted as the standard target
+triple alias, and `native` resolves to the host target when the host is
+implemented. The only implemented concrete target is Linux x86_64, which emits
+ELF64 executables directly from Rust without invoking an external assembler,
+linker, Java, Scala, sbt, or the JVM. The native
 compiler keeps Linux syscall numbers and OS ABI constants behind a
 target-platform boundary, so future target work can change fds, open modes,
 errno values, stat masks, clocks, mmap flags, and transfer limits without

@@ -1,8 +1,9 @@
 # Native Compiler Coverage
 
 This document enumerates the language constructs the native compiler currently
-lowers to direct ELF for Linux x86_64. Anything not listed here fails at build
-time rather than falling back to the evaluator.
+lowers to direct ELF for Linux x86_64, selectable as `linux-x86_64`,
+`x86_64-unknown-linux-gnu`, or `native` on a matching host. Anything not listed
+here fails at build time rather than falling back to the evaluator.
 
 ## Core Surface
 
