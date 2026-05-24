@@ -8368,7 +8368,12 @@ impl NativeCodeGenerator {
         let b_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(b_slot.offset, Reg::Rax);
 
-        Ok(self.emit_heap_string_concat_from_slots(a_slot, b_slot))
+        Ok(self.emit_heap_string_concat_from_slots(
+            a_slot,
+            b_slot,
+            span,
+            "heap string concatenation",
+        ))
     }
 
     fn compile_heap_string_equality(
@@ -8472,12 +8477,36 @@ impl NativeCodeGenerator {
         &mut self,
         a_slot: VarSlot,
         b_slot: VarSlot,
+        span: Span,
+        overflow_context: &str,
     ) -> NativeValue {
         // total_len = len_a + len_b
         self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
         self.asm.load_rbp_slot(Reg::R10, b_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+
+        let size_ok = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::R8, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.cmp_reg_imm8(Reg::R9, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.mov_imm64(Reg::Rcx, Self::GC_MAX_STRING_ALLOC_SIZE);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.sub_reg_reg(Reg::Rcx, Reg::R9);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.jmp_label(size_ok);
+        self.asm.bind_text_label(overflow);
+        self.emit_runtime_error(
+            span,
+            &format!("{overflow_context} allocation size overflow"),
+        );
+        self.asm.bind_text_label(size_ok);
 
         // payload_size = 8 + align_up(total_len, 8)
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R8);
@@ -8589,7 +8618,7 @@ impl NativeCodeGenerator {
         let b_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(b_slot.offset, Reg::Rax);
 
-        Ok(self.emit_heap_string_concat_from_slots(a_slot, b_slot))
+        Ok(self.emit_heap_string_concat_from_slots(a_slot, b_slot, span, "__gc_string_concat"))
     }
 
     /// `__gc_string_println(g)` writes the heap string's bytes followed
