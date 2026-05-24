@@ -75,8 +75,8 @@ binary.
 |---|---|---|
 | `__gc_list_int(n)` | list | n zero-init Int slots. |
 | `__gc_list_int_len(lst)` | Int | Stored length. |
-| `__gc_list_int_get(lst, idx)` | Int | Bounds-checked read. |
-| `__gc_list_int_set(lst, idx, v)` | Unit | Bounds-checked write. |
+| `__gc_list_int_get(lst, idx)` | Int | Bounds-checked read; invalid stored length aborts. |
+| `__gc_list_int_set(lst, idx, v)` | Unit | Bounds-checked write; invalid stored length aborts. |
 | `__gc_list_int_push(lst, v)` | list | Functional append; size overflow aborts. |
 | `__gc_list_int_pop(lst)` | list | Functional drop-last; empty or size overflow aborts. |
 | `__gc_list_int_reverse(lst)` | list | Fresh reversed list; size overflow aborts. |
@@ -93,9 +93,9 @@ binary.
 |---|---|---|
 | `__gc_list_ptr(n)` | list | n zero-init pointer slots (tag 4). |
 | `__gc_list_ptr_len(lst)` | Int | Length at offset 0. |
-| `__gc_list_ptr_get(lst, idx)` | HeapPointer | Bounds-checked read. |
-| `__gc_list_ptr_get_string(lst, idx)` | HeapString | Bounds-checked read when the slot stores a heap string. |
-| `__gc_list_ptr_set(lst, idx, ptr)` | Unit | Bounds-checked write. |
+| `__gc_list_ptr_get(lst, idx)` | HeapPointer | Bounds-checked read; invalid stored length aborts. |
+| `__gc_list_ptr_get_string(lst, idx)` | HeapString | Bounds-checked read when the slot stores a heap string; invalid stored length aborts. |
+| `__gc_list_ptr_set(lst, idx, ptr)` | Unit | Bounds-checked write; invalid stored length aborts. |
 | `__gc_list_ptr_push(lst, ptr)` | list | Functional append; size overflow aborts. |
 | `__gc_list_ptr_pop(lst)` | list | Functional drop-last; empty or size overflow aborts. |
 | `__gc_list_ptr_reverse(lst)` | list | Fresh reversed list; size overflow aborts. |

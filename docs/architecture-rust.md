@@ -668,7 +668,8 @@ cargo run -- -e "1 + 2"
   `__gc_list_ptr_get(lst, idx)` /
   `__gc_list_ptr_get_string(lst, idx)` (length and indexed pointer access
   for the new list, including a string-specific read for slots known to
-  hold heap strings); `__gc_list_ptr_push(lst, ptr)` (returns a
+  hold heap strings, and validating stored length before indexed
+  access); `__gc_list_ptr_push(lst, ptr)` (returns a
   fresh tag-4 list with `ptr` appended, spilling both inputs into
   shadow-stack slots so neither the source list nor an inline
   `__gc_alloc(...)` argument is reclaimed by the destination's
@@ -687,8 +688,9 @@ cargo run -- -e "1 + 2"
   length read); `__gc_list_int_set(lst, idx, value)`
   and `__gc_list_int_get(lst, idx)` (untrusted-index element
   access, mirroring `__gc_read`/`__gc_write` for the dedicated
-  list layout); `__gc_list_int_push(lst, v)` (returns a fresh
-  list one slot longer with `v` appended — both inputs spill
+  list layout after validating stored length);
+  `__gc_list_int_push(lst, v)` (returns a fresh list one slot
+  longer with `v` appended — both inputs spill
   into shadow-stack slots so a collection inside the destination
   allocation cannot reclaim the source mid-copy, and corrupted
   lengths are rejected before the derived allocation size is

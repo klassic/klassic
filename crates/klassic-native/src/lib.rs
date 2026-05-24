@@ -8798,6 +8798,7 @@ impl NativeCodeGenerator {
         self.next_stack_offset -= 8;
         // Bounds check against the length stored at offset 0.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_set", Reg::R11);
         self.emit_gc_bounds_check(Reg::Rcx, Reg::R11);
         // addr = list + 8 + idx*8
         self.asm.shl_reg_imm8(Reg::Rcx, 3);
@@ -8844,6 +8845,7 @@ impl NativeCodeGenerator {
         self.next_stack_offset -= 8;
         // Bounds check against the length stored at offset 0.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_get", Reg::R11);
         self.emit_gc_bounds_check(Reg::Rax, Reg::R11);
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.add_reg_reg(Reg::R10, Reg::Rax);
@@ -9564,6 +9566,7 @@ impl NativeCodeGenerator {
         self.next_stack_offset -= 8;
         // Bounds check against the length stored at offset 0.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_iteration_length_check(span, "__gc_list_ptr_set", Reg::R11);
         self.emit_gc_bounds_check(Reg::Rcx, Reg::R11);
         // addr = lst + 8 + idx*8
         self.asm.shl_reg_imm8(Reg::Rcx, 3);
@@ -9605,6 +9608,7 @@ impl NativeCodeGenerator {
         self.next_stack_offset -= 8;
         // Bounds check against the length stored at offset 0.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_iteration_length_check(span, name, Reg::R11);
         self.emit_gc_bounds_check(Reg::Rax, Reg::R11);
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.add_reg_reg(Reg::R10, Reg::Rax);
@@ -32419,8 +32423,8 @@ impl NativeCodeGenerator {
         let overflow = self.asm.create_text_label();
         self.asm.cmp_reg_imm8(len, 0);
         self.asm.jcc_label(Condition::Less, overflow);
-        self.asm.mov_imm64(Reg::Rcx, Self::GC_MAX_LIST_LENGTH);
-        self.asm.cmp_reg_reg(len, Reg::Rcx);
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_MAX_LIST_LENGTH);
+        self.asm.cmp_reg_reg(len, Reg::Rdi);
         self.asm.jcc_label(Condition::Below, ok);
         self.asm.bind_text_label(overflow);
         self.emit_runtime_error(span, &format!("{name} allocation size overflow"));
@@ -32453,8 +32457,8 @@ impl NativeCodeGenerator {
         let overflow = self.asm.create_text_label();
         self.asm.cmp_reg_imm8(len, 0);
         self.asm.jcc_label(Condition::Less, overflow);
-        self.asm.mov_imm64(Reg::Rcx, Self::GC_MAX_LIST_LENGTH);
-        self.asm.cmp_reg_reg(len, Reg::Rcx);
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_MAX_LIST_LENGTH);
+        self.asm.cmp_reg_reg(len, Reg::Rdi);
         self.asm.jcc_label(Condition::Above, overflow);
         self.asm.jmp_label(ok);
         self.asm.bind_text_label(overflow);
@@ -32467,8 +32471,8 @@ impl NativeCodeGenerator {
         let overflow = self.asm.create_text_label();
         self.asm.cmp_reg_imm8(len, 0);
         self.asm.jcc_label(Condition::Less, overflow);
-        self.asm.mov_imm64(Reg::Rcx, Self::GC_MAX_LIST_LENGTH);
-        self.asm.cmp_reg_reg(len, Reg::Rcx);
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_MAX_LIST_LENGTH);
+        self.asm.cmp_reg_reg(len, Reg::Rdi);
         self.asm.jcc_label(Condition::Above, overflow);
         self.asm.jmp_label(ok);
         self.asm.bind_text_label(overflow);
