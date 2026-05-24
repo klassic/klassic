@@ -11,6 +11,10 @@ klassic build path/to/program.kl -o program
 ./program
 ```
 
+You can make the target explicit with `--target linux-x86_64`. That is currently
+the only implemented native target, but keeping it visible in the command line
+lets future targets reuse the same build surface.
+
 That's the whole flow. The compiler runs the same parse → rewrite →
 type-check → proof-check pipeline as the evaluator, then lowers a
 supported subset to machine code and writes an ELF64 file.

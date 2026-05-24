@@ -36,7 +36,7 @@ language behavior.
 Klassic also has an initial native compiler path:
 
 ```bash
-cargo run -- build program.kl -o program
+cargo run -- build --target linux-x86_64 program.kl -o program
 ```
 
 That path now carries an explicit native target. The only implemented target is

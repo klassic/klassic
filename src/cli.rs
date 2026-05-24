@@ -1,16 +1,20 @@
 use std::path::PathBuf;
 
+use klassic_native::NativeTarget;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionConfig {
     pub deny_trust: bool,
     pub warn_trust: bool,
+    pub native_target: NativeTarget,
 }
 
 impl ExecutionConfig {
-    pub const fn new(deny_trust: bool, warn_trust: bool) -> Self {
+    pub const fn new(deny_trust: bool, warn_trust: bool, native_target: NativeTarget) -> Self {
         Self {
             deny_trust,
             warn_trust,
+            native_target,
         }
     }
 }
@@ -32,6 +36,7 @@ pub struct ParsedCommand {
 pub fn parse_command_line(args: &[String]) -> Option<ParsedCommand> {
     let mut deny_trust = false;
     let mut warn_trust = false;
+    let mut native_target = NativeTarget::default();
     let mut others = Vec::new();
     let mut index = 0usize;
 
@@ -45,6 +50,11 @@ pub fn parse_command_line(args: &[String]) -> Option<ParsedCommand> {
                 warn_trust = true;
                 index += 1;
             }
+            "--target" => {
+                let target_name = args.get(index + 1)?;
+                native_target = NativeTarget::parse(target_name)?;
+                index += 2;
+            }
             other => {
                 others.push(other.to_owned());
                 index += 1;
@@ -52,7 +62,7 @@ pub fn parse_command_line(args: &[String]) -> Option<ParsedCommand> {
         }
     }
 
-    let config = ExecutionConfig::new(deny_trust, warn_trust);
+    let config = ExecutionConfig::new(deny_trust, warn_trust, native_target);
     let action = match others.as_slice() {
         [] => RunAction::StartRepl,
         [file_name] if file_name.ends_with(".kl") => {
@@ -73,10 +83,11 @@ pub fn parse_command_line(args: &[String]) -> Option<ParsedCommand> {
 }
 
 pub fn usage() -> &'static str {
-    "Usage: klassic [--deny-trust] [--warn-trust] (-f <fileName> | -e <expression> | build <fileName> -o <output>)\n\
+    "Usage: klassic [--deny-trust] [--warn-trust] [--target <target>] (-f <fileName> | -e <expression> | build <fileName> -o <output>)\n\
      Options:\n\
        --deny-trust   : reject programs that depend on trusted proofs\n\
        --warn-trust   : warn when trusted proofs are used\n\
+       --target <target>: native build target (supported: linux-x86_64)\n\
        <fileName>     : read a program from <fileName> and execute it\n\
        -e <expression>: evaluate <expression>\n\
        build <fileName> -o <output>: compile <fileName> to a native Linux x86_64 executable\n"
@@ -84,6 +95,8 @@ pub fn usage() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use klassic_native::NativeTarget;
+
     use super::{RunAction, parse_command_line};
 
     #[test]
@@ -136,8 +149,43 @@ mod tests {
             RunAction::BuildFile { input, output } => {
                 assert_eq!(input.to_string_lossy(), "sample.kl");
                 assert_eq!(output.to_string_lossy(), "sample");
+                assert_eq!(parsed.config.native_target, NativeTarget::LinuxX86_64);
             }
             other => panic!("unexpected action: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_native_build_invocation_with_explicit_target() {
+        let args = vec![
+            "build".to_string(),
+            "--target".to_string(),
+            "linux-x86_64".to_string(),
+            "sample.kl".to_string(),
+            "-o".to_string(),
+            "sample".to_string(),
+        ];
+        let parsed = parse_command_line(&args).expect("build command should parse");
+        assert_eq!(parsed.config.native_target, NativeTarget::LinuxX86_64);
+        match parsed.action {
+            RunAction::BuildFile { input, output } => {
+                assert_eq!(input.to_string_lossy(), "sample.kl");
+                assert_eq!(output.to_string_lossy(), "sample");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_native_target() {
+        let args = vec![
+            "build".to_string(),
+            "--target".to_string(),
+            "linux-aarch64".to_string(),
+            "sample.kl".to_string(),
+            "-o".to_string(),
+            "sample".to_string(),
+        ];
+        assert!(parse_command_line(&args).is_none());
     }
 }

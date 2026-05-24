@@ -61,6 +61,9 @@ klassic build path/to/program.kl -o program
 ./program
 ```
 
+Pass `--target linux-x86_64` to select the native target explicitly. Linux
+x86_64 is currently the only implemented target.
+
 Start the REPL:
 
 ```bash

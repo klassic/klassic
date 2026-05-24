@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use cli::{ExecutionConfig, ParsedCommand, RunAction, parse_command_line, usage};
 use klassic_eval::{Evaluator, EvaluatorConfig};
-use klassic_native::{NativeCompilerConfig, compile_source_with_prelude_to_elf};
+use klassic_native::{NativeCompilerConfig, compile_source_with_prelude_for_target};
 
 /// The standard prelude is bundled into the compiler at build time. It is
 /// loaded as a separate translation unit so user code is parsed in its own
@@ -41,11 +41,11 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 }
             };
             let config = NativeCompilerConfig {
+                target: command.config.native_target,
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
-                ..NativeCompilerConfig::default()
             };
-            let bytes = match compile_source_with_prelude_to_elf(
+            let bytes = match compile_source_with_prelude_for_target(
                 &input.display().to_string(),
                 STDLIB_PRELUDE,
                 &text,

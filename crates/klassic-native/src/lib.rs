@@ -29,6 +29,15 @@ impl Default for NativeTarget {
 }
 
 impl NativeTarget {
+    pub const SUPPORTED_NAMES: &'static [&'static str] = &["linux-x86_64"];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "linux-x86_64" => Some(Self::LinuxX86_64),
+            _ => None,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::LinuxX86_64 => "linux-x86_64",
@@ -35255,6 +35264,16 @@ mod tests {
         let bytes = compile_source_for_target("<test>", "println(1)", config)
             .expect("program should compile for linux x86_64");
         assert_eq!(&bytes[..4], b"\x7fELF");
+    }
+
+    #[test]
+    fn parses_native_target_names() {
+        assert_eq!(
+            NativeTarget::parse("linux-x86_64"),
+            Some(NativeTarget::LinuxX86_64)
+        );
+        assert_eq!(NativeTarget::parse("linux-aarch64"), None);
+        assert_eq!(NativeTarget::SUPPORTED_NAMES, &["linux-x86_64"]);
     }
 
     #[test]

@@ -123,6 +123,8 @@ fn builds_native_executable_for_basic_program() {
     let build = Command::new(klassic_bin())
         .args([
             "build",
+            "--target",
+            "linux-x86_64",
             source_path.to_string_lossy().as_ref(),
             "-o",
             output_path.to_string_lossy().as_ref(),
