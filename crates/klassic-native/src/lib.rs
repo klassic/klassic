@@ -22,22 +22,68 @@ pub enum NativeTarget {
     LinuxX86_64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeArchitecture {
+    X86_64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeOperatingSystem {
+    Linux,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeAbi {
+    Gnu,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeTargetSpec {
+    pub target: NativeTarget,
+    pub canonical_name: &'static str,
+    pub standard_triple: &'static str,
+    pub aliases: &'static [&'static str],
+    pub architecture: NativeArchitecture,
+    pub operating_system: NativeOperatingSystem,
+    pub abi: NativeAbi,
+    pub executable_format: NativeExecutableFormat,
+}
+
 impl Default for NativeTarget {
     fn default() -> Self {
         Self::LinuxX86_64
     }
 }
 
+const LINUX_X86_64_ALIASES: &[&str] = &["linux-x86_64", "x86_64-unknown-linux-gnu"];
+
+const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[NativeTargetSpec {
+    target: NativeTarget::LinuxX86_64,
+    canonical_name: "linux-x86_64",
+    standard_triple: "x86_64-unknown-linux-gnu",
+    aliases: LINUX_X86_64_ALIASES,
+    architecture: NativeArchitecture::X86_64,
+    operating_system: NativeOperatingSystem::Linux,
+    abi: NativeAbi::Gnu,
+    executable_format: NativeExecutableFormat::Elf64,
+}];
+
 impl NativeTarget {
     pub const SUPPORTED_NAMES: &'static [&'static str] =
         &["linux-x86_64", "x86_64-unknown-linux-gnu", "native"];
 
+    pub fn supported_specs() -> &'static [NativeTargetSpec] {
+        NATIVE_TARGET_SPECS
+    }
+
     pub fn parse(name: &str) -> Option<Self> {
-        match name {
-            "linux-x86_64" | "x86_64-unknown-linux-gnu" => Some(Self::LinuxX86_64),
-            "native" => Self::host(),
-            _ => None,
+        if name == "native" {
+            return Self::host();
         }
+        Self::supported_specs()
+            .iter()
+            .find(|spec| spec.aliases.contains(&name))
+            .map(|spec| spec.target)
     }
 
     pub fn host() -> Option<Self> {
@@ -49,15 +95,34 @@ impl NativeTarget {
     }
 
     pub fn name(self) -> &'static str {
-        match self {
-            Self::LinuxX86_64 => "linux-x86_64",
-        }
+        self.spec().canonical_name
+    }
+
+    pub fn standard_triple(self) -> &'static str {
+        self.spec().standard_triple
+    }
+
+    pub fn architecture(self) -> NativeArchitecture {
+        self.spec().architecture
+    }
+
+    pub fn operating_system(self) -> NativeOperatingSystem {
+        self.spec().operating_system
+    }
+
+    pub fn abi(self) -> NativeAbi {
+        self.spec().abi
     }
 
     pub fn executable_format(self) -> NativeExecutableFormat {
-        match self {
-            Self::LinuxX86_64 => NativeExecutableFormat::Elf64,
-        }
+        self.spec().executable_format
+    }
+
+    pub fn spec(self) -> &'static NativeTargetSpec {
+        Self::supported_specs()
+            .iter()
+            .find(|spec| spec.target == self)
+            .expect("every NativeTarget variant must have a NativeTargetSpec")
     }
 }
 
@@ -35483,8 +35548,9 @@ mod elf {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeCompilerConfig, NativeExecutableFormat, NativeTarget, PlatformSyscall,
-        TargetPlatform, compile_source_for_target, compile_source_to_elf,
+        NativeAbi, NativeArchitecture, NativeCompilerConfig, NativeExecutableFormat,
+        NativeOperatingSystem, NativeTarget, PlatformSyscall, TargetPlatform,
+        compile_source_for_target, compile_source_to_elf,
     };
 
     #[test]
@@ -35528,6 +35594,24 @@ mod tests {
             NativeTarget::SUPPORTED_NAMES,
             &["linux-x86_64", "x86_64-unknown-linux-gnu", "native"]
         );
+    }
+
+    #[test]
+    fn native_target_metadata_is_registry_backed() {
+        let specs = NativeTarget::supported_specs();
+        assert_eq!(specs.len(), 1);
+        let linux = NativeTarget::LinuxX86_64;
+        let spec = linux.spec();
+        assert_eq!(spec.target, linux);
+        assert_eq!(spec.canonical_name, "linux-x86_64");
+        assert_eq!(spec.standard_triple, "x86_64-unknown-linux-gnu");
+        assert_eq!(spec.aliases, &["linux-x86_64", "x86_64-unknown-linux-gnu"]);
+        assert_eq!(linux.name(), "linux-x86_64");
+        assert_eq!(linux.standard_triple(), "x86_64-unknown-linux-gnu");
+        assert_eq!(linux.architecture(), NativeArchitecture::X86_64);
+        assert_eq!(linux.operating_system(), NativeOperatingSystem::Linux);
+        assert_eq!(linux.abi(), NativeAbi::Gnu);
+        assert_eq!(linux.executable_format(), NativeExecutableFormat::Elf64);
     }
 
     #[test]

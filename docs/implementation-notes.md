@@ -46,10 +46,12 @@ Klassic name, `x86_64-unknown-linux-gnu` is accepted as the standard target
 triple alias, and `native` resolves to the host target when the host is
 implemented. The only implemented concrete target is Linux x86_64, which emits
 ELF64 executables directly from Rust without invoking an external assembler,
-linker, Java, Scala, sbt, or the JVM. The native
-compiler keeps Linux syscall numbers and OS ABI constants behind a
-target-platform boundary, so future target work can change fds, open modes,
-errno values, stat masks, clocks, mmap flags, and transfer limits without
+linker, Java, Scala, sbt, or the JVM. The native compiler records each supported
+target in a metadata registry with its compact name, standard triple,
+architecture, operating system, ABI, and executable format, then keeps Linux
+syscall numbers and OS ABI constants behind a target-platform boundary. Future
+target work can change fds, open modes, errno values, stat masks, clocks, mmap
+flags, and transfer limits without
 editing expression codegen directly. It reuses the parser, rewrite pass,
 typechecker, and
 proof/trust checks, then emits

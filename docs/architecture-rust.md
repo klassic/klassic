@@ -62,6 +62,8 @@ cargo run -- -e "1 + 2"
 - Emits Linux x86_64 machine code directly
 - Carries an explicit `NativeTarget`; the only implemented target is currently
   `LinuxX86_64`
+- Keeps supported targets in a metadata registry containing the compact name,
+  standard triple, architecture, operating system, ABI, and executable format
 - Writes ELF64 executables directly without invoking `cc`, `as`, `ld`, Java, Scala,
   or the JVM
 - Current native codegen covers the first vertical slice: integer and boolean
