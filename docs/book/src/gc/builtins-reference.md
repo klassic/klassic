@@ -66,7 +66,7 @@ binary.
 | `__gc_int_to_string(n)` | HeapString | Decimal render. |
 | `__gc_string_get_byte(s, idx)` | Int | Bounds-checked byte read; invalid stored length aborts. |
 | `__gc_string_set_byte(s, idx, byte)` | Unit | Bounds-checked byte write; invalid stored length aborts. |
-| `__gc_string_split(s, sep_byte)` | list_ptr | Split → list of heap strings; invalid stored length aborts. |
+| `__gc_string_split(s, sep_byte)` | list_ptr | Split → list of heap strings; invalid stored length or result size overflow aborts. |
 | `__gc_string_lines(s)` | list_ptr | `__gc_string_split(s, 10)`. |
 
 ## Heap-backed integer lists

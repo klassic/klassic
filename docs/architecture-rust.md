@@ -636,6 +636,10 @@ cargo run -- -e "1 + 2"
   `__gc_string_replace(s, from, to)` (counts non-overlapping
   matches, validates all stored string lengths, and checks the
   replacement result length before allocation);
+  `__gc_string_split(s, sep_byte)` (counts separator bytes,
+  checks the resulting list length before allocation, zeroes the
+  destination pointer-list slots, then fills each slot with a fresh
+  heap string segment);
   `__gc_string_index_of(s, byte)` (returns the first index of
   the low-byte of `byte` in `s`, or `-1` if absent — no
   allocation, just a movzx/cmp loop, after validating the stored

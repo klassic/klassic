@@ -11200,6 +11200,7 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(count_done);
 
         // Allocate destination list_ptr(count + 1).
+        self.emit_gc_list_push_size_check(span, "__gc_string_split", Reg::R8);
         self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
         self.asm.add_reg_imm32(Reg::Rax, 1);
         self.asm.shl_reg_imm8(Reg::Rax, 3);
@@ -11233,6 +11234,7 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(recount_loop);
         self.asm.bind_text_label(recount_done);
 
+        self.emit_gc_list_push_size_check(span, "__gc_string_split", Reg::R8);
         self.asm.add_reg_imm32(Reg::R8, 1);
         self.asm.load_rbp_slot(Reg::Rax, list_slot.offset);
         self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::R8);
