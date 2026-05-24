@@ -887,6 +887,7 @@ struct TargetPlatform {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PlatformConstants {
+    syscall_numbers: [u64; PLATFORM_SYSCALL_COUNT],
     stdin_fd: u64,
     stdout_fd: u64,
     stderr_fd: u64,
@@ -911,6 +912,25 @@ struct PlatformConstants {
 }
 
 const LINUX_X86_64_PLATFORM_CONSTANTS: PlatformConstants = PlatformConstants {
+    syscall_numbers: [
+        0,   // read
+        1,   // write
+        2,   // open
+        3,   // close
+        9,   // mmap
+        21,  // access
+        35,  // nanosleep
+        40,  // sendfile
+        79,  // getcwd
+        82,  // rename
+        83,  // mkdir
+        84,  // rmdir
+        87,  // unlink
+        217, // getdents64
+        228, // clock_gettime
+        262, // newfstatat
+        60,  // exit
+    ],
     stdin_fd: 0,
     stdout_fd: 1,
     stderr_fd: 2,
@@ -943,9 +963,7 @@ impl TargetPlatform {
     }
 
     fn syscall_number(self, syscall: PlatformSyscall) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => linux_x86_64_syscall_number(syscall),
-        }
+        self.constants.syscall_numbers[syscall as usize]
     }
 
     fn stdin_fd(self) -> u64 {
@@ -1033,7 +1051,10 @@ impl TargetPlatform {
     }
 }
 
+const PLATFORM_SYSCALL_COUNT: usize = 17;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
 enum PlatformSyscall {
     Read,
     Write,
@@ -1052,28 +1073,6 @@ enum PlatformSyscall {
     ClockGettime,
     Newfstatat,
     Exit,
-}
-
-fn linux_x86_64_syscall_number(syscall: PlatformSyscall) -> u64 {
-    match syscall {
-        PlatformSyscall::Read => 0,
-        PlatformSyscall::Write => 1,
-        PlatformSyscall::Open => 2,
-        PlatformSyscall::Close => 3,
-        PlatformSyscall::Mmap => 9,
-        PlatformSyscall::Access => 21,
-        PlatformSyscall::Nanosleep => 35,
-        PlatformSyscall::Sendfile => 40,
-        PlatformSyscall::Getcwd => 79,
-        PlatformSyscall::Rename => 82,
-        PlatformSyscall::Mkdir => 83,
-        PlatformSyscall::Rmdir => 84,
-        PlatformSyscall::Unlink => 87,
-        PlatformSyscall::Getdents64 => 217,
-        PlatformSyscall::ClockGettime => 228,
-        PlatformSyscall::Newfstatat => 262,
-        PlatformSyscall::Exit => 60,
-    }
 }
 
 struct NativeCodeGenerator {
@@ -35624,7 +35623,23 @@ mod tests {
     #[test]
     fn linux_x86_64_platform_names_os_abi_constants() {
         let platform = TargetPlatform::for_target(NativeTarget::LinuxX86_64);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Read), 0);
         assert_eq!(platform.syscall_number(PlatformSyscall::Write), 1);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Open), 2);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Close), 3);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Mmap), 9);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Access), 21);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Nanosleep), 35);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Sendfile), 40);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Getcwd), 79);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Rename), 82);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Mkdir), 83);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Rmdir), 84);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Unlink), 87);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Getdents64), 217);
+        assert_eq!(platform.syscall_number(PlatformSyscall::ClockGettime), 228);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Newfstatat), 262);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Exit), 60);
         assert_eq!(platform.stdin_fd(), 0);
         assert_eq!(platform.stdout_fd(), 1);
         assert_eq!(platform.stderr_fd(), 2);
