@@ -129,6 +129,7 @@ pub(crate) fn builtin_name(name: &str) -> Option<&'static str> {
         "__gc_list_ptr_concat" => Some("__gc_list_ptr_concat"),
         "__gc_list_ptr_reverse" => Some("__gc_list_ptr_reverse"),
         "__gc_list_ptr_join" => Some("__gc_list_ptr_join"),
+        "__gc_list_ptr_get_string" => Some("__gc_list_ptr_get_string"),
         "__gc_list_int_sum" => Some("__gc_list_int_sum"),
         "__gc_list_int_min" => Some("__gc_list_int_min"),
         "__gc_list_int_max" => Some("__gc_list_int_max"),
@@ -230,6 +231,7 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         | "__gc_list_int_to_string"
         | "__gc_list_concat"
         | "__gc_list_ptr_get"
+        | "__gc_list_ptr_get_string"
         | "__gc_list_ptr_push"
         | "__gc_list_ptr_concat"
         | "__gc_list_ptr_join"

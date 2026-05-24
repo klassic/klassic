@@ -478,6 +478,8 @@ back into strict address-taking GC helpers without reopening arbitrary plain
 `__gc_read_string` is the string-specific companion that returns
 `NativeValue::HeapString`, letting a raw field re-enter natural heap-string
 printing, `+`, `toString`, and `assertResult` paths.
+`__gc_list_ptr_get_string` provides the same string-specific projection for
+tag-4 pointer lists whose slots are known to contain heap strings.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

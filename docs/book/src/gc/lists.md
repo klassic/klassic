@@ -51,6 +51,7 @@ println(__gc_list_ptr_join(parts, __gc_string(", ")))  // "hello, world"
 | `__gc_list_ptr_push(lst, ptr)` | functional append |
 | `__gc_list_ptr_pop(lst)` | functional drop-last |
 | `__gc_list_ptr_get(lst, i)` / `_set(lst, i, ptr)` | bounds-checked access |
+| `__gc_list_ptr_get_string(lst, i)` | string-typed bounds-checked read when the slot stores a heap string |
 | `__gc_list_ptr_reverse(lst)` | fresh reversed list |
 | `__gc_list_ptr_concat(a, b)` | concatenate two pointer lists |
 | `__gc_list_ptr_join(parts, sep)` | join heap-string elements with separator |

@@ -1999,6 +1999,11 @@ impl TypeChecker {
             Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int)),
         );
         self.declare_poly(
+            "__gc_list_ptr_get_string".to_string(),
+            false,
+            Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int)),
+        );
+        self.declare_poly(
             "__gc_list_ptr_push".to_string(),
             false,
             Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int)),

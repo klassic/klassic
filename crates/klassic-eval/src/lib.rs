@@ -2158,6 +2158,10 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             ensure_arity(name, arguments, 2, span)?;
             Ok(Value::Int(1))
         }
+        "__gc_list_ptr_get_string" => {
+            ensure_arity(name, arguments, 2, span)?;
+            Ok(Value::Int(1))
+        }
         "__gc_list_ptr_push" => {
             ensure_arity(name, arguments, 2, span)?;
             Ok(Value::Int(1))

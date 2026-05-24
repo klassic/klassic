@@ -646,8 +646,10 @@ cargo run -- -e "1 + 2"
   layout `[len, ptr_0, ...]` whose mark phase skips the leading
   length qword); `__gc_list_ptr_len(lst)` /
   `__gc_list_ptr_set(lst, idx, ptr)` /
-  `__gc_list_ptr_get(lst, idx)` (length and indexed pointer access
-  for the new list); `__gc_list_ptr_push(lst, ptr)` (returns a
+  `__gc_list_ptr_get(lst, idx)` /
+  `__gc_list_ptr_get_string(lst, idx)` (length and indexed pointer access
+  for the new list, including a string-specific read for slots known to
+  hold heap strings); `__gc_list_ptr_push(lst, ptr)` (returns a
   fresh tag-4 list with `ptr` appended, spilling both inputs into
   shadow-stack slots so neither the source list nor an inline
   `__gc_alloc(...)` argument is reclaimed by the destination's

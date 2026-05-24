@@ -218,7 +218,9 @@ raw field is meant to flow back into address-taking GC helpers; `__gc_read`
 continues to model scalar qword reads as `Int`. Use
 `__gc_read_string(addr, offset)` when the field is known to hold a heap string
 and should re-enter the `HeapString` surface for `println`, `+`, `toString`, and
-`assertResult`.
+`assertResult`. Pointer lists have the same split surface: `__gc_list_ptr_get`
+preserves generic pointer provenance, while `__gc_list_ptr_get_string` returns a
+known heap-string slot as `HeapString`.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including

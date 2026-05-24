@@ -91,6 +91,7 @@ binary.
 | `__gc_list_ptr(n)` | list | n zero-init pointer slots (tag 4). |
 | `__gc_list_ptr_len(lst)` | Int | Length at offset 0. |
 | `__gc_list_ptr_get(lst, idx)` | HeapPointer | Bounds-checked read. |
+| `__gc_list_ptr_get_string(lst, idx)` | HeapString | Bounds-checked read when the slot stores a heap string. |
 | `__gc_list_ptr_set(lst, idx, ptr)` | Unit | Bounds-checked write. |
 | `__gc_list_ptr_push(lst, ptr)` | list | Functional append. |
 | `__gc_list_ptr_pop(lst)` | list | Functional drop-last; empty aborts. |

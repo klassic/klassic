@@ -3239,6 +3239,7 @@ impl NativeCodeGenerator {
             "__gc_list_ptr_len" => self.compile_gc_list_ptr_len(arguments, span),
             "__gc_list_ptr_set" => self.compile_gc_list_ptr_set(arguments, span),
             "__gc_list_ptr_get" => self.compile_gc_list_ptr_get(arguments, span),
+            "__gc_list_ptr_get_string" => self.compile_gc_list_ptr_get_string(arguments, span),
             "__gc_list_ptr_push" => self.compile_gc_list_ptr_push(arguments, span),
             "__gc_list_ptr_pop" => self.compile_gc_list_ptr_pop(arguments, span),
             "__gc_list_ptr_concat" => self.compile_gc_list_ptr_concat(arguments, span),
@@ -4004,6 +4005,9 @@ impl NativeCodeGenerator {
             "__gc_list_ptr_len" => self.compile_gc_list_ptr_len(arguments, span).map(Some),
             "__gc_list_ptr_set" => self.compile_gc_list_ptr_set(arguments, span).map(Some),
             "__gc_list_ptr_get" => self.compile_gc_list_ptr_get(arguments, span).map(Some),
+            "__gc_list_ptr_get_string" => self
+                .compile_gc_list_ptr_get_string(arguments, span)
+                .map(Some),
             "__gc_list_ptr_push" => self.compile_gc_list_ptr_push(arguments, span).map(Some),
             "__gc_list_ptr_pop" => self.compile_gc_list_ptr_pop(arguments, span).map(Some),
             "__gc_list_ptr_concat" => self.compile_gc_list_ptr_concat(arguments, span).map(Some),
@@ -9397,28 +9401,24 @@ impl NativeCodeGenerator {
         Ok(NativeValue::Unit)
     }
 
-    /// `__gc_list_ptr_get(lst, idx)` reads slot `idx` and returns a
-    /// `HeapPointer`. The slot is shared with the list, so the returned
-    /// value's lifetime is at least as long as the list's.
-    fn compile_gc_list_ptr_get(
+    fn compile_gc_list_ptr_get_value(
         &mut self,
         arguments: &[Expr],
         span: Span,
+        name: &str,
+        result: NativeValue,
     ) -> Result<NativeValue, Diagnostic> {
         if arguments.len() != 2 {
             return Err(Diagnostic::compile(
                 span,
-                format!(
-                    "__gc_list_ptr_get expects 2 arguments but got {}",
-                    arguments.len()
-                ),
+                format!("{name} expects 2 arguments but got {}", arguments.len()),
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
         if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
-                "native __gc_list_ptr_get for non-address list argument",
+                &format!("native {name} for non-address list argument"),
             ));
         }
         self.asm.push_reg(Reg::Rax);
@@ -9427,7 +9427,7 @@ impl NativeCodeGenerator {
         if idx != NativeValue::Int {
             return Err(unsupported(
                 span,
-                "native __gc_list_ptr_get for non-Int index argument",
+                &format!("native {name} for non-Int index argument"),
             ));
         }
         self.asm.pop_reg(Reg::R10);
@@ -9438,7 +9438,38 @@ impl NativeCodeGenerator {
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.add_reg_reg(Reg::R10, Reg::Rax);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 8);
-        Ok(NativeValue::HeapPointer)
+        Ok(result)
+    }
+
+    /// `__gc_list_ptr_get(lst, idx)` reads slot `idx` and returns a
+    /// `HeapPointer`. The slot is shared with the list, so the returned
+    /// value's lifetime is at least as long as the list's.
+    fn compile_gc_list_ptr_get(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.compile_gc_list_ptr_get_value(
+            arguments,
+            span,
+            "__gc_list_ptr_get",
+            NativeValue::HeapPointer,
+        )
+    }
+
+    /// `__gc_list_ptr_get_string(lst, idx)` reads slot `idx` and returns a
+    /// `HeapString` when the caller knows the pointer list stores strings.
+    fn compile_gc_list_ptr_get_string(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.compile_gc_list_ptr_get_value(
+            arguments,
+            span,
+            "__gc_list_ptr_get_string",
+            NativeValue::HeapString,
+        )
     }
 
     /// `__gc_int_to_string(n)` returns a heap string containing the
@@ -34642,6 +34673,7 @@ fn heap_string_returning_helper(name: &str) -> bool {
             | "__gc_list_int_to_string"
             | "__gc_list_ptr_join"
             | "__gc_read_string"
+            | "__gc_list_ptr_get_string"
     )
 }
 
