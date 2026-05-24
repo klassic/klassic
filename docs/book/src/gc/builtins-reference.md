@@ -60,6 +60,7 @@ binary.
 | `__gc_string_ends_with(s, suffix)` | Bool | Length + bytes. |
 | `__gc_string_contains(s, needle)` | Bool | Naive search. |
 | `__gc_string_index_of(s, byte)` | Int | First index, or -1. |
+| `__gc_string_index_of_from(s, byte, start)` | Int | First index at or after `start`, or -1. |
 | `__gc_string_to_int(s)` | Int | Permissive base-10 parse. |
 | `__gc_int_to_string(n)` | HeapString | Decimal render. |
 | `__gc_string_get_byte(s, idx)` | Int | Bounds-checked byte read. |

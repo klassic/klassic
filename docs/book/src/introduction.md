@@ -59,7 +59,7 @@ foreach (entry in ages) {
 Klassic is alive and shipping features in small commits. The native
 compiler covers a growing slice of the language; if you hit something
 unsupported, the build emits a source-located diagnostic instead of
-silently falling back to the evaluator. The GC currently exposes 66
+silently falling back to the evaluator. The GC currently exposes 67
 debug builtins that let you write practical text-processing scripts on
 the heap; the long-term plan (see [Roadmap](./gc/roadmap.md)) is to
 make the heap the default home for every language value.

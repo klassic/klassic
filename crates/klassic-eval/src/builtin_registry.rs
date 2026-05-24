@@ -104,6 +104,7 @@ pub(crate) fn builtin_name(name: &str) -> Option<&'static str> {
         "__gc_string_substring" => Some("__gc_string_substring"),
         "__gc_string_repeat" => Some("__gc_string_repeat"),
         "__gc_string_index_of" => Some("__gc_string_index_of"),
+        "__gc_string_index_of_from" => Some("__gc_string_index_of_from"),
         "__gc_string_to_int" => Some("__gc_string_to_int"),
         "__gc_int_to_string" => Some("__gc_int_to_string"),
         "__gc_string_starts_with" => Some("__gc_string_starts_with"),
@@ -244,6 +245,7 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         | "__gc_string_get_byte"
         | "__gc_string_eq" => Some(2),
         "__gc_write"
+        | "__gc_string_index_of_from"
         | "__gc_list_int_set"
         | "__gc_list_ptr_set"
         | "__gc_string_set_byte"

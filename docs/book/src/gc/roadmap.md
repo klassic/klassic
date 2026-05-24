@@ -1,6 +1,6 @@
 # Roadmap
 
-The GC runtime is feature-complete as a debug surface — 66
+The GC runtime is feature-complete as a debug surface — 67
 builtins, full bounds checking, multi-segment heap growth,
 introspection helpers. The remaining work is to **make the GC heap
 the default home for every language value** so the `__gc_*` prefix
