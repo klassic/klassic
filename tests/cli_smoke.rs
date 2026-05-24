@@ -5947,6 +5947,59 @@ println(__gc_string_to_int(__gc_string("123456789")))
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn builds_native_executable_for_gc_list_int_len_basic() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-gc-len-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-gc-len-{unique}"));
+    fs::write(
+        &source_path,
+        r#"val empty = __gc_list_int(0)
+println(__gc_list_int_len(empty))
+val fixed = __gc_list_int(3)
+println(__gc_list_int_len(fixed))
+mutable xs = __gc_list_int(0)
+xs = __gc_list_int_push(xs, 10)
+xs = __gc_list_int_push(xs, 20)
+println(__gc_list_int_len(xs))
+xs = __gc_list_int_pop(xs)
+println(__gc_list_int_len(xs))
+"#,
+    )
+    .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "gc list_int_len build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "0\n3\n2\n1\n");
+    assert!(run.stderr.is_empty());
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_list_int_pop_basic() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7313,6 +7366,43 @@ fn native_build_rejects_plain_ints_for_gc_string_reads() {
     assert!(
         String::from_utf8_lossy(&build.stderr)
             .contains("native __gc_read_string for non-address argument"),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_rejects_plain_ints_for_gc_list_int_len() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!(
+        "klassic-native-gc-plain-int-list-int-len-{unique}.kl"
+    ));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic-native-gc-plain-int-list-int-len-{unique}"));
+    fs::write(&source_path, "println(__gc_list_int_len(42))\n").expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(!build.status.success());
+    assert!(build.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&build.stderr)
+            .contains("native __gc_list_int_len for non-address list argument"),
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );

@@ -17,7 +17,7 @@ Rust. The implementation builds a native `klassic` executable with Cargo.
 - List, map, and set literals with comma, space, or newline separators
 - Pure Rust file, directory, string, list, map, set, time, and thread helpers
 - Native CLI and REPL
-- Precise mark-and-sweep garbage collector with multi-segment heap growth, exposed through 65 `__gc_*` debug builtins
+- Precise mark-and-sweep garbage collector with multi-segment heap growth, exposed through 66 `__gc_*` debug builtins
 - Standalone Rust macro PEG subsystem
 
 ## Build And Test
@@ -120,7 +120,7 @@ phase skips). Roots come from three sources: a static 1024-entry pin table, an
 8192-entry shadow stack of every `HeapPointer`-typed stack slot, and mutable
 `HeapPointer` slot reassignment paths.
 
-Source programs reach the heap through a 65-builtin debug surface:
+Source programs reach the heap through a 66-builtin debug surface:
 
 - Allocation: `__gc_alloc(size)`, `__gc_record(num_fields)`,
   `__gc_array(num_slots)`, `__gc_list_int(n)`, `__gc_list_ptr(n)`.
@@ -136,8 +136,8 @@ Source programs reach the heap through a 65-builtin debug surface:
   `__gc_string_index_of(s, byte)`, `__gc_string_to_int(s)`,
   `__gc_string_split(s, sep_byte)`, `__gc_string_lines(s)`, and
   `__gc_int_to_string(n)`.
-- Int-list helpers: `__gc_list_int_get` / `_set` / `_push` / `_pop` /
-  `_reverse` / `_sum` / `_min` / `_max` / `_println` / `_to_string`, plus
+- Int-list helpers: `__gc_list_int_len`, `_get`, `_set`, `_push`, `_pop`,
+  `_reverse`, `_sum`, `_min`, `_max`, `_println`, and `_to_string`, plus
   `__gc_list_concat(a, b)`.
 - Pointer-list helpers: `__gc_list_ptr_len`, `_get`, `_get_string`, `_set`,
   `_push`, `_pop`, `_reverse`, `_concat`, and `_join`.

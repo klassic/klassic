@@ -113,6 +113,7 @@ pub(crate) fn builtin_name(name: &str) -> Option<&'static str> {
         "__gc_segment_count" => Some("__gc_segment_count"),
         "__gc_collect_count" => Some("__gc_collect_count"),
         "__gc_list_int" => Some("__gc_list_int"),
+        "__gc_list_int_len" => Some("__gc_list_int_len"),
         "__gc_list_int_set" => Some("__gc_list_int_set"),
         "__gc_list_int_get" => Some("__gc_list_int_get"),
         "__gc_list_int_println" => Some("__gc_list_int_println"),
@@ -201,6 +202,7 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         | "__gc_int_to_string"
         | "__gc_pointer_count"
         | "__gc_list_int"
+        | "__gc_list_int_len"
         | "__gc_list_int_pop"
         | "__gc_list_int_reverse"
         | "__gc_list_int_sum"

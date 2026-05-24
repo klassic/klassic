@@ -661,7 +661,8 @@ cargo run -- -e "1 + 2"
   own allocation);
   `__gc_list_int(n)` (a heap-backed integer list of length `n`,
   zero-initialized via a runtime fill loop so a free-list reuse
-  cannot surface stale bytes); `__gc_list_int_set(lst, idx, value)`
+  cannot surface stale bytes); `__gc_list_int_len(lst)` (stored
+  length read); `__gc_list_int_set(lst, idx, value)`
   and `__gc_list_int_get(lst, idx)` (untrusted-index element
   access, mirroring `__gc_read`/`__gc_write` for the dedicated
   list layout); `__gc_list_int_push(lst, v)` (returns a fresh

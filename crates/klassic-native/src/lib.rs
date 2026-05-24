@@ -3299,6 +3299,7 @@ impl NativeCodeGenerator {
             "__gc_segment_count" => self.compile_gc_segment_count(arguments, span),
             "__gc_collect_count" => self.compile_gc_collect_count(arguments, span),
             "__gc_list_int" => self.compile_gc_list_int(arguments, span),
+            "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span),
             "__gc_list_int_set" => self.compile_gc_list_int_set(arguments, span),
             "__gc_list_int_get" => self.compile_gc_list_int_get(arguments, span),
             "__gc_list_int_push" => self.compile_gc_list_int_push(arguments, span),
@@ -4066,6 +4067,7 @@ impl NativeCodeGenerator {
             "__gc_segment_count" => self.compile_gc_segment_count(arguments, span).map(Some),
             "__gc_collect_count" => self.compile_gc_collect_count(arguments, span).map(Some),
             "__gc_list_int" => self.compile_gc_list_int(arguments, span).map(Some),
+            "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span).map(Some),
             "__gc_list_int_set" => self.compile_gc_list_int_set(arguments, span).map(Some),
             "__gc_list_int_get" => self.compile_gc_list_int_get(arguments, span).map(Some),
             "__gc_list_int_push" => self.compile_gc_list_int_push(arguments, span).map(Some),
@@ -8665,6 +8667,32 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(init_loop);
         self.asm.bind_text_label(init_done);
         Ok(NativeValue::HeapPointer)
+    }
+
+    /// `__gc_list_int_len(lst)` returns the length stored at offset 0.
+    fn compile_gc_list_int_len(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 1 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__gc_list_int_len expects 1 argument but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let value = self.compile_expr(&arguments[0])?;
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
+            return Err(unsupported(
+                span,
+                "native __gc_list_int_len for non-address list argument",
+            ));
+        }
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        Ok(NativeValue::Int)
     }
 
     /// `__gc_list_int_set(lst, idx, value)` writes `value` into slot

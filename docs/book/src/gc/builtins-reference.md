@@ -72,6 +72,7 @@ binary.
 | Builtin | Returns | Description |
 |---|---|---|
 | `__gc_list_int(n)` | list | n zero-init Int slots. |
+| `__gc_list_int_len(lst)` | Int | Stored length. |
 | `__gc_list_int_get(lst, idx)` | Int | Bounds-checked read. |
 | `__gc_list_int_set(lst, idx, v)` | Unit | Bounds-checked write. |
 | `__gc_list_int_push(lst, v)` | list | Functional append. |
