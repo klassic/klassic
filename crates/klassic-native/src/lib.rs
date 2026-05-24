@@ -9386,6 +9386,21 @@ impl NativeCodeGenerator {
         // size = header_word & ~MARK_BIT
         self.asm.mov_imm64(Reg::Rcx, !((1_u64) << 63));
         self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
+        let size_ok = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 16);
+        self.asm.jcc_label(Condition::Below, overflow);
+        self.asm
+            .mov_imm64(Reg::Rcx, Self::GC_MAX_PAYLOAD_SIZE + 16 + 15);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.and_reg_imm32(Reg::Rcx, 7);
+        self.asm.cmp_reg_imm8(Reg::Rcx, 0);
+        self.asm.jcc_label(Condition::Equal, size_ok);
+        self.asm.bind_text_label(overflow);
+        self.emit_runtime_error(span, "__gc_pointer_count header size overflow");
+        self.asm.bind_text_label(size_ok);
         // payload_bytes = size - 16
         self.asm.sub_reg_imm8(Reg::Rax, 16);
         // count = payload_bytes / 8

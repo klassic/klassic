@@ -5735,6 +5735,73 @@ println(__gc_segment_count())
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn builds_native_executable_for_gc_pointer_count_header_overflow_runtime_errors() {
+    let cases = [
+        (
+            r#"val rec = __gc_record(1)
+__gc_write(rec, -16, 0)
+__gc_pointer_count(rec)
+"#,
+            0,
+        ),
+        (
+            r#"val rec = __gc_record(1)
+__gc_write(rec, -16, 20)
+__gc_pointer_count(rec)
+"#,
+            20,
+        ),
+    ];
+    for (index, (source, header_size)) in cases.iter().enumerate() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-pointer-count-header-overflow-{index}-{unique}.kl"
+        ));
+        let output_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-pointer-count-header-overflow-{index}-{unique}"
+        ));
+        fs::write(&source_path, source).expect("source should write");
+
+        let build = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_string_lossy().as_ref(),
+                "-o",
+                output_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .expect("klassic build should run");
+        assert!(
+            build.status.success(),
+            "gc pointer_count header overflow build failed for {header_size}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let run = Command::new(&output_path)
+            .output()
+            .expect("generated executable should run");
+
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&output_path);
+
+        assert_eq!(run.status.code(), Some(1), "__gc_pointer_count should fail");
+        assert!(run.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!(
+                "{}:3:1: __gc_pointer_count header size overflow\n",
+                source_path.display()
+            )
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_heap_string_natural_println() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

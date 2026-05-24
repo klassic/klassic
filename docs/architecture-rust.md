@@ -663,7 +663,9 @@ cargo run -- -e "1 + 2"
   lengths validated before scanning);
   `__gc_pointer_count(addr)` (derives the slot count of a record or
   array from the GC header — note that the count reflects the
-  16-byte-aligned actual allocation, not the user-requested fields);
+  16-byte-aligned actual allocation, not the user-requested fields,
+  and impossible or unaligned header sizes are rejected before the
+  payload calculation);
   `__gc_segment_count()` (returns how many heap segments are
   currently mmap'd);
   `__gc_list_ptr(n)` (a heap-backed pointer list using a new tag-4

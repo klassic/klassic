@@ -121,7 +121,7 @@ binary.
 |---|---|---|
 | `__gc_collect_count()` | Int | Number of mark-and-sweep cycles. |
 | `__gc_segment_count()` | Int | Number of mmap'd heap segments. |
-| `__gc_pointer_count(addr)` | Int | Slot count derived from a record / array / list header. |
+| `__gc_pointer_count(addr)` | Int | Slot count derived from a record / array / list header; invalid header size aborts. |
 
 ## Diagnostics
 
@@ -140,4 +140,5 @@ exits with status 1:
 | Stored string length is negative or too large | `<builtin> string length overflow` |
 | Stored list length is negative or too large | `<builtin> list length overflow` |
 | Stored map payload length is negative, too large, or odd | `<builtin> map length overflow` |
+| Stored GC block size is too small, too large, or unaligned | `<builtin> header size overflow` |
 | Out-of-bounds index in any length-aware op | `klassic gc: index out of bounds` |
