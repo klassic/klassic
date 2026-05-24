@@ -620,18 +620,21 @@ cargo run -- -e "1 + 2"
   `__gc_string_len(s)` (returns the byte length stored at offset 0);
   `__gc_string_alloc(n)` (reserves an `n`-byte zero-filled string for
   byte-by-byte construction); `__gc_string_get_byte(s, idx)` /
-  `__gc_string_set_byte(s, idx, byte)` (single-byte access);
+  `__gc_string_set_byte(s, idx, byte)` (single-byte access after
+  validating the stored string length);
   `__gc_string_eq(a, b)` (length-then-`repe cmpsb` byte equality);
   `__gc_string_substring(s, start, end)` (allocates a fresh heap
   string holding bytes `[start, end)` with three bounds checks
-  before the destination allocation runs);
+  and a stored-length sanity check before the destination allocation
+  runs);
   `__gc_string_repeat(s, n)` (concatenates `s` with itself `n`
   times in a single allocation; negative `n` jumps to
-  `gc_bounds_error`, and total length is checked before allocation
-  size arithmetic);
+  `gc_bounds_error`, the stored source length is validated, and
+  total length is checked before allocation size arithmetic);
   `__gc_string_index_of(s, byte)` (returns the first index of
   the low-byte of `byte` in `s`, or `-1` if absent — no
-  allocation, just a movzx/cmp loop);
+  allocation, just a movzx/cmp loop, after validating the stored
+  string length);
   `__gc_string_index_of_from(s, byte, start)` (same byte search
   starting at `start`, returning `-1` if the cursor is at or past
   the end);
@@ -639,17 +642,20 @@ cargo run -- -e "1 + 2"
   returning the highest matching byte index or `-1`);
   `__gc_string_to_int(s)` (permissive base-10 parser with
   optional leading `-` that stops at the first non-digit and
-  returns 0 on empty / no-digit inputs);
+  returns 0 on empty / no-digit inputs, after validating the stored
+  string length);
   `__gc_int_to_string(n)` (renders a signed integer to a fresh
   heap string via a digit-counting pass followed by a render-
   backwards pass into the exact-sized destination);
   `__gc_string_starts_with(s, prefix)` and
   `__gc_string_ends_with(s, suffix)` (length precheck plus
-  `repe cmpsb` against the leading or trailing bytes);
+  `repe cmpsb` against the leading or trailing bytes, after
+  validating both stored string lengths);
   `__gc_string_contains(haystack, needle)` (naive O(n*m) search
   via an outer i-loop and inner `repe cmpsb`, with all loop
   scratch slots allocated up front so no early conditional
-  return skips a `sub rsp` emission);
+  return skips a `sub rsp` emission, and both stored string
+  lengths validated before scanning);
   `__gc_pointer_count(addr)` (derives the slot count of a record or
   array from the GC header — note that the count reflects the
   16-byte-aligned actual allocation, not the user-requested fields);

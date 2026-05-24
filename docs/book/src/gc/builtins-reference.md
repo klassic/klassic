@@ -47,26 +47,26 @@ binary.
 | `__gc_string(text)` | HeapString | Copy a static literal or runtime `String` onto the heap. |
 | `__gc_string_alloc(n)` | HeapString | n-byte zero-filled heap string. |
 | `__gc_string_concat(a, b)` | HeapString | Join two heap strings; size overflow aborts. |
-| `__gc_string_repeat(s, n)` | HeapString | Repeat. Negative `n` or size overflow aborts. |
-| `__gc_string_substring(s, start, end)` | HeapString | Bytes `[start, end)`. |
-| `__gc_string_replace(s, from, to)` | HeapString | Replace every occurrence. |
-| `__gc_string_trim(s)` | HeapString | Strip ASCII whitespace. |
-| `__gc_string_to_lower(s)` | HeapString | ASCII A–Z → a–z. |
-| `__gc_string_to_upper(s)` | HeapString | ASCII a–z → A–Z. |
-| `__gc_string_println(g)` | Unit | Bytes plus newline. (Prefer `println(g)`.) |
+| `__gc_string_repeat(s, n)` | HeapString | Repeat. Negative `n`, invalid stored length, or size overflow aborts. |
+| `__gc_string_substring(s, start, end)` | HeapString | Bytes `[start, end)`; invalid stored length aborts. |
+| `__gc_string_replace(s, from, to)` | HeapString | Replace every occurrence; invalid stored length aborts. |
+| `__gc_string_trim(s)` | HeapString | Strip ASCII whitespace; invalid stored length aborts. |
+| `__gc_string_to_lower(s)` | HeapString | ASCII A–Z → a–z; invalid stored length aborts. |
+| `__gc_string_to_upper(s)` | HeapString | ASCII a–z → A–Z; invalid stored length aborts. |
+| `__gc_string_println(g)` | Unit | Bytes plus newline; invalid stored length aborts. |
 | `__gc_string_len(s)` | Int | Byte length. |
 | `__gc_string_eq(a, b)` | Bool | Byte equality. |
-| `__gc_string_starts_with(s, prefix)` | Bool | Length + bytes. |
-| `__gc_string_ends_with(s, suffix)` | Bool | Length + bytes. |
-| `__gc_string_contains(s, needle)` | Bool | Naive search. |
-| `__gc_string_index_of(s, byte)` | Int | First index, or -1. |
-| `__gc_string_index_of_from(s, byte, start)` | Int | First index at or after `start`, or -1. |
-| `__gc_string_last_index_of(s, byte)` | Int | Last index, or -1. |
-| `__gc_string_to_int(s)` | Int | Permissive base-10 parse. |
+| `__gc_string_starts_with(s, prefix)` | Bool | Length + bytes; invalid stored length aborts. |
+| `__gc_string_ends_with(s, suffix)` | Bool | Length + bytes; invalid stored length aborts. |
+| `__gc_string_contains(s, needle)` | Bool | Naive search; invalid stored length aborts. |
+| `__gc_string_index_of(s, byte)` | Int | First index, or -1; invalid stored length aborts. |
+| `__gc_string_index_of_from(s, byte, start)` | Int | First index at or after `start`, or -1; invalid stored length aborts. |
+| `__gc_string_last_index_of(s, byte)` | Int | Last index, or -1; invalid stored length aborts. |
+| `__gc_string_to_int(s)` | Int | Permissive base-10 parse; invalid stored length aborts. |
 | `__gc_int_to_string(n)` | HeapString | Decimal render. |
-| `__gc_string_get_byte(s, idx)` | Int | Bounds-checked byte read. |
-| `__gc_string_set_byte(s, idx, byte)` | Unit | Bounds-checked byte write. |
-| `__gc_string_split(s, sep_byte)` | list_ptr | Split → list of heap strings. |
+| `__gc_string_get_byte(s, idx)` | Int | Bounds-checked byte read; invalid stored length aborts. |
+| `__gc_string_set_byte(s, idx, byte)` | Unit | Bounds-checked byte write; invalid stored length aborts. |
+| `__gc_string_split(s, sep_byte)` | list_ptr | Split → list of heap strings; invalid stored length aborts. |
 | `__gc_string_lines(s)` | list_ptr | `__gc_string_split(s, 10)`. |
 
 ## Heap-backed integer lists
@@ -137,5 +137,6 @@ exits with status 1:
 | Shadow stack exceeded 8192 entries | `klassic gc: shadow stack overflow` |
 | Negative size/count for allocation constructors | `<builtin> expects a non-negative integer index` |
 | Size/count would overflow allocation math | `<builtin> allocation size overflow` |
+| Stored string length is negative or too large | `<builtin> string length overflow` |
 | Stored list length is negative or too large | `<builtin> list length overflow` |
 | Out-of-bounds index in any length-aware op | `klassic gc: index out of bounds` |

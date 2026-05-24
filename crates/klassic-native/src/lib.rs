@@ -8649,6 +8649,7 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
         self.asm.add_reg_imm32(Reg::Rsi, 8);
         self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rax, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_println", Reg::Rdx);
         self.emit_syscall_number(PlatformSyscall::Write);
         self.asm.mov_imm64(Reg::Rdi, self.platform.stdout_fd());
         self.asm.syscall();
@@ -9142,6 +9143,7 @@ impl NativeCodeGenerator {
         self.next_stack_offset -= 8;
         // Bounds check against the length stored at offset 0.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_get_byte", Reg::R11);
         self.emit_gc_bounds_check(Reg::Rax, Reg::R11);
         // r10 = s; rax = idx. Address of byte = r10 + 8 + idx.
         self.asm.add_reg_imm32(Reg::R10, 8);
@@ -9197,6 +9199,7 @@ impl NativeCodeGenerator {
         self.next_stack_offset -= 8;
         // Bounds check against the length stored at offset 0.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_set_byte", Reg::R11);
         self.emit_gc_bounds_check(Reg::Rcx, Reg::R11);
         // Address = r10 + 8 + rcx.
         self.asm.add_reg_imm32(Reg::R10, 8);
@@ -9263,6 +9266,7 @@ impl NativeCodeGenerator {
         self.asm.load_rbp_slot(Reg::R11, end_slot.offset);
         self.asm.load_rbp_slot(Reg::R8, s_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R8, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_substring", Reg::R9);
         self.asm.cmp_reg_imm8(Reg::R10, 0);
         self.asm.jcc_label(Condition::Less, self.gc_bounds_error);
         self.asm.cmp_reg_reg(Reg::R11, Reg::R9);
@@ -9810,6 +9814,8 @@ impl NativeCodeGenerator {
 
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R11, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_starts_with", Reg::R8);
+        self.emit_gc_string_length_check(span, "__gc_string_starts_with", Reg::R9);
         // prefix_len > s_len → false
         self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
         self.asm.jcc_label(Condition::Greater, false_branch);
@@ -9874,6 +9880,8 @@ impl NativeCodeGenerator {
 
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R11, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_ends_with", Reg::R8);
+        self.emit_gc_string_length_check(span, "__gc_string_ends_with", Reg::R9);
         // suffix_len > s_len → false
         self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
         self.asm.jcc_label(Condition::Greater, false_branch);
@@ -9954,6 +9962,8 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
         self.asm.load_rbp_slot(Reg::R10, n_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_contains", Reg::R8);
+        self.emit_gc_string_length_check(span, "__gc_string_contains", Reg::R9);
         // empty needle → true
         self.asm.test_reg_reg(Reg::R9, Reg::R9);
         self.asm.jcc_label(Condition::Equal, true_branch);
@@ -10139,6 +10149,7 @@ impl NativeCodeGenerator {
         // iterating `n` times.
         self.asm.load_rbp_slot(Reg::R10, s_slot.offset);
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_repeat", Reg::R8);
         self.asm.load_rbp_slot(Reg::R9, n_slot.offset);
         self.asm.test_reg_reg(Reg::R8, Reg::R8);
         self.asm.jcc_label(Condition::Equal, zero_total);
@@ -10253,6 +10264,7 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
         // r11 = len, r10 advanced to data start.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_index_of", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
 
         let scan = self.asm.create_text_label();
@@ -10332,6 +10344,7 @@ impl NativeCodeGenerator {
         self.asm.and_reg_imm32(Reg::R8, 0xff);
         // r11 = len, r10 advanced to data start.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_index_of_from", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
 
         let scan = self.asm.create_text_label();
@@ -10396,6 +10409,7 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
         // r11 = len, r10 advanced to data start.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_last_index_of", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
 
         let scan = self.asm.create_text_label();
@@ -10454,6 +10468,7 @@ impl NativeCodeGenerator {
         // r10 = s, r11 = len, r10 advanced past length to data.
         self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_to_int", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
 
         // result(rax) = 0; sign(r9) = 1; cursor(rcx) = 0.
@@ -11138,6 +11153,7 @@ impl NativeCodeGenerator {
         // Count separator occurrences in s to size the destination list.
         self.asm.load_rbp_slot(Reg::R10, s_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_split", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.load_rbp_slot(Reg::R9, sep_slot.offset);
         self.asm.mov_imm64(Reg::Rcx, 0);
@@ -11494,6 +11510,11 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
         self.asm.load_rbp_slot(Reg::R10, from_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+        self.asm.load_rbp_slot(Reg::R10, to_slot.offset);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_replace", Reg::R8);
+        self.emit_gc_string_length_check(span, "__gc_string_replace", Reg::R9);
+        self.emit_gc_string_length_check(span, "__gc_string_replace", Reg::R11);
         self.asm.mov_imm64(Reg::Rcx, 0);
         let from_zero = self.asm.create_text_label();
         let count_loop = self.asm.create_text_label();
@@ -11677,6 +11698,7 @@ impl NativeCodeGenerator {
         // Compute start: first index where s[i] is not whitespace.
         self.asm.load_rbp_slot(Reg::R10, s_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, "__gc_string_trim", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.mov_imm64(Reg::Rcx, 0);
         let lead_loop = self.asm.create_text_label();
@@ -11792,6 +11814,7 @@ impl NativeCodeGenerator {
         // payload_size = 8 + align_up(s_len, 8)
         self.asm.load_rbp_slot(Reg::R10, s_slot.offset);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.emit_gc_string_length_check(span, label, Reg::Rax);
         self.asm.add_reg_imm32(Reg::Rax, 8 + 7);
         self.asm.and_reg_imm32(Reg::Rax, -8);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -32450,6 +32473,20 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(ok);
         self.asm.bind_text_label(overflow);
         self.emit_runtime_error(span, &format!("{name} list length overflow"));
+        self.asm.bind_text_label(ok);
+    }
+
+    fn emit_gc_string_length_check(&mut self, span: Span, name: &str, len: Reg) {
+        let ok = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(len, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_MAX_STRING_ALLOC_SIZE);
+        self.asm.cmp_reg_reg(len, Reg::Rdi);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.jmp_label(ok);
+        self.asm.bind_text_label(overflow);
+        self.emit_runtime_error(span, &format!("{name} string length overflow"));
         self.asm.bind_text_label(ok);
     }
 

@@ -4487,6 +4487,178 @@ __gc_list_int_to_string(xs, __gc_string(","))
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn builds_native_executable_for_gc_string_stored_length_overflow_runtime_errors() {
+    let cases = [
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_println(s)
+"#,
+            "__gc_string_println",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_get_byte(s, 0)
+"#,
+            "__gc_string_get_byte",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_set_byte(s, 0, 65)
+"#,
+            "__gc_string_set_byte",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_substring(s, 0, 0)
+"#,
+            "__gc_string_substring",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_starts_with(s, __gc_string(""))
+"#,
+            "__gc_string_starts_with",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_ends_with(s, __gc_string(""))
+"#,
+            "__gc_string_ends_with",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_contains(s, __gc_string("x"))
+"#,
+            "__gc_string_contains",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_repeat(s, 1)
+"#,
+            "__gc_string_repeat",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_index_of(s, 65)
+"#,
+            "__gc_string_index_of",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_index_of_from(s, 65, 0)
+"#,
+            "__gc_string_index_of_from",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_last_index_of(s, 65)
+"#,
+            "__gc_string_last_index_of",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_to_int(s)
+"#,
+            "__gc_string_to_int",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_split(s, 44)
+"#,
+            "__gc_string_split",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_replace(s, __gc_string("a"), __gc_string("b"))
+"#,
+            "__gc_string_replace",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_trim(s)
+"#,
+            "__gc_string_trim",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_to_lower(s)
+"#,
+            "__gc_string_to_lower",
+        ),
+        (
+            r#"val s = __gc_string_alloc(0)
+__gc_write(s, 0, 9223372036854771667)
+__gc_string_to_upper(s)
+"#,
+            "__gc_string_to_upper",
+        ),
+    ];
+    for (index, (source, builtin_name)) in cases.iter().enumerate() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-string-length-overflow-{index}-{unique}.kl"
+        ));
+        let output_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-string-length-overflow-{index}-{unique}"
+        ));
+        fs::write(&source_path, source).expect("source should write");
+
+        let build = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_string_lossy().as_ref(),
+                "-o",
+                output_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .expect("klassic build should run");
+        assert!(
+            build.status.success(),
+            "gc string length overflow build failed for {builtin_name}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let run = Command::new(&output_path)
+            .output()
+            .expect("generated executable should run");
+
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&output_path);
+
+        assert_eq!(run.status.code(), Some(1), "{builtin_name} should fail");
+        assert!(run.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!(
+                "{}:3:1: {builtin_name} string length overflow\n",
+                source_path.display()
+            )
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_reclaims_dead_allocations() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
