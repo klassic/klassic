@@ -4230,6 +4230,94 @@ fn builds_native_executable_for_gc_allocation_size_overflow_runtime_errors() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn builds_native_executable_for_gc_list_derived_size_overflow_runtime_errors() {
+    let cases = [
+        (
+            r#"val xs = __gc_list_int(0)
+__gc_write(xs, 0, 1152921504606846459)
+__gc_list_int_push(xs, 1)
+"#,
+            "__gc_list_int_push",
+            3,
+        ),
+        (
+            r#"val a = __gc_list_int(0)
+__gc_write(a, 0, 1152921504606846459)
+val b = __gc_list_int(1)
+__gc_list_concat(a, b)
+"#,
+            "__gc_list_concat",
+            4,
+        ),
+        (
+            r#"val xs = __gc_list_ptr(0)
+__gc_write(xs, 0, 1152921504606846459)
+__gc_list_ptr_push(xs, __gc_string("x"))
+"#,
+            "__gc_list_ptr_push",
+            3,
+        ),
+        (
+            r#"val a = __gc_list_ptr(0)
+__gc_write(a, 0, 1152921504606846459)
+val b = __gc_list_ptr(1)
+__gc_list_ptr_set(b, 0, __gc_string("x"))
+__gc_list_ptr_concat(a, b)
+"#,
+            "__gc_list_ptr_concat",
+            5,
+        ),
+    ];
+    for (index, (source, builtin_name, line)) in cases.iter().enumerate() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-list-derived-overflow-{index}-{unique}.kl"
+        ));
+        let output_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-list-derived-overflow-{index}-{unique}"
+        ));
+        fs::write(&source_path, source).expect("source should write");
+
+        let build = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_string_lossy().as_ref(),
+                "-o",
+                output_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .expect("klassic build should run");
+        assert!(
+            build.status.success(),
+            "gc list derived overflow build failed for {builtin_name}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let run = Command::new(&output_path)
+            .output()
+            .expect("generated executable should run");
+
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&output_path);
+
+        assert_eq!(run.status.code(), Some(1), "{builtin_name} should fail");
+        assert!(run.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!(
+                "{}:{line}:1: {builtin_name} allocation size overflow\n",
+                source_path.display()
+            )
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_reclaims_dead_allocations() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -666,7 +666,10 @@ cargo run -- -e "1 + 2"
   fresh tag-4 list with `ptr` appended, spilling both inputs into
   shadow-stack slots so neither the source list nor an inline
   `__gc_alloc(...)` argument is reclaimed by the destination's
-  own allocation);
+  own allocation, and rejecting corrupted lengths before deriving
+  the allocation size); `__gc_list_ptr_concat(a, b)` (returns a
+  fresh tag-4 pointer list after checking that the two stored
+  lengths can be safely summed for the destination allocation);
   `__gc_list_int(n)` (a heap-backed integer list of length `n`,
   zero-initialized via a runtime fill loop so a free-list reuse
   cannot surface stale bytes); `__gc_list_int_len(lst)` (stored
@@ -676,7 +679,9 @@ cargo run -- -e "1 + 2"
   list layout); `__gc_list_int_push(lst, v)` (returns a fresh
   list one slot longer with `v` appended — both inputs spill
   into shadow-stack slots so a collection inside the destination
-  allocation cannot reclaim the source mid-copy);
+  allocation cannot reclaim the source mid-copy, and corrupted
+  lengths are rejected before the derived allocation size is
+  computed);
   `__gc_list_int_pop(lst)` (returns a fresh list with the
   trailing element removed; popping an empty list jumps to
   `gc_bounds_error`);
@@ -684,7 +689,8 @@ cargo run -- -e "1 + 2"
   same payload in reverse order);
   `__gc_list_concat(a, b)` (returns a fresh int list whose
   payload is `a` followed by `b`, both copied via two rep movsb
-  passes);
+  passes after checking that the two stored lengths can be safely
+  summed for the destination allocation);
   `__gc_list_int_println(lst)` (prints `[a, b, c]\n`
   by driving `print_i64` per element through two anonymous stack
   slots that are released on exit); `__gc_collect()`;

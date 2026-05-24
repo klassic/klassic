@@ -77,10 +77,10 @@ binary.
 | `__gc_list_int_len(lst)` | Int | Stored length. |
 | `__gc_list_int_get(lst, idx)` | Int | Bounds-checked read. |
 | `__gc_list_int_set(lst, idx, v)` | Unit | Bounds-checked write. |
-| `__gc_list_int_push(lst, v)` | list | Functional append. |
+| `__gc_list_int_push(lst, v)` | list | Functional append; size overflow aborts. |
 | `__gc_list_int_pop(lst)` | list | Functional drop-last; empty aborts. |
 | `__gc_list_int_reverse(lst)` | list | Fresh reversed list. |
-| `__gc_list_concat(a, b)` | list | Concatenate two int lists. |
+| `__gc_list_concat(a, b)` | list | Concatenate two int lists; size overflow aborts. |
 | `__gc_list_int_sum(lst)` | Int | Sum (0 for empty). |
 | `__gc_list_int_min(lst)` | Int | Empty aborts. |
 | `__gc_list_int_max(lst)` | Int | Empty aborts. |
@@ -96,10 +96,10 @@ binary.
 | `__gc_list_ptr_get(lst, idx)` | HeapPointer | Bounds-checked read. |
 | `__gc_list_ptr_get_string(lst, idx)` | HeapString | Bounds-checked read when the slot stores a heap string. |
 | `__gc_list_ptr_set(lst, idx, ptr)` | Unit | Bounds-checked write. |
-| `__gc_list_ptr_push(lst, ptr)` | list | Functional append. |
+| `__gc_list_ptr_push(lst, ptr)` | list | Functional append; size overflow aborts. |
 | `__gc_list_ptr_pop(lst)` | list | Functional drop-last; empty aborts. |
 | `__gc_list_ptr_reverse(lst)` | list | Fresh reversed list. |
-| `__gc_list_ptr_concat(a, b)` | list | Concatenate two pointer lists. |
+| `__gc_list_ptr_concat(a, b)` | list | Concatenate two pointer lists; size overflow aborts. |
 | `__gc_list_ptr_join(parts, sep)` | HeapString | Join heap-string elements. |
 
 ## String-keyed maps

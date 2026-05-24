@@ -8894,6 +8894,7 @@ impl NativeCodeGenerator {
         // payload_size = 8 + (old_len + 1) * 8
         self.asm.load_rbp_slot(Reg::R10, lst_slot.offset);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.emit_gc_list_push_size_check(span, "__gc_list_int_push", Reg::Rax);
         self.asm.add_reg_imm32(Reg::Rax, 1);
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.add_reg_imm32(Reg::Rax, 8);
@@ -10600,6 +10601,7 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
         self.asm.load_rbp_slot(Reg::R10, b_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+        self.emit_gc_list_concat_size_check(span, "__gc_list_concat", Reg::R8, Reg::R9);
 
         // payload_size = 8 + (a_len + b_len) * 8
         self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
@@ -10686,6 +10688,7 @@ impl NativeCodeGenerator {
         // payload_size = 8 + (old_len + 1) * 8
         self.asm.load_rbp_slot(Reg::R10, lst_slot.offset);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.emit_gc_list_push_size_check(span, "__gc_list_ptr_push", Reg::Rax);
         self.asm.add_reg_imm32(Reg::Rax, 1);
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.add_reg_imm32(Reg::Rax, 8);
@@ -10824,6 +10827,7 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
         self.asm.load_rbp_slot(Reg::R10, b_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+        self.emit_gc_list_concat_size_check(span, "__gc_list_ptr_concat", Reg::R8, Reg::R9);
 
         self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
         self.asm.add_reg_reg(Reg::Rax, Reg::R9);
@@ -32371,6 +32375,40 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rcx, max);
         self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
         self.asm.jcc_label(Condition::LessEqual, ok);
+        self.emit_runtime_error(span, &format!("{name} allocation size overflow"));
+        self.asm.bind_text_label(ok);
+    }
+
+    fn emit_gc_list_push_size_check(&mut self, span: Span, name: &str, len: Reg) {
+        let ok = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(len, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.mov_imm64(Reg::Rcx, Self::GC_MAX_LIST_LENGTH);
+        self.asm.cmp_reg_reg(len, Reg::Rcx);
+        self.asm.jcc_label(Condition::Below, ok);
+        self.asm.bind_text_label(overflow);
+        self.emit_runtime_error(span, &format!("{name} allocation size overflow"));
+        self.asm.bind_text_label(ok);
+    }
+
+    fn emit_gc_list_concat_size_check(&mut self, span: Span, name: &str, a_len: Reg, b_len: Reg) {
+        let ok = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(a_len, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.cmp_reg_imm8(b_len, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.mov_imm64(Reg::Rcx, Self::GC_MAX_LIST_LENGTH);
+        self.asm.cmp_reg_reg(a_len, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.cmp_reg_reg(b_len, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.sub_reg_reg(Reg::Rcx, b_len);
+        self.asm.cmp_reg_reg(a_len, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.jmp_label(ok);
+        self.asm.bind_text_label(overflow);
         self.emit_runtime_error(span, &format!("{name} allocation size overflow"));
         self.asm.bind_text_label(ok);
     }
