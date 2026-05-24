@@ -40,6 +40,9 @@ The same migration for runtime lists: `RuntimeList`,
 compiler. Replace fixed-buffer storage with `__gc_list_*` and
 `__gc_list_ptr_*` allocations.
 
+Until this lands, high-level collection literals reject GC heap pointer values
+instead of storing them in unrooted fixed-buffer runtime-list slots.
+
 ### Phase C — Records on the heap
 
 `RuntimeRecord` field storage migrates to heap allocations. Each

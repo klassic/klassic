@@ -6764,6 +6764,45 @@ assertResult("static hello, world!")(toString(f))
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn native_build_rejects_gc_heap_values_in_high_level_collection_literals() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic-native-gc-list-literal-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-gc-list-literal-{unique}"));
+    fs::write(
+        &source_path,
+        r#"println([__gc_string("a"), __gc_string("b")])"#,
+    )
+    .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(!build.status.success());
+    assert!(build.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&build.stderr)
+            .contains("high-level collection literals containing GC heap pointers"),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_string_to_string_bridge() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -456,6 +456,10 @@ length-prefixed byte payloads through the same scan path.
 `RuntimeString`, letting ordinary `String` helpers consume explicitly
 heap-backed data. Runtime string interpolation appends `HeapString`
 fragments into the same fixed-buffer representation.
+High-level collection literals reject `HeapPointer` / `HeapString` values for
+now instead of preserving them in unrooted fixed-buffer runtime-list metadata;
+the explicit `__gc_list_ptr_*` helpers remain the native path for collections
+of heap pointers.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

@@ -203,6 +203,9 @@ the GC heap, and native `==` / `!=` plus
 temporaries rooted across right-hand evaluation. `toString(heapString)` copies
 heap bytes back into a fixed-buffer runtime `String` for ordinary string
 helpers, and runtime string interpolation can append `HeapString` fragments.
+High-level collection literals reject GC heap pointer values for now; use the
+explicit `__gc_list_ptr_*` helpers for heap-pointer collections until Phase B
+migrates ordinary lists onto the GC heap.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including

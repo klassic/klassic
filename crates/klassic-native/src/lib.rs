@@ -6682,6 +6682,12 @@ impl NativeCodeGenerator {
 
     fn compile_literal_value(&mut self, expr: &Expr) -> Result<CompiledLiteralValue, Diagnostic> {
         let value = self.compile_expr(expr)?;
+        if matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
+            return Err(unsupported(
+                expr.span(),
+                "native high-level collection literals containing GC heap pointers",
+            ));
+        }
         Ok(self.compiled_literal_value_from_native(value))
     }
 
