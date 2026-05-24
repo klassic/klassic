@@ -471,6 +471,10 @@ typed through integers.
 Raw `__gc_write` accepts `Int`, `HeapPointer`, and `HeapString` values as qwords,
 so pointer records and arrays can store heap strings through the same field path
 used for generic heap objects.
+Raw `__gc_read` remains an integer qword load; `__gc_read_ptr` emits the same
+load but returns `NativeValue::HeapPointer`, so pointer-record fields can flow
+back into strict address-taking GC helpers without reopening arbitrary plain
+`Int` addresses.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

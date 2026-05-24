@@ -674,11 +674,11 @@ cargo run -- -e "1 + 2"
   slots that are released on exit); `__gc_collect()`;
   `__gc_pin(addr)` / `__gc_unpin(addr)` for explicit static-table
   registration alongside the automatic shadow-stack tracking; and
-  `__gc_read(addr, offset)` / `__gc_write(addr, offset, value)`
-  for raw qword access, including `Int`, `HeapPointer`, or `HeapString`
-  stores (which doubles as record-field and array-slot access since both
-  share the same packed-pointer
-  layout). Marking uses an iterative
+  `__gc_read(addr, offset)` / `__gc_read_ptr(addr, offset)` /
+  `__gc_write(addr, offset, value)` for raw qword access, including scalar reads,
+  pointer-provenance reads, and `Int`, `HeapPointer`, or `HeapString` stores
+  (which doubles as record-field and array-slot access since both share the
+  same packed-pointer layout). Marking uses an iterative
   worklist keyed off the type-tag header field: the
   `gc_mark_visit` subroutine sets the mark bit and pushes the
   block onto a 4096-entry trace stack; the trace loop pops each

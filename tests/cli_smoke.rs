@@ -4458,6 +4458,62 @@ __gc_unpin(parent)
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn builds_native_executable_for_gc_read_ptr_preserves_pointer_value() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-gc-read-ptr-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-gc-read-ptr-{unique}"));
+    // __gc_read keeps scalar qword reads as Int. __gc_read_ptr reads the same
+    // field but tags the result as a heap pointer so address-taking helpers can
+    // consume fields after strict plain-Int rejection.
+    fs::write(
+        &source_path,
+        r#"val parent = __gc_record(1)
+__gc_write(parent, 0, __gc_string("child"))
+__gc_pin(parent)
+foreach(i in [1, 2, 3, 4, 5, 6, 7, 8]) {
+  __gc_alloc(150000)
+}
+__gc_collect()
+__gc_string_println(__gc_read_ptr(parent, 0))
+__gc_unpin(parent)
+"#,
+    )
+    .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    assert!(
+        build.status.success(),
+        "gc read_ptr build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "child\n");
+    assert!(run.stderr.is_empty());
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_string_introspection_and_byte_access() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7008,6 +7064,43 @@ fn native_build_rejects_plain_ints_for_gc_raw_memory_helpers() {
     assert!(
         String::from_utf8_lossy(&build.stderr)
             .contains("native __gc_read for non-address argument"),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_rejects_plain_ints_for_gc_pointer_reads() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic-native-gc-plain-int-read-ptr-{unique}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic-native-gc-plain-int-read-ptr-{unique}"));
+    fs::write(&source_path, "__gc_string_println(__gc_read_ptr(42, 0))\n")
+        .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(!build.status.success());
+    assert!(build.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&build.stderr)
+            .contains("native __gc_read_ptr for non-address argument"),
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );

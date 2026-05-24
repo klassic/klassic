@@ -2269,6 +2269,12 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             ensure_arity(name, arguments, 2, span)?;
             Ok(Value::Int(0))
         }
+        "__gc_read_ptr" => {
+            // The evaluator has no heap to read; return 0 as a stable
+            // sentinel so source programs remain evaluable.
+            ensure_arity(name, arguments, 2, span)?;
+            Ok(Value::Int(0))
+        }
         "__gc_write" => {
             ensure_arity(name, arguments, 3, span)?;
             Ok(Value::Unit)

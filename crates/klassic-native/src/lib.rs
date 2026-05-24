@@ -3265,6 +3265,7 @@ impl NativeCodeGenerator {
             "__gc_pin" => self.compile_gc_pin(arguments, span),
             "__gc_unpin" => self.compile_gc_unpin(arguments, span),
             "__gc_read" => self.compile_gc_read(arguments, span),
+            "__gc_read_ptr" => self.compile_gc_read_ptr(arguments, span),
             "__gc_write" => self.compile_gc_write(arguments, span),
             "assert" => {
                 if arguments.len() != 1 {
@@ -4030,6 +4031,7 @@ impl NativeCodeGenerator {
             "__gc_pin" => self.compile_gc_pin(arguments, span).map(Some),
             "__gc_unpin" => self.compile_gc_unpin(arguments, span).map(Some),
             "__gc_read" => self.compile_gc_read(arguments, span).map(Some),
+            "__gc_read_ptr" => self.compile_gc_read_ptr(arguments, span).map(Some),
             "__gc_write" => self.compile_gc_write(arguments, span).map(Some),
             "head" => self.compile_static_head(arguments, span).map(Some),
             "FileOutput#write" => self
@@ -12300,23 +12302,24 @@ impl NativeCodeGenerator {
         Ok(NativeValue::Unit)
     }
 
-    /// `__gc_read(addr, byte_offset)` reads an i64 from `addr + byte_offset`.
-    fn compile_gc_read(
+    fn compile_gc_read_qword(
         &mut self,
         arguments: &[Expr],
         span: Span,
+        name: &str,
+        result: NativeValue,
     ) -> Result<NativeValue, Diagnostic> {
         if arguments.len() != 2 {
             return Err(Diagnostic::compile(
                 span,
-                format!("__gc_read expects 2 arguments but got {}", arguments.len()),
+                format!("{name} expects 2 arguments but got {}", arguments.len()),
             ));
         }
         let addr = self.compile_expr(&arguments[0])?;
         if !matches!(addr, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
-                "native __gc_read for non-address argument",
+                &format!("native {name} for non-address argument"),
             ));
         }
         self.asm.push_reg(Reg::Rax);
@@ -12325,7 +12328,7 @@ impl NativeCodeGenerator {
         if offset != NativeValue::Int {
             return Err(unsupported(
                 span,
-                "native __gc_read for non-Int byte_offset argument",
+                &format!("native {name} for non-Int byte_offset argument"),
             ));
         }
         self.asm.pop_reg(Reg::Rcx);
@@ -12333,7 +12336,27 @@ impl NativeCodeGenerator {
         self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
         // rax = address + offset; load *(rax)
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
-        Ok(NativeValue::Int)
+        Ok(result)
+    }
+
+    /// `__gc_read(addr, byte_offset)` reads an integer qword from
+    /// `addr + byte_offset`.
+    fn compile_gc_read(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.compile_gc_read_qword(arguments, span, "__gc_read", NativeValue::Int)
+    }
+
+    /// `__gc_read_ptr(addr, byte_offset)` reads a pointer qword from
+    /// `addr + byte_offset`, preserving GC pointer provenance in native codegen.
+    fn compile_gc_read_ptr(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.compile_gc_read_qword(arguments, span, "__gc_read_ptr", NativeValue::HeapPointer)
     }
 
     /// `__gc_write(addr, byte_offset, value)` writes `value` (qword) at

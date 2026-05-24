@@ -32,6 +32,8 @@ diagnostic; there is no silent fallback to the evaluator.
 - GC helper calls that consume heap addresses reject plain `Int` arguments in
   native builds, even while the debug surface is source-typed through integers;
   raw `__gc_write` may still store `Int`, `HeapPointer`, or `HeapString` qwords.
+  `__gc_read_ptr` preserves pointer provenance for raw fields that flow back
+  into address-taking helpers, while `__gc_read` remains the scalar qword read.
 - Linux file / directory / process / environment / stdin / argv
   builtins via direct syscalls.
 - Source-located stderr diagnostics for runtime failures (`assert`,

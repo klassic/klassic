@@ -34,6 +34,7 @@ binary.
 | Builtin | Returns | Description |
 |---|---|---|
 | `__gc_read(addr, byte_offset)` | Int | Read a raw qword. |
+| `__gc_read_ptr(addr, byte_offset)` | HeapPointer | Read a raw qword and keep it tagged as a heap pointer for later GC helpers. |
 | `__gc_write(addr, byte_offset, value)` | Unit | Write an `Int` or heap pointer qword. |
 | `__gc_pin(addr)` | HeapPointer | Add to the static root table. |
 | `__gc_unpin(addr)` | Unit | Remove the first matching root entry. |
