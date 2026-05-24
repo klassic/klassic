@@ -2460,6 +2460,11 @@ impl NativeCodeGenerator {
             return Ok(self.emit_static_string(value));
         }
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+            && (self.expr_may_yield_heap_string(lhs) || self.expr_may_yield_heap_string(rhs))
+        {
+            return self.compile_heap_string_equality(lhs, rhs, op, span);
+        }
+        if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && let Some(equal) = self.static_equality_from_exprs(lhs, rhs)
         {
             self.asm
@@ -8226,6 +8231,41 @@ impl NativeCodeGenerator {
         Ok(self.emit_heap_string_concat_from_slots(a_slot, b_slot))
     }
 
+    fn compile_heap_string_equality(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        op: BinaryOp,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let a = self.compile_expr(lhs)?;
+        if a != NativeValue::HeapString {
+            return Err(unsupported(
+                span,
+                "native heap string equality first argument",
+            ));
+        }
+        self.asm.push_reg(Reg::Rax);
+        self.next_stack_offset += 8;
+        let b = self.compile_expr(rhs)?;
+        if b != NativeValue::HeapString {
+            return Err(unsupported(
+                span,
+                "native heap string equality second argument",
+            ));
+        }
+        self.asm.pop_reg(Reg::R10);
+        self.next_stack_offset -= 8;
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+        self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11);
+        if op == BinaryOp::NotEqual {
+            self.asm.cmp_reg_imm8(Reg::Rax, 0);
+            self.asm.setcc_al(Condition::Equal);
+            self.asm.movzx_rax_al();
+        }
+        Ok(NativeValue::Bool)
+    }
+
     fn emit_static_string_to_heap_string(&mut self, label: DataLabel, len: usize) {
         let payload_size = (8 + len.next_multiple_of(8)) as u64;
         self.asm.mov_imm64(Reg::Rdi, payload_size);
@@ -8342,6 +8382,32 @@ impl NativeCodeGenerator {
 
         self.asm.load_rbp_slot(Reg::Rax, new_slot.offset);
         NativeValue::HeapString
+    }
+
+    fn emit_heap_string_equality_from_regs(&mut self, lhs: Reg, rhs: Reg) {
+        let false_branch = self.asm.create_text_label();
+        let true_branch = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        // len(lhs) vs len(rhs)
+        self.asm.load_ptr_disp32(Reg::R8, lhs, 0);
+        self.asm.load_ptr_disp32(Reg::R9, rhs, 0);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
+        self.asm.jcc_label(Condition::NotEqual, false_branch);
+        self.asm.test_reg_reg(Reg::R8, Reg::R8);
+        self.asm.jcc_label(Condition::Equal, true_branch);
+        self.asm.mov_reg_reg(Reg::Rsi, lhs);
+        self.asm.add_reg_imm32(Reg::Rsi, 8);
+        self.asm.mov_reg_reg(Reg::Rdi, rhs);
+        self.asm.add_reg_imm32(Reg::Rdi, 8);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R8);
+        self.asm.repe_cmpsb();
+        self.asm.jcc_label(Condition::NotEqual, false_branch);
+        self.asm.bind_text_label(true_branch);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(false_branch);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.bind_text_label(done);
     }
 
     /// `__gc_string_concat(a, b)` allocates a fresh heap string whose
@@ -9100,30 +9166,7 @@ impl NativeCodeGenerator {
         self.asm.pop_reg(Reg::R10);
         self.next_stack_offset -= 8;
         self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
-
-        let false_branch = self.asm.create_text_label();
-        let true_branch = self.asm.create_text_label();
-        let done = self.asm.create_text_label();
-        // len_a vs len_b
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
-        self.asm.load_ptr_disp32(Reg::R9, Reg::R11, 0);
-        self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
-        self.asm.jcc_label(Condition::NotEqual, false_branch);
-        self.asm.test_reg_reg(Reg::R8, Reg::R8);
-        self.asm.jcc_label(Condition::Equal, true_branch);
-        self.asm.mov_reg_reg(Reg::Rsi, Reg::R10);
-        self.asm.add_reg_imm32(Reg::Rsi, 8);
-        self.asm.mov_reg_reg(Reg::Rdi, Reg::R11);
-        self.asm.add_reg_imm32(Reg::Rdi, 8);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::R8);
-        self.asm.repe_cmpsb();
-        self.asm.jcc_label(Condition::NotEqual, false_branch);
-        self.asm.bind_text_label(true_branch);
-        self.asm.mov_imm64(Reg::Rax, 1);
-        self.asm.jmp_label(done);
-        self.asm.bind_text_label(false_branch);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.bind_text_label(done);
+        self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11);
         Ok(NativeValue::Bool)
     }
 

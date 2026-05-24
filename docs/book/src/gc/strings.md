@@ -25,6 +25,7 @@ val a = __gc_string("foo")
 val b = __gc_string("bar")
 val ab = __gc_string_concat(a, b)               // "foobar"
 val bang = ab + __gc_string("!")                // heap-backed `+`
+println(ab == __gc_string("foobar"))            // content equality
 
 val tag  = __gc_string_repeat(__gc_string("-"), 10)   // "----------"
 val mid  = __gc_string_substring(__gc_string("klassic"), 1, 5) // "lass"

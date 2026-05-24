@@ -22,6 +22,7 @@ Status:
 - ✅ `__gc_string(runtime_string)` copies fixed-buffer runtime `String`
   values onto the GC heap as an explicit migration bridge.
 - ✅ `+` can concatenate `HeapString` operands with other heap strings.
+- ✅ `==` / `!=` compare `HeapString` bytes by content.
 - 🚧 `+` on fixed-buffer-only dynamic operands → produce `HeapString` by
   default.
 - 🚧 String interpolation → produce `HeapString`.
