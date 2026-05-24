@@ -17,7 +17,8 @@ diagnostic; there is no silent fallback to the evaluator.
 - Static folding for pure expressions, with mutable side effects
   preserved when a value can still be recovered statically.
 - Fixed-buffer runtime strings, line lists, runtime lists, and
-  runtime records.
+  runtime records, with explicit runtime `String` to `HeapString`
+  lifting through `__gc_string`.
 - Static maps and sets, plus runtime-key lookups that copy entries
   into runtime storage without losing the selected length.
 - Linux file / directory / process / environment / stdin / argv

@@ -19,6 +19,8 @@ Status:
 - ✅ `__gc_string_*` returns `HeapString` (a marker variant of the
   `HeapPointer` ABI).
 - ✅ `println(heap_string)` dispatches to a byte-emitting path.
+- ✅ `__gc_string(runtime_string)` copies fixed-buffer runtime `String`
+  values onto the GC heap as an explicit migration bridge.
 - 🚧 `+` on dynamic operands → produce `HeapString`.
 - 🚧 String interpolation → produce `HeapString`.
 - 🚧 `FileInput#all` / `readAll` returns → migrate to `HeapString`.

@@ -440,7 +440,10 @@ evaluator. Runtime string values can be used as syscall paths for
 `FileInput#all`, direct file-input printing, and `FileInput#open` callback
 bodies or callable callback values whose stream parameter flows through
 supported runtime string and file helpers, including `readAll` / `readLines`,
-`length`, `cleanup`, or returning the path itself. Direct printing or immutable
+`length`, `cleanup`, or returning the path itself. Fixed-buffer runtime strings
+can be copied onto the GC heap with `__gc_string(runtimeString)`, providing an
+explicit bridge from runtime file/stdin data into `HeapString` operations.
+Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,
 `cons`, `contains`, inline-lambda `map` or aliased-lambda /

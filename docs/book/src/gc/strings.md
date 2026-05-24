@@ -9,9 +9,14 @@ helper.
 
 ```kl
 val literal = __gc_string("Hello")              // copy from .data
+val lifted  = __gc_string(FileInput#all("message.txt"))
 val empty   = __gc_string_alloc(64)             // 64 zero bytes
 val number  = __gc_int_to_string(42)            // "42"
 ```
+
+`__gc_string` accepts either a static literal or a fixed-buffer runtime
+`String`, so file input, stdin, and other runtime string helpers can be lifted
+onto the GC heap when you want heap-backed composition.
 
 ## Composition
 

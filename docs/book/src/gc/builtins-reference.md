@@ -37,7 +37,7 @@ runtime GC heap directly so practical programs can use it.
 
 | Builtin | Returns | Description |
 |---|---|---|
-| `__gc_string(literal)` | HeapString | Copy a static literal onto the heap. |
+| `__gc_string(text)` | HeapString | Copy a static literal or runtime `String` onto the heap. |
 | `__gc_string_alloc(n)` | HeapString | n-byte zero-filled heap string. |
 | `__gc_string_concat(a, b)` | HeapString | Join two heap strings. |
 | `__gc_string_repeat(s, n)` | HeapString | Repeat. Negative `n` aborts. |

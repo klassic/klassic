@@ -194,7 +194,9 @@ static or runtime integer counts, and string search predicates, plus ASCII
 `toLowerCase` / `toUpperCase`, simple `matches` with static or runtime
 patterns, first-occurrence `replace` with static or runtime literal operands,
 all-occurrence `replaceAll` with static or runtime pattern and replacement
-strings, and UTF-8 `reverse`.
+strings, and UTF-8 `reverse`. `__gc_string(runtimeString)` can also copy these
+fixed-buffer runtime strings onto the GC heap as `HeapString` values for
+heap-backed string composition.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including

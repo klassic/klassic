@@ -8124,9 +8124,9 @@ impl NativeCodeGenerator {
         Ok(NativeValue::HeapPointer)
     }
 
-    /// `__gc_string("static text")` allocates a length-prefixed string on
-    /// the GC heap and copies the static bytes into it. The argument must
-    /// be a compile-time literal so the codegen knows the byte payload.
+    /// `__gc_string(text)` allocates a length-prefixed string on the GC
+    /// heap and copies bytes from either a compile-time literal or an
+    /// existing fixed-buffer runtime `String`.
     /// The returned `HeapPointer` is auto-rooted at the binding site, so
     /// `val s = __gc_string("hi")` survives subsequent collections.
     ///
@@ -8143,34 +8143,53 @@ impl NativeCodeGenerator {
                 format!("__gc_string expects 1 argument but got {}", arguments.len()),
             ));
         }
-        let value = self.compile_expr(&arguments[0])?;
-        let (label, len) = match value {
-            NativeValue::StaticString { label, len } => (label, len),
-            _ => {
-                return Err(unsupported(
-                    span,
-                    "native __gc_string only supports static string literal arguments",
-                ));
+        match self.compile_expr(&arguments[0])? {
+            NativeValue::StaticString { label, len } => {
+                let payload_size = (8 + len.next_multiple_of(8)) as u64;
+                self.asm.mov_imm64(Reg::Rdi, payload_size);
+                self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
+                self.asm.call_label(self.gc_alloc);
+                // rax = heap pointer; store len at offset 0.
+                self.asm.mov_imm64(Reg::Rdi, len as u64);
+                self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rdi);
+                if len > 0 {
+                    // memcpy bytes from the static label into the payload via
+                    // rep movsb. rep movsb leaves rax untouched, so the heap
+                    // pointer in rax survives.
+                    self.asm.mov_data_addr(Reg::Rsi, label);
+                    self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+                    self.asm.add_reg_imm32(Reg::Rdi, 8);
+                    self.asm.mov_imm64(Reg::Rcx, len as u64);
+                    self.asm.rep_movsb();
+                }
+                Ok(NativeValue::HeapString)
             }
-        };
-        let payload_size = (8 + len.next_multiple_of(8)) as u64;
-        self.asm.mov_imm64(Reg::Rdi, payload_size);
-        self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
-        self.asm.call_label(self.gc_alloc);
-        // rax = heap pointer; store len at offset 0.
-        self.asm.mov_imm64(Reg::Rdi, len as u64);
-        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rdi);
-        if len > 0 {
-            // memcpy bytes from the static label into the payload via
-            // rep movsb. rep movsb leaves rax untouched, so the heap
-            // pointer in rax survives.
-            self.asm.mov_data_addr(Reg::Rsi, label);
-            self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-            self.asm.add_reg_imm32(Reg::Rdi, 8);
-            self.asm.mov_imm64(Reg::Rcx, len as u64);
-            self.asm.rep_movsb();
+            NativeValue::RuntimeString { data, len } => {
+                // payload_size = 8 + align_up(runtime_len, 8)
+                self.asm.mov_data_addr(Reg::R10, len);
+                self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
+                self.asm.add_reg_imm32(Reg::Rdi, 8 + 7);
+                self.asm.and_reg_imm32(Reg::Rdi, -8);
+                self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
+                self.asm.call_label(self.gc_alloc);
+
+                // Reload the runtime length after gc_alloc, store it in the
+                // heap string header, then copy that many bytes from the
+                // fixed runtime string buffer into the heap payload.
+                self.asm.mov_data_addr(Reg::R10, len);
+                self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
+                self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rcx);
+                self.asm.mov_data_addr(Reg::Rsi, data);
+                self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+                self.asm.add_reg_imm32(Reg::Rdi, 8);
+                self.asm.rep_movsb();
+                Ok(NativeValue::HeapString)
+            }
+            _ => Err(unsupported(
+                span,
+                "native __gc_string only supports static or runtime string arguments",
+            )),
         }
-        Ok(NativeValue::HeapString)
     }
 
     /// `__gc_string_concat(a, b)` allocates a fresh heap string whose
