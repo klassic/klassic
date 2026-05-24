@@ -6779,6 +6779,77 @@ assertResult(__gc_string("same!"))(c)
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn builds_native_executable_for_gc_string_equality_roots_left_temporaries() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic-native-gc-str-eq-root-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-gc-str-eq-root-{unique}"));
+    fs::write(
+        &source_path,
+        r#"println(__gc_string("same") == {
+  foreach(i in [1, 2, 3, 4, 5, 6, 7, 8]) {
+    __gc_alloc(150000)
+  }
+  __gc_collect()
+  __gc_string("same")
+})
+println(__gc_string_eq(__gc_string("same"), {
+  foreach(i in [1, 2, 3, 4, 5, 6, 7, 8]) {
+    __gc_alloc(150000)
+  }
+  __gc_collect()
+  __gc_string("same")
+}))
+assertResult(__gc_string("same"))({
+  foreach(i in [1, 2, 3, 4, 5, 6, 7, 8]) {
+    __gc_alloc(150000)
+  }
+  __gc_collect()
+  __gc_string("same")
+})
+"#,
+    )
+    .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    assert!(
+        build.status.success(),
+        "gc string equality rooting build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run.status.success(),
+        "gc string equality rooting run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "true\ntrue\n");
+    assert!(run.stderr.is_empty());
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_array_traces_packed_pointer_payload() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

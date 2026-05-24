@@ -32,6 +32,10 @@ val tag  = __gc_string_repeat(__gc_string("-"), 10)   // "----------"
 val mid  = __gc_string_substring(__gc_string("klassic"), 1, 5) // "lass"
 ```
 
+Heap string equality roots the left-hand value while the right-hand side is
+evaluated, so content checks remain safe even when the right side allocates or
+collects before returning its string.
+
 ## Predicates and search
 
 ```kl

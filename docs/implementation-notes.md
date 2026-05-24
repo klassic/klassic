@@ -445,8 +445,9 @@ can be copied onto the GC heap with `__gc_string(runtimeString)`, providing an
 explicit bridge from runtime file/stdin data into `HeapString` operations.
 Heap string operands also participate in native `+`, using the same
 shadow-stack-rooted concatenation path as `__gc_string_concat`.
-Native `==` / `!=` and `assertResult` over heap strings compare their
-length-prefixed byte payloads, sharing the same scan path as `__gc_string_eq`.
+Native `==` / `!=`, `assertResult`, and `__gc_string_eq` over heap strings
+root the left operand while the right-hand side is evaluated, then compare
+length-prefixed byte payloads through the same scan path.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

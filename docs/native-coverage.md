@@ -198,7 +198,8 @@ strings, and UTF-8 `reverse`. `__gc_string(runtimeString)` can also copy these
 fixed-buffer runtime strings onto the GC heap as `HeapString` values for
 heap-backed string composition. Once an operand is a `HeapString`, native `+`
 concatenates heap strings through the GC heap, and native `==` / `!=` plus
-`assertResult` compare heap strings by byte content.
+`assertResult` compare heap strings by byte content while keeping left-hand
+temporaries rooted across right-hand evaluation.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including

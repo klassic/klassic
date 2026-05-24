@@ -4142,7 +4142,8 @@ impl NativeCodeGenerator {
         let expected = self.compile_expr(&expected_arguments[0])?;
         match expected {
             NativeValue::HeapString => {
-                self.push_temp_reg(Reg::Rax);
+                let expected_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+                self.asm.store_rbp_slot(expected_slot.offset, Reg::Rax);
                 let actual = self.compile_expr(&actual_arguments[0])?;
                 if actual != NativeValue::HeapString {
                     return Err(unsupported(
@@ -4150,7 +4151,7 @@ impl NativeCodeGenerator {
                         "native assertResult for values with different types",
                     ));
                 }
-                self.pop_temp_reg(Reg::R10);
+                self.asm.load_rbp_slot(Reg::R10, expected_slot.offset);
                 self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
                 self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11);
                 let ok = self.asm.create_text_label();
@@ -8263,8 +8264,8 @@ impl NativeCodeGenerator {
                 "native heap string equality first argument",
             ));
         }
-        self.asm.push_reg(Reg::Rax);
-        self.next_stack_offset += 8;
+        let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+        self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
         let b = self.compile_expr(rhs)?;
         if b != NativeValue::HeapString {
             return Err(unsupported(
@@ -8272,8 +8273,7 @@ impl NativeCodeGenerator {
                 "native heap string equality second argument",
             ));
         }
-        self.asm.pop_reg(Reg::R10);
-        self.next_stack_offset -= 8;
+        self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
         self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
         self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11);
         if op == BinaryOp::NotEqual {
@@ -9169,8 +9169,8 @@ impl NativeCodeGenerator {
                 "native __gc_string_eq for non-address first argument",
             ));
         }
-        self.asm.push_reg(Reg::Rax);
-        self.next_stack_offset += 8;
+        let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+        self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
         let b = self.compile_expr(&arguments[1])?;
         if !matches!(
             b,
@@ -9181,8 +9181,7 @@ impl NativeCodeGenerator {
                 "native __gc_string_eq for non-address second argument",
             ));
         }
-        self.asm.pop_reg(Reg::R10);
-        self.next_stack_offset -= 8;
+        self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
         self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
         self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11);
         Ok(NativeValue::Bool)
