@@ -28,7 +28,8 @@ diagnostic; there is no silent fallback to the evaluator.
 - High-level collection literals currently reject GC heap pointer values; use
   `__gc_list_ptr_*` until ordinary lists are heap-backed.
 - GC helper calls that consume heap addresses reject plain `Int` arguments in
-  native builds, even while the debug surface is source-typed through integers.
+  native builds, even while the debug surface is source-typed through integers;
+  raw `__gc_write` may still store `Int`, `HeapPointer`, or `HeapString` qwords.
 - Linux file / directory / process / environment / stdin / argv
   builtins via direct syscalls.
 - Source-located stderr diagnostics for runtime failures (`assert`,

@@ -465,6 +465,9 @@ Address-taking GC helper calls also reject plain `Int` native values at build
 time; pointer-producing expressions keep their `HeapPointer` / `HeapString`
 native value tags even though the temporary source-level debug API is still
 typed through integers.
+Raw `__gc_write` accepts `Int`, `HeapPointer`, and `HeapString` values as qwords,
+so pointer records and arrays can store heap strings through the same field path
+used for generic heap objects.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

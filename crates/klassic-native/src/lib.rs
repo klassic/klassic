@@ -12335,7 +12335,7 @@ impl NativeCodeGenerator {
         Ok(NativeValue::Int)
     }
 
-    /// `__gc_write(addr, byte_offset, value)` writes `value` (i64) at
+    /// `__gc_write(addr, byte_offset, value)` writes `value` (qword) at
     /// `addr + byte_offset`.
     fn compile_gc_write(
         &mut self,
@@ -12370,10 +12370,13 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rcx);
         self.next_stack_offset += 8;
         let value = self.compile_expr(&arguments[2])?;
-        if !matches!(value, NativeValue::Int | NativeValue::HeapPointer) {
+        if !matches!(
+            value,
+            NativeValue::Int | NativeValue::HeapPointer | NativeValue::HeapString
+        ) {
             return Err(unsupported(
                 span,
-                "native __gc_write for non-Int value argument",
+                "native __gc_write for non-qword value argument",
             ));
         }
         self.asm.pop_reg(Reg::Rcx);

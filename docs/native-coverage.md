@@ -210,7 +210,8 @@ migrates ordinary lists onto the GC heap.
 GC helper calls that consume heap addresses require values produced by GC
 allocation or pointer-returning helpers; plain `Int` values are rejected at
 build time even though the temporary debug surface is still source-typed as
-integers.
+integers. Raw `__gc_write` still accepts `Int`, `HeapPointer`, or `HeapString`
+values as qwords, while its address operand must come from a GC pointer source.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including

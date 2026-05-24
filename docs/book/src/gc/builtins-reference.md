@@ -33,8 +33,8 @@ binary.
 
 | Builtin | Returns | Description |
 |---|---|---|
-| `__gc_read(addr, byte_offset)` | Int | Read i64. |
-| `__gc_write(addr, byte_offset, value)` | Unit | Write i64. |
+| `__gc_read(addr, byte_offset)` | Int | Read a raw qword. |
+| `__gc_write(addr, byte_offset, value)` | Unit | Write an `Int` or heap pointer qword. |
 | `__gc_pin(addr)` | HeapPointer | Add to the static root table. |
 | `__gc_unpin(addr)` | Unit | Remove the first matching root entry. |
 
