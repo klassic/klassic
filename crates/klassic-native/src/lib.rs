@@ -11363,6 +11363,7 @@ impl NativeCodeGenerator {
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.load_rbp_slot(Reg::R8, sep_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R8, 0);
+        self.emit_gc_string_length_check(span, "__gc_list_ptr_join", Reg::R9);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.mov_imm64(Reg::Rcx, 0);
         let len_loop = self.asm.create_text_label();
@@ -11376,7 +11377,8 @@ impl NativeCodeGenerator {
         self.asm.add_reg_reg(Reg::Rdi, Reg::R8);
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rdi, 0);
         self.asm.load_ptr_disp32(Reg::R8, Reg::Rdi, 0);
-        self.asm.add_reg_reg(Reg::Rax, Reg::R8);
+        self.emit_gc_string_length_check(span, "__gc_list_ptr_join", Reg::R8);
+        self.emit_gc_string_total_add_check(span, "__gc_list_ptr_join", Reg::Rax, Reg::R8);
         self.asm.add_reg_imm32(Reg::Rcx, 1);
         self.asm.jmp_label(len_loop);
         self.asm.bind_text_label(len_done);
@@ -11386,8 +11388,13 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::Equal, total_done);
         self.asm.mov_reg_reg(Reg::R8, Reg::R11);
         self.asm.sub_reg_imm8(Reg::R8, 1);
-        self.asm.imul_reg_reg(Reg::R8, Reg::R9);
-        self.asm.add_reg_reg(Reg::Rax, Reg::R8);
+        self.emit_gc_string_total_add_product_check(
+            span,
+            "__gc_list_ptr_join",
+            Reg::Rax,
+            Reg::R8,
+            Reg::R9,
+        );
         self.asm.bind_text_label(total_done);
         self.asm.store_rbp_slot(total_slot.offset, Reg::Rax);
 
@@ -12024,6 +12031,7 @@ impl NativeCodeGenerator {
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.load_rbp_slot(Reg::R8, sep_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R8, 0);
+        self.emit_gc_string_length_check(span, "__gc_list_int_to_string", Reg::R9);
         self.asm.mov_imm64(Reg::Rax, 0); // total
         self.asm.mov_imm64(Reg::Rcx, 0); // i
         let len_outer = self.asm.create_text_label();
@@ -12077,13 +12085,14 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(len_count_done);
         // total += digits + sign_offset
         self.asm.load_rbp_slot(Reg::Rax, total_slot.offset);
-        self.asm.add_reg_reg(Reg::Rax, Reg::Rsi);
-        self.asm.add_reg_reg(Reg::Rax, Reg::R8);
+        self.emit_gc_string_total_add_check(span, "__gc_list_int_to_string", Reg::Rax, Reg::Rsi);
+        self.emit_gc_string_total_add_check(span, "__gc_list_int_to_string", Reg::Rax, Reg::R8);
         self.asm.pop_reg(Reg::Rbx);
         self.next_stack_offset -= 8;
         self.asm.jmp_label(len_after_count);
         self.asm.bind_text_label(len_zero_case);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
+        self.asm.mov_imm64(Reg::R8, 1);
+        self.emit_gc_string_total_add_check(span, "__gc_list_int_to_string", Reg::Rax, Reg::R8);
         self.asm.bind_text_label(len_after_count);
         self.asm.add_reg_imm32(Reg::Rcx, 1);
         // Reload R10/R11 since count loop may have clobbered them.
@@ -12101,8 +12110,13 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::Equal, total_done);
         self.asm.mov_reg_reg(Reg::R8, Reg::R11);
         self.asm.sub_reg_imm8(Reg::R8, 1);
-        self.asm.imul_reg_reg(Reg::R8, Reg::R9);
-        self.asm.add_reg_reg(Reg::Rax, Reg::R8);
+        self.emit_gc_string_total_add_product_check(
+            span,
+            "__gc_list_int_to_string",
+            Reg::Rax,
+            Reg::R8,
+            Reg::R9,
+        );
         self.asm.bind_text_label(total_done);
         self.asm.store_rbp_slot(total_slot.offset, Reg::Rax);
 
@@ -32550,6 +32564,76 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(ok);
         self.asm.bind_text_label(overflow);
         self.emit_runtime_error(span, &format!("{name} string length overflow"));
+        self.asm.bind_text_label(ok);
+    }
+
+    fn emit_gc_string_total_add_check(&mut self, span: Span, name: &str, total: Reg, addend: Reg) {
+        let ok = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(total, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.cmp_reg_imm8(addend, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_MAX_STRING_ALLOC_SIZE);
+        self.asm.cmp_reg_reg(total, Reg::Rdi);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.cmp_reg_reg(addend, Reg::Rdi);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.sub_reg_reg(Reg::Rdi, total);
+        self.asm.cmp_reg_reg(addend, Reg::Rdi);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.add_reg_reg(total, addend);
+        self.asm.jmp_label(ok);
+        self.asm.bind_text_label(overflow);
+        self.emit_runtime_error(span, &format!("{name} allocation size overflow"));
+        self.asm.bind_text_label(ok);
+    }
+
+    fn emit_gc_string_total_add_product_check(
+        &mut self,
+        span: Span,
+        name: &str,
+        total: Reg,
+        factor: Reg,
+        addend: Reg,
+    ) {
+        let zero_product = self.asm.create_text_label();
+        let ok = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(total, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.cmp_reg_imm8(factor, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.cmp_reg_imm8(addend, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_MAX_STRING_ALLOC_SIZE);
+        self.asm.cmp_reg_reg(total, Reg::Rdi);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.cmp_reg_reg(addend, Reg::Rdi);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.test_reg_reg(factor, factor);
+        self.asm.jcc_label(Condition::Equal, zero_product);
+        self.asm.test_reg_reg(addend, addend);
+        self.asm.jcc_label(Condition::Equal, zero_product);
+
+        self.asm.mov_reg_reg(Reg::R10, total);
+        self.asm.sub_reg_reg(Reg::Rdi, total);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rdi);
+        self.asm.mov_imm64(Reg::Rdx, 0);
+        self.asm.div_reg(addend);
+        self.asm.cmp_reg_reg(factor, Reg::Rax);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.mov_reg_reg(Reg::Rdi, factor);
+        self.asm.imul_reg_reg(Reg::Rdi, addend);
+        self.asm.mov_reg_reg(total, Reg::R10);
+        self.asm.add_reg_reg(total, Reg::Rdi);
+        self.asm.jmp_label(ok);
+
+        self.asm.bind_text_label(zero_product);
+        self.asm.jmp_label(ok);
+
+        self.asm.bind_text_label(overflow);
+        self.emit_runtime_error(span, &format!("{name} allocation size overflow"));
         self.asm.bind_text_label(ok);
     }
 

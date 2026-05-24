@@ -85,7 +85,7 @@ binary.
 | `__gc_list_int_min(lst)` | Int | Empty or invalid stored length aborts. |
 | `__gc_list_int_max(lst)` | Int | Empty or invalid stored length aborts. |
 | `__gc_list_int_println(lst)` | Unit | `[a, b, c]\n`; invalid stored length aborts. |
-| `__gc_list_int_to_string(lst, sep)` | HeapString | Render with separator; invalid stored length aborts. |
+| `__gc_list_int_to_string(lst, sep)` | HeapString | Render with separator; invalid stored length or result size overflow aborts. |
 
 ## Heap-backed pointer lists
 
@@ -100,7 +100,7 @@ binary.
 | `__gc_list_ptr_pop(lst)` | list | Functional drop-last; empty or size overflow aborts. |
 | `__gc_list_ptr_reverse(lst)` | list | Fresh reversed list; size overflow aborts. |
 | `__gc_list_ptr_concat(a, b)` | list | Concatenate two pointer lists; size overflow aborts. |
-| `__gc_list_ptr_join(parts, sep)` | HeapString | Join heap-string elements; invalid stored length aborts. |
+| `__gc_list_ptr_join(parts, sep)` | HeapString | Join heap-string elements; invalid stored length or result size overflow aborts. |
 
 ## String-keyed maps
 
