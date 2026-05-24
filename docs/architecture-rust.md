@@ -64,6 +64,9 @@ cargo run -- -e "1 + 2"
   `LinuxX86_64`
 - Keeps supported targets in a metadata registry containing the compact name,
   standard triple, architecture, operating system, ABI, and executable format
+- Keeps target-specific OS constants such as fds, open modes, errno values,
+  stat masks, clocks, mmap flags, and sendfile limits in a platform constants
+  table
 - Writes ELF64 executables directly without invoking `cc`, `as`, `ld`, Java, Scala,
   or the JVM
 - Current native codegen covers the first vertical slice: integer and boolean

@@ -882,11 +882,64 @@ struct RuntimeMapCallableDispatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TargetPlatform {
     target: NativeTarget,
+    constants: &'static PlatformConstants,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlatformConstants {
+    stdin_fd: u64,
+    stdout_fd: u64,
+    stderr_fd: u64,
+    open_read_flags: u64,
+    open_write_truncate_flags: u64,
+    open_write_append_flags: u64,
+    open_directory_flags: u64,
+    default_file_mode: u64,
+    default_dir_mode: u64,
+    at_fdcwd: u64,
+    errno_no_entry: i8,
+    errno_exists: i8,
+    stat_file_type_mask: u64,
+    stat_directory_type: u64,
+    stat_regular_file_type: u64,
+    clock_realtime: u64,
+    clock_monotonic: u64,
+    mmap_prot_read_write: u64,
+    mmap_private_anonymous_flags: u64,
+    mmap_anonymous_fd: u64,
+    sendfile_chunk_max: u64,
+}
+
+const LINUX_X86_64_PLATFORM_CONSTANTS: PlatformConstants = PlatformConstants {
+    stdin_fd: 0,
+    stdout_fd: 1,
+    stderr_fd: 2,
+    open_read_flags: 0,
+    open_write_truncate_flags: 1 | 64 | 512,
+    open_write_append_flags: 1 | 64 | 1024,
+    open_directory_flags: 0o200000,
+    default_file_mode: 0o644,
+    default_dir_mode: 0o755,
+    at_fdcwd: (-100i64) as u64,
+    errno_no_entry: -2,
+    errno_exists: -17,
+    stat_file_type_mask: 0o170000,
+    stat_directory_type: 0o040000,
+    stat_regular_file_type: 0o100000,
+    clock_realtime: 0,
+    clock_monotonic: 1,
+    mmap_prot_read_write: 3,
+    mmap_private_anonymous_flags: 0x22,
+    mmap_anonymous_fd: (-1_i64) as u64,
+    sendfile_chunk_max: 0x7ffff000,
+};
 
 impl TargetPlatform {
     fn for_target(target: NativeTarget) -> Self {
-        Self { target }
+        let constants = match target {
+            NativeTarget::LinuxX86_64 => &LINUX_X86_64_PLATFORM_CONSTANTS,
+        };
+        Self { target, constants }
     }
 
     fn syscall_number(self, syscall: PlatformSyscall) -> u64 {
@@ -896,133 +949,87 @@ impl TargetPlatform {
     }
 
     fn stdin_fd(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0,
-        }
+        self.constants.stdin_fd
     }
 
     fn stdout_fd(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 1,
-        }
+        self.constants.stdout_fd
     }
 
     fn stderr_fd(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 2,
-        }
+        self.constants.stderr_fd
     }
 
     fn open_read_flags(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0,
-        }
+        self.constants.open_read_flags
     }
 
     fn open_write_flags(self, append: bool) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => {
-                const O_WRONLY: u64 = 1;
-                const O_CREAT: u64 = 64;
-                const O_TRUNC: u64 = 512;
-                const O_APPEND: u64 = 1024;
-                if append {
-                    O_WRONLY | O_CREAT | O_APPEND
-                } else {
-                    O_WRONLY | O_CREAT | O_TRUNC
-                }
-            }
+        if append {
+            self.constants.open_write_append_flags
+        } else {
+            self.constants.open_write_truncate_flags
         }
     }
 
     fn open_directory_flags(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0o200000,
-        }
+        self.constants.open_directory_flags
     }
 
     fn default_file_mode(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0o644,
-        }
+        self.constants.default_file_mode
     }
 
     fn default_dir_mode(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0o755,
-        }
+        self.constants.default_dir_mode
     }
 
     fn at_fdcwd(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => (-100i64) as u64,
-        }
+        self.constants.at_fdcwd
     }
 
     fn errno_no_entry(self) -> i8 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => -2,
-        }
+        self.constants.errno_no_entry
     }
 
     fn errno_exists(self) -> i8 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => -17,
-        }
+        self.constants.errno_exists
     }
 
     fn stat_file_type_mask(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0o170000,
-        }
+        self.constants.stat_file_type_mask
     }
 
     fn stat_directory_type(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0o040000,
-        }
+        self.constants.stat_directory_type
     }
 
     fn stat_regular_file_type(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0o100000,
-        }
+        self.constants.stat_regular_file_type
     }
 
     fn clock_realtime(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0,
-        }
+        self.constants.clock_realtime
     }
 
     fn clock_monotonic(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 1,
-        }
+        self.constants.clock_monotonic
     }
 
     fn mmap_prot_read_write(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 3,
-        }
+        self.constants.mmap_prot_read_write
     }
 
     fn mmap_private_anonymous_flags(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0x22,
-        }
+        self.constants.mmap_private_anonymous_flags
     }
 
     fn mmap_anonymous_fd(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => (-1_i64) as u64,
-        }
+        self.constants.mmap_anonymous_fd
     }
 
     fn sendfile_chunk_max(self) -> u64 {
-        match self.target {
-            NativeTarget::LinuxX86_64 => 0x7ffff000,
-        }
+        self.constants.sendfile_chunk_max
     }
 }
 
