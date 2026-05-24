@@ -202,7 +202,8 @@ the GC heap, and native `==` / `!=` plus
 `assertResult` compare heap strings by byte content while keeping left-hand
 temporaries rooted across right-hand evaluation. `toString(heapString)` copies
 heap bytes back into a fixed-buffer runtime `String` for ordinary string
-helpers, and runtime string interpolation can append `HeapString` fragments.
+helpers; method-style `heapString.toString()` uses the same bridge. Runtime
+string interpolation can append `HeapString` fragments.
 High-level collection literals reject GC heap pointer values for now; use the
 explicit `__gc_list_ptr_*` helpers for heap-pointer collections until Phase B
 migrates ordinary lists onto the GC heap.

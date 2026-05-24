@@ -607,9 +607,9 @@ cargo run -- -e "1 + 2"
   participates, lifting static or runtime string fragments as needed, and
   native `==` / `!=` plus `assertResult` root the left operand across
   right-hand evaluation before reusing the byte-content equality scan;
-  `toString(heapString)` copies heap bytes back into a fixed-buffer runtime
-  `String` for ordinary string helpers; runtime string interpolation can append
-  `HeapString` fragments into its fixed buffer;
+  top-level or method-style `toString` copies heap bytes back into a
+  fixed-buffer runtime `String` for ordinary string helpers; runtime string
+  interpolation can append `HeapString` fragments into its fixed buffer;
   `__gc_string_len(s)` (returns the byte length stored at offset 0);
   `__gc_string_alloc(n)` (reserves an `n`-byte zero-filled string for
   byte-by-byte construction); `__gc_string_get_byte(s, idx)` /

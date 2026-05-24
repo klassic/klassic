@@ -453,9 +453,10 @@ Native `==` / `!=`, `assertResult`, and `__gc_string_eq` over heap strings
 root the left operand while the right-hand side is evaluated, then compare
 length-prefixed byte payloads through the same scan path.
 `toString(heapString)` copies heap bytes back into a fixed-buffer
-`RuntimeString`, letting ordinary `String` helpers consume explicitly
-heap-backed data. Runtime string interpolation appends `HeapString`
-fragments into the same fixed-buffer representation.
+`RuntimeString`, and `heapString.toString()` uses the same bridge, letting
+ordinary `String` helpers consume explicitly heap-backed data. Runtime string
+interpolation appends `HeapString` fragments into the same fixed-buffer
+representation.
 High-level collection literals reject `HeapPointer` / `HeapString` values for
 now instead of preserving them in unrooted fixed-buffer runtime-list metadata;
 the explicit `__gc_list_ptr_*` helpers remain the native path for collections

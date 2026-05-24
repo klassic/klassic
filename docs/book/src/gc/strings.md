@@ -29,6 +29,7 @@ val tagged = "tag:" + bang                      // static/runtime fragments ok
 println(ab == __gc_string("foobar"))            // content equality
 assertResult(__gc_string("foobar"))(ab)         // content assertion
 val text = toString(ab)                         // fixed-buffer String bridge
+val method = ab.toString()                      // method-style bridge
 println(length(text))                           // ordinary String helper
 val message = "heap=#{ab}"                      // interpolation bridge
 

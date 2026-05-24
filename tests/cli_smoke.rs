@@ -6927,11 +6927,14 @@ fn builds_native_executable_for_gc_string_to_string_bridge() {
         &source_path,
         r#"val h = __gc_string("heap")
 val s = toString(h)
+val method = h.toString()
 println(s)
+println(method)
 println(length(s))
 val shouted = toString(h + __gc_string("!"))
 println(shouted)
 assertResult("heap")(s)
+assertResult("heap")(method)
 assertResult("heap!")(shouted)
 "#,
     )
@@ -6967,7 +6970,10 @@ assertResult("heap!")(shouted)
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&run.stdout), "heap\n4\nheap!\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "heap\nheap\n4\nheap!\n"
+    );
     assert!(run.stderr.is_empty());
 }
 

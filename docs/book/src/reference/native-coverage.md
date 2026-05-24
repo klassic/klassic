@@ -21,7 +21,8 @@ diagnostic; there is no silent fallback to the evaluator.
   lifting through `__gc_string` and heap-backed `+` when a `HeapString`
   participates, including static and runtime string fragments; rooted content
   equality and `assertResult` for heap strings; and
-  `toString` / interpolation bridging from `HeapString` back to runtime `String`.
+  top-level or method-style `toString` / interpolation bridging from
+  `HeapString` back to runtime `String`.
 - Static maps and sets, plus runtime-key lookups that copy entries
   into runtime storage without losing the selected length.
 - High-level collection literals currently reject GC heap pointer values; use
