@@ -52,8 +52,8 @@ architecture, backend, data layout, operating system, ABI, and executable
 format. The current target selects the direct x86_64 backend and little-endian
 64-bit layout, and the ELF writer emits header architecture/endianness fields
 from that metadata. Linux syscall numbers and OS ABI constants stay behind a
-target-platform boundary. Those target-specific numbers live in a per-target
-table, so future target work can change syscall ids, fds, open modes, errno
+target-platform boundary. Those target-specific numbers live in a target-keyed
+registry, so future target work can change syscall ids, fds, open modes, errno
 values, stat masks, clocks, mmap flags, and transfer limits without editing
 expression codegen directly. It reuses the parser, rewrite pass,
 typechecker, and

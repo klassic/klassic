@@ -67,7 +67,7 @@ cargo run -- -e "1 + 2"
   operating system, ABI, and executable format
 - Keeps target-specific syscall numbers and OS constants such as fds, open
   modes, errno values, stat masks, clocks, mmap flags, and sendfile limits in a
-  platform constants table
+  target-keyed platform constants registry
 - Writes ELF64 executables directly without invoking `cc`, `as`, `ld`, Java, Scala,
   or the JVM
 - Current native codegen covers the first vertical slice: integer and boolean

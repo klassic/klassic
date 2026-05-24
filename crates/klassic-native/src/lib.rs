@@ -971,6 +971,12 @@ struct PlatformConstants {
     sendfile_chunk_max: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlatformConstantsEntry {
+    target: NativeTarget,
+    constants: &'static PlatformConstants,
+}
+
 const LINUX_X86_64_PLATFORM_CONSTANTS: PlatformConstants = PlatformConstants {
     syscall_numbers: [
         0,   // read
@@ -1014,11 +1020,18 @@ const LINUX_X86_64_PLATFORM_CONSTANTS: PlatformConstants = PlatformConstants {
     sendfile_chunk_max: 0x7ffff000,
 };
 
+const PLATFORM_CONSTANTS_BY_TARGET: &[PlatformConstantsEntry] = &[PlatformConstantsEntry {
+    target: NativeTarget::LinuxX86_64,
+    constants: &LINUX_X86_64_PLATFORM_CONSTANTS,
+}];
+
 impl TargetPlatform {
     fn for_target(target: NativeTarget) -> Self {
-        let constants = match target {
-            NativeTarget::LinuxX86_64 => &LINUX_X86_64_PLATFORM_CONSTANTS,
-        };
+        let constants = PLATFORM_CONSTANTS_BY_TARGET
+            .iter()
+            .find(|entry| entry.target == target)
+            .map(|entry| entry.constants)
+            .expect("every NativeTarget variant must have PlatformConstants");
         Self { target, constants }
     }
 
@@ -36322,8 +36335,8 @@ mod elf {
 mod tests {
     use super::{
         NativeAbi, NativeArchitecture, NativeBackend, NativeCompilerConfig, NativeEndianness,
-        NativeExecutableFormat, NativeOperatingSystem, NativeTarget, PlatformSyscall,
-        TargetPlatform, compile_source_for_target, compile_source_to_elf,
+        NativeExecutableFormat, NativeOperatingSystem, NativeTarget, PLATFORM_CONSTANTS_BY_TARGET,
+        PlatformSyscall, TargetPlatform, compile_source_for_target, compile_source_to_elf,
     };
 
     #[test]
@@ -36397,6 +36410,12 @@ mod tests {
     #[test]
     fn linux_x86_64_platform_names_os_abi_constants() {
         let platform = TargetPlatform::for_target(NativeTarget::LinuxX86_64);
+        assert_eq!(platform.target, NativeTarget::LinuxX86_64);
+        assert_eq!(PLATFORM_CONSTANTS_BY_TARGET.len(), 1);
+        assert_eq!(
+            PLATFORM_CONSTANTS_BY_TARGET[0].target,
+            NativeTarget::LinuxX86_64
+        );
         assert_eq!(platform.syscall_number(PlatformSyscall::Read), 0);
         assert_eq!(platform.syscall_number(PlatformSyscall::Write), 1);
         assert_eq!(platform.syscall_number(PlatformSyscall::Open), 2);
