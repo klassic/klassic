@@ -4,6 +4,10 @@
 
 Klassic is a Rust workspace with small crates for the language pipeline. The
 root package builds the native `klassic` binary.
+The native backend direction is tracked in
+[`docs/native-backend-strategy.md`](native-backend-strategy.md): keep the direct
+backend as the bootstrap path, while preserving a target/backend boundary for a
+future optional LLVM backend.
 
 ```bash
 cargo build
