@@ -50,6 +50,7 @@ println(__gc_string_starts_with(s, __gc_string("the")))   // true
 println(__gc_string_ends_with(s, __gc_string("fox")))     // true
 println(__gc_string_index_of(s, 113))                     // 4 (q)
 println(__gc_string_index_of_from(s, 111, 13))            // 17 (o)
+println(__gc_string_last_index_of(s, 111))                // 17 (o)
 ```
 
 ## Cleanup helpers

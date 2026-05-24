@@ -3291,6 +3291,7 @@ impl NativeCodeGenerator {
             "__gc_string_repeat" => self.compile_gc_string_repeat(arguments, span),
             "__gc_string_index_of" => self.compile_gc_string_index_of(arguments, span),
             "__gc_string_index_of_from" => self.compile_gc_string_index_of_from(arguments, span),
+            "__gc_string_last_index_of" => self.compile_gc_string_last_index_of(arguments, span),
             "__gc_string_to_int" => self.compile_gc_string_to_int(arguments, span),
             "__gc_int_to_string" => self.compile_gc_int_to_string(arguments, span),
             "__gc_string_starts_with" => self.compile_gc_string_starts_with(arguments, span),
@@ -4059,6 +4060,9 @@ impl NativeCodeGenerator {
             "__gc_string_index_of" => self.compile_gc_string_index_of(arguments, span).map(Some),
             "__gc_string_index_of_from" => self
                 .compile_gc_string_index_of_from(arguments, span)
+                .map(Some),
+            "__gc_string_last_index_of" => self
+                .compile_gc_string_last_index_of(arguments, span)
                 .map(Some),
             "__gc_string_to_int" => self.compile_gc_string_to_int(arguments, span).map(Some),
             "__gc_int_to_string" => self.compile_gc_int_to_string(arguments, span).map(Some),
@@ -10275,6 +10279,77 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::Equal, found);
         self.asm.add_reg_imm32(Reg::Rcx, 1);
         self.asm.jmp_label(scan);
+        self.asm.bind_text_label(found);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(not_found);
+        self.asm.mov_imm64(Reg::Rax, (-1_i64) as u64);
+        self.asm.bind_text_label(done);
+        Ok(NativeValue::Int)
+    }
+
+    /// `__gc_string_last_index_of(s, byte)` returns the last index where
+    /// `s` contains the given byte (low 8 bits of the integer argument),
+    /// or -1 if not found.
+    fn compile_gc_string_last_index_of(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 2 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__gc_string_last_index_of expects 2 arguments but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let s = self.compile_expr(&arguments[0])?;
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
+            return Err(unsupported(
+                span,
+                "native __gc_string_last_index_of for non-address source",
+            ));
+        }
+        self.asm.push_reg(Reg::Rax);
+        self.next_stack_offset += 8;
+        let byte = self.compile_expr(&arguments[1])?;
+        if byte != NativeValue::Int {
+            return Err(unsupported(
+                span,
+                "native __gc_string_last_index_of for non-Int byte argument",
+            ));
+        }
+        // rax = byte; pop r10 = s.
+        self.asm.pop_reg(Reg::R10);
+        self.next_stack_offset -= 8;
+        // Mask byte to low 8 bits for the comparison.
+        self.asm.and_reg_imm32(Reg::Rax, 0xff);
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
+        // r11 = len, r10 advanced to data start.
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.add_reg_imm32(Reg::R10, 8);
+
+        let scan = self.asm.create_text_label();
+        let not_found = self.asm.create_text_label();
+        let found = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+
+        self.asm.cmp_reg_imm8(Reg::R11, 0);
+        self.asm.jcc_label(Condition::Equal, not_found);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R11);
+        self.asm.dec_reg(Reg::Rcx);
+
+        self.asm.bind_text_label(scan);
+        self.asm.movzx_byte_indexed(Reg::Rdi, Reg::R10, Reg::Rcx);
+        self.asm.cmp_reg_reg(Reg::Rdi, Reg::R8);
+        self.asm.jcc_label(Condition::Equal, found);
+        self.asm.cmp_reg_imm8(Reg::Rcx, 0);
+        self.asm.jcc_label(Condition::Equal, not_found);
+        self.asm.dec_reg(Reg::Rcx);
+        self.asm.jmp_label(scan);
+
         self.asm.bind_text_label(found);
         self.asm.mov_reg_reg(Reg::Rax, Reg::Rcx);
         self.asm.jmp_label(done);

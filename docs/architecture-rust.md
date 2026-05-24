@@ -633,6 +633,8 @@ cargo run -- -e "1 + 2"
   `__gc_string_index_of_from(s, byte, start)` (same byte search
   starting at `start`, returning `-1` if the cursor is at or past
   the end);
+  `__gc_string_last_index_of(s, byte)` (reverse byte search,
+  returning the highest matching byte index or `-1`);
   `__gc_string_to_int(s)` (permissive base-10 parser with
   optional leading `-` that stops at the first non-digit and
   returns 0 on empty / no-digit inputs);
