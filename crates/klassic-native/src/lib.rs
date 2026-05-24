@@ -96,6 +96,14 @@ impl NativeTarget {
     pub const SUPPORTED_NAMES: &'static [&'static str] =
         &["linux-x86_64", "x86_64-unknown-linux-gnu", "native"];
 
+    pub fn supported_names() -> &'static [&'static str] {
+        Self::SUPPORTED_NAMES
+    }
+
+    pub fn supported_names_csv() -> String {
+        Self::supported_names().join(", ")
+    }
+
     pub fn supported_specs() -> &'static [NativeTargetSpec] {
         NATIVE_TARGET_SPECS
     }
@@ -175,6 +183,20 @@ impl NativeArchitecture {
     fn elf_machine(self) -> u16 {
         match self {
             NativeArchitecture::X86_64 => 62,
+        }
+    }
+}
+
+impl NativeBackend {
+    pub fn name(self) -> &'static str {
+        match self {
+            NativeBackend::DirectX86_64 => "direct-x86_64",
+        }
+    }
+
+    pub fn architecture(self) -> NativeArchitecture {
+        match self {
+            NativeBackend::DirectX86_64 => NativeArchitecture::X86_64,
         }
     }
 }
@@ -36333,6 +36355,8 @@ mod elf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{
         NativeAbi, NativeArchitecture, NativeBackend, NativeCompilerConfig, NativeEndianness,
         NativeExecutableFormat, NativeOperatingSystem, NativeTarget, PLATFORM_CONSTANTS_BY_TARGET,
@@ -36378,7 +36402,7 @@ mod tests {
         assert_eq!(NativeTarget::parse("native"), NativeTarget::host());
         assert_eq!(NativeTarget::parse("linux-aarch64"), None);
         assert_eq!(
-            NativeTarget::SUPPORTED_NAMES,
+            NativeTarget::supported_names(),
             &["linux-x86_64", "x86_64-unknown-linux-gnu", "native"]
         );
     }
@@ -36399,12 +36423,39 @@ mod tests {
         assert_eq!(linux.name(), "linux-x86_64");
         assert_eq!(linux.standard_triple(), "x86_64-unknown-linux-gnu");
         assert_eq!(linux.architecture(), NativeArchitecture::X86_64);
+        assert_eq!(linux.backend().name(), "direct-x86_64");
+        assert_eq!(linux.backend().architecture(), NativeArchitecture::X86_64);
         assert_eq!(linux.backend(), NativeBackend::DirectX86_64);
         assert_eq!(linux.pointer_width_bits(), 64);
         assert_eq!(linux.endianness(), NativeEndianness::Little);
         assert_eq!(linux.operating_system(), NativeOperatingSystem::Linux);
         assert_eq!(linux.abi(), NativeAbi::Gnu);
         assert_eq!(linux.executable_format(), NativeExecutableFormat::Elf64);
+    }
+
+    #[test]
+    fn native_target_registry_aliases_match_supported_names() {
+        let mut aliases = Vec::new();
+        let mut seen = HashSet::new();
+        for spec in NativeTarget::supported_specs() {
+            assert!(spec.aliases.contains(&spec.canonical_name));
+            assert!(spec.aliases.contains(&spec.standard_triple));
+            assert_eq!(spec.backend.architecture(), spec.architecture);
+            for alias in spec.aliases {
+                assert!(
+                    seen.insert(*alias),
+                    "duplicate native target alias: {alias}"
+                );
+                aliases.push(*alias);
+                assert_eq!(NativeTarget::parse(alias), Some(spec.target));
+            }
+        }
+        aliases.push("native");
+        assert_eq!(NativeTarget::supported_names(), aliases.as_slice());
+        assert_eq!(
+            NativeTarget::supported_names_csv(),
+            "linux-x86_64, x86_64-unknown-linux-gnu, native"
+        );
     }
 
     #[test]

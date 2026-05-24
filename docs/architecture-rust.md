@@ -65,6 +65,8 @@ cargo run -- -e "1 + 2"
 - Keeps supported targets in a metadata registry containing the compact name,
   standard triple, architecture, direct-codegen backend, data layout,
   operating system, ABI, and executable format
+- Exposes supported target names from the native target API so CLI help and
+  target parsing stay aligned with the registry
 - Keeps target-specific syscall numbers and OS constants such as fds, open
   modes, errno values, stat masks, clocks, mmap flags, and sendfile limits in a
   target-keyed platform constants registry

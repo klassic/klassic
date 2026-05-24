@@ -92,7 +92,7 @@ pub fn usage() -> String {
        <fileName>     : read a program from <fileName> and execute it\n\
        -e <expression>: evaluate <expression>\n\
        build <fileName> -o <output>: compile <fileName> to a native Linux x86_64 executable\n",
-        NativeTarget::SUPPORTED_NAMES.join(", ")
+        NativeTarget::supported_names_csv()
     )
 }
 
@@ -218,6 +218,6 @@ mod tests {
 
     #[test]
     fn usage_lists_supported_native_targets_from_registry() {
-        assert!(usage().contains(&NativeTarget::SUPPORTED_NAMES.join(", ")));
+        assert!(usage().contains(&NativeTarget::supported_names_csv()));
     }
 }
