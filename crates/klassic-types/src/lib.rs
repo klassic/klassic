@@ -2134,6 +2134,11 @@ impl TypeChecker {
             Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int)),
         );
         self.declare_poly(
+            "__gc_read_string".to_string(),
+            false,
+            Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int)),
+        );
+        self.declare_poly(
             "__gc_write".to_string(),
             false,
             Type::Function(vec![Type::Int, Type::Int, Type::Int], Box::new(Type::Unit)),

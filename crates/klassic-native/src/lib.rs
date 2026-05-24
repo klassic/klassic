@@ -3266,6 +3266,7 @@ impl NativeCodeGenerator {
             "__gc_unpin" => self.compile_gc_unpin(arguments, span),
             "__gc_read" => self.compile_gc_read(arguments, span),
             "__gc_read_ptr" => self.compile_gc_read_ptr(arguments, span),
+            "__gc_read_string" => self.compile_gc_read_string(arguments, span),
             "__gc_write" => self.compile_gc_write(arguments, span),
             "assert" => {
                 if arguments.len() != 1 {
@@ -4032,6 +4033,7 @@ impl NativeCodeGenerator {
             "__gc_unpin" => self.compile_gc_unpin(arguments, span).map(Some),
             "__gc_read" => self.compile_gc_read(arguments, span).map(Some),
             "__gc_read_ptr" => self.compile_gc_read_ptr(arguments, span).map(Some),
+            "__gc_read_string" => self.compile_gc_read_string(arguments, span).map(Some),
             "__gc_write" => self.compile_gc_write(arguments, span).map(Some),
             "head" => self.compile_static_head(arguments, span).map(Some),
             "FileOutput#write" => self
@@ -12357,6 +12359,16 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.compile_gc_read_qword(arguments, span, "__gc_read_ptr", NativeValue::HeapPointer)
+    }
+
+    /// `__gc_read_string(addr, byte_offset)` reads a pointer qword from
+    /// `addr + byte_offset`, preserving heap-string provenance in native codegen.
+    fn compile_gc_read_string(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.compile_gc_read_qword(arguments, span, "__gc_read_string", NativeValue::HeapString)
     }
 
     /// `__gc_write(addr, byte_offset, value)` writes `value` (qword) at
@@ -34629,6 +34641,7 @@ fn heap_string_returning_helper(name: &str) -> bool {
             | "__gc_int_to_string"
             | "__gc_list_int_to_string"
             | "__gc_list_ptr_join"
+            | "__gc_read_string"
     )
 }
 

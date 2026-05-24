@@ -215,7 +215,10 @@ integers. Raw `__gc_write` still accepts `Int`, `HeapPointer`, or `HeapString`
 values as qwords, while its address operand must come from a GC pointer source.
 Use `__gc_read_ptr(addr, offset)` rather than `__gc_read(addr, offset)` when a
 raw field is meant to flow back into address-taking GC helpers; `__gc_read`
-continues to model scalar qword reads as `Int`.
+continues to model scalar qword reads as `Int`. Use
+`__gc_read_string(addr, offset)` when the field is known to hold a heap string
+and should re-enter the `HeapString` surface for `println`, `+`, `toString`, and
+`assertResult`.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including

@@ -151,6 +151,7 @@ pub(crate) fn builtin_name(name: &str) -> Option<&'static str> {
         "__gc_unpin" => Some("__gc_unpin"),
         "__gc_read" => Some("__gc_read"),
         "__gc_read_ptr" => Some("__gc_read_ptr"),
+        "__gc_read_string" => Some("__gc_read_string"),
         "__gc_write" => Some("__gc_write"),
         _ => None,
     }
@@ -216,6 +217,7 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         "__gc_collect" | "__gc_segment_count" | "__gc_collect_count" | "__gc_smap_new" => Some(0),
         "__gc_read"
         | "__gc_read_ptr"
+        | "__gc_read_string"
         | "__gc_string_concat"
         | "__gc_string_repeat"
         | "__gc_string_index_of"

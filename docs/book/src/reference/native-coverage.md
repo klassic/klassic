@@ -34,6 +34,8 @@ diagnostic; there is no silent fallback to the evaluator.
   raw `__gc_write` may still store `Int`, `HeapPointer`, or `HeapString` qwords.
   `__gc_read_ptr` preserves pointer provenance for raw fields that flow back
   into address-taking helpers, while `__gc_read` remains the scalar qword read.
+  `__gc_read_string` preserves heap-string provenance for fields that should
+  re-enter ordinary heap-string printing, concatenation, and `toString`.
 - Linux file / directory / process / environment / stdin / argv
   builtins via direct syscalls.
 - Source-located stderr diagnostics for runtime failures (`assert`,

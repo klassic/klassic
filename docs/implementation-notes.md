@@ -475,6 +475,9 @@ Raw `__gc_read` remains an integer qword load; `__gc_read_ptr` emits the same
 load but returns `NativeValue::HeapPointer`, so pointer-record fields can flow
 back into strict address-taking GC helpers without reopening arbitrary plain
 `Int` addresses.
+`__gc_read_string` is the string-specific companion that returns
+`NativeValue::HeapString`, letting a raw field re-enter natural heap-string
+printing, `+`, `toString`, and `assertResult` paths.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,
