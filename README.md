@@ -81,8 +81,9 @@ proof graph that depends on a trusted theorem or axiom.
 
 ## Native Compiler Coverage
 
-The native compiler lowers a growing slice of the language directly to ELF
-for Linux x86_64. Highlights:
+The native compiler lowers a growing slice of the language directly to a
+selected native target. The only implemented target is currently Linux x86_64,
+which emits ELF64 without an external linker. Highlights:
 
 - Core integer / boolean / string / list expressions, control flow, and
   recursive `def`s (including annotated `String` and `List<String>` parameters).

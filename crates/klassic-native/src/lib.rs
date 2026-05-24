@@ -12,8 +12,39 @@ use klassic_types::typecheck_program;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativeCompilerConfig {
+    pub target: NativeTarget,
     pub deny_trust: bool,
     pub warn_trust: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeTarget {
+    LinuxX86_64,
+}
+
+impl Default for NativeTarget {
+    fn default() -> Self {
+        Self::LinuxX86_64
+    }
+}
+
+impl NativeTarget {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LinuxX86_64 => "linux-x86_64",
+        }
+    }
+
+    pub fn executable_format(self) -> NativeExecutableFormat {
+        match self {
+            Self::LinuxX86_64 => NativeExecutableFormat::Elf64,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeExecutableFormat {
+    Elf64,
 }
 
 /// Optional view that lets the compiler report user-facing line numbers
@@ -87,6 +118,19 @@ pub fn compile_source_to_elf(
     text: &str,
     config: NativeCompilerConfig,
 ) -> Result<Vec<u8>, NativeCompileError> {
+    let config = NativeCompilerConfig {
+        target: NativeTarget::LinuxX86_64,
+        ..config
+    };
+    compile_source_for_target(name, text, config)
+}
+
+#[allow(clippy::result_large_err)]
+pub fn compile_source_for_target(
+    name: &str,
+    text: &str,
+    config: NativeCompilerConfig,
+) -> Result<Vec<u8>, NativeCompileError> {
     let source = SourceFile::new(name, text);
     compile_internal(source, None, config)
 }
@@ -96,6 +140,22 @@ pub fn compile_source_to_elf(
 /// line numbers stay 1-based — the prelude is invisible to the user.
 #[allow(clippy::result_large_err)]
 pub fn compile_source_with_prelude_to_elf(
+    name: &str,
+    prelude_text: &str,
+    user_text: &str,
+    config: NativeCompilerConfig,
+) -> Result<Vec<u8>, NativeCompileError> {
+    let config = NativeCompilerConfig {
+        target: NativeTarget::LinuxX86_64,
+        ..config
+    };
+    compile_source_with_prelude_for_target(name, prelude_text, user_text, config)
+}
+
+/// Compile `user_text` as if `prelude_text` were prepended in front of it for
+/// the selected native target.
+#[allow(clippy::result_large_err)]
+pub fn compile_source_with_prelude_for_target(
     name: &str,
     prelude_text: &str,
     user_text: &str,
@@ -132,10 +192,17 @@ fn compile_internal(
     analyze_proofs(&expr, config).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
-    let object = NativeCodeGenerator::new(source.clone(), user_view.clone())
+    let target = config.target;
+    let object = NativeCodeGenerator::new(source.clone(), user_view.clone(), target)
         .compile(&expr)
         .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic))?;
-    Ok(elf::write_executable(object))
+    Ok(write_executable_for_target(target, object))
+}
+
+fn write_executable_for_target(target: NativeTarget, object: ObjectFile) -> Vec<u8> {
+    match target.executable_format() {
+        NativeExecutableFormat::Elf64 => elf::write_executable(object),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -728,9 +795,70 @@ struct RuntimeMapCallableDispatch {
     candidates: Vec<RuntimeMapCallableCandidate>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TargetPlatform {
+    target: NativeTarget,
+}
+
+impl TargetPlatform {
+    fn for_target(target: NativeTarget) -> Self {
+        Self { target }
+    }
+
+    fn syscall_number(self, syscall: PlatformSyscall) -> u64 {
+        match self.target {
+            NativeTarget::LinuxX86_64 => linux_x86_64_syscall_number(syscall),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlatformSyscall {
+    Read,
+    Write,
+    Open,
+    Close,
+    Mmap,
+    Access,
+    Nanosleep,
+    Sendfile,
+    Getcwd,
+    Rename,
+    Mkdir,
+    Rmdir,
+    Unlink,
+    Getdents64,
+    ClockGettime,
+    Newfstatat,
+    Exit,
+}
+
+fn linux_x86_64_syscall_number(syscall: PlatformSyscall) -> u64 {
+    match syscall {
+        PlatformSyscall::Read => 0,
+        PlatformSyscall::Write => 1,
+        PlatformSyscall::Open => 2,
+        PlatformSyscall::Close => 3,
+        PlatformSyscall::Mmap => 9,
+        PlatformSyscall::Access => 21,
+        PlatformSyscall::Nanosleep => 35,
+        PlatformSyscall::Sendfile => 40,
+        PlatformSyscall::Getcwd => 79,
+        PlatformSyscall::Rename => 82,
+        PlatformSyscall::Mkdir => 83,
+        PlatformSyscall::Rmdir => 84,
+        PlatformSyscall::Unlink => 87,
+        PlatformSyscall::Getdents64 => 217,
+        PlatformSyscall::ClockGettime => 228,
+        PlatformSyscall::Newfstatat => 262,
+        PlatformSyscall::Exit => 60,
+    }
+}
+
 struct NativeCodeGenerator {
     source: SourceFile,
     user_view: Option<UserSourceView>,
+    platform: TargetPlatform,
     /// Seed cell for `Random#seed` / `Random#nextInt`. Lives in the
     /// data segment as a single u64 initialised to zero — same
     /// observable starting state as the evaluator's `RANDOM_STATE`.
@@ -813,7 +941,7 @@ struct NativeCodeGenerator {
 }
 
 impl NativeCodeGenerator {
-    fn new(source: SourceFile, user_view: Option<UserSourceView>) -> Self {
+    fn new(source: SourceFile, user_view: Option<UserSourceView>, target: NativeTarget) -> Self {
         let mut asm = Assembler::new();
         let newline = asm.data_label_with_bytes(b"\n");
         let true_text = asm.data_label_with_bytes(b"true");
@@ -879,6 +1007,7 @@ impl NativeCodeGenerator {
         Self {
             source,
             user_view,
+            platform: TargetPlatform::for_target(target),
             random_state,
             asm,
             newline,
@@ -976,6 +1105,11 @@ impl NativeCodeGenerator {
         self.emit_gc_grow_heap_runtime();
         self.emit_gc_bounds_error_runtime();
         Ok(self.asm.finish())
+    }
+
+    fn emit_syscall_number(&mut self, syscall: PlatformSyscall) {
+        self.asm
+            .mov_imm64(Reg::Rax, self.platform.syscall_number(syscall));
     }
 
     fn emit_store_command_line_state(&mut self) {
@@ -7691,7 +7825,7 @@ impl NativeCodeGenerator {
             let seconds = millis / 1000;
             let nanos = (millis % 1000) * 1_000_000;
             let timespec = self.asm.data_label_with_i64s(&[seconds, nanos]);
-            self.asm.mov_imm64(Reg::Rax, 35);
+            self.emit_syscall_number(PlatformSyscall::Nanosleep);
             self.asm.mov_data_addr(Reg::Rdi, timespec);
             self.asm.mov_imm64(Reg::Rsi, 0);
             self.asm.syscall();
@@ -7719,7 +7853,7 @@ impl NativeCodeGenerator {
         self.asm.imul_reg_reg(Reg::Rcx, Reg::Rbx);
         self.asm.push_reg(Reg::Rcx);
         self.asm.push_reg(Reg::Rax);
-        self.asm.mov_imm64(Reg::Rax, 35);
+        self.emit_syscall_number(PlatformSyscall::Nanosleep);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rsp);
         self.asm.mov_imm64(Reg::Rsi, 0);
         self.asm.syscall();
@@ -8027,11 +8161,11 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
         self.asm.add_reg_imm32(Reg::Rsi, 8);
         self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rax, 0);
-        self.asm.mov_imm64(Reg::Rax, 1);
+        self.emit_syscall_number(PlatformSyscall::Write);
         self.asm.mov_imm64(Reg::Rdi, 1);
         self.asm.syscall();
         // newline
-        self.asm.mov_imm64(Reg::Rax, 1);
+        self.emit_syscall_number(PlatformSyscall::Write);
         self.asm.mov_imm64(Reg::Rdi, 1);
         self.asm.mov_data_addr(Reg::Rsi, self.newline);
         self.asm.mov_imm64(Reg::Rdx, 1);
@@ -12186,7 +12320,7 @@ impl NativeCodeGenerator {
     }
 
     fn emit_clock_gettime(&mut self, output: DataLabel) {
-        self.asm.mov_imm64(Reg::Rax, 228);
+        self.emit_syscall_number(PlatformSyscall::ClockGettime);
         self.asm.mov_imm64(Reg::Rdi, 1);
         self.asm.mov_data_addr(Reg::Rsi, output);
         self.asm.syscall();
@@ -12213,7 +12347,7 @@ impl NativeCodeGenerator {
             ));
         }
         let now = self.asm.data_label_with_i64s(&[0, 0]);
-        self.asm.mov_imm64(Reg::Rax, 228);
+        self.emit_syscall_number(PlatformSyscall::ClockGettime);
         self.asm.mov_imm64(Reg::Rdi, 0); // CLOCK_REALTIME
         self.asm.mov_data_addr(Reg::Rsi, now);
         self.asm.syscall();
@@ -17526,7 +17660,7 @@ impl NativeCodeGenerator {
         let overflow = self.asm.data_label_with_bytes(&[0]);
         let len = self.asm.data_label_with_i64s(&[0]);
 
-        self.asm.mov_imm64(Reg::Rax, 0);
+        self.emit_syscall_number(PlatformSyscall::Read);
         self.asm.mov_imm64(Reg::Rdi, 0);
         self.asm.mov_data_addr(Reg::Rsi, data);
         self.asm.mov_imm64(Reg::Rdx, RUNTIME_STRING_CAP as u64);
@@ -17538,7 +17672,7 @@ impl NativeCodeGenerator {
         self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
         let done = self.asm.create_text_label();
         self.asm.jcc_label(Condition::NotEqual, done);
-        self.asm.mov_imm64(Reg::Rax, 0);
+        self.emit_syscall_number(PlatformSyscall::Read);
         self.asm.mov_imm64(Reg::Rdi, 0);
         self.asm.mov_data_addr(Reg::Rsi, overflow);
         self.asm.mov_imm64(Reg::Rdx, 1);
@@ -18022,7 +18156,7 @@ impl NativeCodeGenerator {
                 self.emit_runtime_error(span, "Process#exit expects a non-negative integer index");
                 return Ok(NativeValue::Unit);
             }
-            self.asm.mov_imm64(Reg::Rax, 60);
+            self.emit_syscall_number(PlatformSyscall::Exit);
             self.asm.mov_imm64(Reg::Rdi, code as u64);
             self.asm.syscall();
             return Ok(NativeValue::Unit);
@@ -18038,7 +18172,7 @@ impl NativeCodeGenerator {
         self.emit_runtime_error(span, "Process#exit expects a non-negative integer index");
         self.asm.bind_text_label(ok);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rax, 60);
+        self.emit_syscall_number(PlatformSyscall::Exit);
         self.asm.syscall();
         Ok(NativeValue::Unit)
     }
@@ -18297,7 +18431,7 @@ impl NativeCodeGenerator {
     ) {
         let content_label = self.asm.data_label_with_bytes(bytes);
         let flags = if append { 1 | 64 | 1024 } else { 1 | 64 | 512 };
-        self.asm.mov_imm64(Reg::Rax, 2);
+        self.emit_syscall_number(PlatformSyscall::Open);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.mov_imm64(Reg::Rsi, flags);
         self.asm.mov_imm64(Reg::Rdx, 0o644);
@@ -18305,13 +18439,13 @@ impl NativeCodeGenerator {
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open file"));
         self.asm.push_reg(Reg::Rax);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rax, 1);
+        self.emit_syscall_number(PlatformSyscall::Write);
         self.asm.mov_data_addr(Reg::Rsi, content_label);
         self.asm.mov_imm64(Reg::Rdx, bytes.len() as u64);
         self.asm.syscall();
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to write file"));
         self.asm.pop_reg(Reg::Rdi);
-        self.asm.mov_imm64(Reg::Rax, 3);
+        self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.syscall();
     }
 
@@ -18336,7 +18470,7 @@ impl NativeCodeGenerator {
         name: &str,
     ) {
         let flags = if append { 1 | 64 | 1024 } else { 1 | 64 | 512 };
-        self.asm.mov_imm64(Reg::Rax, 2);
+        self.emit_syscall_number(PlatformSyscall::Open);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.mov_imm64(Reg::Rsi, flags);
         self.asm.mov_imm64(Reg::Rdx, 0o644);
@@ -18344,13 +18478,13 @@ impl NativeCodeGenerator {
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open file"));
         self.asm.push_reg(Reg::Rax);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rax, 1);
+        self.emit_syscall_number(PlatformSyscall::Write);
         self.asm.mov_data_addr(Reg::Rsi, content.data);
         self.emit_load_native_string_len(Reg::Rdx, content.len);
         self.asm.syscall();
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to write file"));
         self.asm.pop_reg(Reg::Rdi);
-        self.asm.mov_imm64(Reg::Rax, 3);
+        self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.syscall();
     }
 
@@ -18360,7 +18494,7 @@ impl NativeCodeGenerator {
     }
 
     fn emit_file_delete_label(&mut self, path_label: DataLabel, span: Span, name: &str) {
-        self.asm.mov_imm64(Reg::Rax, 87);
+        self.emit_syscall_number(PlatformSyscall::Unlink);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.syscall();
         self.emit_runtime_error_if_rax_negative_except_errno(
@@ -18376,7 +18510,7 @@ impl NativeCodeGenerator {
     }
 
     fn emit_runtime_path_exists_label(&mut self, path_label: DataLabel) {
-        self.asm.mov_imm64(Reg::Rax, 21);
+        self.emit_syscall_number(PlatformSyscall::Access);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.mov_imm64(Reg::Rsi, 0);
         self.asm.syscall();
@@ -18407,7 +18541,7 @@ impl NativeCodeGenerator {
         let not_found = self.asm.create_text_label();
         let done = self.asm.create_text_label();
 
-        self.asm.mov_imm64(Reg::Rax, 262);
+        self.emit_syscall_number(PlatformSyscall::Newfstatat);
         self.asm.mov_imm64(Reg::Rdi, (-100i64) as u64);
         self.asm.mov_data_addr(Reg::Rsi, path_label);
         self.asm.mov_data_addr(Reg::Rdx, stat_buffer);
@@ -18448,7 +18582,7 @@ impl NativeCodeGenerator {
         span: Span,
         name: &str,
     ) {
-        self.asm.mov_imm64(Reg::Rax, 2);
+        self.emit_syscall_number(PlatformSyscall::Open);
         self.asm.mov_data_addr(Reg::Rdi, source_label);
         self.asm.mov_imm64(Reg::Rsi, 0);
         self.asm.mov_imm64(Reg::Rdx, 0);
@@ -18459,7 +18593,7 @@ impl NativeCodeGenerator {
         );
         self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
 
-        self.asm.mov_imm64(Reg::Rax, 2);
+        self.emit_syscall_number(PlatformSyscall::Open);
         self.asm.mov_data_addr(Reg::Rdi, target_label);
         self.asm.mov_imm64(Reg::Rsi, 1 | 64 | 512);
         self.asm.mov_imm64(Reg::Rdx, 0o644);
@@ -18473,7 +18607,7 @@ impl NativeCodeGenerator {
         let copy_loop = self.asm.create_text_label();
         let done = self.asm.create_text_label();
         self.asm.bind_text_label(copy_loop);
-        self.asm.mov_imm64(Reg::Rax, 40);
+        self.emit_syscall_number(PlatformSyscall::Sendfile);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R8);
         self.asm.mov_reg_reg(Reg::Rsi, Reg::R9);
         self.asm.mov_imm64(Reg::Rdx, 0);
@@ -18485,10 +18619,10 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(copy_loop);
         self.asm.bind_text_label(done);
 
-        self.asm.mov_imm64(Reg::Rax, 3);
+        self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R8);
         self.asm.syscall();
-        self.asm.mov_imm64(Reg::Rax, 3);
+        self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
         self.asm.syscall();
     }
@@ -18506,7 +18640,7 @@ impl NativeCodeGenerator {
         name: &str,
     ) {
         let buffer = self.asm.data_label_with_bytes(&[0; 8192]);
-        self.asm.mov_imm64(Reg::Rax, 2);
+        self.emit_syscall_number(PlatformSyscall::Open);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.mov_imm64(Reg::Rsi, 0);
         self.asm.mov_imm64(Reg::Rdx, 0);
@@ -18517,7 +18651,7 @@ impl NativeCodeGenerator {
         let read_loop = self.asm.create_text_label();
         let done = self.asm.create_text_label();
         self.asm.bind_text_label(read_loop);
-        self.asm.mov_imm64(Reg::Rax, 0);
+        self.emit_syscall_number(PlatformSyscall::Read);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
         self.asm.mov_data_addr(Reg::Rsi, buffer);
         self.asm.mov_imm64(Reg::Rdx, 8192);
@@ -18526,7 +18660,7 @@ impl NativeCodeGenerator {
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Equal, done);
         self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rax, 1);
+        self.emit_syscall_number(PlatformSyscall::Write);
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_data_addr(Reg::Rsi, buffer);
         self.asm.mov_reg_reg(Reg::Rdx, Reg::R8);
@@ -18535,7 +18669,7 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(read_loop);
         self.asm.bind_text_label(done);
 
-        self.asm.mov_imm64(Reg::Rax, 3);
+        self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
         self.asm.syscall();
     }
@@ -18560,7 +18694,7 @@ impl NativeCodeGenerator {
         let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
         let overflow = self.asm.data_label_with_bytes(&[0]);
         let len = self.asm.data_label_with_i64s(&[0]);
-        self.asm.mov_imm64(Reg::Rax, 2);
+        self.emit_syscall_number(PlatformSyscall::Open);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.mov_imm64(Reg::Rsi, 0);
         self.asm.mov_imm64(Reg::Rdx, 0);
@@ -18568,7 +18702,7 @@ impl NativeCodeGenerator {
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open file"));
         self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
 
-        self.asm.mov_imm64(Reg::Rax, 0);
+        self.emit_syscall_number(PlatformSyscall::Read);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
         self.asm.mov_data_addr(Reg::Rsi, data);
         self.asm.mov_imm64(Reg::Rdx, RUNTIME_STRING_CAP as u64);
@@ -18580,7 +18714,7 @@ impl NativeCodeGenerator {
         self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
         let close_file = self.asm.create_text_label();
         self.asm.jcc_label(Condition::NotEqual, close_file);
-        self.asm.mov_imm64(Reg::Rax, 0);
+        self.emit_syscall_number(PlatformSyscall::Read);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
         self.asm.mov_data_addr(Reg::Rsi, overflow);
         self.asm.mov_imm64(Reg::Rdx, 1);
@@ -18591,7 +18725,7 @@ impl NativeCodeGenerator {
         self.emit_runtime_error(span, &format!("{name} runtime string exceeds 65536 bytes"));
 
         self.asm.bind_text_label(close_file);
-        self.asm.mov_imm64(Reg::Rax, 3);
+        self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
         self.asm.syscall();
         NativeValue::RuntimeString { data, len }
@@ -18613,7 +18747,7 @@ impl NativeCodeGenerator {
             .data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP + 1]);
         let len = self.asm.data_label_with_i64s(&[0]);
 
-        self.asm.mov_imm64(Reg::Rax, 79);
+        self.emit_syscall_number(PlatformSyscall::Getcwd);
         self.asm.mov_data_addr(Reg::Rdi, data);
         self.asm
             .mov_imm64(Reg::Rsi, (RUNTIME_STRING_CAP + 1) as u64);
@@ -19006,7 +19140,7 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::R8, 0);
         self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::R8);
 
-        self.asm.mov_imm64(Reg::Rax, 2);
+        self.emit_syscall_number(PlatformSyscall::Open);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.mov_imm64(Reg::Rsi, 0o200000);
         self.asm.mov_imm64(Reg::Rdx, 0);
@@ -19022,7 +19156,7 @@ impl NativeCodeGenerator {
         let done = self.asm.create_text_label();
 
         self.asm.bind_text_label(read_loop);
-        self.asm.mov_imm64(Reg::Rax, 217);
+        self.emit_syscall_number(PlatformSyscall::Getdents64);
         self.asm.mov_data_addr(Reg::R10, fd_slot);
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
         self.asm.mov_data_addr(Reg::Rsi, dir_buffer);
@@ -19101,7 +19235,7 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(entry_loop);
 
         self.asm.bind_text_label(done);
-        self.asm.mov_imm64(Reg::Rax, 3);
+        self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.mov_data_addr(Reg::R10, fd_slot);
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
         self.asm.syscall();
@@ -19423,7 +19557,7 @@ impl NativeCodeGenerator {
         span: Span,
         name: &str,
     ) {
-        self.asm.mov_imm64(Reg::Rax, 83);
+        self.emit_syscall_number(PlatformSyscall::Mkdir);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.mov_imm64(Reg::Rsi, 0o755);
         self.asm.syscall();
@@ -19476,7 +19610,7 @@ impl NativeCodeGenerator {
     }
 
     fn emit_dir_delete_label(&mut self, path_label: DataLabel, span: Span, name: &str) {
-        self.asm.mov_imm64(Reg::Rax, 84);
+        self.emit_syscall_number(PlatformSyscall::Rmdir);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.syscall();
         self.emit_runtime_error_if_rax_negative(
@@ -19498,7 +19632,7 @@ impl NativeCodeGenerator {
         span: Span,
         name: &str,
     ) {
-        self.asm.mov_imm64(Reg::Rax, 82);
+        self.emit_syscall_number(PlatformSyscall::Rename);
         self.asm.mov_data_addr(Reg::Rdi, source_label);
         self.asm.mov_data_addr(Reg::Rsi, target_label);
         self.asm.syscall();
@@ -27949,7 +28083,7 @@ impl NativeCodeGenerator {
                 self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
                 self.asm.add_reg_imm32(Reg::Rsi, 8);
                 self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rax, 0);
-                self.asm.mov_imm64(Reg::Rax, 1);
+                self.emit_syscall_number(PlatformSyscall::Write);
                 self.asm.mov_imm64(Reg::Rdi, fd);
                 self.asm.syscall();
             }
@@ -28254,7 +28388,7 @@ impl NativeCodeGenerator {
 
         self.asm.mov_reg_reg(Reg::Rdx, Reg::R8);
         self.asm.sub_reg_reg(Reg::Rdx, Reg::R9);
-        self.asm.mov_imm64(Reg::Rax, 1);
+        self.emit_syscall_number(PlatformSyscall::Write);
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_data_addr(Reg::Rsi, input.data);
         self.asm.add_reg_reg(Reg::Rsi, Reg::R9);
@@ -29571,7 +29705,7 @@ impl NativeCodeGenerator {
     }
 
     fn emit_write_data(&mut self, fd: u64, label: DataLabel, len: usize) {
-        self.asm.mov_imm64(Reg::Rax, 1);
+        self.emit_syscall_number(PlatformSyscall::Write);
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_data_addr(Reg::Rsi, label);
         self.asm.mov_imm64(Reg::Rdx, len as u64);
@@ -29579,7 +29713,7 @@ impl NativeCodeGenerator {
     }
 
     fn emit_write_data_dynamic_len(&mut self, fd: u64, data: DataLabel, len: DataLabel) {
-        self.asm.mov_imm64(Reg::Rax, 1);
+        self.emit_syscall_number(PlatformSyscall::Write);
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_data_addr(Reg::Rsi, data);
         self.asm.mov_data_addr(Reg::Rdx, len);
@@ -31523,7 +31657,7 @@ impl NativeCodeGenerator {
     }
 
     fn emit_exit_code(&mut self, code: u64) {
-        self.asm.mov_imm64(Reg::Rax, 60);
+        self.emit_syscall_number(PlatformSyscall::Exit);
         self.asm.mov_imm64(Reg::Rdi, code);
         self.asm.syscall();
     }
@@ -31751,7 +31885,7 @@ impl NativeCodeGenerator {
         self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'-');
         self.asm.inc_reg(Reg::Rcx);
         self.asm.bind_text_label(write);
-        self.asm.mov_imm64(Reg::Rax, 1);
+        self.emit_syscall_number(PlatformSyscall::Write);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R10);
         self.asm.mov_reg_reg(Reg::Rdx, Reg::Rcx);
         self.asm.syscall();
@@ -31799,7 +31933,7 @@ impl NativeCodeGenerator {
     fn emit_initialize_gc_heap(&mut self) {
         // mmap(NULL, GC_HEAP_SIZE, PROT_READ | PROT_WRITE,
         //      MAP_ANON | MAP_PRIVATE, -1, 0)
-        self.asm.mov_imm64(Reg::Rax, 9); // sys_mmap
+        self.emit_syscall_number(PlatformSyscall::Mmap);
         self.asm.mov_imm64(Reg::Rdi, 0); // addr = NULL
         self.asm.mov_imm64(Reg::Rsi, Self::GC_HEAP_SIZE);
         self.asm.mov_imm64(Reg::Rdx, 3); // PROT_READ|PROT_WRITE
@@ -32406,7 +32540,7 @@ impl NativeCodeGenerator {
 
         // mmap(NULL, alloc_size, PROT_READ|PROT_WRITE,
         //      MAP_ANON|MAP_PRIVATE, -1, 0).
-        self.asm.mov_imm64(Reg::Rax, 9);
+        self.emit_syscall_number(PlatformSyscall::Mmap);
         self.asm.mov_imm64(Reg::Rdi, 0);
         self.asm.load_rbp_slot(Reg::Rsi, 8);
         self.asm.mov_imm64(Reg::Rdx, 3);
@@ -34928,7 +35062,10 @@ mod elf {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeCompilerConfig, compile_source_to_elf};
+    use super::{
+        NativeCompilerConfig, NativeExecutableFormat, NativeTarget, compile_source_for_target,
+        compile_source_to_elf,
+    };
 
     #[test]
     fn emits_elf_header_for_println_int_program() {
@@ -34938,6 +35075,21 @@ mod tests {
         assert_eq!(&bytes[..4], b"\x7fELF");
         assert_eq!(bytes[4], 2);
         assert_eq!(bytes[5], 1);
+    }
+
+    #[test]
+    fn linux_x86_64_target_selects_elf_executable_output() {
+        let config = NativeCompilerConfig {
+            target: NativeTarget::LinuxX86_64,
+            ..NativeCompilerConfig::default()
+        };
+        assert_eq!(
+            config.target.executable_format(),
+            NativeExecutableFormat::Elf64
+        );
+        let bytes = compile_source_for_target("<test>", "println(1)", config)
+            .expect("program should compile for linux x86_64");
+        assert_eq!(&bytes[..4], b"\x7fELF");
     }
 
     #[test]

@@ -43,6 +43,7 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
             let config = NativeCompilerConfig {
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
+                ..NativeCompilerConfig::default()
             };
             let bytes = match compile_source_with_prelude_to_elf(
                 &input.display().to_string(),

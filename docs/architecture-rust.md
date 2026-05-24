@@ -60,6 +60,8 @@ cargo run -- -e "1 + 2"
 - Batch native compilation through `klassic build <file.kl> -o <output>`
 - Reuses the Rust parser, rewrite pass, typechecker, and proof/trust analysis
 - Emits Linux x86_64 machine code directly
+- Carries an explicit `NativeTarget`; the only implemented target is currently
+  `LinuxX86_64`
 - Writes ELF64 executables directly without invoking `cc`, `as`, `ld`, Java, Scala,
   or the JVM
 - Current native codegen covers the first vertical slice: integer and boolean

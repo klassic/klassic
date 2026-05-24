@@ -30,8 +30,11 @@ the module layout is described in `docs/architecture-rust.md`.
 
 ## Native Compiler Decisions
 
-- Native codegen emits Linux x86_64 ELF64 directly from Rust without invoking an
-  assembler, linker, JVM, Scala, or sbt.
+- Native codegen carries an explicit `NativeTarget`. `LinuxX86_64` is currently
+  the only implemented target and emits ELF64 directly from Rust without
+  invoking an assembler, linker, JVM, Scala, or sbt.
+- Linux x86_64 syscall numbers live behind the target platform boundary so new
+  platform work does not spread raw OS ABI constants through expression codegen.
 - Static strings, lists, maps, sets, records, lambdas, builtin function values,
   and virtual File/Dir state are tracked by the compiler so the current native
   subset can preserve observable side effects while still folding known values.

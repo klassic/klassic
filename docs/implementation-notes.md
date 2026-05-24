@@ -39,10 +39,11 @@ Klassic also has an initial native compiler path:
 cargo run -- build program.kl -o program
 ```
 
-That path emits Linux x86_64 ELF64 executables directly from Rust. It does not
-invoke an external assembler, linker, Java, Scala, sbt, or the JVM. The native
-compiler reuses the parser, rewrite pass, typechecker, and proof/trust checks,
-then emits handwritten x64 for the subset it currently supports. That subset now
+That path now carries an explicit native target. The only implemented target is
+Linux x86_64, which emits ELF64 executables directly from Rust without invoking
+an external assembler, linker, Java, Scala, sbt, or the JVM. The native compiler
+reuses the parser, rewrite pass, typechecker, and proof/trust checks, then emits
+handwritten x64 for the subset it currently supports. That subset now
 includes annotated boolean arguments and returns for native functions, simple
 unannotated integer/boolean return inference, immutable static string/list
 bindings, stack-passed arguments beyond the first six integer/boolean native
