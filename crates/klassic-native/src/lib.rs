@@ -10024,6 +10024,7 @@ impl NativeCodeGenerator {
         // payload_size = 8 + len * 8
         self.asm.load_rbp_slot(Reg::R10, lst_slot.offset);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.emit_gc_list_transform_size_check(span, "__gc_list_int_reverse", Reg::Rax);
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.add_reg_imm32(Reg::Rax, 8);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -10521,6 +10522,7 @@ impl NativeCodeGenerator {
         // Empty list → bounds error.
         self.asm.load_rbp_slot(Reg::R10, lst_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_transform_size_check(span, "__gc_list_int_pop", Reg::R11);
         self.asm.test_reg_reg(Reg::R11, Reg::R11);
         self.asm.jcc_label(Condition::Equal, self.gc_bounds_error);
 
@@ -10753,6 +10755,7 @@ impl NativeCodeGenerator {
 
         self.asm.load_rbp_slot(Reg::R10, lst_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_transform_size_check(span, "__gc_list_ptr_pop", Reg::R11);
         self.asm.test_reg_reg(Reg::R11, Reg::R11);
         self.asm.jcc_label(Condition::Equal, self.gc_bounds_error);
 
@@ -10894,6 +10897,7 @@ impl NativeCodeGenerator {
 
         self.asm.load_rbp_slot(Reg::R10, lst_slot.offset);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.emit_gc_list_transform_size_check(span, "__gc_list_ptr_reverse", Reg::Rax);
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.add_reg_imm32(Reg::Rax, 8);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -32406,6 +32410,20 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::Above, overflow);
         self.asm.sub_reg_reg(Reg::Rcx, b_len);
         self.asm.cmp_reg_reg(a_len, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.jmp_label(ok);
+        self.asm.bind_text_label(overflow);
+        self.emit_runtime_error(span, &format!("{name} allocation size overflow"));
+        self.asm.bind_text_label(ok);
+    }
+
+    fn emit_gc_list_transform_size_check(&mut self, span: Span, name: &str, len: Reg) {
+        let ok = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(len, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.mov_imm64(Reg::Rcx, Self::GC_MAX_LIST_LENGTH);
+        self.asm.cmp_reg_reg(len, Reg::Rcx);
         self.asm.jcc_label(Condition::Above, overflow);
         self.asm.jmp_label(ok);
         self.asm.bind_text_label(overflow);

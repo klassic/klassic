@@ -670,6 +670,9 @@ cargo run -- -e "1 + 2"
   the allocation size); `__gc_list_ptr_concat(a, b)` (returns a
   fresh tag-4 pointer list after checking that the two stored
   lengths can be safely summed for the destination allocation);
+  `__gc_list_ptr_pop(lst)` / `__gc_list_ptr_reverse(lst)` (return
+  fresh tag-4 pointer lists after checking that the stored length
+  can be represented as the destination allocation size);
   `__gc_list_int(n)` (a heap-backed integer list of length `n`,
   zero-initialized via a runtime fill loop so a free-list reuse
   cannot surface stale bytes); `__gc_list_int_len(lst)` (stored
@@ -684,9 +687,11 @@ cargo run -- -e "1 + 2"
   computed);
   `__gc_list_int_pop(lst)` (returns a fresh list with the
   trailing element removed; popping an empty list jumps to
-  `gc_bounds_error`);
+  `gc_bounds_error`, and corrupted lengths are rejected before
+  deriving the smaller allocation size);
   `__gc_list_int_reverse(lst)` (returns a fresh list with the
-  same payload in reverse order);
+  same payload in reverse order after checking the stored length
+  can be represented as a destination allocation);
   `__gc_list_concat(a, b)` (returns a fresh int list whose
   payload is `a` followed by `b`, both copied via two rep movsb
   passes after checking that the two stored lengths can be safely
