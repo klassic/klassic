@@ -81,11 +81,11 @@ binary.
 | `__gc_list_int_pop(lst)` | list | Functional drop-last; empty or size overflow aborts. |
 | `__gc_list_int_reverse(lst)` | list | Fresh reversed list; size overflow aborts. |
 | `__gc_list_concat(a, b)` | list | Concatenate two int lists; size overflow aborts. |
-| `__gc_list_int_sum(lst)` | Int | Sum (0 for empty). |
-| `__gc_list_int_min(lst)` | Int | Empty aborts. |
-| `__gc_list_int_max(lst)` | Int | Empty aborts. |
-| `__gc_list_int_println(lst)` | Unit | `[a, b, c]\n`. |
-| `__gc_list_int_to_string(lst, sep)` | HeapString | Render with separator. |
+| `__gc_list_int_sum(lst)` | Int | Sum (0 for empty); invalid stored length aborts. |
+| `__gc_list_int_min(lst)` | Int | Empty or invalid stored length aborts. |
+| `__gc_list_int_max(lst)` | Int | Empty or invalid stored length aborts. |
+| `__gc_list_int_println(lst)` | Unit | `[a, b, c]\n`; invalid stored length aborts. |
+| `__gc_list_int_to_string(lst, sep)` | HeapString | Render with separator; invalid stored length aborts. |
 
 ## Heap-backed pointer lists
 
@@ -100,7 +100,7 @@ binary.
 | `__gc_list_ptr_pop(lst)` | list | Functional drop-last; empty or size overflow aborts. |
 | `__gc_list_ptr_reverse(lst)` | list | Fresh reversed list; size overflow aborts. |
 | `__gc_list_ptr_concat(a, b)` | list | Concatenate two pointer lists; size overflow aborts. |
-| `__gc_list_ptr_join(parts, sep)` | HeapString | Join heap-string elements. |
+| `__gc_list_ptr_join(parts, sep)` | HeapString | Join heap-string elements; invalid stored length aborts. |
 
 ## String-keyed maps
 
@@ -137,4 +137,5 @@ exits with status 1:
 | Shadow stack exceeded 8192 entries | `klassic gc: shadow stack overflow` |
 | Negative size/count for allocation constructors | `<builtin> expects a non-negative integer index` |
 | Size/count would overflow allocation math | `<builtin> allocation size overflow` |
+| Stored list length is negative or too large | `<builtin> list length overflow` |
 | Out-of-bounds index in any length-aware op | `klassic gc: index out of bounds` |

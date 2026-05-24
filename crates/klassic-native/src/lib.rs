@@ -8965,6 +8965,10 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.store_rbp_slot(idx_slot.offset, Reg::Rax);
 
+        self.asm.load_rbp_slot(Reg::R10, list_slot.offset);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_println", Reg::R11);
+
         self.emit_write_data(self.platform.stdout_fd(), self.list_open, 1);
 
         let loop_start = self.asm.create_text_label();
@@ -10987,6 +10991,7 @@ impl NativeCodeGenerator {
         }
         self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_sum", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.mov_imm64(Reg::Rcx, 0);
@@ -11033,6 +11038,7 @@ impl NativeCodeGenerator {
         }
         self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_iteration_length_check(span, label, Reg::R11);
         self.asm.test_reg_reg(Reg::R11, Reg::R11);
         self.asm.jcc_label(Condition::Equal, self.gc_bounds_error);
         self.asm.add_reg_imm32(Reg::R10, 8);
@@ -11326,6 +11332,7 @@ impl NativeCodeGenerator {
         // Pass 1: total = sum(part_len) + (n - 1) * sep_len if n > 0.
         self.asm.load_rbp_slot(Reg::R10, parts_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_iteration_length_check(span, "__gc_list_ptr_join", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.load_rbp_slot(Reg::R8, sep_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R8, 0);
@@ -11927,6 +11934,7 @@ impl NativeCodeGenerator {
         // Pass 1: total = sum(digit_count(lst[i])) + (n - 1) * sep_len.
         self.asm.load_rbp_slot(Reg::R10, lst_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_to_string", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.load_rbp_slot(Reg::R8, sep_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R8, 0);
@@ -32428,6 +32436,20 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(ok);
         self.asm.bind_text_label(overflow);
         self.emit_runtime_error(span, &format!("{name} allocation size overflow"));
+        self.asm.bind_text_label(ok);
+    }
+
+    fn emit_gc_list_iteration_length_check(&mut self, span: Span, name: &str, len: Reg) {
+        let ok = self.asm.create_text_label();
+        let overflow = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(len, 0);
+        self.asm.jcc_label(Condition::Less, overflow);
+        self.asm.mov_imm64(Reg::Rcx, Self::GC_MAX_LIST_LENGTH);
+        self.asm.cmp_reg_reg(len, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, overflow);
+        self.asm.jmp_label(ok);
+        self.asm.bind_text_label(overflow);
+        self.emit_runtime_error(span, &format!("{name} list length overflow"));
         self.asm.bind_text_label(ok);
     }
 

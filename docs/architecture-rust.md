@@ -673,6 +673,8 @@ cargo run -- -e "1 + 2"
   `__gc_list_ptr_pop(lst)` / `__gc_list_ptr_reverse(lst)` (return
   fresh tag-4 pointer lists after checking that the stored length
   can be represented as the destination allocation size);
+  `__gc_list_ptr_join(parts, sep)` validates the stored list
+  length before using it to drive the two-pass join loop;
   `__gc_list_int(n)` (a heap-backed integer list of length `n`,
   zero-initialized via a runtime fill loop so a free-list reuse
   cannot surface stale bytes); `__gc_list_int_len(lst)` (stored
@@ -698,7 +700,10 @@ cargo run -- -e "1 + 2"
   summed for the destination allocation);
   `__gc_list_int_println(lst)` (prints `[a, b, c]\n`
   by driving `print_i64` per element through two anonymous stack
-  slots that are released on exit); `__gc_collect()`;
+  slots that are released on exit after validating the stored
+  list length); `__gc_list_int_sum` / `__gc_list_int_min` /
+  `__gc_list_int_max` / `__gc_list_int_to_string` similarly
+  validate the stored list length before iterating; `__gc_collect()`;
   `__gc_pin(addr)` / `__gc_unpin(addr)` for explicit static-table
   registration alongside the automatic shadow-stack tracking; and
   `__gc_read(addr, offset)` / `__gc_read_ptr(addr, offset)` /
