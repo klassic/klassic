@@ -67,6 +67,8 @@ cargo run -- -e "1 + 2"
   operating system, ABI, and executable format
 - Exposes supported target names from the native target API so CLI help and
   target parsing stay aligned with the registry
+- Resolves a per-compile native target context that pairs the selected target
+  spec with its platform constants before entering codegen
 - Keeps target-specific syscall numbers and OS constants such as fds, open
   modes, errno values, stat masks, clocks, mmap flags, and sendfile limits in a
   target-keyed platform constants registry

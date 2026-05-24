@@ -354,20 +354,20 @@ fn compile_internal(
     analyze_proofs(&expr, config).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
-    let target = config.target;
-    let object = match target.backend() {
+    let target = NativeTargetContext::for_target(config.target);
+    let object = match target.spec.backend {
         NativeBackend::DirectX86_64 => {
-            NativeCodeGenerator::new(source.clone(), user_view.clone(), target).compile(&expr)
+            NativeCodeGenerator::new(source.clone(), user_view.clone(), target.platform)
+                .compile(&expr)
         }
     }
     .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic))?;
     Ok(write_executable_for_target(target, object))
 }
 
-fn write_executable_for_target(target: NativeTarget, object: ObjectFile) -> Vec<u8> {
-    let spec = target.spec();
-    match spec.executable_format {
-        NativeExecutableFormat::Elf64 => elf::write_executable(object, spec),
+fn write_executable_for_target(target: NativeTargetContext, object: ObjectFile) -> Vec<u8> {
+    match target.spec.executable_format {
+        NativeExecutableFormat::Elf64 => elf::write_executable(object, target.spec),
     }
 }
 
@@ -1146,6 +1146,21 @@ impl TargetPlatform {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeTargetContext {
+    spec: &'static NativeTargetSpec,
+    platform: TargetPlatform,
+}
+
+impl NativeTargetContext {
+    fn for_target(target: NativeTarget) -> Self {
+        Self {
+            spec: target.spec(),
+            platform: TargetPlatform::for_target(target),
+        }
+    }
+}
+
 const PLATFORM_SYSCALL_COUNT: usize = 17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1256,7 +1271,11 @@ struct NativeCodeGenerator {
 }
 
 impl NativeCodeGenerator {
-    fn new(source: SourceFile, user_view: Option<UserSourceView>, target: NativeTarget) -> Self {
+    fn new(
+        source: SourceFile,
+        user_view: Option<UserSourceView>,
+        platform: TargetPlatform,
+    ) -> Self {
         let mut asm = Assembler::new();
         let newline = asm.data_label_with_bytes(b"\n");
         let true_text = asm.data_label_with_bytes(b"true");
@@ -1322,7 +1341,7 @@ impl NativeCodeGenerator {
         Self {
             source,
             user_view,
-            platform: TargetPlatform::for_target(target),
+            platform,
             random_state,
             asm,
             newline,
@@ -36362,8 +36381,9 @@ mod tests {
 
     use super::{
         NativeAbi, NativeArchitecture, NativeBackend, NativeCompilerConfig, NativeEndianness,
-        NativeExecutableFormat, NativeOperatingSystem, NativeTarget, PLATFORM_CONSTANTS_BY_TARGET,
-        PlatformSyscall, TargetPlatform, compile_source_for_target, compile_source_to_elf,
+        NativeExecutableFormat, NativeOperatingSystem, NativeTarget, NativeTargetContext,
+        PLATFORM_CONSTANTS_BY_TARGET, PlatformSyscall, TargetPlatform, compile_source_for_target,
+        compile_source_to_elf,
     };
 
     #[test]
@@ -36434,6 +36454,14 @@ mod tests {
         assert_eq!(linux.operating_system(), NativeOperatingSystem::Linux);
         assert_eq!(linux.abi(), NativeAbi::Gnu);
         assert_eq!(linux.executable_format(), NativeExecutableFormat::Elf64);
+    }
+
+    #[test]
+    fn native_target_context_pairs_spec_and_platform_constants() {
+        let context = NativeTargetContext::for_target(NativeTarget::LinuxX86_64);
+        assert_eq!(context.spec.target, NativeTarget::LinuxX86_64);
+        assert_eq!(context.spec.backend, NativeBackend::DirectX86_64);
+        assert_eq!(context.platform.target, NativeTarget::LinuxX86_64);
     }
 
     #[test]

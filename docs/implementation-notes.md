@@ -52,8 +52,10 @@ architecture, backend, data layout, operating system, ABI, and executable
 format. The current target selects the direct x86_64 backend and little-endian
 64-bit layout, and the ELF writer emits header architecture/endianness fields
 from that metadata. Supported target names shown by the CLI are exposed by the
-same target API and covered by registry invariant tests. Linux syscall numbers
-and OS ABI constants stay behind a
+same target API and covered by registry invariant tests. The compiler resolves a
+`NativeTargetContext` once per compile so backend selection and platform
+constants come from the same target metadata. Linux syscall numbers and OS ABI
+constants stay behind a
 target-platform boundary. Those target-specific numbers live in a target-keyed
 registry, so future target work can change syscall ids, fds, open modes, errno
 values, stat masks, clocks, mmap flags, and transfer limits without editing
