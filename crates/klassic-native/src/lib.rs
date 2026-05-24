@@ -3259,6 +3259,7 @@ impl NativeCodeGenerator {
             "__gc_smap_size" => self.compile_gc_smap_size(arguments, span),
             "__gc_smap_has" => self.compile_gc_smap_has(arguments, span),
             "__gc_smap_get" => self.compile_gc_smap_get(arguments, span),
+            "__gc_smap_get_string" => self.compile_gc_smap_get_string(arguments, span),
             "__gc_smap_set" => self.compile_gc_smap_set(arguments, span),
             "__gc_smap_keys" => self.compile_gc_smap_keys(arguments, span),
             "__gc_smap_values" => self.compile_gc_smap_values(arguments, span),
@@ -4029,6 +4030,7 @@ impl NativeCodeGenerator {
             "__gc_smap_size" => self.compile_gc_smap_size(arguments, span).map(Some),
             "__gc_smap_has" => self.compile_gc_smap_has(arguments, span).map(Some),
             "__gc_smap_get" => self.compile_gc_smap_get(arguments, span).map(Some),
+            "__gc_smap_get_string" => self.compile_gc_smap_get_string(arguments, span).map(Some),
             "__gc_smap_set" => self.compile_gc_smap_set(arguments, span).map(Some),
             "__gc_smap_keys" => self.compile_gc_smap_keys(arguments, span).map(Some),
             "__gc_smap_values" => self.compile_gc_smap_values(arguments, span).map(Some),
@@ -11935,27 +11937,24 @@ impl NativeCodeGenerator {
         Ok(NativeValue::Bool)
     }
 
-    /// `__gc_smap_get(m, key)` returns the associated value, or 0 (null)
-    /// when the key is absent.
-    fn compile_gc_smap_get(
+    fn compile_gc_smap_get_value(
         &mut self,
         arguments: &[Expr],
         span: Span,
+        name: &str,
+        result: NativeValue,
     ) -> Result<NativeValue, Diagnostic> {
         if arguments.len() != 2 {
             return Err(Diagnostic::compile(
                 span,
-                format!(
-                    "__gc_smap_get expects 2 arguments but got {}",
-                    arguments.len()
-                ),
+                format!("{name} expects 2 arguments but got {}", arguments.len()),
             ));
         }
         let m = self.compile_expr(&arguments[0])?;
         if !matches!(m, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
-                "native __gc_smap_get for non-address map",
+                &format!("native {name} for non-address map"),
             ));
         }
         let m_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
@@ -11964,7 +11963,7 @@ impl NativeCodeGenerator {
         if !matches!(key, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
-                "native __gc_smap_get for non-address key",
+                &format!("native {name} for non-address key"),
             ));
         }
         let key_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
@@ -11988,7 +11987,32 @@ impl NativeCodeGenerator {
         self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
         self.asm.bind_text_label(done);
-        Ok(NativeValue::HeapPointer)
+        Ok(result)
+    }
+
+    /// `__gc_smap_get(m, key)` returns the associated value, or 0 (null)
+    /// when the key is absent.
+    fn compile_gc_smap_get(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.compile_gc_smap_get_value(arguments, span, "__gc_smap_get", NativeValue::HeapPointer)
+    }
+
+    /// `__gc_smap_get_string(m, key)` returns the associated value as a
+    /// `HeapString` when the caller knows the value slot stores a heap string.
+    fn compile_gc_smap_get_string(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.compile_gc_smap_get_value(
+            arguments,
+            span,
+            "__gc_smap_get_string",
+            NativeValue::HeapString,
+        )
     }
 
     /// `__gc_smap_set(m, key, value)` returns a fresh map with the
@@ -34674,6 +34698,7 @@ fn heap_string_returning_helper(name: &str) -> bool {
             | "__gc_list_ptr_join"
             | "__gc_read_string"
             | "__gc_list_ptr_get_string"
+            | "__gc_smap_get_string"
     )
 }
 

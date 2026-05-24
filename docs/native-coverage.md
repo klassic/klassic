@@ -220,7 +220,9 @@ continues to model scalar qword reads as `Int`. Use
 and should re-enter the `HeapString` surface for `println`, `+`, `toString`, and
 `assertResult`. Pointer lists have the same split surface: `__gc_list_ptr_get`
 preserves generic pointer provenance, while `__gc_list_ptr_get_string` returns a
-known heap-string slot as `HeapString`.
+known heap-string slot as `HeapString`. String-keyed maps mirror that convention
+with `__gc_smap_get` for generic pointer values and `__gc_smap_get_string` for
+present values known to be heap strings.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including

@@ -144,6 +144,7 @@ pub(crate) fn builtin_name(name: &str) -> Option<&'static str> {
         "__gc_smap_size" => Some("__gc_smap_size"),
         "__gc_smap_has" => Some("__gc_smap_has"),
         "__gc_smap_get" => Some("__gc_smap_get"),
+        "__gc_smap_get_string" => Some("__gc_smap_get_string"),
         "__gc_smap_set" => Some("__gc_smap_set"),
         "__gc_smap_keys" => Some("__gc_smap_keys"),
         "__gc_smap_values" => Some("__gc_smap_values"),
@@ -237,6 +238,7 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         | "__gc_list_ptr_join"
         | "__gc_smap_has"
         | "__gc_smap_get"
+        | "__gc_smap_get_string"
         | "__gc_string_get_byte"
         | "__gc_string_eq" => Some(2),
         "__gc_write"

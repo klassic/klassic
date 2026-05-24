@@ -681,7 +681,9 @@ cargo run -- -e "1 + 2"
   qword access, including scalar reads, pointer- or heap-string-provenance
   reads, and `Int`, `HeapPointer`, or `HeapString` stores (which doubles as
   record-field and array-slot access since both share the same packed-pointer
-  layout). Marking uses an iterative
+  layout). String-keyed maps use `__gc_smap_get` for generic pointer values and
+  `__gc_smap_get_string` when a present value is known to hold a heap string.
+  Marking uses an iterative
   worklist keyed off the type-tag header field: the
   `gc_mark_visit` subroutine sets the mark bit and pushes the
   block onto a 4096-entry trace stack; the trace loop pops each

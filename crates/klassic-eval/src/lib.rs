@@ -2238,6 +2238,10 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             ensure_arity(name, arguments, 2, span)?;
             Ok(Value::Int(0))
         }
+        "__gc_smap_get_string" => {
+            ensure_arity(name, arguments, 2, span)?;
+            Ok(Value::Int(0))
+        }
         "__gc_smap_set" => {
             ensure_arity(name, arguments, 3, span)?;
             Ok(Value::Int(1))

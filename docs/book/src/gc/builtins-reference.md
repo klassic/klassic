@@ -107,6 +107,7 @@ binary.
 | `__gc_smap_size(m)` | Int | Pair count. |
 | `__gc_smap_has(m, key)` | Bool | Membership. |
 | `__gc_smap_get(m, key)` | HeapPointer | Value, or 0 (null) when absent. |
+| `__gc_smap_get_string(m, key)` | HeapString | Value when it is known to be a heap string. |
 | `__gc_smap_set(m, key, value)` | map | Fresh map (replace or append). |
 | `__gc_smap_keys(m)` | list_ptr | Every key. |
 | `__gc_smap_values(m)` | list_ptr | Every value. |

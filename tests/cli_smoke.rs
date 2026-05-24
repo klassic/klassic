@@ -4838,6 +4838,64 @@ println(__gc_smap_get(m, __gc_string("missing")))
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn builds_native_executable_for_gc_smap_get_string_preserves_heap_string_value() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic-native-gc-smap-get-string-{unique}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic-native-gc-smap-get-string-{unique}"));
+    fs::write(
+        &source_path,
+        r#"mutable m = __gc_smap_new()
+m = __gc_smap_set(m, __gc_string("lang"), __gc_string("klassic"))
+m = __gc_smap_set(m, __gc_string("mode"), __gc_string("native"))
+foreach(i in [1, 2, 3, 4, 5, 6, 7, 8]) {
+  __gc_alloc(150000)
+}
+__gc_collect()
+val lang = __gc_smap_get_string(m, __gc_string("lang"))
+val mode = __gc_smap_get_string(m, __gc_string("mode"))
+println(lang)
+println(mode + __gc_string("!"))
+assertResult("klassic")(toString(lang))
+assertResult("native!")(toString(mode + __gc_string("!")))
+"#,
+    )
+    .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "gc smap_get_string build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "klassic\nnative!\n");
+    assert!(run.stderr.is_empty());
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_string_replace_basic() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7294,6 +7352,48 @@ fn native_build_rejects_plain_ints_for_gc_list_ptr_get_string() {
     assert!(
         String::from_utf8_lossy(&build.stderr)
             .contains("native __gc_list_ptr_get_string for non-address list argument"),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_rejects_plain_ints_for_gc_smap_get_string() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!(
+        "klassic-native-gc-plain-int-smap-get-string-{unique}.kl"
+    ));
+    let output_path = std::env::temp_dir().join(format!(
+        "klassic-native-gc-plain-int-smap-get-string-{unique}"
+    ));
+    fs::write(
+        &source_path,
+        "println(__gc_smap_get_string(42, __gc_string(\"x\")))\n",
+    )
+    .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(!build.status.success());
+    assert!(build.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&build.stderr)
+            .contains("native __gc_smap_get_string for non-address map"),
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );

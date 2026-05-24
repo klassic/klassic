@@ -36,7 +36,8 @@ diagnostic; there is no silent fallback to the evaluator.
   into address-taking helpers, while `__gc_read` remains the scalar qword read.
   `__gc_read_string` preserves heap-string provenance for fields that should
   re-enter ordinary heap-string printing, concatenation, and `toString`; pointer
-  lists expose the same string-specific path through `__gc_list_ptr_get_string`.
+  lists and string-keyed maps expose the same string-specific path through
+  `__gc_list_ptr_get_string` and `__gc_smap_get_string`.
 - Linux file / directory / process / environment / stdin / argv
   builtins via direct syscalls.
 - Source-located stderr diagnostics for runtime failures (`assert`,

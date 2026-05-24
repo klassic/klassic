@@ -480,6 +480,8 @@ back into strict address-taking GC helpers without reopening arbitrary plain
 printing, `+`, `toString`, and `assertResult` paths.
 `__gc_list_ptr_get_string` provides the same string-specific projection for
 tag-4 pointer lists whose slots are known to contain heap strings.
+`__gc_smap_get_string` applies that convention to string-keyed maps, preserving
+`NativeValue::HeapString` for present values whose payloads are heap strings.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

@@ -16,10 +16,10 @@ directory = __gc_smap_set(directory, __gc_string("carol"), __gc_string("manager"
 
 println(__gc_smap_size(directory))                       // 3
 println(__gc_smap_has(directory, __gc_string("alice")))  // true
-println(__gc_smap_get(directory, __gc_string("alice")))  // "CEO"
+println(__gc_smap_get_string(directory, __gc_string("alice")))  // "CEO"
 
 directory = __gc_smap_set(directory, __gc_string("alice"), __gc_string("Founder"))
-println(__gc_smap_get(directory, __gc_string("alice")))  // "Founder"
+println(__gc_smap_get_string(directory, __gc_string("alice")))  // "Founder"
 println(__gc_smap_size(directory))                       // 3 — replaced, not added
 
 println(__gc_smap_get(directory, __gc_string("missing")))  // 0 (null)
@@ -33,6 +33,7 @@ println(__gc_smap_get(directory, __gc_string("missing")))  // 0 (null)
 | `__gc_smap_size(m)` | Int | Number of pairs. |
 | `__gc_smap_has(m, key)` | Bool | True iff `key` is present. |
 | `__gc_smap_get(m, key)` | value or `0` | Stored value, or null when absent. |
+| `__gc_smap_get_string(m, key)` | HeapString | Stored value when it is known to be a heap string. |
 | `__gc_smap_set(m, key, value)` | map | Fresh map with the pair installed. |
 | `__gc_smap_keys(m)` | list_ptr of strings | Every key in insertion order. |
 | `__gc_smap_values(m)` | list_ptr | Every value in insertion order. |
@@ -66,12 +67,9 @@ all the regular list helpers apply:
 ```kl
 val keys = __gc_smap_keys(directory)
 foreach (i in [0, 1, 2]) {
-  val k = __gc_list_ptr_get(keys, i)
-  val v = __gc_smap_get(directory, k)
-  println(__gc_string_concat(
-    __gc_string_concat(k, __gc_string(": ")),
-    v
-  ))
+  val k = __gc_list_ptr_get_string(keys, i)
+  val v = __gc_smap_get_string(directory, k)
+  println(k + __gc_string(": ") + v)
 }
 ```
 
