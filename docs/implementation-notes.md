@@ -448,6 +448,9 @@ shadow-stack-rooted concatenation path as `__gc_string_concat`.
 Native `==` / `!=`, `assertResult`, and `__gc_string_eq` over heap strings
 root the left operand while the right-hand side is evaluated, then compare
 length-prefixed byte payloads through the same scan path.
+`toString(heapString)` copies heap bytes back into a fixed-buffer
+`RuntimeString`, letting ordinary `String` helpers consume explicitly
+heap-backed data.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

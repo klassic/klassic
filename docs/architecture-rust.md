@@ -606,6 +606,8 @@ cargo run -- -e "1 + 2"
   over `HeapString` operands lowers through the same heap concatenation path,
   and native `==` / `!=` plus `assertResult` root the left operand across
   right-hand evaluation before reusing the byte-content equality scan;
+  `toString(heapString)` copies heap bytes back into a fixed-buffer runtime
+  `String` for ordinary string helpers;
   `__gc_string_len(s)` (returns the byte length stored at offset 0);
   `__gc_string_alloc(n)` (reserves an `n`-byte zero-filled string for
   byte-by-byte construction); `__gc_string_get_byte(s, idx)` /

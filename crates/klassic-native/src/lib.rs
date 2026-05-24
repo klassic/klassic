@@ -18166,6 +18166,12 @@ impl NativeCodeGenerator {
                 "toString result exceeds 65536 bytes",
             ));
         }
+        if value == NativeValue::HeapString {
+            return Ok(self.emit_heap_string_to_runtime_string_value(
+                span,
+                "toString result exceeds 65536 bytes",
+            ));
+        }
         if let Some(value) = self.static_value_from_native(value) {
             if self.static_value_has_conditional_builtin_display(&value) {
                 return Ok(self.emit_static_value_display_runtime_string(&value, span));
@@ -31517,6 +31523,35 @@ impl NativeCodeGenerator {
             overflow_message,
         );
         self.emit_store_runtime_string_len_from_offset(len, offset);
+    }
+
+    fn emit_heap_string_to_runtime_string_value(
+        &mut self,
+        span: Span,
+        overflow_message: &str,
+    ) -> NativeValue {
+        let (data, len) = self.runtime_record_branch_string_buffer();
+        self.asm.mov_data_addr(Reg::Rbx, data);
+        self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
+        self.asm.add_reg_imm32(Reg::Rsi, 8);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rax, 0);
+        self.asm.mov_imm64(Reg::R8, 0);
+        self.asm.mov_imm64(Reg::R9, 0);
+        let loop_label = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.bind_text_label(loop_label);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::Rdx);
+        self.asm.jcc_label(Condition::Equal, done);
+        self.emit_runtime_buffer_capacity_check(Reg::R9, 65_536, span, overflow_message);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R8);
+        self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::R9, Reg8::Al);
+        self.asm.inc_reg(Reg::R8);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.jmp_label(loop_label);
+        self.asm.bind_text_label(done);
+        self.asm.mov_data_addr(Reg::R10, len);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
+        NativeValue::RuntimeString { data, len }
     }
 
     fn emit_i64_rax_to_runtime_string_ref(

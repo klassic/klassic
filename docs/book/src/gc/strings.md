@@ -27,6 +27,8 @@ val ab = __gc_string_concat(a, b)               // "foobar"
 val bang = ab + __gc_string("!")                // heap-backed `+`
 println(ab == __gc_string("foobar"))            // content equality
 assertResult(__gc_string("foobar"))(ab)         // content assertion
+val text = toString(ab)                         // fixed-buffer String bridge
+println(length(text))                           // ordinary String helper
 
 val tag  = __gc_string_repeat(__gc_string("-"), 10)   // "----------"
 val mid  = __gc_string_substring(__gc_string("klassic"), 1, 5) // "lass"
