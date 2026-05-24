@@ -8357,7 +8357,7 @@ impl NativeCodeGenerator {
                 self.emit_runtime_string_to_heap_string(data, len);
                 Ok(())
             }
-            NativeValue::HeapPointer | NativeValue::Int if allow_erased_pointer => Ok(()),
+            NativeValue::HeapPointer if allow_erased_pointer => Ok(()),
             _ => Err(unsupported(span, context)),
         }
     }
@@ -8504,10 +8504,7 @@ impl NativeCodeGenerator {
             ));
         }
         let value = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            value,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_println for non-address argument",
@@ -8606,10 +8603,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_int_set for non-address list argument",
@@ -8666,10 +8660,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_int_get for non-address list argument",
@@ -8718,10 +8709,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_int_push for non-address list argument",
@@ -8800,10 +8788,7 @@ impl NativeCodeGenerator {
             ));
         }
         let value = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            value,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_int_println for non-address argument",
@@ -8880,10 +8865,7 @@ impl NativeCodeGenerator {
             ));
         }
         let value = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            value,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_len for non-address argument",
@@ -8967,10 +8949,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_get_byte for non-address argument",
@@ -9013,10 +8992,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_set_byte for non-address argument",
@@ -9078,10 +9054,7 @@ impl NativeCodeGenerator {
         }
 
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_substring for non-address source",
@@ -9175,10 +9148,7 @@ impl NativeCodeGenerator {
             ));
         }
         let a = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            a,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(a, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_eq for non-address first argument",
@@ -9187,10 +9157,7 @@ impl NativeCodeGenerator {
         let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
         let b = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            b,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(b, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_eq for non-address second argument",
@@ -9221,10 +9188,7 @@ impl NativeCodeGenerator {
             ));
         }
         let value = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            value,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_pointer_count for non-address argument",
@@ -9362,10 +9326,7 @@ impl NativeCodeGenerator {
             ));
         }
         let value = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            value,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_len for non-address argument",
@@ -9393,10 +9354,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_set for non-address list argument",
@@ -9414,10 +9372,7 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
         let value = self.compile_expr(&arguments[2])?;
-        if !matches!(
-            value,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_set for non-address value argument",
@@ -9455,10 +9410,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_get for non-address list argument",
@@ -9630,10 +9582,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_starts_with for non-address haystack",
@@ -9642,10 +9591,7 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
         let pfx = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            pfx,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(pfx, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_starts_with for non-address prefix",
@@ -9700,10 +9646,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_ends_with for non-address haystack",
@@ -9712,10 +9655,7 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
         let sfx = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            sfx,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(sfx, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_ends_with for non-address suffix",
@@ -9775,10 +9715,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_contains for non-address haystack",
@@ -9787,10 +9724,7 @@ impl NativeCodeGenerator {
         let s_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(s_slot.offset, Reg::Rax);
         let n = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            n,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(n, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_contains for non-address needle",
@@ -9879,10 +9813,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_int_reverse for non-address argument",
@@ -9969,10 +9900,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_repeat for non-address source",
@@ -10066,10 +9994,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_index_of for non-address source",
@@ -10135,10 +10060,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_to_int for non-address argument",
@@ -10207,10 +10129,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_int_pop for non-address argument",
@@ -10278,10 +10197,7 @@ impl NativeCodeGenerator {
             ));
         }
         let a = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            a,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(a, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_concat for non-address first argument",
@@ -10291,10 +10207,7 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
 
         let b = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            b,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(b, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_concat for non-address second argument",
@@ -10372,10 +10285,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_push for non-address list argument",
@@ -10385,10 +10295,7 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(lst_slot.offset, Reg::Rax);
 
         let ptr = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            ptr,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(ptr, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_push for non-address value argument",
@@ -10453,10 +10360,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_pop for non-address argument",
@@ -10518,10 +10422,7 @@ impl NativeCodeGenerator {
             ));
         }
         let a = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            a,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(a, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_concat for non-address first argument",
@@ -10531,10 +10432,7 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
 
         let b = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            b,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(b, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_concat for non-address second argument",
@@ -10602,10 +10500,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_reverse for non-address argument",
@@ -10697,10 +10592,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_int_sum for non-address argument",
@@ -10746,10 +10638,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native list min/max for non-address argument",
@@ -10824,10 +10713,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_split for non-address source",
@@ -11026,10 +10912,7 @@ impl NativeCodeGenerator {
             ));
         }
         let parts = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            parts,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(parts, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_join for non-address parts argument",
@@ -11039,10 +10922,7 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(parts_slot.offset, Reg::Rax);
 
         let sep = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            sep,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(sep, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_ptr_join for non-address separator",
@@ -11171,10 +11051,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_replace for non-address source",
@@ -11184,10 +11061,7 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(s_slot.offset, Reg::Rax);
 
         let from = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            from,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(from, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_replace for non-address `from`",
@@ -11197,10 +11071,7 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(from_slot.offset, Reg::Rax);
 
         let to = self.compile_expr(&arguments[2])?;
-        if !matches!(
-            to,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(to, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_replace for non-address `to`",
@@ -11396,10 +11267,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_string_trim for non-address argument",
@@ -11520,10 +11388,7 @@ impl NativeCodeGenerator {
             ));
         }
         let s = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            s,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(span, "native string case op for non-address"));
         }
         let s_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
@@ -11648,10 +11513,7 @@ impl NativeCodeGenerator {
             ));
         }
         let lst = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            lst,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(lst, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_int_to_string for non-address list",
@@ -11661,10 +11523,7 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(lst_slot.offset, Reg::Rax);
 
         let sep = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            sep,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(sep, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_list_int_to_string for non-address separator",
@@ -11927,10 +11786,7 @@ impl NativeCodeGenerator {
             ));
         }
         let value = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            value,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_smap_size for non-address argument",
@@ -12011,10 +11867,7 @@ impl NativeCodeGenerator {
             ));
         }
         let m = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            m,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(m, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_smap_has for non-address map",
@@ -12023,10 +11876,7 @@ impl NativeCodeGenerator {
         let m_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(m_slot.offset, Reg::Rax);
         let key = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            key,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(key, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_smap_has for non-address key",
@@ -12066,10 +11916,7 @@ impl NativeCodeGenerator {
             ));
         }
         let m = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            m,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(m, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_smap_get for non-address map",
@@ -12078,10 +11925,7 @@ impl NativeCodeGenerator {
         let m_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(m_slot.offset, Reg::Rax);
         let key = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            key,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(key, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_smap_get for non-address key",
@@ -12130,10 +11974,7 @@ impl NativeCodeGenerator {
             ));
         }
         let m = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            m,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(m, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_smap_set for non-address map",
@@ -12142,10 +11983,7 @@ impl NativeCodeGenerator {
         let m_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(m_slot.offset, Reg::Rax);
         let key = self.compile_expr(&arguments[1])?;
-        if !matches!(
-            key,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(key, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_smap_set for non-address key",
@@ -12154,10 +11992,7 @@ impl NativeCodeGenerator {
         let key_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(key_slot.offset, Reg::Rax);
         let value = self.compile_expr(&arguments[2])?;
-        if !matches!(
-            value,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_smap_set for non-address value",
@@ -12299,10 +12134,7 @@ impl NativeCodeGenerator {
             ));
         }
         let m = self.compile_expr(&arguments[0])?;
-        if !matches!(
-            m,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
+        if !matches!(m, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_smap_keys/values for non-address",
@@ -12432,7 +12264,7 @@ impl NativeCodeGenerator {
             ));
         }
         let value = self.compile_expr(&arguments[0])?;
-        if !matches!(value, NativeValue::Int | NativeValue::HeapPointer) {
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_pin for non-address argument",
@@ -12456,7 +12288,7 @@ impl NativeCodeGenerator {
             ));
         }
         let value = self.compile_expr(&arguments[0])?;
-        if !matches!(value, NativeValue::Int | NativeValue::HeapPointer) {
+        if !matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_unpin for non-address argument",
@@ -12480,7 +12312,7 @@ impl NativeCodeGenerator {
             ));
         }
         let addr = self.compile_expr(&arguments[0])?;
-        if !matches!(addr, NativeValue::Int | NativeValue::HeapPointer) {
+        if !matches!(addr, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_read for non-address argument",
@@ -12517,7 +12349,7 @@ impl NativeCodeGenerator {
             ));
         }
         let addr = self.compile_expr(&arguments[0])?;
-        if !matches!(addr, NativeValue::Int | NativeValue::HeapPointer) {
+        if !matches!(addr, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(
                 span,
                 "native __gc_write for non-address argument",

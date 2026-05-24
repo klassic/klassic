@@ -460,6 +460,10 @@ High-level collection literals reject `HeapPointer` / `HeapString` values for
 now instead of preserving them in unrooted fixed-buffer runtime-list metadata;
 the explicit `__gc_list_ptr_*` helpers remain the native path for collections
 of heap pointers.
+Address-taking GC helper calls also reject plain `Int` native values at build
+time; pointer-producing expressions keep their `HeapPointer` / `HeapString`
+native value tags even though the temporary source-level debug API is still
+typed through integers.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

@@ -26,6 +26,8 @@ diagnostic; there is no silent fallback to the evaluator.
   into runtime storage without losing the selected length.
 - High-level collection literals currently reject GC heap pointer values; use
   `__gc_list_ptr_*` until ordinary lists are heap-backed.
+- GC helper calls that consume heap addresses reject plain `Int` arguments in
+  native builds, even while the debug surface is source-typed through integers.
 - Linux file / directory / process / environment / stdin / argv
   builtins via direct syscalls.
 - Source-located stderr diagnostics for runtime failures (`assert`,

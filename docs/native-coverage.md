@@ -206,6 +206,10 @@ helpers, and runtime string interpolation can append `HeapString` fragments.
 High-level collection literals reject GC heap pointer values for now; use the
 explicit `__gc_list_ptr_*` helpers for heap-pointer collections until Phase B
 migrates ordinary lists onto the GC heap.
+GC helper calls that consume heap addresses require values produced by GC
+allocation or pointer-returning helpers; plain `Int` values are rejected at
+build time even though the temporary debug surface is still source-typed as
+integers.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including

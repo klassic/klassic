@@ -5,6 +5,11 @@ debug-prefixed because the long-term goal is to lift these
 capabilities into ordinary language values; today they expose the
 runtime GC heap directly so practical programs can use it.
 
+The native compiler tracks values produced by GC allocation helpers separately
+from plain integers. Passing an ordinary `Int` to a GC helper that expects a
+heap address is rejected at build time instead of producing an invalid native
+binary.
+
 ## Object Model
 
 | Tag | Symbol | Layout | Trace behaviour |
