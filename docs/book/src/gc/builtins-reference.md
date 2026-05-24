@@ -49,7 +49,7 @@ binary.
 | `__gc_string_concat(a, b)` | HeapString | Join two heap strings; size overflow aborts. |
 | `__gc_string_repeat(s, n)` | HeapString | Repeat. Negative `n`, invalid stored length, or size overflow aborts. |
 | `__gc_string_substring(s, start, end)` | HeapString | Bytes `[start, end)`; invalid stored length aborts. |
-| `__gc_string_replace(s, from, to)` | HeapString | Replace every occurrence; invalid stored length aborts. |
+| `__gc_string_replace(s, from, to)` | HeapString | Replace every occurrence; invalid stored length or result size overflow aborts. |
 | `__gc_string_trim(s)` | HeapString | Strip ASCII whitespace; invalid stored length aborts. |
 | `__gc_string_to_lower(s)` | HeapString | ASCII A–Z → a–z; invalid stored length aborts. |
 | `__gc_string_to_upper(s)` | HeapString | ASCII a–z → A–Z; invalid stored length aborts. |

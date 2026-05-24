@@ -11574,18 +11574,70 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(count_slot.offset, Reg::Rax);
         self.asm.bind_text_label(count_done);
 
-        // Compute new_len = s_len + count * (to_len - from_len).
+        // Compute new_len = s_len + count * (to_len - from_len), checked
+        // before any allocation-size arithmetic can wrap.
         self.asm.load_rbp_slot(Reg::R10, s_slot.offset);
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
         self.asm.load_rbp_slot(Reg::R10, from_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
         self.asm.load_rbp_slot(Reg::R10, to_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.sub_reg_reg(Reg::Rax, Reg::R9);
         self.asm.load_rbp_slot(Reg::Rcx, count_slot.offset);
+
+        let replacement_not_shorter = self.asm.create_text_label();
+        let replacement_same_length = self.asm.create_text_label();
+        let replacement_total_checked = self.asm.create_text_label();
+        let replacement_overflow = self.asm.create_text_label();
+
+        self.asm.cmp_reg_reg(Reg::R11, Reg::R9);
+        self.asm
+            .jcc_label(Condition::AboveOrEqual, replacement_not_shorter);
+
+        // Shrinking replacement: delta = from_len - to_len. The
+        // non-overlap count implies count * delta <= s_len, and this
+        // guard keeps the emitted multiplication bounded too.
+        self.asm.mov_reg_reg(Reg::R10, Reg::R9);
+        self.asm.sub_reg_reg(Reg::R10, Reg::R11);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.mov_imm64(Reg::Rdx, 0);
+        self.asm.div_reg(Reg::R10);
+        self.asm.cmp_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.jcc_label(Condition::Above, replacement_overflow);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R10);
+        self.asm.imul_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::R8);
+        self.asm.sub_reg_reg(Reg::Rdi, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rdi);
+        self.asm.jmp_label(replacement_total_checked);
+
+        self.asm.bind_text_label(replacement_not_shorter);
+        self.asm.mov_reg_reg(Reg::R10, Reg::R11);
+        self.asm.sub_reg_reg(Reg::R10, Reg::R9);
+        self.asm.test_reg_reg(Reg::R10, Reg::R10);
+        self.asm
+            .jcc_label(Condition::Equal, replacement_same_length);
+
+        // Growing replacement: count * delta must fit in the remaining
+        // checked string allocation budget.
+        self.asm.mov_imm64(Reg::Rax, Self::GC_MAX_STRING_ALLOC_SIZE);
+        self.asm.sub_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.mov_imm64(Reg::Rdx, 0);
+        self.asm.div_reg(Reg::R10);
+        self.asm.cmp_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.jcc_label(Condition::Above, replacement_overflow);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R10);
         self.asm.imul_reg_reg(Reg::Rax, Reg::Rcx);
         self.asm.add_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.jmp_label(replacement_total_checked);
+
+        self.asm.bind_text_label(replacement_same_length);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.jmp_label(replacement_total_checked);
+
+        self.asm.bind_text_label(replacement_overflow);
+        self.emit_runtime_error(span, "__gc_string_replace allocation size overflow");
+
+        self.asm.bind_text_label(replacement_total_checked);
         self.asm.store_rbp_slot(new_len_slot.offset, Reg::Rax);
 
         // Allocate destination heap string.

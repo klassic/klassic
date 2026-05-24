@@ -633,6 +633,9 @@ cargo run -- -e "1 + 2"
   times in a single allocation; negative `n` jumps to
   `gc_bounds_error`, the stored source length is validated, and
   total length is checked before allocation size arithmetic);
+  `__gc_string_replace(s, from, to)` (counts non-overlapping
+  matches, validates all stored string lengths, and checks the
+  replacement result length before allocation);
   `__gc_string_index_of(s, byte)` (returns the first index of
   the low-byte of `byte` in `s`, or `-1` if absent — no
   allocation, just a movzx/cmp loop, after validating the stored
