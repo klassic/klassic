@@ -4168,6 +4168,68 @@ fn builds_native_executable_for_gc_negative_allocation_sizes_runtime_errors() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn builds_native_executable_for_gc_allocation_size_overflow_runtime_errors() {
+    let cases = [
+        ("__gc_alloc(9223372036854771682)\n", "__gc_alloc"),
+        (
+            "__gc_string_alloc(9223372036854771667)\n",
+            "__gc_string_alloc",
+        ),
+        ("__gc_record(1152921504606846461)\n", "__gc_record"),
+        ("__gc_array(1152921504606846461)\n", "__gc_array"),
+        ("__gc_list_int(1152921504606846460)\n", "__gc_list_int"),
+        ("__gc_list_ptr(1152921504606846460)\n", "__gc_list_ptr"),
+    ];
+    for (index, (source, builtin_name)) in cases.iter().enumerate() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!(
+            "klassic-native-gc-alloc-overflow-{index}-{unique}.kl"
+        ));
+        let output_path =
+            std::env::temp_dir().join(format!("klassic-native-gc-alloc-overflow-{index}-{unique}"));
+        fs::write(&source_path, source).expect("source should write");
+
+        let build = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_string_lossy().as_ref(),
+                "-o",
+                output_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .expect("klassic build should run");
+
+        assert!(
+            build.status.success(),
+            "gc allocation overflow build failed for {builtin_name}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let run = Command::new(&output_path)
+            .output()
+            .expect("generated executable should run");
+
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&output_path);
+
+        assert!(!run.status.success(), "{builtin_name} should fail");
+        assert!(run.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!(
+                "{}:1:1: {builtin_name} allocation size overflow\n",
+                source_path.display()
+            )
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_reclaims_dead_allocations() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

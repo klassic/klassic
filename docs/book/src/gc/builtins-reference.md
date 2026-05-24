@@ -134,4 +134,5 @@ exits with status 1:
 | Mark worklist exceeded 4096 entries | `klassic gc: mark worklist overflow` |
 | Shadow stack exceeded 8192 entries | `klassic gc: shadow stack overflow` |
 | Negative size/count for allocation constructors | `<builtin> expects a non-negative integer index` |
+| Size/count would overflow allocation math | `<builtin> allocation size overflow` |
 | Out-of-bounds index in any length-aware op | `klassic gc: index out of bounds` |

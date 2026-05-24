@@ -8150,6 +8150,7 @@ impl NativeCodeGenerator {
             ));
         }
         self.emit_non_negative_builtin_int_check(span, "__gc_alloc");
+        self.emit_builtin_allocation_size_check(span, "__gc_alloc", Self::GC_MAX_PAYLOAD_SIZE);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         // Type tag 1 = "raw bytes" (no pointer fields).
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
@@ -8181,6 +8182,11 @@ impl NativeCodeGenerator {
             ));
         }
         self.emit_non_negative_builtin_int_check(span, "__gc_record");
+        self.emit_builtin_allocation_size_check(
+            span,
+            "__gc_record",
+            Self::GC_MAX_POINTER_SLOT_COUNT,
+        );
         // size in bytes = field_count * 8
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -8232,6 +8238,11 @@ impl NativeCodeGenerator {
             ));
         }
         self.emit_non_negative_builtin_int_check(span, "__gc_array");
+        self.emit_builtin_allocation_size_check(
+            span,
+            "__gc_array",
+            Self::GC_MAX_POINTER_SLOT_COUNT,
+        );
         // size in bytes = slot_count * 8
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -8641,6 +8652,7 @@ impl NativeCodeGenerator {
             ));
         }
         self.emit_non_negative_builtin_int_check(span, "__gc_list_int");
+        self.emit_builtin_allocation_size_check(span, "__gc_list_int", Self::GC_MAX_LIST_LENGTH);
         // rax holds n. Spill so we can recover it after gc_alloc.
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
@@ -9014,6 +9026,11 @@ impl NativeCodeGenerator {
             ));
         }
         self.emit_non_negative_builtin_int_check(span, "__gc_string_alloc");
+        self.emit_builtin_allocation_size_check(
+            span,
+            "__gc_string_alloc",
+            Self::GC_MAX_STRING_ALLOC_SIZE,
+        );
         // Spill n so we can recover it after gc_alloc.
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
@@ -9395,6 +9412,7 @@ impl NativeCodeGenerator {
             ));
         }
         self.emit_non_negative_builtin_int_check(span, "__gc_list_ptr");
+        self.emit_builtin_allocation_size_check(span, "__gc_list_ptr", Self::GC_MAX_LIST_LENGTH);
         // Spill n.
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
@@ -32047,6 +32065,15 @@ impl NativeCodeGenerator {
         );
     }
 
+    fn emit_builtin_allocation_size_check(&mut self, span: Span, name: &str, max: u64) {
+        let ok = self.asm.create_text_label();
+        self.asm.mov_imm64(Reg::Rcx, max);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::LessEqual, ok);
+        self.emit_runtime_error(span, &format!("{name} allocation size overflow"));
+        self.asm.bind_text_label(ok);
+    }
+
     fn emit_runtime_error_if_rax_negative_except_errno(
         &mut self,
         span: Span,
@@ -32411,6 +32438,10 @@ impl NativeCodeGenerator {
     /// one time. Allocating a 33rd nested heap-pointer var beyond this
     /// limit aborts with an explicit shadow-stack overflow message.
     const GC_SHADOW_STACK_LEN: usize = 8192;
+    const GC_MAX_PAYLOAD_SIZE: u64 = i64::MAX as u64 - 31 - 4095;
+    const GC_MAX_STRING_ALLOC_SIZE: u64 = Self::GC_MAX_PAYLOAD_SIZE - 15;
+    const GC_MAX_POINTER_SLOT_COUNT: u64 = Self::GC_MAX_PAYLOAD_SIZE / 8;
+    const GC_MAX_LIST_LENGTH: u64 = (Self::GC_MAX_PAYLOAD_SIZE - 8) / 8;
     /// Type tag stored in the second header word. 0 marks a free block,
     /// 1 marks a raw-bytes payload (no pointer fields), 2 marks a
     /// "pointer record" whose payload is interpreted as a packed array
