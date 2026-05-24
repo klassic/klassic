@@ -6706,11 +6706,17 @@ __gc_string_println(c)
 val raw = FileInput#all("{}")
 val lifted = __gc_string(raw)
 val d = c + __gc_string(" / ") + lifted
+val e = __gc_string("prefix: ") + raw
+val f = "static " + c
 foreach(i in [1, 2, 3, 4, 5, 6, 7, 8]) {{
   __gc_alloc(150000)
 }}
 __gc_collect()
 __gc_string_println(d)
+println(e)
+println(f)
+assertResult("prefix: runtime")(toString(e))
+assertResult("static hello, world!")(toString(f))
 "#,
             input_path.display()
         ),
@@ -6751,7 +6757,7 @@ __gc_string_println(d)
     );
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
-        "hello, world!\nhello, world! / runtime\n"
+        "hello, world!\nhello, world! / runtime\nprefix: runtime\nstatic hello, world!\n"
     );
     assert!(run.stderr.is_empty());
 }

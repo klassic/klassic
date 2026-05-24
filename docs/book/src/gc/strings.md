@@ -25,6 +25,7 @@ val a = __gc_string("foo")
 val b = __gc_string("bar")
 val ab = __gc_string_concat(a, b)               // "foobar"
 val bang = ab + __gc_string("!")                // heap-backed `+`
+val tagged = "tag:" + bang                      // static/runtime fragments ok
 println(ab == __gc_string("foobar"))            // content equality
 assertResult(__gc_string("foobar"))(ab)         // content assertion
 val text = toString(ab)                         // fixed-buffer String bridge

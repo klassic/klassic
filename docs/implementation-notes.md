@@ -447,7 +447,8 @@ supported runtime string and file helpers, including `readAll` / `readLines`,
 can be copied onto the GC heap with `__gc_string(runtimeString)`, providing an
 explicit bridge from runtime file/stdin data into `HeapString` operations.
 Heap string operands also participate in native `+`, using the same
-shadow-stack-rooted concatenation path as `__gc_string_concat`.
+shadow-stack-rooted concatenation path as `__gc_string_concat` and lifting
+static or runtime string fragments when needed.
 Native `==` / `!=`, `assertResult`, and `__gc_string_eq` over heap strings
 root the left operand while the right-hand side is evaluated, then compare
 length-prefixed byte payloads through the same scan path.

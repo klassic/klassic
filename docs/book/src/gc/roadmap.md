@@ -21,7 +21,8 @@ Status:
 - ✅ `println(heap_string)` dispatches to a byte-emitting path.
 - ✅ `__gc_string(runtime_string)` copies fixed-buffer runtime `String`
   values onto the GC heap as an explicit migration bridge.
-- ✅ `+` can concatenate `HeapString` operands with other heap strings.
+- ✅ `+` can concatenate `HeapString` operands with static, runtime, or
+  heap string fragments.
 - ✅ `==` / `!=` compare `HeapString` bytes by content.
 - ✅ `assertResult` compares `HeapString` bytes by content.
 - ✅ `toString(heap_string)` bridges heap bytes back to runtime `String`.

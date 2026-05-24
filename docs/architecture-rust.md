@@ -603,8 +603,9 @@ cargo run -- -e "1 + 2"
   spilling both inputs into shadow-stack-tracked slots so the
   allocation in the middle cannot reclaim them); `__gc_string_println(g)`
   (writes the heap string's bytes followed by `\n` to stdout); native `+`
-  over `HeapString` operands lowers through the same heap concatenation path,
-  and native `==` / `!=` plus `assertResult` root the left operand across
+  lowers through the same heap concatenation path when a `HeapString`
+  participates, lifting static or runtime string fragments as needed, and
+  native `==` / `!=` plus `assertResult` root the left operand across
   right-hand evaluation before reusing the byte-content equality scan;
   `toString(heapString)` copies heap bytes back into a fixed-buffer runtime
   `String` for ordinary string helpers; runtime string interpolation can append
