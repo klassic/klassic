@@ -8844,7 +8844,8 @@ impl NativeCodeGenerator {
         Ok(NativeValue::HeapPointer)
     }
 
-    /// `__gc_list_int_len(lst)` returns the length stored at offset 0.
+    /// `__gc_list_int_len(lst)` validates and returns the length stored
+    /// at offset 0.
     fn compile_gc_list_int_len(
         &mut self,
         arguments: &[Expr],
@@ -8867,13 +8868,13 @@ impl NativeCodeGenerator {
             ));
         }
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
-        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_len", Reg::Rax);
+        self.emit_gc_list_length_check(span, "__gc_list_int_len", Reg::Rax);
         Ok(NativeValue::Int)
     }
 
     /// `__gc_list_int_set(lst, idx, value)` writes `value` into slot
-    /// `idx` of the heap list. No bounds check — same trust model as
-    /// `__gc_write`.
+    /// `idx` of the heap list after validating the stored length and
+    /// checking the index against it.
     fn compile_gc_list_int_set(
         &mut self,
         arguments: &[Expr],
@@ -8920,7 +8921,7 @@ impl NativeCodeGenerator {
         self.next_stack_offset -= 8;
         // Bounds check against the length stored at offset 0.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_set", Reg::R11);
+        self.emit_gc_list_length_check(span, "__gc_list_int_set", Reg::R11);
         self.emit_gc_bounds_check(Reg::Rcx, Reg::R11);
         // addr = list + 8 + idx*8
         self.asm.shl_reg_imm8(Reg::Rcx, 3);
@@ -8967,7 +8968,7 @@ impl NativeCodeGenerator {
         self.next_stack_offset -= 8;
         // Bounds check against the length stored at offset 0.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_get", Reg::R11);
+        self.emit_gc_list_length_check(span, "__gc_list_int_get", Reg::R11);
         self.emit_gc_bounds_check(Reg::Rax, Reg::R11);
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.add_reg_reg(Reg::R10, Reg::Rax);
@@ -9092,7 +9093,7 @@ impl NativeCodeGenerator {
 
         self.asm.load_rbp_slot(Reg::R10, list_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_println", Reg::R11);
+        self.emit_gc_list_length_check(span, "__gc_list_int_println", Reg::R11);
 
         self.emit_write_data(self.platform.stdout_fd(), self.list_open, 1);
 
@@ -9140,9 +9141,9 @@ impl NativeCodeGenerator {
         Ok(NativeValue::Unit)
     }
 
-    /// `__gc_string_len(s)` returns the byte length stored at offset 0
-    /// of a heap string. The argument must be a heap pointer; the result
-    /// is a plain Int.
+    /// `__gc_string_len(s)` validates and returns the byte length stored
+    /// at offset 0 of a heap string. The argument must be a heap pointer;
+    /// the result is a plain Int.
     fn compile_gc_string_len(
         &mut self,
         arguments: &[Expr],
@@ -9277,7 +9278,8 @@ impl NativeCodeGenerator {
     }
 
     /// `__gc_string_set_byte(s, idx, byte)` writes the low byte of
-    /// `byte` at position `idx` of the heap string. No bounds check.
+    /// `byte` at position `idx` after validating the stored length and
+    /// checking the index against it.
     fn compile_gc_string_set_byte(
         &mut self,
         arguments: &[Expr],
@@ -9630,7 +9632,8 @@ impl NativeCodeGenerator {
         Ok(NativeValue::HeapPointer)
     }
 
-    /// `__gc_list_ptr_len(lst)` returns the length stored at offset 0.
+    /// `__gc_list_ptr_len(lst)` validates and returns the length stored
+    /// at offset 0.
     fn compile_gc_list_ptr_len(
         &mut self,
         arguments: &[Expr],
@@ -9653,7 +9656,7 @@ impl NativeCodeGenerator {
             ));
         }
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
-        self.emit_gc_list_iteration_length_check(span, "__gc_list_ptr_len", Reg::Rax);
+        self.emit_gc_list_length_check(span, "__gc_list_ptr_len", Reg::Rax);
         Ok(NativeValue::Int)
     }
 
@@ -9705,7 +9708,7 @@ impl NativeCodeGenerator {
         self.next_stack_offset -= 8;
         // Bounds check against the length stored at offset 0.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.emit_gc_list_iteration_length_check(span, "__gc_list_ptr_set", Reg::R11);
+        self.emit_gc_list_length_check(span, "__gc_list_ptr_set", Reg::R11);
         self.emit_gc_bounds_check(Reg::Rcx, Reg::R11);
         // addr = lst + 8 + idx*8
         self.asm.shl_reg_imm8(Reg::Rcx, 3);
@@ -9747,7 +9750,7 @@ impl NativeCodeGenerator {
         self.next_stack_offset -= 8;
         // Bounds check against the length stored at offset 0.
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.emit_gc_list_iteration_length_check(span, name, Reg::R11);
+        self.emit_gc_list_length_check(span, name, Reg::R11);
         self.emit_gc_bounds_check(Reg::Rax, Reg::R11);
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.add_reg_reg(Reg::R10, Reg::Rax);
@@ -11149,7 +11152,7 @@ impl NativeCodeGenerator {
         }
         self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_sum", Reg::R11);
+        self.emit_gc_list_length_check(span, "__gc_list_int_sum", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.mov_imm64(Reg::Rcx, 0);
@@ -11196,7 +11199,7 @@ impl NativeCodeGenerator {
         }
         self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.emit_gc_list_iteration_length_check(span, label, Reg::R11);
+        self.emit_gc_list_length_check(span, label, Reg::R11);
         self.asm.test_reg_reg(Reg::R11, Reg::R11);
         self.asm.jcc_label(Condition::Equal, self.gc_bounds_error);
         self.asm.add_reg_imm32(Reg::R10, 8);
@@ -11493,7 +11496,7 @@ impl NativeCodeGenerator {
         // Pass 1: total = sum(part_len) + (n - 1) * sep_len if n > 0.
         self.asm.load_rbp_slot(Reg::R10, parts_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.emit_gc_list_iteration_length_check(span, "__gc_list_ptr_join", Reg::R11);
+        self.emit_gc_list_length_check(span, "__gc_list_ptr_join", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.load_rbp_slot(Reg::R8, sep_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R8, 0);
@@ -12161,7 +12164,7 @@ impl NativeCodeGenerator {
         // Pass 1: total = sum(digit_count(lst[i])) + (n - 1) * sep_len.
         self.asm.load_rbp_slot(Reg::R10, lst_slot.offset);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.emit_gc_list_iteration_length_check(span, "__gc_list_int_to_string", Reg::R11);
+        self.emit_gc_list_length_check(span, "__gc_list_int_to_string", Reg::R11);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.load_rbp_slot(Reg::R8, sep_slot.offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R8, 0);
@@ -32710,7 +32713,7 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(ok);
     }
 
-    fn emit_gc_list_iteration_length_check(&mut self, span: Span, name: &str, len: Reg) {
+    fn emit_gc_list_length_check(&mut self, span: Span, name: &str, len: Reg) {
         let ok = self.asm.create_text_label();
         let overflow = self.asm.create_text_label();
         self.asm.cmp_reg_imm8(len, 0);
