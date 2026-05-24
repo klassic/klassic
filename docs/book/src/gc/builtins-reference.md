@@ -133,4 +133,5 @@ exits with status 1:
 | `__gc_pin` exceeded the 1024-entry root table | `klassic gc: root table overflow` |
 | Mark worklist exceeded 4096 entries | `klassic gc: mark worklist overflow` |
 | Shadow stack exceeded 8192 entries | `klassic gc: shadow stack overflow` |
+| Negative size/count for allocation constructors | `<builtin> expects a non-negative integer index` |
 | Out-of-bounds index in any length-aware op | `klassic gc: index out of bounds` |

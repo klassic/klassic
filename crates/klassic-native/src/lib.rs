@@ -8149,6 +8149,7 @@ impl NativeCodeGenerator {
                 "native __gc_alloc for non-Int size argument",
             ));
         }
+        self.emit_non_negative_builtin_int_check(span, "__gc_alloc");
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         // Type tag 1 = "raw bytes" (no pointer fields).
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
@@ -8179,6 +8180,7 @@ impl NativeCodeGenerator {
                 "native __gc_record for non-Int field-count argument",
             ));
         }
+        self.emit_non_negative_builtin_int_check(span, "__gc_record");
         // size in bytes = field_count * 8
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -8229,6 +8231,7 @@ impl NativeCodeGenerator {
                 "native __gc_array for non-Int slot-count argument",
             ));
         }
+        self.emit_non_negative_builtin_int_check(span, "__gc_array");
         // size in bytes = slot_count * 8
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -8637,6 +8640,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_int for non-Int length argument",
             ));
         }
+        self.emit_non_negative_builtin_int_check(span, "__gc_list_int");
         // rax holds n. Spill so we can recover it after gc_alloc.
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
@@ -9009,6 +9013,7 @@ impl NativeCodeGenerator {
                 "native __gc_string_alloc for non-Int length argument",
             ));
         }
+        self.emit_non_negative_builtin_int_check(span, "__gc_string_alloc");
         // Spill n so we can recover it after gc_alloc.
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
@@ -9389,6 +9394,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_ptr for non-Int length argument",
             ));
         }
+        self.emit_non_negative_builtin_int_check(span, "__gc_list_ptr");
         // Spill n.
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
@@ -32032,6 +32038,13 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::GreaterEqual, ok);
         self.emit_runtime_error(span, message);
         self.asm.bind_text_label(ok);
+    }
+
+    fn emit_non_negative_builtin_int_check(&mut self, span: Span, name: &str) {
+        self.emit_runtime_error_if_rax_negative(
+            span,
+            &format!("{name} expects a non-negative integer index"),
+        );
     }
 
     fn emit_runtime_error_if_rax_negative_except_errno(

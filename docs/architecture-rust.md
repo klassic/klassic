@@ -598,8 +598,9 @@ cargo run -- -e "1 + 2"
   comparisons, and printing now all treat `HeapPointer` like `Int`
   so `val a = __gc_alloc(...); println(a > 0)` compiles cleanly.
 
-  Forty-one debug builtins drive the GC end-to-end:
-  `__gc_alloc(size)` (type tag 1, raw bytes); `__gc_record(num_fields)`
+  The debug builtins drive the GC end-to-end:
+  `__gc_alloc(size)` (type tag 1, raw bytes, with a native runtime
+  guard against negative sizes); `__gc_record(num_fields)`
   (type tag 2, packed heap pointers, fixed shape); `__gc_array(num_slots)`
   (type tag 3, packed heap pointers, indexed); `__gc_string(text)`
   (heap-allocated length-prefixed string built from a static literal or runtime
