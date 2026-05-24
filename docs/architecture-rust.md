@@ -622,7 +622,9 @@ cargo run -- -e "1 + 2"
   byte-by-byte construction); `__gc_string_get_byte(s, idx)` /
   `__gc_string_set_byte(s, idx, byte)` (single-byte access after
   validating the stored string length);
-  `__gc_string_eq(a, b)` (length-then-`repe cmpsb` byte equality);
+  `__gc_string_eq(a, b)` and heap string equality operators
+  (stored-length validation followed by length-then-`repe cmpsb`
+  byte equality);
   `__gc_string_substring(s, start, end)` (allocates a fresh heap
   string holding bytes `[start, end)` with three bounds checks
   and a stored-length sanity check before the destination allocation

@@ -55,7 +55,7 @@ binary.
 | `__gc_string_to_upper(s)` | HeapString | ASCII a–z → A–Z; invalid stored length aborts. |
 | `__gc_string_println(g)` | Unit | Bytes plus newline; invalid stored length aborts. |
 | `__gc_string_len(s)` | Int | Byte length. |
-| `__gc_string_eq(a, b)` | Bool | Byte equality. |
+| `__gc_string_eq(a, b)` | Bool | Byte equality; invalid stored length aborts. |
 | `__gc_string_starts_with(s, prefix)` | Bool | Length + bytes; invalid stored length aborts. |
 | `__gc_string_ends_with(s, suffix)` | Bool | Length + bytes; invalid stored length aborts. |
 | `__gc_string_contains(s, needle)` | Bool | Naive search; invalid stored length aborts. |

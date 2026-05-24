@@ -4254,7 +4254,12 @@ impl NativeCodeGenerator {
                 }
                 self.asm.load_rbp_slot(Reg::R10, expected_slot.offset);
                 self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
-                self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11);
+                self.emit_heap_string_equality_from_regs(
+                    Reg::R10,
+                    Reg::R11,
+                    span,
+                    "heap string equality",
+                );
                 let ok = self.asm.create_text_label();
                 self.asm.cmp_reg_imm8(Reg::Rax, 0);
                 self.asm.jcc_label(Condition::NotEqual, ok);
@@ -8401,7 +8406,7 @@ impl NativeCodeGenerator {
         }
         self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
         self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
-        self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11);
+        self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11, span, "heap string equality");
         if op == BinaryOp::NotEqual {
             self.asm.cmp_reg_imm8(Reg::Rax, 0);
             self.asm.setcc_al(Condition::Equal);
@@ -8552,13 +8557,15 @@ impl NativeCodeGenerator {
         NativeValue::HeapString
     }
 
-    fn emit_heap_string_equality_from_regs(&mut self, lhs: Reg, rhs: Reg) {
+    fn emit_heap_string_equality_from_regs(&mut self, lhs: Reg, rhs: Reg, span: Span, name: &str) {
         let false_branch = self.asm.create_text_label();
         let true_branch = self.asm.create_text_label();
         let done = self.asm.create_text_label();
         // len(lhs) vs len(rhs)
         self.asm.load_ptr_disp32(Reg::R8, lhs, 0);
         self.asm.load_ptr_disp32(Reg::R9, rhs, 0);
+        self.emit_gc_string_length_check(span, name, Reg::R8);
+        self.emit_gc_string_length_check(span, name, Reg::R9);
         self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
         self.asm.jcc_label(Condition::NotEqual, false_branch);
         self.asm.test_reg_reg(Reg::R8, Reg::R8);
@@ -9345,7 +9352,7 @@ impl NativeCodeGenerator {
         }
         self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
         self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
-        self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11);
+        self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11, span, "__gc_string_eq");
         Ok(NativeValue::Bool)
     }
 
