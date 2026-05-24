@@ -100,8 +100,17 @@ impl NativeTarget {
         Self::SUPPORTED_NAMES
     }
 
+    pub fn supported_names_vec() -> Vec<&'static str> {
+        let mut names = Self::supported_specs()
+            .iter()
+            .flat_map(|spec| spec.aliases.iter().copied())
+            .collect::<Vec<_>>();
+        names.push("native");
+        names
+    }
+
     pub fn supported_names_csv() -> String {
-        Self::supported_names().join(", ")
+        Self::supported_names_vec().join(", ")
     }
 
     pub fn supported_specs() -> &'static [NativeTargetSpec] {
@@ -36486,6 +36495,7 @@ mod tests {
         }
         aliases.push("native");
         assert_eq!(NativeTarget::supported_names(), aliases.as_slice());
+        assert_eq!(NativeTarget::supported_names_vec(), aliases);
         assert_eq!(
             NativeTarget::supported_names_csv(),
             "linux-x86_64, x86_64-unknown-linux-gnu, native"
