@@ -443,6 +443,8 @@ supported runtime string and file helpers, including `readAll` / `readLines`,
 `length`, `cleanup`, or returning the path itself. Fixed-buffer runtime strings
 can be copied onto the GC heap with `__gc_string(runtimeString)`, providing an
 explicit bridge from runtime file/stdin data into `HeapString` operations.
+Heap string operands also participate in native `+`, using the same
+shadow-stack-rooted concatenation path as `__gc_string_concat`.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

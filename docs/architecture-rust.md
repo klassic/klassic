@@ -602,7 +602,8 @@ cargo run -- -e "1 + 2"
   `__gc_string_concat(a, b)` (joins two heap strings into a new one,
   spilling both inputs into shadow-stack-tracked slots so the
   allocation in the middle cannot reclaim them); `__gc_string_println(g)`
-  (writes the heap string's bytes followed by `\n` to stdout);
+  (writes the heap string's bytes followed by `\n` to stdout); native `+`
+  over `HeapString` operands lowers through the same heap concatenation path;
   `__gc_string_len(s)` (returns the byte length stored at offset 0);
   `__gc_string_alloc(n)` (reserves an `n`-byte zero-filled string for
   byte-by-byte construction); `__gc_string_get_byte(s, idx)` /

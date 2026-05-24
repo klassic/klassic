@@ -2439,6 +2439,11 @@ impl NativeCodeGenerator {
             return self.compile_logical(lhs, op, rhs, span);
         }
         if op == BinaryOp::Add
+            && (self.expr_may_yield_heap_string(lhs) || self.expr_may_yield_heap_string(rhs))
+        {
+            return self.compile_heap_string_concat(lhs, rhs, span);
+        }
+        if op == BinaryOp::Add
             && (self.expr_may_yield_runtime_string(lhs)
                 || self.expr_may_yield_runtime_string(rhs)
                 || self.expr_may_yield_static_string(lhs)
@@ -8192,52 +8197,103 @@ impl NativeCodeGenerator {
         }
     }
 
-    /// `__gc_string_concat(a, b)` allocates a fresh heap string whose
-    /// bytes are the concatenation of `a` and `b`. Both arguments are
-    /// spilled into shadow-stack-tracked slots before the destination
-    /// allocation runs, so a collection triggered by `gc_alloc` cannot
-    /// reclaim the inputs out from under the copy.
-    fn compile_gc_string_concat(
+    fn compile_heap_string_concat(
         &mut self,
-        arguments: &[Expr],
+        lhs: &Expr,
+        rhs: &Expr,
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if arguments.len() != 2 {
-            return Err(Diagnostic::compile(
-                span,
-                format!(
-                    "__gc_string_concat expects 2 arguments but got {}",
-                    arguments.len()
-                ),
-            ));
-        }
-
-        let a_value = self.compile_expr(&arguments[0])?;
-        if !matches!(
+        let a_value = self.compile_expr(lhs)?;
+        self.emit_heap_string_concat_fragment(
             a_value,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
-            return Err(unsupported(
-                span,
-                "native __gc_string_concat for non-address first argument",
-            ));
-        }
+            span,
+            "native heap string concatenation first argument",
+            false,
+        )?;
         let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
 
-        let b_value = self.compile_expr(&arguments[1])?;
-        if !matches!(
+        let b_value = self.compile_expr(rhs)?;
+        self.emit_heap_string_concat_fragment(
             b_value,
-            NativeValue::HeapPointer | NativeValue::HeapString | NativeValue::Int
-        ) {
-            return Err(unsupported(
-                span,
-                "native __gc_string_concat for non-address second argument",
-            ));
-        }
+            span,
+            "native heap string concatenation second argument",
+            false,
+        )?;
         let b_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(b_slot.offset, Reg::Rax);
 
+        Ok(self.emit_heap_string_concat_from_slots(a_slot, b_slot))
+    }
+
+    fn emit_static_string_to_heap_string(&mut self, label: DataLabel, len: usize) {
+        let payload_size = (8 + len.next_multiple_of(8)) as u64;
+        self.asm.mov_imm64(Reg::Rdi, payload_size);
+        self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
+        self.asm.call_label(self.gc_alloc);
+        // rax = heap pointer; store len at offset 0.
+        self.asm.mov_imm64(Reg::Rdi, len as u64);
+        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rdi);
+        if len > 0 {
+            // memcpy bytes from the static label into the payload via
+            // rep movsb. rep movsb leaves rax untouched, so the heap
+            // pointer in rax survives.
+            self.asm.mov_data_addr(Reg::Rsi, label);
+            self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+            self.asm.add_reg_imm32(Reg::Rdi, 8);
+            self.asm.mov_imm64(Reg::Rcx, len as u64);
+            self.asm.rep_movsb();
+        }
+    }
+
+    fn emit_runtime_string_to_heap_string(&mut self, data: DataLabel, len: DataLabel) {
+        // payload_size = 8 + align_up(runtime_len, 8)
+        self.asm.mov_data_addr(Reg::R10, len);
+        self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
+        self.asm.add_reg_imm32(Reg::Rdi, 8 + 7);
+        self.asm.and_reg_imm32(Reg::Rdi, -8);
+        self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
+        self.asm.call_label(self.gc_alloc);
+
+        // Reload the runtime length after gc_alloc, store it in the heap
+        // string header, then copy that many bytes from the fixed runtime
+        // string buffer into the heap payload.
+        self.asm.mov_data_addr(Reg::R10, len);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
+        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rcx);
+        self.asm.mov_data_addr(Reg::Rsi, data);
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+        self.asm.add_reg_imm32(Reg::Rdi, 8);
+        self.asm.rep_movsb();
+    }
+
+    fn emit_heap_string_concat_fragment(
+        &mut self,
+        value: NativeValue,
+        span: Span,
+        context: &str,
+        allow_erased_pointer: bool,
+    ) -> Result<(), Diagnostic> {
+        match value {
+            NativeValue::HeapString => Ok(()),
+            NativeValue::StaticString { label, len } => {
+                self.emit_static_string_to_heap_string(label, len);
+                Ok(())
+            }
+            NativeValue::RuntimeString { data, len } => {
+                self.emit_runtime_string_to_heap_string(data, len);
+                Ok(())
+            }
+            NativeValue::HeapPointer | NativeValue::Int if allow_erased_pointer => Ok(()),
+            _ => Err(unsupported(span, context)),
+        }
+    }
+
+    fn emit_heap_string_concat_from_slots(
+        &mut self,
+        a_slot: VarSlot,
+        b_slot: VarSlot,
+    ) -> NativeValue {
         // total_len = len_a + len_b
         self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
@@ -8285,7 +8341,50 @@ impl NativeCodeGenerator {
         self.asm.rep_movsb();
 
         self.asm.load_rbp_slot(Reg::Rax, new_slot.offset);
-        Ok(NativeValue::HeapString)
+        NativeValue::HeapString
+    }
+
+    /// `__gc_string_concat(a, b)` allocates a fresh heap string whose
+    /// bytes are the concatenation of `a` and `b`. Both arguments are
+    /// spilled into shadow-stack-tracked slots before the destination
+    /// allocation runs, so a collection triggered by `gc_alloc` cannot
+    /// reclaim the inputs out from under the copy.
+    fn compile_gc_string_concat(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 2 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__gc_string_concat expects 2 arguments but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+
+        let a_value = self.compile_expr(&arguments[0])?;
+        self.emit_heap_string_concat_fragment(
+            a_value,
+            span,
+            "native __gc_string_concat for non-address first argument",
+            true,
+        )?;
+        let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+        self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
+
+        let b_value = self.compile_expr(&arguments[1])?;
+        self.emit_heap_string_concat_fragment(
+            b_value,
+            span,
+            "native __gc_string_concat for non-address second argument",
+            true,
+        )?;
+        let b_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+        self.asm.store_rbp_slot(b_slot.offset, Reg::Rax);
+
+        Ok(self.emit_heap_string_concat_from_slots(a_slot, b_slot))
     }
 
     /// `__gc_string_println(g)` writes the heap string's bytes followed
@@ -25454,7 +25553,9 @@ impl NativeCodeGenerator {
     }
 
     fn expr_may_yield_native_string(&mut self, expr: &Expr) -> bool {
-        self.expr_may_yield_static_string(expr) || self.expr_may_yield_runtime_string(expr)
+        self.expr_may_yield_static_string(expr)
+            || self.expr_may_yield_runtime_string(expr)
+            || self.expr_may_yield_heap_string(expr)
     }
 
     fn expr_may_yield_native_lines_list(&mut self, expr: &Expr) -> bool {
@@ -26404,6 +26505,49 @@ impl NativeCodeGenerator {
                 .static_string_text_for_return_hint(key_expr)
                 .map(|value| self.asm.data_bytes_for_label(*label, *len) == value.as_bytes()),
             _ => None,
+        }
+    }
+
+    fn expr_may_yield_heap_string(&self, expr: &Expr) -> bool {
+        if matches!(
+            self.native_value_hint_for_expr(expr),
+            Some(NativeValue::HeapString)
+        ) {
+            return true;
+        }
+        match expr {
+            Expr::Identifier { name, .. } => matches!(
+                self.lookup_var(name).map(|slot| slot.value),
+                Some(NativeValue::HeapString)
+            ),
+            Expr::Block { expressions, .. } => expressions
+                .last()
+                .is_some_and(|expr| self.expr_may_yield_heap_string(expr)),
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.expr_may_yield_heap_string(then_branch)
+                    || else_branch
+                        .as_deref()
+                        .is_some_and(|branch| self.expr_may_yield_heap_string(branch))
+            }
+            Expr::Binary {
+                lhs,
+                op: BinaryOp::Add,
+                rhs,
+                ..
+            } => self.expr_may_yield_heap_string(lhs) || self.expr_may_yield_heap_string(rhs),
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::Identifier { name, .. } => {
+                    heap_string_returning_helper(&self.builtin_name_for_identifier(name))
+                }
+                callee => self
+                    .callee_return_value_hint(callee)
+                    .is_some_and(|return_value| return_value == NativeValue::HeapString),
+            },
+            _ => false,
         }
     }
 
@@ -34472,6 +34616,24 @@ fn runtime_string_returning_helper(name: &str) -> bool {
             | "toUpperCase"
             | "repeat"
             | "reverse"
+    )
+}
+
+fn heap_string_returning_helper(name: &str) -> bool {
+    matches!(
+        name,
+        "__gc_string"
+            | "__gc_string_alloc"
+            | "__gc_string_concat"
+            | "__gc_string_substring"
+            | "__gc_string_repeat"
+            | "__gc_string_replace"
+            | "__gc_string_trim"
+            | "__gc_string_to_lower"
+            | "__gc_string_to_upper"
+            | "__gc_int_to_string"
+            | "__gc_list_int_to_string"
+            | "__gc_list_ptr_join"
     )
 }
 

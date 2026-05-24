@@ -6646,6 +6646,76 @@ __gc_string_println(tagged)
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn builds_native_executable_for_gc_string_plus() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-gc-str-plus-{unique}.kl"));
+    let input_path = std::env::temp_dir().join(format!("klassic-native-gc-str-plus-{unique}.txt"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-gc-str-plus-{unique}"));
+    fs::write(
+        &source_path,
+        format!(
+            r#"val a = __gc_string("hello")
+val b = __gc_string(", ")
+val c = a + b + __gc_string("world") + __gc_string("!")
+__gc_string_println(c)
+val raw = FileInput#all("{}")
+val lifted = __gc_string(raw)
+val d = c + __gc_string(" / ") + lifted
+foreach(i in [1, 2, 3, 4, 5, 6, 7, 8]) {{
+  __gc_alloc(150000)
+}}
+__gc_collect()
+__gc_string_println(d)
+"#,
+            input_path.display()
+        ),
+    )
+    .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    assert!(
+        build.status.success(),
+        "gc string plus build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    fs::write(&input_path, "runtime").expect("input should write after native build");
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run.status.success(),
+        "gc string plus run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "hello, world!\nhello, world! / runtime\n"
+    );
+    assert!(run.stderr.is_empty());
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn builds_native_executable_for_gc_array_traces_packed_pointer_payload() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

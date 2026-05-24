@@ -196,7 +196,8 @@ patterns, first-occurrence `replace` with static or runtime literal operands,
 all-occurrence `replaceAll` with static or runtime pattern and replacement
 strings, and UTF-8 `reverse`. `__gc_string(runtimeString)` can also copy these
 fixed-buffer runtime strings onto the GC heap as `HeapString` values for
-heap-backed string composition.
+heap-backed string composition. Once an operand is a `HeapString`, native `+`
+concatenates heap strings through the GC heap.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including
