@@ -450,7 +450,8 @@ root the left operand while the right-hand side is evaluated, then compare
 length-prefixed byte payloads through the same scan path.
 `toString(heapString)` copies heap bytes back into a fixed-buffer
 `RuntimeString`, letting ordinary `String` helpers consume explicitly
-heap-backed data.
+heap-backed data. Runtime string interpolation appends `HeapString`
+fragments into the same fixed-buffer representation.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

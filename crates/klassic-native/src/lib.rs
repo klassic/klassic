@@ -28369,6 +28369,13 @@ impl NativeCodeGenerator {
                         span,
                         "string interpolation result exceeds 65536 bytes",
                     );
+                } else if fragment == NativeValue::HeapString {
+                    self.emit_append_heap_string_to_runtime_buffer_offset_label(
+                        data,
+                        offset,
+                        span,
+                        "string interpolation result exceeds 65536 bytes",
+                    );
                 } else if fragment == NativeValue::Int {
                     self.emit_append_i64_rax_to_runtime_buffer_offset_label(
                         data,
@@ -31531,12 +31538,32 @@ impl NativeCodeGenerator {
         overflow_message: &str,
     ) -> NativeValue {
         let (data, len) = self.runtime_record_branch_string_buffer();
-        self.asm.mov_data_addr(Reg::Rbx, data);
+        let offset = self.asm.data_label_with_i64s(&[0]);
+        self.emit_reset_runtime_buffer_offset_label(offset);
+        self.emit_append_heap_string_to_runtime_buffer_offset_label(
+            data,
+            offset,
+            span,
+            overflow_message,
+        );
+        self.emit_store_runtime_string_len_from_offset(len, offset);
+        NativeValue::RuntimeString { data, len }
+    }
+
+    fn emit_append_heap_string_to_runtime_buffer_offset_label(
+        &mut self,
+        output: DataLabel,
+        offset: DataLabel,
+        span: Span,
+        overflow_message: &str,
+    ) {
+        self.asm.mov_data_addr(Reg::Rbx, output);
         self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
         self.asm.add_reg_imm32(Reg::Rsi, 8);
         self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rax, 0);
+        self.asm.mov_data_addr(Reg::R10, offset);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
         self.asm.mov_imm64(Reg::R8, 0);
-        self.asm.mov_imm64(Reg::R9, 0);
         let loop_label = self.asm.create_text_label();
         let done = self.asm.create_text_label();
         self.asm.bind_text_label(loop_label);
@@ -31549,9 +31576,8 @@ impl NativeCodeGenerator {
         self.asm.inc_reg(Reg::R9);
         self.asm.jmp_label(loop_label);
         self.asm.bind_text_label(done);
-        self.asm.mov_data_addr(Reg::R10, len);
+        self.asm.mov_data_addr(Reg::R10, offset);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
-        NativeValue::RuntimeString { data, len }
     }
 
     fn emit_i64_rax_to_runtime_string_ref(

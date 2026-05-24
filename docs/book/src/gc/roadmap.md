@@ -25,6 +25,7 @@ Status:
 - ✅ `==` / `!=` compare `HeapString` bytes by content.
 - ✅ `assertResult` compares `HeapString` bytes by content.
 - ✅ `toString(heap_string)` bridges heap bytes back to runtime `String`.
+- ✅ String interpolation can append `HeapString` fragments.
 - 🚧 `+` on fixed-buffer-only dynamic operands → produce `HeapString` by
   default.
 - 🚧 String interpolation → produce `HeapString`.

@@ -20,7 +20,7 @@ diagnostic; there is no silent fallback to the evaluator.
   runtime records, with explicit runtime `String` to `HeapString`
   lifting through `__gc_string` and heap-backed `+` for `HeapString`
   operands, rooted content equality and `assertResult` for heap strings, and
-  `toString` bridging from `HeapString` back to runtime `String`.
+  `toString` / interpolation bridging from `HeapString` back to runtime `String`.
 - Static maps and sets, plus runtime-key lookups that copy entries
   into runtime storage without losing the selected length.
 - Linux file / directory / process / environment / stdin / argv

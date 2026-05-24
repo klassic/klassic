@@ -201,7 +201,7 @@ concatenates heap strings through the GC heap, and native `==` / `!=` plus
 `assertResult` compare heap strings by byte content while keeping left-hand
 temporaries rooted across right-hand evaluation. `toString(heapString)` copies
 heap bytes back into a fixed-buffer runtime `String` for ordinary string
-helpers.
+helpers, and runtime string interpolation can append `HeapString` fragments.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including
