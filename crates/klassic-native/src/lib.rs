@@ -28,6 +28,22 @@ pub enum NativeArchitecture {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeBackend {
+    DirectX86_64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeEndianness {
+    Little,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeDataLayout {
+    pub pointer_width_bits: u8,
+    pub endianness: NativeEndianness,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeOperatingSystem {
     Linux,
 }
@@ -44,6 +60,8 @@ pub struct NativeTargetSpec {
     pub standard_triple: &'static str,
     pub aliases: &'static [&'static str],
     pub architecture: NativeArchitecture,
+    pub backend: NativeBackend,
+    pub data_layout: NativeDataLayout,
     pub operating_system: NativeOperatingSystem,
     pub abi: NativeAbi,
     pub executable_format: NativeExecutableFormat,
@@ -56,6 +74,10 @@ impl Default for NativeTarget {
 }
 
 const LINUX_X86_64_ALIASES: &[&str] = &["linux-x86_64", "x86_64-unknown-linux-gnu"];
+const X86_64_DATA_LAYOUT: NativeDataLayout = NativeDataLayout {
+    pointer_width_bits: 64,
+    endianness: NativeEndianness::Little,
+};
 
 const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[NativeTargetSpec {
     target: NativeTarget::LinuxX86_64,
@@ -63,6 +85,8 @@ const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[NativeTargetSpec {
     standard_triple: "x86_64-unknown-linux-gnu",
     aliases: LINUX_X86_64_ALIASES,
     architecture: NativeArchitecture::X86_64,
+    backend: NativeBackend::DirectX86_64,
+    data_layout: X86_64_DATA_LAYOUT,
     operating_system: NativeOperatingSystem::Linux,
     abi: NativeAbi::Gnu,
     executable_format: NativeExecutableFormat::Elf64,
@@ -106,6 +130,22 @@ impl NativeTarget {
         self.spec().architecture
     }
 
+    pub fn backend(self) -> NativeBackend {
+        self.spec().backend
+    }
+
+    pub fn data_layout(self) -> NativeDataLayout {
+        self.spec().data_layout
+    }
+
+    pub fn pointer_width_bits(self) -> u8 {
+        self.data_layout().pointer_width_bits
+    }
+
+    pub fn endianness(self) -> NativeEndianness {
+        self.data_layout().endianness
+    }
+
     pub fn operating_system(self) -> NativeOperatingSystem {
         self.spec().operating_system
     }
@@ -129,6 +169,22 @@ impl NativeTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeExecutableFormat {
     Elf64,
+}
+
+impl NativeArchitecture {
+    fn elf_machine(self) -> u16 {
+        match self {
+            NativeArchitecture::X86_64 => 62,
+        }
+    }
+}
+
+impl NativeEndianness {
+    fn elf_data_encoding(self) -> u8 {
+        match self {
+            NativeEndianness::Little => 1,
+        }
+    }
 }
 
 /// Optional view that lets the compiler report user-facing line numbers
@@ -277,15 +333,19 @@ fn compile_internal(
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
     let target = config.target;
-    let object = NativeCodeGenerator::new(source.clone(), user_view.clone(), target)
-        .compile(&expr)
-        .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic))?;
+    let object = match target.backend() {
+        NativeBackend::DirectX86_64 => {
+            NativeCodeGenerator::new(source.clone(), user_view.clone(), target).compile(&expr)
+        }
+    }
+    .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic))?;
     Ok(write_executable_for_target(target, object))
 }
 
 fn write_executable_for_target(target: NativeTarget, object: ObjectFile) -> Vec<u8> {
-    match target.executable_format() {
-        NativeExecutableFormat::Elf64 => elf::write_executable(object),
+    let spec = target.spec();
+    match spec.executable_format {
+        NativeExecutableFormat::Elf64 => elf::write_executable(object, spec),
     }
 }
 
@@ -36155,7 +36215,7 @@ impl Assembler {
 }
 
 mod elf {
-    use super::{ObjectFile, RelocKind, RelocTarget};
+    use super::{NativeTargetSpec, ObjectFile, RelocKind, RelocTarget};
 
     const PAGE_SIZE: u64 = 0x1000;
     const ELF_HEADER_SIZE: u64 = 64;
@@ -36164,13 +36224,13 @@ mod elf {
     const TEXT_VADDR: u64 = 0x401000;
     const TEXT_OFFSET: u64 = 0x1000;
 
-    pub(super) fn write_executable(mut object: ObjectFile) -> Vec<u8> {
+    pub(super) fn write_executable(mut object: ObjectFile, spec: &NativeTargetSpec) -> Vec<u8> {
         let data_offset = align_to(TEXT_OFFSET + object.text.len() as u64, PAGE_SIZE);
         let data_vaddr = TEXT_VADDR + (data_offset - TEXT_OFFSET);
         patch_relocations(&mut object, data_vaddr);
 
         let mut bytes = Vec::new();
-        write_elf_header(&mut bytes);
+        write_elf_header(&mut bytes, spec);
         write_program_header(
             &mut bytes,
             TEXT_OFFSET,
@@ -36215,12 +36275,12 @@ mod elf {
         }
     }
 
-    fn write_elf_header(bytes: &mut Vec<u8>) {
+    fn write_elf_header(bytes: &mut Vec<u8>, spec: &NativeTargetSpec) {
         bytes.extend_from_slice(b"\x7fELF");
-        bytes.extend_from_slice(&[2, 1, 1, 0]);
+        bytes.extend_from_slice(&[2, spec.data_layout.endianness.elf_data_encoding(), 1, 0]);
         bytes.extend_from_slice(&[0; 8]);
         write_u16(bytes, 2);
-        write_u16(bytes, 62);
+        write_u16(bytes, spec.architecture.elf_machine());
         write_u32(bytes, 1);
         write_u64(bytes, TEXT_VADDR);
         write_u64(bytes, ELF_HEADER_SIZE);
@@ -36261,9 +36321,9 @@ mod elf {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeAbi, NativeArchitecture, NativeCompilerConfig, NativeExecutableFormat,
-        NativeOperatingSystem, NativeTarget, PlatformSyscall, TargetPlatform,
-        compile_source_for_target, compile_source_to_elf,
+        NativeAbi, NativeArchitecture, NativeBackend, NativeCompilerConfig, NativeEndianness,
+        NativeExecutableFormat, NativeOperatingSystem, NativeTarget, PlatformSyscall,
+        TargetPlatform, compile_source_for_target, compile_source_to_elf,
     };
 
     #[test]
@@ -36274,6 +36334,7 @@ mod tests {
         assert_eq!(&bytes[..4], b"\x7fELF");
         assert_eq!(bytes[4], 2);
         assert_eq!(bytes[5], 1);
+        assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 62);
     }
 
     #[test]
@@ -36319,9 +36380,15 @@ mod tests {
         assert_eq!(spec.canonical_name, "linux-x86_64");
         assert_eq!(spec.standard_triple, "x86_64-unknown-linux-gnu");
         assert_eq!(spec.aliases, &["linux-x86_64", "x86_64-unknown-linux-gnu"]);
+        assert_eq!(spec.backend, NativeBackend::DirectX86_64);
+        assert_eq!(spec.data_layout.pointer_width_bits, 64);
+        assert_eq!(spec.data_layout.endianness, NativeEndianness::Little);
         assert_eq!(linux.name(), "linux-x86_64");
         assert_eq!(linux.standard_triple(), "x86_64-unknown-linux-gnu");
         assert_eq!(linux.architecture(), NativeArchitecture::X86_64);
+        assert_eq!(linux.backend(), NativeBackend::DirectX86_64);
+        assert_eq!(linux.pointer_width_bits(), 64);
+        assert_eq!(linux.endianness(), NativeEndianness::Little);
         assert_eq!(linux.operating_system(), NativeOperatingSystem::Linux);
         assert_eq!(linux.abi(), NativeAbi::Gnu);
         assert_eq!(linux.executable_format(), NativeExecutableFormat::Elf64);

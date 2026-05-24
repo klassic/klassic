@@ -48,12 +48,14 @@ implemented. The only implemented concrete target is Linux x86_64, which emits
 ELF64 executables directly from Rust without invoking an external assembler,
 linker, Java, Scala, sbt, or the JVM. The native compiler records each supported
 target in a metadata registry with its compact name, standard triple,
-architecture, operating system, ABI, and executable format, then keeps Linux
-syscall numbers and OS ABI constants behind a target-platform boundary. Those
-target-specific numbers live in a per-target table, so future target work can
-change syscall ids, fds, open modes, errno values, stat masks, clocks, mmap
-flags, and transfer limits without
-editing expression codegen directly. It reuses the parser, rewrite pass,
+architecture, backend, data layout, operating system, ABI, and executable
+format. The current target selects the direct x86_64 backend and little-endian
+64-bit layout, and the ELF writer emits header architecture/endianness fields
+from that metadata. Linux syscall numbers and OS ABI constants stay behind a
+target-platform boundary. Those target-specific numbers live in a per-target
+table, so future target work can change syscall ids, fds, open modes, errno
+values, stat masks, clocks, mmap flags, and transfer limits without editing
+expression codegen directly. It reuses the parser, rewrite pass,
 typechecker, and
 proof/trust checks, then emits
 handwritten x64 for the subset it currently supports. That subset now

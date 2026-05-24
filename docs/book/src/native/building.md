@@ -15,7 +15,9 @@ You can make the target explicit with `--target linux-x86_64` or the standard
 triple alias `--target x86_64-unknown-linux-gnu`, or use `--target native` on a
 Linux x86_64 host. Linux x86_64 is currently the only implemented concrete
 target, but keeping the target visible in the command line lets future targets
-reuse the same build surface.
+reuse the same build surface. Internally the target registry records the backend
+and data layout as well as the OS/ABI/file format, so future backends can plug
+into the same target-selection path instead of being hardcoded into the CLI.
 
 That's the whole flow. The compiler runs the same parse → rewrite →
 type-check → proof-check pipeline as the evaluator, then lowers a

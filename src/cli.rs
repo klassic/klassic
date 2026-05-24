@@ -82,22 +82,25 @@ pub fn parse_command_line(args: &[String]) -> Option<ParsedCommand> {
     Some(ParsedCommand { action, config })
 }
 
-pub fn usage() -> &'static str {
-    "Usage: klassic [--deny-trust] [--warn-trust] [--target <target>] (-f <fileName> | -e <expression> | build <fileName> -o <output>)\n\
+pub fn usage() -> String {
+    format!(
+        "Usage: klassic [--deny-trust] [--warn-trust] [--target <target>] (-f <fileName> | -e <expression> | build <fileName> -o <output>)\n\
      Options:\n\
        --deny-trust   : reject programs that depend on trusted proofs\n\
        --warn-trust   : warn when trusted proofs are used\n\
-       --target <target>: native build target (supported: linux-x86_64, x86_64-unknown-linux-gnu, native)\n\
+       --target <target>: native build target (supported: {})\n\
        <fileName>     : read a program from <fileName> and execute it\n\
        -e <expression>: evaluate <expression>\n\
-       build <fileName> -o <output>: compile <fileName> to a native Linux x86_64 executable\n"
+       build <fileName> -o <output>: compile <fileName> to a native Linux x86_64 executable\n",
+        NativeTarget::SUPPORTED_NAMES.join(", ")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use klassic_native::NativeTarget;
 
-    use super::{RunAction, parse_command_line};
+    use super::{RunAction, parse_command_line, usage};
 
     #[test]
     fn parses_expression_invocation() {
@@ -211,5 +214,10 @@ mod tests {
             "sample".to_string(),
         ];
         assert!(parse_command_line(&args).is_none());
+    }
+
+    #[test]
+    fn usage_lists_supported_native_targets_from_registry() {
+        assert!(usage().contains(&NativeTarget::SUPPORTED_NAMES.join(", ")));
     }
 }

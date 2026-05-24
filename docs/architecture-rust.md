@@ -63,7 +63,8 @@ cargo run -- -e "1 + 2"
 - Carries an explicit `NativeTarget`; the only implemented target is currently
   `LinuxX86_64`
 - Keeps supported targets in a metadata registry containing the compact name,
-  standard triple, architecture, operating system, ABI, and executable format
+  standard triple, architecture, direct-codegen backend, data layout,
+  operating system, ABI, and executable format
 - Keeps target-specific syscall numbers and OS constants such as fds, open
   modes, errno values, stat masks, clocks, mmap flags, and sendfile limits in a
   platform constants table
