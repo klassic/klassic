@@ -100,30 +100,43 @@ The helper is called `fileExtension` rather than `extension` because
 
 ## std.option
 
-Lightweight Option/Maybe helpers backed by `null` for "none" and the
-value itself for "some" — same convention `find` in `std.list`
-already uses. Once Klassic gains ADTs the underlying representation
-will change, but the function-style API will keep working.
+ADT-based Option/Maybe with both function-style helpers and
+extension methods on `Option<a>`:
 
 ```klassic
-import std.option.{isSome, isNone, getOrElse, mapOption}
+import std.option.{some, none, getOrElse}
 
-println(isSome(null))            // false
-println(isSome(7))               // true
-println(getOrElse(null, 99))     // 99
-println(getOrElse("hi", "x"))    // "hi"
-println(mapOption(7, (x) => x * 2)) // 14
-println(mapOption(null, (x) => x))  // null
+val maybe = some(7)
+println(getOrElse(maybe, 0))     // 7   (function-style)
+println(maybe.getOrElse(0))      // 7   (method-style)
+
+println(none().isNone())         // true
+println(some("hi").isSome())     // true
+println(some(2).mapOption((x) => x * 10).getOrElse(0)) // 20
+```
+
+The underlying ADT lives in the same file:
+
+```klassic
+enum Option<a> {
+  case Some(value: a)
+  case None
+}
+```
+
+Pattern-match on it directly when the helpers don't fit:
+
+```klassic
+val n = some(42) match {
+  case Some(v) => v
+  case None    => 0
+}
 ```
 
 ## std.result
 
-Result-style **constructors**. The two records `#ROk` and `#RErr`
-encode the success / failure tag; users inspect the payload with
-ordinary field access. Klassic's record typechecker statically
-rejects a `value` access on `#RErr` (and vice versa), so the
-inspector surface (`isOk`, `unwrapOr`, `mapResult`, ...) is on hold
-until ADTs or a union type land.
+ADT-based Result/Either with both function-style helpers and
+extension methods on `Result<a, e>`:
 
 ```klassic
 import std.result.{ok, err}
@@ -131,8 +144,29 @@ import std.result.{ok, err}
 val good = ok("payload")
 val bad  = err("nope")
 
-println(good.value)     // "payload"
-println(bad.message)    // "nope"
+println(good.isOk())                   // true
+println(bad.isErr())                   // true
+println(good.unwrapOr("fallback"))     // "payload"
+println(bad.unwrapOr("fallback"))      // "fallback"
+println(good.mapResult((x) => x + "!").unwrapOr("")) // "payload!"
+```
+
+The underlying ADT:
+
+```klassic
+enum Result<a, e> {
+  case Ok(value: a)
+  case Err(message: e)
+}
+```
+
+Direct pattern matching is also available:
+
+```klassic
+val message = ok(42) match {
+  case Ok(v)  => "got " + toString(v)
+  case Err(m) => "error: " + m
+}
 ```
 
 ## std.map / std.set
