@@ -50,4 +50,10 @@ extension <a>(this: List<a>) {
 extension (this: List<Int>) {
   def total() = sum(this)
   def productOf() = product(this)
+  def minimum() = foldLeft(tail(this))(head(this))((a, b) => if((a <= b)) a else b)
+  def maximum() = foldLeft(tail(this))(head(this))((a, b) => if((a >= b)) a else b)
+}
+
+extension (this: List<Double>) {
+  def totalDouble() = foldLeft(this)(0.0)((a, b) => a + b)
 }
