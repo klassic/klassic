@@ -50,5 +50,7 @@
 # Reference
 
 - [Standard Prelude](./reference/stdlib-prelude.md)
+- [Standard Library Modules](./reference/stdlib-modules.md)
+- [Extension Methods](./reference/extension-methods.md)
 - [Native Compiler Coverage](./reference/native-coverage.md)
 - [Architecture Overview](./reference/architecture.md)
