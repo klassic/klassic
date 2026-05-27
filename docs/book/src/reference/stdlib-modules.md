@@ -135,6 +135,29 @@ println(unwrapOr(good, "default"))   // "payload"
 println(unwrapOr(bad, "default"))    // "default"
 ```
 
+## std.cli
+
+Tiny CLI-argument helpers for scripts that read
+`CommandLine#args()`. The module pairs naturally with
+`klassic run file.kl -- <args>` (PR 7) — every member operates on
+the `List<String>` that `--` populates.
+
+```klassic
+import std.cli.{flag, option, positionals}
+
+val args = CommandLine#args()
+val verbose = flag(args, "--verbose")        // Boolean
+val output  = option(args, "--out")          // String or null
+val files   = positionals(args)              // remaining non-flag args
+```
+
+`flag(args, name)` returns true iff `name` appears as one of the
+tokens in `args`. `option(args, name)` finds the first occurrence
+and returns the token that follows it (or `null` if absent).
+`positionals(args)` drops everything that starts with `--` and
+returns the rest; callers that need to pair flags with values
+should use `flag` / `option` directly on the original list.
+
 ## std.test
 
 Lightweight assertion helpers for scripting and small test programs.

@@ -1,0 +1,23 @@
+module std.cli
+
+// Plain-Klassic helpers for parsing the `--`-separated arguments
+// available through `CommandLine#args()`. Designed for tiny scripts;
+// users with more demanding needs should hand-roll their parser.
+
+// Returns true when `name` appears verbatim in `args` (e.g.
+// `--verbose`).
+def flag(args, name) = if(isEmpty(args)) false else if((head(args) == name)) true else flag(tail(args), name)
+
+// Returns the value associated with the first occurrence of `name`
+// in `args` (`--out OUT` form: the value follows the flag).
+// Returns `null` when the flag is missing or has no value after it.
+def option(args, name) = if(isEmpty(args)) null else if((head(args) == name)) (if(isEmpty(tail(args))) null else head(tail(args))) else option(tail(args), name)
+
+// Returns the arguments that do not look like `--flag` style flags.
+// This is the bare positional-args helper; it does not try to be
+// clever about pairing flags with values — callers that need the
+// distinction should use `flag(args, name)` / `option(args, name)`
+// on the original arg list directly.
+def isFlagToken(tok) = if((length(tok) < 2)) false else if((substring(tok, 0, 2) == "--")) true else false
+
+def positionals(args) = stdlibFilter(args, (tok) => if(isFlagToken(tok)) false else true)
