@@ -93,6 +93,75 @@ const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[NativeTargetSpec {
     executable_format: NativeExecutableFormat::Elf64,
 }];
 
+/// A target that is acknowledged by the compiler but not yet wired up
+/// to a working backend. Listing planned targets here lets `--target`
+/// produce a "recognized but not implemented yet" diagnostic instead of
+/// a generic "unknown target" error, which matches the roadmap's
+/// `TargetSpec`-style diagnostic policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannedTarget {
+    pub triple: &'static str,
+    pub aliases: &'static [&'static str],
+    pub backend: &'static str,
+    pub artifact: &'static str,
+    pub tier: u8,
+}
+
+const PLANNED_TARGETS: &[PlannedTarget] = &[
+    PlannedTarget {
+        triple: "x86_64-unknown-linux-musl",
+        aliases: &["linux-x86_64-musl"],
+        backend: "direct-elf",
+        artifact: "executable",
+        tier: 1,
+    },
+    PlannedTarget {
+        triple: "aarch64-unknown-linux-gnu",
+        aliases: &["linux-aarch64"],
+        backend: "direct-elf",
+        artifact: "executable",
+        tier: 1,
+    },
+    PlannedTarget {
+        triple: "wasm32-wasi",
+        aliases: &["wasm-wasi"],
+        backend: "wasm",
+        artifact: "wasm-module",
+        tier: 2,
+    },
+    PlannedTarget {
+        triple: "x86_64-apple-darwin",
+        aliases: &["macos-x86_64"],
+        backend: "portable-c",
+        artifact: "executable",
+        tier: 2,
+    },
+    PlannedTarget {
+        triple: "aarch64-apple-darwin",
+        aliases: &["macos-aarch64"],
+        backend: "portable-c",
+        artifact: "executable",
+        tier: 2,
+    },
+    PlannedTarget {
+        triple: "x86_64-pc-windows-msvc",
+        aliases: &["windows-x86_64"],
+        backend: "portable-c",
+        artifact: "executable",
+        tier: 2,
+    },
+];
+
+/// Result of recognising a `--target` argument. Distinguishing
+/// `Supported`, `Planned`, and `Unknown` lets the CLI emit the right
+/// diagnostic without inventing one per call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetRecognition {
+    Supported(NativeTarget),
+    Planned(&'static PlannedTarget),
+    Unknown,
+}
+
 impl NativeTarget {
     pub const SUPPORTED_NAMES: &'static [&'static str] =
         &["linux-x86_64", "x86_64-unknown-linux-gnu", "native"];
@@ -183,6 +252,61 @@ impl NativeTarget {
             .iter()
             .find(|spec| spec.target == self)
             .expect("every NativeTarget variant must have a NativeTargetSpec")
+    }
+
+    /// Returns metadata for every target the compiler acknowledges, in
+    /// the order they appear in the target matrix.
+    pub fn planned_targets() -> &'static [PlannedTarget] {
+        PLANNED_TARGETS
+    }
+
+    /// Recognises a `--target` argument as supported, planned, or
+    /// unknown. Used to pick the right diagnostic at the call site.
+    pub fn recognize(name: &str) -> TargetRecognition {
+        if name == "native" {
+            return match Self::host() {
+                Some(target) => TargetRecognition::Supported(target),
+                None => TargetRecognition::Unknown,
+            };
+        }
+        if let Some(target) = Self::parse(name) {
+            return TargetRecognition::Supported(target);
+        }
+        if let Some(planned) = PLANNED_TARGETS
+            .iter()
+            .find(|planned| planned.triple == name || planned.aliases.contains(&name))
+        {
+            return TargetRecognition::Planned(planned);
+        }
+        TargetRecognition::Unknown
+    }
+
+    /// Renders the target matrix as a human-readable table. Used by the
+    /// `klassic targets` subcommand. Format mirrors
+    /// `docs/native-coverage.md#target-matrix`.
+    pub fn target_matrix() -> String {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "{:<32}{:<14}{:<14}{:<6}{}",
+            "TARGET", "BACKEND", "ARTIFACT", "TIER", "STATUS"
+        ));
+        for spec in Self::supported_specs() {
+            lines.push(format!(
+                "{:<32}{:<14}{:<14}{:<6}{}",
+                spec.standard_triple,
+                spec.backend.name(),
+                "executable",
+                "0",
+                "supported"
+            ));
+        }
+        for planned in PLANNED_TARGETS {
+            lines.push(format!(
+                "{:<32}{:<14}{:<14}{:<6}{}",
+                planned.triple, planned.backend, planned.artifact, planned.tier, "planned"
+            ));
+        }
+        lines.join("\n")
     }
 }
 

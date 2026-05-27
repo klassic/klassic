@@ -6,9 +6,11 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process::ExitCode;
 
-use cli::{ExecutionConfig, ParsedCommand, RunAction, parse_command_line, usage};
+use cli::{
+    ExecutionConfig, ParsedCommand, RunAction, parse_command_line, render_command_line_error,
+};
 use klassic_eval::{Evaluator, EvaluatorConfig};
-use klassic_native::{NativeCompilerConfig, compile_source_with_prelude_for_target};
+use klassic_native::{NativeCompilerConfig, NativeTarget, compile_source_with_prelude_for_target};
 
 /// The standard prelude is bundled into the compiler at build time. It is
 /// loaded as a separate translation unit so user code is parsed in its own
@@ -19,9 +21,12 @@ const STDLIB_PRELUDE_NAME: &str = "<stdlib>";
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let Some(command) = parse_command_line(&args) else {
-        eprintln!("{}", usage());
-        return ExitCode::from(1);
+    let command = match parse_command_line(&args) {
+        Ok(command) => command,
+        Err(error) => {
+            eprint!("{}", render_command_line_error(&error));
+            return ExitCode::from(1);
+        }
     };
 
     match run(command) {
@@ -116,6 +121,10 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
         }
         RunAction::StartRepl => {
             start_repl(command.config);
+            Ok(())
+        }
+        RunAction::ListTargets => {
+            println!("{}", NativeTarget::target_matrix());
             Ok(())
         }
     }

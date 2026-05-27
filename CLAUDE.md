@@ -25,6 +25,8 @@ cargo run -- path/to/program.kl                      # evaluate a file
 cargo run -- -f path/to/program.kl                   # equivalent to above
 cargo run                                            # REPL (`:history`, `:exit`)
 cargo run -- build path/to/program.kl -o program     # native build (Linux x86_64)
+cargo run -- targets                                  # list known native targets
+cargo run -- --target x86_64-unknown-linux-gnu build path/to/program.kl -o program
 cargo run -- --warn-trust path/to/program.kl         # report trusted proofs
 cargo run -- --deny-trust path/to/program.kl         # reject trusted proofs
 ```
