@@ -35,12 +35,15 @@ The module also installs extension methods on `List<a>` and
 `List<Int>` so the same operations are reachable via dot syntax:
 
 ```klassic
-println([1, 2, 3].lengthOf())     // 3
-println([1, 2, 3].isEmptyList())  // false
-println([1, 2, 3].headOr(0))      // 1
+println([1, 2, 3].lengthOf())          // 3
+println([1, 2, 3].isEmptyList())       // false
+println([1, 2, 3].headOr(0))           // 1
 println([1, 2, 3].filterBy((x) => x > 1))
-println([1, 2, 3, 4].total())     // 10  (List<Int>)
-println([1, 2, 3, 4].productOf()) // 24  (List<Int>)
+println([1, 2, 3, 4].total())          // 10  (List<Int>)
+println([1, 2, 3, 4].productOf())      // 24  (List<Int>)
+println([3, 1, 4, 1, 5, 9].minimum())  // 1   (List<Int>)
+println([3, 1, 4, 1, 5, 9].maximum())  // 9   (List<Int>)
+println([1.5, 2.5, 3.5].totalDouble()) // 7.5 (List<Double>)
 ```
 
 ## std.string
@@ -58,6 +61,9 @@ println("klassic".containsText("la"))     // true
 println("klassic".startsWithText("kl"))   // true
 println("klassic".lengthChars())          // 7
 println("hello".reverseChars())           // "olleh"
+println("hello".takeChars(3))             // "hel"
+println("hello".dropChars(2))             // "llo"
+println("hello".sliceFromTo(1, 4))        // "ell"
 ```
 
 ## std.math
