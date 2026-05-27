@@ -20491,6 +20491,48 @@ fn evaluator_supports_enum_declarations_and_postfix_match() {
     );
 }
 
+/// The shipped `examples/stdlib-v0.2-demo.kl` script exercises the
+/// full v0.2 surface — extension methods on List / String / Int /
+/// Map plus an ADT `match`. Pinning its expected stdout means any
+/// stdlib regression that touches one of those areas trips here.
+#[test]
+fn stdlib_v0_2_demo_example_round_trips_end_to_end() {
+    let demo_path = std::env::current_dir()
+        .expect("current dir should be readable")
+        .join("examples/stdlib-v0.2-demo.kl");
+    let output = Command::new(klassic_bin())
+        .arg(demo_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "55\n",
+            "3628800\n",
+            "HELLO, KLASSIC!\n",
+            "spaces\n",
+            "[alpha:beta:gamma]\n",
+            "true\n",
+            "10\n",
+            "7\n",
+            "55\n",
+            "[2, 4, 6, 8, 10]\n",
+            "true\n",
+            "0\n",
+            "2\n",
+            "42\n",
+            "got 42\n",
+        )
+    );
+}
+
 /// Recursive ADTs (linked list, tree) work end to end: declarations
 /// install their constructors, `match` arms bind fields with the
 /// right type, and recursive helpers terminate.
