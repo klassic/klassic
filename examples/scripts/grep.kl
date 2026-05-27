@@ -1,0 +1,27 @@
+// Minimal grep utility — usage:
+//   klassic run examples/scripts/grep.kl -- <pattern> <path>
+//
+// Prints every line in <path> that contains <pattern>. Pattern is
+// a literal substring match (no regex). Demonstrates std.cli /
+// std.file plus the existing `contains` builtin on String.
+
+import std.cli.{positionals}
+import std.file.{readAll}
+
+val args = positionals(CommandLine#args())
+
+if((size(args) < 2)) {
+  printlnError("usage: klassic run grep.kl -- <pattern> <path>")
+  Process#exit(1)
+}
+
+val pattern = head(args)
+val path = head(tail(args))
+val text = readAll(path)
+val ls = text.lines()
+
+def maybePrint(line: String, pat: String) = if(line.contains(pat)) println(line) else ()
+
+def printMatching(remaining: List<String>, pat: String) = if(isEmpty(remaining)) () else { maybePrint(head(remaining), pat); printMatching(tail(remaining), pat) }
+
+printMatching(ls, pattern)
