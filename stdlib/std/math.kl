@@ -28,3 +28,12 @@ extension (this: Int) {
   def signOf() = if((this > 0)) 1 else if((this < 0)) -1 else 0
   def clampTo(lo, hi) = clamp(this, lo, hi)
 }
+
+// Method-style access for Double-typed receivers. Float and Double
+// share the same dispatch key so single-precision values reach
+// these too.
+extension (this: Double) {
+  def absValueD() = if((this < 0.0)) -this else this
+  def signOfD() = if((this > 0.0)) 1 else if((this < 0.0)) -1 else 0
+  def clampToD(lo, hi) = if((this < lo)) lo else if((this > hi)) hi else this
+}
