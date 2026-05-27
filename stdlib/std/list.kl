@@ -1,0 +1,32 @@
+module std.list
+
+// Standard list helpers exposed under `std.list`. Implementations are
+// plain Klassic and intentionally identical to the v0.1 prelude
+// `stdlib*` aliases so the evaluator and native compiler reach the
+// same answer for every member.
+
+def range(start, end) = if((start >= end)) [] else cons(start)(range(start + 1, end))
+
+def rangeInclusive(start, end) = range(start, end + 1)
+
+def take(xs, n) = if((n <= 0)) [] else if(isEmpty(xs)) [] else cons(head(xs))(take(tail(xs), n - 1))
+
+def drop(xs, n) = if((n <= 0)) xs else if(isEmpty(xs)) xs else drop(tail(xs), n - 1)
+
+def filter(xs, p) = if(isEmpty(xs)) [] else if(p(head(xs))) cons(head(xs))(filter(tail(xs), p)) else filter(tail(xs), p)
+
+def find(xs, p) = if(isEmpty(xs)) null else if(p(head(xs))) head(xs) else find(tail(xs), p)
+
+def any(xs, p) = if(isEmpty(xs)) false else if(p(head(xs))) true else any(tail(xs), p)
+
+def all(xs, p) = if(isEmpty(xs)) true else if(p(head(xs))) all(tail(xs), p) else false
+
+def count(xs, p) = foldLeft(xs)(0)((acc, x) => if(p(x)) acc + 1 else acc)
+
+def replicate(n, x) = if((n <= 0)) [] else cons(x)(replicate(n - 1, x))
+
+def last(xs) = if(isEmpty(tail(xs))) head(xs) else last(tail(xs))
+
+def sum(xs) = foldLeft(xs)(0)((acc, x) => acc + x)
+
+def product(xs) = foldLeft(xs)(1)((acc, x) => acc * x)

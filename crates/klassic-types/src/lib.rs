@@ -2685,8 +2685,19 @@ impl TypeChecker {
             return Ok(());
         }
 
-        let exports = resolve_user_module_types(path)
-            .ok_or_else(|| type_error(span, format!("unknown module `{path}`")))?;
+        let exports = resolve_user_module_types(path).ok_or_else(|| {
+            let message = if path.starts_with("std.") {
+                format!(
+                    "module `{path}` is part of the standard library but is not yet \
+                     available in native builds. Run the program with the evaluator \
+                     (klassic file.kl) or wait for the native stdlib module loader \
+                     described in docs/roadmap-targets-stdlib.md."
+                )
+            } else {
+                format!("unknown module `{path}`")
+            };
+            type_error(span, message)
+        })?;
 
         if let Some(alias) = alias {
             for (name, stored) in &exports {

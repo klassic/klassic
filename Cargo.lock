@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "klassic-eval",
  "klassic-native",
+ "klassic-runtime",
 ]
 
 [[package]]

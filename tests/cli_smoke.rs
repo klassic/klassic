@@ -20170,3 +20170,74 @@ fn recursive_user_def_coexists_with_thread_spawn() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// PR 6: the evaluator can import a stdlib module by module-qualified
+/// name and use its exports just like a user-defined module.
+#[test]
+fn evaluator_imports_std_list_members() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.list.{range, sum}\nprintln(range(0, 5))\nprintln(sum(range(1, 6)))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // -e prints the final expression's value; the last println returns
+    // Unit, which is then displayed as `()`.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[0, 1, 2, 3, 4]\n15\n()\n"
+    );
+}
+
+/// PR 6: native compile path does not yet bundle stdlib modules. The
+/// compiler emits a source-located diagnostic pointing users at the
+/// evaluator until PR 7 closes the gap.
+#[test]
+fn native_build_rejects_std_module_import_with_helpful_message() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_std_native_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_std_native_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "import std.list.{range}\nprintln(range(0, 3))\n",
+    )
+    .expect("temp source file should write");
+
+    let output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !output.status.success(),
+        "native build should fail when stdlib module is imported"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("std.list"),
+        "stderr should mention std.list: {stderr}"
+    );
+    assert!(
+        stderr.contains("not yet available in native builds"),
+        "stderr should explain the limitation: {stderr}"
+    );
+}

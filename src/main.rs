@@ -74,15 +74,10 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
             Ok(())
         }
         RunAction::EvaluateExpression(expression) => {
-            let config = EvaluatorConfig {
+            let mut evaluator = prepare_evaluator(EvaluatorConfig {
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
-            };
-            let mut evaluator = Evaluator::with_config(config);
-            if let Err(error) = evaluator.evaluate_text(STDLIB_PRELUDE_NAME, STDLIB_PRELUDE) {
-                eprintln!("{error}");
-                return Err(1);
-            }
+            })?;
             match evaluator.evaluate_text("<expression>", &expression) {
                 Ok(value) => {
                     println!("{value}");
@@ -102,15 +97,10 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     return Err(1);
                 }
             };
-            let config = EvaluatorConfig {
+            let mut evaluator = prepare_evaluator(EvaluatorConfig {
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
-            };
-            let mut evaluator = Evaluator::with_config(config);
-            if let Err(error) = evaluator.evaluate_text(STDLIB_PRELUDE_NAME, STDLIB_PRELUDE) {
-                eprintln!("{error}");
-                return Err(1);
-            }
+            })?;
             match evaluator.evaluate_text(&path.display().to_string(), &text) {
                 Ok(_) => Ok(()),
                 Err(error) => {
@@ -130,17 +120,32 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
     }
 }
 
+fn prepare_evaluator(config: EvaluatorConfig) -> Result<Evaluator, u8> {
+    let mut evaluator = Evaluator::with_config(config);
+    if let Err(error) = evaluator.evaluate_text(STDLIB_PRELUDE_NAME, STDLIB_PRELUDE) {
+        eprintln!("{error}");
+        return Err(1);
+    }
+    for module in klassic_runtime::STDLIB_MODULES {
+        if let Err(error) = evaluator.evaluate_text(module.diagnostic_name, module.source) {
+            eprintln!("{error}");
+            return Err(1);
+        }
+    }
+    Ok(evaluator)
+}
+
 fn start_repl(config: ExecutionConfig) {
     let mut history = Vec::<String>::new();
     let mut buffer = String::new();
-    let mut evaluator = Evaluator::with_config(EvaluatorConfig {
+    let mut evaluator = match prepare_evaluator(EvaluatorConfig {
         deny_trust: config.deny_trust,
         warn_trust: config.warn_trust,
-    });
-    if let Err(error) = evaluator.evaluate_text(STDLIB_PRELUDE_NAME, STDLIB_PRELUDE) {
-        eprintln!("failed to load stdlib prelude: {error}");
-        return;
-    }
+    }) {
+        Ok(evaluator) => evaluator,
+        Err(_) => return,
+    };
+    let _ = STDLIB_PRELUDE_NAME; // keep marker available for future REPL diagnostics
 
     loop {
         print!("{}", if buffer.is_empty() { "> " } else { "| " });

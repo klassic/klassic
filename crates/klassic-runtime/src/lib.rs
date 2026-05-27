@@ -10,8 +10,10 @@
 pub mod builtins;
 pub mod error;
 pub mod fs;
+pub mod stdlib_bundle;
 pub mod system;
 
 pub use error::{RuntimeError, RuntimeErrorKind};
 pub use fs::FileSystemInterface;
+pub use stdlib_bundle::{EmbeddedModule, STDLIB_MODULES};
 pub use system::SystemInterface;

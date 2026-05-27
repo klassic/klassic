@@ -31,6 +31,7 @@ resolver = "2"
 [dependencies]
 klassic-eval = { path = "crates/klassic-eval" }
 klassic-native = { path = "crates/klassic-native" }
+klassic-runtime = { path = "crates/klassic-runtime" }
 
 [[bin]]
 name = "klassic"
