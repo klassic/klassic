@@ -20305,6 +20305,32 @@ fn extension_methods_dispatch_via_dot_syntax() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "HI\nababab\n()\n");
 }
 
+/// A generic extension binds its type parameter `a` once across the
+/// receiver and the method bodies, so `[1 2 3].headOr(0)` and
+/// `["x" "y"].headOr("")` both compile from one declaration.
+#[test]
+fn generic_extension_methods_unify_type_parameter() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "extension <a>(this: List<a>) {\n  \
+               def headOr(d) = if(isEmpty(this)) d else head(this)\n\
+             }\n\
+             println([1 2 3].headOr(0))\n\
+             println([].headOr(99))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n99\n()\n");
+}
+
 /// Extension methods on a concrete instantiation of a generic type
 /// (`List<Int>` here). The dispatch key normalises the receiver type
 /// to its outer constructor, so the method is reachable from any

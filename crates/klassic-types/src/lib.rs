@@ -4030,7 +4030,18 @@ fn parse_type_annotation_with_named_vars(
         "Prop" => Type::Prop,
         "String" => Type::String,
         "Unit" => Type::Unit,
-        other => Type::Named(other.to_string()),
+        other => {
+            // Identifiers pre-registered in `named` are treated as
+            // type variables for this annotation context — extension
+            // declarations seed `named` with their `<type-params>`
+            // header so a generic `extension <a>(this: List<a>)`
+            // unifies `a` consistently across the receiver and the
+            // method bodies.
+            if let Some(ty) = named.get(other) {
+                return ty.clone();
+            }
+            Type::Named(other.to_string())
+        }
     }
 }
 
