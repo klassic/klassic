@@ -20491,6 +20491,62 @@ fn evaluator_supports_enum_declarations_and_postfix_match() {
     );
 }
 
+/// Recursive ADTs (linked list, tree) work end to end: declarations
+/// install their constructors, `match` arms bind fields with the
+/// right type, and recursive helpers terminate.
+#[test]
+fn evaluator_handles_recursive_enums() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Tree { case Leaf(value: Int); case Branch(left: Tree, right: Tree) }\n\
+             def total(t) = t match {\n  \
+               case Leaf(v) => v\n  \
+               case Branch(l, r) => total(l) + total(r)\n\
+             }\n\
+             val t = Branch(Leaf(1), Branch(Leaf(2), Leaf(3)))\n\
+             println(total(t))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "6\n()\n");
+}
+
+/// Wildcard `case _ => ...` catches every variant that does not
+/// match an earlier arm. The arm reports the variant name via
+/// `toString` so callers can sanity-check the runtime tag.
+#[test]
+fn evaluator_match_wildcard_arm_catches_unmatched_variant() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Color { case Red; case Green; case Blue }\n\
+             val c = Green\n\
+             val name = c match {\n  \
+               case Red => \"red\"\n  \
+               case _   => \"other\"\n\
+             }\n\
+             println(name)",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "other\n()\n");
+}
+
 /// Enum extension methods round-trip through dot syntax — both
 /// `Option<a>` and `Result<a, e>` work via either the function-style
 /// helpers or the extension-method form.
