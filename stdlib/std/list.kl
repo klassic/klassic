@@ -29,3 +29,25 @@ def last(xs) = if(isEmpty(tail(xs))) head(xs) else last(tail(xs))
 def sum(xs) = foldLeft(xs)(0)((acc, x) => acc + x)
 
 def product(xs) = foldLeft(xs)(1)((acc, x) => acc * x)
+
+// Method-style helpers for any list. `this.method()` syntax delegates
+// to the equivalent module-level def above; users can pick whichever
+// reads better at the call site.
+extension <a>(this: List<a>) {
+  def isEmptyList() = isEmpty(this)
+  def lengthOf() = size(this)
+  def takeN(n) = take(this, n)
+  def dropN(n) = drop(this, n)
+  def filterBy(p) = filter(this, p)
+  def findBy(p) = find(this, p)
+  def anyMatch(p) = any(this, p)
+  def allMatch(p) = all(this, p)
+  def countBy(p) = count(this, p)
+  def headOr(d) = if(isEmpty(this)) d else head(this)
+  def lastItem() = last(this)
+}
+
+extension (this: List<Int>) {
+  def total() = sum(this)
+  def productOf() = product(this)
+}
