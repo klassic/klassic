@@ -1,0 +1,28 @@
+// Word count utility — usage:
+//   klassic run examples/scripts/wc.kl -- <path>
+//
+// Prints `<lines> <words> <chars> <path>` to stdout. The script
+// uses the v0.2 stdlib modules (`std.cli`, `std.file`).
+//
+// Caveat: word counting uses `split(text, " ")` and counts every
+// whitespace-separated token, including consecutive blanks. Good
+// enough for a script-language smoke test; refine with `trim` /
+// regex once those land in the stdlib.
+
+import std.cli.{positionals}
+import std.file.{readAll}
+
+val args = positionals(CommandLine#args())
+
+if(isEmpty(args)) {
+  printlnError("usage: klassic run wc.kl -- <path>")
+  Process#exit(1)
+}
+
+val path = head(args)
+val text = readAll(path)
+val linesCount = size(split(text, "\n"))
+val wordsCount = size(split(text, " "))
+val charsCount = length(text)
+
+println(toString(linesCount) + " " + toString(wordsCount) + " " + toString(charsCount) + " " + path)
