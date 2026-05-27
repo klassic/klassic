@@ -19,3 +19,11 @@ def expectEqualsInt(name, expected, actual) = if((expected == actual)) passed(na
 def expectEqualsString(name, expected, actual) = if((expected == actual)) passed(name) else failed(name, "expected " + expected + " but got " + actual)
 
 def fail(name, reason) = failed(name, reason)
+
+// Runs `body` as a named test suite. The header `[suite] <name>`
+// prints first; `body` must be a thunk (`() => { ... }`) so the
+// header lands before the contained `expect...` lines.
+def suite(name, body) = {
+  println("[suite] " + name)
+  body()
+}
