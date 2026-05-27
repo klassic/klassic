@@ -135,6 +135,25 @@ println(good.value)     // "payload"
 println(bad.message)    // "nope"
 ```
 
+## std.map / std.set
+
+Thin wrappers around the existing `Map#*` and `Set#*` builtins.
+
+```klassic
+import std.map.{containsKey, get, getOrElse}
+import std.set.{contains}
+
+val users = %["alice": 1, "bob": 2]
+println(containsKey(users, "alice"))         // true
+println(getOrElse(users, "missing", 0))      // 0
+
+val tags = %("rust", "klassic")
+println(contains(tags, "rust"))               // true
+```
+
+`std.map` also adds `getOrElse(m, key, fallback)` since the
+underlying builtin only returns the raw value (or fails).
+
 ## std.dir
 
 Wraps the existing `Dir#*` builtins. All members delegate to their

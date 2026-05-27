@@ -36,6 +36,8 @@ const STD_ENV_SOURCE: &str = include_str!("../../../stdlib/std/env.kl");
 const STD_FILE_SOURCE: &str = include_str!("../../../stdlib/std/file.kl");
 const STD_PROCESS_SOURCE: &str = include_str!("../../../stdlib/std/process.kl");
 const STD_DIR_SOURCE: &str = include_str!("../../../stdlib/std/dir.kl");
+const STD_MAP_SOURCE: &str = include_str!("../../../stdlib/std/map.kl");
+const STD_SET_SOURCE: &str = include_str!("../../../stdlib/std/set.kl");
 
 /// Every embedded module the compiler ships with. The driver loads
 /// these in order before user code so the user's source sees their
@@ -100,6 +102,16 @@ pub const STDLIB_MODULES: &[EmbeddedModule] = &[
         path: "std.dir",
         diagnostic_name: "<stdlib std.dir>",
         source: STD_DIR_SOURCE,
+    },
+    EmbeddedModule {
+        path: "std.map",
+        diagnostic_name: "<stdlib std.map>",
+        source: STD_MAP_SOURCE,
+    },
+    EmbeddedModule {
+        path: "std.set",
+        diagnostic_name: "<stdlib std.set>",
+        source: STD_SET_SOURCE,
     },
 ];
 

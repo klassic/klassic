@@ -1,0 +1,9 @@
+module std.set
+
+// Set helpers wrapping the existing `Set#*` builtins.
+
+def contains(s, value) = Set#contains(s, value)
+
+def isEmpty(s) = Set#isEmpty(s)
+
+def size(s) = Set#size(s)

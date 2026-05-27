@@ -1,0 +1,16 @@
+module std.map
+
+// Map helpers wrapping the existing `Map#*` builtins so callers
+// can use module-qualified imports.
+
+def containsKey(m, key) = Map#containsKey(m, key)
+
+def containsValue(m, value) = Map#containsValue(m, value)
+
+def get(m, key) = Map#get(m, key)
+
+def isEmpty(m) = Map#isEmpty(m)
+
+def size(m) = Map#size(m)
+
+def getOrElse(m, key, fallback) = if(Map#containsKey(m, key)) Map#get(m, key) else fallback
