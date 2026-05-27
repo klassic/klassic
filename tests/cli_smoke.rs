@@ -20433,6 +20433,116 @@ fn shebang_line_is_stripped_from_source() {
     );
 }
 
+/// Stdlib v0.2 ships record-based Option helpers and Result
+/// constructors. The full Result inspector surface is on hold until
+/// ADTs land — Klassic's record typechecker statically rejects
+/// `.value` on `RErr`, so `unwrapOr` and friends would need either
+/// a true union type or a permissive top type to be safe.
+#[test]
+fn evaluator_imports_std_option_and_result() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.option.{getOrElse, isSome, isNone}\n\
+             import std.result.{ok, err}\n\
+             println(getOrElse(null, 99))\n\
+             println(isSome(7))\n\
+             println(isNone(null))\n\
+             println(ok(\"hi\").value)\n\
+             println(err(\"boom\").message)",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "99\ntrue\ntrue\nhi\nboom\n()\n"
+    );
+}
+
+/// `std.test` provides named assertion helpers that print a
+/// human-readable `[ OK ]` / `[FAIL]` line each. Failing checks go
+/// to stderr; passing ones go to stdout — and unlike the raw
+/// `assert` builtin, neither aborts the script.
+#[test]
+fn evaluator_uses_std_test_assertions() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.test.{expectTrue, expectEqualsInt}\n\
+             expectTrue(\"truthy\", true)\n\
+             expectEqualsInt(\"math\", 6, 1 + 2 + 3)\n\
+             expectEqualsInt(\"fails\", 99, 1)",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[ OK ] truthy"), "stdout: {stdout}");
+    assert!(stdout.contains("[ OK ] math"), "stdout: {stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[FAIL] fails"), "stderr: {stderr}");
+}
+
+/// `std.cli` cooperates with the new `klassic run file.kl -- args`
+/// path: `flag`, `option`, and `positionals` operate on the list
+/// `CommandLine#args()` returns after the `--` separator.
+#[test]
+fn evaluator_uses_std_cli_helpers() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_std_cli_{stamp}.kl"));
+    fs::write(
+        &source_path,
+        "import std.cli.{flag, option, positionals}\n\
+         val args = CommandLine#args()\n\
+         println(flag(args, \"--verbose\"))\n\
+         println(option(args, \"--out\"))\n\
+         println(positionals(args))\n",
+    )
+    .expect("temp source file should write");
+
+    let output = Command::new(klassic_bin())
+        .args([
+            "run",
+            source_path.to_str().expect("source path should be utf-8"),
+            "--",
+            "--verbose",
+            "--out",
+            "file.txt",
+            "input.txt",
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "true\nfile.txt\n[file.txt, input.txt]\n"
+    );
+}
+
 /// PR 6: native compile path does not yet bundle stdlib modules. The
 /// compiler emits a source-located diagnostic pointing users at the
 /// evaluator until PR 7 closes the gap.

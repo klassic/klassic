@@ -118,21 +118,21 @@ println(mapOption(null, (x) => x))  // null
 
 ## std.result
 
-`Result`-style success / failure helpers. The current implementation
-uses two records (`#ROk`, `#RErr`) under the hood; the public
-surface is the function helpers below. The plain identifiers `Ok` /
-`Err` are reserved for the future ADT-based revision.
+Result-style **constructors**. The two records `#ROk` and `#RErr`
+encode the success / failure tag; users inspect the payload with
+ordinary field access. Klassic's record typechecker statically
+rejects a `value` access on `#RErr` (and vice versa), so the
+inspector surface (`isOk`, `unwrapOr`, `mapResult`, ...) is on hold
+until ADTs or a union type land.
 
 ```klassic
-import std.result.{ok, err, isOk, isErr, unwrapOr, mapResult}
+import std.result.{ok, err}
 
 val good = ok("payload")
 val bad  = err("nope")
 
-println(isOk(good))                  // true
-println(isErr(bad))                  // true
-println(unwrapOr(good, "default"))   // "payload"
-println(unwrapOr(bad, "default"))    // "default"
+println(good.value)     // "payload"
+println(bad.message)    // "nope"
 ```
 
 ## std.dir
