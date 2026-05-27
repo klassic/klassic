@@ -270,6 +270,15 @@ fn collect_referenced_proof_names(
                 collect_referenced_proof_names(method, names, dependencies);
             }
         }
+        Expr::EnumDeclaration { .. } => {}
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_referenced_proof_names(scrutinee, names, dependencies);
+            for arm in arms {
+                collect_referenced_proof_names(&arm.body, names, dependencies);
+            }
+        }
         Expr::TheoremDeclaration {
             proposition, body, ..
         } => {

@@ -1,17 +1,38 @@
 module std.result
 
-// Lightweight Result/Either constructors. Klassic does not yet
-// have an ADT-style record union nor a permissive top type for
-// inspector helpers, so v0.2 only exposes the constructors here;
-// callers pattern-match by inspecting the record's runtime shape
-// (`#ROk(value)` vs `#RErr(message)`).
+// Result/Either ADT. `Ok(value)` carries a success payload, `Err(message)`
+// carries a failure payload. Inspect via postfix `match`:
 //
-// The full helper surface (`isOk`, `unwrapOr`, `mapResult`, ...)
-// will land alongside the ADT-based revision.
+//   r match {
+//     case Ok(v)  => ...
+//     case Err(m) => ...
+//   }
 
-record ROk { value: * }
-record RErr { message: * }
+enum Result<a, e> {
+  case Ok(value: a)
+  case Err(message: e)
+}
 
-def ok(value) = #ROk(value)
+def ok(value) = Ok(value)
 
-def err(message) = #RErr(message)
+def err(message) = Err(message)
+
+def isOk(r) = r match {
+  case Ok(v) => true
+  case Err(m) => false
+}
+
+def isErr(r) = r match {
+  case Ok(v) => false
+  case Err(m) => true
+}
+
+def unwrapOr(r, fallback) = r match {
+  case Ok(v) => v
+  case Err(m) => fallback
+}
+
+def mapResult(r, f) = r match {
+  case Ok(v) => Ok(f(v))
+  case Err(m) => Err(m)
+}

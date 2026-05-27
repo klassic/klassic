@@ -68,6 +68,16 @@ enum ThreadValueSnapshot {
         bound_args: Vec<ThreadValueSnapshot>,
     },
     Function(Arc<ThreadFunctionSnapshot>),
+    Enum {
+        enum_name: String,
+        variant: String,
+        fields: Vec<(String, ThreadValueSnapshot)>,
+    },
+    EnumConstructor {
+        enum_name: String,
+        variant: String,
+        param_names: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -258,6 +268,27 @@ fn snapshot_value_for_thread(value: &Value) -> ThreadValueSnapshot {
             });
             ThreadValueSnapshot::Function(snapshot)
         }
+        Value::Enum {
+            enum_name,
+            variant,
+            fields,
+        } => ThreadValueSnapshot::Enum {
+            enum_name: enum_name.clone(),
+            variant: variant.clone(),
+            fields: fields
+                .iter()
+                .map(|(field, value)| (field.clone(), snapshot_value_for_thread(value)))
+                .collect(),
+        },
+        Value::EnumConstructor {
+            enum_name,
+            variant,
+            param_names,
+        } => ThreadValueSnapshot::EnumConstructor {
+            enum_name: enum_name.clone(),
+            variant: variant.clone(),
+            param_names: param_names.clone(),
+        },
     }
 }
 
@@ -328,6 +359,27 @@ fn restore_thread_value(snapshot: ThreadValueSnapshot) -> Value {
             });
             Value::Function(rc)
         }
+        ThreadValueSnapshot::Enum {
+            enum_name,
+            variant,
+            fields,
+        } => Value::Enum {
+            enum_name,
+            variant,
+            fields: fields
+                .into_iter()
+                .map(|(field, value)| (field, restore_thread_value(value)))
+                .collect(),
+        },
+        ThreadValueSnapshot::EnumConstructor {
+            enum_name,
+            variant,
+            param_names,
+        } => Value::EnumConstructor {
+            enum_name,
+            variant,
+            param_names,
+        },
     }
 }
 
@@ -612,6 +664,78 @@ fn resolve_user_extension_method(value: &Value, field: &str) -> Option<Value> {
     let key = value_dispatch_key(value)?;
     USER_EXTENSION_METHODS
         .with(|registry| registry.borrow().get(&(key, field.to_string())).cloned())
+}
+
+fn register_enum_constructors(expr: &Expr, environment: &mut Environment) {
+    let Expr::EnumDeclaration { name, variants, .. } = expr else {
+        return;
+    };
+    for variant in variants {
+        let param_names = variant
+            .params
+            .iter()
+            .map(|(field_name, _)| field_name.clone())
+            .collect::<Vec<_>>();
+        if param_names.is_empty() {
+            // Nullary variant — bind it as a ready-made enum value.
+            let value = Value::Enum {
+                enum_name: name.clone(),
+                variant: variant.name.clone(),
+                fields: Vec::new(),
+            };
+            environment.declare_with_value(variant.name.clone(), false, value);
+        } else {
+            let constructor = Value::EnumConstructor {
+                enum_name: name.clone(),
+                variant: variant.name.clone(),
+                param_names,
+            };
+            environment.declare_with_value(variant.name.clone(), false, constructor);
+        }
+    }
+}
+
+fn eval_match(
+    scrutinee: &Expr,
+    arms: &[klassic_syntax::MatchArm],
+    span: Span,
+    environment: &mut Environment,
+    state: &mut EvaluationState,
+) -> Result<Value, Diagnostic> {
+    let value = eval_expr(scrutinee, environment, state)?;
+    let (variant_name, fields) = match &value {
+        Value::Enum {
+            variant, fields, ..
+        } => (variant.as_str(), fields.clone()),
+        _ => {
+            return Err(Diagnostic::runtime(
+                span,
+                format!("`match` scrutinee is not an enum value: {value}"),
+            ));
+        }
+    };
+    for arm in arms {
+        if arm.constructor != variant_name && arm.constructor != "_" {
+            continue;
+        }
+        environment.push_scope();
+        if arm.constructor == "_" {
+            // wildcard arm — no bindings to introduce.
+        } else {
+            for (index, binding) in arm.bindings.iter().enumerate() {
+                if let Some((_, field_value)) = fields.get(index) {
+                    environment.declare_with_value(binding.clone(), false, field_value.clone());
+                }
+            }
+        }
+        let result = eval_expr(&arm.body, environment, state);
+        environment.pop_scope();
+        return result;
+    }
+    Err(Diagnostic::runtime(
+        span,
+        format!("no `match` arm matched variant `{variant_name}`"),
+    ))
 }
 
 type ModuleExports = HashMap<String, Value>;
@@ -917,6 +1041,15 @@ fn eval_expr(
             register_extension_methods(expr, environment);
             Ok(Value::Unit)
         }
+        Expr::EnumDeclaration { .. } => {
+            register_enum_constructors(expr, environment);
+            Ok(Value::Unit)
+        }
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => eval_match(scrutinee, arms, *span, environment, state),
         Expr::VarDecl {
             mutable,
             name,
@@ -1638,6 +1771,31 @@ fn apply_callable(
         Value::Function(function) => invoke_user_function(&function, argument_values, span),
         Value::BuiltinFunction(function) => {
             invoke_builtin_function(&function, argument_values, span)
+        }
+        Value::EnumConstructor {
+            enum_name,
+            variant,
+            param_names,
+        } => {
+            if argument_values.len() != param_names.len() {
+                return Err(Diagnostic::runtime(
+                    span,
+                    format!(
+                        "variant `{variant}` expects {} arguments but got {}",
+                        param_names.len(),
+                        argument_values.len()
+                    ),
+                ));
+            }
+            let fields = param_names
+                .into_iter()
+                .zip(argument_values)
+                .collect::<Vec<_>>();
+            Ok(Value::Enum {
+                enum_name,
+                variant,
+                fields,
+            })
         }
         _ => Err(Diagnostic::runtime(span, "callee is not a function")),
     }

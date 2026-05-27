@@ -1176,6 +1176,37 @@ impl TypeChecker {
                 Ok(Type::Unit)
             }
             Expr::PegRuleBlock { .. } => Ok(Type::Unit),
+            Expr::EnumDeclaration { .. } => {
+                // Real enum typecheck would register constructor
+                // signatures + a sum type, but the MVP only adds
+                // the constructors to the runtime scope via eval.
+                // Typecheck accepts the declaration as Unit so the
+                // syntax flows through.
+                self.register_enum_constructors_as_dynamic(expr);
+                Ok(Type::Unit)
+            }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                let _ = self.infer_expr(scrutinee)?;
+                let mut arm_type = self.fresh_var();
+                for arm in arms {
+                    self.push_scope();
+                    for binding in &arm.bindings {
+                        self.declare(
+                            binding.clone(),
+                            false,
+                            Type::Dynamic,
+                            Vec::new(),
+                            Vec::new(),
+                        );
+                    }
+                    let body_type = self.infer_expr(&arm.body)?;
+                    self.pop_scope();
+                    arm_type = self.unify(arm_type, body_type, arm.span)?;
+                }
+                Ok(self.resolve(&arm_type))
+            }
             Expr::ExtensionDeclaration {
                 type_params,
                 this_name,
@@ -3316,6 +3347,29 @@ impl TypeChecker {
         Some(row)
     }
 
+    fn register_enum_constructors_as_dynamic(&mut self, expr: &Expr) {
+        let Expr::EnumDeclaration {
+            name: _enum_name,
+            variants,
+            ..
+        } = expr
+        else {
+            return;
+        };
+        for variant in variants {
+            let arity = variant.params.len();
+            let ty = if arity == 0 {
+                Type::Dynamic
+            } else {
+                Type::Function(vec![Type::Dynamic; arity], Box::new(Type::Dynamic))
+            };
+            // Bind the variant name so user code can reference it
+            // without typecheck errors. Once the proper sum-type
+            // story lands this will register a real ADT constructor.
+            self.declare_poly(variant.name.clone(), false, ty);
+        }
+    }
+
     fn infer_extension_declaration(
         &mut self,
         type_params: &[String],
@@ -4588,6 +4642,8 @@ fn substitute_expr_identifiers(expr: &Expr, substitutions: &HashMap<String, Expr
         | Expr::ModuleHeader { .. }
         | Expr::Import { .. }
         | Expr::ExtensionDeclaration { .. }
+        | Expr::EnumDeclaration { .. }
+        | Expr::Match { .. }
         | Expr::PegRuleBlock { .. } => expr.clone(),
         Expr::Identifier { name, .. } => substitutions
             .get(name)

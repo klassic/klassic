@@ -1,19 +1,51 @@
 module std.option
 
-// Lightweight Option/Maybe helpers. Klassic does not yet have ADTs,
-// so the v0.2 Option surface uses `null` for "none" and the value
-// itself for "some" — same convention as the existing `find` helper
-// in `std.list`. This keeps the API trivially interoperable with
-// existing builtins; once ADTs land the module will switch over.
+// Option/Maybe ADT. `Some(value)` carries a payload; `None` is
+// nullary. Inspect with postfix `match`:
+//
+//   o match {
+//     case Some(v) => ...
+//     case None    => ...
+//   }
+//
+// Existing helpers below use postfix `match` so the API stays
+// ergonomic without forcing callers to write their own patterns.
 
-def isNone(value) = value == null
+enum Option<a> {
+  case Some(value: a)
+  case None
+}
 
-def isSome(value) = if((value == null)) false else true
+def some(value) = Some(value)
 
-def getOrElse(value, fallback) = if((value == null)) fallback else value
+def none() = None
 
-def mapOption(value, f) = if((value == null)) null else f(value)
+def isSome(o) = o match {
+  case Some(v) => true
+  case None => false
+}
 
-def flatMapOption(value, f) = if((value == null)) null else f(value)
+def isNone(o) = o match {
+  case Some(v) => false
+  case None => true
+}
 
-def orElse(value, alternative) = if((value == null)) alternative else value
+def getOrElse(o, fallback) = o match {
+  case Some(v) => v
+  case None => fallback
+}
+
+def mapOption(o, f) = o match {
+  case Some(v) => Some(f(v))
+  case None => None
+}
+
+def flatMapOption(o, f) = o match {
+  case Some(v) => f(v)
+  case None => None
+}
+
+def orElse(o, alternative) = o match {
+  case Some(v) => Some(v)
+  case None => alternative
+}

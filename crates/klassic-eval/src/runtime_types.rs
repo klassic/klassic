@@ -20,11 +20,13 @@ pub(crate) fn dynamic_type_name(value: &Value) -> Option<&str> {
         Value::Set(_) => Some("Set"),
         Value::Record { name, .. } => Some(name.as_str()),
         Value::Unit => Some("Unit"),
+        Value::Enum { enum_name, .. } => Some(enum_name.as_str()),
         Value::Null
         | Value::BuiltinFunction(_)
         | Value::Function(_)
         | Value::TypeClassMethod(_)
-        | Value::BoundTypeClassMethod { .. } => None,
+        | Value::BoundTypeClassMethod { .. }
+        | Value::EnumConstructor { .. } => None,
     }
 }
 
@@ -167,10 +169,12 @@ pub(crate) fn known_type_from_value(value: &Value) -> KnownType {
                 KnownType::Record(name.clone(), type_args)
             }
         }
+        Value::Enum { .. } => KnownType::Dynamic,
         Value::BuiltinFunction(_)
         | Value::Function(_)
         | Value::TypeClassMethod(_)
-        | Value::BoundTypeClassMethod { .. } => KnownType::Function,
+        | Value::BoundTypeClassMethod { .. }
+        | Value::EnumConstructor { .. } => KnownType::Function,
     }
 }
 

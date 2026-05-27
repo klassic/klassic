@@ -1547,6 +1547,14 @@ impl NativeCodeGenerator {
                 *span,
                 "extension methods are not yet supported in native builds; see docs/roadmap-targets-stdlib.md",
             )),
+            Expr::EnumDeclaration { span, .. } => Err(unsupported(
+                *span,
+                "enum declarations are not yet supported in native builds; see docs/roadmap-targets-stdlib.md",
+            )),
+            Expr::Match { span, .. } => Err(unsupported(
+                *span,
+                "match expressions are not yet supported in native builds; see docs/roadmap-targets-stdlib.md",
+            )),
             _ => self.compile_expr(expr),
         }
     }
@@ -2417,9 +2425,9 @@ impl NativeCodeGenerator {
             | Expr::InstanceDeclaration { span, .. }
             | Expr::TheoremDeclaration { span, .. }
             | Expr::AxiomDeclaration { span, .. }
-            | Expr::ExtensionDeclaration { span, .. } => {
-                Err(unsupported(*span, native_feature_name(expr)))
-            }
+            | Expr::ExtensionDeclaration { span, .. }
+            | Expr::EnumDeclaration { span, .. }
+            | Expr::Match { span, .. } => Err(unsupported(*span, native_feature_name(expr))),
             Expr::PegRuleBlock { .. } => Ok(NativeValue::Unit),
         }
     }
@@ -34318,6 +34326,8 @@ fn expr_references_any_name_with_shadowing(
         | Expr::RecordDeclaration { .. }
         | Expr::TypeClassDeclaration { .. }
         | Expr::ExtensionDeclaration { .. }
+        | Expr::EnumDeclaration { .. }
+        | Expr::Match { .. }
         | Expr::PegRuleBlock { .. } => false,
     }
 }
@@ -34426,6 +34436,8 @@ fn collect_assigned_names(expr: &Expr, names: &mut HashSet<String>) {
         | Expr::RecordDeclaration { .. }
         | Expr::TypeClassDeclaration { .. }
         | Expr::ExtensionDeclaration { .. }
+        | Expr::EnumDeclaration { .. }
+        | Expr::Match { .. }
         | Expr::PegRuleBlock { .. } => {}
     }
 }
@@ -34528,6 +34540,8 @@ fn static_expr_is_pure(expr: &Expr) -> bool {
         | Expr::TheoremDeclaration { .. }
         | Expr::AxiomDeclaration { .. }
         | Expr::ExtensionDeclaration { .. }
+        | Expr::EnumDeclaration { .. }
+        | Expr::Match { .. }
         | Expr::PegRuleBlock { .. } => true,
     }
 }
@@ -34689,6 +34703,8 @@ fn expr_contains_thread_call(expr: &Expr, thread_aliases: &HashSet<String>) -> b
         | Expr::RecordDeclaration { .. }
         | Expr::TypeClassDeclaration { .. }
         | Expr::ExtensionDeclaration { .. }
+        | Expr::EnumDeclaration { .. }
+        | Expr::Match { .. }
         | Expr::PegRuleBlock { .. } => false,
     }
 }

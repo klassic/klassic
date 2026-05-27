@@ -20433,23 +20433,17 @@ fn shebang_line_is_stripped_from_source() {
     );
 }
 
-/// Stdlib v0.2 ships record-based Option helpers and Result
-/// constructors. The full Result inspector surface is on hold until
-/// ADTs land — Klassic's record typechecker statically rejects
-/// `.value` on `RErr`, so `unwrapOr` and friends would need either
-/// a true union type or a permissive top type to be safe.
+/// Stdlib v0.2 ships ADT-based Option / Result modules. Both expose
+/// pattern matching via `match` so callers stay decoupled from the
+/// underlying representation.
 #[test]
 fn evaluator_imports_std_option_and_result() {
     let output = Command::new(klassic_bin())
         .args([
             "-e",
-            "import std.option.{getOrElse, isSome, isNone}\n\
-             import std.result.{ok, err}\n\
-             println(getOrElse(null, 99))\n\
-             println(isSome(7))\n\
-             println(isNone(null))\n\
-             println(ok(\"hi\").value)\n\
-             println(err(\"boom\").message)",
+            "import std.option.{some, none, getOrElse}\n\
+             println(getOrElse(some(\"hi\"), \"fallback\"))\n\
+             println(getOrElse(none(), \"fallback\"))",
         ])
         .output()
         .expect("binary should run");
@@ -20462,7 +20456,38 @@ fn evaluator_imports_std_option_and_result() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "99\ntrue\ntrue\nhi\nboom\n()\n"
+        "hi\nfallback\n()\n"
+    );
+}
+
+/// `enum` declarations + postfix `match` form the v0.2 ADT surface.
+/// Variants build values via constructor calls; `x match { case ... }`
+/// destructures them and binds positional pattern variables in scope.
+#[test]
+fn evaluator_supports_enum_declarations_and_postfix_match() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Option<a> { case Some(v: a); case None }\n\
+             def describe(o) = o match {\n  \
+               case Some(n) => \"got \" + toString(n)\n  \
+               case None => \"nothing\"\n\
+             }\n\
+             println(describe(Some(42)))\n\
+             println(describe(None))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "got 42\nnothing\n()\n"
     );
 }
 

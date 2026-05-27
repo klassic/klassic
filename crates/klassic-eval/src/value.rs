@@ -22,6 +22,24 @@ pub enum Value {
         name: String,
         fields: Vec<(String, Value)>,
     },
+    /// Algebraic data type instance produced by an `enum` variant
+    /// constructor. The enum name comes from the declaration, the
+    /// variant name from the constructor that built this value, and
+    /// fields hold each named parameter in declaration order.
+    Enum {
+        enum_name: String,
+        variant: String,
+        fields: Vec<(String, Value)>,
+    },
+    /// Reference to an `enum` variant constructor — produced when the
+    /// user writes the variant name without arguments. Calling the
+    /// constructor with the right number of arguments yields
+    /// `Value::Enum`.
+    EnumConstructor {
+        enum_name: String,
+        variant: String,
+        param_names: Vec<String>,
+    },
     TypeClassMethod(String),
     BoundTypeClassMethod {
         name: String,
@@ -55,6 +73,18 @@ impl PartialEq for Value {
                     fields: rhs_fields,
                 },
             ) => lhs_name == rhs_name && lhs_fields == rhs_fields,
+            (
+                Self::Enum {
+                    enum_name: l_en,
+                    variant: l_v,
+                    fields: l_f,
+                },
+                Self::Enum {
+                    enum_name: r_en,
+                    variant: r_v,
+                    fields: r_f,
+                },
+            ) => l_en == r_en && l_v == r_v && l_f == r_f,
             (Self::Int(lhs), Self::Double(rhs)) => (*lhs as f64) == *rhs,
             (Self::Double(lhs), Self::Int(rhs)) => *lhs == (*rhs as f64),
             (Self::Int(lhs), Self::Long(rhs)) => *lhs == *rhs,
@@ -135,6 +165,29 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Self::Enum {
+                enum_name: _,
+                variant,
+                fields,
+            } => {
+                if fields.is_empty() {
+                    write!(f, "{variant}")
+                } else {
+                    write!(f, "{variant}(")?;
+                    for (index, (_, value)) in fields.iter().enumerate() {
+                        if index > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{value}")?;
+                    }
+                    write!(f, ")")
+                }
+            }
+            Self::EnumConstructor {
+                enum_name: _,
+                variant,
+                ..
+            } => write!(f, "<enum-constructor:{variant}>"),
             Self::TypeClassMethod(name) => write!(f, "<typeclass-method:{name}>"),
             Self::BoundTypeClassMethod { name, .. } => {
                 write!(f, "<bound-typeclass-method:{name}>")

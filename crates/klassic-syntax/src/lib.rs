@@ -32,6 +32,24 @@ pub struct TypeClassMethod {
     pub annotation: TypeAnnotation,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumVariant {
+    pub name: String,
+    /// Variant parameters in `field: Type` form. The field name lets
+    /// user code access the payload via record-style field access
+    /// (`opt.v`) without writing an explicit pattern match.
+    pub params: Vec<(String, TypeAnnotation)>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatchArm {
+    pub constructor: String,
+    pub bindings: Vec<String>,
+    pub body: Expr,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeClassConstraint {
     pub class_name: String,
@@ -161,6 +179,27 @@ pub enum Expr {
         methods: Vec<Expr>,
         span: Span,
     },
+    /// `data Name<type-params>? = Variant1(types...) | Variant2 | ...`
+    ///
+    /// Algebraic data type declaration. Each variant becomes a
+    /// constructor — calling `Variant(args)` yields a tagged value
+    /// that pattern matches via `match`. Variants without arguments
+    /// are nullary constants.
+    EnumDeclaration {
+        name: String,
+        type_params: Vec<String>,
+        variants: Vec<EnumVariant>,
+        span: Span,
+    },
+    /// `match scrutinee { Variant1(x, y) => body1 | Variant2 => body2 | ... }`
+    ///
+    /// Dispatches on the variant tag of an ADT value. Pattern
+    /// variables become bindings inside their arm body.
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
     PegRuleBlock {
         span: Span,
     },
@@ -277,6 +316,8 @@ impl Expr {
             | Self::TheoremDeclaration { span, .. }
             | Self::AxiomDeclaration { span, .. }
             | Self::ExtensionDeclaration { span, .. }
+            | Self::EnumDeclaration { span, .. }
+            | Self::Match { span, .. }
             | Self::PegRuleBlock { span }
             | Self::VarDecl { span, .. }
             | Self::DefDecl { span, .. }
@@ -327,6 +368,8 @@ enum TokenKind {
     Trust,
     Axiom,
     Extension,
+    Enum,
+    Match,
     Rule,
     Where,
     Cleanup,
@@ -662,6 +705,8 @@ impl<'a> Lexer<'a> {
             "trust" => TokenKind::Trust,
             "axiom" => TokenKind::Axiom,
             "extension" => TokenKind::Extension,
+            "enum" => TokenKind::Enum,
+            "match" => TokenKind::Match,
             "rule" => TokenKind::Rule,
             "where" => TokenKind::Where,
             "cleanup" => TokenKind::Cleanup,
@@ -903,6 +948,7 @@ impl Parser {
                 self.parse_proof_declaration()
             }
             TokenKind::Extension => self.parse_extension_declaration(),
+            TokenKind::Enum => self.parse_enum_declaration(),
             TokenKind::Rule => self.parse_peg_rule_block(),
             TokenKind::Val => self.parse_variable_declaration(false),
             TokenKind::Mutable => self.parse_variable_declaration(true),
@@ -1291,6 +1337,244 @@ impl Parser {
             receiver_type,
             methods,
             span: start.merge(this_span).merge(end),
+        })
+    }
+
+    fn parse_enum_declaration(&mut self) -> Result<Expr, Diagnostic> {
+        let start = self.bump().span; // consume `enum`
+        let (name, name_span) = self.expect_identifier()?;
+        let (type_params, _inline) = self.parse_optional_generic_param_names()?;
+
+        match self.peek().kind {
+            TokenKind::LBrace => {
+                self.bump();
+            }
+            TokenKind::Eof => {
+                return Err(
+                    Diagnostic::parse(self.peek().span, "expected `{`").with_incomplete_input()
+                );
+            }
+            _ => return Err(Diagnostic::parse(self.peek().span, "expected `{`")),
+        }
+
+        let mut variants = Vec::new();
+        self.consume_separators();
+        while !matches!(self.peek().kind, TokenKind::RBrace) {
+            // Each variant is introduced by `case`. We parse `case` as
+            // an identifier rather than a dedicated keyword so user
+            // code can still use `case` as a regular name elsewhere.
+            match &self.peek().kind {
+                TokenKind::Identifier(text) if text == "case" => {
+                    self.bump();
+                }
+                TokenKind::Eof => {
+                    return Err(
+                        Diagnostic::parse(self.peek().span, "expected `case` or `}`")
+                            .with_incomplete_input(),
+                    );
+                }
+                _ => {
+                    return Err(Diagnostic::parse(
+                        self.peek().span,
+                        "expected `case` or `}`",
+                    ));
+                }
+            }
+            let (variant_name, variant_span) = self.expect_identifier()?;
+            let params = if matches!(self.peek().kind, TokenKind::LParen) {
+                self.bump();
+                let mut entries = Vec::new();
+                self.consume_separators();
+                if !matches!(self.peek().kind, TokenKind::RParen) {
+                    loop {
+                        let (field_name, _field_span) = self.expect_identifier()?;
+                        match self.peek().kind {
+                            TokenKind::Colon => {
+                                self.bump();
+                            }
+                            _ => {
+                                return Err(Diagnostic::parse(
+                                    self.peek().span,
+                                    "expected `:` after variant field name",
+                                ));
+                            }
+                        }
+                        let annotation = self.parse_variant_field_type()?;
+                        entries.push((field_name, annotation));
+                        self.consume_separators();
+                        if matches!(self.peek().kind, TokenKind::Comma) {
+                            self.bump();
+                            self.consume_separators();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                match self.peek().kind {
+                    TokenKind::RParen => {
+                        self.bump();
+                    }
+                    _ => return Err(Diagnostic::parse(self.peek().span, "expected `)`")),
+                }
+                entries
+            } else {
+                Vec::new()
+            };
+            variants.push(EnumVariant {
+                name: variant_name,
+                params,
+                span: variant_span,
+            });
+            self.consume_separators();
+        }
+
+        let end = match self.peek().kind {
+            TokenKind::RBrace => self.bump().span,
+            TokenKind::Eof => {
+                return Err(
+                    Diagnostic::parse(self.peek().span, "expected `}`").with_incomplete_input()
+                );
+            }
+            _ => return Err(Diagnostic::parse(self.peek().span, "expected `}`")),
+        };
+
+        Ok(Expr::EnumDeclaration {
+            name,
+            type_params,
+            variants,
+            span: start.merge(name_span).merge(end),
+        })
+    }
+
+    /// Reads a single field's type annotation, stopping at `,` or `)`.
+    /// Mirrors the simple-token capture used by
+    /// `parse_extension_declaration` so the same nested generics rules
+    /// apply.
+    fn parse_variant_field_type(&mut self) -> Result<TypeAnnotation, Diagnostic> {
+        let start_index = self.index;
+        let mut paren_depth = 0usize;
+        let mut angle_depth = 0usize;
+        loop {
+            match self.peek().kind {
+                TokenKind::LParen => {
+                    paren_depth += 1;
+                    self.bump();
+                }
+                TokenKind::RParen => {
+                    if paren_depth == 0 && angle_depth == 0 {
+                        break;
+                    }
+                    paren_depth = paren_depth.saturating_sub(1);
+                    self.bump();
+                }
+                TokenKind::Comma if paren_depth == 0 && angle_depth == 0 => break,
+                TokenKind::Less => {
+                    angle_depth += 1;
+                    self.bump();
+                }
+                TokenKind::Greater => {
+                    angle_depth = angle_depth.saturating_sub(1);
+                    self.bump();
+                }
+                TokenKind::Eof => {
+                    return Err(Diagnostic::parse(
+                        self.peek().span,
+                        "expected `)` to close variant field list",
+                    )
+                    .with_incomplete_input());
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        if start_index == self.index {
+            return Err(Diagnostic::parse(
+                self.peek().span,
+                "expected type annotation for variant field",
+            ));
+        }
+        let span = self.tokens[start_index]
+            .span
+            .merge(self.tokens[self.index - 1].span);
+        Ok(TypeAnnotation {
+            text: self.render_tokens(start_index, self.index),
+            span,
+        })
+    }
+
+    fn parse_postfix_match(&mut self, scrutinee: Expr) -> Result<Expr, Diagnostic> {
+        let start = self.bump().span; // consume `match`
+        let scrutinee_span = scrutinee.span();
+        match self.peek().kind {
+            TokenKind::LBrace => {
+                self.bump();
+            }
+            _ => return Err(Diagnostic::parse(self.peek().span, "expected `{`")),
+        }
+        let mut arms = Vec::new();
+        self.consume_separators();
+        while !matches!(self.peek().kind, TokenKind::RBrace) {
+            // Each arm is introduced by `case`. We parse `case` as
+            // an identifier so it doesn't collide with user names.
+            match &self.peek().kind {
+                TokenKind::Identifier(text) if text == "case" => {
+                    self.bump();
+                }
+                _ => return Err(Diagnostic::parse(self.peek().span, "expected `case`")),
+            }
+            let (ctor, ctor_span) = self.expect_identifier()?;
+            let bindings = if matches!(self.peek().kind, TokenKind::LParen) {
+                self.bump();
+                let mut names = Vec::new();
+                self.consume_separators();
+                if !matches!(self.peek().kind, TokenKind::RParen) {
+                    loop {
+                        let (binding, _) = self.expect_identifier()?;
+                        names.push(binding);
+                        self.consume_separators();
+                        if matches!(self.peek().kind, TokenKind::Comma) {
+                            self.bump();
+                            self.consume_separators();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                match self.peek().kind {
+                    TokenKind::RParen => {
+                        self.bump();
+                    }
+                    _ => return Err(Diagnostic::parse(self.peek().span, "expected `)`")),
+                }
+                names
+            } else {
+                Vec::new()
+            };
+            match self.peek().kind {
+                TokenKind::FatArrow => {
+                    self.bump();
+                }
+                _ => return Err(Diagnostic::parse(self.peek().span, "expected `=>`")),
+            }
+            let body = self.parse_expression()?;
+            let arm_span = ctor_span.merge(body.span());
+            arms.push(MatchArm {
+                constructor: ctor,
+                bindings,
+                body,
+                span: arm_span,
+            });
+            self.consume_separators();
+        }
+        let end = match self.peek().kind {
+            TokenKind::RBrace => self.bump().span,
+            _ => return Err(Diagnostic::parse(self.peek().span, "expected `}`")),
+        };
+        Ok(Expr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+            span: start.merge(scrutinee_span).merge(end),
         })
     }
 
@@ -1883,6 +2167,11 @@ impl Parser {
                     callee: Box::new(expr),
                     arguments: vec![lambda],
                 };
+                continue;
+            }
+
+            if matches!(self.peek().kind, TokenKind::Match) {
+                expr = self.parse_postfix_match(expr)?;
                 continue;
             }
 
@@ -3363,6 +3652,8 @@ fn token_text(kind: &TokenKind) -> String {
         TokenKind::Trust => "trust".to_string(),
         TokenKind::Axiom => "axiom".to_string(),
         TokenKind::Extension => "extension".to_string(),
+        TokenKind::Enum => "enum".to_string(),
+        TokenKind::Match => "match".to_string(),
         TokenKind::Rule => "rule".to_string(),
         TokenKind::Where => "where".to_string(),
         TokenKind::Cleanup => "cleanup".to_string(),
@@ -3551,6 +3842,24 @@ fn rewrap_span(expr: Expr, span: Span) -> Expr {
             this_name,
             receiver_type,
             methods,
+            span,
+        },
+        Expr::EnumDeclaration {
+            name,
+            type_params,
+            variants,
+            ..
+        } => Expr::EnumDeclaration {
+            name,
+            type_params,
+            variants,
+            span,
+        },
+        Expr::Match {
+            scrutinee, arms, ..
+        } => Expr::Match {
+            scrutinee,
+            arms,
             span,
         },
         Expr::PegRuleBlock { .. } => Expr::PegRuleBlock { span },
