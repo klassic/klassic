@@ -18,4 +18,11 @@ extension (this: String) {
   def startsWithText(prefix) = this.startsWith(prefix)
   def endsWithText(suffix) = this.endsWith(suffix)
   def containsText(needle) = this.contains(needle)
+  // `substring(s, start, end)` is the builtin's (start, end) form;
+  // mirror it as a dot-callable helper so user code can chain.
+  def sliceFromTo(start, end) = substring(this, start, end)
+  // First `n` characters; clamps to length.
+  def takeChars(n) = substring(this, 0, n)
+  // Drop first `n` characters; the rest follows.
+  def dropChars(n) = substring(this, n, length(this))
 }
