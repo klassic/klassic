@@ -554,6 +554,37 @@ thread_local! {
     /// constants so a given seed produces the same stream in either
     /// mode.
     static RANDOM_STATE: RefCell<u64> = const { RefCell::new(0) };
+    /// Arguments the CLI driver collected after `--`, surfaced through
+    /// `CommandLine#args()`. When `None` (the default), the builtin falls
+    /// back to `std::env::args()` so embedded or test scenarios keep the
+    /// historical behaviour.
+    static SCRIPT_ARGS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+/// Install the slice of strings that `CommandLine#args()` returns. The
+/// CLI driver calls this before handing control to the evaluator so
+/// scripts see only the args that follow `--`.
+pub fn set_script_args(args: Vec<String>) {
+    SCRIPT_ARGS.with(|cell| {
+        *cell.borrow_mut() = Some(args);
+    });
+}
+
+/// Clear any previously installed script args, restoring the
+/// `env::args()` fallback.
+pub fn clear_script_args() {
+    SCRIPT_ARGS.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+fn current_script_args() -> Vec<String> {
+    SCRIPT_ARGS.with(|cell| {
+        if let Some(args) = cell.borrow().as_ref() {
+            return args.clone();
+        }
+        env::args().skip(1).collect()
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -2639,7 +2670,10 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
         "CommandLine#args" => {
             ensure_arity(name, arguments, 0, span)?;
             Ok(Value::List(
-                env::args().skip(1).map(Value::String).collect(),
+                current_script_args()
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
             ))
         }
         "Process#exit" => {

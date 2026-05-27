@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use cli::{
     ExecutionConfig, ParsedCommand, RunAction, parse_command_line, render_command_line_error,
 };
-use klassic_eval::{Evaluator, EvaluatorConfig};
+use klassic_eval::{Evaluator, EvaluatorConfig, set_script_args};
 use klassic_native::{NativeCompilerConfig, NativeTarget, compile_source_with_prelude_for_target};
 
 /// The standard prelude is bundled into the compiler at build time. It is
@@ -18,6 +18,20 @@ use klassic_native::{NativeCompilerConfig, NativeTarget, compile_source_with_pre
 /// stay 1-based for the user's view of their .kl file.
 const STDLIB_PRELUDE: &str = include_str!("../stdlib/prelude.kl");
 const STDLIB_PRELUDE_NAME: &str = "<stdlib>";
+
+/// If the source begins with a `#!` shebang line, replace the leading
+/// `#!` bytes with `//` so the rest of the line is read as a normal
+/// Klassic comment. Byte offsets stay identical, so spans and line /
+/// column numbers in diagnostics are unaffected.
+fn strip_shebang(text: String) -> String {
+    if !text.starts_with("#!") {
+        return text;
+    }
+    let mut bytes = text.into_bytes();
+    bytes[0] = b'/';
+    bytes[1] = b'/';
+    String::from_utf8(bytes).expect("replacing two ASCII bytes preserves UTF-8")
+}
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -29,6 +43,8 @@ fn main() -> ExitCode {
         }
     };
 
+    set_script_args(command.script_args.clone());
+
     match run(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => ExitCode::from(code),
@@ -39,7 +55,7 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
     match command.action {
         RunAction::BuildFile { input, output } => {
             let text = match fs::read_to_string(&input) {
-                Ok(text) => text,
+                Ok(text) => strip_shebang(text),
                 Err(error) => {
                     eprintln!("{}: {error}", input.display());
                     return Err(1);
@@ -91,7 +107,7 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
         }
         RunAction::EvaluateFile(path) => {
             let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
+                Ok(text) => strip_shebang(text),
                 Err(error) => {
                     eprintln!("{}: {error}", path.display());
                     return Err(1);
@@ -135,17 +151,23 @@ fn prepare_evaluator(config: EvaluatorConfig) -> Result<Evaluator, u8> {
     Ok(evaluator)
 }
 
+const REPL_HELP: &str = ":help          show this help\n\
+                        :quit | :exit  leave the REPL\n\
+                        :history       print previously evaluated input\n\
+                        :load <path>   evaluate <path> in the current session\n\
+                        :reset         reload the stdlib prelude and modules\n";
+
 fn start_repl(config: ExecutionConfig) {
     let mut history = Vec::<String>::new();
     let mut buffer = String::new();
-    let mut evaluator = match prepare_evaluator(EvaluatorConfig {
+    let evaluator_config = EvaluatorConfig {
         deny_trust: config.deny_trust,
         warn_trust: config.warn_trust,
-    }) {
+    };
+    let mut evaluator = match prepare_evaluator(evaluator_config) {
         Ok(evaluator) => evaluator,
         Err(_) => return,
     };
-    let _ = STDLIB_PRELUDE_NAME; // keep marker available for future REPL diagnostics
 
     loop {
         print!("{}", if buffer.is_empty() { "> " } else { "| " });
@@ -158,14 +180,43 @@ fn start_repl(config: ExecutionConfig) {
         }
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if buffer.is_empty() && trimmed == ":exit" {
-            break;
-        }
-        if buffer.is_empty() && trimmed == ":history" {
-            for (index, command) in history.iter().enumerate() {
-                println!("{}: {}", index + 1, command);
+        if buffer.is_empty() {
+            if trimmed == ":exit" || trimmed == ":quit" {
+                break;
             }
-            continue;
+            if trimmed == ":help" {
+                print!("{REPL_HELP}");
+                continue;
+            }
+            if trimmed == ":history" {
+                for (index, command) in history.iter().enumerate() {
+                    println!("{}: {}", index + 1, command);
+                }
+                continue;
+            }
+            if trimmed == ":reset" {
+                evaluator = match prepare_evaluator(evaluator_config) {
+                    Ok(evaluator) => evaluator,
+                    Err(_) => return,
+                };
+                println!("(stdlib reloaded)");
+                continue;
+            }
+            if let Some(path) = trimmed.strip_prefix(":load ").map(str::trim)
+                && !path.is_empty()
+            {
+                match fs::read_to_string(path) {
+                    Ok(text) => {
+                        let text = strip_shebang(text);
+                        match evaluator.evaluate_text(path, &text) {
+                            Ok(value) => println!("loaded {path} = {value}"),
+                            Err(error) => println!("Error: {error}"),
+                        }
+                    }
+                    Err(error) => println!("{path}: {error}"),
+                }
+                continue;
+            }
         }
 
         buffer.push_str(trimmed);

@@ -20197,6 +20197,82 @@ fn evaluator_imports_std_list_members() {
     );
 }
 
+/// PR 7: `klassic run file.kl -- args` makes user-script arguments
+/// available through `CommandLine#args()` while filtering out the
+/// klassic-facing flags.
+#[test]
+fn run_subcommand_threads_script_args_through_command_line_args() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_run_args_{stamp}.kl"));
+    fs::write(
+        &source_path,
+        "val argv = CommandLine#args()\nprintln(argv)\nprintln(size(argv))\n",
+    )
+    .expect("temp source file should write");
+
+    let output = Command::new(klassic_bin())
+        .args([
+            "run",
+            source_path.to_str().expect("source path should be utf-8"),
+            "--",
+            "alpha",
+            "beta",
+            "gamma",
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[alpha, beta, gamma]\n3\n"
+    );
+}
+
+/// PR 7: a `#!` shebang at the top of a `.kl` file is dropped during
+/// source loading so the rest of the script parses normally.
+#[test]
+fn shebang_line_is_stripped_from_source() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_shebang_{stamp}.kl"));
+    fs::write(
+        &source_path,
+        "#!/usr/bin/env klassic\nprintln(\"hello-from-shebang\")\n",
+    )
+    .expect("temp source file should write");
+
+    let output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("source path should be utf-8"))
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "hello-from-shebang\n"
+    );
+}
+
 /// PR 6: native compile path does not yet bundle stdlib modules. The
 /// compiler emits a source-located diagnostic pointing users at the
 /// evaluator until PR 7 closes the gap.

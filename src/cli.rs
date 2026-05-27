@@ -32,6 +32,11 @@ pub enum RunAction {
 pub struct ParsedCommand {
     pub action: RunAction,
     pub config: ExecutionConfig,
+    /// Arguments that should be visible to the user's program via
+    /// `CommandLine#args()`. Populated from anything after the `--`
+    /// separator on the command line (and intentionally empty for any
+    /// invocation that lacks one).
+    pub script_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,10 +62,21 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     let mut warn_trust = false;
     let mut native_target = NativeTarget::default();
     let mut others = Vec::new();
+    let mut script_args = Vec::new();
+    let mut seen_separator = false;
     let mut index = 0usize;
 
     while index < args.len() {
+        if seen_separator {
+            script_args.push(args[index].clone());
+            index += 1;
+            continue;
+        }
         match args[index].as_str() {
+            "--" => {
+                seen_separator = true;
+                index += 1;
+            }
             "--deny-trust" => {
                 deny_trust = true;
                 index += 1;
@@ -103,6 +119,9 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
         }
         [flag, file_name] if flag == "-f" => RunAction::EvaluateFile(PathBuf::from(file_name)),
         [flag, expression] if flag == "-e" => RunAction::EvaluateExpression(expression.clone()),
+        [command, file_name] if command == "run" => {
+            RunAction::EvaluateFile(PathBuf::from(file_name))
+        }
         [command, input, output_flag, output] if command == "build" && output_flag == "-o" => {
             RunAction::BuildFile {
                 input: PathBuf::from(input),
@@ -112,20 +131,29 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
         _ => return Err(CommandLineError::Usage),
     };
 
-    Ok(ParsedCommand { action, config })
+    Ok(ParsedCommand {
+        action,
+        config,
+        script_args,
+    })
 }
 
 pub fn usage() -> String {
     format!(
-        "Usage: klassic [--deny-trust] [--warn-trust] [--target <target>] (-f <fileName> | -e <expression> | build <fileName> -o <output> | targets)\n\
+        "Usage: klassic [--deny-trust] [--warn-trust] [--target <target>] \
+         (-f <fileName> | -e <expression> | run <fileName> | <fileName> | \
+         build <fileName> -o <output> | targets) [-- <script args>...]\n\
      Options:\n\
-       --deny-trust   : reject programs that depend on trusted proofs\n\
-       --warn-trust   : warn when trusted proofs are used\n\
-       --target <target>: native build target (supported: {})\n\
-       <fileName>     : read a program from <fileName> and execute it\n\
-       -e <expression>: evaluate <expression>\n\
+       --deny-trust       : reject programs that depend on trusted proofs\n\
+       --warn-trust       : warn when trusted proofs are used\n\
+       --target <target>  : native build target (supported: {})\n\
+       <fileName>         : read a program from <fileName> and execute it\n\
+       run <fileName>     : same as <fileName>; pairs naturally with `-- <args>`\n\
+       -e <expression>    : evaluate <expression>\n\
        build <fileName> -o <output>: compile <fileName> to a native executable\n\
-       targets        : list known native targets and their support status\n",
+       targets            : list known native targets and their support status\n\
+       --                 : separates klassic flags from arguments visible to \
+the user script via CommandLine#args()\n",
         NativeTarget::supported_names_csv()
     )
 }
@@ -327,5 +355,51 @@ mod tests {
     #[test]
     fn usage_lists_supported_native_targets_from_registry() {
         assert!(usage().contains(&NativeTarget::supported_names_csv()));
+    }
+
+    #[test]
+    fn parses_run_subcommand_with_script_args() {
+        let args = vec![
+            "run".to_string(),
+            "scripts/wc.kl".to_string(),
+            "--".to_string(),
+            "README.md".to_string(),
+            "--verbose".to_string(),
+        ];
+        let parsed = parse_command_line(&args).expect("run command should parse");
+        match parsed.action {
+            RunAction::EvaluateFile(path) => assert_eq!(path.to_string_lossy(), "scripts/wc.kl"),
+            other => panic!("unexpected action: {other:?}"),
+        }
+        assert_eq!(
+            parsed.script_args,
+            vec!["README.md".to_string(), "--verbose".to_string()]
+        );
+    }
+
+    #[test]
+    fn positional_file_invocation_accepts_script_args_after_double_dash() {
+        let args = vec![
+            "sample.kl".to_string(),
+            "--".to_string(),
+            "alpha".to_string(),
+            "beta".to_string(),
+        ];
+        let parsed = parse_command_line(&args).expect("positional invocation should parse");
+        match parsed.action {
+            RunAction::EvaluateFile(path) => assert_eq!(path.to_string_lossy(), "sample.kl"),
+            other => panic!("unexpected action: {other:?}"),
+        }
+        assert_eq!(
+            parsed.script_args,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn expression_invocation_without_separator_has_no_script_args() {
+        let args = vec!["-e".to_string(), "1 + 2".to_string()];
+        let parsed = parse_command_line(&args).expect("expression invocation should parse");
+        assert!(parsed.script_args.is_empty());
     }
 }
