@@ -526,6 +526,94 @@ fn join_active_threads() {
     }
 }
 
+/// Normalise a receiver type annotation into a single dispatch key.
+///
+/// `String` → `"String"`, `List<a>` → `"List"`, `Map<K, V>` → `"Map"`,
+/// `#Point` → `"Point"`. We intentionally drop the generic arguments
+/// for now — extension dispatch is structural on the outer type.
+fn normalise_receiver_type(annotation: &TypeAnnotation) -> String {
+    let trimmed = annotation.text.trim();
+    let stripped = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    let name = stripped
+        .split(|ch: char| ch == '<' || ch.is_whitespace())
+        .next()
+        .unwrap_or("");
+    name.to_string()
+}
+
+/// Map a runtime [`Value`] to the normalised dispatch key.
+fn value_dispatch_key(value: &Value) -> Option<String> {
+    Some(match value {
+        Value::Int(_) | Value::Long(_) => "Int".to_string(),
+        Value::Float(_) | Value::Double(_) => "Double".to_string(),
+        Value::Bool(_) => "Boolean".to_string(),
+        Value::String(_) => "String".to_string(),
+        Value::List(_) => "List".to_string(),
+        Value::Map(_) => "Map".to_string(),
+        Value::Set(_) => "Set".to_string(),
+        Value::Record { name, .. } if !name.is_empty() => name.clone(),
+        Value::Unit => "Unit".to_string(),
+        Value::Null => "Null".to_string(),
+        _ => return None,
+    })
+}
+
+/// Registers each method of an `Expr::ExtensionDeclaration` in the
+/// thread-local extension table. Methods become regular
+/// `FunctionValue` closures whose first parameter is `this` (named per
+/// the extension header).
+fn register_extension_methods(expr: &Expr, environment: &Environment) {
+    let Expr::ExtensionDeclaration {
+        this_name,
+        receiver_type,
+        methods,
+        ..
+    } = expr
+    else {
+        return;
+    };
+    let key_prefix = normalise_receiver_type(receiver_type);
+    for method in methods {
+        let Expr::DefDecl {
+            name,
+            params,
+            param_annotations,
+            body,
+            constraints,
+            ..
+        } = method
+        else {
+            continue;
+        };
+        let mut full_params = Vec::with_capacity(params.len() + 1);
+        full_params.push(this_name.clone());
+        full_params.extend(params.iter().cloned());
+
+        let mut full_annotations = Vec::with_capacity(param_annotations.len() + 1);
+        full_annotations.push(Some(receiver_type.clone()));
+        full_annotations.extend(param_annotations.iter().cloned());
+
+        let function = Value::Function(Rc::new(FunctionValue {
+            params: full_params,
+            param_annotations: full_annotations,
+            constraints: constraints.clone(),
+            body: (**body).clone(),
+            env: environment.clone(),
+        }));
+        USER_EXTENSION_METHODS.with(|registry| {
+            registry
+                .borrow_mut()
+                .insert((key_prefix.clone(), name.clone()), function);
+        });
+    }
+}
+
+fn resolve_user_extension_method(value: &Value, field: &str) -> Option<Value> {
+    let key = value_dispatch_key(value)?;
+    USER_EXTENSION_METHODS
+        .with(|registry| registry.borrow().get(&(key, field.to_string())).cloned())
+}
+
 type ModuleExports = HashMap<String, Value>;
 #[derive(Clone, Debug)]
 struct RecordSchema {
@@ -559,6 +647,13 @@ thread_local! {
     /// back to `std::env::args()` so embedded or test scenarios keep the
     /// historical behaviour.
     static SCRIPT_ARGS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    /// User-defined extension methods, keyed by
+    /// `(normalised-receiver-type, method-name)`. Populated when an
+    /// `extension (this: T) { def foo(...) = ... }` declaration is
+    /// evaluated. Method dispatch on `Expr::FieldAccess` falls back
+    /// here after the hardcoded builtin lookup.
+    static USER_EXTENSION_METHODS: RefCell<HashMap<(String, String), Value>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Install the slice of strings that `CommandLine#args()` returns. The
@@ -671,12 +766,22 @@ impl Evaluator {
             source: source.clone(),
             diagnostic,
         })?;
+        let root_before = self.environment.root_binding_names();
         let mut state = EvaluationState::default();
         let result = eval_program(&expr, &mut self.environment, &mut state);
         join_active_threads();
         let result = result.map_err(|diagnostic| EvaluationError { source, diagnostic })?;
         if let Some(module) = state.current_module {
             export_current_module(&module, &self.environment);
+            // Module-scoped defs must only be reachable through the
+            // module's exports, not the evaluator's top-level scope.
+            // Remove any binding that this translation unit just added.
+            let root_after = self.environment.root_binding_names();
+            let newly_added = root_after
+                .difference(&root_before)
+                .cloned()
+                .collect::<Vec<_>>();
+            self.environment.forget_root_bindings(newly_added);
         }
         Ok(result)
     }
@@ -808,6 +913,10 @@ fn eval_expr(
             Ok(Value::Unit)
         }
         Expr::PegRuleBlock { .. } => Ok(Value::Unit),
+        Expr::ExtensionDeclaration { .. } => {
+            register_extension_methods(expr, environment);
+            Ok(Value::Unit)
+        }
         Expr::VarDecl {
             mutable,
             name,
@@ -1471,6 +1580,17 @@ fn eval_call(
                     .collect::<Result<Vec<_>, _>>()?,
             );
             return eval_builtin(builtin, &all_arguments, span);
+        }
+        if let Some(method) = resolve_user_extension_method(&target_value, field) {
+            let mut all_arguments = Vec::with_capacity(arguments.len() + 1);
+            all_arguments.push(target_value);
+            all_arguments.extend(
+                arguments
+                    .iter()
+                    .map(|argument| eval_expr(argument, environment, state))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            return apply_callable(method, all_arguments, span);
         }
     }
 

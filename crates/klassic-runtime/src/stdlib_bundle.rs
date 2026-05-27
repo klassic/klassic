@@ -25,15 +25,35 @@ pub struct EmbeddedModule {
 }
 
 const STD_LIST_SOURCE: &str = include_str!("../../../stdlib/std/list.kl");
+const STD_STRING_SOURCE: &str = include_str!("../../../stdlib/std/string.kl");
+const STD_MATH_SOURCE: &str = include_str!("../../../stdlib/std/math.kl");
+const STD_PATH_SOURCE: &str = include_str!("../../../stdlib/std/path.kl");
 
 /// Every embedded module the compiler ships with. The driver loads
 /// these in order before user code so the user's source sees their
 /// exports already registered.
-pub const STDLIB_MODULES: &[EmbeddedModule] = &[EmbeddedModule {
-    path: "std.list",
-    diagnostic_name: "<stdlib std.list>",
-    source: STD_LIST_SOURCE,
-}];
+pub const STDLIB_MODULES: &[EmbeddedModule] = &[
+    EmbeddedModule {
+        path: "std.list",
+        diagnostic_name: "<stdlib std.list>",
+        source: STD_LIST_SOURCE,
+    },
+    EmbeddedModule {
+        path: "std.string",
+        diagnostic_name: "<stdlib std.string>",
+        source: STD_STRING_SOURCE,
+    },
+    EmbeddedModule {
+        path: "std.math",
+        diagnostic_name: "<stdlib std.math>",
+        source: STD_MATH_SOURCE,
+    },
+    EmbeddedModule {
+        path: "std.path",
+        diagnostic_name: "<stdlib std.path>",
+        source: STD_PATH_SOURCE,
+    },
+];
 
 #[cfg(test)]
 mod tests {

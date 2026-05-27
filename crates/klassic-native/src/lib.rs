@@ -1543,6 +1543,10 @@ impl NativeCodeGenerator {
             Expr::TheoremDeclaration { .. }
             | Expr::AxiomDeclaration { .. }
             | Expr::PegRuleBlock { .. } => Ok(NativeValue::Unit),
+            Expr::ExtensionDeclaration { span, .. } => Err(unsupported(
+                *span,
+                "extension methods are not yet supported in native builds; see docs/roadmap-targets-stdlib.md",
+            )),
             _ => self.compile_expr(expr),
         }
     }
@@ -2412,7 +2416,8 @@ impl NativeCodeGenerator {
             | Expr::TypeClassDeclaration { span, .. }
             | Expr::InstanceDeclaration { span, .. }
             | Expr::TheoremDeclaration { span, .. }
-            | Expr::AxiomDeclaration { span, .. } => {
+            | Expr::AxiomDeclaration { span, .. }
+            | Expr::ExtensionDeclaration { span, .. } => {
                 Err(unsupported(*span, native_feature_name(expr)))
             }
             Expr::PegRuleBlock { .. } => Ok(NativeValue::Unit),
@@ -34312,6 +34317,7 @@ fn expr_references_any_name_with_shadowing(
         | Expr::Import { .. }
         | Expr::RecordDeclaration { .. }
         | Expr::TypeClassDeclaration { .. }
+        | Expr::ExtensionDeclaration { .. }
         | Expr::PegRuleBlock { .. } => false,
     }
 }
@@ -34419,6 +34425,7 @@ fn collect_assigned_names(expr: &Expr, names: &mut HashSet<String>) {
         | Expr::Import { .. }
         | Expr::RecordDeclaration { .. }
         | Expr::TypeClassDeclaration { .. }
+        | Expr::ExtensionDeclaration { .. }
         | Expr::PegRuleBlock { .. } => {}
     }
 }
@@ -34520,6 +34527,7 @@ fn static_expr_is_pure(expr: &Expr) -> bool {
         | Expr::TypeClassDeclaration { .. }
         | Expr::TheoremDeclaration { .. }
         | Expr::AxiomDeclaration { .. }
+        | Expr::ExtensionDeclaration { .. }
         | Expr::PegRuleBlock { .. } => true,
     }
 }
@@ -34680,6 +34688,7 @@ fn expr_contains_thread_call(expr: &Expr, thread_aliases: &HashSet<String>) -> b
         | Expr::Import { .. }
         | Expr::RecordDeclaration { .. }
         | Expr::TypeClassDeclaration { .. }
+        | Expr::ExtensionDeclaration { .. }
         | Expr::PegRuleBlock { .. } => false,
     }
 }

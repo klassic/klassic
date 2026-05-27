@@ -1,0 +1,40 @@
+module std.path
+
+// Path string helpers. POSIX-style `/` separator only, matching the
+// v0.1 informal convention used elsewhere in the repo. Windows-style
+// paths land later when the runtime crate gains target-aware path
+// semantics.
+
+def separator() = "/"
+
+def basename(path) = {
+  val slash = lastIndexOf(path, "/")
+  if((slash < 0)) path else substring(path, slash + 1, length(path))
+}
+
+def dirname(path) = {
+  val slash = lastIndexOf(path, "/")
+  if((slash < 0)) "" else if((slash == 0)) "/" else substring(path, 0, slash)
+}
+
+def fileExtension(path) = {
+  val name = basename(path)
+  val dot = lastIndexOf(name, ".")
+  if((dot <= 0)) "" else substring(name, dot, length(name))
+}
+
+def withoutExtension(path) = {
+  val name = basename(path)
+  val dot = lastIndexOf(name, ".")
+  if((dot <= 0)) path else {
+    val slash = lastIndexOf(path, "/")
+    if((slash < 0)) substring(path, 0, dot) else substring(path, 0, slash + 1 + dot)
+  }
+}
+
+def join(a, b) = {
+  if(isEmptyString(a)) b else if(isEmptyString(b)) a else {
+    val tail = at(a, length(a) - 1)
+    if((tail == "/")) a + b else a + "/" + b
+  }
+}

@@ -145,6 +145,33 @@ impl Environment {
             .map(|(name, binding)| (name.clone(), binding.borrow().current_value()))
             .collect()
     }
+
+    /// Returns every binding name currently in the root scope. Used by
+    /// the evaluator to detect which definitions a module-scoped
+    /// translation unit just added so they can be removed from the
+    /// root scope (only the module's exports should be visible there).
+    pub(crate) fn root_binding_names(&self) -> std::collections::HashSet<String> {
+        self.scopes
+            .first()
+            .into_iter()
+            .flat_map(|scope| scope.keys().cloned())
+            .collect()
+    }
+
+    /// Removes `names` from the root scope. Inner scopes are not
+    /// affected — module loads only happen at the program top level,
+    /// so the root scope is the only one that can leak.
+    pub(crate) fn forget_root_bindings<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        if let Some(scope) = self.scopes.first_mut() {
+            for name in names {
+                scope.remove(name.as_ref());
+            }
+        }
+    }
 }
 
 pub(crate) enum AssignmentFailure {

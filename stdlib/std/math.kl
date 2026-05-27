@@ -1,0 +1,19 @@
+module std.math
+
+// Math helpers exposed under `std.math`. Plain Klassic only — builtins
+// (`abs`, `floor`, `ceil`, `sqrt`, `Math#powInt`, ...) stay accessible
+// directly without going through this module.
+
+def mod(n, m) = n - (n / m) * m
+
+def min(a, b) = if((a <= b)) a else b
+
+def max(a, b) = if((a >= b)) a else b
+
+def clamp(n, lo, hi) = if((n < lo)) lo else if((n > hi)) hi else n
+
+def isEven(n) = mod(n, 2) == 0
+
+def isOdd(n) = mod(n, 2) == 1
+
+def sign(n) = if((n > 0)) 1 else if((n < 0)) -1 else 0

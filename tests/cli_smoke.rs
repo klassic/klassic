@@ -20239,6 +20239,140 @@ fn run_subcommand_threads_script_args_through_command_line_args() {
     );
 }
 
+/// PR 8: std.string / std.math / std.path are all reachable via the
+/// embedded stdlib bundle from a single evaluator run.
+#[test]
+fn evaluator_imports_std_string_math_path_modules() {
+    // `std.string` ships its members as extension methods on String —
+    // they become callable via dot syntax (`"hi".nonEmpty()`)
+    // automatically once the stdlib bundle is loaded, so the user
+    // does not need to import them. `std.math` and `std.path`
+    // continue to expose ordinary functions imported by member.
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.math.{mod, clamp, sign}\n\
+             import std.path.{basename, dirname, fileExtension, join}\n\
+             println(\"hello\".nonEmpty())\n\
+             println(\"a\\nb\\nc\".lines())\n\
+             println(mod(10, 3))\n\
+             println(clamp(15, 0, 10))\n\
+             println(sign(-7))\n\
+             println(basename(\"/usr/lib/foo.txt\"))\n\
+             println(dirname(\"/usr/lib/foo.txt\"))\n\
+             println(fileExtension(\"/usr/lib/foo.txt\"))\n\
+             println(join(\"/usr\", \"lib\"))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = "true\n[a, b, c]\n1\n10\n-1\nfoo.txt\n/usr/lib\n.txt\n/usr/lib\n()\n";
+    assert_eq!(stdout, expected, "stdout mismatch:\n{stdout}");
+}
+
+/// Extension methods (PR B): `extension (this: T) { def name() = ... }`
+/// declarations add new methods to existing types and are dispatched
+/// through dot syntax. The implicit `this` is in scope inside every
+/// method body so members can be tiny one-liners.
+#[test]
+fn extension_methods_dispatch_via_dot_syntax() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "extension (this: String) {\n  \
+               def shout() = toUpperCase(this)\n  \
+               def repeatN(n) = if((n <= 0)) \"\" else this + this.repeatN(n - 1)\n\
+             }\n\
+             println(\"hi\".shout())\n\
+             println(\"ab\".repeatN(3))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "HI\nababab\n()\n");
+}
+
+/// Extension methods on a concrete instantiation of a generic type
+/// (`List<Int>` here). The dispatch key normalises the receiver type
+/// to its outer constructor, so the method is reachable from any
+/// `List<Int>` value.
+#[test]
+fn extension_methods_dispatch_on_list_int() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "extension (this: List<Int>) {\n  \
+               def total() = foldLeft(this)(0)((a, b) => a + b)\n\
+             }\n\
+             println([1 2 3 4 5].total())",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "15\n()\n");
+}
+
+/// Native build path does not yet support extension methods. The
+/// compiler must reject them with a source-located diagnostic so the
+/// user knows to drop back to the evaluator until PR ?? closes the
+/// gap.
+#[test]
+fn native_build_rejects_extension_declarations() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_ext_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_ext_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "extension (this: String) { def shout() = toUpperCase(this) }\nprintln(\"hi\".shout())\n",
+    )
+    .expect("temp source file should write");
+
+    let output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !output.status.success(),
+        "native build should fail for extension declarations"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("extension methods"),
+        "stderr should explain the limitation: {stderr}"
+    );
+}
+
 /// PR 7: a `#!` shebang at the top of a `.kl` file is dropped during
 /// source loading so the rest of the script parses normally.
 #[test]

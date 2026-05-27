@@ -261,6 +261,7 @@ fn collect_referenced_proof_names(
         | Expr::Null { .. }
         | Expr::Unit { .. } => {}
         Expr::InstanceDeclaration { methods, .. }
+        | Expr::ExtensionDeclaration { methods, .. }
         | Expr::Block {
             expressions: methods,
             ..

@@ -1,9 +1,8 @@
 module std.list
 
-// Standard list helpers exposed under `std.list`. Implementations are
-// plain Klassic and intentionally identical to the v0.1 prelude
-// `stdlib*` aliases so the evaluator and native compiler reach the
-// same answer for every member.
+// Plain-Klassic list helpers under `std.list`. Module-qualified
+// imports give the user a clean namespace; the v0.1 prelude aliases
+// (`stdlibRange` etc.) remain available without an import.
 
 def range(start, end) = if((start >= end)) [] else cons(start)(range(start + 1, end))
 

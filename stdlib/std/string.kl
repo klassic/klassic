@@ -1,0 +1,13 @@
+module std.string
+
+// String helpers exposed under `std.string`. They are provided as
+// extension methods on the `String` type so user code can call them
+// in dot-notation after `import std.string` — no naming conflict
+// with the existing top-level `length` / `trim` / ... builtins.
+
+extension (this: String) {
+  def isEmpty() = isEmptyString(this)
+  def nonEmpty() = if(isEmptyString(this)) false else true
+  def lines() = split(this, "\n")
+  def words() = stdlibFilter(split(this, " "), (w) => if(isEmptyString(w)) false else true)
+}

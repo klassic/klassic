@@ -154,6 +154,61 @@ thread_local! {
     static USER_BINDING_TYPES: RefCell<HashMap<String, StoredType>> = RefCell::new(HashMap::new());
     static USER_TYPECLASS_INFOS: RefCell<HashMap<String, TypeClassInfo>> = RefCell::new(HashMap::new());
     static USER_INSTANCE_INFOS: RefCell<Vec<InstanceInfo>> = const { RefCell::new(Vec::new()) };
+    /// User-defined extension methods, keyed by
+    /// `(normalised-receiver-type, method-name)`. The stored function
+    /// type still carries `this` as its first parameter; the FieldAccess
+    /// inference path drops that prefix before returning the type to
+    /// the caller.
+    static USER_EXTENSION_METHODS: RefCell<HashMap<(String, String), StoredType>> =
+        RefCell::new(HashMap::new());
+}
+
+fn normalise_receiver_annotation(annotation: &TypeAnnotation) -> String {
+    let trimmed = annotation.text.trim();
+    let stripped = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    stripped
+        .split(|ch: char| ch == '<' || ch.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn dispatch_key_for_type(ty: &Type) -> Option<String> {
+    Some(match ty {
+        Type::Int | Type::Byte | Type::Short | Type::Long => "Int".to_string(),
+        Type::Float | Type::Double => "Double".to_string(),
+        Type::Bool => "Boolean".to_string(),
+        Type::String => "String".to_string(),
+        Type::Unit => "Unit".to_string(),
+        Type::Null => "Null".to_string(),
+        Type::List(_) => "List".to_string(),
+        Type::Map(_, _) => "Map".to_string(),
+        Type::Set(_) => "Set".to_string(),
+        Type::Record(name, _) | Type::Named(name) => name.clone(),
+        Type::Applied(inner, _) => dispatch_key_for_type(inner)?,
+        _ => return None,
+    })
+}
+
+fn register_user_extension_method(receiver_key: String, method_name: String, stored: StoredType) {
+    USER_EXTENSION_METHODS.with(|registry| {
+        registry
+            .borrow_mut()
+            .insert((receiver_key, method_name), stored);
+    });
+}
+
+fn resolve_user_extension_method_type(receiver_key: &str, method: &str) -> Option<StoredType> {
+    USER_EXTENSION_METHODS.with(|registry| {
+        registry
+            .borrow()
+            .get(&(receiver_key.to_string(), method.to_string()))
+            .cloned()
+    })
+}
+
+pub fn clear_user_extension_methods() {
+    USER_EXTENSION_METHODS.with(|registry| registry.borrow_mut().clear());
 }
 
 pub fn typecheck_program(expr: &Expr) -> Result<(), Diagnostic> {
@@ -189,11 +244,18 @@ where
     let result = checker.infer_program(expr).map(|_| ());
     if result.is_ok() {
         export_user_record_schemas(checker.user_record_schemas());
-        export_user_binding_types(checker.root_exports());
         export_user_typeclass_infos(checker.user_typeclass_infos());
         export_user_instance_types(checker.user_instance_types());
+        // Module-scoped translation units export their root bindings
+        // under the module's name only — leaking them into
+        // USER_BINDING_TYPES would let user code reference module
+        // members without an explicit `import`, which contradicts
+        // module semantics and previously masked builtin names like
+        // `isEmpty` for List.
         if let Some(module) = &checker.current_module {
             export_current_module_types(module, checker.root_exports());
+        } else {
+            export_user_binding_types(checker.root_exports());
         }
     }
     result
@@ -1114,6 +1176,19 @@ impl TypeChecker {
                 Ok(Type::Unit)
             }
             Expr::PegRuleBlock { .. } => Ok(Type::Unit),
+            Expr::ExtensionDeclaration {
+                type_params,
+                this_name,
+                receiver_type,
+                methods,
+                span,
+            } => self.infer_extension_declaration(
+                type_params,
+                this_name,
+                receiver_type,
+                methods,
+                *span,
+            ),
             Expr::RecordDeclaration {
                 name,
                 type_params,
@@ -1384,6 +1459,9 @@ impl TypeChecker {
             } => {
                 let target_type = self.infer_expr(target)?;
                 if let Some(method_type) = self.builtin_value_method_type(&target_type, field) {
+                    return Ok(method_type);
+                }
+                if let Some(method_type) = self.user_extension_method_type(&target_type, field) {
                     return Ok(method_type);
                 }
                 match self.resolve(&target_type) {
@@ -3238,6 +3316,123 @@ impl TypeChecker {
         Some(row)
     }
 
+    fn infer_extension_declaration(
+        &mut self,
+        type_params: &[String],
+        this_name: &str,
+        receiver_type: &TypeAnnotation,
+        methods: &[Expr],
+        _span: Span,
+    ) -> Result<Type, Diagnostic> {
+        let receiver_key = normalise_receiver_annotation(receiver_type);
+        for method in methods {
+            let Expr::DefDecl {
+                name,
+                constraints,
+                params,
+                param_annotations,
+                return_annotation,
+                body,
+                span,
+                ..
+            } = method
+            else {
+                continue;
+            };
+
+            let mut named = HashMap::new();
+            for type_param in type_params {
+                named
+                    .entry(type_param.clone())
+                    .or_insert_with(|| self.fresh_var());
+            }
+            let receiver_ty = self.parse_annotation_with_named_vars(receiver_type, &mut named);
+            let mut param_types = vec![receiver_ty.clone()];
+            for annotation in param_annotations {
+                let ty = match annotation {
+                    Some(annotation) => {
+                        self.parse_annotation_with_named_vars(annotation, &mut named)
+                    }
+                    None => self.fresh_var(),
+                };
+                param_types.push(ty);
+            }
+            while param_types.len() < params.len() + 1 {
+                param_types.push(self.fresh_var());
+            }
+            let return_type = return_annotation
+                .as_ref()
+                .map(|annotation| self.parse_annotation_with_named_vars(annotation, &mut named))
+                .unwrap_or_else(|| self.fresh_var());
+            let resolved_constraints = self.build_constraints(constraints, &mut named, *span)?;
+            let function_type = Type::Function(param_types.clone(), Box::new(return_type.clone()));
+
+            // Register the method's tentative type before checking the
+            // body so recursive `this.method(...)` calls resolve.
+            let preliminary_stored = StoredType {
+                ty: function_type.clone(),
+                generalized_vars: Vec::new(),
+                constraints: resolved_constraints.clone(),
+            };
+            register_user_extension_method(receiver_key.clone(), name.clone(), preliminary_stored);
+
+            self.push_scope();
+            self.declare(
+                name.clone(),
+                false,
+                function_type.clone(),
+                Vec::new(),
+                resolved_constraints.clone(),
+            );
+            self.declare(
+                this_name.to_string(),
+                false,
+                receiver_ty.clone(),
+                Vec::new(),
+                Vec::new(),
+            );
+            for (param, ty) in params.iter().zip(param_types.iter().skip(1)) {
+                self.declare(param.clone(), false, ty.clone(), Vec::new(), Vec::new());
+            }
+            self.declare_constraint_methods(&resolved_constraints, *span)?;
+            let body_type = self.infer_expr(body)?;
+            self.pop_scope();
+
+            let resolved_return = self.enforce_assignable(return_type, body_type, *span)?;
+            let resolved_params = param_types
+                .into_iter()
+                .map(|param| self.resolve(&param))
+                .collect::<Vec<_>>();
+            let final_type =
+                Type::Function(resolved_params, Box::new(self.resolve(&resolved_return)));
+            let generalized_vars = self.generalize_signature(&final_type, &resolved_constraints);
+            let stored = StoredType {
+                ty: final_type,
+                generalized_vars,
+                constraints: resolved_constraints,
+            };
+            register_user_extension_method(receiver_key.clone(), name.clone(), stored);
+        }
+        Ok(Type::Unit)
+    }
+
+    fn user_extension_method_type(&mut self, target: &Type, field: &str) -> Option<Type> {
+        let resolved = self.resolve(target);
+        let key = dispatch_key_for_type(&resolved)?;
+        let stored = resolve_user_extension_method_type(&key, field)?;
+        let instantiated = self.instantiate_stored_type(&stored);
+        match instantiated {
+            // Drop the leading `this` parameter — dispatch already
+            // supplies the receiver, so the user-visible method type
+            // only carries any extra arguments.
+            Type::Function(mut params, ret) if !params.is_empty() => {
+                params.remove(0);
+                Some(Type::Function(params, ret))
+            }
+            other => Some(other),
+        }
+    }
+
     fn builtin_value_method_type(&mut self, target: &Type, field: &str) -> Option<Type> {
         let resolved = self.resolve(target);
         match resolved {
@@ -4381,6 +4576,7 @@ fn substitute_expr_identifiers(expr: &Expr, substitutions: &HashMap<String, Expr
         | Expr::Unit { .. }
         | Expr::ModuleHeader { .. }
         | Expr::Import { .. }
+        | Expr::ExtensionDeclaration { .. }
         | Expr::PegRuleBlock { .. } => expr.clone(),
         Expr::Identifier { name, .. } => substitutions
             .get(name)

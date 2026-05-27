@@ -146,6 +146,21 @@ pub enum Expr {
         proposition: Box<Expr>,
         span: Span,
     },
+    /// `extension <type-params>? (this: <ReceiverType>) { <DefDecl>* }`
+    ///
+    /// Adds new methods to an existing type. Each `def` inside the
+    /// block is dispatched through `value.method(args)` syntax with
+    /// the value bound to `this_name` (always `"this"` today) in the
+    /// def body. Type parameters declared on the extension header are
+    /// in scope across every method, so `extension <a>(this: List<a>)`
+    /// can refer to `a` in any contained `def`.
+    ExtensionDeclaration {
+        type_params: Vec<String>,
+        this_name: String,
+        receiver_type: TypeAnnotation,
+        methods: Vec<Expr>,
+        span: Span,
+    },
     PegRuleBlock {
         span: Span,
     },
@@ -261,6 +276,7 @@ impl Expr {
             | Self::InstanceDeclaration { span, .. }
             | Self::TheoremDeclaration { span, .. }
             | Self::AxiomDeclaration { span, .. }
+            | Self::ExtensionDeclaration { span, .. }
             | Self::PegRuleBlock { span }
             | Self::VarDecl { span, .. }
             | Self::DefDecl { span, .. }
@@ -310,6 +326,7 @@ enum TokenKind {
     Theorem,
     Trust,
     Axiom,
+    Extension,
     Rule,
     Where,
     Cleanup,
@@ -644,6 +661,7 @@ impl<'a> Lexer<'a> {
             "theorem" => TokenKind::Theorem,
             "trust" => TokenKind::Trust,
             "axiom" => TokenKind::Axiom,
+            "extension" => TokenKind::Extension,
             "rule" => TokenKind::Rule,
             "where" => TokenKind::Where,
             "cleanup" => TokenKind::Cleanup,
@@ -884,6 +902,7 @@ impl Parser {
             TokenKind::Trust | TokenKind::Theorem | TokenKind::Axiom => {
                 self.parse_proof_declaration()
             }
+            TokenKind::Extension => self.parse_extension_declaration(),
             TokenKind::Rule => self.parse_peg_rule_block(),
             TokenKind::Val => self.parse_variable_declaration(false),
             TokenKind::Mutable => self.parse_variable_declaration(true),
@@ -1134,6 +1153,144 @@ impl Parser {
             constraints,
             methods,
             span: start.merge(class_span).merge(end),
+        })
+    }
+
+    fn parse_extension_declaration(&mut self) -> Result<Expr, Diagnostic> {
+        let start = self.bump().span; // consume `extension`
+        let (type_params, _inline_constraints) = self.parse_optional_generic_param_names()?;
+
+        match self.peek().kind {
+            TokenKind::LParen => {
+                self.bump();
+            }
+            TokenKind::Eof => {
+                return Err(
+                    Diagnostic::parse(self.peek().span, "expected `(` after `extension`")
+                        .with_incomplete_input(),
+                );
+            }
+            _ => {
+                return Err(Diagnostic::parse(
+                    self.peek().span,
+                    "expected `(` after `extension`",
+                ));
+            }
+        }
+
+        let (this_name, this_span) = self.expect_identifier()?;
+
+        match self.peek().kind {
+            TokenKind::Colon => {
+                self.bump();
+            }
+            _ => {
+                return Err(Diagnostic::parse(
+                    self.peek().span,
+                    "expected `:` after extension receiver name",
+                ));
+            }
+        }
+
+        let annotation_start = self.index;
+        let mut paren_depth = 1usize;
+        let mut angle_depth = 0usize;
+        while paren_depth > 0 {
+            match self.peek().kind {
+                TokenKind::LParen => {
+                    paren_depth += 1;
+                    self.bump();
+                }
+                TokenKind::RParen => {
+                    if paren_depth == 1 && angle_depth == 0 {
+                        break;
+                    }
+                    paren_depth = paren_depth.saturating_sub(1);
+                    self.bump();
+                }
+                TokenKind::Less => {
+                    angle_depth += 1;
+                    self.bump();
+                }
+                TokenKind::Greater => {
+                    angle_depth = angle_depth.saturating_sub(1);
+                    self.bump();
+                }
+                TokenKind::Eof => {
+                    return Err(Diagnostic::parse(
+                        self.peek().span,
+                        "expected `)` to close extension receiver type",
+                    )
+                    .with_incomplete_input());
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        let annotation_end = self.index;
+        if annotation_start == annotation_end {
+            return Err(Diagnostic::parse(
+                self.peek().span,
+                "expected receiver type annotation",
+            ));
+        }
+        let annotation_span = self.tokens[annotation_start]
+            .span
+            .merge(self.tokens[annotation_end - 1].span);
+        let receiver_type = TypeAnnotation {
+            text: self.render_tokens(annotation_start, annotation_end),
+            span: annotation_span,
+        };
+
+        match self.peek().kind {
+            TokenKind::RParen => {
+                self.bump();
+            }
+            _ => return Err(Diagnostic::parse(self.peek().span, "expected `)`")),
+        }
+
+        match self.peek().kind {
+            TokenKind::LBrace => {
+                self.bump();
+            }
+            TokenKind::Eof => {
+                return Err(
+                    Diagnostic::parse(self.peek().span, "expected `{`").with_incomplete_input()
+                );
+            }
+            _ => return Err(Diagnostic::parse(self.peek().span, "expected `{`")),
+        }
+
+        let mut methods = Vec::new();
+        self.consume_separators();
+        while !matches!(self.peek().kind, TokenKind::RBrace) {
+            if !matches!(self.peek().kind, TokenKind::Def) {
+                return Err(Diagnostic::parse(
+                    self.peek().span,
+                    "expected `def` inside extension declaration",
+                ));
+            }
+            methods.push(self.parse_function_declaration()?);
+            self.consume_separators();
+        }
+
+        let end = match self.peek().kind {
+            TokenKind::RBrace => self.bump().span,
+            TokenKind::Eof => {
+                return Err(
+                    Diagnostic::parse(self.peek().span, "expected `}`").with_incomplete_input()
+                );
+            }
+            _ => return Err(Diagnostic::parse(self.peek().span, "expected `}`")),
+        };
+
+        Ok(Expr::ExtensionDeclaration {
+            type_params,
+            this_name,
+            receiver_type,
+            methods,
+            span: start.merge(this_span).merge(end),
         })
     }
 
@@ -3205,6 +3362,7 @@ fn token_text(kind: &TokenKind) -> String {
         TokenKind::Theorem => "theorem".to_string(),
         TokenKind::Trust => "trust".to_string(),
         TokenKind::Axiom => "axiom".to_string(),
+        TokenKind::Extension => "extension".to_string(),
         TokenKind::Rule => "rule".to_string(),
         TokenKind::Where => "where".to_string(),
         TokenKind::Cleanup => "cleanup".to_string(),
@@ -3380,6 +3538,19 @@ fn rewrap_span(expr: Expr, span: Span) -> Expr {
             params,
             param_annotations,
             proposition,
+            span,
+        },
+        Expr::ExtensionDeclaration {
+            type_params,
+            this_name,
+            receiver_type,
+            methods,
+            ..
+        } => Expr::ExtensionDeclaration {
+            type_params,
+            this_name,
+            receiver_type,
+            methods,
             span,
         },
         Expr::PegRuleBlock { .. } => Expr::PegRuleBlock { span },
