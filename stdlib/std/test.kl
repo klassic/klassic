@@ -1,0 +1,21 @@
+module std.test
+
+// Lightweight assertion helpers for scripting and small test
+// programs. Builds on the existing `assert` / `assertResult`
+// builtins; the wrappers below add named test cases and human-
+// readable failure messages so a failed script prints something
+// closer to a unit-test report.
+
+def passed(name) = println("[ OK ] " + name)
+
+def failed(name, reason) = printlnError("[FAIL] " + name + ": " + reason)
+
+def expectTrue(name, value) = if(value) passed(name) else failed(name, "expected true but got false")
+
+def expectFalse(name, value) = if(value) failed(name, "expected false but got true") else passed(name)
+
+def expectEqualsInt(name, expected, actual) = if((expected == actual)) passed(name) else failed(name, "expected " + toString(expected) + " but got " + toString(actual))
+
+def expectEqualsString(name, expected, actual) = if((expected == actual)) passed(name) else failed(name, "expected " + expected + " but got " + actual)
+
+def fail(name, reason) = failed(name, reason)

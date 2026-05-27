@@ -135,6 +135,25 @@ println(unwrapOr(good, "default"))   // "payload"
 println(unwrapOr(bad, "default"))    // "default"
 ```
 
+## std.test
+
+Lightweight assertion helpers for scripting and small test programs.
+Builds on the existing `assert` / `assertResult` builtins so failures
+print a human-readable report instead of stopping the program with a
+runtime error.
+
+```klassic
+import std.test.{expectTrue, expectEqualsInt, expectEqualsString}
+
+expectTrue("simple", true)
+expectEqualsInt("math",   6,        1 + 2 + 3)
+expectEqualsString("name", "hello", "hel" + "lo")
+```
+
+A passing check prints `[ OK ] <name>` on stdout; a failing one
+prints `[FAIL] <name>: <reason>` on stderr without aborting, so a
+script can run a whole suite and aggregate results.
+
 ## Native availability
 
 Stdlib modules are currently loaded only by the evaluator. The
