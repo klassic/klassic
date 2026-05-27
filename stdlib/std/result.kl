@@ -1,0 +1,21 @@
+module std.result
+
+// Lightweight Result/Either helpers. Klassic constructs records with
+// `#TypeName(...)` syntax — we wrap that in plain functions here so
+// callers can write `ok(value)` / `err(msg)` and let the helpers
+// inspect the result's shape uniformly.
+
+record ROk { value: * }
+record RErr { message: * }
+
+def ok(value) = #ROk(value)
+
+def err(message) = #RErr(message)
+
+def isOk(result) = if((result == null)) false else if((result.value == null)) false else true
+
+def isErr(result) = if((result == null)) false else if((result.message == null)) false else true
+
+def unwrapOr(result, fallback) = if(isOk(result)) result.value else fallback
+
+def mapResult(result, f) = if(isOk(result)) #ROk(f(result.value)) else result
