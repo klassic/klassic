@@ -8,6 +8,7 @@ use klassic_syntax::{
     BinaryOp, Expr, FloatLiteralKind, IntLiteralKind, RecordField, TypeAnnotation,
     TypeClassConstraint, UnaryOp, parse_inline_expression, parse_source,
 };
+use klassic_types::proof::{ProofConfig, analyze_proofs};
 use klassic_types::typecheck_program;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -105,7 +106,9 @@ impl NativeTarget {
             .iter()
             .flat_map(|spec| spec.aliases.iter().copied())
             .collect::<Vec<_>>();
-        names.push("native");
+        if Self::host().is_some() {
+            names.push("native");
+        }
         names
     }
 
@@ -360,7 +363,15 @@ fn compile_internal(
     typecheck_program(&expr).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
-    analyze_proofs(&expr, config).map_err(|diagnostic| {
+    analyze_proofs(
+        &expr,
+        ProofConfig {
+            deny_trust: config.deny_trust,
+            warn_trust: config.warn_trust,
+            build_error: &Diagnostic::compile,
+        },
+    )
+    .map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
     let target = NativeTargetContext::for_target(config.target);
@@ -377,319 +388,6 @@ fn compile_internal(
 fn write_executable_for_target(target: NativeTargetContext, object: ObjectFile) -> Vec<u8> {
     match target.spec.executable_format {
         NativeExecutableFormat::Elf64 => elf::write_executable(object, target.spec),
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ProofDefinition {
-    name: String,
-    span: Span,
-    proposition: Expr,
-    body: Option<Expr>,
-    trusted: bool,
-    is_axiom: bool,
-}
-
-#[derive(Clone, Debug)]
-struct ProofMetadata {
-    name: String,
-    span: Span,
-    level: usize,
-    trusted: bool,
-    dependencies: HashSet<String>,
-}
-
-fn analyze_proofs(expr: &Expr, config: NativeCompilerConfig) -> Result<(), Diagnostic> {
-    let definitions = collect_proof_definitions(expr);
-    if definitions.is_empty() {
-        return Ok(());
-    }
-    let metadata = compute_proof_metadata(&definitions)?;
-    if config.deny_trust
-        && let Some(proof) = definitions
-            .iter()
-            .filter_map(|definition| metadata.get(&definition.name))
-            .find(|proof| proof.trusted)
-    {
-        return Err(Diagnostic::compile(
-            proof.span,
-            format!(
-                "trusted proof '{}' is not allowed (level {})",
-                proof.name, proof.level
-            ),
-        ));
-    }
-    if config.warn_trust {
-        let mut proofs = metadata
-            .values()
-            .filter(|proof| proof.trusted)
-            .cloned()
-            .collect::<Vec<_>>();
-        proofs.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
-        for proof in proofs {
-            let mut deps = proof.dependencies.iter().cloned().collect::<Vec<_>>();
-            deps.sort();
-            eprintln!(
-                "[trust] proof '{}' is trusted (level {}); depends on [{}]",
-                proof.name,
-                proof.level,
-                deps.join(", ")
-            );
-        }
-    }
-    Ok(())
-}
-
-fn collect_proof_definitions(expr: &Expr) -> Vec<ProofDefinition> {
-    let expressions = match expr {
-        Expr::Block { expressions, .. } => expressions.as_slice(),
-        other => std::slice::from_ref(other),
-    };
-    expressions
-        .iter()
-        .filter_map(|expression| match expression {
-            Expr::TheoremDeclaration {
-                name,
-                proposition,
-                body,
-                trusted,
-                span,
-                ..
-            } => Some(ProofDefinition {
-                name: name.clone(),
-                span: *span,
-                proposition: proposition.as_ref().clone(),
-                body: Some(body.as_ref().clone()),
-                trusted: *trusted,
-                is_axiom: false,
-            }),
-            Expr::AxiomDeclaration {
-                name,
-                proposition,
-                span,
-                ..
-            } => Some(ProofDefinition {
-                name: name.clone(),
-                span: *span,
-                proposition: proposition.as_ref().clone(),
-                body: None,
-                trusted: true,
-                is_axiom: true,
-            }),
-            _ => None,
-        })
-        .collect()
-}
-
-fn compute_proof_metadata(
-    definitions: &[ProofDefinition],
-) -> Result<HashMap<String, ProofMetadata>, Diagnostic> {
-    let by_name = definitions
-        .iter()
-        .map(|definition| (definition.name.clone(), definition))
-        .collect::<HashMap<_, _>>();
-    let proof_names = by_name.keys().cloned().collect::<HashSet<_>>();
-    let deps = definitions
-        .iter()
-        .map(|definition| {
-            (
-                definition.name.clone(),
-                proof_dependencies(definition, &proof_names),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-
-    fn compute_level(
-        name: &str,
-        by_name: &HashMap<String, &ProofDefinition>,
-        deps: &HashMap<String, HashSet<String>>,
-        memo: &mut HashMap<String, usize>,
-        visiting: &mut HashSet<String>,
-    ) -> Result<usize, Diagnostic> {
-        if let Some(level) = memo.get(name) {
-            return Ok(*level);
-        }
-        if !visiting.insert(name.to_string()) {
-            let span = by_name
-                .get(name)
-                .map(|definition| definition.span)
-                .unwrap_or(Span::new(0, 0));
-            return Err(Diagnostic::compile(
-                span,
-                format!("cyclic proof dependency detected for '{name}'"),
-            ));
-        }
-        let definition = by_name
-            .get(name)
-            .expect("proof definition should exist for level computation");
-        let base = if definition.is_axiom || definition.trusted {
-            1
-        } else {
-            0
-        };
-        let mut level = base;
-        if let Some(children) = deps.get(name) {
-            for dependency in children {
-                let dep_level = compute_level(dependency, by_name, deps, memo, visiting)?;
-                if dep_level > 0 {
-                    level = level.max(dep_level + 1);
-                }
-            }
-        }
-        visiting.remove(name);
-        memo.insert(name.to_string(), level);
-        Ok(level)
-    }
-
-    let mut memo = HashMap::new();
-    let mut visiting = HashSet::new();
-    for definition in definitions {
-        compute_level(&definition.name, &by_name, &deps, &mut memo, &mut visiting)?;
-    }
-
-    Ok(definitions
-        .iter()
-        .map(|definition| {
-            let level = *memo
-                .get(&definition.name)
-                .expect("proof level should exist after computation");
-            (
-                definition.name.clone(),
-                ProofMetadata {
-                    name: definition.name.clone(),
-                    span: definition.span,
-                    level,
-                    trusted: level > 0,
-                    dependencies: deps.get(&definition.name).cloned().unwrap_or_default(),
-                },
-            )
-        })
-        .collect())
-}
-
-fn proof_dependencies(definition: &ProofDefinition, names: &HashSet<String>) -> HashSet<String> {
-    let mut dependencies = HashSet::new();
-    collect_referenced_proof_names(&definition.proposition, names, &mut dependencies);
-    if let Some(body) = &definition.body {
-        collect_referenced_proof_names(body, names, &mut dependencies);
-    }
-    dependencies.remove(&definition.name);
-    dependencies
-}
-
-fn collect_referenced_proof_names(
-    expr: &Expr,
-    names: &HashSet<String>,
-    dependencies: &mut HashSet<String>,
-) {
-    match expr {
-        Expr::Identifier { name, .. } if names.contains(name) => {
-            dependencies.insert(name.clone());
-        }
-        Expr::TheoremDeclaration {
-            proposition, body, ..
-        } => {
-            collect_referenced_proof_names(proposition, names, dependencies);
-            collect_referenced_proof_names(body, names, dependencies);
-        }
-        Expr::AxiomDeclaration { proposition, .. } => {
-            collect_referenced_proof_names(proposition, names, dependencies);
-        }
-        Expr::VarDecl { value, .. }
-        | Expr::Assign { value, .. }
-        | Expr::Unary { expr: value, .. } => {
-            collect_referenced_proof_names(value, names, dependencies);
-        }
-        Expr::DefDecl { body, .. } | Expr::Lambda { body, .. } => {
-            collect_referenced_proof_names(body, names, dependencies);
-        }
-        Expr::Binary { lhs, rhs, .. } => {
-            collect_referenced_proof_names(lhs, names, dependencies);
-            collect_referenced_proof_names(rhs, names, dependencies);
-        }
-        Expr::Call {
-            callee, arguments, ..
-        } => {
-            collect_referenced_proof_names(callee, names, dependencies);
-            for argument in arguments {
-                collect_referenced_proof_names(argument, names, dependencies);
-            }
-        }
-        Expr::FieldAccess { target, .. } => {
-            collect_referenced_proof_names(target, names, dependencies);
-        }
-        Expr::Cleanup { body, cleanup, .. } => {
-            collect_referenced_proof_names(body, names, dependencies);
-            collect_referenced_proof_names(cleanup, names, dependencies);
-        }
-        Expr::RecordConstructor { arguments, .. }
-        | Expr::ListLiteral {
-            elements: arguments,
-            ..
-        }
-        | Expr::SetLiteral {
-            elements: arguments,
-            ..
-        } => {
-            for argument in arguments {
-                collect_referenced_proof_names(argument, names, dependencies);
-            }
-        }
-        Expr::RecordLiteral { fields, .. } => {
-            for (_, value) in fields {
-                collect_referenced_proof_names(value, names, dependencies);
-            }
-        }
-        Expr::MapLiteral { entries, .. } => {
-            for (key, value) in entries {
-                collect_referenced_proof_names(key, names, dependencies);
-                collect_referenced_proof_names(value, names, dependencies);
-            }
-        }
-        Expr::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            collect_referenced_proof_names(condition, names, dependencies);
-            collect_referenced_proof_names(then_branch, names, dependencies);
-            if let Some(branch) = else_branch {
-                collect_referenced_proof_names(branch, names, dependencies);
-            }
-        }
-        Expr::While {
-            condition, body, ..
-        } => {
-            collect_referenced_proof_names(condition, names, dependencies);
-            collect_referenced_proof_names(body, names, dependencies);
-        }
-        Expr::Foreach { iterable, body, .. } => {
-            collect_referenced_proof_names(iterable, names, dependencies);
-            collect_referenced_proof_names(body, names, dependencies);
-        }
-        Expr::Block { expressions, .. } => {
-            for expression in expressions {
-                collect_referenced_proof_names(expression, names, dependencies);
-            }
-        }
-        Expr::InstanceDeclaration { methods, .. } => {
-            for method in methods {
-                collect_referenced_proof_names(method, names, dependencies);
-            }
-        }
-        Expr::Int { .. }
-        | Expr::Double { .. }
-        | Expr::Bool { .. }
-        | Expr::String { .. }
-        | Expr::Null { .. }
-        | Expr::Unit { .. }
-        | Expr::Identifier { .. }
-        | Expr::ModuleHeader { .. }
-        | Expr::Import { .. }
-        | Expr::RecordDeclaration { .. }
-        | Expr::TypeClassDeclaration { .. }
-        | Expr::PegRuleBlock { .. } => {}
     }
 }
 
@@ -36493,12 +36191,17 @@ mod tests {
                 assert_eq!(NativeTarget::parse(alias), Some(spec.target));
             }
         }
-        aliases.push("native");
-        assert_eq!(NativeTarget::supported_names(), aliases.as_slice());
-        assert_eq!(NativeTarget::supported_names_vec(), aliases);
+        let mut all_aliases = aliases.clone();
+        all_aliases.push("native");
+        assert_eq!(NativeTarget::supported_names(), all_aliases.as_slice());
+        let mut host_aware_aliases = aliases.clone();
+        if NativeTarget::host().is_some() {
+            host_aware_aliases.push("native");
+        }
+        assert_eq!(NativeTarget::supported_names_vec(), host_aware_aliases);
         assert_eq!(
             NativeTarget::supported_names_csv(),
-            "linux-x86_64, x86_64-unknown-linux-gnu, native"
+            NativeTarget::supported_names_vec().join(", ")
         );
     }
 

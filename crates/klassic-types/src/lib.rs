@@ -7,6 +7,8 @@ use klassic_syntax::{
     TypeClassMethod,
 };
 
+pub mod proof;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum GenericVar {
     Type(u32),

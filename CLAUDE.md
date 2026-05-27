@@ -69,6 +69,15 @@ source-located diagnostic — there is no fallback to the evaluator.
 - Klassic sample programs live under `test-programs/` (and `examples/`).
 - `klassic-native` integration tests are gated with `#[cfg(all(target_os = "linux", target_arch = "x86_64"))]`.
 
+### Roadmap
+
+Long-term direction — multi-target native backends and a shared
+standard library between evaluator and native — is captured in
+`docs/roadmap-targets-stdlib.md`. The PR-sized execution plan that
+sits alongside it is `klassic_claude_code_plan.md`. Read both before
+starting work that touches the native target abstraction, the stdlib
+module layout, or the builtin registry.
+
 ## Native Compiler Development Pattern
 
 Most recent commit history is a long stream of small, focused additions to

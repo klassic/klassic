@@ -487,3 +487,38 @@ silently, as do Dir copy / mkdir / delete / move failures.
 
 Unsupported constructs fail at build time instead of falling back to the
 evaluator.
+
+## Target Matrix
+
+Native target support is tracked as tiers. Tier 0 is the only target
+that must build a runnable executable today; tiers 1 and 2 are tracked
+here so the work item is visible even before the target abstraction
+lands. See `docs/roadmap-targets-stdlib.md` for the wider rationale.
+
+| Target triple                  | Backend                | Artifact      | Tier | Status      |
+| ------------------------------ | ---------------------- | ------------- | ---- | ----------- |
+| `x86_64-unknown-linux-gnu`     | direct ELF writer      | executable    | 0    | supported   |
+| `x86_64-unknown-linux-musl`    | direct ELF writer      | executable    | 1    | planned (Tier 0 alias once exposed) |
+| `aarch64-unknown-linux-gnu`    | direct ELF writer      | executable    | 1    | planned     |
+| `wasm32-wasi`                  | wasm module emitter    | wasm-module   | 2    | planned     |
+| `x86_64-apple-darwin`          | portable C backend     | executable    | 2    | planned     |
+| `aarch64-apple-darwin`         | portable C backend     | executable    | 2    | planned     |
+| `x86_64-pc-windows-msvc`       | portable C backend     | executable    | 2    | planned     |
+
+Rules:
+
+- Tier 0 must keep working at every commit. No PR can land if the
+  `x86_64-unknown-linux-gnu` direct ELF path stops producing a runnable
+  executable.
+- Tier 1 targets stay on the direct-syscall family of backends so that
+  Klassic's "no external `cc` / `as` / `ld`" property is preserved on
+  Linux.
+- Tier 2 targets reach the matrix through the portable runtime call
+  path / C backend. macOS and Windows do not get a direct syscall
+  backend.
+- An unsupported target must produce a `TargetSpec`-style diagnostic,
+  not a panic.
+
+When a target moves from `planned` to `supported`, add a row entry and
+a one-paragraph note in the relevant Native Compiler Development
+Pattern section describing the new emitter / runtime path.

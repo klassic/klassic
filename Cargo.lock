@@ -45,6 +45,9 @@ dependencies = [
 [[package]]
 name = "klassic-runtime"
 version = "0.1.0"
+dependencies = [
+ "klassic-span",
+]
 
 [[package]]
 name = "klassic-span"

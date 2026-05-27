@@ -3,5 +3,8 @@ name = "klassic-runtime"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+klassic-span = { path = "../klassic-span" }
+
 [lib]
 path = "src/lib.rs"
