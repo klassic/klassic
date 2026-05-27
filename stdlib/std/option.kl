@@ -1,0 +1,19 @@
+module std.option
+
+// Lightweight Option/Maybe helpers. Klassic does not yet have ADTs,
+// so the v0.2 Option surface uses `null` for "none" and the value
+// itself for "some" — same convention as the existing `find` helper
+// in `std.list`. This keeps the API trivially interoperable with
+// existing builtins; once ADTs land the module will switch over.
+
+def isNone(value) = value == null
+
+def isSome(value) = if((value == null)) false else true
+
+def getOrElse(value, fallback) = if((value == null)) fallback else value
+
+def mapOption(value, f) = if((value == null)) null else f(value)
+
+def flatMapOption(value, f) = if((value == null)) null else f(value)
+
+def orElse(value, alternative) = if((value == null)) alternative else value
