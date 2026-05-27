@@ -1,0 +1,40 @@
+// A short tour of the v0.2 stdlib modules and extension-method
+// syntax. Run with: `klassic examples/stdlib-v0.2-demo.kl`
+//
+// Note: this script uses the new module-qualified imports and
+// extension methods, which are evaluator-only today. Native build
+// (`klassic build`) emits a "not yet supported" diagnostic.
+
+import std.list.{range, sum, filter}
+import std.math.{mod, clamp}
+import std.option.{getOrElse}
+
+val numbers = range(1, 11)
+
+// dot-form extension methods on List<Int>
+println(numbers.total())
+println(numbers.productOf())
+
+// extension methods on String
+println("Hello, Klassic!".upper())
+println("    spaces    ".trimmed())
+println("alpha:beta:gamma".lines())
+
+// extension methods on Int (via std.math)
+println(4.isEvenN())
+println(15.clampTo(0, 10))
+println((-7).absValue())
+
+// module-qualified helpers still available
+println(sum(numbers))
+println(filter(numbers, (x) => mod(x, 2) == 0))
+
+// std.option falls back when null
+val maybeName = null
+println(getOrElse(maybeName, "anonymous"))
+
+// extension methods on Map<K, V> (via std.map)
+val users = %["alice": 1, "bob": 2]
+println(users.containsKey("alice"))
+println(users.getOrElse("missing", 0))
+println(users.sizeOf())

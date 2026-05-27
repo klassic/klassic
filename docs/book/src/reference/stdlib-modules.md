@@ -137,22 +137,26 @@ println(bad.message)    // "nope"
 
 ## std.map / std.set
 
-Thin wrappers around the existing `Map#*` and `Set#*` builtins.
+Method-style helpers on `Map<k, v>` and `Set<a>`. The members are
+extension methods, so they become available through dot syntax once
+the stdlib bundle is loaded — no explicit import required.
 
 ```klassic
-import std.map.{containsKey, get, getOrElse}
-import std.set.{contains}
-
 val users = %["alice": 1, "bob": 2]
-println(containsKey(users, "alice"))         // true
-println(getOrElse(users, "missing", 0))      // 0
+println(users.containsKey("alice"))           // true
+println(users.get("bob"))                     // 2
+println(users.getOrElse("missing", 0))        // 0
+println(users.sizeOf())                       // 2
 
 val tags = %("rust", "klassic")
-println(contains(tags, "rust"))               // true
+println(tags.containsElement("rust"))          // true
+println(tags.sizeOf())                         // 2
 ```
 
-`std.map` also adds `getOrElse(m, key, fallback)` since the
-underlying builtin only returns the raw value (or fails).
+`getOrElse(key, fallback)` is a small convenience on top of the
+builtin — the underlying `Map#get` returns the raw value (or fails).
+`sizeOf()` and `isEmptyMap()` / `isEmptySet()` avoid name clashes
+with the top-level `size` / `isEmpty` builtins.
 
 ## std.dir
 

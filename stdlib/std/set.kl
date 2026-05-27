@@ -1,9 +1,10 @@
 module std.set
 
-// Set helpers wrapping the existing `Set#*` builtins.
+// Set helpers exposed as extension methods on Set<a>. They delegate
+// to the existing `Set#*` builtins.
 
-def contains(s, value) = Set#contains(s, value)
-
-def isEmpty(s) = Set#isEmpty(s)
-
-def size(s) = Set#size(s)
+extension <a>(this: Set<a>) {
+  def containsElement(value) = Set#contains(this, value)
+  def isEmptySet() = Set#isEmpty(this)
+  def sizeOf() = Set#size(this)
+}
