@@ -1,0 +1,19 @@
+module std.file
+
+// File helpers wrapping the existing `FileInput#` / `FileOutput#`
+// builtins. Useful when callers prefer module-qualified imports over
+// the hash-prefixed builtin names.
+
+def readAll(path) = FileInput#readAll(path)
+
+def readLines(path) = FileInput#readLines(path)
+
+def write(path, text) = FileOutput#write(path, text)
+
+def append(path, text) = FileOutput#append(path, text)
+
+def writeLines(path, lines) = FileOutput#writeLines(path, lines)
+
+def exists(path) = FileOutput#exists(path)
+
+def delete(path) = FileOutput#delete(path)

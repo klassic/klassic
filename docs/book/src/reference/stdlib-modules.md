@@ -135,6 +135,41 @@ println(unwrapOr(good, "default"))   // "payload"
 println(unwrapOr(bad, "default"))    // "default"
 ```
 
+## std.env
+
+Wraps the existing `Environment#*` builtins with shorter
+module-qualified names.
+
+```klassic
+import std.env.{get, exists, vars, getOrElse}
+
+println(getOrElse("HOME", "/unknown"))   // env var or fallback
+println(exists("DEBUG"))                  // Boolean
+```
+
+`get(name)` is equivalent to `Environment#get(name)` (returns "" or
+the empty string when missing, matching the builtin behaviour),
+`exists` to `Environment#exists`, `vars()` to `Environment#vars()`,
+and `getOrElse(name, fallback)` returns the env var's value when
+present, otherwise the supplied fallback.
+
+## std.file
+
+Wraps the existing `FileInput#` / `FileOutput#` builtins so callers
+can write `import std.file.{readAll, write}` instead of typing the
+hash-prefixed builtin names directly. All members delegate to the
+corresponding builtin, so error semantics and native-mode coverage
+are unchanged.
+
+```klassic
+import std.file.{readAll, writeLines, exists}
+
+if(exists("config.txt")) {
+  println(readAll("config.txt"))
+}
+writeLines("out.txt", ["hello", "world"])
+```
+
 ## std.cli
 
 Tiny CLI-argument helpers for scripts that read
