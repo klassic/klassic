@@ -135,6 +135,32 @@ println(unwrapOr(good, "default"))   // "payload"
 println(unwrapOr(bad, "default"))    // "default"
 ```
 
+## std.dir
+
+Wraps the existing `Dir#*` builtins. All members delegate to their
+builtin counterpart.
+
+```klassic
+import std.dir.{current, home, temp, isDirectory, list}
+
+println(current())            // current working directory
+println(home())               // user's home directory
+println(list("/tmp"))         // directory entries
+```
+
+## std.process
+
+Wraps `Process#exit`, `CommandLine#args`, and the StandardInput
+helpers under one module-qualified namespace.
+
+```klassic
+import std.process.{args, stdinAll, exitWith}
+
+val files = args()            // CommandLine#args()
+val text  = stdinAll()        // stdin contents
+if(isEmpty(files)) exitWith(1)
+```
+
 ## std.env
 
 Wraps the existing `Environment#*` builtins with shorter

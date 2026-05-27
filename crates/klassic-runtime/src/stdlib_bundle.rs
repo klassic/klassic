@@ -34,6 +34,8 @@ const STD_TEST_SOURCE: &str = include_str!("../../../stdlib/std/test.kl");
 const STD_CLI_SOURCE: &str = include_str!("../../../stdlib/std/cli.kl");
 const STD_ENV_SOURCE: &str = include_str!("../../../stdlib/std/env.kl");
 const STD_FILE_SOURCE: &str = include_str!("../../../stdlib/std/file.kl");
+const STD_PROCESS_SOURCE: &str = include_str!("../../../stdlib/std/process.kl");
+const STD_DIR_SOURCE: &str = include_str!("../../../stdlib/std/dir.kl");
 
 /// Every embedded module the compiler ships with. The driver loads
 /// these in order before user code so the user's source sees their
@@ -88,6 +90,16 @@ pub const STDLIB_MODULES: &[EmbeddedModule] = &[
         path: "std.file",
         diagnostic_name: "<stdlib std.file>",
         source: STD_FILE_SOURCE,
+    },
+    EmbeddedModule {
+        path: "std.process",
+        diagnostic_name: "<stdlib std.process>",
+        source: STD_PROCESS_SOURCE,
+    },
+    EmbeddedModule {
+        path: "std.dir",
+        diagnostic_name: "<stdlib std.dir>",
+        source: STD_DIR_SOURCE,
     },
 ];
 

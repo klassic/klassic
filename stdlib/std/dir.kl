@@ -1,0 +1,29 @@
+module std.dir
+
+// Directory helpers wrapping the existing `Dir#*` builtins.
+
+def current() = Dir#current()
+
+def home() = Dir#home()
+
+def temp() = Dir#temp()
+
+def exists(path) = Dir#exists(path)
+
+def mkdir(path) = Dir#mkdir(path)
+
+def mkdirs(path) = Dir#mkdirs(path)
+
+def isDirectory(path) = Dir#isDirectory(path)
+
+def isFile(path) = Dir#isFile(path)
+
+def list(path) = Dir#list(path)
+
+def listFull(path) = Dir#listFull(path)
+
+def delete(path) = Dir#delete(path)
+
+def copy(src, dst) = Dir#copy(src, dst)
+
+def move(src, dst) = Dir#move(src, dst)

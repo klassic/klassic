@@ -1,0 +1,13 @@
+module std.process
+
+// Process helpers wrapping `Process#exit`, `CommandLine#args`, and
+// the StandardInput builtins. All members delegate to the existing
+// builtin so error semantics and native coverage are unchanged.
+
+def args() = CommandLine#args()
+
+def stdinAll() = stdin()
+
+def stdinLines() = stdinLines()
+
+def exitWith(code) = Process#exit(code)
