@@ -129,5 +129,7 @@ When adding syntax or semantics:
 - `cleanup { ... }` clauses run after the associated expression.
 - `module foo.bar { ... }` plus selective / aliased imports.
 - Structural records (`record { x = 1; y = 2 }`) and nominal record declarations (`record Point { x: Int; y: Int }`).
+- Algebraic data types: `enum Option<a> { case Some(value: a); case None }` and Scala-style postfix pattern matching (`o match { case Some(v) => v; case None => 0 }`). Today the evaluator runs the dispatch; native compile rejects `enum` / `match` with a source-located diagnostic.
+- Extension methods: `extension <a>(this: List<a>) { def headOr(d) = ... }` adds dot-callable methods to existing types. Stdlib leans on this for `std.string`, `std.list`, `std.math`, `std.option`, `std.result`, `std.map`, `std.set`.
 - Type classes with constraints, including higher-kinded examples.
 - Proof surface: `axiom`, `theorem`, with `--warn-trust` / `--deny-trust` flags.
