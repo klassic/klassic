@@ -20491,6 +20491,35 @@ fn evaluator_supports_enum_declarations_and_postfix_match() {
     );
 }
 
+/// Enum extension methods round-trip through dot syntax — both
+/// `Option<a>` and `Result<a, e>` work via either the function-style
+/// helpers or the extension-method form.
+#[test]
+fn evaluator_enum_extension_methods_round_trip() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.result.{ok, err}\n\
+             println(ok(\"yes\").isOk())\n\
+             println(err(\"boom\").isErr())\n\
+             println(ok(\"yes\").unwrapOr(\"fallback\"))\n\
+             println(err(\"boom\").unwrapOr(\"fallback\"))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "true\ntrue\nyes\nfallback\n()\n"
+    );
+}
+
 /// `std.test` provides named assertion helpers that print a
 /// human-readable `[ OK ]` / `[FAIL]` line each. Failing checks go
 /// to stderr; passing ones go to stdout — and unlike the raw
