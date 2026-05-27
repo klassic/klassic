@@ -7,6 +7,7 @@
 //! Native direct-syscall backends keep their existing inline syscall
 //! emission and do not link to this crate.
 
+pub mod builtins;
 pub mod error;
 pub mod fs;
 pub mod system;
