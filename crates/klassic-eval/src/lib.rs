@@ -604,6 +604,7 @@ fn value_dispatch_key(value: &Value) -> Option<String> {
         Value::Map(_) => "Map".to_string(),
         Value::Set(_) => "Set".to_string(),
         Value::Record { name, .. } if !name.is_empty() => name.clone(),
+        Value::Enum { enum_name, .. } => enum_name.clone(),
         Value::Unit => "Unit".to_string(),
         Value::Null => "Null".to_string(),
         _ => return None,

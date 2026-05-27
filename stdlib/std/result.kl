@@ -1,12 +1,8 @@
 module std.result
 
 // Result/Either ADT. `Ok(value)` carries a success payload, `Err(message)`
-// carries a failure payload. Inspect via postfix `match`:
-//
-//   r match {
-//     case Ok(v)  => ...
-//     case Err(m) => ...
-//   }
+// carries a failure payload. Inspect via postfix `match` or the
+// extension methods at the bottom of the file.
 
 enum Result<a, e> {
   case Ok(value: a)
@@ -35,4 +31,24 @@ def unwrapOr(r, fallback) = r match {
 def mapResult(r, f) = r match {
   case Ok(v) => Ok(f(v))
   case Err(m) => Err(m)
+}
+
+// Method-style dispatch. Mirrors the function helpers above.
+extension <a, e>(this: Result<a, e>) {
+  def isOk() = this match {
+    case Ok(v) => true
+    case Err(m) => false
+  }
+  def isErr() = this match {
+    case Ok(v) => false
+    case Err(m) => true
+  }
+  def unwrapOr(fallback) = this match {
+    case Ok(v) => v
+    case Err(m) => fallback
+  }
+  def mapResult(f) = this match {
+    case Ok(v) => Ok(f(v))
+    case Err(m) => Err(m)
+  }
 }

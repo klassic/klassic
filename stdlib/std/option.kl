@@ -1,15 +1,8 @@
 module std.option
 
 // Option/Maybe ADT. `Some(value)` carries a payload; `None` is
-// nullary. Inspect with postfix `match`:
-//
-//   o match {
-//     case Some(v) => ...
-//     case None    => ...
-//   }
-//
-// Existing helpers below use postfix `match` so the API stays
-// ergonomic without forcing callers to write their own patterns.
+// nullary. Inspect with postfix `match` or the extension methods
+// below.
 
 enum Option<a> {
   case Some(value: a)
@@ -48,4 +41,34 @@ def flatMapOption(o, f) = o match {
 def orElse(o, alternative) = o match {
   case Some(v) => Some(v)
   case None => alternative
+}
+
+// Method-style access. `opt.isSome()` and friends delegate to the
+// function-style helpers above; users can pick whichever reads
+// better at the call site.
+extension <a>(this: Option<a>) {
+  def isSome() = this match {
+    case Some(v) => true
+    case None => false
+  }
+  def isNone() = this match {
+    case Some(v) => false
+    case None => true
+  }
+  def getOrElse(fallback) = this match {
+    case Some(v) => v
+    case None => fallback
+  }
+  def mapOption(f) = this match {
+    case Some(v) => Some(f(v))
+    case None => None
+  }
+  def flatMapOption(f) = this match {
+    case Some(v) => f(v)
+    case None => None
+  }
+  def orElse(alternative) = this match {
+    case Some(v) => Some(v)
+    case None => alternative
+  }
 }
