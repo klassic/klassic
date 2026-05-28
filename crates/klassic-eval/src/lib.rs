@@ -985,7 +985,28 @@ fn eval_program(
     }
 }
 
+/// Grow the OS thread's Rust stack on demand before stepping into a
+/// recursive Klassic eval frame. Klassic has neither TCO nor a
+/// trampoline today, so plain user-defined recursion piles host
+/// frames 1:1 with Klassic frames. Without this, even `def loop(n) =
+/// if (n == 0) 0 else loop(n - 1)` blows the host stack at a few
+/// hundred levels. `stacker::maybe_grow` adds a fresh 1 MiB segment
+/// when only 64 KiB remain, so call depths typical of recursive list
+/// processing comfortably fit.
+const STACK_RED_ZONE: usize = 64 * 1024;
+const STACK_GROW_SIZE: usize = 1024 * 1024;
+
 fn eval_expr(
+    expr: &Expr,
+    environment: &mut Environment,
+    state: &mut EvaluationState,
+) -> Result<Value, Diagnostic> {
+    stacker::maybe_grow(STACK_RED_ZONE, STACK_GROW_SIZE, || {
+        eval_expr_inner(expr, environment, state)
+    })
+}
+
+fn eval_expr_inner(
     expr: &Expr,
     environment: &mut Environment,
     state: &mut EvaluationState,

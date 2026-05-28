@@ -20930,3 +20930,30 @@ fn cross_module_imports_avoid_var_id_collision() {
         "stdout should mention err payload: {stdout}"
     );
 }
+
+/// Deep self-recursion regression: without on-demand host stack
+/// growth, recursing `def loop(n) = if (n == 0) 0 else loop(n - 1)`
+/// even a few hundred levels would abort the process with
+/// "thread 'main' has overflowed its stack" because Klassic has no
+/// TCO and uses the host call stack 1:1 with Klassic frames.
+/// `stacker::maybe_grow` in `eval_expr` lifts that ceiling well into
+/// the tens of thousands of frames.
+#[test]
+fn deep_recursion_survives_stack_growth() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "def loop(n, acc) = if(n == 0) acc else loop(n - 1, acc + 1)\n\
+             println(loop(5000, 0))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "5000\n()\n");
+}
