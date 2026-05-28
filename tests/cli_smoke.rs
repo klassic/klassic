@@ -20898,3 +20898,35 @@ fn match_supports_mixed_payload_patterns() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "5\n7\n5\n()\n");
 }
+
+/// Cross-module type variable pollution regression: importing two
+/// stdlib modules and chaining their generic functions used to trip
+/// a bogus "Int not compatible with String" because the imported
+/// `StoredType`s carried free var ids that clashed with locally
+/// allocated ones. The fix renames every var id at import time.
+#[test]
+fn cross_module_imports_avoid_var_id_collision() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.option.{some, getOrElse}\n\
+             import std.result.{err}\n\
+             println(getOrElse(some(7), 0))\n\
+             println(err(\"boom\"))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("7\n"), "stdout should contain 7: {stdout}");
+    assert!(
+        stdout.contains("boom"),
+        "stdout should mention err payload: {stdout}"
+    );
+}

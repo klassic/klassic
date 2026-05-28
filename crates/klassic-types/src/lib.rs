@@ -227,12 +227,13 @@ where
     checker.typeclasses.extend(resolve_user_typeclass_infos());
     checker.instances.extend(resolve_user_instance_types());
     for (name, stored) in resolve_user_binding_types() {
+        let adopted = checker.adopt_stored_type(&stored);
         checker.declare(
             name,
             false,
-            stored.ty,
-            stored.generalized_vars,
-            stored.constraints,
+            adopted.ty,
+            adopted.generalized_vars,
+            adopted.constraints,
         );
     }
     for (binding, ty) in bindings {
@@ -342,6 +343,67 @@ impl TypeChecker {
             stored.generalized_vars.clone(),
             stored.constraints.clone(),
         );
+    }
+
+    /// Reassign every `Type::Var` / `Type::RowVar` id inside a stored
+    /// type to fresh ids drawn from this checker's `next_var` pool.
+    /// Without this step a `StoredType` imported from a previously
+    /// typechecked module can collide with an unrelated fresh var
+    /// allocated locally — surfacing as bogus "X not compatible with Y"
+    /// errors when two modules happen to land on the same id space.
+    /// Both generalized and free vars are renumbered, so leakage of
+    /// non-generalized free vars (e.g. recursive definitions whose own
+    /// placeholder was in scope during generalization) is also neutralised.
+    fn adopt_stored_type(&mut self, stored: &StoredType) -> StoredType {
+        let mut type_map: HashMap<u32, u32> = HashMap::new();
+        let mut row_map: HashMap<u32, u32> = HashMap::new();
+        collect_var_ids(&stored.ty, &mut type_map, &mut row_map);
+        for v in &stored.generalized_vars {
+            match v {
+                GenericVar::Type(id) => {
+                    type_map.entry(*id).or_insert(0);
+                }
+                GenericVar::Row(id) => {
+                    row_map.entry(*id).or_insert(0);
+                }
+            }
+        }
+        for c in &stored.constraints {
+            for arg in &c.arguments {
+                collect_var_ids(arg, &mut type_map, &mut row_map);
+            }
+        }
+        for value in type_map.values_mut() {
+            *value = self.next_var;
+            self.next_var += 1;
+        }
+        for value in row_map.values_mut() {
+            *value = self.next_var;
+            self.next_var += 1;
+        }
+        StoredType {
+            ty: rewrite_var_ids(&stored.ty, &type_map, &row_map),
+            generalized_vars: stored
+                .generalized_vars
+                .iter()
+                .map(|v| match v {
+                    GenericVar::Type(id) => GenericVar::Type(*type_map.get(id).unwrap_or(id)),
+                    GenericVar::Row(id) => GenericVar::Row(*row_map.get(id).unwrap_or(id)),
+                })
+                .collect(),
+            constraints: stored
+                .constraints
+                .iter()
+                .map(|c| Constraint {
+                    class_name: c.class_name.clone(),
+                    arguments: c
+                        .arguments
+                        .iter()
+                        .map(|t| rewrite_var_ids(t, &type_map, &row_map))
+                        .collect(),
+                })
+                .collect(),
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<&Binding> {
@@ -1079,7 +1141,8 @@ impl TypeChecker {
                 if let Some(binding) = self.lookup(name).cloned() {
                     Ok(self.instantiate(&binding))
                 } else if let Some(stored) = resolve_module_selector_type(name) {
-                    Ok(self.instantiate_stored_type(&stored))
+                    let adopted = self.adopt_stored_type(&stored);
+                    Ok(self.instantiate_stored_type(&adopted))
                 } else {
                     Err(type_error(*span, format!("undefined variable `{name}`")))
                 }
@@ -2854,7 +2917,8 @@ impl TypeChecker {
                     .is_none_or(|allowed| allowed.iter().any(|member| member == name))
                     && !excludes.iter().any(|member| member == name);
                 if allowed {
-                    self.declare_stored(format!("{alias}#{name}"), false, stored);
+                    let adopted = self.adopt_stored_type(stored);
+                    self.declare_stored(format!("{alias}#{name}"), false, &adopted);
                 }
             }
         }
@@ -2868,12 +2932,13 @@ impl TypeChecker {
                     let stored = exports.get(member).cloned().ok_or_else(|| {
                         type_error(span, format!("module `{path}` has no member `{member}`"))
                     })?;
+                    let adopted = self.adopt_stored_type(&stored);
                     self.declare(
                         member.clone(),
                         false,
-                        stored.ty,
-                        stored.generalized_vars,
-                        stored.constraints,
+                        adopted.ty,
+                        adopted.generalized_vars,
+                        adopted.constraints,
                     );
                 }
             }
@@ -2882,12 +2947,13 @@ impl TypeChecker {
                     if excludes.iter().any(|member| member == &name) {
                         continue;
                     }
+                    let adopted = self.adopt_stored_type(&stored);
                     self.declare(
                         name,
                         false,
-                        stored.ty,
-                        stored.generalized_vars,
-                        stored.constraints,
+                        adopted.ty,
+                        adopted.generalized_vars,
+                        adopted.constraints,
                     );
                 }
             }
@@ -3514,7 +3580,8 @@ impl TypeChecker {
         let resolved = self.resolve(target);
         let key = dispatch_key_for_type(&resolved)?;
         let stored = resolve_user_extension_method_type(&key, field)?;
-        let instantiated = self.instantiate_stored_type(&stored);
+        let adopted = self.adopt_stored_type(&stored);
+        let instantiated = self.instantiate_stored_type(&adopted);
         match instantiated {
             // Drop the leading `this` parameter — dispatch already
             // supplies the receiver, so the user-visible method type
@@ -4412,6 +4479,87 @@ fn replace_constraint_generics(
             .iter()
             .map(|argument| replace_generic_vars(argument, replacements))
             .collect(),
+    }
+}
+
+fn collect_var_ids(ty: &Type, type_map: &mut HashMap<u32, u32>, row_map: &mut HashMap<u32, u32>) {
+    match ty {
+        Type::Var(id) => {
+            type_map.entry(*id).or_insert(0);
+        }
+        Type::RowVar(id) => {
+            row_map.entry(*id).or_insert(0);
+        }
+        Type::List(inner) | Type::Set(inner) | Type::StructuralRecord(inner) => {
+            collect_var_ids(inner, type_map, row_map);
+        }
+        Type::Map(key, value) => {
+            collect_var_ids(key, type_map, row_map);
+            collect_var_ids(value, type_map, row_map);
+        }
+        Type::Function(params, result) => {
+            for param in params {
+                collect_var_ids(param, type_map, row_map);
+            }
+            collect_var_ids(result, type_map, row_map);
+        }
+        Type::Record(_, args) => {
+            for arg in args {
+                collect_var_ids(arg, type_map, row_map);
+            }
+        }
+        Type::Applied(head, args) => {
+            collect_var_ids(head, type_map, row_map);
+            for arg in args {
+                collect_var_ids(arg, type_map, row_map);
+            }
+        }
+        Type::RowExtend(_, field, rest) => {
+            collect_var_ids(field, type_map, row_map);
+            collect_var_ids(rest, type_map, row_map);
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_var_ids(ty: &Type, type_map: &HashMap<u32, u32>, row_map: &HashMap<u32, u32>) -> Type {
+    match ty {
+        Type::Var(id) => Type::Var(*type_map.get(id).unwrap_or(id)),
+        Type::RowVar(id) => Type::RowVar(*row_map.get(id).unwrap_or(id)),
+        Type::List(inner) => Type::List(Box::new(rewrite_var_ids(inner, type_map, row_map))),
+        Type::Set(inner) => Type::Set(Box::new(rewrite_var_ids(inner, type_map, row_map))),
+        Type::StructuralRecord(inner) => {
+            Type::StructuralRecord(Box::new(rewrite_var_ids(inner, type_map, row_map)))
+        }
+        Type::Map(key, value) => Type::Map(
+            Box::new(rewrite_var_ids(key, type_map, row_map)),
+            Box::new(rewrite_var_ids(value, type_map, row_map)),
+        ),
+        Type::Function(params, result) => Type::Function(
+            params
+                .iter()
+                .map(|p| rewrite_var_ids(p, type_map, row_map))
+                .collect(),
+            Box::new(rewrite_var_ids(result, type_map, row_map)),
+        ),
+        Type::Record(name, args) => Type::Record(
+            name.clone(),
+            args.iter()
+                .map(|a| rewrite_var_ids(a, type_map, row_map))
+                .collect(),
+        ),
+        Type::Applied(head, args) => Type::Applied(
+            Box::new(rewrite_var_ids(head, type_map, row_map)),
+            args.iter()
+                .map(|a| rewrite_var_ids(a, type_map, row_map))
+                .collect(),
+        ),
+        Type::RowExtend(label, field, rest) => Type::RowExtend(
+            label.clone(),
+            Box::new(rewrite_var_ids(field, type_map, row_map)),
+            Box::new(rewrite_var_ids(rest, type_map, row_map)),
+        ),
+        other => other.clone(),
     }
 }
 
