@@ -42,10 +42,58 @@ pub struct EnumVariant {
     pub span: Span,
 }
 
+/// Patterns used in `match` arms.
+///
+/// Constructors are uppercase-headed identifiers (e.g. `Some`,
+/// `None`) optionally followed by parenthesised sub-patterns.
+/// Lowercase-headed identifiers bind the scrutinee to a fresh
+/// variable in the arm body. `_` matches anything without binding.
+/// Integer / string / bool literals match by value equality.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pattern {
+    Constructor {
+        name: String,
+        args: Vec<Pattern>,
+        span: Span,
+    },
+    Variable {
+        name: String,
+        span: Span,
+    },
+    Wildcard {
+        span: Span,
+    },
+    LiteralInt {
+        value: i64,
+        span: Span,
+    },
+    LiteralString {
+        value: String,
+        span: Span,
+    },
+    LiteralBool {
+        value: bool,
+        span: Span,
+    },
+}
+
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::Constructor { span, .. }
+            | Pattern::Variable { span, .. }
+            | Pattern::Wildcard { span }
+            | Pattern::LiteralInt { span, .. }
+            | Pattern::LiteralString { span, .. }
+            | Pattern::LiteralBool { span, .. } => *span,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MatchArm {
-    pub constructor: String,
-    pub bindings: Vec<String>,
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
     pub body: Expr,
     pub span: Span,
 }
@@ -1523,33 +1571,13 @@ impl Parser {
                 }
                 _ => return Err(Diagnostic::parse(self.peek().span, "expected `case`")),
             }
-            let (ctor, ctor_span) = self.expect_identifier()?;
-            let bindings = if matches!(self.peek().kind, TokenKind::LParen) {
+            let pattern = self.parse_pattern()?;
+            let pattern_span = pattern.span();
+            let guard = if matches!(self.peek().kind, TokenKind::If) {
                 self.bump();
-                let mut names = Vec::new();
-                self.consume_separators();
-                if !matches!(self.peek().kind, TokenKind::RParen) {
-                    loop {
-                        let (binding, _) = self.expect_identifier()?;
-                        names.push(binding);
-                        self.consume_separators();
-                        if matches!(self.peek().kind, TokenKind::Comma) {
-                            self.bump();
-                            self.consume_separators();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-                match self.peek().kind {
-                    TokenKind::RParen => {
-                        self.bump();
-                    }
-                    _ => return Err(Diagnostic::parse(self.peek().span, "expected `)`")),
-                }
-                names
+                Some(self.parse_expression()?)
             } else {
-                Vec::new()
+                None
             };
             match self.peek().kind {
                 TokenKind::FatArrow => {
@@ -1558,10 +1586,10 @@ impl Parser {
                 _ => return Err(Diagnostic::parse(self.peek().span, "expected `=>`")),
             }
             let body = self.parse_expression()?;
-            let arm_span = ctor_span.merge(body.span());
+            let arm_span = pattern_span.merge(body.span());
             arms.push(MatchArm {
-                constructor: ctor,
-                bindings,
+                pattern,
+                guard,
                 body,
                 span: arm_span,
             });
@@ -1576,6 +1604,95 @@ impl Parser {
             arms,
             span: start.merge(scrutinee_span).merge(end),
         })
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        let token = self.peek().clone();
+        match token.kind {
+            TokenKind::True => {
+                let span = self.bump().span;
+                Ok(Pattern::LiteralBool { value: true, span })
+            }
+            TokenKind::False => {
+                let span = self.bump().span;
+                Ok(Pattern::LiteralBool { value: false, span })
+            }
+            TokenKind::Minus => {
+                let start = self.bump().span;
+                match self.peek().kind.clone() {
+                    TokenKind::Int(value, _) => {
+                        let int_span = self.bump().span;
+                        Ok(Pattern::LiteralInt {
+                            value: -value,
+                            span: start.merge(int_span),
+                        })
+                    }
+                    _ => Err(Diagnostic::parse(
+                        self.peek().span,
+                        "expected integer literal after `-` in pattern",
+                    )),
+                }
+            }
+            TokenKind::Int(value, _) => {
+                let span = self.bump().span;
+                Ok(Pattern::LiteralInt { value, span })
+            }
+            TokenKind::String(text) => {
+                let span = self.bump().span;
+                Ok(Pattern::LiteralString { value: text, span })
+            }
+            TokenKind::Identifier(name) => {
+                let head_span = self.bump().span;
+                if name == "_" {
+                    return Ok(Pattern::Wildcard { span: head_span });
+                }
+                let starts_upper = name
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_uppercase())
+                    .unwrap_or(false);
+                if starts_upper {
+                    let (args, end_span) = if matches!(self.peek().kind, TokenKind::LParen) {
+                        self.bump();
+                        let mut args = Vec::new();
+                        self.consume_separators();
+                        if !matches!(self.peek().kind, TokenKind::RParen) {
+                            loop {
+                                let arg = self.parse_pattern()?;
+                                args.push(arg);
+                                self.consume_separators();
+                                if matches!(self.peek().kind, TokenKind::Comma) {
+                                    self.bump();
+                                    self.consume_separators();
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        let end_span = match self.peek().kind {
+                            TokenKind::RParen => self.bump().span,
+                            _ => {
+                                return Err(Diagnostic::parse(self.peek().span, "expected `)`"));
+                            }
+                        };
+                        (args, end_span)
+                    } else {
+                        (Vec::new(), head_span)
+                    };
+                    Ok(Pattern::Constructor {
+                        name,
+                        args,
+                        span: head_span.merge(end_span),
+                    })
+                } else {
+                    Ok(Pattern::Variable {
+                        name,
+                        span: head_span,
+                    })
+                }
+            }
+            _ => Err(Diagnostic::parse(token.span, "expected a pattern")),
+        }
     }
 
     fn parse_proof_declaration(&mut self) -> Result<Expr, Diagnostic> {

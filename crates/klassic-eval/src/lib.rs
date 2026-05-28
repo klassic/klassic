@@ -704,29 +704,19 @@ fn eval_match(
     state: &mut EvaluationState,
 ) -> Result<Value, Diagnostic> {
     let value = eval_expr(scrutinee, environment, state)?;
-    let (variant_name, fields) = match &value {
-        Value::Enum {
-            variant, fields, ..
-        } => (variant.as_str(), fields.clone()),
-        _ => {
-            return Err(Diagnostic::runtime(
-                span,
-                format!("`match` scrutinee is not an enum value: {value}"),
-            ));
-        }
-    };
     for arm in arms {
-        if arm.constructor != variant_name && arm.constructor != "_" {
+        environment.push_scope();
+        let matched = match_pattern(&arm.pattern, &value, environment);
+        if !matched {
+            environment.pop_scope();
             continue;
         }
-        environment.push_scope();
-        if arm.constructor == "_" {
-            // wildcard arm — no bindings to introduce.
-        } else {
-            for (index, binding) in arm.bindings.iter().enumerate() {
-                if let Some((_, field_value)) = fields.get(index) {
-                    environment.declare_with_value(binding.clone(), false, field_value.clone());
-                }
+        if let Some(guard) = &arm.guard {
+            let guard_value = eval_expr(guard, environment, state)?;
+            let passes = matches!(guard_value, Value::Bool(true));
+            if !passes {
+                environment.pop_scope();
+                continue;
             }
         }
         let result = eval_expr(&arm.body, environment, state);
@@ -735,8 +725,56 @@ fn eval_match(
     }
     Err(Diagnostic::runtime(
         span,
-        format!("no `match` arm matched variant `{variant_name}`"),
+        format!("no `match` arm matched value: {value}"),
     ))
+}
+
+/// Try to match `pattern` against `value`. On success, declare any
+/// variable bindings into the current scope of `environment` and
+/// return true. On failure, return false (caller must `pop_scope`
+/// to discard any partially-bound variables from a constructor
+/// sub-pattern).
+fn match_pattern(
+    pattern: &klassic_syntax::Pattern,
+    value: &Value,
+    environment: &mut Environment,
+) -> bool {
+    match pattern {
+        klassic_syntax::Pattern::Wildcard { .. } => true,
+        klassic_syntax::Pattern::Variable { name, .. } => {
+            environment.declare_with_value(name.clone(), false, value.clone());
+            true
+        }
+        klassic_syntax::Pattern::Constructor { name, args, .. } => {
+            let Value::Enum {
+                variant, fields, ..
+            } = value
+            else {
+                return false;
+            };
+            if variant != name {
+                return false;
+            }
+            if args.len() != fields.len() {
+                return false;
+            }
+            for (arg, (_, field_value)) in args.iter().zip(fields.iter()) {
+                if !match_pattern(arg, field_value, environment) {
+                    return false;
+                }
+            }
+            true
+        }
+        klassic_syntax::Pattern::LiteralInt { value: lit, .. } => {
+            matches!(value, Value::Int(v) if *v == *lit)
+        }
+        klassic_syntax::Pattern::LiteralString { value: lit, .. } => {
+            matches!(value, Value::String(v) if v == lit)
+        }
+        klassic_syntax::Pattern::LiteralBool { value: lit, .. } => {
+            matches!(value, Value::Bool(v) if *v == *lit)
+        }
+    }
 }
 
 type ModuleExports = HashMap<String, Value>;

@@ -401,6 +401,50 @@ impl TypeChecker {
         Type::RowVar(id)
     }
 
+    /// Walk a `Pattern` against a scrutinee type, declaring any
+    /// variable bindings in the current scope and unifying literal
+    /// patterns with the scrutinee type. Constructor sub-patterns
+    /// are bound with `Type::Dynamic` until we track variant arg
+    /// types in a real enum schema (deferred — same fidelity as the
+    /// pre-Pattern code which forced all bindings to `Dynamic`).
+    fn declare_pattern_bindings(
+        &mut self,
+        pattern: &klassic_syntax::Pattern,
+        scrutinee_type: &Type,
+    ) -> Result<(), Diagnostic> {
+        match pattern {
+            klassic_syntax::Pattern::Wildcard { .. } => Ok(()),
+            klassic_syntax::Pattern::Variable { name, .. } => {
+                self.declare(
+                    name.clone(),
+                    false,
+                    scrutinee_type.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                Ok(())
+            }
+            klassic_syntax::Pattern::Constructor { args, .. } => {
+                for arg in args {
+                    self.declare_pattern_bindings(arg, &Type::Dynamic)?;
+                }
+                Ok(())
+            }
+            klassic_syntax::Pattern::LiteralInt { span, .. } => {
+                let _ = self.unify(scrutinee_type.clone(), Type::Int, *span)?;
+                Ok(())
+            }
+            klassic_syntax::Pattern::LiteralString { span, .. } => {
+                let _ = self.unify(scrutinee_type.clone(), Type::String, *span)?;
+                Ok(())
+            }
+            klassic_syntax::Pattern::LiteralBool { span, .. } => {
+                let _ = self.unify(scrutinee_type.clone(), Type::Bool, *span)?;
+                Ok(())
+            }
+        }
+    }
+
     fn resolve(&self, ty: &Type) -> Type {
         match ty {
             Type::Var(id) => match self.substitutions.get(&GenericVar::Type(*id)) {
@@ -1188,18 +1232,14 @@ impl TypeChecker {
             Expr::Match {
                 scrutinee, arms, ..
             } => {
-                let _ = self.infer_expr(scrutinee)?;
+                let scrutinee_type = self.infer_expr(scrutinee)?;
                 let mut arm_type = self.fresh_var();
                 for arm in arms {
                     self.push_scope();
-                    for binding in &arm.bindings {
-                        self.declare(
-                            binding.clone(),
-                            false,
-                            Type::Dynamic,
-                            Vec::new(),
-                            Vec::new(),
-                        );
+                    self.declare_pattern_bindings(&arm.pattern, &scrutinee_type)?;
+                    if let Some(guard) = &arm.guard {
+                        let guard_type = self.infer_expr(guard)?;
+                        let _ = self.unify(guard_type, Type::Bool, guard.span())?;
                     }
                     let body_type = self.infer_expr(&arm.body)?;
                     self.pop_scope();

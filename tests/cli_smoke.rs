@@ -20739,3 +20739,162 @@ fn native_build_rejects_std_module_import_with_helpful_message() {
         "stderr should explain the limitation: {stderr}"
     );
 }
+
+/// Nested constructor patterns: `case Some(Some(v))` reaches into a
+/// two-level ADT and binds the inner payload. Pre-Pattern code only
+/// supported flat `case Ctor(name)` and could not express nesting.
+#[test]
+fn match_supports_nested_constructor_patterns() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Option<a> { case Some(v: a); case None }\n\
+             val nested = Some(Some(7))\n\
+             val flat = Some(None)\n\
+             def describe(o) = o match {\n  \
+               case Some(Some(v)) => toString(v)\n  \
+               case Some(None) => \"some-none\"\n  \
+               case None => \"none\"\n\
+             }\n\
+             println(describe(nested))\n\
+             println(describe(flat))\n\
+             println(describe(None))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "7\nsome-none\nnone\n()\n"
+    );
+}
+
+/// Literal integer patterns: arms can match an exact integer
+/// scrutinee without going through an ADT first.
+#[test]
+fn match_supports_integer_literal_patterns() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "def label(n) = n match {\n  \
+               case 0 => \"zero\"\n  \
+               case 1 => \"one\"\n  \
+               case _ => \"other\"\n\
+             }\n\
+             println(label(0))\n\
+             println(label(1))\n\
+             println(label(42))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "zero\none\nother\n()\n"
+    );
+}
+
+/// Variable binding patterns + match guards: a lowercase pattern
+/// binds the scrutinee to a name, and `if <expr>` narrows the arm
+/// further. The first arm that both matches and satisfies its guard
+/// wins.
+#[test]
+fn match_supports_variable_pattern_with_guard() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "def sign(n) = n match {\n  \
+               case 0 => \"zero\"\n  \
+               case x if x > 0 => \"pos\"\n  \
+               case _ => \"neg\"\n\
+             }\n\
+             println(sign(5))\n\
+             println(sign(0))\n\
+             println(sign(-3))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "pos\nzero\nneg\n()\n"
+    );
+}
+
+/// String literal patterns: arms can match against exact string
+/// values, useful for dispatching on tag-like strings.
+#[test]
+fn match_supports_string_literal_patterns() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "def kind(s) = s match {\n  \
+               case \"red\" => 1\n  \
+               case \"green\" => 2\n  \
+               case \"blue\" => 3\n  \
+               case _ => 0\n\
+             }\n\
+             println(kind(\"green\"))\n\
+             println(kind(\"red\"))\n\
+             println(kind(\"unknown\"))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "2\n1\n0\n()\n");
+}
+
+/// Constructor patterns with mixed payload patterns: a constructor
+/// can carry a literal pattern in one position and a variable in
+/// another, exercising recursive pattern walks against `Value::Enum`
+/// fields of different shapes.
+#[test]
+fn match_supports_mixed_payload_patterns() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Pair { case P(a: Int, b: Int) }\n\
+             def f(p) = p match {\n  \
+               case P(0, y) => y\n  \
+               case P(x, 0) => x\n  \
+               case P(x, y) => x + y\n\
+             }\n\
+             println(f(P(0, 5)))\n\
+             println(f(P(7, 0)))\n\
+             println(f(P(2, 3)))",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        output.status.success(),
+        "exit failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "5\n7\n5\n()\n");
+}
