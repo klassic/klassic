@@ -487,6 +487,7 @@ fn compile_internal(
     typecheck_program(&expr).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
+    let expr = desugar_extensions(expr);
     analyze_proofs(
         &expr,
         ProofConfig {
@@ -507,6 +508,385 @@ fn compile_internal(
     }
     .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic))?;
     Ok(write_executable_for_target(target, object))
+}
+
+/// Rewrite every `Expr::ExtensionDeclaration` into a `Expr::Block` of
+/// plain top-level `Expr::DefDecl`s so the native code generator can
+/// emit them through the regular function path. Each contained
+/// method becomes `def __ext_<TypeName>_<methodName>(this, <orig
+/// params>) = <body>`, mirroring how the typechecker / evaluator
+/// already track extension methods internally.
+///
+/// Call sites of the form `target.method(args)` are also rewritten
+/// to `__ext_<TypeName>_method(target, args)` when `method` resolves
+/// unambiguously to a single registered extension type — typecheck
+/// has already verified the receiver / method pair, so a unique name
+/// match is safe to dispatch statically. Ambiguous names (the same
+/// method declared on multiple types) are left to native's existing
+/// method dispatch, which will emit a `not supported yet` diagnostic
+/// for cases the static analyser can't reduce on its own.
+fn desugar_extensions(expr: Expr) -> Expr {
+    let mut registry: HashMap<String, Vec<String>> = HashMap::new();
+    collect_extension_methods(&expr, &mut registry);
+    desugar_extensions_with(expr, &registry)
+}
+
+fn collect_extension_methods(expr: &Expr, registry: &mut HashMap<String, Vec<String>>) {
+    match expr {
+        Expr::ExtensionDeclaration {
+            receiver_type,
+            methods,
+            ..
+        } => {
+            let type_key = normalise_native_receiver(&receiver_type.text);
+            for method in methods {
+                if let Expr::DefDecl { name, .. } = method {
+                    let entry = registry.entry(name.clone()).or_default();
+                    if !entry.iter().any(|t| t == &type_key) {
+                        entry.push(type_key.clone());
+                    }
+                }
+            }
+        }
+        Expr::Block { expressions, .. } => {
+            for sub in expressions {
+                collect_extension_methods(sub, registry);
+            }
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_extension_methods(condition, registry);
+            collect_extension_methods(then_branch, registry);
+            if let Some(else_branch) = else_branch {
+                collect_extension_methods(else_branch, registry);
+            }
+        }
+        Expr::DefDecl { body, .. } | Expr::Lambda { body, .. } => {
+            collect_extension_methods(body, registry);
+        }
+        Expr::Call {
+            callee, arguments, ..
+        } => {
+            collect_extension_methods(callee, registry);
+            for arg in arguments {
+                collect_extension_methods(arg, registry);
+            }
+        }
+        Expr::FieldAccess { target, .. } => {
+            collect_extension_methods(target, registry);
+        }
+        _ => {}
+    }
+}
+
+fn desugar_extensions_with(expr: Expr, registry: &HashMap<String, Vec<String>>) -> Expr {
+    match expr {
+        Expr::ExtensionDeclaration {
+            this_name,
+            receiver_type,
+            methods,
+            span,
+            ..
+        } => {
+            let type_key = normalise_native_receiver(&receiver_type.text);
+            let expressions = methods
+                .into_iter()
+                .filter_map(|method| {
+                    desugar_extension_method(
+                        &this_name,
+                        &receiver_type,
+                        &type_key,
+                        method,
+                        registry,
+                    )
+                })
+                .collect();
+            Expr::Block { expressions, span }
+        }
+        Expr::Block { expressions, span } => {
+            // Flatten any nested `Expr::Block` that the desugar
+            // produces from `ExtensionDeclaration` so the resulting
+            // top-level expression list stays one level deep — the
+            // codegen's `predeclare_top_level_functions` only iterates
+            // the outer block and won't reach mangled defs hidden
+            // inside an inner block.
+            let mut flattened = Vec::with_capacity(expressions.len());
+            for sub in expressions {
+                match desugar_extensions_with(sub, registry) {
+                    Expr::Block {
+                        expressions: inner, ..
+                    } => flattened.extend(inner),
+                    other => flattened.push(other),
+                }
+            }
+            Expr::Block {
+                expressions: flattened,
+                span,
+            }
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+            span,
+        } => Expr::If {
+            condition: Box::new(desugar_extensions_with(*condition, registry)),
+            then_branch: Box::new(desugar_extensions_with(*then_branch, registry)),
+            else_branch: else_branch
+                .map(|branch| Box::new(desugar_extensions_with(*branch, registry))),
+            span,
+        },
+        Expr::While {
+            condition,
+            body,
+            span,
+        } => Expr::While {
+            condition: Box::new(desugar_extensions_with(*condition, registry)),
+            body: Box::new(desugar_extensions_with(*body, registry)),
+            span,
+        },
+        Expr::DefDecl {
+            name,
+            type_params,
+            constraints,
+            params,
+            param_annotations,
+            return_annotation,
+            body,
+            span,
+        } => Expr::DefDecl {
+            name,
+            type_params,
+            constraints,
+            params,
+            param_annotations,
+            return_annotation,
+            body: Box::new(desugar_extensions_with(*body, registry)),
+            span,
+        },
+        Expr::Lambda {
+            params,
+            param_annotations,
+            body,
+            span,
+        } => Expr::Lambda {
+            params,
+            param_annotations,
+            body: Box::new(desugar_extensions_with(*body, registry)),
+            span,
+        },
+        // Call site: `target.method(args)` rewrites to
+        // `__ext_<TypeName>_method(target, args)` when `method` is
+        // declared on exactly one extension type. Ambiguous or
+        // unrelated calls fall through to native's existing dispatch.
+        Expr::Call {
+            callee,
+            arguments,
+            span,
+        } => {
+            if let Expr::FieldAccess {
+                target,
+                field,
+                span: fa_span,
+            } = *callee
+            {
+                if let Some(types) = registry.get(&field)
+                    && types.len() == 1
+                {
+                    let type_key = &types[0];
+                    let mangled = format!("__ext_{type_key}_{field}");
+                    let new_target = desugar_extensions_with(*target, registry);
+                    let mut new_args = Vec::with_capacity(arguments.len() + 1);
+                    new_args.push(new_target);
+                    for arg in arguments {
+                        new_args.push(desugar_extensions_with(arg, registry));
+                    }
+                    return Expr::Call {
+                        callee: Box::new(Expr::Identifier {
+                            name: mangled,
+                            span: fa_span,
+                        }),
+                        arguments: new_args,
+                        span,
+                    };
+                }
+                // Reconstruct the original Call when no rewrite applies.
+                Expr::Call {
+                    callee: Box::new(Expr::FieldAccess {
+                        target: Box::new(desugar_extensions_with(*target, registry)),
+                        field,
+                        span: fa_span,
+                    }),
+                    arguments: arguments
+                        .into_iter()
+                        .map(|a| desugar_extensions_with(a, registry))
+                        .collect(),
+                    span,
+                }
+            } else {
+                Expr::Call {
+                    callee: Box::new(desugar_extensions_with(*callee, registry)),
+                    arguments: arguments
+                        .into_iter()
+                        .map(|a| desugar_extensions_with(a, registry))
+                        .collect(),
+                    span,
+                }
+            }
+        }
+        Expr::FieldAccess {
+            target,
+            field,
+            span,
+        } => Expr::FieldAccess {
+            target: Box::new(desugar_extensions_with(*target, registry)),
+            field,
+            span,
+        },
+        Expr::VarDecl {
+            mutable,
+            name,
+            annotation,
+            value,
+            span,
+        } => Expr::VarDecl {
+            mutable,
+            name,
+            annotation,
+            value: Box::new(desugar_extensions_with(*value, registry)),
+            span,
+        },
+        Expr::Assign { name, value, span } => Expr::Assign {
+            name,
+            value: Box::new(desugar_extensions_with(*value, registry)),
+            span,
+        },
+        Expr::Cleanup {
+            body,
+            cleanup,
+            span,
+        } => Expr::Cleanup {
+            body: Box::new(desugar_extensions_with(*body, registry)),
+            cleanup: Box::new(desugar_extensions_with(*cleanup, registry)),
+            span,
+        },
+        Expr::Foreach {
+            binding,
+            iterable,
+            body,
+            span,
+        } => Expr::Foreach {
+            binding,
+            iterable: Box::new(desugar_extensions_with(*iterable, registry)),
+            body: Box::new(desugar_extensions_with(*body, registry)),
+            span,
+        },
+        Expr::Unary { op, expr, span } => Expr::Unary {
+            op,
+            expr: Box::new(desugar_extensions_with(*expr, registry)),
+            span,
+        },
+        Expr::Binary { lhs, op, rhs, span } => Expr::Binary {
+            lhs: Box::new(desugar_extensions_with(*lhs, registry)),
+            op,
+            rhs: Box::new(desugar_extensions_with(*rhs, registry)),
+            span,
+        },
+        Expr::ListLiteral { elements, span } => Expr::ListLiteral {
+            elements: elements
+                .into_iter()
+                .map(|e| desugar_extensions_with(e, registry))
+                .collect(),
+            span,
+        },
+        Expr::MapLiteral { entries, span } => Expr::MapLiteral {
+            entries: entries
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        desugar_extensions_with(k, registry),
+                        desugar_extensions_with(v, registry),
+                    )
+                })
+                .collect(),
+            span,
+        },
+        Expr::SetLiteral { elements, span } => Expr::SetLiteral {
+            elements: elements
+                .into_iter()
+                .map(|e| desugar_extensions_with(e, registry))
+                .collect(),
+            span,
+        },
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => Expr::Match {
+            scrutinee: Box::new(desugar_extensions_with(*scrutinee, registry)),
+            arms,
+            span,
+        },
+        other => other,
+    }
+}
+
+fn desugar_extension_method(
+    this_name: &str,
+    receiver_type: &TypeAnnotation,
+    type_key: &str,
+    method: Expr,
+    registry: &HashMap<String, Vec<String>>,
+) -> Option<Expr> {
+    let Expr::DefDecl {
+        name,
+        type_params,
+        constraints,
+        params,
+        param_annotations,
+        return_annotation,
+        body,
+        span,
+    } = method
+    else {
+        return None;
+    };
+    let mangled = format!("__ext_{type_key}_{name}");
+    let mut new_params = Vec::with_capacity(params.len() + 1);
+    new_params.push(this_name.to_string());
+    new_params.extend(params);
+    let mut new_annotations = Vec::with_capacity(param_annotations.len() + 1);
+    new_annotations.push(Some(receiver_type.clone()));
+    new_annotations.extend(param_annotations);
+    Some(Expr::DefDecl {
+        name: mangled,
+        type_params,
+        constraints,
+        params: new_params,
+        param_annotations: new_annotations,
+        return_annotation,
+        body: Box::new(desugar_extensions_with(*body, registry)),
+        span,
+    })
+}
+
+/// Mirror of `klassic_types::normalise_receiver_annotation` — peel off
+/// the optional `#` prefix and stop at the first `<` / whitespace so
+/// `List<Int>` and `List<a>` both collapse to `List`. The mangled
+/// name space therefore matches the typechecker's
+/// `USER_EXTENSION_METHODS` keying.
+fn normalise_native_receiver(text: &str) -> String {
+    let trimmed = text.trim();
+    let stripped = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    stripped
+        .split(|ch: char| ch == '<' || ch.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 fn write_executable_for_target(target: NativeTargetContext, object: ObjectFile) -> Vec<u8> {
@@ -1543,10 +1923,13 @@ impl NativeCodeGenerator {
             Expr::TheoremDeclaration { .. }
             | Expr::AxiomDeclaration { .. }
             | Expr::PegRuleBlock { .. } => Ok(NativeValue::Unit),
-            Expr::ExtensionDeclaration { span, .. } => Err(unsupported(
-                *span,
-                "extension methods are not yet supported in native builds; see docs/roadmap-targets-stdlib.md",
-            )),
+            Expr::ExtensionDeclaration { .. } => {
+                // `desugar_extensions` runs before codegen and rewrites
+                // every `Expr::ExtensionDeclaration` into a Block of
+                // mangled `Expr::DefDecl`s, so reaching the codegen
+                // path with one still in the tree is a compiler bug.
+                Ok(NativeValue::Unit)
+            }
             Expr::EnumDeclaration { span, .. } => Err(unsupported(
                 *span,
                 "enum declarations are not yet supported in native builds; see docs/roadmap-targets-stdlib.md",
@@ -2425,9 +2808,9 @@ impl NativeCodeGenerator {
             | Expr::InstanceDeclaration { span, .. }
             | Expr::TheoremDeclaration { span, .. }
             | Expr::AxiomDeclaration { span, .. }
-            | Expr::ExtensionDeclaration { span, .. }
             | Expr::EnumDeclaration { span, .. }
             | Expr::Match { span, .. } => Err(unsupported(*span, native_feature_name(expr))),
+            Expr::ExtensionDeclaration { .. } => Ok(NativeValue::Unit),
             Expr::PegRuleBlock { .. } => Ok(NativeValue::Unit),
         }
     }

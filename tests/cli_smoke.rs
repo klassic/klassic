@@ -20357,12 +20357,14 @@ fn extension_methods_dispatch_on_list_int() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "15\n()\n");
 }
 
-/// Native build path does not yet support extension methods. The
-/// compiler must reject them with a source-located diagnostic so the
-/// user knows to drop back to the evaluator until PR ?? closes the
-/// gap.
+/// Native build now supports extension methods on built-in types by
+/// desugaring `extension (this: T) { def m() = ... }` into a
+/// mangled top-level def `__ext_T_m(this) = ...` and rewriting
+/// `target.m(args)` call sites with an unambiguous method name to
+/// `__ext_T_m(target, args)`. The resulting binary executes the
+/// extension body just like an inlined free function.
 #[test]
-fn native_build_rejects_extension_declarations() {
+fn native_build_compiles_extension_method_calls() {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -20375,7 +20377,7 @@ fn native_build_rejects_extension_declarations() {
     )
     .expect("temp source file should write");
 
-    let output = Command::new(klassic_bin())
+    let build_output = Command::new(klassic_bin())
         .args([
             "build",
             source_path.to_str().expect("source path should be utf-8"),
@@ -20385,18 +20387,27 @@ fn native_build_rejects_extension_declarations() {
         .output()
         .expect("binary should run");
 
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
     let _ = fs::remove_file(&source_path);
     let _ = fs::remove_file(&output_path);
 
     assert!(
-        !output.status.success(),
-        "native build should fail for extension declarations"
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("extension methods"),
-        "stderr should explain the limitation: {stderr}"
-    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "HI\n");
 }
 
 /// PR 7: a `#!` shebang at the top of a `.kl` file is dropped during
