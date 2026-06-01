@@ -8,6 +8,7 @@ klassic-span = { path = "../klassic-span" }
 klassic-syntax = { path = "../klassic-syntax" }
 klassic-rewrite = { path = "../klassic-rewrite" }
 klassic-types = { path = "../klassic-types" }
+klassic-runtime = { path = "../klassic-runtime" }
 
 [lib]
 path = "src/lib.rs"

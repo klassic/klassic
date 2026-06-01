@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs;
 
 use klassic_rewrite::rewrite_expression;
+use klassic_runtime::STDLIB_MODULES;
 use klassic_span::{Diagnostic, SourceFile, Span};
 use klassic_syntax::{
     BinaryOp, EnumVariant, Expr, FloatLiteralKind, IntLiteralKind, MatchArm, Pattern, RecordField,
@@ -484,6 +485,12 @@ fn compile_internal(
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
     let expr = rewrite_expression(expr);
+    let prelude_offset = user_view
+        .as_ref()
+        .map_or(0, |view| view.prelude_byte_offset);
+    let expr = inline_stdlib_imports(expr, prelude_offset).map_err(|diagnostic| {
+        NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
+    })?;
     typecheck_program(&expr).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
@@ -526,6 +533,138 @@ fn compile_internal(
 /// method declared on multiple types) are left to native's existing
 /// method dispatch, which will emit a `not supported yet` diagnostic
 /// for cases the static analyser can't reduce on its own.
+/// Whether a `std.*` module can be inlined into a native build. The
+/// ADT-based modules (`std.option` / `std.result`) lean on generic
+/// enums, which native codegen does not support, so their imports keep
+/// the existing rejection instead of being inlined.
+fn stdlib_module_is_inlinable(path: &str) -> bool {
+    !matches!(path, "std.option" | "std.result")
+        && STDLIB_MODULES.iter().any(|module| module.path == path)
+}
+
+fn stdlib_module_source(path: &str) -> Option<&'static str> {
+    STDLIB_MODULES
+        .iter()
+        .find(|module| module.path == path)
+        .map(|module| module.source)
+}
+
+fn collect_inlinable_std_imports(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Import {
+            path, alias: None, ..
+        } if stdlib_module_is_inlinable(path) => {
+            if !out.iter().any(|existing| existing == path) {
+                out.push(path.clone());
+            }
+        }
+        Expr::Block { expressions, .. } => {
+            for sub in expressions {
+                collect_inlinable_std_imports(sub, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Drop the `module <path>` header of a parsed stdlib module, returning
+/// its top-level declarations so they can be spliced into the program.
+fn stdlib_module_decls(parsed: Expr) -> Vec<Expr> {
+    match parsed {
+        Expr::Block { expressions, .. } => expressions
+            .into_iter()
+            .filter(|expr| !matches!(expr, Expr::ModuleHeader { .. }))
+            .collect(),
+        Expr::ModuleHeader { .. } => Vec::new(),
+        other => vec![other],
+    }
+}
+
+fn strip_inlined_imports(expr: Expr, inlined: &[String]) -> Expr {
+    match expr {
+        Expr::Import {
+            path,
+            alias: None,
+            span,
+            ..
+        } if inlined.iter().any(|p| p == &path) => Expr::Block {
+            expressions: Vec::new(),
+            span,
+        },
+        Expr::Block { expressions, span } => Expr::Block {
+            expressions: expressions
+                .into_iter()
+                .map(|sub| strip_inlined_imports(sub, inlined))
+                .collect(),
+            span,
+        },
+        other => other,
+    }
+}
+
+/// Inline non-generic `std.*` module imports before type checking.
+///
+/// Native builds compile a single translation unit, so unlike the
+/// evaluator (which loads each stdlib module into its own namespace)
+/// there is no module loader. Instead, for every non-aliased import of
+/// an inlinable stdlib module, this pass splices that module's top-level
+/// declarations into the program and drops the import node. Names resolve
+/// directly (the stdlib modules use bare, collision-free identifiers),
+/// and the native code generator's lazy emission only materializes the
+/// functions actually called. Aliased imports and the ADT modules are
+/// left untouched so their unsupported diagnostics still fire.
+///
+/// `prelude_offset` is the byte position where the user program begins in
+/// the bundled source. Native name resolution is order-sensitive (a `def`
+/// can only call earlier `def`s), and stdlib modules call prelude helpers,
+/// so the spliced declarations are inserted *after* the prelude and
+/// *before* the user program — i.e. `[prelude][modules][user]`.
+fn inline_stdlib_imports(expr: Expr, prelude_offset: usize) -> Result<Expr, Diagnostic> {
+    let mut paths = Vec::new();
+    collect_inlinable_std_imports(&expr, &mut paths);
+    if paths.is_empty() {
+        return Ok(expr);
+    }
+
+    let mut module_decls = Vec::new();
+    for path in &paths {
+        let source = stdlib_module_source(path).expect("inlinable module has a source");
+        let file = SourceFile::new(path, source.to_string());
+        let parsed = rewrite_expression(parse_source(&file)?);
+        module_decls.extend(stdlib_module_decls(parsed));
+    }
+
+    let span = expr.span();
+    let expr = strip_inlined_imports(expr, &paths);
+    let Expr::Block { expressions, .. } = expr else {
+        // No top-level block to splice into (single-expression program):
+        // the modules can only be prelude-dependent, so place them first.
+        let mut combined = module_decls;
+        combined.push(expr);
+        return Ok(Expr::Block {
+            expressions: combined,
+            span,
+        });
+    };
+
+    let mut combined = Vec::with_capacity(expressions.len() + module_decls.len());
+    let mut inserted = false;
+    for expression in expressions {
+        if !inserted && expression.span().start >= prelude_offset {
+            combined.append(&mut module_decls);
+            inserted = true;
+        }
+        combined.push(expression);
+    }
+    if !inserted {
+        combined.append(&mut module_decls);
+    }
+    Ok(Expr::Block {
+        expressions: combined,
+        span,
+    })
+}
+
 /// Storage strategy for one monomorphic enum variant payload slot.
 ///
 /// Every slot of the backing `__gc_record` must hold a heap pointer so

@@ -569,6 +569,14 @@ cargo run -- -e "1 + 2"
   Generic enums (any type parameters), enums with string payloads, and
   recursive functions over enum-typed parameters remain unsupported and
   keep their compile-time diagnostics.
+  Non-aliased imports of the plain-Klassic `std.*` modules are inlined
+  before type checking: the imported module's declarations are spliced
+  between the bundled prelude and the user program (native name
+  resolution is order-sensitive, and the modules call prelude helpers),
+  the import node is dropped, and lazy codegen only emits the functions
+  actually called. Aliased `std.*` imports and the ADT-backed modules
+  (`std.option` / `std.result`, which need generic enums) keep their
+  "not available in native builds" diagnostic.
 
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program

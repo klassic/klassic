@@ -63,6 +63,7 @@ name = "klassic-native"
 version = "0.1.0"
 dependencies = [
  "klassic-rewrite",
+ "klassic-runtime",
  "klassic-span",
  "klassic-syntax",
  "klassic-types",

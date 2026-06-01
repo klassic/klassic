@@ -20648,6 +20648,105 @@ fn native_build_match_without_matching_arm_aborts() {
     );
 }
 
+/// Native build now inlines non-aliased imports of the plain-Klassic
+/// `std.*` modules: the imported module's declarations are spliced
+/// between the prelude and the user program before type checking, so
+/// `std.list` / `std.math` helpers compile into the executable.
+#[test]
+fn native_build_inlines_stdlib_module_imports() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_stdimp_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_stdimp_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "import std.list.{range, sum}\n\
+         import std.math.{clamp}\n\
+         println(sum(range(1, 11)))\n\
+         println(clamp(99, 0, 10))\n\
+         println(range(2, 5))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "55\n10\n[2, 3, 4]\n"
+    );
+}
+
+/// The ADT-backed stdlib modules still rely on generic enums, which
+/// native codegen does not support, so importing `std.option` keeps its
+/// "not available in native builds" diagnostic rather than inlining.
+#[test]
+fn native_build_rejects_adt_stdlib_module_import() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_stdadt_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_stdadt_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "import std.option.{some, getOrElse}\nprintln(getOrElse(some(1), 0))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !build_output.status.success(),
+        "ADT stdlib import should still be rejected by native build"
+    );
+    assert!(
+        String::from_utf8_lossy(&build_output.stderr).contains("std.option"),
+        "stderr should name the unsupported module\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
 /// PR 7: a `#!` shebang at the top of a `.kl` file is dropped during
 /// source loading so the rest of the script parses normally.
 #[test]
@@ -20944,11 +21043,12 @@ fn evaluator_uses_std_cli_helpers() {
     );
 }
 
-/// PR 6: native compile path does not yet bundle stdlib modules. The
-/// compiler emits a source-located diagnostic pointing users at the
-/// evaluator until PR 7 closes the gap.
+/// Native build inlines a plain-Klassic `std.*` import (formerly
+/// rejected with a "not yet available in native builds" diagnostic):
+/// `import std.list.{range}` splices `range` into the program and the
+/// compiled binary prints the list.
 #[test]
-fn native_build_rejects_std_module_import_with_helpful_message() {
+fn native_build_inlines_std_list_import() {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -20961,7 +21061,7 @@ fn native_build_rejects_std_module_import_with_helpful_message() {
     )
     .expect("temp source file should write");
 
-    let output = Command::new(klassic_bin())
+    let build_output = Command::new(klassic_bin())
         .args([
             "build",
             source_path.to_str().expect("source path should be utf-8"),
@@ -20971,22 +21071,27 @@ fn native_build_rejects_std_module_import_with_helpful_message() {
         .output()
         .expect("binary should run");
 
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
     let _ = fs::remove_file(&source_path);
     let _ = fs::remove_file(&output_path);
 
     assert!(
-        !output.status.success(),
-        "native build should fail when stdlib module is imported"
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("std.list"),
-        "stderr should mention std.list: {stderr}"
-    );
-    assert!(
-        stderr.contains("not yet available in native builds"),
-        "stderr should explain the limitation: {stderr}"
-    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "[0, 1, 2]\n");
 }
 
 /// Nested constructor patterns: `case Some(Some(v))` reaches into a
