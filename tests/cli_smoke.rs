@@ -20748,6 +20748,60 @@ fn native_build_inlines_stdlib_module_imports() {
     );
 }
 
+/// Aliased stdlib imports work too: `import std.math as M` inlines the
+/// module and rewrites every `M.func` access to a bare `func`, so the
+/// compiled binary calls the spliced helpers.
+#[test]
+fn native_build_inlines_aliased_stdlib_import() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_stdalias_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_stdalias_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "import std.math as M\n\
+         import std.list as L\n\
+         println(M.sign(-7))\n\
+         println(M.clamp(99, 0, 10))\n\
+         println(L.sum(L.range(1, 6)))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "-1\n10\n15\n");
+}
+
 /// The ADT-backed stdlib modules still rely on generic enums, which
 /// native codegen does not support, so importing `std.option` keeps its
 /// "not available in native builds" diagnostic rather than inlining.

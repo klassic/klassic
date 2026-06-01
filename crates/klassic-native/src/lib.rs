@@ -549,14 +549,10 @@ fn stdlib_module_source(path: &str) -> Option<&'static str> {
         .map(|module| module.source)
 }
 
-fn collect_inlinable_std_imports(expr: &Expr, out: &mut Vec<String>) {
+fn collect_inlinable_std_imports(expr: &Expr, out: &mut Vec<(String, Option<String>)>) {
     match expr {
-        Expr::Import {
-            path, alias: None, ..
-        } if stdlib_module_is_inlinable(path) => {
-            if !out.iter().any(|existing| existing == path) {
-                out.push(path.clone());
-            }
+        Expr::Import { path, alias, .. } if stdlib_module_is_inlinable(path) => {
+            out.push((path.clone(), alias.clone()));
         }
         Expr::Block { expressions, .. } => {
             for sub in expressions {
@@ -580,22 +576,230 @@ fn stdlib_module_decls(parsed: Expr) -> Vec<Expr> {
     }
 }
 
-fn strip_inlined_imports(expr: Expr, inlined: &[String]) -> Expr {
+/// Remove the import nodes of inlined modules and rewrite aliased module
+/// access (`M.func` for `import std.x as M`) into a direct reference
+/// (`func`), recursing through the whole tree. Runs before type checking,
+/// so the aliased forms never need their own resolution.
+fn rewrite_inlined(expr: Expr, inlined: &[String], aliases: &HashSet<String>) -> Expr {
+    fn go(e: Expr, inlined: &[String], aliases: &HashSet<String>) -> Expr {
+        rewrite_inlined(e, inlined, aliases)
+    }
+    #[allow(clippy::boxed_local)] // mirrors the `Box<Expr>` AST fields it rewrites
+    fn go_box(e: Box<Expr>, inlined: &[String], aliases: &HashSet<String>) -> Box<Expr> {
+        Box::new(rewrite_inlined(*e, inlined, aliases))
+    }
+    fn go_vec(es: Vec<Expr>, inlined: &[String], aliases: &HashSet<String>) -> Vec<Expr> {
+        es.into_iter().map(|e| go(e, inlined, aliases)).collect()
+    }
     match expr {
-        Expr::Import {
-            path,
-            alias: None,
-            span,
-            ..
-        } if inlined.iter().any(|p| p == &path) => Expr::Block {
+        Expr::Import { path, span, .. } if inlined.iter().any(|p| p == &path) => Expr::Block {
             expressions: Vec::new(),
             span,
         },
+        // `M.field` where `M` aliases an inlined module collapses to the
+        // bare `field` the spliced declarations define.
+        Expr::FieldAccess {
+            target,
+            field,
+            span,
+        } => {
+            if let Expr::Identifier { name, .. } = target.as_ref()
+                && aliases.contains(name)
+            {
+                return Expr::Identifier { name: field, span };
+            }
+            Expr::FieldAccess {
+                target: go_box(target, inlined, aliases),
+                field,
+                span,
+            }
+        }
         Expr::Block { expressions, span } => Expr::Block {
-            expressions: expressions
+            expressions: go_vec(expressions, inlined, aliases),
+            span,
+        },
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+            span,
+        } => Expr::If {
+            condition: go_box(condition, inlined, aliases),
+            then_branch: go_box(then_branch, inlined, aliases),
+            else_branch: else_branch.map(|b| go_box(b, inlined, aliases)),
+            span,
+        },
+        Expr::While {
+            condition,
+            body,
+            span,
+        } => Expr::While {
+            condition: go_box(condition, inlined, aliases),
+            body: go_box(body, inlined, aliases),
+            span,
+        },
+        Expr::Foreach {
+            binding,
+            iterable,
+            body,
+            span,
+        } => Expr::Foreach {
+            binding,
+            iterable: go_box(iterable, inlined, aliases),
+            body: go_box(body, inlined, aliases),
+            span,
+        },
+        Expr::DefDecl {
+            name,
+            type_params,
+            constraints,
+            params,
+            param_annotations,
+            return_annotation,
+            body,
+            span,
+        } => Expr::DefDecl {
+            name,
+            type_params,
+            constraints,
+            params,
+            param_annotations,
+            return_annotation,
+            body: go_box(body, inlined, aliases),
+            span,
+        },
+        Expr::Lambda {
+            params,
+            param_annotations,
+            body,
+            span,
+        } => Expr::Lambda {
+            params,
+            param_annotations,
+            body: go_box(body, inlined, aliases),
+            span,
+        },
+        Expr::Call {
+            callee,
+            arguments,
+            span,
+        } => Expr::Call {
+            callee: go_box(callee, inlined, aliases),
+            arguments: go_vec(arguments, inlined, aliases),
+            span,
+        },
+        Expr::VarDecl {
+            mutable,
+            name,
+            annotation,
+            value,
+            span,
+        } => Expr::VarDecl {
+            mutable,
+            name,
+            annotation,
+            value: go_box(value, inlined, aliases),
+            span,
+        },
+        Expr::Assign { name, value, span } => Expr::Assign {
+            name,
+            value: go_box(value, inlined, aliases),
+            span,
+        },
+        Expr::Cleanup {
+            body,
+            cleanup,
+            span,
+        } => Expr::Cleanup {
+            body: go_box(body, inlined, aliases),
+            cleanup: go_box(cleanup, inlined, aliases),
+            span,
+        },
+        Expr::Unary { op, expr, span } => Expr::Unary {
+            op,
+            expr: go_box(expr, inlined, aliases),
+            span,
+        },
+        Expr::Binary { lhs, op, rhs, span } => Expr::Binary {
+            lhs: go_box(lhs, inlined, aliases),
+            op,
+            rhs: go_box(rhs, inlined, aliases),
+            span,
+        },
+        Expr::ListLiteral { elements, span } => Expr::ListLiteral {
+            elements: go_vec(elements, inlined, aliases),
+            span,
+        },
+        Expr::MapLiteral { entries, span } => Expr::MapLiteral {
+            entries: entries
                 .into_iter()
-                .map(|sub| strip_inlined_imports(sub, inlined))
+                .map(|(k, v)| (go(k, inlined, aliases), go(v, inlined, aliases)))
                 .collect(),
+            span,
+        },
+        Expr::SetLiteral { elements, span } => Expr::SetLiteral {
+            elements: go_vec(elements, inlined, aliases),
+            span,
+        },
+        Expr::RecordConstructor {
+            name,
+            arguments,
+            span,
+        } => Expr::RecordConstructor {
+            name,
+            arguments: go_vec(arguments, inlined, aliases),
+            span,
+        },
+        Expr::RecordLiteral { fields, span } => Expr::RecordLiteral {
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| (name, go(value, inlined, aliases)))
+                .collect(),
+            span,
+        },
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => Expr::Match {
+            scrutinee: go_box(scrutinee, inlined, aliases),
+            arms: arms
+                .into_iter()
+                .map(|arm| MatchArm {
+                    pattern: arm.pattern,
+                    guard: arm.guard.map(|g| go(g, inlined, aliases)),
+                    body: go(arm.body, inlined, aliases),
+                    span: arm.span,
+                })
+                .collect(),
+            span,
+        },
+        Expr::ExtensionDeclaration {
+            type_params,
+            this_name,
+            receiver_type,
+            methods,
+            span,
+        } => Expr::ExtensionDeclaration {
+            type_params,
+            this_name,
+            receiver_type,
+            methods: go_vec(methods, inlined, aliases),
+            span,
+        },
+        Expr::InstanceDeclaration {
+            class_name,
+            for_type,
+            for_type_annotation,
+            constraints,
+            methods,
+            span,
+        } => Expr::InstanceDeclaration {
+            class_name,
+            for_type,
+            for_type_annotation,
+            constraints,
+            methods: go_vec(methods, inlined, aliases),
             span,
         },
         other => other,
@@ -606,13 +810,15 @@ fn strip_inlined_imports(expr: Expr, inlined: &[String]) -> Expr {
 ///
 /// Native builds compile a single translation unit, so unlike the
 /// evaluator (which loads each stdlib module into its own namespace)
-/// there is no module loader. Instead, for every non-aliased import of
-/// an inlinable stdlib module, this pass splices that module's top-level
-/// declarations into the program and drops the import node. Names resolve
-/// directly (the stdlib modules use bare, collision-free identifiers),
-/// and the native code generator's lazy emission only materializes the
-/// functions actually called. Aliased imports and the ADT modules are
-/// left untouched so their unsupported diagnostics still fire.
+/// there is no module loader. Instead, for every import of an inlinable
+/// stdlib module, this pass splices that module's top-level declarations
+/// into the program and drops the import node. Selective and bulk imports
+/// resolve directly (the stdlib modules use bare, collision-free
+/// identifiers); aliased imports (`import std.x as M`) additionally have
+/// their `M.func` access rewritten to a bare `func`. The native code
+/// generator's lazy emission only materializes the functions actually
+/// called. The ADT modules (`std.option` / `std.result`) are not
+/// inlinable, so their unsupported diagnostics still fire.
 ///
 /// `prelude_offset` is the byte position where the user program begins in
 /// the bundled source. Native name resolution is order-sensitive (a `def`
@@ -620,10 +826,21 @@ fn strip_inlined_imports(expr: Expr, inlined: &[String]) -> Expr {
 /// so the spliced declarations are inserted *after* the prelude and
 /// *before* the user program — i.e. `[prelude][modules][user]`.
 fn inline_stdlib_imports(expr: Expr, prelude_offset: usize) -> Result<Expr, Diagnostic> {
-    let mut paths = Vec::new();
-    collect_inlinable_std_imports(&expr, &mut paths);
-    if paths.is_empty() {
+    let mut imports = Vec::new();
+    collect_inlinable_std_imports(&expr, &mut imports);
+    if imports.is_empty() {
         return Ok(expr);
+    }
+
+    let mut paths: Vec<String> = Vec::new();
+    let mut aliases: HashSet<String> = HashSet::new();
+    for (path, alias) in &imports {
+        if !paths.iter().any(|existing| existing == path) {
+            paths.push(path.clone());
+        }
+        if let Some(alias) = alias {
+            aliases.insert(alias.clone());
+        }
     }
 
     let mut module_decls = Vec::new();
@@ -635,7 +852,7 @@ fn inline_stdlib_imports(expr: Expr, prelude_offset: usize) -> Result<Expr, Diag
     }
 
     let span = expr.span();
-    let expr = strip_inlined_imports(expr, &paths);
+    let expr = rewrite_inlined(expr, &paths, &aliases);
     let Expr::Block { expressions, .. } = expr else {
         // No top-level block to splice into (single-expression program):
         // the modules can only be prelude-dependent, so place them first.
