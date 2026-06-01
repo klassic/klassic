@@ -20410,6 +20410,244 @@ fn native_build_compiles_extension_method_calls() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "HI\n");
 }
 
+/// Native build now lowers monomorphic `enum` declarations, variant
+/// constructors and `match` expressions onto the existing `__gc_*` heap
+/// primitives: an enum value is a `__gc_record(1 + fields)` whose slot 0
+/// holds the boxed variant tag. This covers nullary variants and
+/// integer payloads end to end.
+#[test]
+fn native_build_compiles_enum_construction_and_match() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_enum_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_enum_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Shape { case Circle(r: Int); case Square(side: Int); case Nothing }\n\
+         def area(s) = s match {\n  \
+           case Circle(r) => r * r * 3\n  \
+           case Square(side) => side * side\n  \
+           case Nothing => 0\n\
+         }\n\
+         println(area(Circle(2)))\n\
+         println(area(Square(3)))\n\
+         println(area(Nothing))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "12\n9\n0\n");
+}
+
+/// Native `match` lowering is fully recursive: nested constructor
+/// patterns (`case O(I(n))`), integer-literal sub-patterns and arm
+/// guards all compile, with short-circuited tag tests guarding payload
+/// reads so a mismatched variant never dereferences a slot it lacks.
+#[test]
+fn native_build_compiles_nested_enum_patterns_with_guards() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_enum_nest_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_enum_nest_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Inner { case I(n: Int) }\n\
+         enum Outer { case O(inner: Inner); case Empty }\n\
+         def g(o) = o match {\n  \
+           case O(I(0)) => -100\n  \
+           case O(I(n)) if n > 10 => n * 2\n  \
+           case O(I(n)) => n\n  \
+           case Empty => -1\n\
+         }\n\
+         println(g(O(I(0))))\n\
+         println(g(O(I(20))))\n\
+         println(g(O(I(5))))\n\
+         println(g(Empty))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "-100\n40\n5\n-1\n"
+    );
+}
+
+/// The same `match` lowering covers scrutinees that are not enums at
+/// all: integer- and string-literal patterns, a variable pattern and a
+/// guard now compile to native, which previously rejected every
+/// `match`.
+#[test]
+fn native_build_compiles_literal_and_guard_match() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_litmatch_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_litmatch_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def sign(n) = n match { case 0 => \"zero\"; case x if x > 0 => \"pos\"; case _ => \"neg\" }\n\
+         def kind(s) = s match { case \"red\" => 1; case \"green\" => 2; case _ => 0 }\n\
+         println(sign(0))\n\
+         println(sign(8))\n\
+         println(sign(-2))\n\
+         println(kind(\"green\"))\n\
+         println(kind(\"blue\"))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "zero\npos\nneg\n2\n0\n"
+    );
+}
+
+/// A non-exhaustive `match` that falls through every arm aborts at
+/// runtime instead of silently returning a bogus value: the lowering's
+/// `__match_fail()` tail prints a diagnostic and exits non-zero.
+#[test]
+fn native_build_match_without_matching_arm_aborts() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_nomatch_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_nomatch_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def only_zero(n) = n match { case 0 => 1 }\nprintln(only_zero(5))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !run_output.status.success(),
+        "a non-matching scrutinee should abort\nstdout:\n{}",
+        String::from_utf8_lossy(&run_output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_output.stderr).contains("match: no pattern matched"),
+        "stderr should explain the match failure\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+}
+
 /// PR 7: a `#!` shebang at the top of a `.kl` file is dropped during
 /// source loading so the rest of the script parses normally.
 #[test]

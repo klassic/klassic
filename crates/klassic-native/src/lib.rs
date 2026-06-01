@@ -5,8 +5,8 @@ use std::fs;
 use klassic_rewrite::rewrite_expression;
 use klassic_span::{Diagnostic, SourceFile, Span};
 use klassic_syntax::{
-    BinaryOp, Expr, FloatLiteralKind, IntLiteralKind, RecordField, TypeAnnotation,
-    TypeClassConstraint, UnaryOp, parse_inline_expression, parse_source,
+    BinaryOp, EnumVariant, Expr, FloatLiteralKind, IntLiteralKind, MatchArm, Pattern, RecordField,
+    TypeAnnotation, TypeClassConstraint, UnaryOp, parse_inline_expression, parse_source,
 };
 use klassic_types::proof::{ProofConfig, analyze_proofs};
 use klassic_types::typecheck_program;
@@ -487,6 +487,7 @@ fn compile_internal(
     typecheck_program(&expr).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
+    let expr = desugar_enums(expr);
     let expr = desugar_extensions(expr);
     analyze_proofs(
         &expr,
@@ -525,6 +526,694 @@ fn compile_internal(
 /// method declared on multiple types) are left to native's existing
 /// method dispatch, which will emit a `not supported yet` diagnostic
 /// for cases the static analyser can't reduce on its own.
+/// Storage strategy for one monomorphic enum variant payload slot.
+///
+/// Every slot of the backing `__gc_record` must hold a heap pointer so
+/// the collector's pointer-tracing stays sound, so integer-family
+/// fields are boxed into an 8-byte raw cell while already-heap payloads
+/// (strings, nested enums) are stored by pointer directly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnumFieldRepr {
+    Scalar,
+    EnumField,
+}
+
+#[derive(Clone)]
+struct EnumVariantInfo {
+    index: i64,
+    fields: Vec<EnumFieldRepr>,
+}
+
+/// Rewrites monomorphic `enum` declarations, variant constructors and
+/// `match` expressions into the existing `__gc_*` heap primitives so the
+/// native backend never needs bespoke ADT codegen. The lowering runs
+/// after type checking, so the synthesized trees only have to satisfy
+/// codegen, not the inference pass.
+///
+/// An enum value is laid out as `__gc_record(1 + field_count)`:
+/// slot 0 holds the boxed variant index and slot `i + 1` holds field
+/// `i` (boxed when scalar, by pointer when a string or nested enum).
+/// Generic enums (any type parameters) and enums whose fields fall
+/// outside the supported set are left untouched, so they keep hitting
+/// the existing "not supported yet" diagnostic instead of miscompiling.
+struct EnumLowering {
+    /// variant name -> tag index + field layout.
+    variants: HashMap<String, EnumVariantInfo>,
+    /// enum type names whose declarations are erased during lowering.
+    lowered_enums: HashSet<String>,
+    counter: usize,
+}
+
+fn classify_enum_field(text: &str, supported: &HashSet<String>) -> Option<EnumFieldRepr> {
+    // String payloads are intentionally excluded for now: extracting a
+    // field yields a GC heap string, and native's heap-string interop
+    // (branch merging, equality) is not yet complete enough to use one
+    // soundly downstream. Such enums keep their unsupported diagnostic.
+    match text.trim() {
+        "Int" | "Long" | "Short" | "Byte" => Some(EnumFieldRepr::Scalar),
+        other if supported.contains(other) => Some(EnumFieldRepr::EnumField),
+        _ => None,
+    }
+}
+
+fn collect_enum_decls(expr: &Expr, out: &mut Vec<(String, Vec<String>, Vec<EnumVariant>)>) {
+    match expr {
+        Expr::EnumDeclaration {
+            name,
+            type_params,
+            variants,
+            ..
+        } => out.push((name.clone(), type_params.clone(), variants.clone())),
+        Expr::Block { expressions, .. } => {
+            for sub in expressions {
+                collect_enum_decls(sub, out);
+            }
+        }
+        Expr::DefDecl { body, .. } | Expr::Lambda { body, .. } => collect_enum_decls(body, out),
+        Expr::ExtensionDeclaration { methods, .. } | Expr::InstanceDeclaration { methods, .. } => {
+            for method in methods {
+                collect_enum_decls(method, out);
+            }
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_enum_decls(condition, out);
+            collect_enum_decls(then_branch, out);
+            if let Some(branch) = else_branch {
+                collect_enum_decls(branch, out);
+            }
+        }
+        Expr::VarDecl { value, .. } => collect_enum_decls(value, out),
+        _ => {}
+    }
+}
+
+fn desugar_enums(expr: Expr) -> Expr {
+    let mut decls = Vec::new();
+    collect_enum_decls(&expr, &mut decls);
+
+    // Candidate monomorphic enums keyed by name.
+    let mut mono: HashMap<String, Vec<EnumVariant>> = HashMap::new();
+    for (name, type_params, variants) in &decls {
+        if type_params.is_empty() {
+            mono.insert(name.clone(), variants.clone());
+        }
+    }
+    let mut supported: HashSet<String> = mono.keys().cloned().collect();
+
+    // Drop enums that share a variant name — without per-node types we
+    // cannot statically resolve an ambiguous constructor to one enum.
+    let mut variant_owners: HashMap<String, Vec<String>> = HashMap::new();
+    for (enum_name, variants) in &mono {
+        for variant in variants {
+            variant_owners
+                .entry(variant.name.clone())
+                .or_default()
+                .push(enum_name.clone());
+        }
+    }
+    for owners in variant_owners.values() {
+        if owners.len() > 1 {
+            for owner in owners {
+                supported.remove(owner);
+            }
+        }
+    }
+
+    // Fixpoint: an enum is unsupported if any field type is unsupported
+    // (which can cascade when a field references a dropped enum).
+    loop {
+        let mut to_remove = Vec::new();
+        for name in &supported {
+            let ok = mono[name].iter().all(|variant| {
+                variant.params.iter().all(|(_, annotation)| {
+                    classify_enum_field(&annotation.text, &supported).is_some()
+                })
+            });
+            if !ok {
+                to_remove.push(name.clone());
+            }
+        }
+        if to_remove.is_empty() {
+            break;
+        }
+        for name in to_remove {
+            supported.remove(&name);
+        }
+    }
+
+    // Note: we keep going even when no enum survives — literal / variable
+    // / wildcard `match` expressions carry no enum dependency and are
+    // lowered the same way, which is a net new native capability.
+    let mut variants = HashMap::new();
+    for name in &supported {
+        for (index, variant) in mono[name].iter().enumerate() {
+            let fields = variant
+                .params
+                .iter()
+                .map(|(_, annotation)| {
+                    classify_enum_field(&annotation.text, &supported)
+                        .expect("supported enum field classified")
+                })
+                .collect();
+            variants.insert(
+                variant.name.clone(),
+                EnumVariantInfo {
+                    index: index as i64,
+                    fields,
+                },
+            );
+        }
+    }
+
+    let mut lowering = EnumLowering {
+        variants,
+        lowered_enums: supported,
+        counter: 0,
+    };
+    lowering.lower(expr)
+}
+
+impl EnumLowering {
+    fn fresh(&mut self, prefix: &str) -> String {
+        self.counter += 1;
+        format!("__enum_{prefix}{}", self.counter)
+    }
+
+    fn pattern_supported(&self, pattern: &Pattern) -> bool {
+        match pattern {
+            Pattern::Constructor { name, args, .. } => {
+                self.variants.contains_key(name)
+                    && args.iter().all(|arg| self.pattern_supported(arg))
+            }
+            _ => true,
+        }
+    }
+
+    fn lower(&mut self, expr: Expr) -> Expr {
+        match expr {
+            Expr::EnumDeclaration { name, span, .. } => {
+                if self.lowered_enums.contains(&name) {
+                    Expr::Block {
+                        expressions: Vec::new(),
+                        span,
+                    }
+                } else {
+                    Expr::EnumDeclaration {
+                        name,
+                        type_params: Vec::new(),
+                        variants: Vec::new(),
+                        span,
+                    }
+                }
+            }
+            Expr::Identifier { name, span } => {
+                if let Some(info) = self.variants.get(&name)
+                    && info.fields.is_empty()
+                {
+                    let info = info.clone();
+                    self.build_construct(&info, Vec::new(), span)
+                } else {
+                    Expr::Identifier { name, span }
+                }
+            }
+            Expr::Call {
+                callee,
+                arguments,
+                span,
+            } => {
+                let arguments: Vec<Expr> =
+                    arguments.into_iter().map(|arg| self.lower(arg)).collect();
+                if let Expr::Identifier { name, .. } = callee.as_ref()
+                    && let Some(info) = self.variants.get(name)
+                    && info.fields.len() == arguments.len()
+                {
+                    let info = info.clone();
+                    return self.build_construct(&info, arguments, span);
+                }
+                Expr::Call {
+                    callee: Box::new(self.lower(*callee)),
+                    arguments,
+                    span,
+                }
+            }
+            Expr::RecordConstructor {
+                name,
+                arguments,
+                span,
+            } => {
+                let arguments: Vec<Expr> =
+                    arguments.into_iter().map(|arg| self.lower(arg)).collect();
+                if let Some(info) = self.variants.get(&name)
+                    && info.fields.len() == arguments.len()
+                {
+                    let info = info.clone();
+                    return self.build_construct(&info, arguments, span);
+                }
+                Expr::RecordConstructor {
+                    name,
+                    arguments,
+                    span,
+                }
+            }
+            Expr::Match {
+                scrutinee,
+                arms,
+                span,
+            } => {
+                let scrutinee = self.lower(*scrutinee);
+                let arms: Vec<MatchArm> = arms
+                    .into_iter()
+                    .map(|arm| MatchArm {
+                        pattern: arm.pattern,
+                        guard: arm.guard.map(|guard| self.lower(guard)),
+                        body: self.lower(arm.body),
+                        span: arm.span,
+                    })
+                    .collect();
+                if arms.iter().all(|arm| self.pattern_supported(&arm.pattern)) {
+                    self.build_match(scrutinee, arms, span)
+                } else {
+                    Expr::Match {
+                        scrutinee: Box::new(scrutinee),
+                        arms,
+                        span,
+                    }
+                }
+            }
+            Expr::Block { expressions, span } => Expr::Block {
+                expressions: expressions.into_iter().map(|sub| self.lower(sub)).collect(),
+                span,
+            },
+            Expr::If {
+                condition,
+                then_branch,
+                else_branch,
+                span,
+            } => Expr::If {
+                condition: Box::new(self.lower(*condition)),
+                then_branch: Box::new(self.lower(*then_branch)),
+                else_branch: else_branch.map(|branch| Box::new(self.lower(*branch))),
+                span,
+            },
+            Expr::While {
+                condition,
+                body,
+                span,
+            } => Expr::While {
+                condition: Box::new(self.lower(*condition)),
+                body: Box::new(self.lower(*body)),
+                span,
+            },
+            Expr::Foreach {
+                binding,
+                iterable,
+                body,
+                span,
+            } => Expr::Foreach {
+                binding,
+                iterable: Box::new(self.lower(*iterable)),
+                body: Box::new(self.lower(*body)),
+                span,
+            },
+            Expr::DefDecl {
+                name,
+                type_params,
+                constraints,
+                params,
+                param_annotations,
+                return_annotation,
+                body,
+                span,
+            } => Expr::DefDecl {
+                name,
+                type_params,
+                constraints,
+                params,
+                param_annotations,
+                return_annotation,
+                body: Box::new(self.lower(*body)),
+                span,
+            },
+            Expr::Lambda {
+                params,
+                param_annotations,
+                body,
+                span,
+            } => Expr::Lambda {
+                params,
+                param_annotations,
+                body: Box::new(self.lower(*body)),
+                span,
+            },
+            Expr::ExtensionDeclaration {
+                type_params,
+                this_name,
+                receiver_type,
+                methods,
+                span,
+            } => Expr::ExtensionDeclaration {
+                type_params,
+                this_name,
+                receiver_type,
+                methods: methods
+                    .into_iter()
+                    .map(|method| self.lower(method))
+                    .collect(),
+                span,
+            },
+            Expr::InstanceDeclaration {
+                class_name,
+                for_type,
+                for_type_annotation,
+                constraints,
+                methods,
+                span,
+            } => Expr::InstanceDeclaration {
+                class_name,
+                for_type,
+                for_type_annotation,
+                constraints,
+                methods: methods
+                    .into_iter()
+                    .map(|method| self.lower(method))
+                    .collect(),
+                span,
+            },
+            Expr::VarDecl {
+                mutable,
+                name,
+                annotation,
+                value,
+                span,
+            } => Expr::VarDecl {
+                mutable,
+                name,
+                annotation,
+                value: Box::new(self.lower(*value)),
+                span,
+            },
+            Expr::Assign { name, value, span } => Expr::Assign {
+                name,
+                value: Box::new(self.lower(*value)),
+                span,
+            },
+            Expr::Cleanup {
+                body,
+                cleanup,
+                span,
+            } => Expr::Cleanup {
+                body: Box::new(self.lower(*body)),
+                cleanup: Box::new(self.lower(*cleanup)),
+                span,
+            },
+            Expr::Unary { op, expr, span } => Expr::Unary {
+                op,
+                expr: Box::new(self.lower(*expr)),
+                span,
+            },
+            Expr::Binary { lhs, op, rhs, span } => Expr::Binary {
+                lhs: Box::new(self.lower(*lhs)),
+                op,
+                rhs: Box::new(self.lower(*rhs)),
+                span,
+            },
+            Expr::FieldAccess {
+                target,
+                field,
+                span,
+            } => Expr::FieldAccess {
+                target: Box::new(self.lower(*target)),
+                field,
+                span,
+            },
+            Expr::ListLiteral { elements, span } => Expr::ListLiteral {
+                elements: elements.into_iter().map(|e| self.lower(e)).collect(),
+                span,
+            },
+            Expr::MapLiteral { entries, span } => Expr::MapLiteral {
+                entries: entries
+                    .into_iter()
+                    .map(|(k, v)| (self.lower(k), self.lower(v)))
+                    .collect(),
+                span,
+            },
+            Expr::SetLiteral { elements, span } => Expr::SetLiteral {
+                elements: elements.into_iter().map(|e| self.lower(e)).collect(),
+                span,
+            },
+            other => other,
+        }
+    }
+
+    fn build_construct(&mut self, info: &EnumVariantInfo, args: Vec<Expr>, span: Span) -> Expr {
+        let obj = self.fresh("obj");
+        let mut stmts = Vec::new();
+        stmts.push(en_vardecl(
+            &obj,
+            en_call(
+                "__gc_record",
+                vec![en_int(info.fields.len() as i64 + 1, span)],
+                span,
+            ),
+            span,
+        ));
+        let index_box = self.box_scalar(en_int(info.index, span), span);
+        stmts.push(en_call(
+            "__gc_write",
+            vec![en_ident(&obj, span), en_int(0, span), index_box],
+            span,
+        ));
+        for (i, (arg, repr)) in args.into_iter().zip(info.fields.iter()).enumerate() {
+            let value = match repr {
+                EnumFieldRepr::Scalar => self.box_scalar(arg, span),
+                EnumFieldRepr::EnumField => arg,
+            };
+            stmts.push(en_call(
+                "__gc_write",
+                vec![
+                    en_ident(&obj, span),
+                    en_int(8 * (i as i64 + 1), span),
+                    value,
+                ],
+                span,
+            ));
+        }
+        stmts.push(en_ident(&obj, span));
+        en_block(stmts, span)
+    }
+
+    fn box_scalar(&mut self, value: Expr, span: Span) -> Expr {
+        let cell = self.fresh("box");
+        en_block(
+            vec![
+                en_vardecl(
+                    &cell,
+                    en_call("__gc_alloc", vec![en_int(8, span)], span),
+                    span,
+                ),
+                en_call(
+                    "__gc_write",
+                    vec![en_ident(&cell, span), en_int(0, span), value],
+                    span,
+                ),
+                en_ident(&cell, span),
+            ],
+            span,
+        )
+    }
+
+    fn build_match(&mut self, scrutinee: Expr, arms: Vec<MatchArm>, span: Span) -> Expr {
+        let scrut = self.fresh("scrut");
+        let mut chain = en_call("__match_fail", Vec::new(), span);
+        for arm in arms.into_iter().rev() {
+            chain = self.build_arm(&scrut, arm, chain, span);
+        }
+        en_block(vec![en_vardecl(&scrut, scrutinee, span), chain], span)
+    }
+
+    fn build_arm(&self, scrut: &str, arm: MatchArm, rest: Expr, span: Span) -> Expr {
+        let subject = en_ident(scrut, span);
+        let predicate = self.pattern_predicate(&arm.pattern, subject, span);
+        let binds = self.pattern_binds(&arm.pattern, en_ident(scrut, span), span);
+
+        let mut success: Vec<Expr> = binds
+            .into_iter()
+            .map(|(name, value)| en_vardecl(&name, value, span))
+            .collect();
+        let body = match arm.guard {
+            Some(guard) => en_if(guard, arm.body, rest.clone(), span),
+            None => arm.body,
+        };
+        success.push(body);
+        let success = en_block(success, span);
+
+        match predicate {
+            Some(condition) => en_if(condition, success, rest, span),
+            None => success,
+        }
+    }
+
+    /// Boolean test that `pattern` matches `subject`, or `None` when the
+    /// pattern is irrefutable (wildcard / variable). Constructor tests
+    /// short-circuit on the variant tag before reading payload slots, so
+    /// a mismatching variant never dereferences a slot it lacks.
+    fn pattern_predicate(&self, pattern: &Pattern, subject: Expr, span: Span) -> Option<Expr> {
+        match pattern {
+            Pattern::Wildcard { .. } | Pattern::Variable { .. } => None,
+            Pattern::LiteralInt { value, .. } => Some(en_binary(
+                subject,
+                BinaryOp::Equal,
+                en_int(*value, span),
+                span,
+            )),
+            Pattern::LiteralBool { value, .. } => Some(en_binary(
+                subject,
+                BinaryOp::Equal,
+                en_bool(*value, span),
+                span,
+            )),
+            Pattern::LiteralString { value, .. } => Some(en_binary(
+                subject,
+                BinaryOp::Equal,
+                en_string(value, span),
+                span,
+            )),
+            Pattern::Constructor { name, args, .. } => {
+                let info = self
+                    .variants
+                    .get(name)
+                    .expect("constructor pattern resolved");
+                let mut condition = en_binary(
+                    en_index_read(subject.clone(), span),
+                    BinaryOp::Equal,
+                    en_int(info.index, span),
+                    span,
+                );
+                for (i, arg) in args.iter().enumerate() {
+                    let field = en_field_read(subject.clone(), info.fields[i], i, span);
+                    if let Some(sub) = self.pattern_predicate(arg, field, span) {
+                        condition = en_binary(condition, BinaryOp::LogicalAnd, sub, span);
+                    }
+                }
+                Some(condition)
+            }
+        }
+    }
+
+    fn pattern_binds(&self, pattern: &Pattern, subject: Expr, span: Span) -> Vec<(String, Expr)> {
+        match pattern {
+            Pattern::Wildcard { .. }
+            | Pattern::LiteralInt { .. }
+            | Pattern::LiteralBool { .. }
+            | Pattern::LiteralString { .. } => Vec::new(),
+            Pattern::Variable { name, .. } => vec![(name.clone(), subject)],
+            Pattern::Constructor { name, args, .. } => {
+                let info = self
+                    .variants
+                    .get(name)
+                    .expect("constructor pattern resolved");
+                let mut binds = Vec::new();
+                for (i, arg) in args.iter().enumerate() {
+                    let field = en_field_read(subject.clone(), info.fields[i], i, span);
+                    binds.extend(self.pattern_binds(arg, field, span));
+                }
+                binds
+            }
+        }
+    }
+}
+
+// --- Synthetic-AST builders shared by the enum lowering. ---
+
+fn en_ident(name: &str, span: Span) -> Expr {
+    Expr::Identifier {
+        name: name.to_string(),
+        span,
+    }
+}
+
+fn en_int(value: i64, span: Span) -> Expr {
+    Expr::Int {
+        value,
+        kind: IntLiteralKind::Int,
+        span,
+    }
+}
+
+fn en_bool(value: bool, span: Span) -> Expr {
+    Expr::Bool { value, span }
+}
+
+fn en_string(value: &str, span: Span) -> Expr {
+    Expr::String {
+        value: value.to_string(),
+        span,
+    }
+}
+
+fn en_call(name: &str, arguments: Vec<Expr>, span: Span) -> Expr {
+    Expr::Call {
+        callee: Box::new(en_ident(name, span)),
+        arguments,
+        span,
+    }
+}
+
+fn en_block(expressions: Vec<Expr>, span: Span) -> Expr {
+    Expr::Block { expressions, span }
+}
+
+fn en_vardecl(name: &str, value: Expr, span: Span) -> Expr {
+    Expr::VarDecl {
+        mutable: false,
+        name: name.to_string(),
+        annotation: None,
+        value: Box::new(value),
+        span,
+    }
+}
+
+fn en_if(condition: Expr, then_branch: Expr, else_branch: Expr, span: Span) -> Expr {
+    Expr::If {
+        condition: Box::new(condition),
+        then_branch: Box::new(then_branch),
+        else_branch: Some(Box::new(else_branch)),
+        span,
+    }
+}
+
+fn en_binary(lhs: Expr, op: BinaryOp, rhs: Expr, span: Span) -> Expr {
+    Expr::Binary {
+        lhs: Box::new(lhs),
+        op,
+        rhs: Box::new(rhs),
+        span,
+    }
+}
+
+/// `__gc_read(__gc_read_ptr(subject, 0), 0)` — read the boxed variant tag.
+fn en_index_read(subject: Expr, span: Span) -> Expr {
+    let slot = en_call("__gc_read_ptr", vec![subject, en_int(0, span)], span);
+    en_call("__gc_read", vec![slot, en_int(0, span)], span)
+}
+
+/// Extract field `i` (zero-based) from `subject` per its storage repr.
+fn en_field_read(subject: Expr, repr: EnumFieldRepr, i: usize, span: Span) -> Expr {
+    let offset = en_int(8 * (i as i64 + 1), span);
+    match repr {
+        EnumFieldRepr::Scalar => {
+            let cell = en_call("__gc_read_ptr", vec![subject, offset], span);
+            en_call("__gc_read", vec![cell, en_int(0, span)], span)
+        }
+        EnumFieldRepr::EnumField => en_call("__gc_read_ptr", vec![subject, offset], span),
+    }
+}
+
 fn desugar_extensions(expr: Expr) -> Expr {
     let mut registry: HashMap<String, Vec<String>> = HashMap::new();
     collect_extension_methods(&expr, &mut registry);
@@ -3685,6 +4374,7 @@ impl NativeCodeGenerator {
             "__gc_read_ptr" => self.compile_gc_read_ptr(arguments, span),
             "__gc_read_string" => self.compile_gc_read_string(arguments, span),
             "__gc_write" => self.compile_gc_write(arguments, span),
+            "__match_fail" => self.compile_match_fail(span),
             "assert" => {
                 if arguments.len() != 1 {
                     return Err(Diagnostic::compile(
@@ -4463,6 +5153,7 @@ impl NativeCodeGenerator {
             "__gc_read_ptr" => self.compile_gc_read_ptr(arguments, span).map(Some),
             "__gc_read_string" => self.compile_gc_read_string(arguments, span).map(Some),
             "__gc_write" => self.compile_gc_write(arguments, span).map(Some),
+            "__match_fail" => self.compile_match_fail(span).map(Some),
             "head" => self.compile_static_head(arguments, span).map(Some),
             "FileOutput#write" => self
                 .compile_file_output_write(arguments, false, span)
@@ -13331,6 +14022,16 @@ impl NativeCodeGenerator {
         self.asm.pop_reg(Reg::Rcx);
         self.next_stack_offset -= 8;
         self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
+        Ok(NativeValue::Unit)
+    }
+
+    /// Internal builtin synthesized by the enum lowering for a `match`
+    /// whose scrutinee matched no arm: print a runtime error and exit.
+    /// Returns `Unit` only as a formality — the emitted code never falls
+    /// through, and `expr_always_diverges` recognizes the call so an
+    /// enclosing `if` keeps the surviving branch's value type.
+    fn compile_match_fail(&mut self, span: Span) -> Result<NativeValue, Diagnostic> {
+        self.emit_runtime_error(span, "match: no pattern matched");
         Ok(NativeValue::Unit)
     }
 
@@ -27995,6 +28696,30 @@ impl NativeCodeGenerator {
         }
     }
 
+    /// Whether evaluating `expr` always exits the process / never
+    /// produces a value (so it contributes no type at a control-flow
+    /// merge). Recognizes the enum lowering's `__match_fail()` tail and
+    /// `exit`, plus blocks and `if`s that end in such a call.
+    fn expr_always_diverges(expr: &Expr) -> bool {
+        match expr {
+            Expr::Call { callee, .. } => matches!(
+                callee.as_ref(),
+                Expr::Identifier { name, .. } if name == "__match_fail" || name == "exit"
+            ),
+            Expr::Block { expressions, .. } => {
+                expressions.last().is_some_and(Self::expr_always_diverges)
+            }
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => else_branch.as_ref().is_some_and(|else_branch| {
+                Self::expr_always_diverges(then_branch) && Self::expr_always_diverges(else_branch)
+            }),
+            _ => false,
+        }
+    }
+
     fn compile_if(
         &mut self,
         condition: &Expr,
@@ -28310,6 +29035,20 @@ impl NativeCodeGenerator {
         self.scope_base_offsets = before_scope_base_offsets;
         self.next_stack_offset = before_next_stack_offset + then_preserved_stack;
         self.asm.bind_text_label(end_label);
+        // A branch that always diverges (the enum lowering's
+        // `__match_fail()` tail, or `exit`) yields no value at the merge
+        // point, so the surviving branch's type wins rather than
+        // collapsing to `Unit`. This only triggers on post-typecheck
+        // synthesized trees; ordinary source is gated by inference long
+        // before codegen, so existing programs are unaffected.
+        if let Some(else_branch) = else_branch {
+            if Self::expr_always_diverges(else_branch) && !Self::expr_always_diverges(then_branch) {
+                return Ok(then_value);
+            }
+            if Self::expr_always_diverges(then_branch) && !Self::expr_always_diverges(else_branch) {
+                return Ok(else_value);
+            }
+        }
         if then_value == else_value
             || self
                 .static_values_equal(then_value, else_value)

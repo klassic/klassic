@@ -555,6 +555,20 @@ cargo run -- -e "1 + 2"
   lists, static records, static maps, static sets, static nulls, and unit.
   Ordinary `==` / `!=` covers runtime integers/booleans and static aggregate
   values. `ToDo()` emits the evaluator-compatible native runtime failure text.
+  Monomorphic `enum` declarations, variant constructors, and postfix
+  `match` are lowered (after type checking, before codegen) onto the
+  existing `__gc_*` heap primitives: an enum value is a
+  `__gc_record(1 + fields)` whose slot 0 holds the boxed variant tag and
+  whose remaining slots hold boxed integer payloads or directly-stored
+  nested-enum pointers, so the collector traces every slot as a pointer.
+  `match` becomes a chain of `if` tests with short-circuited tag checks
+  guarding payload reads, supporting nested constructor patterns,
+  integer/string literal and variable/wildcard patterns, and guards;
+  literal/variable `match` over non-enum scrutinees lowers the same way,
+  and a fully non-matching scrutinee aborts through `__match_fail()`.
+  Generic enums (any type parameters), enums with string payloads, and
+  recursive functions over enum-typed parameters remain unsupported and
+  keep their compile-time diagnostics.
 
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program
