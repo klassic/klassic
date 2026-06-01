@@ -20648,6 +20648,48 @@ fn native_build_match_without_matching_arm_aborts() {
     );
 }
 
+/// A generic `enum` (type parameters) is reported with a precise
+/// diagnostic naming the enum, rather than the old blanket "enum
+/// declarations are not yet supported" message — monomorphic integer
+/// enums do compile, so the error must explain the actual limitation.
+#[test]
+fn native_build_rejects_generic_enum_with_precise_message() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_generic_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_generic_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Box<a> { case Wrap(value: a); case Empty }\nval b = Wrap(5)\nprintln(\"x\")\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !build_output.status.success(),
+        "generic enum should be rejected by native build"
+    );
+    let stderr = String::from_utf8_lossy(&build_output.stderr);
+    assert!(
+        stderr.contains("generic enum `Box`"),
+        "stderr should precisely name the generic enum\nstderr:\n{stderr}"
+    );
+}
+
 /// Native build now inlines non-aliased imports of the plain-Klassic
 /// `std.*` modules: the imported module's declarations are spliced
 /// between the prelude and the user program before type checking, so

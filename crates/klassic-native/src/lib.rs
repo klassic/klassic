@@ -703,6 +703,26 @@ struct EnumLowering {
     counter: usize,
 }
 
+/// Precise diagnostic for an `enum` declaration that the lowering left
+/// in place (i.e. native codegen cannot handle it). Monomorphic enums
+/// with integer / nested-enum payloads are lowered away, so reaching
+/// codegen means the enum is generic, has an unsupported payload (e.g. a
+/// `String` field), or shares a variant name with another enum.
+fn native_enum_unsupported_message(name: &str, type_params: &[String]) -> String {
+    if !type_params.is_empty() {
+        return format!(
+            "native build does not support generic enum `{name}`; only monomorphic enums \
+             (no type parameters) compile to native. Run it with the evaluator or see \
+             docs/roadmap-targets-stdlib.md"
+        );
+    }
+    format!(
+        "native build does not support enum `{name}`; native enums must be monomorphic with \
+         only integer (Int/Long/Short/Byte) or nested monomorphic-enum payloads and distinct \
+         variant names. Run it with the evaluator or see docs/roadmap-targets-stdlib.md"
+    )
+}
+
 fn classify_enum_field(text: &str, supported: &HashSet<String>) -> Option<EnumFieldRepr> {
     // String payloads are intentionally excluded for now: extracting a
     // field yields a GC heap string, and native's heap-string interop
@@ -855,17 +875,25 @@ impl EnumLowering {
 
     fn lower(&mut self, expr: Expr) -> Expr {
         match expr {
-            Expr::EnumDeclaration { name, span, .. } => {
+            Expr::EnumDeclaration {
+                name,
+                type_params,
+                variants,
+                span,
+            } => {
                 if self.lowered_enums.contains(&name) {
                     Expr::Block {
                         expressions: Vec::new(),
                         span,
                     }
                 } else {
+                    // Preserve the declaration verbatim so codegen's
+                    // diagnostic can explain precisely why it is
+                    // unsupported (generic, bad payload, name clash).
                     Expr::EnumDeclaration {
                         name,
-                        type_params: Vec::new(),
-                        variants: Vec::new(),
+                        type_params,
+                        variants,
                         span,
                     }
                 }
@@ -2758,13 +2786,21 @@ impl NativeCodeGenerator {
                 // path with one still in the tree is a compiler bug.
                 Ok(NativeValue::Unit)
             }
-            Expr::EnumDeclaration { span, .. } => Err(unsupported(
+            Expr::EnumDeclaration {
+                name,
+                type_params,
+                span,
+                ..
+            } => Err(Diagnostic::compile(
                 *span,
-                "enum declarations are not yet supported in native builds; see docs/roadmap-targets-stdlib.md",
+                native_enum_unsupported_message(name, type_params),
             )),
-            Expr::Match { span, .. } => Err(unsupported(
+            Expr::Match { span, .. } => Err(Diagnostic::compile(
                 *span,
-                "match expressions are not yet supported in native builds; see docs/roadmap-targets-stdlib.md",
+                "native build cannot compile this `match`: its constructor patterns reference an \
+                 enum that is not supported in native builds (for example a generic enum). The \
+                 enum declaration's own diagnostic explains why. See docs/roadmap-targets-stdlib.md"
+                    .to_string(),
             )),
             _ => self.compile_expr(expr),
         }
