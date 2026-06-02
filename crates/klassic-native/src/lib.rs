@@ -885,12 +885,13 @@ fn inline_stdlib_imports(expr: Expr, prelude_offset: usize) -> Result<Expr, Diag
 /// Storage strategy for one monomorphic enum variant payload slot.
 ///
 /// Every slot of the backing `__gc_record` must hold a heap pointer so
-/// the collector's pointer-tracing stays sound, so integer-family
-/// fields are boxed into an 8-byte raw cell while already-heap payloads
-/// (strings, nested enums) are stored by pointer directly.
+/// the collector's pointer-tracing stays sound. Integer and boolean
+/// fields are boxed into an 8-byte raw cell (booleans as 0/1) while
+/// already-heap payloads (nested enums) are stored by pointer directly.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EnumFieldRepr {
     Scalar,
+    BoolField,
     EnumField,
 }
 
@@ -935,8 +936,8 @@ fn native_enum_unsupported_message(name: &str, type_params: &[String]) -> String
     }
     format!(
         "native build does not support enum `{name}`; native enums must be monomorphic with \
-         only integer (Int/Long/Short/Byte) or nested monomorphic-enum payloads and distinct \
-         variant names. Run it with the evaluator or see docs/roadmap-targets-stdlib.md"
+         only integer (Int/Long/Short/Byte), boolean, or nested monomorphic-enum payloads and \
+         distinct variant names. Run it with the evaluator or see docs/roadmap-targets-stdlib.md"
     )
 }
 
@@ -947,6 +948,7 @@ fn classify_enum_field(text: &str, supported: &HashSet<String>) -> Option<EnumFi
     // soundly downstream. Such enums keep their unsupported diagnostic.
     match text.trim() {
         "Int" | "Long" | "Short" | "Byte" => Some(EnumFieldRepr::Scalar),
+        "Bool" | "Boolean" => Some(EnumFieldRepr::BoolField),
         other if supported.contains(other) => Some(EnumFieldRepr::EnumField),
         _ => None,
     }
@@ -1375,6 +1377,12 @@ impl EnumLowering {
         for (i, (arg, repr)) in args.into_iter().zip(info.fields.iter()).enumerate() {
             let value = match repr {
                 EnumFieldRepr::Scalar => self.box_scalar(arg, span),
+                // Store a boolean as the integer 0/1 so the slot still
+                // boxes a plain qword the collector ignores.
+                EnumFieldRepr::BoolField => {
+                    let as_int = en_if(arg, en_int(1, span), en_int(0, span), span);
+                    self.box_scalar(as_int, span)
+                }
                 EnumFieldRepr::EnumField => arg,
             };
             stmts.push(en_call(
@@ -1593,6 +1601,12 @@ fn en_field_read(subject: Expr, repr: EnumFieldRepr, i: usize, span: Span) -> Ex
         EnumFieldRepr::Scalar => {
             let cell = en_call("__gc_read_ptr", vec![subject, offset], span);
             en_call("__gc_read", vec![cell, en_int(0, span)], span)
+        }
+        // Re-derive a `Bool` from the boxed 0/1 integer.
+        EnumFieldRepr::BoolField => {
+            let cell = en_call("__gc_read_ptr", vec![subject, offset], span);
+            let raw = en_call("__gc_read", vec![cell, en_int(0, span)], span);
+            en_binary(raw, BinaryOp::NotEqual, en_int(0, span), span)
         }
         EnumFieldRepr::EnumField => en_call("__gc_read_ptr", vec![subject, offset], span),
     }

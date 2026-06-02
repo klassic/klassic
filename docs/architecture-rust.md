@@ -559,8 +559,9 @@ cargo run -- -e "1 + 2"
   `match` are lowered (after type checking, before codegen) onto the
   existing `__gc_*` heap primitives: an enum value is a
   `__gc_record(1 + fields)` whose slot 0 holds the boxed variant tag and
-  whose remaining slots hold boxed integer payloads or directly-stored
-  nested-enum pointers, so the collector traces every slot as a pointer.
+  whose remaining slots hold boxed integer / boolean payloads (booleans as
+  0/1) or directly-stored nested-enum pointers, so the collector traces
+  every slot as a pointer.
   `match` becomes a chain of `if` tests with short-circuited tag checks
   guarding payload reads, supporting nested constructor patterns,
   integer/string literal and variable/wildcard patterns, and guards;

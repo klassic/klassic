@@ -20470,6 +20470,63 @@ fn native_build_compiles_enum_construction_and_match() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "12\n9\n0\n");
 }
 
+/// Boolean enum payloads compile too: they are boxed as 0/1 integers on
+/// construction and re-derived as `Bool` on extraction, so both
+/// boolean-literal patterns (`case Mk(true, n)`) and bound boolean
+/// variables work.
+#[test]
+fn native_build_compiles_boolean_enum_payloads() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_enumbool_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_enumbool_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Flag { case Mk(active: Bool, level: Int) }\n\
+         def describe(f) = f match {\n  \
+           case Mk(true, n) => n\n  \
+           case Mk(false, n) => 0 - n\n\
+         }\n\
+         println(describe(Mk(true, 5)))\n\
+         println(describe(Mk(false, 5)))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "5\n-5\n");
+}
+
 /// Native `match` lowering is fully recursive: nested constructor
 /// patterns (`case O(I(n))`), integer-literal sub-patterns and arm
 /// guards all compile, with short-circuited tag tests guarding payload
