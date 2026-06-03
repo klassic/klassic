@@ -892,6 +892,7 @@ fn inline_stdlib_imports(expr: Expr, prelude_offset: usize) -> Result<Expr, Diag
 enum EnumFieldRepr {
     Scalar,
     BoolField,
+    StringField,
     EnumField,
 }
 
@@ -936,19 +937,17 @@ fn native_enum_unsupported_message(name: &str, type_params: &[String]) -> String
     }
     format!(
         "native build does not support enum `{name}`; native enums must be monomorphic with \
-         only integer (Int/Long/Short/Byte), boolean, or nested monomorphic-enum payloads and \
-         distinct variant names. Run it with the evaluator or see docs/roadmap-targets-stdlib.md"
+         only integer (Int/Long/Short/Byte), boolean, string, or nested monomorphic-enum \
+         payloads and distinct variant names. Run it with the evaluator or see \
+         docs/roadmap-targets-stdlib.md"
     )
 }
 
 fn classify_enum_field(text: &str, supported: &HashSet<String>) -> Option<EnumFieldRepr> {
-    // String payloads are intentionally excluded for now: extracting a
-    // field yields a GC heap string, and native's heap-string interop
-    // (branch merging, equality) is not yet complete enough to use one
-    // soundly downstream. Such enums keep their unsupported diagnostic.
     match text.trim() {
         "Int" | "Long" | "Short" | "Byte" => Some(EnumFieldRepr::Scalar),
         "Bool" | "Boolean" => Some(EnumFieldRepr::BoolField),
+        "String" => Some(EnumFieldRepr::StringField),
         other if supported.contains(other) => Some(EnumFieldRepr::EnumField),
         _ => None,
     }
@@ -1383,6 +1382,10 @@ impl EnumLowering {
                     let as_int = en_if(arg, en_int(1, span), en_int(0, span), span);
                     self.box_scalar(as_int, span)
                 }
+                // Normalize to a GC heap string so the slot holds a real
+                // traced pointer (string literals are otherwise static
+                // `.rodata` the collector must never chase).
+                EnumFieldRepr::StringField => en_call("__gc_string", vec![arg], span),
                 EnumFieldRepr::EnumField => arg,
             };
             stmts.push(en_call(
@@ -1608,6 +1611,7 @@ fn en_field_read(subject: Expr, repr: EnumFieldRepr, i: usize, span: Span) -> Ex
             let raw = en_call("__gc_read", vec![cell, en_int(0, span)], span);
             en_binary(raw, BinaryOp::NotEqual, en_int(0, span), span)
         }
+        EnumFieldRepr::StringField => en_call("__gc_read_string", vec![subject, offset], span),
         EnumFieldRepr::EnumField => en_call("__gc_read_ptr", vec![subject, offset], span),
     }
 }
@@ -9778,6 +9782,10 @@ impl NativeCodeGenerator {
                 self.asm.rep_movsb();
                 Ok(NativeValue::HeapString)
             }
+            // Already a GC heap string: pass it through unchanged so the
+            // conversion is idempotent (the enum lowering wraps every
+            // string payload in `__gc_string` without knowing its repr).
+            NativeValue::HeapString => Ok(NativeValue::HeapString),
             _ => Err(unsupported(
                 span,
                 "native __gc_string only supports static or runtime string arguments",
@@ -9826,22 +9834,26 @@ impl NativeCodeGenerator {
         op: BinaryOp,
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        // One side reached here because it `may_yield_heap_string`; the
+        // other can still be a static or runtime string (e.g. comparing a
+        // heap-string enum payload to a string literal). Coerce both to
+        // heap strings so the comparison handles every representation.
         let a = self.compile_expr(lhs)?;
-        if a != NativeValue::HeapString {
-            return Err(unsupported(
-                span,
-                "native heap string equality first argument",
-            ));
-        }
+        self.emit_heap_string_concat_fragment(
+            a,
+            span,
+            "native heap string equality first argument",
+            false,
+        )?;
         let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
         let b = self.compile_expr(rhs)?;
-        if b != NativeValue::HeapString {
-            return Err(unsupported(
-                span,
-                "native heap string equality second argument",
-            ));
-        }
+        self.emit_heap_string_concat_fragment(
+            b,
+            span,
+            "native heap string equality second argument",
+            false,
+        )?;
         self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
         self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
         self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11, span, "heap string equality");
@@ -28564,6 +28576,14 @@ impl NativeCodeGenerator {
     }
 
     fn expr_may_yield_heap_string(&self, expr: &Expr) -> bool {
+        self.heap_string_yield(expr, &HashSet::new())
+    }
+
+    /// Heap-string yield check that also tracks block-local `val`s bound
+    /// to heap strings, so a trailing `{ val s = __gc_read_string(..); s }`
+    /// (as the enum lowering emits for string payloads) is recognised even
+    /// though `s` is not yet in scope when this runs.
+    fn heap_string_yield(&self, expr: &Expr, locals: &HashSet<String>) -> bool {
         if matches!(
             self.native_value_hint_for_expr(expr),
             Some(NativeValue::HeapString)
@@ -28571,29 +28591,44 @@ impl NativeCodeGenerator {
             return true;
         }
         match expr {
-            Expr::Identifier { name, .. } => matches!(
-                self.lookup_var(name).map(|slot| slot.value),
-                Some(NativeValue::HeapString)
-            ),
-            Expr::Block { expressions, .. } => expressions
-                .last()
-                .is_some_and(|expr| self.expr_may_yield_heap_string(expr)),
+            Expr::Identifier { name, .. } => {
+                locals.contains(name)
+                    || matches!(
+                        self.lookup_var(name).map(|slot| slot.value),
+                        Some(NativeValue::HeapString)
+                    )
+            }
+            Expr::Block { expressions, .. } => {
+                let mut locals = locals.clone();
+                let last = expressions.len();
+                for (index, sub) in expressions.iter().enumerate() {
+                    if index + 1 == last {
+                        return self.heap_string_yield(sub, &locals);
+                    }
+                    if let Expr::VarDecl { name, value, .. } = sub
+                        && self.heap_string_yield(value, &locals)
+                    {
+                        locals.insert(name.clone());
+                    }
+                }
+                false
+            }
             Expr::If {
                 then_branch,
                 else_branch,
                 ..
             } => {
-                self.expr_may_yield_heap_string(then_branch)
+                self.heap_string_yield(then_branch, locals)
                     || else_branch
                         .as_deref()
-                        .is_some_and(|branch| self.expr_may_yield_heap_string(branch))
+                        .is_some_and(|branch| self.heap_string_yield(branch, locals))
             }
             Expr::Binary {
                 lhs,
                 op: BinaryOp::Add,
                 rhs,
                 ..
-            } => self.expr_may_yield_heap_string(lhs) || self.expr_may_yield_heap_string(rhs),
+            } => self.heap_string_yield(lhs, locals) || self.heap_string_yield(rhs, locals),
             Expr::Call { callee, .. } => match callee.as_ref() {
                 Expr::Identifier { name, .. } => {
                     heap_string_returning_helper(&self.builtin_name_for_identifier(name))
@@ -29136,7 +29171,23 @@ impl NativeCodeGenerator {
         const RUNTIME_STRING_CAP: usize = 65_536;
         let else_label = self.asm.create_text_label();
         let end_label = self.asm.create_text_label();
+        // When at least one branch yields a GC heap string, coerce both
+        // branches to heap strings and merge them through a rooted stack
+        // slot. Static/runtime-only string ifs keep using the fixed-buffer
+        // `branch_string_output` path below.
+        let branch_heap_string = if let Some(else_branch) = else_branch {
+            let then_heap = self.expr_may_yield_heap_string(then_branch);
+            let else_heap = self.expr_may_yield_heap_string(else_branch);
+            let then_stringy = then_heap || self.expr_may_yield_native_string(then_branch);
+            let else_stringy = else_heap || self.expr_may_yield_native_string(else_branch);
+            (then_heap || else_heap) && then_stringy && else_stringy
+        } else {
+            false
+        };
+        let heap_string_slot =
+            branch_heap_string.then(|| self.allocate_anonymous_slot(NativeValue::HeapPointer));
         let branch_string_output = if let Some(else_branch) = else_branch
+            && !branch_heap_string
             && self.expr_may_yield_native_string(then_branch)
             && self.expr_may_yield_native_string(else_branch)
         {
@@ -29183,6 +29234,17 @@ impl NativeCodeGenerator {
         self.mergeable_dynamic_branch_depth += 1;
         self.push_scope();
         let then_value = self.compile_expr(then_branch)?;
+        // Coerce the then result to a heap string and stash it in the
+        // rooted slot before the scope (and rax) can be disturbed.
+        if let Some(slot) = heap_string_slot {
+            self.emit_heap_string_concat_fragment(
+                then_value,
+                span,
+                "native if heap-string then branch",
+                false,
+            )?;
+            self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+        }
         if self.native_value_captures_current_scope(then_value)
             || self.queued_threads_capture_current_scope()
         {
@@ -29355,6 +29417,15 @@ impl NativeCodeGenerator {
         } else {
             NativeValue::Unit
         };
+        if let Some(slot) = heap_string_slot {
+            self.emit_heap_string_concat_fragment(
+                else_value,
+                span,
+                "native if heap-string else branch",
+                false,
+            )?;
+            self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+        }
         if self.native_value_captures_current_scope(else_value)
             || self.queued_threads_capture_current_scope()
         {
@@ -29454,6 +29525,10 @@ impl NativeCodeGenerator {
             if Self::expr_always_diverges(then_branch) && !Self::expr_always_diverges(else_branch) {
                 return Ok(else_value);
             }
+        }
+        if let Some(slot) = heap_string_slot {
+            self.asm.load_rbp_slot(Reg::Rax, slot.offset);
+            return Ok(NativeValue::HeapString);
         }
         if then_value == else_value
             || self

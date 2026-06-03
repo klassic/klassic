@@ -20527,6 +20527,67 @@ fn native_build_compiles_boolean_enum_payloads() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "5\n-5\n");
 }
 
+/// String enum payloads compile: a string field is normalized to a GC
+/// heap string on construction and read back as one, so it can be bound
+/// and returned (the `match` desugars to an `if` whose branches are
+/// merged as heap strings) and matched against string literals.
+#[test]
+fn native_build_compiles_string_enum_payloads() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_enumstr_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_enumstr_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Tag { case Named(s: String); case Anon }\n\
+         def show(t) = t match { case Named(s) => s; case Anon => \"anon\" }\n\
+         def kind(t) = t match { case Named(\"x\") => 1; case Named(other) => 2; case Anon => 0 }\n\
+         println(show(Named(\"hello\")))\n\
+         println(show(Anon))\n\
+         println(kind(Named(\"x\")))\n\
+         println(kind(Named(\"y\")))\n\
+         println(kind(Anon))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "hello\nanon\n1\n2\n0\n"
+    );
+}
+
 /// Native `match` lowering is fully recursive: nested constructor
 /// patterns (`case O(I(n))`), integer-literal sub-patterns and arm
 /// guards all compile, with short-circuited tag tests guarding payload
