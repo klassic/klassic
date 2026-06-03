@@ -1075,22 +1075,26 @@ fn desugar_enums(expr: Expr) -> Expr {
     lowering.lower(expr)
 }
 
-impl EnumLowering {
-    fn fresh(&mut self, prefix: &str) -> String {
-        self.counter += 1;
-        format!("__enum_{prefix}{}", self.counter)
-    }
+/// Fresh synthetic-name generator shared by the enum lowering and the
+/// (future) codegen-time generic-enum path.
+fn en_fresh(counter: &mut usize, prefix: &str) -> String {
+    *counter += 1;
+    format!("__enum_{prefix}{counter}")
+}
 
-    fn pattern_supported(&self, pattern: &Pattern) -> bool {
-        match pattern {
-            Pattern::Constructor { name, args, .. } => {
-                self.variants.contains_key(name)
-                    && args.iter().all(|arg| self.pattern_supported(arg))
-            }
-            _ => true,
+/// Whether every constructor pattern in `pattern` resolves to a known
+/// variant in `variants` (so the match can be lowered).
+fn en_pattern_supported(variants: &HashMap<String, EnumVariantInfo>, pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Constructor { name, args, .. } => {
+            variants.contains_key(name)
+                && args.iter().all(|arg| en_pattern_supported(variants, arg))
         }
+        _ => true,
     }
+}
 
+impl EnumLowering {
     fn lower(&mut self, expr: Expr) -> Expr {
         match expr {
             Expr::EnumDeclaration {
@@ -1121,7 +1125,7 @@ impl EnumLowering {
                     && info.fields.is_empty()
                 {
                     let info = info.clone();
-                    self.build_construct(&info, Vec::new(), span)
+                    en_build_construct(&mut self.counter, &info, Vec::new(), span)
                 } else {
                     Expr::Identifier { name, span }
                 }
@@ -1138,7 +1142,7 @@ impl EnumLowering {
                     && info.fields.len() == arguments.len()
                 {
                     let info = info.clone();
-                    return self.build_construct(&info, arguments, span);
+                    return en_build_construct(&mut self.counter, &info, arguments, span);
                 }
                 Expr::Call {
                     callee: Box::new(self.lower(*callee)),
@@ -1157,7 +1161,7 @@ impl EnumLowering {
                     && info.fields.len() == arguments.len()
                 {
                     let info = info.clone();
-                    return self.build_construct(&info, arguments, span);
+                    return en_build_construct(&mut self.counter, &info, arguments, span);
                 }
                 Expr::RecordConstructor {
                     name,
@@ -1180,8 +1184,11 @@ impl EnumLowering {
                         span: arm.span,
                     })
                     .collect();
-                if arms.iter().all(|arm| self.pattern_supported(&arm.pattern)) {
-                    self.build_match(scrutinee, arms, span)
+                if arms
+                    .iter()
+                    .all(|arm| en_pattern_supported(&self.variants, &arm.pattern))
+                {
+                    en_build_match(&mut self.counter, &self.variants, scrutinee, arms, span)
                 } else {
                     Expr::Match {
                         scrutinee: Box::new(scrutinee),
@@ -1354,171 +1361,192 @@ impl EnumLowering {
             other => other,
         }
     }
+}
 
-    fn build_construct(&mut self, info: &EnumVariantInfo, args: Vec<Expr>, span: Span) -> Expr {
-        let obj = self.fresh("obj");
-        let mut stmts = Vec::new();
-        stmts.push(en_vardecl(
-            &obj,
-            en_call(
-                "__gc_record",
-                vec![en_int(info.fields.len() as i64 + 1, span)],
-                span,
-            ),
+fn en_build_construct(
+    counter: &mut usize,
+    info: &EnumVariantInfo,
+    args: Vec<Expr>,
+    span: Span,
+) -> Expr {
+    let obj = en_fresh(counter, "obj");
+    let mut stmts = Vec::new();
+    stmts.push(en_vardecl(
+        &obj,
+        en_call(
+            "__gc_record",
+            vec![en_int(info.fields.len() as i64 + 1, span)],
             span,
-        ));
-        let index_box = self.box_scalar(en_int(info.index, span), span);
+        ),
+        span,
+    ));
+    let index_box = en_box_scalar(counter, en_int(info.index, span), span);
+    stmts.push(en_call(
+        "__gc_write",
+        vec![en_ident(&obj, span), en_int(0, span), index_box],
+        span,
+    ));
+    for (i, (arg, repr)) in args.into_iter().zip(info.fields.iter()).enumerate() {
+        let value = match repr {
+            EnumFieldRepr::Scalar => en_box_scalar(counter, arg, span),
+            // Store a boolean as the integer 0/1 so the slot still
+            // boxes a plain qword the collector ignores.
+            EnumFieldRepr::BoolField => {
+                let as_int = en_if(arg, en_int(1, span), en_int(0, span), span);
+                en_box_scalar(counter, as_int, span)
+            }
+            // Normalize to a GC heap string so the slot holds a real
+            // traced pointer (string literals are otherwise static
+            // `.rodata` the collector must never chase).
+            EnumFieldRepr::StringField => en_call("__gc_string", vec![arg], span),
+            EnumFieldRepr::EnumField => arg,
+        };
         stmts.push(en_call(
             "__gc_write",
-            vec![en_ident(&obj, span), en_int(0, span), index_box],
-            span,
-        ));
-        for (i, (arg, repr)) in args.into_iter().zip(info.fields.iter()).enumerate() {
-            let value = match repr {
-                EnumFieldRepr::Scalar => self.box_scalar(arg, span),
-                // Store a boolean as the integer 0/1 so the slot still
-                // boxes a plain qword the collector ignores.
-                EnumFieldRepr::BoolField => {
-                    let as_int = en_if(arg, en_int(1, span), en_int(0, span), span);
-                    self.box_scalar(as_int, span)
-                }
-                // Normalize to a GC heap string so the slot holds a real
-                // traced pointer (string literals are otherwise static
-                // `.rodata` the collector must never chase).
-                EnumFieldRepr::StringField => en_call("__gc_string", vec![arg], span),
-                EnumFieldRepr::EnumField => arg,
-            };
-            stmts.push(en_call(
-                "__gc_write",
-                vec![
-                    en_ident(&obj, span),
-                    en_int(8 * (i as i64 + 1), span),
-                    value,
-                ],
-                span,
-            ));
-        }
-        stmts.push(en_ident(&obj, span));
-        en_block(stmts, span)
-    }
-
-    fn box_scalar(&mut self, value: Expr, span: Span) -> Expr {
-        let cell = self.fresh("box");
-        en_block(
             vec![
-                en_vardecl(
-                    &cell,
-                    en_call("__gc_alloc", vec![en_int(8, span)], span),
-                    span,
-                ),
-                en_call(
-                    "__gc_write",
-                    vec![en_ident(&cell, span), en_int(0, span), value],
-                    span,
-                ),
-                en_ident(&cell, span),
+                en_ident(&obj, span),
+                en_int(8 * (i as i64 + 1), span),
+                value,
             ],
             span,
-        )
+        ));
     }
+    stmts.push(en_ident(&obj, span));
+    en_block(stmts, span)
+}
 
-    fn build_match(&mut self, scrutinee: Expr, arms: Vec<MatchArm>, span: Span) -> Expr {
-        let scrut = self.fresh("scrut");
-        let mut chain = en_call("__match_fail", Vec::new(), span);
-        for arm in arms.into_iter().rev() {
-            chain = self.build_arm(&scrut, arm, chain, span);
-        }
-        en_block(vec![en_vardecl(&scrut, scrutinee, span), chain], span)
+fn en_box_scalar(counter: &mut usize, value: Expr, span: Span) -> Expr {
+    let cell = en_fresh(counter, "box");
+    en_block(
+        vec![
+            en_vardecl(
+                &cell,
+                en_call("__gc_alloc", vec![en_int(8, span)], span),
+                span,
+            ),
+            en_call(
+                "__gc_write",
+                vec![en_ident(&cell, span), en_int(0, span), value],
+                span,
+            ),
+            en_ident(&cell, span),
+        ],
+        span,
+    )
+}
+
+fn en_build_match(
+    counter: &mut usize,
+    variants: &HashMap<String, EnumVariantInfo>,
+    scrutinee: Expr,
+    arms: Vec<MatchArm>,
+    span: Span,
+) -> Expr {
+    let scrut = en_fresh(counter, "scrut");
+    let mut chain = en_call("__match_fail", Vec::new(), span);
+    for arm in arms.into_iter().rev() {
+        chain = en_build_arm(variants, &scrut, arm, chain, span);
     }
+    en_block(vec![en_vardecl(&scrut, scrutinee, span), chain], span)
+}
 
-    fn build_arm(&self, scrut: &str, arm: MatchArm, rest: Expr, span: Span) -> Expr {
-        let subject = en_ident(scrut, span);
-        let predicate = self.pattern_predicate(&arm.pattern, subject, span);
-        let binds = self.pattern_binds(&arm.pattern, en_ident(scrut, span), span);
+fn en_build_arm(
+    variants: &HashMap<String, EnumVariantInfo>,
+    scrut: &str,
+    arm: MatchArm,
+    rest: Expr,
+    span: Span,
+) -> Expr {
+    let subject = en_ident(scrut, span);
+    let predicate = en_pattern_predicate(variants, &arm.pattern, subject, span);
+    let binds = en_pattern_binds(variants, &arm.pattern, en_ident(scrut, span), span);
 
-        let mut success: Vec<Expr> = binds
-            .into_iter()
-            .map(|(name, value)| en_vardecl(&name, value, span))
-            .collect();
-        let body = match arm.guard {
-            Some(guard) => en_if(guard, arm.body, rest.clone(), span),
-            None => arm.body,
-        };
-        success.push(body);
-        let success = en_block(success, span);
+    let mut success: Vec<Expr> = binds
+        .into_iter()
+        .map(|(name, value)| en_vardecl(&name, value, span))
+        .collect();
+    let body = match arm.guard {
+        Some(guard) => en_if(guard, arm.body, rest.clone(), span),
+        None => arm.body,
+    };
+    success.push(body);
+    let success = en_block(success, span);
 
-        match predicate {
-            Some(condition) => en_if(condition, success, rest, span),
-            None => success,
-        }
+    match predicate {
+        Some(condition) => en_if(condition, success, rest, span),
+        None => success,
     }
+}
 
-    /// Boolean test that `pattern` matches `subject`, or `None` when the
-    /// pattern is irrefutable (wildcard / variable). Constructor tests
-    /// short-circuit on the variant tag before reading payload slots, so
-    /// a mismatching variant never dereferences a slot it lacks.
-    fn pattern_predicate(&self, pattern: &Pattern, subject: Expr, span: Span) -> Option<Expr> {
-        match pattern {
-            Pattern::Wildcard { .. } | Pattern::Variable { .. } => None,
-            Pattern::LiteralInt { value, .. } => Some(en_binary(
-                subject,
+/// Boolean test that `pattern` matches `subject`, or `None` when the
+/// pattern is irrefutable (wildcard / variable). Constructor tests
+/// short-circuit on the variant tag before reading payload slots, so
+/// a mismatching variant never dereferences a slot it lacks.
+fn en_pattern_predicate(
+    variants: &HashMap<String, EnumVariantInfo>,
+    pattern: &Pattern,
+    subject: Expr,
+    span: Span,
+) -> Option<Expr> {
+    match pattern {
+        Pattern::Wildcard { .. } | Pattern::Variable { .. } => None,
+        Pattern::LiteralInt { value, .. } => Some(en_binary(
+            subject,
+            BinaryOp::Equal,
+            en_int(*value, span),
+            span,
+        )),
+        Pattern::LiteralBool { value, .. } => Some(en_binary(
+            subject,
+            BinaryOp::Equal,
+            en_bool(*value, span),
+            span,
+        )),
+        Pattern::LiteralString { value, .. } => Some(en_binary(
+            subject,
+            BinaryOp::Equal,
+            en_string(value, span),
+            span,
+        )),
+        Pattern::Constructor { name, args, .. } => {
+            let info = variants.get(name).expect("constructor pattern resolved");
+            let mut condition = en_binary(
+                en_index_read(subject.clone(), span),
                 BinaryOp::Equal,
-                en_int(*value, span),
+                en_int(info.index, span),
                 span,
-            )),
-            Pattern::LiteralBool { value, .. } => Some(en_binary(
-                subject,
-                BinaryOp::Equal,
-                en_bool(*value, span),
-                span,
-            )),
-            Pattern::LiteralString { value, .. } => Some(en_binary(
-                subject,
-                BinaryOp::Equal,
-                en_string(value, span),
-                span,
-            )),
-            Pattern::Constructor { name, args, .. } => {
-                let info = self
-                    .variants
-                    .get(name)
-                    .expect("constructor pattern resolved");
-                let mut condition = en_binary(
-                    en_index_read(subject.clone(), span),
-                    BinaryOp::Equal,
-                    en_int(info.index, span),
-                    span,
-                );
-                for (i, arg) in args.iter().enumerate() {
-                    let field = en_field_read(subject.clone(), info.fields[i], i, span);
-                    if let Some(sub) = self.pattern_predicate(arg, field, span) {
-                        condition = en_binary(condition, BinaryOp::LogicalAnd, sub, span);
-                    }
+            );
+            for (i, arg) in args.iter().enumerate() {
+                let field = en_field_read(subject.clone(), info.fields[i], i, span);
+                if let Some(sub) = en_pattern_predicate(variants, arg, field, span) {
+                    condition = en_binary(condition, BinaryOp::LogicalAnd, sub, span);
                 }
-                Some(condition)
             }
+            Some(condition)
         }
     }
+}
 
-    fn pattern_binds(&self, pattern: &Pattern, subject: Expr, span: Span) -> Vec<(String, Expr)> {
-        match pattern {
-            Pattern::Wildcard { .. }
-            | Pattern::LiteralInt { .. }
-            | Pattern::LiteralBool { .. }
-            | Pattern::LiteralString { .. } => Vec::new(),
-            Pattern::Variable { name, .. } => vec![(name.clone(), subject)],
-            Pattern::Constructor { name, args, .. } => {
-                let info = self
-                    .variants
-                    .get(name)
-                    .expect("constructor pattern resolved");
-                let mut binds = Vec::new();
-                for (i, arg) in args.iter().enumerate() {
-                    let field = en_field_read(subject.clone(), info.fields[i], i, span);
-                    binds.extend(self.pattern_binds(arg, field, span));
-                }
-                binds
+fn en_pattern_binds(
+    variants: &HashMap<String, EnumVariantInfo>,
+    pattern: &Pattern,
+    subject: Expr,
+    span: Span,
+) -> Vec<(String, Expr)> {
+    match pattern {
+        Pattern::Wildcard { .. }
+        | Pattern::LiteralInt { .. }
+        | Pattern::LiteralBool { .. }
+        | Pattern::LiteralString { .. } => Vec::new(),
+        Pattern::Variable { name, .. } => vec![(name.clone(), subject)],
+        Pattern::Constructor { name, args, .. } => {
+            let info = variants.get(name).expect("constructor pattern resolved");
+            let mut binds = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                let field = en_field_read(subject.clone(), info.fields[i], i, span);
+                binds.extend(en_pattern_binds(variants, arg, field, span));
             }
+            binds
         }
     }
 }
