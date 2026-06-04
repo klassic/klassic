@@ -902,6 +902,46 @@ struct EnumVariantInfo {
     fields: Vec<EnumFieldRepr>,
 }
 
+/// A field of a *generic* enum variant, classified from the declaration's
+/// annotation text alone (no type information needed).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GenericField {
+    /// Annotation is a concrete supported type (`Int`, `Bool`, `String`,
+    /// a known monomorphic enum) → fixed repr regardless of instantiation.
+    Fixed(EnumFieldRepr),
+    /// Annotation is exactly a type parameter (`a`) → the repr is whatever
+    /// the constructor argument's `NativeValue` projects to at the site.
+    Param(usize),
+    /// Annotation is an applied generic (`List<a>`, `Option<a>`, ...) →
+    /// always a heap pointer at runtime, hence `EnumField`. Wired in a
+    /// later milestone (nested generics); kept here so the shape logic is
+    /// already total over field kinds.
+    #[allow(dead_code)]
+    AppliedParam,
+}
+
+struct GenericVariantInfo {
+    name: String,
+    index: i64,
+    fields: Vec<GenericField>,
+}
+
+/// A generic `enum` declaration, registered so codegen can specialize its
+/// constructions / matches per instantiation discovered from argument
+/// `NativeValue`s.
+struct GenericEnumInfo {
+    type_params: Vec<String>,
+    variants: Vec<GenericVariantInfo>,
+}
+
+/// A concrete (per-instantiation) enum shape: each variant's tag index and
+/// the resolved field reprs. Built at a construction site and attached to
+/// the value's slot so a later `match` knows how to read each payload.
+#[derive(Clone)]
+struct ConcreteEnumShape {
+    variants: HashMap<String, EnumVariantInfo>,
+}
+
 /// Rewrites monomorphic `enum` declarations, variant constructors and
 /// `match` expressions into the existing `__gc_*` heap primitives so the
 /// native backend never needs bespoke ADT codegen. The lowering runs
@@ -949,6 +989,40 @@ fn classify_enum_field(text: &str, supported: &HashSet<String>) -> Option<EnumFi
         "Bool" | "Boolean" => Some(EnumFieldRepr::BoolField),
         "String" => Some(EnumFieldRepr::StringField),
         other if supported.contains(other) => Some(EnumFieldRepr::EnumField),
+        _ => None,
+    }
+}
+
+/// Classify a *generic* enum variant field from its annotation text. A
+/// bare type parameter becomes `Param`; otherwise it must be a concrete
+/// supported type (reusing `classify_enum_field`). Applied generics and
+/// unknown types return `None`, leaving the enum unregistered (M3+).
+fn classify_generic_field(
+    text: &str,
+    type_params: &[String],
+    supported_mono: &HashSet<String>,
+) -> Option<GenericField> {
+    let trimmed = text.trim();
+    if let Some(index) = type_params.iter().position(|p| p == trimmed) {
+        return Some(GenericField::Param(index));
+    }
+    classify_enum_field(trimmed, supported_mono).map(GenericField::Fixed)
+}
+
+/// Project a constructor argument's `NativeValue` to the enum field repr
+/// used to box / read it. This is the entire "resolve the type parameter
+/// from the argument" mechanism — it consumes the value flow the native
+/// backend already computes.
+fn enum_field_repr_for_native_value(value: NativeValue) -> Option<EnumFieldRepr> {
+    match value {
+        NativeValue::Int => Some(EnumFieldRepr::Scalar),
+        NativeValue::Bool => Some(EnumFieldRepr::BoolField),
+        NativeValue::HeapString
+        | NativeValue::StaticString { .. }
+        | NativeValue::RuntimeString { .. } => Some(EnumFieldRepr::StringField),
+        // Nested enums / records / lists are all heap pointers (M3 widens
+        // read support); a bare heap pointer is the common nested-enum case.
+        NativeValue::HeapPointer => Some(EnumFieldRepr::EnumField),
         _ => None,
     }
 }
@@ -2598,6 +2672,18 @@ struct NativeCodeGenerator {
     queued_threads: Vec<QueuedThread>,
     dynamic_control_depth: usize,
     mergeable_dynamic_branch_depth: usize,
+    /// Generic enum declarations, by enum name. Populated before codegen.
+    generic_enums: HashMap<String, GenericEnumInfo>,
+    /// Variant name -> owning generic enum name.
+    variant_to_generic_enum: HashMap<String, String>,
+    /// Slot id -> concrete enum shape, so a `match` on an identifier can
+    /// recover the per-instantiation field reprs of its scrutinee.
+    enum_shapes: HashMap<usize, ConcreteEnumShape>,
+    /// Shape of the generic enum value just constructed, awaiting binding
+    /// to a slot (picked up by the next `allocate_slot`/`bind_constant`).
+    pending_enum_shape: Option<ConcreteEnumShape>,
+    /// Fresh-name counter for synthesized generic-enum lowering trees.
+    generic_enum_counter: usize,
 }
 
 impl NativeCodeGenerator {
@@ -2746,11 +2832,273 @@ impl NativeCodeGenerator {
             queued_threads: Vec::new(),
             dynamic_control_depth: 0,
             mergeable_dynamic_branch_depth: 0,
+            generic_enums: HashMap::new(),
+            variant_to_generic_enum: HashMap::new(),
+            enum_shapes: HashMap::new(),
+            pending_enum_shape: None,
+            generic_enum_counter: 0,
+        }
+    }
+
+    /// Collect generic (`type_params` non-empty) `enum` declarations whose
+    /// fields all classify, so codegen can specialize their constructions
+    /// and matches per instantiation. Uses only the declaration's
+    /// annotation text — no type information.
+    fn register_generic_enums(&mut self, expr: &Expr) {
+        let mut decls = Vec::new();
+        collect_enum_decls(expr, &mut decls);
+        let mono_names: HashSet<String> = decls
+            .iter()
+            .filter(|(_, type_params, _)| type_params.is_empty())
+            .map(|(name, _, _)| name.clone())
+            .collect();
+        for (name, type_params, variants) in &decls {
+            if type_params.is_empty() {
+                continue;
+            }
+            let mut generic_variants = Vec::with_capacity(variants.len());
+            let mut supported = true;
+            for (index, variant) in variants.iter().enumerate() {
+                let mut fields = Vec::with_capacity(variant.params.len());
+                for (_, annotation) in &variant.params {
+                    match classify_generic_field(&annotation.text, type_params, &mono_names) {
+                        Some(field) => fields.push(field),
+                        None => {
+                            supported = false;
+                            break;
+                        }
+                    }
+                }
+                if !supported {
+                    break;
+                }
+                generic_variants.push(GenericVariantInfo {
+                    name: variant.name.clone(),
+                    index: index as i64,
+                    fields,
+                });
+            }
+            if !supported {
+                continue;
+            }
+            for variant in &generic_variants {
+                self.variant_to_generic_enum
+                    .insert(variant.name.clone(), name.clone());
+            }
+            self.generic_enums.insert(
+                name.clone(),
+                GenericEnumInfo {
+                    type_params: type_params.clone(),
+                    variants: generic_variants,
+                },
+            );
+        }
+    }
+
+    /// Build the concrete shape of `enum_name` given the reprs resolved for
+    /// each type parameter at a construction site. A variant whose type
+    /// parameter is still unresolved is omitted (a later match on it emits
+    /// a precise diagnostic).
+    fn resolve_enum_shape(
+        &self,
+        enum_name: &str,
+        param_reprs: &[Option<EnumFieldRepr>],
+    ) -> ConcreteEnumShape {
+        let info = self
+            .generic_enums
+            .get(enum_name)
+            .expect("generic enum registered");
+        let mut variants = HashMap::new();
+        for variant in &info.variants {
+            let fields = variant
+                .fields
+                .iter()
+                .map(|field| match field {
+                    GenericField::Fixed(repr) => *repr,
+                    GenericField::AppliedParam => EnumFieldRepr::EnumField,
+                    // An unresolved type parameter only happens for a
+                    // variant the constructed value is NOT (e.g. building
+                    // `None` leaves `Some`'s payload unknown). Such an arm
+                    // is dead at runtime — its tag never matches — so a
+                    // `Scalar` default just lets it compile; the field read
+                    // is guarded by the tag test and never executes.
+                    GenericField::Param(index) => param_reprs
+                        .get(*index)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(EnumFieldRepr::Scalar),
+                })
+                .collect();
+            variants.insert(
+                variant.name.clone(),
+                EnumVariantInfo {
+                    index: variant.index,
+                    fields,
+                },
+            );
+        }
+        ConcreteEnumShape { variants }
+    }
+
+    /// Bind a just-compiled (rax-resident) value to a fresh temp slot so a
+    /// synthesized lowering tree can reference it without recompiling the
+    /// original argument (and so heap pointers stay GC-rooted across the
+    /// record allocation).
+    fn bind_generic_temp(&mut self, value: NativeValue, span: Span) -> Result<String, Diagnostic> {
+        self.generic_enum_counter += 1;
+        let name = format!("__gen_arg{}", self.generic_enum_counter);
+        match value {
+            NativeValue::Int
+            | NativeValue::Bool
+            | NativeValue::HeapPointer
+            | NativeValue::HeapString => {
+                let slot = self.allocate_slot(name.clone(), value);
+                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                Ok(name)
+            }
+            _ => Err(unsupported(
+                span,
+                "native generic enum payload for this value type",
+            )),
+        }
+    }
+
+    /// Construct a generic enum value: resolve each field's repr from the
+    /// argument `NativeValue`, build the `__gc_record` via the shared
+    /// `en_build_construct`, and record the resulting instance's concrete
+    /// shape (picked up by the next slot binding).
+    fn compile_generic_enum_construct(
+        &mut self,
+        enum_name: &str,
+        variant_name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let (generic_fields, variant_index, type_param_count) = {
+            let info = self
+                .generic_enums
+                .get(enum_name)
+                .expect("generic enum registered");
+            let variant = info
+                .variants
+                .iter()
+                .find(|variant| variant.name == variant_name)
+                .expect("generic variant registered");
+            (
+                variant.fields.clone(),
+                variant.index,
+                info.type_params.len(),
+            )
+        };
+        if generic_fields.len() != args.len() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "variant `{variant_name}` expects {} arguments but got {}",
+                    generic_fields.len(),
+                    args.len()
+                ),
+            ));
+        }
+        let mut arg_idents = Vec::with_capacity(args.len());
+        let mut field_reprs = Vec::with_capacity(args.len());
+        let mut param_reprs: Vec<Option<EnumFieldRepr>> = vec![None; type_param_count];
+        for (field, arg) in generic_fields.iter().zip(args) {
+            let value = self.compile_expr(arg)?;
+            let repr = match field {
+                GenericField::Fixed(repr) => *repr,
+                GenericField::AppliedParam => EnumFieldRepr::EnumField,
+                GenericField::Param(index) => {
+                    let repr = enum_field_repr_for_native_value(value).ok_or_else(|| {
+                        unsupported(span, "native generic enum payload for this value type")
+                    })?;
+                    param_reprs[*index] = Some(repr);
+                    repr
+                }
+            };
+            let temp = self.bind_generic_temp(value, span)?;
+            arg_idents.push(en_ident(&temp, span));
+            field_reprs.push(repr);
+        }
+        let variant_info = EnumVariantInfo {
+            index: variant_index,
+            fields: field_reprs,
+        };
+        let tree = en_build_construct(
+            &mut self.generic_enum_counter,
+            &variant_info,
+            arg_idents,
+            span,
+        );
+        let result = self.compile_expr(&tree)?;
+        let shape = self.resolve_enum_shape(enum_name, &param_reprs);
+        self.pending_enum_shape = Some(shape);
+        Ok(result)
+    }
+
+    /// Lower a `match` whose constructor patterns are generic-enum variants,
+    /// using the scrutinee value's recorded shape. Only an identifier
+    /// scrutinee with a known shape is supported (M1); anything else emits a
+    /// precise diagnostic rather than miscompiling.
+    fn compile_generic_enum_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let shape = match scrutinee {
+            Expr::Identifier { name, .. } => self
+                .lookup_var(name)
+                .and_then(|slot| self.enum_shapes.get(&slot.id).cloned()),
+            _ => None,
+        };
+        let Some(shape) = shape else {
+            return Err(unsupported(
+                span,
+                "native generic enum match: scrutinee shape is not statically known",
+            ));
+        };
+        if !arms
+            .iter()
+            .all(|arm| en_pattern_supported(&shape.variants, &arm.pattern))
+        {
+            return Err(unsupported(
+                span,
+                "native generic enum match: a pattern variant is not in the scrutinee shape",
+            ));
+        }
+        let tree = en_build_match(
+            &mut self.generic_enum_counter,
+            &shape.variants,
+            scrutinee.clone(),
+            arms.to_vec(),
+            span,
+        );
+        self.compile_expr(&tree)
+    }
+
+    /// Whether `name` resolves to a registered generic-enum variant.
+    fn generic_variant_enum(&self, name: &str) -> Option<String> {
+        self.variant_to_generic_enum.get(name).cloned()
+    }
+
+    /// Whether `pattern` (recursively) tests a registered generic-enum
+    /// variant — used to route a `match` to the generic-enum lowering.
+    fn pattern_uses_generic_variant(&self, pattern: &Pattern) -> bool {
+        match pattern {
+            Pattern::Constructor { name, args, .. } => {
+                self.variant_to_generic_enum.contains_key(name)
+                    || args
+                        .iter()
+                        .any(|arg| self.pattern_uses_generic_variant(arg))
+            }
+            _ => false,
         }
     }
 
     fn compile(mut self, expr: &Expr) -> Result<ObjectFile, Diagnostic> {
         self.predeclare_record_schemas(expr);
+        self.register_generic_enums(expr);
         self.predeclare_top_level_functions(expr);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
@@ -3054,10 +3402,26 @@ impl NativeCodeGenerator {
                 type_params,
                 span,
                 ..
-            } => Err(Diagnostic::compile(
-                *span,
-                native_enum_unsupported_message(name, type_params),
-            )),
+            } => {
+                if self.generic_enums.contains_key(name) {
+                    Ok(NativeValue::Unit)
+                } else {
+                    Err(Diagnostic::compile(
+                        *span,
+                        native_enum_unsupported_message(name, type_params),
+                    ))
+                }
+            }
+            Expr::Match {
+                scrutinee,
+                arms,
+                span,
+            } if arms
+                .iter()
+                .any(|arm| self.pattern_uses_generic_variant(&arm.pattern)) =>
+            {
+                self.compile_generic_enum_match(scrutinee, arms, *span)
+            }
             Expr::Match { span, .. } => Err(Diagnostic::compile(
                 *span,
                 "native build cannot compile this `match`: its constructor patterns reference an \
@@ -3474,6 +3838,10 @@ impl NativeCodeGenerator {
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<NativeValue, Diagnostic> {
+        // A pending generic-enum shape is only valid for the slot binding
+        // that immediately follows its construction; clear any leftover so
+        // it never attaches to an unrelated value.
+        self.pending_enum_shape = None;
         match expr {
             Expr::Int { value, .. } => {
                 self.asm.mov_imm64(Reg::Rax, *value as u64);
@@ -3537,7 +3905,12 @@ impl NativeCodeGenerator {
                 name,
                 arguments,
                 span,
-            } => self.compile_record_constructor(name, arguments, *span),
+            } => {
+                if let Some(enum_name) = self.generic_variant_enum(name) {
+                    return self.compile_generic_enum_construct(&enum_name, name, arguments, *span);
+                }
+                self.compile_record_constructor(name, arguments, *span)
+            }
             Expr::FieldAccess {
                 target,
                 field,
@@ -3550,7 +3923,14 @@ impl NativeCodeGenerator {
                 callee,
                 arguments,
                 span,
-            } => self.compile_call(callee, arguments, *span),
+            } => {
+                if let Expr::Identifier { name, .. } = callee.as_ref()
+                    && let Some(enum_name) = self.generic_variant_enum(name)
+                {
+                    return self.compile_generic_enum_construct(&enum_name, name, arguments, *span);
+                }
+                self.compile_call(callee, arguments, *span)
+            }
             Expr::If {
                 condition,
                 then_branch,
@@ -3628,6 +4008,9 @@ impl NativeCodeGenerator {
             }
             Expr::Identifier { name, span } => {
                 let Some(slot) = self.lookup_var(name) else {
+                    if let Some(enum_name) = self.generic_variant_enum(name) {
+                        return self.compile_generic_enum_construct(&enum_name, name, &[], *span);
+                    }
                     if let Some(value) = self.static_lambda_value_for_function_name(name) {
                         return Ok(self.emit_static_value(&value));
                     }
@@ -3926,6 +4309,19 @@ impl NativeCodeGenerator {
                     self.remove_static_value(name);
                 }
                 Ok(compiled)
+            }
+            Expr::Match {
+                scrutinee,
+                arms,
+                span,
+            } if arms
+                .iter()
+                .any(|arm| self.pattern_uses_generic_variant(&arm.pattern)) =>
+            {
+                self.compile_generic_enum_match(scrutinee, arms, *span)
+            }
+            Expr::EnumDeclaration { name, .. } if self.generic_enums.contains_key(name) => {
+                Ok(NativeValue::Unit)
             }
             Expr::DefDecl { span, .. }
             | Expr::ModuleHeader { span, .. }
@@ -35527,6 +35923,14 @@ impl NativeCodeGenerator {
         };
         if matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             self.register_heap_pointer_slot(slot.offset);
+        }
+        // A generic enum value just constructed carries a pending shape;
+        // attach it to this slot so a later `match` on the binding can read
+        // its payload reprs.
+        if matches!(value, NativeValue::HeapPointer)
+            && let Some(shape) = self.pending_enum_shape.take()
+        {
+            self.enum_shapes.insert(slot.id, shape);
         }
         self.scopes
             .last_mut()

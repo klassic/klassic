@@ -570,9 +570,16 @@ cargo run -- -e "1 + 2"
   integer/string literal and variable/wildcard patterns, and guards;
   literal/variable `match` over non-enum scrutinees lowers the same way,
   and a fully non-matching scrutinee aborts through `__match_fail()`.
-  Generic enums (any type parameters) and recursive functions over
-  enum-typed parameters remain unsupported and keep their compile-time
-  diagnostics.
+  Generic enums with scalar payloads compile by per-instantiation
+  specialization at codegen time: a generic `enum` declaration is
+  registered (variant tags + each field classified as a fixed repr or a
+  type parameter), a construction projects each argument's `NativeValue`
+  to a field repr and records the instance's concrete shape on the bound
+  slot, and a `match` reads payloads through that shape — reusing the same
+  `en_build_construct` / `en_build_match` lowering as monomorphic enums,
+  so the heap layout is byte-identical. Generic enums whose payload is an
+  applied generic (`List<a>`) and recursive functions over enum-typed
+  parameters remain unsupported and keep their compile-time diagnostics.
   Imports of the plain-Klassic `std.*` modules are inlined before type
   checking: the imported module's declarations are spliced between the
   bundled prelude and the user program (native name resolution is

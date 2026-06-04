@@ -20766,12 +20766,13 @@ fn native_build_match_without_matching_arm_aborts() {
     );
 }
 
-/// A generic `enum` (type parameters) is reported with a precise
-/// diagnostic naming the enum, rather than the old blanket "enum
-/// declarations are not yet supported" message — monomorphic integer
-/// enums do compile, so the error must explain the actual limitation.
+/// Native build now compiles generic enums with scalar payloads by
+/// specializing each construction / match per instantiation at codegen
+/// time: the constructor argument's `NativeValue` resolves the type
+/// parameter's repr, the value carries a per-instance shape, and the
+/// match reads its payload through that shape. `unwrap(Some(7), 0)` runs.
 #[test]
-fn native_build_rejects_generic_enum_with_precise_message() {
+fn native_build_compiles_generic_enum_scalar_payload() {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -20780,7 +20781,60 @@ fn native_build_rejects_generic_enum_with_precise_message() {
     let output_path = std::env::temp_dir().join(format!("klassic_native_generic_{stamp}.bin"));
     fs::write(
         &source_path,
-        "enum Box<a> { case Wrap(value: a); case Empty }\nval b = Wrap(5)\nprintln(\"x\")\n",
+        "enum Option<a> { case Some(v: a); case None }\n\
+         def unwrap(o, d) = o match { case Some(v) => v; case None => d }\n\
+         println(unwrap(Some(7), 0))\n\
+         println(unwrap(None, 99))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "7\n99\n");
+}
+
+/// A generic enum whose payload is itself an applied generic (`List<a>`)
+/// is not specializable yet, so it keeps the precise generic-enum
+/// diagnostic naming the enum rather than miscompiling.
+#[test]
+fn native_build_rejects_unsupported_generic_enum_with_precise_message() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_generic2_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_generic2_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Box<a> { case Wrap(value: List<a>); case Empty }\nprintln(\"x\")\n",
     )
     .expect("temp source file should write");
 
@@ -20799,7 +20853,7 @@ fn native_build_rejects_generic_enum_with_precise_message() {
 
     assert!(
         !build_output.status.success(),
-        "generic enum should be rejected by native build"
+        "unsupported generic enum should be rejected by native build"
     );
     let stderr = String::from_utf8_lossy(&build_output.stderr);
     assert!(
