@@ -607,14 +607,15 @@ cargo run -- -e "1 + 2"
   now inline as well, on top of the generic-enum specialization above:
   their constructors (`some` / `ok`), consumers (`getOrElse` / `unwrapOr`
   / `isSome` / `isErr`) and method-style extensions compile to native.
-  The one remaining gap is a helper that *returns* a freshly constructed
-  generic enum through a `match` (`mapOption` / `flatMapOption` / `orElse`
-  / `mapResult`): the constructed value's shape is computed at the
-  construct site but does not yet propagate out through the surrounding
-  `match` / `if` result, so matching such a result reports a clean
-  "scrutinee shape is not statically known" diagnostic rather than
-  miscompiling. Propagating shapes through control-flow joins is left to a
-  later milestone.
+  Helpers that *return* a freshly constructed generic enum through a
+  `match` (`mapOption` / `flatMapOption` / `orElse` / `mapResult`) work too:
+  a generic-enum shape produced inside a branch is captured per branch and
+  the `if` lowering publishes the merged shape of its two branches, so the
+  joined value carries it to its binding. The merge prefers a resolved
+  field repr over a defaulted one (a defaulted field is only ever read in a
+  tag-guarded dead arm, so trusting the resolved branch is sound), letting
+  a string-payload `mapOption` read back as a string rather than the
+  `None` arm's defaulted scalar.
 
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program

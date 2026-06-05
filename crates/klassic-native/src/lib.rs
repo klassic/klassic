@@ -943,6 +943,14 @@ struct GenericEnumInfo {
 struct ShapedField {
     repr: EnumFieldRepr,
     nested: Option<Box<ConcreteEnumShape>>,
+    /// Whether this repr was determined from an actual constructor argument
+    /// (`true`) or defaulted because the value's variant did not fix the
+    /// type parameter (`false`, e.g. the `Some` payload while building
+    /// `None`). When two control-flow branches' shapes are merged, a
+    /// resolved field wins over a defaulted one: a defaulted field is only
+    /// ever read in a tag-guarded dead arm, so trusting the resolved side
+    /// is sound.
+    resolved: bool,
 }
 
 /// A variant within a concrete enum shape: its tag index and shaped fields.
@@ -1205,6 +1213,7 @@ fn en_pattern_supported_shaped(shape: &ConcreteEnumShape, pattern: &Pattern) -> 
                     Some(ShapedField {
                         repr: EnumFieldRepr::EnumField,
                         nested: Some(nested),
+                        ..
                     }) => en_pattern_supported_shaped(nested, arg),
                     _ => false,
                 },
@@ -1213,6 +1222,68 @@ fn en_pattern_supported_shaped(shape: &ConcreteEnumShape, pattern: &Pattern) -> 
         }
         _ => true,
     }
+}
+
+/// Merge two control-flow branches' enum shapes into the shape of their
+/// joined result. Used when a `match` / `if` produces a freshly built
+/// generic enum on each branch (e.g. `o match { case Some(v) => Some(f(v));
+/// case None => None }`): the joined value must carry a single shape so a
+/// later `match` on it can read each payload.
+///
+/// For every variant the union of both branches is taken; for every field a
+/// *resolved* repr wins over a defaulted one (and nested shapes recurse the
+/// same way). This is sound because a defaulted field is only ever read in
+/// a tag-guarded dead arm — at runtime the joined value is exactly one
+/// branch's value, whose own variant fixed the reprs that are actually
+/// read. `None` inputs (a branch that did not yield a tracked enum) leave
+/// the other branch's shape unchanged.
+fn merge_enum_shapes(
+    a: Option<ConcreteEnumShape>,
+    b: Option<ConcreteEnumShape>,
+) -> Option<ConcreteEnumShape> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let mut variants = a.variants;
+            for (name, b_variant) in b.variants {
+                match variants.get_mut(&name) {
+                    Some(a_variant) if a_variant.fields.len() == b_variant.fields.len() => {
+                        for (a_field, b_field) in a_variant
+                            .fields
+                            .iter_mut()
+                            .zip(b_variant.fields.into_iter())
+                        {
+                            *a_field = merge_shaped_field(a_field.clone(), b_field);
+                        }
+                    }
+                    Some(_) => {} // arity disagreement: keep `a`, never miscompile
+                    None => {
+                        variants.insert(name, b_variant);
+                    }
+                }
+            }
+            Some(ConcreteEnumShape { variants })
+        }
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// Merge one field across two branches: a resolved repr wins over a
+/// defaulted one; nested shapes recurse through `merge_enum_shapes`.
+fn merge_shaped_field(a: ShapedField, b: ShapedField) -> ShapedField {
+    let (mut keep, other) = match (a.resolved, b.resolved) {
+        (true, false) => (a, b),
+        (false, true) => (b, a),
+        // Both resolved (should agree) or both defaulted: keep `a`, but
+        // still merge nested shapes so deeper levels recover their reprs.
+        _ => (a, b),
+    };
+    keep.nested = merge_enum_shapes(
+        keep.nested.map(|nested| *nested),
+        other.nested.map(|nested| *nested),
+    )
+    .map(Box::new);
+    keep
 }
 
 /// Shape-aware analogue of `en_build_match`: lowers a generic-enum `match`
@@ -3102,23 +3173,24 @@ impl NativeCodeGenerator {
                     GenericField::Fixed(repr) => ShapedField {
                         repr: *repr,
                         nested: None,
+                        resolved: true,
                     },
                     GenericField::AppliedParam => ShapedField {
                         repr: EnumFieldRepr::EnumField,
                         nested: None,
+                        resolved: true,
                     },
                     // An unresolved type parameter only happens for a
                     // variant the constructed value is NOT (e.g. building
                     // `None` leaves `Some`'s payload unknown). Such an arm
                     // is dead at runtime — its tag never matches — so a
                     // `Scalar` default just lets it compile; the field read
-                    // is guarded by the tag test and never executes.
+                    // is guarded by the tag test and never executes. It is
+                    // marked unresolved so a branch-shape merge prefers a
+                    // sibling branch that did fix the parameter.
                     GenericField::Param(index) => {
-                        let repr = param_reprs
-                            .get(*index)
-                            .copied()
-                            .flatten()
-                            .unwrap_or(EnumFieldRepr::Scalar);
+                        let resolved_repr = param_reprs.get(*index).copied().flatten();
+                        let repr = resolved_repr.unwrap_or(EnumFieldRepr::Scalar);
                         // A nested generic-enum payload carries its own shape
                         // so a nested constructor pattern can descend into it.
                         let nested = if repr == EnumFieldRepr::EnumField {
@@ -3126,7 +3198,11 @@ impl NativeCodeGenerator {
                         } else {
                             None
                         };
-                        ShapedField { repr, nested }
+                        ShapedField {
+                            repr,
+                            nested,
+                            resolved: resolved_repr.is_some(),
+                        }
                     }
                 })
                 .collect();
@@ -29886,6 +29962,10 @@ impl NativeCodeGenerator {
         self.mergeable_dynamic_branch_depth += 1;
         self.push_scope();
         let then_value = self.compile_expr(then_branch)?;
+        // Capture the generic-enum shape this branch produced (if any) so
+        // a value built on each branch can carry a merged shape past the
+        // join. Grab it now, before later codegen resets `pending`.
+        let then_enum_shape = self.pending_enum_shape.take();
         // Coerce the then result to a heap string and stash it in the
         // rooted slot before the scope (and rax) can be disturbed.
         if let Some(slot) = heap_string_slot {
@@ -30069,6 +30149,11 @@ impl NativeCodeGenerator {
         } else {
             NativeValue::Unit
         };
+        // Capture the else branch's generic-enum shape (mirrors the then
+        // branch) and pre-compute the joined shape so the result of this
+        // `if` carries it forward.
+        let else_enum_shape = self.pending_enum_shape.take();
+        let merged_enum_shape = merge_enum_shapes(then_enum_shape, else_enum_shape);
         if let Some(slot) = heap_string_slot {
             self.emit_heap_string_concat_fragment(
                 else_value,
@@ -30164,6 +30249,10 @@ impl NativeCodeGenerator {
         self.scope_base_offsets = before_scope_base_offsets;
         self.next_stack_offset = before_next_stack_offset + then_preserved_stack;
         self.asm.bind_text_label(end_label);
+        // Publish the joined generic-enum shape (if any) so the value this
+        // `if` yields carries it to its binding. No `compile_expr` runs
+        // between here and the returns below, so this survives intact.
+        self.pending_enum_shape = merged_enum_shape;
         // A branch that always diverges (the enum lowering's
         // `__match_fail()` tail, or `exit`) yields no value at the merge
         // point, so the surviving branch's type wins rather than

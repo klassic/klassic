@@ -21167,11 +21167,10 @@ fn native_build_inlines_aliased_stdlib_import() {
 /// The ADT-backed stdlib modules (`std.option` / `std.result`) now inline
 /// into native builds (M5): generic-enum specialization covers their
 /// constructors (`some` / `ok`), consumers (`getOrElse` / `unwrapOr` /
-/// `isSome` / `isErr`) and the method-style extensions. Helpers that
-/// *return* a freshly constructed generic enum through a match
-/// (`mapOption` / `mapResult`) and then have that result matched remain
-/// limited by shape-through-control-flow propagation and keep a clean
-/// diagnostic; this test exercises the supported surface.
+/// `isSome` / `isErr`) and the method-style extensions. (Helpers that
+/// *return* a freshly constructed generic enum through a match —
+/// `mapOption` / `mapResult` / `orElse` — are covered separately by
+/// `native_build_propagates_generic_enum_shape_through_match`.)
 #[test]
 fn native_build_inlines_adt_stdlib_modules() {
     let stamp = SystemTime::now()
@@ -21230,6 +21229,71 @@ fn native_build_inlines_adt_stdlib_modules() {
     assert_eq!(
         String::from_utf8_lossy(&run_output.stdout),
         "7\n42\ntrue\n9\n99\ntrue\n3\n50\n",
+    );
+}
+
+/// A generic-enum value freshly built on each arm of a `match` (so its
+/// shape is produced inside control flow) now carries a merged shape past
+/// the join (M6), so `mapOption` / `flatMapOption` / `orElse` / `mapResult`
+/// results can be matched downstream. The merge prefers a resolved field
+/// over a defaulted one, so a string-payload `mapOption` reads back as a
+/// string, not the `None` arm's defaulted scalar.
+#[test]
+fn native_build_propagates_generic_enum_shape_through_match() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_generic_join_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_generic_join_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "import std.option.{some, none, getOrElse, mapOption, flatMapOption, orElse}\n\
+         import std.result.{ok, err, unwrapOr, mapResult}\n\
+         println(getOrElse(mapOption(some(10), (x) => x + 1), 0))\n\
+         println(getOrElse(mapOption(none(), (x) => x + 1), -1))\n\
+         println(getOrElse(mapOption(some(5), (x) => \"v=#{x}\"), \"none\"))\n\
+         println(getOrElse(flatMapOption(some(10), (x) => some(x * 2)), 0))\n\
+         println(getOrElse(orElse(none(), some(77)), 0))\n\
+         println(getOrElse(mapOption(mapOption(some(3), (x) => x + 1), (y) => y * 10), 0))\n\
+         println(unwrapOr(mapResult(ok(5), (x) => x + 100), 0))\n\
+         println(unwrapOr(mapResult(err(\"boom\"), (x) => x + 100), -1))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "11\n-1\nv=5\n20\n77\n40\n105\n-1\n",
     );
 }
 
