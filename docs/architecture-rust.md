@@ -577,9 +577,16 @@ cargo run -- -e "1 + 2"
   to a field repr and records the instance's concrete shape on the bound
   slot, and a `match` reads payloads through that shape — reusing the same
   `en_build_construct` / `en_build_match` lowering as monomorphic enums,
-  so the heap layout is byte-identical. Generic enums whose payload is an
-  applied generic (`List<a>`) and recursive functions over enum-typed
-  parameters remain unsupported and keep their compile-time diagnostics.
+  so the heap layout is byte-identical. String and bool payloads are
+  carried the same way: the constructor argument's `NativeValue` resolves
+  the type parameter to a string / bool repr, the recorded shape rides
+  through `val` bindings (and into function parameters) so the matcher
+  reads the payload with the right boxing. A value constructed only from a
+  nullary variant (`None`) cannot fix its type parameter, so matching it
+  with a non-integer result reports a clean type error rather than
+  miscompiling. Generic enums whose payload is an applied generic
+  (`List<a>`) and recursive functions over enum-typed parameters remain
+  unsupported and keep their compile-time diagnostics.
   Imports of the plain-Klassic `std.*` modules are inlined before type
   checking: the imported module's declarations are spliced between the
   bundled prelude and the user program (native name resolution is

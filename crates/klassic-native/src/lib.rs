@@ -2956,6 +2956,19 @@ impl NativeCodeGenerator {
                 self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                 Ok(name)
             }
+            // Normalize a static / runtime string to a GC heap string so it
+            // is a real traced pointer in a rooted slot (string payloads).
+            NativeValue::StaticString { .. } | NativeValue::RuntimeString { .. } => {
+                self.emit_heap_string_concat_fragment(
+                    value,
+                    span,
+                    "native generic enum string payload",
+                    false,
+                )?;
+                let slot = self.allocate_slot(name.clone(), NativeValue::HeapString);
+                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                Ok(name)
+            }
             _ => Err(unsupported(
                 span,
                 "native generic enum payload for this value type",
@@ -4030,6 +4043,12 @@ impl NativeCodeGenerator {
                         | NativeValue::HeapString
                 ) {
                     self.asm.load_rbp_slot(Reg::Rax, slot.offset);
+                }
+                // Propagate a generic enum value's shape so passing it on
+                // (e.g. as a function argument or rebinding it) carries the
+                // per-instance payload reprs to the next slot.
+                if let Some(shape) = self.enum_shapes.get(&slot.id) {
+                    self.pending_enum_shape = Some(shape.clone());
                 }
                 Ok(slot.value)
             }
