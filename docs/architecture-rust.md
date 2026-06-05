@@ -589,7 +589,11 @@ cargo run -- -e "1 + 2"
   shape of the enum it points to, the outer construction captures the
   inner value's shape, and a nested constructor pattern descends into it
   with the inner instantiation's reprs (verified at two and three levels).
-  Generic enums whose payload is an applied generic (`List<a>` / a record)
+  Because the shape rides on the value rather than the declaration, one
+  program may instantiate the same generic enum at several types (and use
+  several generic enums) without interference — each inlined call site
+  resolves its own reprs. Generic enums whose payload is an applied
+  generic (`List<a>` / a record)
   and recursive functions over enum-typed parameters remain unsupported
   and keep their compile-time diagnostics.
   Imports of the plain-Klassic `std.*` modules are inlined before type
