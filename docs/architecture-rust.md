@@ -603,9 +603,18 @@ cargo run -- -e "1 + 2"
   is dropped, and lazy codegen only emits the functions actually called.
   Selective and bulk imports resolve directly; aliased imports
   (`import std.x as M`) additionally have their `M.func` access rewritten
-  to a bare `func`. The ADT-backed modules (`std.option` / `std.result`,
-  which need generic enums) keep their "not available in native builds"
-  diagnostic.
+  to a bare `func`. The ADT-backed modules (`std.option` / `std.result`)
+  now inline as well, on top of the generic-enum specialization above:
+  their constructors (`some` / `ok`), consumers (`getOrElse` / `unwrapOr`
+  / `isSome` / `isErr`) and method-style extensions compile to native.
+  The one remaining gap is a helper that *returns* a freshly constructed
+  generic enum through a `match` (`mapOption` / `flatMapOption` / `orElse`
+  / `mapResult`): the constructed value's shape is computed at the
+  construct site but does not yet propagate out through the surrounding
+  `match` / `if` result, so matching such a result reports a clean
+  "scrutinee shape is not statically known" diagnostic rather than
+  miscompiling. Propagating shapes through control-flow joins is left to a
+  later milestone.
 
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program

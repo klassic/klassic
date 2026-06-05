@@ -21164,11 +21164,16 @@ fn native_build_inlines_aliased_stdlib_import() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "-1\n10\n15\n");
 }
 
-/// The ADT-backed stdlib modules still rely on generic enums, which
-/// native codegen does not support, so importing `std.option` keeps its
-/// "not available in native builds" diagnostic rather than inlining.
+/// The ADT-backed stdlib modules (`std.option` / `std.result`) now inline
+/// into native builds (M5): generic-enum specialization covers their
+/// constructors (`some` / `ok`), consumers (`getOrElse` / `unwrapOr` /
+/// `isSome` / `isErr`) and the method-style extensions. Helpers that
+/// *return* a freshly constructed generic enum through a match
+/// (`mapOption` / `mapResult`) and then have that result matched remain
+/// limited by shape-through-control-flow propagation and keep a clean
+/// diagnostic; this test exercises the supported surface.
 #[test]
-fn native_build_rejects_adt_stdlib_module_import() {
+fn native_build_inlines_adt_stdlib_modules() {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -21177,7 +21182,18 @@ fn native_build_rejects_adt_stdlib_module_import() {
     let output_path = std::env::temp_dir().join(format!("klassic_native_stdadt_{stamp}.bin"));
     fs::write(
         &source_path,
-        "import std.option.{some, getOrElse}\nprintln(getOrElse(some(1), 0))\n",
+        "import std.option.{some, none, getOrElse, isSome}\n\
+         import std.result.{ok, err, unwrapOr, isErr}\n\
+         println(getOrElse(some(7), 0))\n\
+         println(getOrElse(none(), 42))\n\
+         println(isSome(some(5)))\n\
+         println(unwrapOr(ok(9), 0))\n\
+         println(unwrapOr(err(\"boom\"), 99))\n\
+         println(isErr(err(\"x\")))\n\
+         val o = some(3)\n\
+         println(o.getOrElse(0))\n\
+         val r = ok(50)\n\
+         println(r.unwrapOr(0))\n",
     )
     .expect("temp source file should write");
 
@@ -21191,17 +21207,29 @@ fn native_build_rejects_adt_stdlib_module_import() {
         .output()
         .expect("binary should run");
 
+    assert!(
+        build_output.status.success(),
+        "ADT stdlib import should now inline into native build\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
     let _ = fs::remove_file(&source_path);
     let _ = fs::remove_file(&output_path);
 
     assert!(
-        !build_output.status.success(),
-        "ADT stdlib import should still be rejected by native build"
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&build_output.stderr).contains("std.option"),
-        "stderr should name the unsupported module\nstderr:\n{}",
-        String::from_utf8_lossy(&build_output.stderr)
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "7\n42\ntrue\n9\n99\ntrue\n3\n50\n",
     );
 }
 

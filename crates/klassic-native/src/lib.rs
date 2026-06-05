@@ -538,8 +538,7 @@ fn compile_internal(
 /// enums, which native codegen does not support, so their imports keep
 /// the existing rejection instead of being inlined.
 fn stdlib_module_is_inlinable(path: &str) -> bool {
-    !matches!(path, "std.option" | "std.result")
-        && STDLIB_MODULES.iter().any(|module| module.path == path)
+    STDLIB_MODULES.iter().any(|module| module.path == path)
 }
 
 fn stdlib_module_source(path: &str) -> Option<&'static str> {
