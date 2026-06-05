@@ -584,9 +584,14 @@ cargo run -- -e "1 + 2"
   reads the payload with the right boxing. A value constructed only from a
   nullary variant (`None`) cannot fix its type parameter, so matching it
   with a non-integer result reports a clean type error rather than
-  miscompiling. Generic enums whose payload is an applied generic
-  (`List<a>`) and recursive functions over enum-typed parameters remain
-  unsupported and keep their compile-time diagnostics.
+  miscompiling. Nested generic enums (`Some(Some(7))`) also compile: the
+  per-instance shape is recursive, so each `EnumField` payload records the
+  shape of the enum it points to, the outer construction captures the
+  inner value's shape, and a nested constructor pattern descends into it
+  with the inner instantiation's reprs (verified at two and three levels).
+  Generic enums whose payload is an applied generic (`List<a>` / a record)
+  and recursive functions over enum-typed parameters remain unsupported
+  and keep their compile-time diagnostics.
   Imports of the plain-Klassic `std.*` modules are inlined before type
   checking: the imported module's declarations are spliced between the
   bundled prelude and the user program (native name resolution is

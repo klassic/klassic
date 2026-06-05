@@ -934,12 +934,32 @@ struct GenericEnumInfo {
     variants: Vec<GenericVariantInfo>,
 }
 
+/// One field of a concrete (per-instantiation) enum shape: its storage
+/// repr plus, when the payload is itself a generic enum, that payload's
+/// own shape so a nested constructor pattern can descend into it with the
+/// right per-instance reprs. `nested` is `None` for non-enum payloads and
+/// for enum payloads whose shape could not be tracked (a later match on
+/// such a field emits a precise diagnostic instead of miscompiling).
+#[derive(Clone)]
+struct ShapedField {
+    repr: EnumFieldRepr,
+    nested: Option<Box<ConcreteEnumShape>>,
+}
+
+/// A variant within a concrete enum shape: its tag index and shaped fields.
+#[derive(Clone)]
+struct ShapedVariant {
+    index: i64,
+    fields: Vec<ShapedField>,
+}
+
 /// A concrete (per-instantiation) enum shape: each variant's tag index and
-/// the resolved field reprs. Built at a construction site and attached to
-/// the value's slot so a later `match` knows how to read each payload.
+/// the resolved (possibly nested) field reprs. Built at a construction site
+/// and attached to the value's slot so a later `match` knows how to read
+/// each payload — including descending into nested generic enums.
 #[derive(Clone)]
 struct ConcreteEnumShape {
-    variants: HashMap<String, EnumVariantInfo>,
+    variants: HashMap<String, ShapedVariant>,
 }
 
 /// Rewrites monomorphic `enum` declarations, variant constructors and
@@ -1165,6 +1185,159 @@ fn en_pattern_supported(variants: &HashMap<String, EnumVariantInfo>, pattern: &P
                 && args.iter().all(|arg| en_pattern_supported(variants, arg))
         }
         _ => true,
+    }
+}
+
+/// Like `en_pattern_supported`, but for a concrete (per-instantiation)
+/// shape that can descend into nested generic enums. A nested constructor
+/// pattern is only supported when the field it matches is an `EnumField`
+/// carrying a tracked nested shape; otherwise the match cannot be lowered.
+fn en_pattern_supported_shaped(shape: &ConcreteEnumShape, pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Constructor { name, args, .. } => {
+            let Some(variant) = shape.variants.get(name) else {
+                return false;
+            };
+            if variant.fields.len() != args.len() {
+                return false;
+            }
+            args.iter().enumerate().all(|(i, arg)| match arg {
+                Pattern::Constructor { .. } => match variant.fields.get(i) {
+                    Some(ShapedField {
+                        repr: EnumFieldRepr::EnumField,
+                        nested: Some(nested),
+                    }) => en_pattern_supported_shaped(nested, arg),
+                    _ => false,
+                },
+                _ => true,
+            })
+        }
+        _ => true,
+    }
+}
+
+/// Shape-aware analogue of `en_build_match`: lowers a generic-enum `match`
+/// using a concrete shape, descending into nested generic enums via each
+/// field's recorded nested shape.
+fn en_build_match_shaped(
+    counter: &mut usize,
+    shape: &ConcreteEnumShape,
+    scrutinee: Expr,
+    arms: Vec<MatchArm>,
+    span: Span,
+) -> Expr {
+    let scrut = en_fresh(counter, "scrut");
+    let mut chain = en_call("__match_fail", Vec::new(), span);
+    for arm in arms.into_iter().rev() {
+        chain = en_build_arm_shaped(shape, &scrut, arm, chain, span);
+    }
+    en_block(vec![en_vardecl(&scrut, scrutinee, span), chain], span)
+}
+
+fn en_build_arm_shaped(
+    shape: &ConcreteEnumShape,
+    scrut: &str,
+    arm: MatchArm,
+    rest: Expr,
+    span: Span,
+) -> Expr {
+    let subject = en_ident(scrut, span);
+    let predicate = en_pattern_predicate_shaped(shape, &arm.pattern, subject, span);
+    let binds = en_pattern_binds_shaped(shape, &arm.pattern, en_ident(scrut, span), span);
+
+    let mut success: Vec<Expr> = binds
+        .into_iter()
+        .map(|(name, value)| en_vardecl(&name, value, span))
+        .collect();
+    let body = match arm.guard {
+        Some(guard) => en_if(guard, arm.body, rest.clone(), span),
+        None => arm.body,
+    };
+    success.push(body);
+    let success = en_block(success, span);
+
+    match predicate {
+        Some(condition) => en_if(condition, success, rest, span),
+        None => success,
+    }
+}
+
+fn en_pattern_predicate_shaped(
+    shape: &ConcreteEnumShape,
+    pattern: &Pattern,
+    subject: Expr,
+    span: Span,
+) -> Option<Expr> {
+    match pattern {
+        Pattern::Wildcard { .. } | Pattern::Variable { .. } => None,
+        Pattern::LiteralInt { value, .. } => {
+            Some(en_binary(subject, BinaryOp::Equal, en_int(*value, span), span))
+        }
+        Pattern::LiteralBool { value, .. } => {
+            Some(en_binary(subject, BinaryOp::Equal, en_bool(*value, span), span))
+        }
+        Pattern::LiteralString { value, .. } => Some(en_binary(
+            subject,
+            BinaryOp::Equal,
+            en_string(value, span),
+            span,
+        )),
+        Pattern::Constructor { name, args, .. } => {
+            let variant = shape.variants.get(name).expect("constructor pattern resolved");
+            let mut condition = en_binary(
+                en_index_read(subject.clone(), span),
+                BinaryOp::Equal,
+                en_int(variant.index, span),
+                span,
+            );
+            for (i, arg) in args.iter().enumerate() {
+                let field = &variant.fields[i];
+                let read = en_field_read(subject.clone(), field.repr, i, span);
+                let sub = match (arg, field.nested.as_ref()) {
+                    (Pattern::Constructor { .. }, Some(nested)) => {
+                        en_pattern_predicate_shaped(nested, arg, read, span)
+                    }
+                    // Leaf sub-pattern: shape is irrelevant, reuse the same
+                    // matcher (its literal / variable / wildcard arms ignore
+                    // the shape argument).
+                    _ => en_pattern_predicate_shaped(shape, arg, read, span),
+                };
+                if let Some(sub) = sub {
+                    condition = en_binary(condition, BinaryOp::LogicalAnd, sub, span);
+                }
+            }
+            Some(condition)
+        }
+    }
+}
+
+fn en_pattern_binds_shaped(
+    shape: &ConcreteEnumShape,
+    pattern: &Pattern,
+    subject: Expr,
+    span: Span,
+) -> Vec<(String, Expr)> {
+    match pattern {
+        Pattern::Wildcard { .. }
+        | Pattern::LiteralInt { .. }
+        | Pattern::LiteralBool { .. }
+        | Pattern::LiteralString { .. } => Vec::new(),
+        Pattern::Variable { name, .. } => vec![(name.clone(), subject)],
+        Pattern::Constructor { name, args, .. } => {
+            let variant = shape.variants.get(name).expect("constructor pattern resolved");
+            let mut binds = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                let field = &variant.fields[i];
+                let read = en_field_read(subject.clone(), field.repr, i, span);
+                match (arg, field.nested.as_ref()) {
+                    (Pattern::Constructor { .. }, Some(nested)) => {
+                        binds.extend(en_pattern_binds_shaped(nested, arg, read, span));
+                    }
+                    _ => binds.extend(en_pattern_binds_shaped(shape, arg, read, span)),
+                }
+            }
+            binds
+        }
     }
 }
 
@@ -2903,6 +3076,7 @@ impl NativeCodeGenerator {
         &self,
         enum_name: &str,
         param_reprs: &[Option<EnumFieldRepr>],
+        param_nested: &[Option<ConcreteEnumShape>],
     ) -> ConcreteEnumShape {
         let info = self
             .generic_enums
@@ -2914,24 +3088,44 @@ impl NativeCodeGenerator {
                 .fields
                 .iter()
                 .map(|field| match field {
-                    GenericField::Fixed(repr) => *repr,
-                    GenericField::AppliedParam => EnumFieldRepr::EnumField,
+                    GenericField::Fixed(repr) => ShapedField {
+                        repr: *repr,
+                        nested: None,
+                    },
+                    GenericField::AppliedParam => ShapedField {
+                        repr: EnumFieldRepr::EnumField,
+                        nested: None,
+                    },
                     // An unresolved type parameter only happens for a
                     // variant the constructed value is NOT (e.g. building
                     // `None` leaves `Some`'s payload unknown). Such an arm
                     // is dead at runtime — its tag never matches — so a
                     // `Scalar` default just lets it compile; the field read
                     // is guarded by the tag test and never executes.
-                    GenericField::Param(index) => param_reprs
-                        .get(*index)
-                        .copied()
-                        .flatten()
-                        .unwrap_or(EnumFieldRepr::Scalar),
+                    GenericField::Param(index) => {
+                        let repr = param_reprs
+                            .get(*index)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(EnumFieldRepr::Scalar);
+                        // A nested generic-enum payload carries its own shape
+                        // so a nested constructor pattern can descend into it.
+                        let nested = if repr == EnumFieldRepr::EnumField {
+                            param_nested
+                                .get(*index)
+                                .cloned()
+                                .flatten()
+                                .map(Box::new)
+                        } else {
+                            None
+                        };
+                        ShapedField { repr, nested }
+                    }
                 })
                 .collect();
             variants.insert(
                 variant.name.clone(),
-                EnumVariantInfo {
+                ShapedVariant {
                     index: variant.index,
                     fields,
                 },
@@ -3016,6 +3210,7 @@ impl NativeCodeGenerator {
         let mut arg_idents = Vec::with_capacity(args.len());
         let mut field_reprs = Vec::with_capacity(args.len());
         let mut param_reprs: Vec<Option<EnumFieldRepr>> = vec![None; type_param_count];
+        let mut param_nested: Vec<Option<ConcreteEnumShape>> = vec![None; type_param_count];
         for (field, arg) in generic_fields.iter().zip(args) {
             let value = self.compile_expr(arg)?;
             let repr = match field {
@@ -3026,6 +3221,13 @@ impl NativeCodeGenerator {
                         unsupported(span, "native generic enum payload for this value type")
                     })?;
                     param_reprs[*index] = Some(repr);
+                    // If the argument is itself a generic enum, capture its
+                    // shape (just set by compiling it) before the temp bind
+                    // consumes the pending shape, so a nested constructor
+                    // pattern can later descend into this payload.
+                    if repr == EnumFieldRepr::EnumField {
+                        param_nested[*index] = self.pending_enum_shape.clone();
+                    }
                     repr
                 }
             };
@@ -3044,7 +3246,7 @@ impl NativeCodeGenerator {
             span,
         );
         let result = self.compile_expr(&tree)?;
-        let shape = self.resolve_enum_shape(enum_name, &param_reprs);
+        let shape = self.resolve_enum_shape(enum_name, &param_reprs, &param_nested);
         self.pending_enum_shape = Some(shape);
         Ok(result)
     }
@@ -3073,16 +3275,16 @@ impl NativeCodeGenerator {
         };
         if !arms
             .iter()
-            .all(|arm| en_pattern_supported(&shape.variants, &arm.pattern))
+            .all(|arm| en_pattern_supported_shaped(&shape, &arm.pattern))
         {
             return Err(unsupported(
                 span,
                 "native generic enum match: a pattern variant is not in the scrutinee shape",
             ));
         }
-        let tree = en_build_match(
+        let tree = en_build_match_shaped(
             &mut self.generic_enum_counter,
-            &shape.variants,
+            &shape,
             scrutinee.clone(),
             arms.to_vec(),
             span,

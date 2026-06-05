@@ -20885,6 +20885,69 @@ fn native_build_compiles_generic_enum_string_and_bool_payloads() {
     );
 }
 
+/// Nested generic enums (`Some(Some(7))`) compile by recording each
+/// payload's own concrete shape on its field (M3): the outer construction
+/// captures the inner value's shape, and a nested constructor pattern
+/// descends into it with the inner instantiation's reprs. Integer and
+/// string payloads round-trip at two and three levels of nesting.
+#[test]
+fn native_build_compiles_nested_generic_enums() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_generic_nest_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_nest_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Option<a> { case Some(value: a); case None }\n\
+         def unwrap2(o, d) = o match { case Some(Some(v)) => v; case Some(None) => d; case None => d }\n\
+         def deep(o) = o match { case Some(Some(Some(v))) => v; case _ => -1 }\n\
+         def firstOr(o, d) = o match { case Some(Some(v)) => v; case _ => d }\n\
+         println(unwrap2(Some(Some(7)), 0))\n\
+         println(unwrap2(Some(None), 99))\n\
+         println(deep(Some(Some(Some(42)))))\n\
+         println(firstOr(Some(Some(\"hi\")), \"x\"))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "7\n99\n42\nhi\n"
+    );
+}
+
 /// A generic enum whose payload is itself an applied generic (`List<a>`)
 /// is not specializable yet, so it keeps the precise generic-enum
 /// diagnostic naming the enum rather than miscompiling.
