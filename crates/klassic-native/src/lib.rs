@@ -1270,12 +1270,18 @@ fn en_pattern_predicate_shaped(
 ) -> Option<Expr> {
     match pattern {
         Pattern::Wildcard { .. } | Pattern::Variable { .. } => None,
-        Pattern::LiteralInt { value, .. } => {
-            Some(en_binary(subject, BinaryOp::Equal, en_int(*value, span), span))
-        }
-        Pattern::LiteralBool { value, .. } => {
-            Some(en_binary(subject, BinaryOp::Equal, en_bool(*value, span), span))
-        }
+        Pattern::LiteralInt { value, .. } => Some(en_binary(
+            subject,
+            BinaryOp::Equal,
+            en_int(*value, span),
+            span,
+        )),
+        Pattern::LiteralBool { value, .. } => Some(en_binary(
+            subject,
+            BinaryOp::Equal,
+            en_bool(*value, span),
+            span,
+        )),
         Pattern::LiteralString { value, .. } => Some(en_binary(
             subject,
             BinaryOp::Equal,
@@ -1283,7 +1289,10 @@ fn en_pattern_predicate_shaped(
             span,
         )),
         Pattern::Constructor { name, args, .. } => {
-            let variant = shape.variants.get(name).expect("constructor pattern resolved");
+            let variant = shape
+                .variants
+                .get(name)
+                .expect("constructor pattern resolved");
             let mut condition = en_binary(
                 en_index_read(subject.clone(), span),
                 BinaryOp::Equal,
@@ -1324,7 +1333,10 @@ fn en_pattern_binds_shaped(
         | Pattern::LiteralString { .. } => Vec::new(),
         Pattern::Variable { name, .. } => vec![(name.clone(), subject)],
         Pattern::Constructor { name, args, .. } => {
-            let variant = shape.variants.get(name).expect("constructor pattern resolved");
+            let variant = shape
+                .variants
+                .get(name)
+                .expect("constructor pattern resolved");
             let mut binds = Vec::new();
             for (i, arg) in args.iter().enumerate() {
                 let field = &variant.fields[i];
@@ -3111,11 +3123,7 @@ impl NativeCodeGenerator {
                         // A nested generic-enum payload carries its own shape
                         // so a nested constructor pattern can descend into it.
                         let nested = if repr == EnumFieldRepr::EnumField {
-                            param_nested
-                                .get(*index)
-                                .cloned()
-                                .flatten()
-                                .map(Box::new)
+                            param_nested.get(*index).cloned().flatten().map(Box::new)
                         } else {
                             None
                         };

@@ -20897,8 +20897,7 @@ fn native_build_compiles_nested_generic_enums() {
         .expect("system time should be after epoch")
         .as_nanos();
     let source_path = std::env::temp_dir().join(format!("klassic_native_generic_nest_{stamp}.kl"));
-    let output_path =
-        std::env::temp_dir().join(format!("klassic_native_generic_nest_{stamp}.bin"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_generic_nest_{stamp}.bin"));
     fs::write(
         &source_path,
         "enum Option<a> { case Some(value: a); case None }\n\
