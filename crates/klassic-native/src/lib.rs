@@ -2776,6 +2776,7 @@ const LINUX_X86_64_PLATFORM_CONSTANTS: PlatformConstants = PlatformConstants {
         228, // clock_gettime
         262, // newfstatat
         60,  // exit
+        97,  // getrlimit
     ],
     stdin_fd: 0,
     stdout_fd: 1,
@@ -2919,7 +2920,7 @@ impl NativeTargetContext {
     }
 }
 
-const PLATFORM_SYSCALL_COUNT: usize = 17;
+const PLATFORM_SYSCALL_COUNT: usize = 18;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -2941,6 +2942,7 @@ enum PlatformSyscall {
     ClockGettime,
     Newfstatat,
     Exit,
+    Getrlimit,
 }
 
 struct NativeCodeGenerator {
@@ -2995,6 +2997,14 @@ struct NativeCodeGenerator {
     gc_shadow_overflow_text: DataLabel,
     gc_segment_overflow_text: DataLabel,
     gc_bounds_error_text: DataLabel,
+    /// Lowest rsp the program may reach before the prologue probe
+    /// aborts: initial rsp minus RLIMIT_STACK plus a safety margin,
+    /// computed at startup. Zero (probe never fires) when the limit is
+    /// unlimited or unavailable, or when the program uses threads
+    /// (thread stacks live at unrelated addresses).
+    stack_floor: DataLabel,
+    stack_overflow_abort: TextLabel,
+    stack_overflow_text: DataLabel,
     /// Per-scope counter parallel to scope_base_offsets — number of GC
     /// pointer slots pushed onto the shadow stack in this scope.
     scope_gc_root_counts: Vec<usize>,
@@ -3118,6 +3128,9 @@ impl NativeCodeGenerator {
         let gc_segment_overflow_text =
             asm.data_label_with_bytes(b"klassic gc: heap segment limit reached\n");
         let gc_bounds_error_text = asm.data_label_with_bytes(b"klassic gc: index out of bounds\n");
+        let stack_floor = asm.data_label_with_i64s(&[0]);
+        let stack_overflow_abort = asm.create_text_label();
+        let stack_overflow_text = asm.data_label_with_bytes(b"klassic: stack overflow\n");
         let mut record_schemas = HashMap::new();
         record_schemas.insert(
             "Point".to_string(),
@@ -3181,6 +3194,9 @@ impl NativeCodeGenerator {
             gc_shadow_overflow_text,
             gc_segment_overflow_text,
             gc_bounds_error_text,
+            stack_floor,
+            stack_overflow_abort,
+            stack_overflow_text,
             scope_gc_root_counts: vec![0],
             scopes: vec![HashMap::new()],
             static_scopes: vec![HashMap::new()],
@@ -3672,11 +3688,13 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
         self.emit_store_command_line_state();
+        self.emit_initialize_stack_floor();
         self.emit_initialize_gc_heap();
         self.compile_top_level(expr)?;
         self.emit_queued_threads()?;
         self.emit_exit_success();
         self.emit_functions()?;
+        self.emit_stack_overflow_abort_runtime();
         self.emit_print_i64_runtime();
         self.emit_gc_mark_visit_runtime();
         self.emit_gc_alloc_runtime();
@@ -35702,6 +35720,18 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(function.label);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        // Stack probe: deep recursion otherwise dies on the guard page
+        // with a bare SIGSEGV. Skipped when the program spawns threads —
+        // thread stacks live at unrelated addresses, so the main-stack
+        // floor would misfire there (the floor is also zero, and the
+        // probe inert, when RLIMIT_STACK is unlimited).
+        if self.queued_threads.is_empty() {
+            self.asm.mov_data_addr(Reg::R10, self.stack_floor);
+            self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+            self.asm.cmp_reg_reg(Reg::Rsp, Reg::R10);
+            self.asm
+                .jcc_label(Condition::Below, self.stack_overflow_abort);
+        }
 
         let qword_params = function
             .params
@@ -35979,6 +36009,58 @@ impl NativeCodeGenerator {
 
     /// Initialize the GC heap: mmap a private anonymous region and seed the
     /// heap_base / heap_top / heap_end globals.
+    /// Compute the stack floor at startup: `getrlimit(RLIMIT_STACK)`
+    /// gives the stack size; the floor is the current rsp (≈ the stack
+    /// top this early) minus that size, plus a safety margin so the
+    /// abort fires while there is still room for builtin leaf routines.
+    /// Unlimited / failed lookups leave the floor at zero, which the
+    /// prologue probe can never go below — probing disabled.
+    fn emit_initialize_stack_floor(&mut self) {
+        const RLIMIT_STACK: u64 = 3;
+        const STACK_FLOOR_MARGIN: i32 = 256 * 1024;
+        let done = self.asm.create_text_label();
+        // struct rlimit { rlim_cur; rlim_max } on the stack.
+        self.asm.sub_reg_imm8(Reg::Rsp, 16);
+        self.asm.mov_imm64(Reg::Rdi, RLIMIT_STACK);
+        self.asm.mov_reg_reg(Reg::Rsi, Reg::Rsp);
+        self.emit_syscall_number(PlatformSyscall::Getrlimit);
+        self.asm.syscall();
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::NotEqual, done);
+        // r10 = rlim_cur; RLIM_INFINITY (= -1) keeps the floor at zero.
+        // (rsp cannot be a memory base for these helpers — hop via r11.)
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rsp);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R11, 0);
+        self.asm.cmp_reg_imm8(Reg::R10, -1);
+        self.asm.jcc_label(Condition::Equal, done);
+        // floor = rsp + 16 (undo the buffer) - rlim_cur + margin.
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rsp);
+        self.asm.add_reg_imm32(Reg::R8, 16);
+        self.asm.sub_reg_reg(Reg::R8, Reg::R10);
+        self.asm.add_reg_imm32(Reg::R8, STACK_FLOOR_MARGIN);
+        // A limit larger than the address itself would wrap below zero;
+        // treat that like unlimited.
+        self.asm.test_reg_reg(Reg::R8, Reg::R8);
+        self.asm.jcc_label(Condition::Less, done);
+        self.asm.mov_data_addr(Reg::R10, self.stack_floor);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R8);
+        self.asm.bind_text_label(done);
+        self.asm.add_reg_imm32(Reg::Rsp, 16);
+    }
+
+    /// Shared abort target for the function-prologue stack probe:
+    /// report and exit instead of dying on the guard page with a bare
+    /// SIGSEGV.
+    fn emit_stack_overflow_abort_runtime(&mut self) {
+        self.asm.bind_text_label(self.stack_overflow_abort);
+        self.emit_write_data(
+            self.platform.stderr_fd(),
+            self.stack_overflow_text,
+            b"klassic: stack overflow\n".len(),
+        );
+        self.emit_exit_code(1);
+    }
+
     fn emit_initialize_gc_heap(&mut self) {
         // mmap(NULL, GC_HEAP_SIZE, PROT_READ | PROT_WRITE,
         //      MAP_ANON | MAP_PRIVATE, -1, 0)

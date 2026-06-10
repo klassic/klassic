@@ -118,6 +118,13 @@ cargo run -- -e "1 + 2"
   Temporary stack pushes used while evaluating native call arguments are tracked
   alongside local slots, so nested argument expressions can allocate closure
   captures without overwriting saved argument values.
+  Startup computes a stack floor from `getrlimit(RLIMIT_STACK)` (initial
+  rsp minus the limit plus a 256 KiB margin) and every emitted function
+  prologue probes rsp against it, so recursing past the stack reports
+  `klassic: stack overflow` and exits 1 instead of dying on the guard
+  page with a bare SIGSEGV. The probe is inert when the limit is
+  unlimited (floor zero) and skipped entirely for programs that spawn
+  threads, whose stacks live at unrelated addresses.
   `println` / `printlnError` stream simple
   string-concatenation and interpolation expressions directly until a heap string
   runtime is added. Interpolated strings can also be folded into static native

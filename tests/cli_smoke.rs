@@ -21398,6 +21398,69 @@ fn native_build_bounds_compile_time_recursion_folding() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "100\n200000\n");
 }
 
+/// Recursing past RLIMIT_STACK used to die on the guard page with a
+/// bare SIGSEGV. The startup code now computes a stack floor from
+/// `getrlimit(RLIMIT_STACK)` and every function prologue probes rsp
+/// against it, so the program reports `klassic: stack overflow` and
+/// exits non-zero instead. GitHub issue #418.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_reports_stack_overflow_gracefully() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_stack_probe_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_stack_probe_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def down(n: Int): Int = if (n <= 0) 0 else 1 + down(n - 1)\n\
+         mutable d = 0\n\
+         d = 100000000\n\
+         println(down(d))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !run_output.status.success(),
+        "deep recursion should abort, not succeed"
+    );
+    assert_eq!(
+        run_output.status.code(),
+        Some(1),
+        "graceful exit, not a signal"
+    );
+    assert!(
+        String::from_utf8_lossy(&run_output.stderr).contains("klassic: stack overflow"),
+        "stderr should carry the stack overflow report, got:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+}
+
 /// Allocating enum values in a loop long enough to exhaust the initial
 /// 1 MiB GC heap exercises collection and free-list reuse. A reused
 /// first-fit block used to keep stale payload bytes (and `__gc_record`'s
