@@ -26,6 +26,7 @@ pub enum RunAction {
     EvaluateFile(PathBuf),
     StartRepl,
     ListTargets,
+    ShowVersion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +114,7 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     let config = ExecutionConfig::new(deny_trust, warn_trust, native_target);
     let action = match others.as_slice() {
         [command] if command == "targets" => RunAction::ListTargets,
+        [flag] if flag == "--version" || flag == "-V" => RunAction::ShowVersion,
         [] => RunAction::StartRepl,
         [file_name] if file_name.ends_with(".kl") => {
             RunAction::EvaluateFile(PathBuf::from(file_name))
@@ -333,6 +335,15 @@ mod tests {
         let args = vec!["targets".to_string()];
         let parsed = parse_command_line(&args).expect("targets command should parse");
         assert_eq!(parsed.action, RunAction::ListTargets);
+    }
+
+    #[test]
+    fn parses_version_flag() {
+        for flag in ["--version", "-V"] {
+            let args = vec![flag.to_string()];
+            let parsed = parse_command_line(&args).expect("version flag should parse");
+            assert_eq!(parsed.action, RunAction::ShowVersion);
+        }
     }
 
     #[test]

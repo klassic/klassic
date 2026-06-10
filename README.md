@@ -20,6 +20,24 @@ Rust. The implementation builds a native `klassic` executable with Cargo.
 - Precise mark-and-sweep garbage collector with multi-segment heap growth, exposed through 68 `__gc_*` debug builtins
 - Standalone Rust macro PEG subsystem
 
+## Install
+
+Prebuilt static Linux (x86_64) binaries are attached to
+[GitHub Releases](https://github.com/klassic/klassic/releases) — they run on
+any x86_64 Linux with no Rust toolchain or shared-library dependencies:
+
+```bash
+curl -L https://github.com/klassic/klassic/releases/latest/download/klassic-$(curl -s https://api.github.com/repos/klassic/klassic/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4)-x86_64-unknown-linux-musl.tar.gz | tar xz
+./klassic --version
+./klassic -e "1 + 2"
+```
+
+Alternatively, build from source with Cargo:
+
+```bash
+cargo install --git https://github.com/klassic/klassic
+```
+
 ## Build And Test
 
 Install a recent Rust toolchain, then use the normal Cargo workflow:

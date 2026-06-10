@@ -145,6 +145,10 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
             println!("{}", NativeTarget::target_matrix());
             Ok(())
         }
+        RunAction::ShowVersion => {
+            println!("klassic {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
     }
 }
 

@@ -1,0 +1,45 @@
+# Tagging vX.Y.Z builds a statically-linked Linux binary (musl, so it
+# runs on any x86_64 Linux without a Rust toolchain) and attaches it to
+# a GitHub Release. Keep Cargo.toml's `version` in sync with the tag so
+# `klassic --version` matches the release.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Test
+        run: cargo test
+
+      - name: Build static binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/klassic klassic
+          tar czf "klassic-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz" klassic
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: klassic-*.tar.gz
+          generate_release_notes: true
