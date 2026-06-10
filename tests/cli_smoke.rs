@@ -22460,6 +22460,69 @@ fn shebang_line_is_stripped_from_source() {
     );
 }
 
+/// std.time wraps the Time#nowMillis builtin with ISO-8601 UTC
+/// formatting (Hinnant's days-to-civil on integer arithmetic) and
+/// duration helpers, in pure Klassic — parity-tested across the
+/// evaluator and a native build (GitHub issue #423).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn std_time_formats_iso_in_evaluator_and_native() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_std_time_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_std_time_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "import std.time.{formatIso, nowMillis, durationMillis}\n\
+         println(formatIso(0))\n\
+         println(formatIso(1718000000123))\n\
+         println(formatIso(951827696789))\n\
+         println(durationMillis(100, 350))\n\
+         println(nowMillis() > 1718000000000)\n",
+    )
+    .expect("temp source file should write");
+    let expected = "1970-01-01T00:00:00.000Z\n\
+                    2024-06-10T06:13:20.123Z\n\
+                    2000-02-29T12:34:56.789Z\n\
+                    250\n\
+                    true\n";
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    assert!(
+        eval_output.status.success(),
+        "std.time should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&eval_output.stdout), expected);
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "std.time should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
+}
+
 /// std.json parses and renders JSON (GitHub issue #422): objects,
 /// arrays, negative integers, escapes, and nesting round-trip;
 /// malformed input returns Err with a character position instead of

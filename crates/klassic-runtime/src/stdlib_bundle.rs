@@ -31,6 +31,7 @@ const STD_PATH_SOURCE: &str = include_str!("../../../stdlib/std/path.kl");
 const STD_OPTION_SOURCE: &str = include_str!("../../../stdlib/std/option.kl");
 const STD_RESULT_SOURCE: &str = include_str!("../../../stdlib/std/result.kl");
 const STD_JSON_SOURCE: &str = include_str!("../../../stdlib/std/json.kl");
+const STD_TIME_SOURCE: &str = include_str!("../../../stdlib/std/time.kl");
 const STD_TEST_SOURCE: &str = include_str!("../../../stdlib/std/test.kl");
 const STD_CLI_SOURCE: &str = include_str!("../../../stdlib/std/cli.kl");
 const STD_ENV_SOURCE: &str = include_str!("../../../stdlib/std/env.kl");
@@ -78,6 +79,11 @@ pub const STDLIB_MODULES: &[EmbeddedModule] = &[
         path: "std.json",
         diagnostic_name: "<stdlib std.json>",
         source: STD_JSON_SOURCE,
+    },
+    EmbeddedModule {
+        path: "std.time",
+        diagnostic_name: "<stdlib std.time>",
+        source: STD_TIME_SOURCE,
     },
     EmbeddedModule {
         path: "std.test",
