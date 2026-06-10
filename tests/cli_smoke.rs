@@ -21827,6 +21827,143 @@ fn native_build_compiles_self_referential_generic_enums() {
     );
 }
 
+/// A pattern variable binding an enum-typed payload with a tracked
+/// nested shape (`case Some(inner) => inner match { ... }`) records the
+/// payload's shape on the binding's slot via a synthesized
+/// `__enum_shape_hint`, so re-matching the bound name resolves instead
+/// of hitting the shape-not-statically-known diagnostic. Returning the
+/// bound payload through a shaped return annotation works too.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_propagates_shape_through_pattern_bindings() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_bind_rematch_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_bind_rematch_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Option<a> { case Some(v: a); case None }\n\
+         def unwrapDepth(o: Option<Option<Int>>): Int = o match {\n\
+           case Some(inner) => inner match { case Some(v) => v; case None => 0 - 1 }\n\
+           case None => 0 - 2\n\
+         }\n\
+         def flatten(o: Option<Option<Int>>): Option<Int> = o match {\n\
+           case Some(inner) => inner\n\
+           case None => None\n\
+         }\n\
+         println(unwrapDepth(Some(Some(42))))\n\
+         println(unwrapDepth(Some(None)))\n\
+         println(unwrapDepth(None))\n\
+         println(flatten(Some(Some(7))) match { case Some(v) => v; case None => 0 - 1 })\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "42\n-1\n-2\n7\n"
+    );
+}
+
+/// Enum String payloads are GC heap strings; passing one to a
+/// String-annotated function parameter or returning one through a
+/// String return annotation now materializes it into the fixed
+/// runtime-string buffer instead of rejecting the call. Covers a
+/// monomorphic enum, a generic Option<String>, and chaining the
+/// extracted payload through another String function.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_passes_enum_string_payloads_through_functions() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_enum_heap_string_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_enum_heap_string_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Msg { case Text(s: String); case Empty }\n\
+         enum Option<a> { case Some(v: a); case None }\n\
+         def label(m: Msg): String = m match { case Text(s) => s; case Empty => \"(none)\" }\n\
+         def shout(s: String): String = s + \"!\"\n\
+         def pick(o: Option<String>): String = o match { case Some(s) => s; case None => \"(nil)\" }\n\
+         println(label(Text(\"hello\")))\n\
+         println(label(Empty))\n\
+         println(Text(\"hey\") match { case Text(s) => shout(s); case Empty => \"?\" })\n\
+         println(pick(Some(\"world\")))\n\
+         println(shout(pick(Some(\"yo\"))))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "hello\n(none)\nhey!\nworld\nyo!\n"
+    );
+}
+
 /// A comma inside an applied type annotation (`Result<Int, String>`,
 /// `Map<String, Int>`) used to terminate the annotation scan — the
 /// parser only tracked parenthesis depth — so two-parameter generic

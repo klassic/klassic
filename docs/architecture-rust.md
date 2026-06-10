@@ -634,7 +634,16 @@ cargo run -- -e "1 + 2"
   scanner in `klassic-syntax` tracks angle-bracket depth alongside
   parentheses, so multi-parameter applied annotations
   (`Result<Int, String>`, `Map<String, Int>`) parse — a comma inside
-  `<...>` previously terminated the annotation. Recursion over
+  `<...>` previously terminated the annotation.
+  A pattern variable binding an enum-typed payload whose nested shape
+  is tracked (`case Some(inner) => inner match { ... }`) wraps its
+  field read in a synthesized `__enum_shape_hint(value, id)` call;
+  codegen compiles the value and publishes the indexed shape as
+  pending, so the binding's slot records the payload's shape and a
+  later `match` on the bound name resolves. Enum String payloads (GC
+  heap strings) materialize into the fixed runtime-string buffer when
+  passed to a String-annotated parameter or returned through a String
+  return annotation, instead of rejecting the call. Recursion over
   generic parameters *without* a concrete annotation (true
   per-call-site monomorphization) remains diagnosed.
   Imports of the plain-Klassic `std.*` modules are inlined before type

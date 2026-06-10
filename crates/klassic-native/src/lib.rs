@@ -1376,11 +1376,12 @@ fn en_build_match_shaped(
     scrutinee: Expr,
     arms: Vec<MatchArm>,
     span: Span,
+    hints: &mut Vec<ConcreteEnumShape>,
 ) -> Expr {
     let scrut = en_fresh(counter, "scrut");
     let mut chain = en_call("__match_fail", Vec::new(), span);
     for arm in arms.into_iter().rev() {
-        chain = en_build_arm_shaped(shape, &scrut, arm, chain, span);
+        chain = en_build_arm_shaped(shape, &scrut, arm, chain, span, hints);
     }
     en_block(vec![en_vardecl(&scrut, scrutinee, span), chain], span)
 }
@@ -1391,10 +1392,11 @@ fn en_build_arm_shaped(
     arm: MatchArm,
     rest: Expr,
     span: Span,
+    hints: &mut Vec<ConcreteEnumShape>,
 ) -> Expr {
     let subject = en_ident(scrut, span);
     let predicate = en_pattern_predicate_shaped(shape, &arm.pattern, subject, span);
-    let binds = en_pattern_binds_shaped(shape, &arm.pattern, en_ident(scrut, span), span);
+    let binds = en_pattern_binds_shaped(shape, &arm.pattern, en_ident(scrut, span), span, hints);
 
     let mut success: Vec<Expr> = binds
         .into_iter()
@@ -1476,6 +1478,7 @@ fn en_pattern_binds_shaped(
     pattern: &Pattern,
     subject: Expr,
     span: Span,
+    hints: &mut Vec<ConcreteEnumShape>,
 ) -> Vec<(String, Expr)> {
     match pattern {
         Pattern::Wildcard { .. }
@@ -1494,9 +1497,24 @@ fn en_pattern_binds_shaped(
                 let read = en_field_read(subject.clone(), field.repr, i, span);
                 match (arg, field.nested.as_ref()) {
                     (Pattern::Constructor { .. }, Some(nested)) => {
-                        binds.extend(en_pattern_binds_shaped(nested, arg, read, span));
+                        binds.extend(en_pattern_binds_shaped(nested, arg, read, span, hints));
                     }
-                    _ => binds.extend(en_pattern_binds_shaped(shape, arg, read, span)),
+                    // A variable binding an enum-typed payload whose
+                    // nested shape is tracked: wrap the read in a shape
+                    // hint so the binding's slot records the payload's
+                    // shape and a later `match` on the bound name
+                    // resolves (`case Some(inner) => inner match ...`).
+                    (Pattern::Variable { name, .. }, Some(nested))
+                        if field.repr == EnumFieldRepr::EnumField =>
+                    {
+                        let id = hints.len() as i64;
+                        hints.push((**nested).clone());
+                        binds.push((
+                            name.clone(),
+                            en_call("__enum_shape_hint", vec![read, en_int(id, span)], span),
+                        ));
+                    }
+                    _ => binds.extend(en_pattern_binds_shaped(shape, arg, read, span, hints)),
                 }
             }
             binds
@@ -3020,6 +3038,11 @@ struct NativeCodeGenerator {
     /// Slot id -> concrete enum shape, so a `match` on an identifier can
     /// recover the per-instantiation field reprs of its scrutinee.
     enum_shapes: HashMap<usize, ConcreteEnumShape>,
+    /// Shapes referenced by synthesized `__enum_shape_hint(value, id)`
+    /// calls: a pattern binding of an enum-typed payload wraps its field
+    /// read in a hint so the binding's slot records the payload's shape
+    /// and a later `match` on the bound name resolves.
+    enum_shape_hints: Vec<ConcreteEnumShape>,
     /// Shape of the generic enum value just constructed, awaiting binding
     /// to a slot (picked up by the next `allocate_slot`/`bind_constant`).
     pending_enum_shape: Option<ConcreteEnumShape>,
@@ -3177,6 +3200,7 @@ impl NativeCodeGenerator {
             generic_enums: HashMap::new(),
             variant_to_generic_enum: HashMap::new(),
             enum_shapes: HashMap::new(),
+            enum_shape_hints: Vec::new(),
             pending_enum_shape: None,
             generic_enum_counter: 0,
         }
@@ -3546,8 +3570,35 @@ impl NativeCodeGenerator {
             scrutinee,
             arms.to_vec(),
             span,
+            &mut self.enum_shape_hints,
         );
         self.compile_expr(&tree)
+    }
+
+    /// `__enum_shape_hint(value, id)` — synthesized by the shaped match
+    /// lowering around a pattern binding's field read. Compiles `value`
+    /// and publishes `enum_shape_hints[id]` as the pending shape, so the
+    /// binding's slot records the payload's shape and a later `match` on
+    /// the bound name resolves its payload reprs.
+    fn compile_enum_shape_hint(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let [value_expr, Expr::Int { value: id, .. }] = arguments else {
+            return Err(Diagnostic::compile(
+                span,
+                "__enum_shape_hint expects a value and a literal hint index".to_string(),
+            ));
+        };
+        let value = self.compile_expr(value_expr)?;
+        let shape = self
+            .enum_shape_hints
+            .get(*id as usize)
+            .cloned()
+            .ok_or_else(|| Diagnostic::compile(span, "unknown enum shape hint".to_string()))?;
+        self.pending_enum_shape = Some(shape);
+        Ok(value)
     }
 
     /// Whether `name` resolves to a registered generic-enum variant.
@@ -5726,6 +5777,7 @@ impl NativeCodeGenerator {
             "__gc_read_ptr" => self.compile_gc_read_ptr(arguments, span),
             "__gc_read_string" => self.compile_gc_read_string(arguments, span),
             "__gc_write" => self.compile_gc_write(arguments, span),
+            "__enum_shape_hint" => self.compile_enum_shape_hint(arguments, span),
             "__match_fail" => self.compile_match_fail(span),
             "assert" => {
                 if arguments.len() != 1 {
@@ -6164,6 +6216,11 @@ impl NativeCodeGenerator {
         for (argument, expected_value) in arguments.iter().zip(function.param_values.iter()) {
             let value = self.compile_expr(argument)?;
             if let NativeValue::RuntimeString { data, len } = expected_value {
+                let value = self.coerce_heap_string_to_runtime(
+                    value,
+                    span,
+                    "function string argument exceeds 65536 bytes",
+                );
                 let Some(input) = self.native_string_ref(value) else {
                     return Err(unsupported(
                         span,
@@ -6324,6 +6381,11 @@ impl NativeCodeGenerator {
         {
             let value = self.compile_expr(argument)?;
             if let NativeValue::RuntimeString { data, len } = expected_value {
+                let value = self.coerce_heap_string_to_runtime(
+                    value,
+                    span,
+                    "function string argument exceeds 65536 bytes",
+                );
                 let Some(input) = self.native_string_ref(value) else {
                     return Err(unsupported(
                         span,
@@ -6711,6 +6773,7 @@ impl NativeCodeGenerator {
             "__gc_read_ptr" => self.compile_gc_read_ptr(arguments, span).map(Some),
             "__gc_read_string" => self.compile_gc_read_string(arguments, span).map(Some),
             "__gc_write" => self.compile_gc_write(arguments, span).map(Some),
+            "__enum_shape_hint" => self.compile_enum_shape_hint(arguments, span).map(Some),
             "__match_fail" => self.compile_match_fail(span).map(Some),
             "head" => self.compile_static_head(arguments, span).map(Some),
             "FileOutput#write" => self
@@ -33355,6 +33418,23 @@ impl NativeCodeGenerator {
         self.asm.syscall();
     }
 
+    /// Materialize a GC heap string (length-prefixed, pointer in rax)
+    /// into a fixed runtime-string buffer so fixed-buffer consumers
+    /// (function string arguments / returns) can take it; other values
+    /// pass through unchanged.
+    fn coerce_heap_string_to_runtime(
+        &mut self,
+        value: NativeValue,
+        span: Span,
+        overflow_message: &str,
+    ) -> NativeValue {
+        if matches!(value, NativeValue::HeapString) {
+            self.emit_heap_string_to_runtime_string_value(span, overflow_message)
+        } else {
+            value
+        }
+    }
+
     fn native_string_ref(&self, value: NativeValue) -> Option<NativeStringRef> {
         match value {
             NativeValue::StaticString { label, len } => Some(NativeStringRef {
@@ -35692,6 +35772,11 @@ impl NativeCodeGenerator {
                 if value == expected {
                     return Ok(());
                 }
+                let value = self.coerce_heap_string_to_runtime(
+                    value,
+                    span,
+                    "function string return exceeds 65536 bytes",
+                );
                 let Some(input) = self.native_string_ref(value) else {
                     return Err(unsupported(
                         span,
