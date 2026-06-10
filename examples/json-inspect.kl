@@ -1,0 +1,43 @@
+// JSON round-trip demo: parse, inspect, and re-render JSON with the
+// pure-Klassic std.json module. Run with the evaluator:
+//
+//   klassic examples/json-inspect.kl
+//
+// (std.json is evaluator-only in native builds for now — see issue #432.)
+
+import std.json.{parse, stringify}
+
+def countValues(j: Json): Int = j match {
+  case JNull => 1
+  case JBool(b) => 1
+  case JNum(n) => 1
+  case JStr(s) => 1
+  case JArr(items) => countAll(items)
+  case JObj(entries) => countMembers(entries)
+}
+
+def countAll(items: List<Json>): Int =
+  if (isEmpty(items)) 0
+  else countValues(head(items)) + countAll(tail(items))
+
+def countMembers(entries: List<JsonMember>): Int =
+  if (isEmpty(entries)) 0
+  else head(entries) match {
+    case Member(key, value) => countValues(value) + countMembers(tail(entries))
+  }
+
+val text = "{\"name\": \"klassic\", \"tags\": [\"compiler\", \"adt\"], \"stars\": 230, \"native\": true}"
+
+parse(text) match {
+  case Ok(json) => {
+    println("parsed OK")
+    println("values: " + countValues(json).toString())
+    println(stringify(json))
+  }
+  case Err(message) => println("parse error: " + message)
+}
+
+parse("[1, 2") match {
+  case Ok(_) => println("unreachable")
+  case Err(message) => println(message)
+}
