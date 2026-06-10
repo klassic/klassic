@@ -3998,6 +3998,11 @@ impl TypeChecker {
                 _ => None,
             },
             Type::Var(id) => match field {
+                // toString is universal: answer with its type and
+                // leave the receiver variable free — unifying it into
+                // a structural record used to pin e.g. an Int
+                // parameter to `record { toString: ... }`.
+                "toString" => Some(Type::Function(vec![], Box::new(Type::String))),
                 "map" => {
                     let inner = self.fresh_var();
                     self.bind_var(GenericVar::Type(id), Type::List(Box::new(inner)));

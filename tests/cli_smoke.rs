@@ -22887,6 +22887,36 @@ fn std_time_formats_iso_in_evaluator_and_native() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
 }
 
+/// `.toString()` works on an inferred (still-unresolved) receiver
+/// (GitHub issue #428): the builtin-method lookup answers for type
+/// variables without unifying the receiver into a structural record,
+/// so an Int parameter used as `i.toString()` stays an Int and a
+/// polymorphic helper serves every value kind.
+#[test]
+fn to_string_works_on_inferred_receivers() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "def fail(message, i) = message + \" at position \" + i.toString()\n\
+             def show(x) = x.toString()\n\
+             println(fail(\"oops\", 42))\n\
+             println(show(7))\n\
+             println(show(\"hi\"))\n\
+             println(show(true))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "inferred-receiver toString should typecheck\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "oops at position 42\n7\nhi\ntrue\n()\n"
+    );
+}
+
 /// std.json parses and renders JSON (GitHub issue #422): objects,
 /// arrays, negative integers, escapes, and nesting round-trip;
 /// malformed input returns Err with a character position instead of
