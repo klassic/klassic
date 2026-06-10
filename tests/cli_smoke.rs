@@ -20497,6 +20497,7 @@ fn extension_methods_dispatch_on_list_int() {
 /// `target.m(args)` call sites with an unambiguous method name to
 /// `__ext_T_m(target, args)`. The resulting binary executes the
 /// extension body just like an inlined free function.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_compiles_extension_method_calls() {
     let stamp = SystemTime::now()
@@ -20549,6 +20550,7 @@ fn native_build_compiles_extension_method_calls() {
 /// primitives: an enum value is a `__gc_record(1 + fields)` whose slot 0
 /// holds the boxed variant tag. This covers nullary variants and
 /// integer payloads end to end.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_compiles_enum_construction_and_match() {
     let stamp = SystemTime::now()
@@ -20608,6 +20610,7 @@ fn native_build_compiles_enum_construction_and_match() {
 /// construction and re-derived as `Bool` on extraction, so both
 /// boolean-literal patterns (`case Mk(true, n)`) and bound boolean
 /// variables work.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_compiles_boolean_enum_payloads() {
     let stamp = SystemTime::now()
@@ -20665,6 +20668,7 @@ fn native_build_compiles_boolean_enum_payloads() {
 /// heap string on construction and read back as one, so it can be bound
 /// and returned (the `match` desugars to an `if` whose branches are
 /// merged as heap strings) and matched against string literals.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_compiles_string_enum_payloads() {
     let stamp = SystemTime::now()
@@ -20726,6 +20730,7 @@ fn native_build_compiles_string_enum_payloads() {
 /// patterns (`case O(I(n))`), integer-literal sub-patterns and arm
 /// guards all compile, with short-circuited tag tests guarding payload
 /// reads so a mismatched variant never dereferences a slot it lacks.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_compiles_nested_enum_patterns_with_guards() {
     let stamp = SystemTime::now()
@@ -20791,6 +20796,7 @@ fn native_build_compiles_nested_enum_patterns_with_guards() {
 /// all: integer- and string-literal patterns, a variable pattern and a
 /// guard now compile to native, which previously rejected every
 /// `match`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_compiles_literal_and_guard_match() {
     let stamp = SystemTime::now()
@@ -20850,6 +20856,7 @@ fn native_build_compiles_literal_and_guard_match() {
 /// A non-exhaustive `match` that falls through every arm aborts at
 /// runtime instead of silently returning a bogus value: the lowering's
 /// `__match_fail()` tail prints a diagnostic and exits non-zero.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_match_without_matching_arm_aborts() {
     let stamp = SystemTime::now()
@@ -20905,6 +20912,7 @@ fn native_build_match_without_matching_arm_aborts() {
 /// time: the constructor argument's `NativeValue` resolves the type
 /// parameter's repr, the value carries a per-instance shape, and the
 /// match reads its payload through that shape. `unwrap(Some(7), 0)` runs.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_compiles_generic_enum_scalar_payload() {
     let stamp = SystemTime::now()
@@ -20961,6 +20969,7 @@ fn native_build_compiles_generic_enum_scalar_payload() {
 /// the value through a `val` binding into the matcher, and the payload is
 /// read back with the right boxing. `orElse(Some("hi"), "x")` yields the
 /// string; a bool-payload enum round-trips `true` / `false`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_compiles_generic_enum_string_and_bool_payloads() {
     let stamp = SystemTime::now()
@@ -21024,6 +21033,7 @@ fn native_build_compiles_generic_enum_string_and_bool_payloads() {
 /// captures the inner value's shape, and a nested constructor pattern
 /// descends into it with the inner instantiation's reprs. Integer and
 /// string payloads round-trip at two and three levels of nesting.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_compiles_nested_generic_enums() {
     let stamp = SystemTime::now()
@@ -21085,6 +21095,7 @@ fn native_build_compiles_nested_generic_enums() {
 /// different types, and several generic enums, without interference (M4):
 /// each value carries its own per-instance shape, so the inlined helper
 /// resolves the right reprs at every call site.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_compiles_multiple_generic_enum_instantiations() {
     let stamp = SystemTime::now()
@@ -21148,6 +21159,7 @@ fn native_build_compiles_multiple_generic_enum_instantiations() {
 /// A generic enum whose payload is itself an applied generic (`List<a>`)
 /// is not specializable yet, so it keeps the precise generic-enum
 /// diagnostic naming the enum rather than miscompiling.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_rejects_unsupported_generic_enum_with_precise_message() {
     let stamp = SystemTime::now()
@@ -21234,6 +21246,7 @@ fn native_build_rejects_non_heap_generic_enum_payload() {
 /// `std.*` modules: the imported module's declarations are spliced
 /// between the prelude and the user program before type checking, so
 /// `std.list` / `std.math` helpers compile into the executable.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_inlines_stdlib_module_imports() {
     let stamp = SystemTime::now()
@@ -21291,6 +21304,7 @@ fn native_build_inlines_stdlib_module_imports() {
 /// Aliased stdlib imports work too: `import std.math as M` inlines the
 /// module and rewrites every `M.func` access to a bare `func`, so the
 /// compiled binary calls the spliced helpers.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_inlines_aliased_stdlib_import() {
     let stamp = SystemTime::now()
@@ -21349,6 +21363,7 @@ fn native_build_inlines_aliased_stdlib_import() {
 /// *return* a freshly constructed generic enum through a match —
 /// `mapOption` / `mapResult` / `orElse` — are covered separately by
 /// `native_build_propagates_generic_enum_shape_through_match`.)
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_inlines_adt_stdlib_modules() {
     let stamp = SystemTime::now()
@@ -21416,6 +21431,7 @@ fn native_build_inlines_adt_stdlib_modules() {
 /// results can be matched downstream. The merge prefers a resolved field
 /// over a defaulted one, so a string-payload `mapOption` reads back as a
 /// string, not the `None` arm's defaulted scalar.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_propagates_generic_enum_shape_through_match() {
     let stamp = SystemTime::now()
@@ -23293,6 +23309,7 @@ fn evaluator_uses_std_cli_helpers() {
 /// rejected with a "not yet available in native builds" diagnostic):
 /// `import std.list.{range}` splices `range` into the program and the
 /// compiled binary prints the list.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_inlines_std_list_import() {
     let stamp = SystemTime::now()
