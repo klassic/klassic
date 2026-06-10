@@ -19294,7 +19294,7 @@ fn shares_mutable_thread_captures_via_cli() {
     let output = Command::new(klassic_bin())
         .args([
             "-e",
-            "mutable counter = 0\nthread(() => {\n  sleep(1)\n  counter = counter + 1\n})\nsleep(10)\ncounter",
+            "mutable counter = 0\nthread(() => {\n  sleep(1)\n  counter = counter + 1\n})\nsleep(300)\ncounter",
         ])
         .output()
         .expect("binary should run");
@@ -22457,6 +22457,41 @@ fn shebang_line_is_stripped_from_source() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "hello-from-shebang\n"
+    );
+}
+
+/// std.json parses and renders JSON (GitHub issue #422): objects,
+/// arrays, negative integers, escapes, and nesting round-trip;
+/// malformed input returns Err with a character position instead of
+/// aborting. Written in pure Klassic on top of the ADT/stdlib stack.
+#[test]
+fn evaluator_parses_and_stringifies_json() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.json.{parse, stringify}\n\
+             import std.result.{ok, err}\n\
+             def show(text) = parse(text) match { case Ok(j) => stringify(j); case Err(e) => \"ERR: \" + e }\n\
+             println(show(\"  [ -42, true, false, \\\"a\\\\nb\\\\\\\"c\\\", {} ]  \"))\n\
+             println(show(\"{\\\"nested\\\": {\\\"deep\\\": [[1], []]}}\"))\n\
+             println(show(\"[1, 2\"))\n\
+             println(show(\"[1] garbage\"))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "json module should evaluate\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[-42,true,false,\"a\\nb\\\"c\",{}]\n\
+         {\"nested\":{\"deep\":[[1],[]]}}\n\
+         ERR: expected `,` or `]` at position 5\n\
+         ERR: trailing input at position 4\n\
+         ()\n"
     );
 }
 

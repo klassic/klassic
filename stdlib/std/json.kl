@@ -1,0 +1,209 @@
+module std.json
+
+import std.result.{ok, err}
+
+// JSON values as an ADT. Numbers are integers in v1 (the shared
+// stdlib surface has no float runtime yet) and string escapes cover
+// the common set; \uXXXX is reported as an error rather than decoded.
+// `parse` returns Result<Json, String> with the character position in
+// the error message; `stringify` renders compact JSON.
+
+enum Json {
+  case JNull
+  case JBool(b: Bool)
+  case JNum(n: Int)
+  case JStr(s: String)
+  case JArr(items: List<Json>)
+  case JObj(entries: List<JsonMember>)
+}
+
+enum JsonMember {
+  case Member(key: String, value: Json)
+}
+
+// Internal: a successful step carries the parsed value and the next
+// character index; parsers compose through Result<JsonStep, String>.
+enum JsonStep {
+  case Step(value: Json, next: Int)
+}
+
+def jsonCharAt(text, i) = substring(text, i, i + 1)
+
+def jsonIsDigit(c) = c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+
+def jsonIsWs(c) = c == " " || c == "\n" || c == "\t" || c == "\r"
+
+def jsonSkipWs(text, i) = if (i < length(text) && jsonIsWs(jsonCharAt(text, i))) jsonSkipWs(text, i + 1) else i
+
+def jsonReverse(xs, acc) = if (isEmpty(xs)) acc else jsonReverse(tail(xs), cons(head(xs))(acc))
+
+def jsonFail(message, i) = err("#{message} at position #{i}")
+
+def jsonExpectLiteral(text, i, literal, value) = {
+  if (i + length(literal) <= length(text) && substring(text, i, i + length(literal)) == literal) {
+    ok(Step(value, i + length(literal)))
+  } else {
+    jsonFail("expected `" + literal + "`", i)
+  }
+}
+
+def jsonDigitValue(c) = {
+  if (c == "0") 0 else if (c == "1") 1 else if (c == "2") 2 else if (c == "3") 3 else if (c == "4") 4 else if (c == "5") 5 else if (c == "6") 6 else if (c == "7") 7 else if (c == "8") 8 else 9
+}
+
+def jsonParseDigits(text, i, acc) = {
+  if (i < length(text) && jsonIsDigit(jsonCharAt(text, i))) {
+    jsonParseDigits(text, i + 1, acc * 10 + jsonDigitValue(jsonCharAt(text, i)))
+  } else {
+    Step(JNum(acc), i)
+  }
+}
+
+def jsonParseNumber(text, i) = {
+  val negative = i < length(text) && jsonCharAt(text, i) == "-"
+  val start = if (negative) i + 1 else i
+  if (start < length(text) && jsonIsDigit(jsonCharAt(text, start))) {
+    jsonParseDigits(text, start, 0) match {
+      case Step(JNum(magnitude), next) => ok(Step(JNum(if (negative) 0 - magnitude else magnitude), next))
+      case Step(other, next) => jsonFail("internal number state", i)
+    }
+  } else {
+    jsonFail("expected digits", start)
+  }
+}
+
+def jsonEscapeChar(e) = {
+  if (e == "\"") "\"" else if (e == "\\") "\\" else if (e == "/") "/" else if (e == "n") "\n" else if (e == "t") "\t" else if (e == "r") "\r" else ""
+}
+
+def jsonParseStringBody(text, i, acc) = {
+  if (i >= length(text)) {
+    jsonFail("unterminated string", i)
+  } else {
+    val c = jsonCharAt(text, i)
+    if (c == "\"") {
+      ok(Step(JStr(acc), i + 1))
+    } else if (c == "\\") {
+      if (i + 1 >= length(text)) {
+        jsonFail("unterminated escape", i)
+      } else {
+        val decoded = jsonEscapeChar(jsonCharAt(text, i + 1))
+        if (decoded == "") {
+          jsonFail("unsupported escape `\\" + jsonCharAt(text, i + 1) + "`", i)
+        } else {
+          jsonParseStringBody(text, i + 2, acc + decoded)
+        }
+      }
+    } else {
+      jsonParseStringBody(text, i + 1, acc + c)
+    }
+  }
+}
+
+def jsonParseArrayItems(text, i, acc, parseVal) = {
+  parseVal(text, jsonSkipWs(text, i)) match {
+    case Ok(Step(item, next)) => {
+      val rest = jsonSkipWs(text, next)
+      val grown = cons(item)(acc)
+      if (rest < length(text) && jsonCharAt(text, rest) == ",") {
+        jsonParseArrayItems(text, rest + 1, grown, parseVal)
+      } else if (rest < length(text) && jsonCharAt(text, rest) == "]") {
+        ok(Step(JArr(jsonReverse(grown, [])), rest + 1))
+      } else {
+        jsonFail("expected `,` or `]`", rest)
+      }
+    }
+    case Err(message) => err(message)
+  }
+}
+
+def jsonParseMembers(text, i, acc, parseVal) = {
+  val keyAt = jsonSkipWs(text, i)
+  if (keyAt >= length(text) || jsonCharAt(text, keyAt) != "\"") {
+    jsonFail("expected object key", keyAt)
+  } else {
+    jsonParseStringBody(text, keyAt + 1, "") match {
+      case Ok(Step(JStr(key), afterKey)) => {
+        val colonAt = jsonSkipWs(text, afterKey)
+        if (colonAt >= length(text) || jsonCharAt(text, colonAt) != ":") {
+          jsonFail("expected `:`", colonAt)
+        } else {
+          parseVal(text, jsonSkipWs(text, colonAt + 1)) match {
+            case Ok(Step(value, next)) => {
+              val rest = jsonSkipWs(text, next)
+              val grown = cons(Member(key, value))(acc)
+              if (rest < length(text) && jsonCharAt(text, rest) == ",") {
+                jsonParseMembers(text, rest + 1, grown, parseVal)
+              } else if (rest < length(text) && jsonCharAt(text, rest) == "}") {
+                ok(Step(JObj(jsonReverse(grown, [])), rest + 1))
+              } else {
+                jsonFail("expected `,` or `}`", rest)
+              }
+            }
+            case Err(message) => err(message)
+          }
+        }
+      }
+      case Ok(Step(other, afterKey)) => jsonFail("internal key state", keyAt)
+      case Err(message) => err(message)
+    }
+  }
+}
+
+def jsonParseValue(text, i) = {
+  if (i >= length(text)) {
+    jsonFail("unexpected end of input", i)
+  } else {
+    val c = jsonCharAt(text, i)
+    if (c == "n") {
+      jsonExpectLiteral(text, i, "null", JNull)
+    } else if (c == "t") {
+      jsonExpectLiteral(text, i, "true", JBool(true))
+    } else if (c == "f") {
+      jsonExpectLiteral(text, i, "false", JBool(false))
+    } else if (c == "\"") {
+      jsonParseStringBody(text, i + 1, "")
+    } else if (c == "[") {
+      val at = jsonSkipWs(text, i + 1)
+      if (at < length(text) && jsonCharAt(text, at) == "]") ok(Step(JArr([]), at + 1)) else jsonParseArrayItems(text, i + 1, [], (t, j) => jsonParseValue(t, j))
+    } else if (c == "{") {
+      val at = jsonSkipWs(text, i + 1)
+      if (at < length(text) && jsonCharAt(text, at) == "}") ok(Step(JObj([]), at + 1)) else jsonParseMembers(text, i + 1, [], (t, j) => jsonParseValue(t, j))
+    } else if (c == "-" || jsonIsDigit(c)) {
+      jsonParseNumber(text, i)
+    } else {
+      jsonFail("unexpected character `" + c + "`", i)
+    }
+  }
+}
+
+def parse(text) = {
+  jsonParseValue(text, jsonSkipWs(text, 0)) match {
+    case Ok(Step(value, next)) => {
+      val rest = jsonSkipWs(text, next)
+      if (rest >= length(text)) ok(value) else jsonFail("trailing input", rest)
+    }
+    case Err(message) => err(message)
+  }
+}
+
+def jsonEncodeChar(c) = {
+  if (c == "\"") "\\\"" else if (c == "\\") "\\\\" else if (c == "\n") "\\n" else if (c == "\t") "\\t" else if (c == "\r") "\\r" else c
+}
+
+def jsonEscape(s, i, acc) = if (i >= length(s)) acc else jsonEscape(s, i + 1, acc + jsonEncodeChar(jsonCharAt(s, i)))
+
+def jsonJoin(parts, sep) = {
+  if (isEmpty(parts)) "" else if (isEmpty(tail(parts))) "#{head(parts)}" else "#{head(parts)}#{sep}#{jsonJoin(tail(parts), sep)}"
+}
+
+def stringify(json) = json match {
+  case JNull => "null"
+  case JBool(b) => if (b) "true" else "false"
+  case JNum(n) => "#{n}"
+  case JStr(s) => "\"" + jsonEscape(s, 0, "") + "\""
+  case JArr(items) => "[" + jsonJoin(stdlibMap(items, (item) => stringify(item)), ",") + "]"
+  case JObj(entries) => "{" + jsonJoin(stdlibMap(entries, (entry) => entry match {
+    case Member(key, value) => "\"" + jsonEscape(key, 0, "") + "\":" + stringify(value)
+  }), ",") + "}"
+}

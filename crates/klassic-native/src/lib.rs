@@ -559,6 +559,13 @@ fn compile_internal(
 /// enums, which native codegen does not support, so their imports keep
 /// the existing rejection instead of being inlined.
 fn stdlib_module_is_inlinable(path: &str) -> bool {
+    // std.json leans on applied-generic enum payloads (`List<Json>`)
+    // that native enum lowering does not support yet; keep its import
+    // on the existing rejection diagnostic instead of splicing a
+    // module that cannot compile.
+    if path == "std.json" {
+        return false;
+    }
     STDLIB_MODULES.iter().any(|module| module.path == path)
 }
 
