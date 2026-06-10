@@ -3206,10 +3206,13 @@ impl NativeCodeGenerator {
         let gc_heap_top = asm.data_label_with_i64s(&[0]);
         let gc_heap_end = asm.data_label_with_i64s(&[0]);
         let gc_free_list_head = asm.data_label_with_i64s(&[0]);
-        let gc_root_table = asm.data_label_with_i64s(&[0; Self::GC_ROOT_TABLE_LEN]);
-        let gc_mark_worklist = asm.data_label_with_i64s(&[0; Self::GC_MARK_WORKLIST_LEN]);
+        // The GC tables live in an anonymous mmap made at startup;
+        // these .data qwords hold only each table's base pointer, so
+        // binaries don't embed hundreds of KB of zeros.
+        let gc_root_table = asm.data_label_with_i64s(&[0]);
+        let gc_mark_worklist = asm.data_label_with_i64s(&[0]);
         let gc_mark_worklist_top = asm.data_label_with_i64s(&[0]);
-        let gc_shadow_stack = asm.data_label_with_i64s(&[0; Self::GC_SHADOW_STACK_LEN]);
+        let gc_shadow_stack = asm.data_label_with_i64s(&[0]);
         let gc_shadow_stack_top = asm.data_label_with_i64s(&[0]);
         let gc_segments = asm.data_label_with_i64s(&vec![0; 3 * Self::GC_MAX_SEGMENTS]);
         let gc_segment_count = asm.data_label_with_i64s(&[0]);
@@ -36266,6 +36269,9 @@ impl NativeCodeGenerator {
     /// Maximum number of objects that can be queued for tracing during a
     /// single mark phase. Marking aborts with an error message if the
     /// worklist overflows.
+    const GC_TABLES_BYTES: u64 =
+        ((Self::GC_ROOT_TABLE_LEN + Self::GC_SHADOW_STACK_LEN + Self::GC_MARK_WORKLIST_LEN) * 8)
+            as u64;
     // The mark worklist must hold the breadth-first frontier of the
     // live object graph; deep recursion with per-frame heap values
     // makes the live set proportional to recursion depth.
@@ -36397,6 +36403,42 @@ impl NativeCodeGenerator {
         // free_list_head = 0 (already zero-initialized, but be explicit)
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.mov_data_addr(Reg::R10, self.gc_free_list_head);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        // Map the GC tables (root table, shadow stack, mark worklist)
+        // in one anonymous mapping — mmap memory is zero-filled, which
+        // is exactly the tables' required initial state.
+        self.emit_syscall_number(PlatformSyscall::Mmap);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.mov_imm64(Reg::Rsi, Self::GC_TABLES_BYTES);
+        self.asm
+            .mov_imm64(Reg::Rdx, self.platform.mmap_prot_read_write());
+        self.asm
+            .mov_imm64(Reg::R10, self.platform.mmap_private_anonymous_flags());
+        self.asm
+            .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.syscall();
+        let tables_ok = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, tables_ok);
+        let tables_failed = self.asm.data_label_with_bytes(b"klassic gc: mmap failed\n");
+        self.emit_write_data(
+            self.platform.stderr_fd(),
+            tables_failed,
+            b"klassic gc: mmap failed\n".len(),
+        );
+        self.emit_exit_code(1);
+        self.asm.bind_text_label(tables_ok);
+        self.asm.mov_data_addr(Reg::R10, self.gc_root_table);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm
+            .add_reg_imm32(Reg::Rax, (Self::GC_ROOT_TABLE_LEN * 8) as i32);
+        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm
+            .add_reg_imm32(Reg::Rax, (Self::GC_SHADOW_STACK_LEN * 8) as i32);
+        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
 
         // Record the initial segment in the segments table:
@@ -36592,6 +36634,7 @@ impl NativeCodeGenerator {
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         // Initialize the root cursor / end.
         self.asm.mov_data_addr(Reg::R10, self.gc_root_table);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
         self.asm.store_rbp_slot(8, Reg::R10);
         self.asm
             .add_reg_imm32(Reg::R10, (Self::GC_ROOT_TABLE_LEN * 8) as i32);
@@ -36621,6 +36664,7 @@ impl NativeCodeGenerator {
         // root_cursor (slot 8) reused: now & shadow stack; root_end (slot 16)
         // reused as end pointer.
         self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
         self.asm.store_rbp_slot(8, Reg::R10);
         // end = base + top * 8
         self.asm.mov_data_addr(Reg::R8, self.gc_shadow_stack_top);
@@ -36665,6 +36709,7 @@ impl NativeCodeGenerator {
         self.asm.sub_reg_imm8(Reg::Rcx, 1);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
         self.asm.mov_data_addr(Reg::R8, self.gc_mark_worklist);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
         self.asm.mov_reg_reg(Reg::R9, Reg::Rcx);
         self.asm.shl_reg_imm8(Reg::R9, 3);
         self.asm.add_reg_reg(Reg::R8, Reg::R9);
@@ -36844,6 +36889,7 @@ impl NativeCodeGenerator {
             .cmp_reg_imm32(Reg::Rax, Self::GC_MARK_WORKLIST_LEN as i32);
         self.asm.jcc_label(Condition::AboveOrEqual, overflow);
         self.asm.mov_data_addr(Reg::R8, self.gc_mark_worklist);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
         // r9 = base + rax*8
         self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
         self.asm.shl_reg_imm8(Reg::R9, 3);
@@ -36874,6 +36920,7 @@ impl NativeCodeGenerator {
 
         // r10 = &table[i], r11 = end-of-table sentinel
         self.asm.mov_data_addr(Reg::R10, self.gc_root_table);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
         self.asm.mov_reg_reg(Reg::R11, Reg::R10);
         self.asm
             .add_reg_imm32(Reg::R11, (Self::GC_ROOT_TABLE_LEN * 8) as i32);
@@ -36916,6 +36963,7 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
 
         self.asm.mov_data_addr(Reg::R10, self.gc_root_table);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
         self.asm.mov_reg_reg(Reg::R11, Reg::R10);
         self.asm
             .add_reg_imm32(Reg::R11, (Self::GC_ROOT_TABLE_LEN * 8) as i32);
@@ -37148,6 +37196,7 @@ impl NativeCodeGenerator {
             .cmp_reg_imm32(Reg::Rax, Self::GC_SHADOW_STACK_LEN as i32);
         self.asm.jcc_label(Condition::AboveOrEqual, overflow);
         self.asm.mov_data_addr(Reg::R8, self.gc_shadow_stack);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
         self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
         self.asm.shl_reg_imm8(Reg::R9, 3);
         self.asm.add_reg_reg(Reg::R8, Reg::R9);

@@ -649,10 +649,14 @@ cargo run -- -e "1 + 2"
   `String#parseInt` — those sites keep the 64KB cap for now). The
   caller unpins heap-string arguments exactly like enum pointers —
   the pin/unpin pair must stay matched per argument or the root
-  table fills after a few thousand calls — and the GC's static
-  tables (root table, shadow stack, mark worklist) are sized so deep
-  recursion with per-frame heap values runs thousands of frames
-  before the clean overflow abort.
+  table fills after a few thousand calls — and the GC tables (root
+  table, shadow stack, mark worklist) are sized so deep recursion
+  with per-frame heap values runs thousands of frames before the
+  clean overflow abort. The tables themselves come from one anonymous
+  mmap at startup (mmap memory is zero-filled, their required initial
+  state); only a base-pointer qword per table lives in .data, so the
+  ~824KB of table zeros never lands in the emitted binary — a trivial
+  executable is back to a few tens of KB.
   Annotations naming a *fully-applied* generic enum (`Option<Int>`,
   `Option<String>`, `Option<Option<Int>>`) ride the same ABI: the
   annotation text alone fixes every type parameter, so the parameter's

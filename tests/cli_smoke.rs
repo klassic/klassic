@@ -314,6 +314,48 @@ fn builds_native_executable_for_recursive_integer_functions() {
     assert!(run.stderr.is_empty());
 }
 
+/// The GC tables come from an anonymous mmap at startup instead of
+/// zero-filled .data (GitHub issue #430), so binaries stay small even
+/// though the tables hold tens of thousands of entries. A trivial
+/// program's executable must stay well under the ~870KB the embedded
+/// tables used to cost.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_binaries_do_not_embed_gc_tables() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_binary_size_{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_binary_size_{unique}.bin"));
+    fs::write(&source_path, "println(\"hello\")\n").expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(build_output.status.success());
+    let size = fs::metadata(&output_path)
+        .expect("output should exist")
+        .len();
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "hello\n");
+    assert!(
+        size < 200_000,
+        "trivial binary should not embed GC tables, got {size} bytes"
+    );
+}
+
 /// Annotated String parameters/returns travel as GC heap pointers
 /// (GitHub issue #424): every recursion frame owns its own string, so
 /// recursive functions can build fresh strings per frame, >64KB
