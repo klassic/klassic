@@ -22460,6 +22460,65 @@ fn shebang_line_is_stripped_from_source() {
     );
 }
 
+/// std.list gains append / concat and std.string exposes parseInt
+/// (plus a `.toInt()` extension) — the everyday helpers whose absence
+/// forced cons-then-reverse and digit-accumulation workarounds
+/// (GitHub issue #428). Native parity included.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn std_list_append_concat_and_string_parse_int() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_stdlib_428_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_stdlib_428_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "import std.list.{append, concat}\n\
+         import std.string.{parseInt}\n\
+         println(append([1 2], 3))\n\
+         println(concat([1 2], [3 4]))\n\
+         println(parseInt(\"42\") + 1)\n\
+         println(\"7\".toInt() * 2)\n",
+    )
+    .expect("temp source file should write");
+    let expected = "[1, 2, 3]\n[1, 2, 3, 4]\n43\n14\n";
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    assert!(
+        eval_output.status.success(),
+        "stdlib helpers should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&eval_output.stdout), expected);
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "stdlib helpers should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
+}
+
 /// `else` may start a continuation line (GitHub issue #429): the if
 /// parser peeks past newline tokens and only consumes them when an
 /// `else` actually follows, so the newline still terminates the

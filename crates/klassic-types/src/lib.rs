@@ -2596,6 +2596,11 @@ impl TypeChecker {
             Type::Function(vec![], Box::new(Type::Int)),
         );
         self.declare_poly(
+            "String#parseInt".to_string(),
+            false,
+            Type::Function(vec![Type::String], Box::new(Type::Int)),
+        );
+        self.declare_poly(
             "Math#powInt".to_string(),
             false,
             Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int)),

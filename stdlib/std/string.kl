@@ -25,4 +25,10 @@ extension (this: String) {
   def takeChars(n) = substring(this, 0, n)
   // Drop first `n` characters; the rest follows.
   def dropChars(n) = substring(this, n, length(this))
+  // Decimal integer parse; a non-numeric string is a runtime error
+  // (a Result-returning variant can layer on once parse failures are
+  // recoverable in-language).
+  def toInt() = String#parseInt(this)
 }
+
+def parseInt(s) = String#parseInt(s)

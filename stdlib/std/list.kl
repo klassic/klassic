@@ -24,6 +24,10 @@ def count(xs, p) = foldLeft(xs)(0)((acc, x) => if(p(x)) acc + 1 else acc)
 
 def replicate(n, x) = if((n <= 0)) [] else cons(x)(replicate(n - 1, x))
 
+def append(xs, x) = if(isEmpty(xs)) [x] else cons(head(xs))(append(tail(xs), x))
+
+def concat(xs, ys) = if(isEmpty(xs)) ys else cons(head(xs))(concat(tail(xs), ys))
+
 def last(xs) = if(isEmpty(tail(xs))) head(xs) else last(tail(xs))
 
 def sum(xs) = foldLeft(xs)(0)((acc, x) => acc + x)
