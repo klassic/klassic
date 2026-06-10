@@ -10384,23 +10384,12 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_POINTER_RECORD);
         self.asm.call_label(self.gc_alloc);
-        // Zero-initialize the payload. rax = pointer, rdi = size in bytes.
-        // Note: the bump path leaves zeroed mmap memory; the free-list
-        // path may have stale next-free bytes at offset 0. Memset the
-        // whole payload to be safe.
-        let init_loop = self.asm.create_text_label();
-        let init_done = self.asm.create_text_label();
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
-        self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
-        self.asm.bind_text_label(init_loop);
-        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
-        self.asm.jcc_label(Condition::Equal, init_done);
-        self.asm.mov_imm64(Reg::Rdi, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdi);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.sub_reg_imm8(Reg::Rcx, 8);
-        self.asm.jmp_label(init_loop);
-        self.asm.bind_text_label(init_done);
+        // The payload arrives zeroed on both allocator paths: bump
+        // memory is fresh mmap, and the free-list hit path memsets the
+        // reused block's whole payload. (An earlier local memset here
+        // read rdi after the call, but gc_alloc rewrites rdi to the
+        // aligned total size — the loop overran the block and zeroed
+        // the next block's header.)
         Ok(NativeValue::HeapPointer)
     }
 
@@ -10440,21 +10429,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_POINTER_ARRAY);
         self.asm.call_label(self.gc_alloc);
-        // Zero-initialize the payload so leftover free-list bytes do not
-        // look like stale pointers to the mark phase.
-        let init_loop = self.asm.create_text_label();
-        let init_done = self.asm.create_text_label();
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
-        self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
-        self.asm.bind_text_label(init_loop);
-        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
-        self.asm.jcc_label(Condition::Equal, init_done);
-        self.asm.mov_imm64(Reg::Rdi, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdi);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.sub_reg_imm8(Reg::Rcx, 8);
-        self.asm.jmp_label(init_loop);
-        self.asm.bind_text_label(init_done);
+        // Payload arrives zeroed on both allocator paths (fresh mmap on
+        // the bump path, explicit memset on free-list reuse), so stale
+        // bytes can never look like pointers to the mark phase.
         Ok(NativeValue::HeapPointer)
     }
 
@@ -35564,6 +35541,27 @@ impl NativeCodeGenerator {
         // type tag = [rbp - 24]
         self.asm.load_rbp_slot(Reg::Rsi, 24);
         self.asm.store_ptr_disp32(Reg::R11, 8, Reg::Rsi);
+        // Zero the whole payload. First-fit reuse can hand out a block
+        // larger than the request without splitting it, and the mark
+        // trace walks header-size qwords — stale payload bytes from the
+        // block's previous life (old pointers, the free-list link)
+        // would be chased as heap pointers. The bump path skips this
+        // because fresh mmap memory is already zero.
+        let zero_loop = self.asm.create_text_label();
+        let zero_done = self.asm.create_text_label();
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R11, 0);
+        self.asm.sub_reg_imm8(Reg::Rcx, 16);
+        self.asm.mov_reg_reg(Reg::R10, Reg::R11);
+        self.asm.add_reg_imm32(Reg::R10, 16);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.bind_text_label(zero_loop);
+        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
+        self.asm.jcc_label(Condition::Equal, zero_done);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdi);
+        self.asm.add_reg_imm32(Reg::R10, 8);
+        self.asm.sub_reg_imm8(Reg::Rcx, 8);
+        self.asm.jmp_label(zero_loop);
+        self.asm.bind_text_label(zero_done);
         self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
         self.asm.add_reg_imm32(Reg::Rax, 16);
         self.asm.jmp_label(success);

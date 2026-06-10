@@ -628,7 +628,17 @@ cargo run -- -e "1 + 2"
     policy, and falls back to a bump pointer when no free block fits.
     Each block carries a 16-byte header — word 0 is the total block
     size with the GC mark bit reused as the top bit, word 1 is the
-    type tag (0 marks a free block).
+    type tag (0 marks a free block). A free-list hit zeroes the
+    reused block's entire payload before returning it: first-fit can
+    hand out a block larger than the request without splitting it,
+    and because the mark trace walks header-size qwords, stale bytes
+    from the block's previous life would otherwise be chased as heap
+    pointers (the bump path skips the memset — fresh mmap memory is
+    already zero). Callers must not assume `rdi` still holds the
+    requested size after the call; `gc_alloc` rewrites it to the
+    aligned total, which previously made `__gc_record`'s local
+    payload memset overrun into the next block's header and corrupt
+    the heap after the first collection.
   - `gc_collect()` performs stop-the-world mark-and-sweep. The mark
     phase walks compile-time-registered roots; the sweep phase walks
     every active segment linearly using each header's size, clears

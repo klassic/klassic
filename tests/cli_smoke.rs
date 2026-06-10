@@ -21297,6 +21297,71 @@ fn native_build_propagates_generic_enum_shape_through_match() {
     );
 }
 
+/// Allocating enum values in a loop long enough to exhaust the initial
+/// 1 MiB GC heap exercises collection and free-list reuse. A reused
+/// first-fit block used to keep stale payload bytes (and `__gc_record`'s
+/// local memset overran into the next block's header), which corrupted
+/// the heap after the first collection and hung the sweep. The allocator
+/// now zeroes a reused block's whole payload.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_survives_enum_allocation_churn_across_collections() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_gc_churn_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_gc_churn_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Tree {\n\
+           case Leaf(v: Int)\n\
+           case Branch(l: Tree, r: Tree)\n\
+         }\n\
+         mutable i = 0\n\
+         mutable acc = 0\n\
+         while (i < 50000) {\n\
+           val t = Branch(Leaf(7), Leaf(2))\n\
+           acc = acc + (t match { case Branch(l, r) => 1; case Leaf(v) => 0 })\n\
+           i = i + 1\n\
+         }\n\
+         println(acc)\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "50000\n");
+}
+
 /// PR 7: a `#!` shebang at the top of a `.kl` file is dropped during
 /// source loading so the rest of the script parses normally.
 #[test]
