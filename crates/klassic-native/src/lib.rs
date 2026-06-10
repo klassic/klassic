@@ -4150,7 +4150,7 @@ impl NativeCodeGenerator {
 
     fn native_function_param_value(&mut self, annotation: &TypeAnnotation) -> Option<NativeValue> {
         match annotation.text.trim() {
-            "String" => Some(self.runtime_string_scratch_value()),
+            "String" => Some(NativeValue::HeapString),
             "List<String>" => Some(self.runtime_lines_list_scratch_value()),
             text => self
                 .runtime_record_scratch_value_from_annotation(text)
@@ -5801,6 +5801,7 @@ impl NativeCodeGenerator {
                         lambda.return_value,
                         Some(
                             NativeValue::RuntimeString { .. }
+                                | NativeValue::HeapString
                                 | NativeValue::RuntimeLinesList { .. }
                         )
                     )
@@ -6372,7 +6373,7 @@ impl NativeCodeGenerator {
         if function
             .param_values
             .iter()
-            .any(|value| matches!(value, NativeValue::HeapPointer))
+            .any(|value| matches!(value, NativeValue::HeapPointer | NativeValue::HeapString))
         {
             return self.compile_pointer_abi_function_call(&function, arguments, span);
         }
@@ -6632,13 +6633,38 @@ impl NativeCodeGenerator {
                 continue;
             }
             if native_param_is_qword(expected_value) {
+                let value = if matches!(expected_value, NativeValue::HeapString) {
+                    match value {
+                        NativeValue::HeapString => value,
+                        NativeValue::StaticString { .. } | NativeValue::RuntimeString { .. } => {
+                            self.emit_heap_string_concat_fragment(
+                                value,
+                                span,
+                                "native function string argument",
+                                false,
+                            )?;
+                            NativeValue::HeapString
+                        }
+                        _ => {
+                            return Err(unsupported(
+                                span,
+                                "native function string argument for this value type",
+                            ));
+                        }
+                    }
+                } else {
+                    value
+                };
                 if value != *expected_value {
                     return Err(unsupported(
                         span,
                         "native function argument for this value type",
                     ));
                 }
-                if matches!(expected_value, NativeValue::HeapPointer) {
+                if matches!(
+                    expected_value,
+                    NativeValue::HeapPointer | NativeValue::HeapString
+                ) {
                     // A generic enum argument with a statically-known
                     // shape must be laid out the way the parameter's
                     // annotation says it will be read.
@@ -6695,7 +6721,7 @@ impl NativeCodeGenerator {
         // / r11, never the argument registers).
         let qword_count = qword_arg_values.len();
         for (index, value) in qword_arg_values.iter().enumerate() {
-            if matches!(value, NativeValue::HeapPointer) {
+            if matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
                 let disp = ((qword_count - 1 - index) * 8) as i32;
                 self.asm.mov_reg_reg(Reg::R10, Reg::Rsp);
                 self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, disp);
@@ -6752,7 +6778,9 @@ impl NativeCodeGenerator {
         argument: &Expr,
     ) -> bool {
         match return_value {
-            NativeValue::RuntimeString { .. } => self.expr_may_yield_native_string(argument),
+            NativeValue::RuntimeString { .. } | NativeValue::HeapString => {
+                self.expr_may_yield_native_string(argument)
+            }
             NativeValue::RuntimeLinesList { .. } => self.expr_may_yield_native_lines_list(argument),
             NativeValue::RuntimeRecord { .. } => true,
             _ => false,
@@ -7065,11 +7093,25 @@ impl NativeCodeGenerator {
                 let expected_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
                 self.asm.store_rbp_slot(expected_slot.offset, Reg::Rax);
                 let actual = self.compile_expr(&actual_arguments[0])?;
-                if actual != NativeValue::HeapString {
-                    return Err(unsupported(
-                        span,
-                        "native assertResult for values with different types",
-                    ));
+                // Lift a fixed-buffer / static actual to the heap so
+                // both sides compare through the heap equality (the
+                // expected side is rooted across the allocation).
+                match actual {
+                    NativeValue::HeapString => {}
+                    NativeValue::StaticString { .. } | NativeValue::RuntimeString { .. } => {
+                        self.emit_heap_string_concat_fragment(
+                            actual,
+                            span,
+                            "native assertResult string actual",
+                            false,
+                        )?;
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            span,
+                            "native assertResult for values with different types",
+                        ));
+                    }
                 }
                 self.asm.load_rbp_slot(Reg::R10, expected_slot.offset);
                 self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
@@ -7110,6 +7152,36 @@ impl NativeCodeGenerator {
                     .native_string_ref(expected)
                     .expect("string value should expose native string ref");
                 let actual = self.compile_expr(&actual_arguments[0])?;
+                // A heap-string actual (a by-pointer String return /
+                // parameter) compares through the heap equality: root
+                // the actual, lift the expected fixed-buffer string to
+                // the heap, and compare pointers' contents.
+                if matches!(actual, NativeValue::HeapString) {
+                    let actual_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+                    self.asm.store_rbp_slot(actual_slot.offset, Reg::Rax);
+                    self.emit_heap_string_concat_fragment(
+                        expected,
+                        span,
+                        "native assertResult string expectation",
+                        false,
+                    )?;
+                    self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
+                    self.asm.load_rbp_slot(Reg::R11, actual_slot.offset);
+                    self.emit_heap_string_equality_from_regs(
+                        Reg::R10,
+                        Reg::R11,
+                        span,
+                        "heap string equality",
+                    );
+                    let ok = self.asm.create_text_label();
+                    self.asm.cmp_reg_imm8(Reg::Rax, 0);
+                    self.asm.jcc_label(Condition::NotEqual, ok);
+                    self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
+                    self.asm.mov_reg_reg(Reg::Rcx, Reg::R10);
+                    self.emit_assert_result_failed_runtime(span, NativeValue::HeapString);
+                    self.asm.bind_text_label(ok);
+                    return Ok(NativeValue::Unit);
+                }
                 let Some(actual_string) = self.native_string_ref(actual) else {
                     return Err(unsupported(
                         span,
@@ -7397,6 +7469,40 @@ impl NativeCodeGenerator {
                 self.bind_constant(param.clone(), value);
                 continue;
             }
+            // An annotated `String` parameter expects a heap string:
+            // lift fixed-buffer / static arguments onto the heap and
+            // bind the parameter as a rooted HeapString slot, exactly
+            // like the non-inline by-pointer convention.
+            if matches!(expected_value, NativeValue::HeapString) {
+                let value = match value {
+                    NativeValue::HeapString => value,
+                    NativeValue::StaticString { .. } | NativeValue::RuntimeString { .. } => {
+                        if let Err(diagnostic) = self.emit_heap_string_concat_fragment(
+                            value,
+                            span,
+                            "native inline function string argument",
+                            false,
+                        ) {
+                            self.pop_scope();
+                            return Err(diagnostic);
+                        }
+                        NativeValue::HeapString
+                    }
+                    _ => {
+                        self.pop_scope();
+                        return Err(unsupported(
+                            span,
+                            "native inline function string argument for this value type",
+                        ));
+                    }
+                };
+                let slot = self.allocate_slot(param.clone(), value);
+                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                if let Some(value) = static_argument {
+                    self.bind_static_value(param.clone(), value);
+                }
+                continue;
+            }
             let accepts_call_site_value = flexible
                 || function.flexible_return
                 || (unannotated
@@ -7468,7 +7574,9 @@ impl NativeCodeGenerator {
         value: NativeValue,
     ) -> bool {
         match return_value {
-            NativeValue::RuntimeString { .. } => self.native_string_ref(value).is_some(),
+            NativeValue::RuntimeString { .. } | NativeValue::HeapString => {
+                matches!(value, NativeValue::HeapString) || self.native_string_ref(value).is_some()
+            }
             NativeValue::RuntimeLinesList { .. } => {
                 self.native_value_is_lines_list_compatible(value)
             }
@@ -7487,6 +7595,10 @@ impl NativeCodeGenerator {
     ) -> Result<bool, Diagnostic> {
         match expected {
             NativeValue::RuntimeString { .. } => Ok(self.native_string_ref(value).is_some()),
+            NativeValue::HeapString => {
+                Ok(matches!(value, NativeValue::HeapString)
+                    || self.native_string_ref(value).is_some())
+            }
             NativeValue::RuntimeLinesList { .. } => {
                 Ok(self.native_value_is_lines_list_compatible(value))
             }
@@ -9689,8 +9801,15 @@ impl NativeCodeGenerator {
             }
             "substring" => {
                 self.expect_static_arity(name, arguments, 3, span)?;
-                if self.expr_may_yield_runtime_string(&arguments[0]) {
+                if self.expr_may_yield_runtime_string(&arguments[0])
+                    || self.expr_may_yield_heap_string(&arguments[0])
+                {
                     let input = self.compile_expr(&arguments[0])?;
+                    let input = self.coerce_heap_string_to_runtime(
+                        input,
+                        span,
+                        "substring input exceeds 65536 bytes",
+                    );
                     let Some(input) = self.native_string_ref(input) else {
                         return Err(unsupported(span, "native substring for non-string"));
                     };
@@ -9804,8 +9923,18 @@ impl NativeCodeGenerator {
             }
             "at" => {
                 self.expect_static_arity(name, arguments, 2, span)?;
-                if self.expr_may_yield_runtime_string(&arguments[0]) {
+                if self.expr_may_yield_runtime_string(&arguments[0])
+                    || self.expr_may_yield_heap_string(&arguments[0])
+                {
                     let input = self.compile_expr(&arguments[0])?;
+                    // A heap-string input (by-pointer String parameter)
+                    // materializes into a fixed buffer for the slicing
+                    // machinery — transitional 64KB cap at this site.
+                    let input = self.coerce_heap_string_to_runtime(
+                        input,
+                        span,
+                        "at input exceeds 65536 bytes",
+                    );
                     let Some(input) = self.native_string_ref(input) else {
                         return Err(unsupported(span, "native at for non-string"));
                     };
@@ -10159,6 +10288,14 @@ impl NativeCodeGenerator {
                         self.asm.setcc_al(Condition::Equal);
                         self.asm.movzx_rax_al();
                     }
+                    // Heap string: emptiness is just the byte-length
+                    // prefix at [ptr] being zero.
+                    NativeValue::HeapString => {
+                        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+                        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+                        self.asm.setcc_al(Condition::Equal);
+                        self.asm.movzx_rax_al();
+                    }
                     _ => return Err(unsupported(span, "native isEmptyString for non-string")),
                 }
                 Ok(NativeValue::Bool)
@@ -10183,6 +10320,15 @@ impl NativeCodeGenerator {
                     NativeValue::StaticString { label, len } => {
                         let input = self.string_from_data_label(label, len, span, name)?;
                         self.asm.mov_imm64(Reg::Rax, input.chars().count() as u64);
+                    }
+                    // Heap string: pointer in rax, layout
+                    // [i64 byte_len][bytes...] — count characters in
+                    // place, no fixed-buffer copy and no 64KB cap.
+                    NativeValue::HeapString => {
+                        self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
+                        self.asm.add_reg_imm32(Reg::Rsi, 8);
+                        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rax, 0);
+                        self.emit_utf8_char_count_loop_rsi_rdx();
                     }
                     value => {
                         let Some(input) = self.native_string_ref(value) else {
@@ -16201,6 +16347,11 @@ impl NativeCodeGenerator {
                 }
             };
         }
+        let value = self.coerce_heap_string_to_runtime(
+            value,
+            span,
+            "String#parseInt input exceeds 65536 bytes",
+        );
         let Some(input) = self.native_string_ref(value) else {
             return Err(unsupported(
                 span,
@@ -33719,7 +33870,14 @@ impl NativeCodeGenerator {
     fn emit_runtime_string_char_length(&mut self, value: NativeStringRef) {
         self.asm.mov_data_addr(Reg::Rsi, value.data);
         self.emit_load_native_string_len(Reg::Rdx, value.len);
+        self.emit_utf8_char_count_loop_rsi_rdx();
+    }
 
+    /// Count the UTF-8 characters in the `rdx` bytes at `rsi`, leaving
+    /// the count in rax (continuation bytes — `0b10xxxxxx` — are not
+    /// counted). Shared by the fixed-buffer and heap-string `length`
+    /// paths so both keep character (not byte) semantics.
+    fn emit_utf8_char_count_loop_rsi_rdx(&mut self) {
         let loop_label = self.asm.create_text_label();
         let skip_count = self.asm.create_text_label();
         let done = self.asm.create_text_label();
@@ -35850,7 +36008,7 @@ impl NativeCodeGenerator {
             for ((param, value, shape), reg) in qword_params.iter().zip(arg_regs) {
                 let slot = self.allocate_param_slot((*param).clone(), *value);
                 self.asm.store_rbp_slot(slot.offset, reg);
-                if matches!(value, NativeValue::HeapPointer) {
+                if matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
                     heap_param_offsets.push(slot.offset);
                     if let Some(shape) = shape {
                         self.enum_shapes.insert(slot.id, shape.clone());
@@ -35864,7 +36022,7 @@ impl NativeCodeGenerator {
                 let offset = 16 + ((param_count - 1 - index) * 8);
                 self.asm.load_rbp_arg(Reg::Rax, offset as i32);
                 self.asm.store_rbp_slot(slot.offset, Reg::Rax);
-                if matches!(value, NativeValue::HeapPointer) {
+                if matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
                     heap_param_offsets.push(slot.offset);
                     if let Some(shape) = shape {
                         self.enum_shapes.insert(slot.id, shape.clone());
@@ -36005,6 +36163,27 @@ impl NativeCodeGenerator {
                     "function record return exceeds 65536 bytes",
                 )
             }
+            NativeValue::HeapString => {
+                if matches!(value, NativeValue::HeapString) {
+                    return Ok(());
+                }
+                if matches!(
+                    value,
+                    NativeValue::StaticString { .. } | NativeValue::RuntimeString { .. }
+                ) {
+                    self.emit_heap_string_concat_fragment(
+                        value,
+                        span,
+                        "native function string return",
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                Err(unsupported(
+                    span,
+                    "native function string return value with this type",
+                ))
+            }
             NativeValue::Unit if matches!(value, NativeValue::Unit) => Ok(()),
             expected if value == expected => Ok(()),
             _ => Err(unsupported(
@@ -36083,15 +36262,24 @@ impl NativeCodeGenerator {
     const GC_MAX_SEGMENTS: usize = 64;
     /// Number of pointer slots in the static GC root table. Each slot is
     /// either zero (free) or holds a heap pointer pinned via `__gc_pin`.
-    const GC_ROOT_TABLE_LEN: usize = 1024;
+    const GC_ROOT_TABLE_LEN: usize = 4096;
     /// Maximum number of objects that can be queued for tracing during a
     /// single mark phase. Marking aborts with an error message if the
     /// worklist overflows.
-    const GC_MARK_WORKLIST_LEN: usize = 4096;
+    // The mark worklist must hold the breadth-first frontier of the
+    // live object graph; deep recursion with per-frame heap values
+    // makes the live set proportional to recursion depth.
+    const GC_MARK_WORKLIST_LEN: usize = 65536;
     /// Maximum number of stack-frame heap-pointer slots tracked at any
     /// one time. Allocating a 33rd nested heap-pointer var beyond this
     /// limit aborts with an explicit shadow-stack overflow message.
-    const GC_SHADOW_STACK_LEN: usize = 8192;
+    // Sized for deep recursion: every live frame of a function with
+    // heap-pointer parameters holds roots here (param slots plus any
+    // rooted temporaries), so the cap bounds recursion depth for
+    // string- and enum-carrying functions. Overflow stays a clean
+    // abort. The tables are zero-filled .data, so growing them grows
+    // every emitted binary — keep proportionate.
+    const GC_SHADOW_STACK_LEN: usize = 32768;
     const GC_MAX_PAYLOAD_SIZE: u64 = i64::MAX as u64 - 31 - 4095;
     const GC_MAX_STRING_ALLOC_SIZE: u64 = Self::GC_MAX_PAYLOAD_SIZE - 15;
     const GC_MAX_POINTER_SLOT_COUNT: u64 = Self::GC_MAX_PAYLOAD_SIZE / 8;
@@ -37275,7 +37463,7 @@ fn argument_registers(count: usize) -> Vec<Reg> {
 fn native_param_is_qword(value: &NativeValue) -> bool {
     matches!(
         value,
-        NativeValue::Int | NativeValue::Bool | NativeValue::HeapPointer
+        NativeValue::Int | NativeValue::Bool | NativeValue::HeapPointer | NativeValue::HeapString
     )
 }
 

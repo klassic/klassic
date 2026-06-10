@@ -636,6 +636,23 @@ cargo run -- -e "1 + 2"
   rcx/r8/r9 — and pops again before returning. That makes recursive
   functions over monomorphic enum arguments, and enum-returning
   recursion, compile and run.
+  Annotated `String` parameters and returns ride the same by-pointer
+  convention as GC heap strings (`[i64 byte_len][bytes]`), retiring
+  the fixed 64KB scratch-buffer convention at function boundaries:
+  every recursion frame owns its own string, and strings larger than
+  64KB cross calls. Static and fixed-buffer arguments are lifted onto
+  the heap at the call site; consumers inside bodies either handle
+  heap strings directly (`length` counts UTF-8 characters in place,
+  `isEmptyString` reads the length prefix, `assertResult` and `==`
+  compare through the heap-string equality) or materialize into a
+  fresh fixed buffer transitionally (`substring`, `at`,
+  `String#parseInt` — those sites keep the 64KB cap for now). The
+  caller unpins heap-string arguments exactly like enum pointers —
+  the pin/unpin pair must stay matched per argument or the root
+  table fills after a few thousand calls — and the GC's static
+  tables (root table, shadow stack, mark worklist) are sized so deep
+  recursion with per-frame heap values runs thousands of frames
+  before the clean overflow abort.
   Annotations naming a *fully-applied* generic enum (`Option<Int>`,
   `Option<String>`, `Option<Option<Int>>`) ride the same ABI: the
   annotation text alone fixes every type parameter, so the parameter's

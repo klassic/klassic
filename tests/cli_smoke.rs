@@ -314,6 +314,65 @@ fn builds_native_executable_for_recursive_integer_functions() {
     assert!(run.stderr.is_empty());
 }
 
+/// Annotated String parameters/returns travel as GC heap pointers
+/// (GitHub issue #424): every recursion frame owns its own string, so
+/// recursive functions can build fresh strings per frame, >64KB
+/// strings cross call boundaries, and `length` keeps character (not
+/// byte) semantics on heap strings. The deep-churn case exercises the
+/// caller pin/unpin balance and the shadow-stack/mark-worklist sizing
+/// under collections.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_heap_string_parameters() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_heap_string_abi_{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_heap_string_abi_{unique}.bin"));
+    let big = "y".repeat(70000);
+    fs::write(
+        &source_path,
+        format!(
+            "def describe(s: String, n: Int): String = if (n <= 0) s else describe(s + \"x\", n - 1)\n\
+             def ident(s: String): String = s\n\
+             def churn(s: String, n: Int): Int = if (n <= 0) length(s) else churn(s + \"ab\", n - 1)\n\
+             println(describe(\"r\", 4))\n\
+             println(length(describe(\"あいう\", 2)))\n\
+             println(length(ident(\"{big}\")))\n\
+             println(churn(\"\", 2000))\n"
+        ),
+    )
+    .expect("temp source file should write");
+    let expected = "rxxxx\n5\n70000\n4000\n";
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "heap string ABI should compile\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        run_output.status.success(),
+        "heap string ABI binary should run\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_recursive_runtime_string_parameter() {
