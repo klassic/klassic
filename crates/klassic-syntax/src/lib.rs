@@ -2972,9 +2972,14 @@ impl Parser {
         let colon_span = self.bump().span;
         let start_index = self.index;
         let mut depth = 0usize;
+        // Angle-bracket nesting: a comma inside `Result<Int, String>` or
+        // `Map<String, Int>` separates type arguments, not parameters,
+        // so stop tokens only apply outside `<...>`. `>>` lexes as two
+        // `Greater` tokens, so nested generics close one level each.
+        let mut angle_depth = 0usize;
         loop {
             let marker = TokenMarker::from_kind(&self.peek().kind);
-            if depth == 0 && stop_tokens.contains(&marker) {
+            if depth == 0 && angle_depth == 0 && stop_tokens.contains(&marker) {
                 let end_index = self.index;
                 let span = if start_index < end_index {
                     self.tokens[start_index]
@@ -3009,6 +3014,14 @@ impl Parser {
                         }));
                     }
                     depth -= 1;
+                    self.bump();
+                }
+                TokenKind::Less => {
+                    angle_depth += 1;
+                    self.bump();
+                }
+                TokenKind::Greater => {
+                    angle_depth = angle_depth.saturating_sub(1);
                     self.bump();
                 }
                 TokenKind::Eof => {

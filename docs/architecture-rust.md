@@ -630,7 +630,11 @@ cargo run -- -e "1 + 2"
   classifies as a heap-pointer field whose nested shape is not tracked
   through the field — a deep pattern into it is diagnosed — because
   recursive traversals re-attach the concrete shape through the
-  function parameter's annotation on every frame. Recursion over
+  function parameter's annotation on every frame. The annotation
+  scanner in `klassic-syntax` tracks angle-bracket depth alongside
+  parentheses, so multi-parameter applied annotations
+  (`Result<Int, String>`, `Map<String, Int>`) parse — a comma inside
+  `<...>` previously terminated the annotation. Recursion over
   generic parameters *without* a concrete annotation (true
   per-call-site monomorphization) remains diagnosed.
   Imports of the plain-Klassic `std.*` modules are inlined before type

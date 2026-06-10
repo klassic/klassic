@@ -21827,6 +21827,90 @@ fn native_build_compiles_self_referential_generic_enums() {
     );
 }
 
+/// A comma inside an applied type annotation (`Result<Int, String>`,
+/// `Map<String, Int>`) used to terminate the annotation scan — the
+/// parser only tracked parenthesis depth — so two-parameter generic
+/// annotations were unwritable anywhere. The scanner now tracks angle
+/// brackets too (`>>` lexes as two `Greater` tokens, closing one level
+/// each). Exercises the evaluator and the native by-pointer ABI with a
+/// recursive Result-typed function and a Result-returning function
+/// matched at the call site.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_compiles_comma_separated_generic_annotations() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_result_comma_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_result_comma_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Result<a, e> { case Ok(value: a); case Err(error: e) }\n\
+         def retries(r: Result<Int, String>, n: Int): Int = r match {\n\
+           case Ok(value) => value + n\n\
+           case Err(error) => if (n <= 0) 0 - 1 else retries(Err(error), n - 1)\n\
+         }\n\
+         def safeDiv(a: Int, b: Int): Result<Int, String> =\n\
+           if (b == 0) Err(\"div by zero\") else Ok(a / b)\n\
+         println(retries(Ok(40), 2))\n\
+         println(retries(Err(\"boom\"), 3))\n\
+         println(safeDiv(10, 2) match { case Ok(v) => v; case Err(e) => 0 - 1 })\n\
+         println(safeDiv(10, 0) match { case Ok(v) => v; case Err(e) => 0 - 1 })\n",
+    )
+    .expect("temp source file should write");
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("source path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    assert!(
+        eval_output.status.success(),
+        "evaluator should accept comma-separated generic annotations\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stdout),
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&eval_output.stdout),
+        "42\n-1\n5\n-1\n"
+    );
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "42\n-1\n5\n-1\n"
+    );
+}
+
 /// Passing a generic enum whose tracked payload shape contradicts the
 /// parameter annotation (`Some(\"oops\")` into `Option<Int>`) is a
 /// compile-time diagnostic — the callee would read the payload per its
