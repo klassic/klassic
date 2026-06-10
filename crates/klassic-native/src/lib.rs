@@ -36929,6 +36929,26 @@ fn expr_references_any_name_with_shadowing(
         Expr::InstanceDeclaration { methods, .. } => methods
             .iter()
             .any(|method| expr_references_any_name_with_shadowing(method, names, shadowed)),
+        // Generic-enum matches survive into codegen as `Expr::Match`
+        // (monomorphic ones are desugared into if-chains earlier), so a
+        // function recursing only inside a match arm must still be
+        // detected — treating `match` as reference-free let such
+        // functions through to call-site inlining, which recursed the
+        // compiler off its stack. Pattern bindings shadow like params.
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            if expr_references_any_name_with_shadowing(scrutinee, names, shadowed) {
+                return true;
+            }
+            arms.iter().any(|arm| {
+                let mut nested_shadowed = shadowed.clone();
+                collect_pattern_binding_names(&arm.pattern, &mut nested_shadowed);
+                arm.guard.as_ref().is_some_and(|guard| {
+                    expr_references_any_name_with_shadowing(guard, names, &nested_shadowed)
+                }) || expr_references_any_name_with_shadowing(&arm.body, names, &nested_shadowed)
+            })
+        }
         Expr::Int { .. }
         | Expr::Double { .. }
         | Expr::Bool { .. }
@@ -36941,8 +36961,26 @@ fn expr_references_any_name_with_shadowing(
         | Expr::TypeClassDeclaration { .. }
         | Expr::ExtensionDeclaration { .. }
         | Expr::EnumDeclaration { .. }
-        | Expr::Match { .. }
         | Expr::PegRuleBlock { .. } => false,
+    }
+}
+
+/// Collect the variable names a pattern binds (recursing through
+/// constructor arguments), for shadowing-aware expression walks.
+fn collect_pattern_binding_names(pattern: &Pattern, names: &mut HashSet<String>) {
+    match pattern {
+        Pattern::Variable { name, .. } => {
+            names.insert(name.clone());
+        }
+        Pattern::Constructor { args, .. } => {
+            for arg in args {
+                collect_pattern_binding_names(arg, names);
+            }
+        }
+        Pattern::Wildcard { .. }
+        | Pattern::LiteralInt { .. }
+        | Pattern::LiteralString { .. }
+        | Pattern::LiteralBool { .. } => {}
     }
 }
 
@@ -37038,6 +37076,17 @@ fn collect_assigned_names(expr: &Expr, names: &mut HashSet<String>) {
                 collect_assigned_names(expression, names);
             }
         }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_assigned_names(scrutinee, names);
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    collect_assigned_names(guard, names);
+                }
+                collect_assigned_names(&arm.body, names);
+            }
+        }
         Expr::Int { .. }
         | Expr::Double { .. }
         | Expr::Bool { .. }
@@ -37051,7 +37100,6 @@ fn collect_assigned_names(expr: &Expr, names: &mut HashSet<String>) {
         | Expr::TypeClassDeclaration { .. }
         | Expr::ExtensionDeclaration { .. }
         | Expr::EnumDeclaration { .. }
-        | Expr::Match { .. }
         | Expr::PegRuleBlock { .. } => {}
     }
 }
@@ -37140,6 +37188,19 @@ fn static_expr_is_pure(expr: &Expr) -> bool {
         Expr::Lambda { .. } => true,
         Expr::DefDecl { body, .. } => static_expr_is_pure(body),
         Expr::InstanceDeclaration { methods, .. } => methods.iter().all(static_expr_is_pure),
+        // A `match` is pure only when its scrutinee, guards, and arm
+        // bodies are — generic-enum matches reach codegen un-desugared,
+        // and lumping them with effect-free declarations would let
+        // effectful arms be elided.
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            static_expr_is_pure(scrutinee)
+                && arms.iter().all(|arm| {
+                    arm.guard.as_ref().is_none_or(static_expr_is_pure)
+                        && static_expr_is_pure(&arm.body)
+                })
+        }
         Expr::Int { .. }
         | Expr::Double { .. }
         | Expr::Bool { .. }
@@ -37155,7 +37216,6 @@ fn static_expr_is_pure(expr: &Expr) -> bool {
         | Expr::AxiomDeclaration { .. }
         | Expr::ExtensionDeclaration { .. }
         | Expr::EnumDeclaration { .. }
-        | Expr::Match { .. }
         | Expr::PegRuleBlock { .. } => true,
     }
 }
@@ -37305,6 +37365,17 @@ fn expr_contains_thread_call(expr: &Expr, thread_aliases: &HashSet<String>) -> b
         Expr::AxiomDeclaration { proposition, .. } => {
             expr_contains_thread_call(proposition, thread_aliases)
         }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            expr_contains_thread_call(scrutinee, thread_aliases)
+                || arms.iter().any(|arm| {
+                    arm.guard
+                        .as_ref()
+                        .is_some_and(|guard| expr_contains_thread_call(guard, thread_aliases))
+                        || expr_contains_thread_call(&arm.body, thread_aliases)
+                })
+        }
         Expr::Int { .. }
         | Expr::Double { .. }
         | Expr::Bool { .. }
@@ -37318,7 +37389,6 @@ fn expr_contains_thread_call(expr: &Expr, thread_aliases: &HashSet<String>) -> b
         | Expr::TypeClassDeclaration { .. }
         | Expr::ExtensionDeclaration { .. }
         | Expr::EnumDeclaration { .. }
-        | Expr::Match { .. }
         | Expr::PegRuleBlock { .. } => false,
     }
 }

@@ -21505,6 +21505,56 @@ fn native_build_runs_recursive_enum_functions_across_collections() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "2463000\n");
 }
 
+/// A function recursing only inside a `match` arm used to slip past the
+/// self-recursion detector (the expression walker treated `Expr::Match`
+/// as reference-free), so a recursive generic-enum helper was call-site
+/// inlined into itself until the compiler overflowed its stack. It now
+/// gets the regular recursive-inline diagnostic. Generic-enum recursion
+/// itself is milestone 3b (per-instantiation function specialization).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_reports_recursive_generic_enum_functions() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_recursion_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_recursion_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Option<a> { case Some(v: a); case None }\n\
+         def depth(o: Option<Int>): Int = o match {\n\
+           case Some(v) => 1 + depth(None)\n\
+           case None => 0\n\
+         }\n\
+         println(depth(Some(5)))\n",
+    )
+    .expect("temp source file should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(!build.status.success());
+    assert!(
+        String::from_utf8_lossy(&build.stderr)
+            .contains("native recursive function requiring call-site inlining"),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
 /// PR 7: a `#!` shebang at the top of a `.kl` file is dropped during
 /// source loading so the rest of the script parses normally.
 #[test]
