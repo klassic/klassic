@@ -253,15 +253,12 @@ fn find_runtime_staticlib() -> Option<std::path::PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    for candidate in [
+    [
         dir.join("libklassic_runtime.a"),
         dir.join("lib").join("libklassic_runtime.a"),
-    ] {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
 }
 
 /// Compile generated C and link it with the runtime staticlib using

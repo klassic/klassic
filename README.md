@@ -114,11 +114,15 @@ klassic --backend c build path/to/program.kl -o program.c
 cc -o program program.c
 ```
 
-The C backend covers a deliberately small subset (integers, booleans, string
-literals, `println`, `if` / `while`, annotated `def`s including recursion) and
-its output depends only on `stdio.h` / `stdint.h`, so any C compiler on any
-platform can finish the job. Unsupported constructs are source-located
-diagnostics.
+The C backend covers a growing subset — integers, doubles, booleans, full
+string values (concatenation, equality, `length`, `substring`, `at`,
+`toString`), `println`, `if` / `while`, and annotated `def`s including
+recursion — with strings served by the `klassic_rt_*` shims in the bundled
+`libklassic_runtime.a`, which share their semantics with the evaluator.
+When the output name doesn't end in `.c`, klassic invokes the system C
+compiler and links the runtime automatically, producing an executable in
+one step (that's the native-binary path on macOS). Unsupported constructs
+are source-located diagnostics.
 
 Start the REPL:
 

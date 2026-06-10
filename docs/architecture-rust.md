@@ -720,17 +720,24 @@ cargo run -- -e "1 + 2"
   a string-payload `mapOption` read back as a string rather than the
   `None` arm's defaulted scalar.
 
-  A portable C backend (roadmap PR 9) lives behind `--backend c`:
-  `klassic --backend c build program.kl -o program.c` emits one C99
-  translation unit (stdio/stdint only) for a deliberately small subset
-  — `Int` / `Bool` / `String` literals, arithmetic / comparison /
-  logical operators, `val` / `mutable` / assignment, `if` / `while`,
-  `println`, and annotated top-level `def`s including recursion.
-  Anything outside the subset is a source-located diagnostic, never
-  wrong code, and the direct ELF path is untouched. The emitter is
-  `crates/klassic-native/src/cbackend.rs`; the runtime-call shim that
-  will widen the subset (strings beyond literals, the GC types) is
-  roadmap PR 10.
+  A portable C backend (roadmap PR 9 / PR 10) lives behind
+  `--backend c`: `klassic --backend c build program.kl -o program.c`
+  emits one C99 translation unit for a growing subset — `Int` /
+  `Double` / `Bool` / `String` values, arithmetic / comparison /
+  logical operators, string concatenation / equality / `length` /
+  `substring` / `at` / `toString`, `val` / `mutable` / assignment,
+  `if` / `while`, `println`, and annotated top-level `def`s including
+  recursion. Strings are `KStr` values served by the `klassic_rt_*`
+  C-ABI shims in `klassic-runtime` (built as `libklassic_runtime.a`
+  and bundled with releases); the shims are written against Rust
+  `str` exactly like the evaluator's builtins, so semantics match by
+  construction, and the root-stack ABI is already reserved for the
+  future collector. An output name not ending in `.c` makes the CLI
+  find the system C compiler and link the runtime automatically — the
+  macOS native-binary path (no Mach-O direct emission, per the
+  roadmap). Anything outside the subset is a source-located
+  diagnostic, never wrong code, and the direct ELF path is untouched.
+  The emitter is `crates/klassic-native/src/cbackend.rs`.
 
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program
