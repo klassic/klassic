@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use klassic_span::{Diagnostic, DiagnosticKind, Severity, Span};
 use klassic_syntax::{
@@ -1404,7 +1404,9 @@ impl TypeChecker {
                 Ok(Type::Unit)
             }
             Expr::Match {
-                scrutinee, arms, ..
+                scrutinee,
+                arms,
+                span,
             } => {
                 let scrutinee_type = self.infer_expr(scrutinee)?;
                 let mut arm_type = self.fresh_var();
@@ -1419,6 +1421,7 @@ impl TypeChecker {
                     self.pop_scope();
                     arm_type = self.unify(arm_type, body_type, arm.span)?;
                 }
+                self.check_match_coverage(&scrutinee_type, arms, *span)?;
                 Ok(self.resolve(&arm_type))
             }
             Expr::ExtensionDeclaration {
@@ -3634,6 +3637,69 @@ impl TypeChecker {
         }
     }
 
+    /// Exhaustiveness and reachability for a `match` over a known enum:
+    /// every variant must be covered by an unguarded arm (a wildcard /
+    /// variable arm covers everything; a constructor arm covers its
+    /// variant), and an arm after an unguarded irrefutable one is dead.
+    /// Guarded arms never count as covering — guards are undecidable.
+    /// Coverage is variant-granular: refutable sub-patterns
+    /// (`case Some(5)` with no other `Some` arm) still fall through to
+    /// the runtime match-failure path, as do non-enum scrutinees.
+    fn check_match_coverage(
+        &mut self,
+        scrutinee_type: &Type,
+        arms: &[klassic_syntax::MatchArm],
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let mut closed = false;
+        for arm in arms {
+            if closed {
+                return Err(type_error(
+                    arm.span,
+                    "unreachable match arm: a preceding pattern already matches every value",
+                ));
+            }
+            if arm.guard.is_none() && pattern_is_irrefutable(&arm.pattern) {
+                closed = true;
+            }
+        }
+        if closed {
+            return Ok(());
+        }
+        let Type::Enum(enum_name, _) = self.resolve(scrutinee_type) else {
+            return Ok(());
+        };
+        let Some(schema) = self.enum_schemas.get(&enum_name) else {
+            return Ok(());
+        };
+        let mut covered = HashSet::new();
+        for arm in arms {
+            if arm.guard.is_some() {
+                continue;
+            }
+            if let klassic_syntax::Pattern::Constructor { name, .. } = &arm.pattern {
+                covered.insert(name.clone());
+            }
+        }
+        let missing: Vec<&str> = schema
+            .variants
+            .iter()
+            .map(|(variant, _)| variant.as_str())
+            .filter(|variant| !covered.contains(*variant))
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(type_error(
+                span,
+                format!(
+                    "match on `{enum_name}` is not exhaustive: missing {}",
+                    missing.join(", ")
+                ),
+            ))
+        }
+    }
+
     /// Look up the enum owning `variant`, returning the enum name, its
     /// type parameters, and the variant's field types (over
     /// `Type::Generic` parameters).
@@ -4965,6 +5031,14 @@ fn collect_free_vars(ty: &Type, vars: &mut Vec<GenericVar>) {
         }
         _ => {}
     }
+}
+
+/// Whether a pattern matches every value of its scrutinee type.
+fn pattern_is_irrefutable(pattern: &klassic_syntax::Pattern) -> bool {
+    matches!(
+        pattern,
+        klassic_syntax::Pattern::Wildcard { .. } | klassic_syntax::Pattern::Variable { .. }
+    )
 }
 
 fn occurs_in(var: GenericVar, ty: &Type) -> bool {

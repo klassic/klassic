@@ -21517,6 +21517,61 @@ fn typecheck_accepts_well_typed_generic_enums() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "42\nhi\n9\n()\n");
 }
 
+/// A match over a known enum that leaves a variant uncovered is a
+/// compile-time diagnostic listing the missing variants, and an arm
+/// after an unguarded irrefutable pattern is flagged unreachable
+/// (GitHub issue #420). Coverage is variant-granular; guarded arms
+/// never count as covering.
+#[test]
+fn typecheck_reports_match_exhaustiveness_and_unreachable_arms() {
+    let missing = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Color { case Red; case Green; case Blue }\n\
+             def name(c: Color): Int = c match { case Red => 1; case Green => 2 }\n\
+             println(name(Red))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("match on `Color` is not exhaustive: missing Blue"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    let unreachable = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Color { case Red; case Green }\n\
+             println(Red match { case _ => 0; case Red => 1 })",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(!unreachable.status.success());
+    assert!(
+        String::from_utf8_lossy(&unreachable.stderr).contains("unreachable match arm"),
+        "{}",
+        String::from_utf8_lossy(&unreachable.stderr)
+    );
+
+    let exhaustive = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Color { case Red; case Green }\n\
+             println(Red match { case Red => 1; case Green => 2 })",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        exhaustive.status.success(),
+        "exhaustive match should pass\nstderr:\n{}",
+        String::from_utf8_lossy(&exhaustive.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&exhaustive.stdout), "1\n()\n");
+}
+
 /// Allocating enum values in a loop long enough to exhaust the initial
 /// 1 MiB GC heap exercises collection and free-list reuse. A reused
 /// first-fit block used to keep stale payload bytes (and `__gc_record`'s
