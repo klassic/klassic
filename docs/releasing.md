@@ -13,11 +13,12 @@ Releases are fully automated by `.github/workflows/release.yml`.
    git push origin v0.2.0
    ```
 
-The workflow runs the full test suite, builds a statically-linked
-`x86_64-unknown-linux-musl` binary (runs on any x86_64 Linux with no
-shared-library dependencies), and attaches
-`klassic-<tag>-x86_64-unknown-linux-musl.tar.gz` to a GitHub Release
-with generated notes.
+The workflow runs the full test suite on Linux and macOS, builds a
+statically-linked `x86_64-unknown-linux-musl` binary (runs on any
+x86_64 Linux with no shared-library dependencies) plus macOS binaries
+for `aarch64-apple-darwin` and `x86_64-apple-darwin`, and attaches
+`klassic-<tag>-<target>.tar.gz` for each to a GitHub Release with
+generated notes.
 
 ## Dry run
 

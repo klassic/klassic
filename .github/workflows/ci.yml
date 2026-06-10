@@ -25,3 +25,18 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release
+
+  # The evaluator, REPL, and C backend are host-independent; only the
+  # direct ELF backend is Linux-only and its tests are cfg-gated. This
+  # job keeps the macOS path honest.
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test

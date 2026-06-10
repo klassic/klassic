@@ -37,15 +37,24 @@ Rust. The implementation builds a native `klassic` executable with Cargo.
 
 ## Install
 
-Prebuilt static Linux (x86_64) binaries are attached to
-[GitHub Releases](https://github.com/klassic/klassic/releases) — they run on
-any x86_64 Linux with no Rust toolchain or shared-library dependencies:
+Prebuilt binaries are attached to
+[GitHub Releases](https://github.com/klassic/klassic/releases): a static
+Linux (x86_64) build that runs on any x86_64 Linux with no Rust toolchain
+or shared-library dependencies, plus macOS builds for Apple Silicon
+(`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`).
 
 ```bash
+# Linux x86_64
 curl -L https://github.com/klassic/klassic/releases/latest/download/klassic-$(curl -s https://api.github.com/repos/klassic/klassic/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4)-x86_64-unknown-linux-musl.tar.gz | tar xz
+# macOS (Apple Silicon — use x86_64-apple-darwin on Intel)
+curl -L https://github.com/klassic/klassic/releases/latest/download/klassic-$(curl -s https://api.github.com/repos/klassic/klassic/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4)-aarch64-apple-darwin.tar.gz | tar xz
 ./klassic --version
 ./klassic -e "1 + 2"
 ```
+
+On macOS the evaluator, REPL, and the portable C backend are fully
+supported; the direct-to-ELF native backend stays Linux-only — on a Mac,
+produce native executables with `--backend c` plus the system `cc`.
 
 Alternatively, build from source with Cargo:
 
