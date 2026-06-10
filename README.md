@@ -9,15 +9,30 @@ Rust. The implementation builds a native `klassic` executable with Cargo.
 ## Features
 
 - Hindley-Milner style type inference with annotations and generalized schemes
+- Algebraic data types with real nominal typing, match exhaustiveness and
+  unreachable-arm diagnostics, and pattern matching with nesting, literals,
+  and guards
 - Row-polymorphic records and record field selection
-- First-class functions, closures, named recursive functions, and mutable locals
+- First-class functions, closures, named recursive functions, mutually
+  recursive top-level functions, and mutable locals
 - Type classes, constrained polymorphism, and repository-backed higher-kinded examples
 - Lightweight theorem / trust / axiom surface with `--warn-trust` and `--deny-trust`
 - String interpolation, comments, cleanup clauses, loops, ternary expressions, and casts
 - List, map, and set literals with comma, space, or newline separators
-- Pure Rust file, directory, string, list, map, set, time, and thread helpers
-- Native CLI and REPL
-- Precise mark-and-sweep garbage collector with multi-segment heap growth, exposed through 68 `__gc_*` debug builtins
+- Multi-file programs: `import` resolves user modules from neighboring files
+  in both the evaluator and native builds
+- Standard library written in Klassic itself — `std.list`, `std.string`,
+  `std.math`, `std.option`, `std.result`, `std.map`, `std.set`, `std.json`,
+  `std.time`, and more
+- Native CLI and a REPL that echoes every value with its inferred type
+- Direct-to-ELF native compiler (no `cc`/`as`/`ld`) with by-pointer calling
+  conventions for enums and strings, a stack-overflow probe, and
+  compile-time-budgeted constant folding
+- Portable C backend (`--backend c`) emitting a single C99 translation unit
+  for a growing subset
+- Precise mark-and-sweep garbage collector with multi-segment heap growth and
+  mmap-backed tables, exposed through 68 `__gc_*` debug builtins
+- Release automation: tagged pushes publish statically-linked Linux binaries
 - Standalone Rust macro PEG subsystem
 
 ## Install
@@ -81,7 +96,20 @@ klassic build path/to/program.kl -o program
 
 Pass `--target linux-x86_64` or `--target x86_64-unknown-linux-gnu` to select
 the native target explicitly, or `--target native` on a matching host. Linux
-x86_64 is currently the only implemented target.
+x86_64 is currently the only implemented direct target.
+
+Emit portable C instead of an ELF executable:
+
+```bash
+klassic --backend c build path/to/program.kl -o program.c
+cc -o program program.c
+```
+
+The C backend covers a deliberately small subset (integers, booleans, string
+literals, `println`, `if` / `while`, annotated `def`s including recursion) and
+its output depends only on `stdio.h` / `stdint.h`, so any C compiler on any
+platform can finish the job. Unsupported constructs are source-located
+diagnostics.
 
 Start the REPL:
 
@@ -89,7 +117,9 @@ Start the REPL:
 klassic
 ```
 
-REPL commands include `:history` and `:exit`.
+The REPL echoes every value with its inferred type (`3: Int`,
+`[1, 2, 3]: List<Int>`); commands include `:history`, `:load <path>`,
+`:reset`, and `:exit`. `klassic --version` prints the release version.
 
 Trust diagnostics:
 

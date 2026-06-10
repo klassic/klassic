@@ -26,6 +26,7 @@ cargo run -- -f path/to/program.kl                   # equivalent to above
 cargo run                                            # REPL (`:history`, `:exit`)
 cargo run -- build path/to/program.kl -o program     # native build (Linux x86_64)
 cargo run -- targets                                  # list known native targets
+cargo run -- --backend c build program.kl -o program.c  # portable C backend (subset)
 cargo run -- --target x86_64-unknown-linux-gnu build path/to/program.kl -o program
 cargo run -- --warn-trust path/to/program.kl         # report trusted proofs
 cargo run -- --deny-trust path/to/program.kl         # reject trusted proofs
@@ -123,13 +124,13 @@ When adding syntax or semantics:
 ## Language Surface (quick reference)
 
 - `val` (immutable) / `mutable` (reassignable) bindings.
-- `def f(x) = ...` and `(x) => ...` lambdas; placeholders like `_ + 1`.
+- `def f(x) = ...` and `(x) => ...` lambdas; placeholders like `_ + 1`. Top-level defs may forward-reference each other (mutual recursion); `else` may start a continuation line.
 - Space- / comma- / newline-separated collection literals: `[1 2 3]`, `%["a":1 "b":2]`, `%(1 2 3)`.
 - String interpolation: `"Hello #{name}"`.
 - `cleanup { ... }` clauses run after the associated expression.
 - `module foo.bar { ... }` plus selective / aliased imports.
 - Structural records (`record { x = 1; y = 2 }`) and nominal record declarations (`record Point { x: Int; y: Int }`).
-- Algebraic data types: `enum Option<a> { case Some(value: a); case None }` and Scala-style postfix pattern matching (`o match { case Some(v) => v; case None => 0 }`). Today the evaluator runs the dispatch; native compile rejects `enum` / `match` with a source-located diagnostic.
+- Algebraic data types: `enum Option<a> { case Some(value: a); case None }` and Scala-style postfix pattern matching (`o match { case Some(v) => v; case None => 0 }`). Enums are real nominal types in the checker (match exhaustiveness and unreachable arms are diagnosed), and native builds compile monomorphic and shape-tracked generic enums — including recursion — through a per-frame by-pointer ABI; remaining native gaps (e.g. list-of-enum payloads) fail with source-located diagnostics.
 - Extension methods: `extension <a>(this: List<a>) { def headOr(d) = ... }` adds dot-callable methods to existing types. Stdlib leans on this for `std.string`, `std.list`, `std.math`, `std.option`, `std.result`, `std.map`, `std.set`.
 - Type classes with constraints, including higher-kinded examples.
 - Proof surface: `axiom`, `theorem`, with `--warn-trust` / `--deny-trust` flags.
