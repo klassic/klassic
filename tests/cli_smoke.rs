@@ -22460,6 +22460,66 @@ fn shebang_line_is_stripped_from_source() {
     );
 }
 
+/// Top-level defs can forward-reference each other (GitHub issue
+/// #427): the type checker predeclares every unconstrained def in a
+/// block before checking statements (retiring the monomorphic
+/// predeclaration before generalizing so polymorphic helpers stay
+/// polymorphic), and the evaluator seeds shared placeholder cells so
+/// an early closure's environment snapshot sees later sibling
+/// definitions. Covers eval and native.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn top_level_defs_support_mutual_recursion() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_mutual_rec_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_mutual_rec_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def isEven(n: Int): Bool = if (n == 0) true else isOdd(n - 1)\n\
+         def isOdd(n: Int): Bool = if (n == 0) false else isEven(n - 1)\n\
+         println(isEven(10))\n\
+         println(isOdd(7))\n",
+    )
+    .expect("temp source file should write");
+    let expected = "true\ntrue\n";
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    assert!(
+        eval_output.status.success(),
+        "mutual recursion should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&eval_output.stdout), expected);
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "mutual recursion should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
+}
+
 /// The portable C backend (GitHub issue #425, roadmap PR 9) emits a
 /// single C99 translation unit for the Int/Bool/String/println/if/
 /// while/def subset behind `--backend c`. The generated source depends

@@ -146,6 +146,10 @@ struct TypeChecker {
     proof_scopes: Vec<HashMap<String, ProofSignature>>,
     record_schemas: HashMap<String, RecordSchema>,
     enum_schemas: HashMap<String, EnumSchema>,
+    /// Tentative (params, return) types from block-level def
+    /// predeclaration, consumed by the DefDecl inference so forward
+    /// calls and the eventual definition share one set of variables.
+    predeclared_defs: HashMap<String, (Vec<Type>, Type)>,
     typeclasses: HashMap<String, TypeClassInfo>,
     instances: Vec<InstanceInfo>,
     current_module: Option<String>,
@@ -422,6 +426,16 @@ impl TypeChecker {
 
     fn lookup(&self, name: &str) -> Option<&Binding> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    /// Drop the innermost binding for `name` (used to retire a def
+    /// predeclaration before generalizing its final signature).
+    fn remove_binding(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.remove(name).is_some() {
+                return;
+            }
+        }
     }
 
     fn lookup_proof_signature(&self, name: &str) -> Option<&ProofSignature> {
@@ -1222,6 +1236,7 @@ impl TypeChecker {
         match expr {
             Expr::Block { expressions, .. } => {
                 self.predeclare_proofs(expressions);
+                self.predeclare_defs(expressions);
                 let mut last = Type::Unit;
                 for expression in expressions {
                     last = self.infer_expr(expression)?;
@@ -1229,6 +1244,57 @@ impl TypeChecker {
                 Ok(last)
             }
             other => self.infer_expr(other),
+        }
+    }
+
+    /// Declare every `def` in the block before checking any statement,
+    /// so functions can forward-reference each other (mutual
+    /// recursion). The tentative parameter/return types are remembered
+    /// and reused by the `DefDecl` inference, which keeps a forward
+    /// call's constraints connected to the definition's final type.
+    /// Defs with type parameters or constraints keep sequential
+    /// scoping for now — their annotation-shared variables would
+    /// disconnect from a separately-built constraint set.
+    fn predeclare_defs(&mut self, expressions: &[Expr]) {
+        for expression in expressions {
+            let Expr::DefDecl {
+                name,
+                type_params,
+                constraints,
+                params,
+                param_annotations,
+                return_annotation,
+                ..
+            } = expression
+            else {
+                continue;
+            };
+            if !type_params.is_empty() || !constraints.is_empty() || self.lookup(name).is_some() {
+                continue;
+            }
+            let mut named = HashMap::new();
+            let mut param_types = param_annotations
+                .iter()
+                .map(|annotation| {
+                    annotation
+                        .as_ref()
+                        .map(|annotation| {
+                            self.parse_annotation_with_named_vars(annotation, &mut named)
+                        })
+                        .unwrap_or_else(|| self.fresh_var())
+                })
+                .collect::<Vec<_>>();
+            if param_types.len() < params.len() {
+                param_types.resize_with(params.len(), || self.fresh_var());
+            }
+            let return_type = return_annotation
+                .as_ref()
+                .map(|annotation| self.parse_annotation_with_named_vars(annotation, &mut named))
+                .unwrap_or_else(|| self.fresh_var());
+            let function_type = Type::Function(param_types.clone(), Box::new(return_type.clone()));
+            self.declare(name.clone(), false, function_type, Vec::new(), Vec::new());
+            self.predeclared_defs
+                .insert(name.clone(), (param_types, return_type));
         }
     }
 
@@ -1500,24 +1566,36 @@ impl TypeChecker {
                 span,
             } => {
                 let mut named = HashMap::new();
-                let mut param_types = param_annotations
-                    .iter()
-                    .map(|annotation| {
-                        annotation
-                            .as_ref()
-                            .map(|annotation| {
-                                self.parse_annotation_with_named_vars(annotation, &mut named)
-                            })
-                            .unwrap_or_else(|| self.fresh_var())
-                    })
-                    .collect::<Vec<_>>();
+                // Reuse the block-level predeclaration's variables when
+                // one exists, so forward calls already checked against
+                // them constrain this definition.
+                let predeclared = self.predeclared_defs.remove(name);
+                let was_predeclared = predeclared.is_some();
+                let (mut param_types, return_type) = if let Some((params, ret)) = predeclared {
+                    (params, ret)
+                } else {
+                    let param_types = param_annotations
+                        .iter()
+                        .map(|annotation| {
+                            annotation
+                                .as_ref()
+                                .map(|annotation| {
+                                    self.parse_annotation_with_named_vars(annotation, &mut named)
+                                })
+                                .unwrap_or_else(|| self.fresh_var())
+                        })
+                        .collect::<Vec<_>>();
+                    let return_type = return_annotation
+                        .as_ref()
+                        .map(|annotation| {
+                            self.parse_annotation_with_named_vars(annotation, &mut named)
+                        })
+                        .unwrap_or_else(|| self.fresh_var());
+                    (param_types, return_type)
+                };
                 if param_types.len() < params.len() {
                     param_types.resize_with(params.len(), || self.fresh_var());
                 }
-                let return_type = return_annotation
-                    .as_ref()
-                    .map(|annotation| self.parse_annotation_with_named_vars(annotation, &mut named))
-                    .unwrap_or_else(|| self.fresh_var());
                 let resolved_constraints =
                     self.build_constraints(constraints, &mut named, *span)?;
                 let function_type =
@@ -1544,6 +1622,13 @@ impl TypeChecker {
                     .collect();
                 let final_type =
                     Type::Function(resolved_params, Box::new(self.resolve(&resolved_return)));
+                // The block-level predeclaration left a monomorphic
+                // binding whose variables would otherwise count as
+                // environment-bound and block generalization — drop it
+                // before quantifying; the final declaration replaces it.
+                if was_predeclared {
+                    self.remove_binding(name);
+                }
                 let generalized_vars =
                     self.generalize_signature(&final_type, &resolved_constraints);
                 self.declare(
@@ -1845,6 +1930,7 @@ impl TypeChecker {
             Expr::Block { expressions, .. } => {
                 self.push_scope();
                 self.predeclare_proofs(expressions);
+                self.predeclare_defs(expressions);
                 let mut last = Type::Unit;
                 for expression in expressions {
                     last = self.infer_expr(expression)?;

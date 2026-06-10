@@ -106,6 +106,17 @@ impl Environment {
         binding
     }
 
+    /// The binding for `name` in the innermost scope only (used by the
+    /// def pre-pass so a definition fills the placeholder every earlier
+    /// closure snapshot already shares).
+    pub(crate) fn current_scope_binding(&self, name: &str) -> Option<BindingRef> {
+        self.scopes
+            .last()
+            .expect("at least one scope always exists")
+            .get(name)
+            .cloned()
+    }
+
     fn declare_binding(&mut self, name: String, binding: BindingRef) {
         self.scopes
             .last_mut()

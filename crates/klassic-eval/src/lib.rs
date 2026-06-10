@@ -1129,7 +1129,9 @@ fn eval_expr_inner(
             constraints,
             ..
         } => {
-            let placeholder = environment.declare_placeholder(name.clone(), false);
+            let placeholder = environment
+                .current_scope_binding(name)
+                .unwrap_or_else(|| environment.declare_placeholder(name.clone(), false));
             let function = Value::Function(Rc::new(FunctionValue {
                 params: params.clone(),
                 param_annotations: param_annotations.clone(),
@@ -1350,6 +1352,19 @@ fn eval_sequence(
     state: &mut EvaluationState,
 ) -> Result<Value, Diagnostic> {
     predeclare_proof_placeholders(expressions, environment);
+    // Insert a placeholder cell for every `def` in the block before
+    // evaluating anything: closures capture the environment maps by
+    // snapshot but share the binding cells, so an early function's
+    // snapshot already holds the cell a later sibling definition will
+    // fill — which is what makes forward references (mutual recursion)
+    // work without reordering evaluation.
+    for expression in expressions {
+        if let Expr::DefDecl { name, .. } = expression
+            && environment.current_scope_binding(name).is_none()
+        {
+            environment.declare_placeholder(name.clone(), false);
+        }
+    }
     let mut last = Value::Unit;
     for expression in expressions {
         last = eval_expr(expression, environment, state)?;

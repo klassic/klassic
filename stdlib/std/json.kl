@@ -100,13 +100,13 @@ def jsonParseStringBody(text, i, acc) = {
   }
 }
 
-def jsonParseArrayItems(text, i, acc, parseVal) = {
-  parseVal(text, jsonSkipWs(text, i)) match {
+def jsonParseArrayItems(text, i, acc) = {
+  jsonParseValue(text, jsonSkipWs(text, i)) match {
     case Ok(Step(item, next)) => {
       val rest = jsonSkipWs(text, next)
       val grown = cons(item)(acc)
       if (rest < length(text) && jsonCharAt(text, rest) == ",") {
-        jsonParseArrayItems(text, rest + 1, grown, parseVal)
+        jsonParseArrayItems(text, rest + 1, grown)
       } else if (rest < length(text) && jsonCharAt(text, rest) == "]") {
         ok(Step(JArr(jsonReverse(grown, [])), rest + 1))
       } else {
@@ -117,7 +117,7 @@ def jsonParseArrayItems(text, i, acc, parseVal) = {
   }
 }
 
-def jsonParseMembers(text, i, acc, parseVal) = {
+def jsonParseMembers(text, i, acc) = {
   val keyAt = jsonSkipWs(text, i)
   if (keyAt >= length(text) || jsonCharAt(text, keyAt) != "\"") {
     jsonFail("expected object key", keyAt)
@@ -128,12 +128,12 @@ def jsonParseMembers(text, i, acc, parseVal) = {
         if (colonAt >= length(text) || jsonCharAt(text, colonAt) != ":") {
           jsonFail("expected `:`", colonAt)
         } else {
-          parseVal(text, jsonSkipWs(text, colonAt + 1)) match {
+          jsonParseValue(text, jsonSkipWs(text, colonAt + 1)) match {
             case Ok(Step(value, next)) => {
               val rest = jsonSkipWs(text, next)
               val grown = cons(Member(key, value))(acc)
               if (rest < length(text) && jsonCharAt(text, rest) == ",") {
-                jsonParseMembers(text, rest + 1, grown, parseVal)
+                jsonParseMembers(text, rest + 1, grown)
               } else if (rest < length(text) && jsonCharAt(text, rest) == "}") {
                 ok(Step(JObj(jsonReverse(grown, [])), rest + 1))
               } else {
@@ -165,10 +165,10 @@ def jsonParseValue(text, i) = {
       jsonParseStringBody(text, i + 1, "")
     } else if (c == "[") {
       val at = jsonSkipWs(text, i + 1)
-      if (at < length(text) && jsonCharAt(text, at) == "]") ok(Step(JArr([]), at + 1)) else jsonParseArrayItems(text, i + 1, [], (t, j) => jsonParseValue(t, j))
+      if (at < length(text) && jsonCharAt(text, at) == "]") ok(Step(JArr([]), at + 1)) else jsonParseArrayItems(text, i + 1, [])
     } else if (c == "{") {
       val at = jsonSkipWs(text, i + 1)
-      if (at < length(text) && jsonCharAt(text, at) == "}") ok(Step(JObj([]), at + 1)) else jsonParseMembers(text, i + 1, [], (t, j) => jsonParseValue(t, j))
+      if (at < length(text) && jsonCharAt(text, at) == "}") ok(Step(JObj([]), at + 1)) else jsonParseMembers(text, i + 1, [])
     } else if (c == "-" || jsonIsDigit(c)) {
       jsonParseNumber(text, i)
     } else {
