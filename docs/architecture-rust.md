@@ -624,7 +624,13 @@ cargo run -- -e "1 + 2"
   dedicated scope now: the slots used to outlive the construct, and
   an enclosing expression with operands spilled on the machine stack
   (a binary op's lhs) popped a temp instead of its operand once the
-  construct appeared as a by-pointer call argument. Recursion over
+  construct appeared as a by-pointer call argument. Self-referential
+  generic enums (`enum MyList<a> { case Cons(h: a, t: MyList<a>);
+  case Nil }`) register too: an applied-generic field annotation
+  classifies as a heap-pointer field whose nested shape is not tracked
+  through the field — a deep pattern into it is diagnosed — because
+  recursive traversals re-attach the concrete shape through the
+  function parameter's annotation on every frame. Recursion over
   generic parameters *without* a concrete annotation (true
   per-call-site monomorphization) remains diagnosed.
   Imports of the plain-Klassic `std.*` modules are inlined before type

@@ -21024,7 +21024,7 @@ fn native_build_rejects_unsupported_generic_enum_with_precise_message() {
     let output_path = std::env::temp_dir().join(format!("klassic_native_generic2_{stamp}.bin"));
     fs::write(
         &source_path,
-        "enum Box<a> { case Wrap(value: List<a>); case Empty }\nprintln(\"x\")\n",
+        "enum Box<a> { case Wrap(value: Double); case Empty }\nprintln(\"x\")\n",
     )
     .expect("temp source file should write");
 
@@ -21049,6 +21049,50 @@ fn native_build_rejects_unsupported_generic_enum_with_precise_message() {
     assert!(
         stderr.contains("generic enum `Box`"),
         "stderr should precisely name the generic enum\nstderr:\n{stderr}"
+    );
+}
+
+/// An applied-generic field annotation (`List<a>`) registers the enum,
+/// but constructing it with a value that is not a GC heap pointer (a
+/// static list literal) is rejected at the construct site instead of
+/// rejecting the whole declaration.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_rejects_non_heap_generic_enum_payload() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_list_payload_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_list_payload_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Box<a> { case Wrap(items: List<a>); case Empty }\n\
+         println(Wrap([1 2 3]) match { case Wrap(items) => 1; case Empty => 0 })\n",
+    )
+    .expect("temp source file should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(!build.status.success());
+    assert!(
+        String::from_utf8_lossy(&build.stderr)
+            .contains("native generic enum payload for this value type"),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
     );
 }
 
@@ -21703,6 +21747,84 @@ fn native_build_runs_recursive_generic_enum_functions_across_collections() {
         String::from_utf8_lossy(&run_output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "100000\n");
+}
+
+/// Self-referential generic enums (`Cons(h: a, t: MyList<a>)`) register
+/// now that applied-generic field annotations classify as heap-pointer
+/// fields, and recursive traversals re-attach the concrete shape
+/// through the function parameter's annotation each frame. Covers a
+/// linear list (construction, sum, an enum-returning builder driven 100
+/// deep, a String payload) and a non-linear tree, with enough
+/// allocation churn in the loop to run collections mid-recursion.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_compiles_self_referential_generic_enums() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_self_ref_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_self_ref_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum MyList<a> { case Cons(h: a, t: MyList<a>); case Nil }\n\
+         enum GTree<a> { case GLeaf(v: a); case GBranch(l: GTree<a>, r: GTree<a>) }\n\
+         def sum(l: MyList<Int>): Int = l match { case Cons(h, t) => h + sum(t); case Nil => 0 }\n\
+         def build(n: Int): MyList<Int> = if (n <= 0) Nil else Cons(n, build(n - 1))\n\
+         def count(l: MyList<String>): Int = l match { case Cons(h, t) => 1 + count(t); case Nil => 0 }\n\
+         def gtotal(t: GTree<Int>): Int = t match {\n\
+           case GLeaf(v) => v\n\
+           case GBranch(l, r) => gtotal(l) + gtotal(r)\n\
+         }\n\
+         println(sum(Cons(1, Cons(2, Cons(3, Nil)))))\n\
+         println(count(Cons(\"a\", Cons(\"b\", Nil))))\n\
+         println(gtotal(GBranch(GLeaf(3), GBranch(GLeaf(4), GLeaf(5)))))\n\
+         mutable acc = 0\n\
+         mutable i = 0\n\
+         while (i < 1000) {\n\
+           acc = acc + sum(build(100))\n\
+           i = i + 1\n\
+         }\n\
+         println(acc)\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "6\n2\n12\n5050000\n"
+    );
 }
 
 /// Passing a generic enum whose tracked payload shape contradicts the

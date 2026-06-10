@@ -913,11 +913,11 @@ enum GenericField {
     /// Annotation is exactly a type parameter (`a`) → the repr is whatever
     /// the constructor argument's `NativeValue` projects to at the site.
     Param(usize),
-    /// Annotation is an applied generic (`List<a>`, `Option<a>`, ...) →
-    /// always a heap pointer at runtime, hence `EnumField`. Wired in a
-    /// later milestone (nested generics); kept here so the shape logic is
-    /// already total over field kinds.
-    #[allow(dead_code)]
+    /// Annotation is an applied generic (`MyList<a>`, `Option<Int>`, ...)
+    /// → always a heap pointer at runtime, hence `EnumField`. The nested
+    /// shape is not tracked through the field (a deep pattern into it
+    /// gets a diagnostic); recursive traversals re-attach the shape via
+    /// the function parameter's annotation instead.
     AppliedParam,
 }
 
@@ -1023,9 +1023,12 @@ fn classify_enum_field(text: &str, supported: &HashSet<String>) -> Option<EnumFi
 }
 
 /// Classify a *generic* enum variant field from its annotation text. A
-/// bare type parameter becomes `Param`; otherwise it must be a concrete
-/// supported type (reusing `classify_enum_field`). Applied generics and
-/// unknown types return `None`, leaving the enum unregistered (M3+).
+/// bare type parameter becomes `Param`; an applied form (`MyList<a>`,
+/// `Option<Int>`) becomes `AppliedParam` — always a heap pointer at
+/// runtime, which is what lets self-referential generic enums
+/// (`Cons(h: a, t: MyList<a>)`) register; anything else must be a
+/// concrete supported type (reusing `classify_enum_field`). Unknown
+/// types return `None`, leaving the enum unregistered.
 fn classify_generic_field(
     text: &str,
     type_params: &[String],
@@ -1035,7 +1038,10 @@ fn classify_generic_field(
     if let Some(index) = type_params.iter().position(|p| p == trimmed) {
         return Some(GenericField::Param(index));
     }
-    classify_enum_field(trimmed, supported_mono).map(GenericField::Fixed)
+    if let Some(field) = classify_enum_field(trimmed, supported_mono).map(GenericField::Fixed) {
+        return Some(field);
+    }
+    parse_applied_annotation(trimmed).map(|_| GenericField::AppliedParam)
 }
 
 /// Split an applied type annotation like `Option<Int>` /
