@@ -19421,6 +19421,35 @@ fn denies_trusted_proofs_via_cli() {
     );
 }
 
+/// The REPL prints each evaluated value with its inferred static
+/// type (GitHub issue #256): `3: Int`, `hello: String`,
+/// `[1, 2, 3]: List<Int>`.
+#[test]
+fn repl_prints_value_types() {
+    let mut child = Command::new(klassic_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start repl");
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin should be piped");
+        stdin
+            .write_all(b"1 + 2\n\"hello\"\n[1 2 3]\n:exit\n")
+            .expect("repl input should be writable");
+    }
+
+    let output = child.wait_with_output().expect("repl should finish");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(stdout.contains("3: Int"), "{stdout}");
+    assert!(stdout.contains("hello: String"), "{stdout}");
+    assert!(stdout.contains("[1, 2, 3]: List<Int>"), "{stdout}");
+}
+
 #[test]
 fn repl_supports_history_and_exit() {
     let mut child = Command::new(klassic_bin())
@@ -19442,8 +19471,8 @@ fn repl_supports_history_and_exit() {
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    assert!(stdout.contains("value = ()"));
-    assert!(stdout.contains("value = 42"));
+    assert!(stdout.contains("(): Unit"));
+    assert!(stdout.contains("42: Int"));
     assert!(stdout.contains("1: val answer = 42"));
     assert!(stdout.contains("2: answer"));
 }
@@ -19469,8 +19498,8 @@ fn repl_buffers_multiline_input_until_complete() {
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    assert!(stdout.contains("value = ()"));
-    assert!(stdout.contains("value = 3"));
+    assert!(stdout.contains("(): Unit"));
+    assert!(stdout.contains("3: Int"));
 }
 
 /// Regression: the bundled stdlib prelude must NOT shift user line

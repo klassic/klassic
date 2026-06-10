@@ -238,6 +238,20 @@ where
     I: IntoIterator<Item = (S, KnownType)>,
     S: Into<String>,
 {
+    typecheck_program_with_bindings_typed(expr, bindings).map(|_| ())
+}
+
+/// Like `typecheck_program_with_bindings`, but returns the displayed
+/// type of the program's final expression — the REPL prints it after
+/// each evaluated value.
+pub fn typecheck_program_with_bindings_typed<I, S>(
+    expr: &Expr,
+    bindings: I,
+) -> Result<String, Diagnostic>
+where
+    I: IntoIterator<Item = (S, KnownType)>,
+    S: Into<String>,
+{
     let mut checker = TypeChecker::default();
     checker.push_scope();
     checker.install_builtins();
@@ -260,7 +274,9 @@ where
             checker.declare(binding, false, from_known_type(ty), Vec::new(), Vec::new());
         }
     }
-    let result = checker.infer_program(expr).map(|_| ());
+    let result = checker
+        .infer_program(expr)
+        .map(|ty| display_type(&checker.resolve(&ty)));
     if result.is_ok() {
         export_user_record_schemas(checker.user_record_schemas());
         export_user_typeclass_infos(checker.user_typeclass_infos());

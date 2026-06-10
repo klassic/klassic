@@ -17,7 +17,7 @@ use klassic_syntax::{
 };
 use klassic_types::proof::{ProofConfig, analyze_proofs};
 use klassic_types::{
-    clear_user_binding_types, clear_user_typeclass_infos, typecheck_program_with_bindings,
+    clear_user_binding_types, clear_user_typeclass_infos, typecheck_program_with_bindings_typed,
 };
 
 mod builtin_registry;
@@ -899,6 +899,16 @@ impl Evaluator {
 
     #[allow(clippy::result_large_err)]
     pub fn evaluate_text(&mut self, name: &str, text: &str) -> Result<Value, EvaluationError> {
+        self.evaluate_text_typed(name, text).map(|(value, _)| value)
+    }
+
+    /// Evaluate `text` and also return the displayed static type of
+    /// its final expression (the REPL prints `value: Type`).
+    pub fn evaluate_text_typed(
+        &mut self,
+        name: &str,
+        text: &str,
+    ) -> Result<(Value, String), EvaluationError> {
         let source = SourceFile::new(name, text);
         let expr = parse_source(&source).map_err(|diagnostic| EvaluationError {
             source: source.clone(),
@@ -911,12 +921,13 @@ impl Evaluator {
             .into_iter()
             .map(|(name, value)| (name, known_type_from_value(&value)))
             .collect::<Vec<_>>();
-        typecheck_program_with_bindings(&expr, known_bindings).map_err(|diagnostic| {
-            EvaluationError {
-                source: source.clone(),
-                diagnostic,
-            }
-        })?;
+        let final_type =
+            typecheck_program_with_bindings_typed(&expr, known_bindings).map_err(|diagnostic| {
+                EvaluationError {
+                    source: source.clone(),
+                    diagnostic,
+                }
+            })?;
         analyze_proofs(
             &expr,
             ProofConfig {
@@ -946,7 +957,7 @@ impl Evaluator {
                 .collect::<Vec<_>>();
             self.environment.forget_root_bindings(newly_added);
         }
-        Ok(result)
+        Ok((result, final_type))
     }
 }
 

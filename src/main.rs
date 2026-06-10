@@ -330,9 +330,9 @@ fn start_repl(config: ExecutionConfig) {
         buffer.push_str(trimmed);
         buffer.push('\n');
 
-        match evaluator.evaluate_text("<repl>", &buffer) {
-            Ok(value) => {
-                println!("value = {value}");
+        match evaluator.evaluate_text_typed("<repl>", &buffer) {
+            Ok((value, ty)) => {
+                println!("{value}: {ty}");
                 history.push(buffer.trim_end().to_string());
                 buffer.clear();
             }
