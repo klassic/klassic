@@ -8,3 +8,7 @@ klassic-span = { path = "../klassic-span" }
 
 [lib]
 path = "src/lib.rs"
+# staticlib: the portable C backend links `libklassic_rt.a` next to its
+# generated C (roadmap PR 10); lib: the evaluator and native compiler
+# keep depending on this crate normally.
+crate-type = ["lib", "staticlib"]

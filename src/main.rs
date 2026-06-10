@@ -73,11 +73,17 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                         return Err(1);
                     }
                 };
-                if let Err(error) = fs::write(&output, c_source) {
-                    eprintln!("{}: {error}", output.display());
-                    return Err(1);
+                // `-o foo.c` writes the C source; any other output
+                // name compiles and links it into an executable with
+                // the system C compiler and the bundled runtime.
+                if output.extension().is_some_and(|extension| extension == "c") {
+                    if let Err(error) = fs::write(&output, c_source) {
+                        eprintln!("{}: {error}", output.display());
+                        return Err(1);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                return link_c_program(&c_source, &output);
             }
             let config = NativeCompilerConfig {
                 target: command.config.native_target,
@@ -231,6 +237,91 @@ fn collect_user_modules(
         });
     }
     Ok(())
+}
+
+/// Locate `libklassic_runtime.a` for the C backend: an explicit
+/// `KLASSIC_RT_LIB` wins, then the directory next to the `klassic`
+/// executable (release tarballs ship the library beside the binary,
+/// and a cargo build leaves it in the same `target/<profile>/`
+/// directory).
+fn find_runtime_staticlib() -> Option<std::path::PathBuf> {
+    if let Ok(explicit) = std::env::var("KLASSIC_RT_LIB") {
+        let path = std::path::PathBuf::from(explicit);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    for candidate in [
+        dir.join("libklassic_runtime.a"),
+        dir.join("lib").join("libklassic_runtime.a"),
+    ] {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Compile generated C and link it with the runtime staticlib using
+/// the system C compiler.
+fn link_c_program(c_source: &str, output: &Path) -> Result<(), u8> {
+    let Some(runtime) = find_runtime_staticlib() else {
+        eprintln!(
+            "error: libklassic_runtime.a not found\n  help: set KLASSIC_RT_LIB to its path, or \
+             pass an output ending in .c and link it yourself"
+        );
+        return Err(1);
+    };
+    let compiler = ["cc", "clang", "gcc"].iter().find(|name| {
+        std::process::Command::new(name)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    });
+    let Some(compiler) = compiler else {
+        eprintln!(
+            "error: no C compiler found (tried cc, clang, gcc)\n  help: pass an output ending \
+             in .c to get the C source and compile it yourself"
+        );
+        return Err(1);
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let c_path = std::env::temp_dir().join(format!("klassic-cbackend-{stamp}.c"));
+    if let Err(error) = fs::write(&c_path, c_source) {
+        eprintln!("{}: {error}", c_path.display());
+        return Err(1);
+    }
+    let mut command = std::process::Command::new(compiler);
+    command
+        .arg("-O2")
+        .arg("-o")
+        .arg(output)
+        .arg(&c_path)
+        .arg(&runtime);
+    // The Rust staticlib needs the platform's usual system libraries.
+    if std::env::consts::OS == "linux" {
+        command.args(["-lpthread", "-ldl", "-lm"]);
+    }
+    let status = command.status();
+    let _ = fs::remove_file(&c_path);
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => {
+            eprintln!("error: {compiler} failed to compile the generated C");
+            Err(1)
+        }
+        Err(error) => {
+            eprintln!("error: failed to run {compiler}: {error}");
+            Err(1)
+        }
+    }
 }
 
 fn user_modules_for(path: &Path, text: &str) -> Result<Vec<UserModuleSource>, u8> {

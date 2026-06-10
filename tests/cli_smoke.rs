@@ -22789,6 +22789,75 @@ fn top_level_defs_support_mutual_recursion() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
 }
 
+/// The C backend's string surface (roadmap PR 10): strings are KStr
+/// values served by the klassic_rt_* shims in libklassic_runtime.a,
+/// sharing semantics with the evaluator — character-counted length,
+/// char-indexed substring/at, concat, equality, toString. The test
+/// compiles and links through the automatic cc path and compares
+/// against the evaluator's output.
+#[test]
+fn build_backend_c_strings_match_the_evaluator() {
+    let cc_available = Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|probe| probe.status.success());
+    if !cc_available {
+        return;
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_cstrings_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_cstrings_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def greet(name: String): String = \"hello, \" + name + \"!\"\n\
+         def shout(s: String, n: Int): String = if (n <= 0) s else shout(s + \"!\", n - 1)\n\
+         println(greet(\"klassic\"))\n\
+         println(length(\"あいう\"))\n\
+         println(substring(\"hello world\", 6, 11))\n\
+         println(at(\"abc\", 1))\n\
+         println(greet(\"a\") == \"hello, a!\")\n\
+         println(toString(42) + \"-\" + toString(true))\n\
+         println(shout(\"hey\", 3))\n",
+    )
+    .expect("temp source file should write");
+    let expected = "hello, klassic!\n3\nworld\nb\ntrue\n42-true\nhey!!!\n";
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    assert!(eval_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&eval_output.stdout), expected);
+
+    let link_output = Command::new(klassic_bin())
+        .args([
+            "--backend",
+            "c",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        link_output.status.success(),
+        "C backend should compile and link strings\nstderr:\n{}",
+        String::from_utf8_lossy(&link_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("compiled C binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(run_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
+}
+
 /// The portable C backend (GitHub issue #425, roadmap PR 9) emits a
 /// single C99 translation unit for the Int/Bool/String/println/if/
 /// while/def subset behind `--backend c`. The generated source depends
@@ -22852,18 +22921,23 @@ fn build_backend_c_emits_compilable_c() {
         .output()
         .is_ok_and(|probe| probe.status.success());
     if cc_available {
-        let compile = Command::new("cc")
+        // A non-.c output compiles and links against the bundled
+        // runtime staticlib automatically.
+        let link_output = Command::new(klassic_bin())
             .args([
+                "--backend",
+                "c",
+                "build",
+                source_path.to_str().expect("path should be utf-8"),
                 "-o",
                 bin_path.to_str().expect("path should be utf-8"),
-                c_path.to_str().expect("path should be utf-8"),
             ])
             .output()
-            .expect("cc should run");
+            .expect("binary should run");
         assert!(
-            compile.status.success(),
-            "cc should accept the generated source\nstderr:\n{}",
-            String::from_utf8_lossy(&compile.stderr)
+            link_output.status.success(),
+            "C backend should compile and link\nstderr:\n{}",
+            String::from_utf8_lossy(&link_output.stderr)
         );
         let run_output = Command::new(&bin_path)
             .output()

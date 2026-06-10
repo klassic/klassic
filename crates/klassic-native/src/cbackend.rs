@@ -1,12 +1,14 @@
-//! Portable C backend MVP (roadmap PR 9). Emits a single C
-//! translation unit for a deliberately small Klassic subset: `Int` /
-//! `Bool` / `String` literals, arithmetic / comparison / logical
-//! operators, `val` / `mutable` / assignment, `if` / `while`,
+//! Portable C backend (roadmap PR 9 / PR 10). Emits a single C
+//! translation unit for a growing Klassic subset: `Int` / `Bool` /
+//! `String` values, arithmetic / comparison / logical operators,
+//! string concatenation / equality / `length` / `substring` / `at` /
+//! `toString`, `val` / `mutable` / assignment, `if` / `while`,
 //! `println`, and annotated top-level `def`s (including recursion).
-//! Anything outside the subset fails with a source-located diagnostic
-//! — never wrong code. The output depends only on `<stdio.h>` /
-//! `<stdint.h>`, so any C compiler on any platform can take it from
-//! there; the direct ELF path stays untouched.
+//! Strings are `KStr` values served by the `klassic_rt_*` shims in
+//! `klassic-runtime` (built as `libklassic_runtime.a`), which share
+//! their semantics with the evaluator by construction. Anything
+//! outside the subset fails with a source-located diagnostic — never
+//! wrong code. The direct ELF path stays untouched.
 
 use klassic_span::{Diagnostic, Span};
 use klassic_syntax::{BinaryOp, Expr};
@@ -24,7 +26,7 @@ impl CType {
         match self {
             CType::Int => "int64_t",
             CType::Bool => "int64_t",
-            CType::Str => "const char*",
+            CType::Str => "KStr",
             CType::Unit => "void",
         }
     }
@@ -114,7 +116,10 @@ impl CEmitter {
                 if value.contains("#{") {
                     return Err(unsupported(*span, "string interpolation"));
                 }
-                Ok((format!("\"{}\"", escape_c_string(value)), CType::Str))
+                Ok((
+                    format!("KL_LIT(\"{}\", {})", escape_c_string(value), value.len()),
+                    CType::Str,
+                ))
             }
             Expr::Identifier { name, span } => self
                 .lookup(name)
@@ -140,7 +145,23 @@ impl CEmitter {
                     _ => return Err(unsupported(*span, "this binary operator")),
                 };
                 if left_ty == CType::Str || right_ty == CType::Str {
-                    return Err(unsupported(*span, "string operators"));
+                    if left_ty != right_ty {
+                        return Err(unsupported(*span, "mixed string/non-string operands"));
+                    }
+                    return match op {
+                        BinaryOp::Add => Ok((
+                            format!("klassic_rt_str_concat({left}, {right})"),
+                            CType::Str,
+                        )),
+                        BinaryOp::Equal => {
+                            Ok((format!("klassic_rt_str_eq({left}, {right})"), CType::Bool))
+                        }
+                        BinaryOp::NotEqual => Ok((
+                            format!("(!klassic_rt_str_eq({left}, {right}))"),
+                            CType::Bool,
+                        )),
+                        _ => Err(unsupported(*span, "this string operator")),
+                    };
                 }
                 let ty = match op {
                     BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
@@ -175,6 +196,9 @@ impl CEmitter {
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return Err(unsupported(*span, "calling a non-identifier"));
                 };
+                if let Some(result) = self.builtin_call(name, arguments, *span)? {
+                    return Ok(result);
+                }
                 let Some(function) = self.function(name) else {
                     return Err(unsupported(*span, &format!("function `{name}`")));
                 };
@@ -200,6 +224,69 @@ impl CEmitter {
                 Ok((format!("{}({})", c_ident(name), rendered.join(", ")), ret))
             }
             other => Err(unsupported(other.span(), "this expression")),
+        }
+    }
+
+    /// String / display builtins served by the `klassic_rt_*` shims.
+    /// Returns Ok(None) when `name` is not a builtin (a user function).
+    fn builtin_call(
+        &mut self,
+        name: &str,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<Option<(String, CType)>, Diagnostic> {
+        match (name, arguments.len()) {
+            ("length", 1) => {
+                let (s, ty) = self.expr(&arguments[0])?;
+                if ty != CType::Str {
+                    return Err(unsupported(span, "length of a non-string"));
+                }
+                Ok(Some((format!("klassic_rt_str_len_chars({s})"), CType::Int)))
+            }
+            ("isEmptyString", 1) => {
+                let (s, ty) = self.expr(&arguments[0])?;
+                if ty != CType::Str {
+                    return Err(unsupported(span, "isEmptyString of a non-string"));
+                }
+                Ok(Some((
+                    format!("(klassic_rt_str_len_chars({s}) == 0)"),
+                    CType::Bool,
+                )))
+            }
+            ("substring", 3) => {
+                let (s, ty) = self.expr(&arguments[0])?;
+                let (start, start_ty) = self.expr(&arguments[1])?;
+                let (end, end_ty) = self.expr(&arguments[2])?;
+                if ty != CType::Str || start_ty != CType::Int || end_ty != CType::Int {
+                    return Err(unsupported(span, "substring with these argument types"));
+                }
+                Ok(Some((
+                    format!("klassic_rt_str_substring({s}, {start}, {end})"),
+                    CType::Str,
+                )))
+            }
+            ("at", 2) => {
+                let (s, ty) = self.expr(&arguments[0])?;
+                let (index, index_ty) = self.expr(&arguments[1])?;
+                if ty != CType::Str || index_ty != CType::Int {
+                    return Err(unsupported(span, "at with these argument types"));
+                }
+                Ok(Some((
+                    format!("klassic_rt_str_at({s}, {index})"),
+                    CType::Str,
+                )))
+            }
+            ("toString", 1) => {
+                let (value, ty) = self.expr(&arguments[0])?;
+                let code = match ty {
+                    CType::Int => format!("klassic_rt_i64_to_str({value})"),
+                    CType::Bool => format!("klassic_rt_bool_to_str({value})"),
+                    CType::Str => value,
+                    CType::Unit => return Err(unsupported(span, "toString of unit")),
+                };
+                Ok(Some((code, CType::Str)))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -271,13 +358,9 @@ impl CEmitter {
                 }
                 let (code, ty) = self.expr(&arguments[0])?;
                 match ty {
-                    CType::Int => self.line(&format!("printf(\"%lld\\n\", (long long){code});")),
-                    CType::Bool => {
-                        self.line(&format!(
-                            "printf(\"%s\\n\", {code} ? \"true\" : \"false\");"
-                        ));
-                    }
-                    CType::Str => self.line(&format!("printf(\"%s\\n\", {code});")),
+                    CType::Int => self.line(&format!("klassic_rt_println_i64({code});")),
+                    CType::Bool => self.line(&format!("klassic_rt_println_bool({code});")),
+                    CType::Str => self.line(&format!("klassic_rt_println_str({code});")),
                     CType::Unit => return Err(unsupported(expr.span(), "printing unit")),
                 }
                 Ok(())
@@ -343,7 +426,24 @@ pub(crate) fn emit_c_program(expr: &Expr) -> Result<String, Diagnostic> {
 
     let mut out = String::new();
     out.push_str("/* generated by klassic --backend c */\n");
-    out.push_str("#include <stdio.h>\n#include <stdint.h>\n\n");
+    out.push_str("#include <stdint.h>\n#include <stddef.h>\n\n");
+    out.push_str(concat!(
+        "/* klassic runtime ABI — link libklassic_runtime.a */\n",
+        "typedef struct { const uint8_t* ptr; size_t len; } KStr;\n",
+        "#define KL_LIT(s, n) ((KStr){ (const uint8_t*)(s), (size_t)(n) })\n",
+        "extern KStr klassic_rt_str_concat(KStr a, KStr b);\n",
+        "extern int64_t klassic_rt_str_eq(KStr a, KStr b);\n",
+        "extern int64_t klassic_rt_str_len_chars(KStr s);\n",
+        "extern KStr klassic_rt_str_substring(KStr s, int64_t start, int64_t end);\n",
+        "extern KStr klassic_rt_str_at(KStr s, int64_t index);\n",
+        "extern KStr klassic_rt_i64_to_str(int64_t value);\n",
+        "extern KStr klassic_rt_bool_to_str(int64_t value);\n",
+        "extern void klassic_rt_print_str(KStr s);\n",
+        "extern void klassic_rt_println_str(KStr s);\n",
+        "extern void klassic_rt_println_i64(int64_t value);\n",
+        "extern void klassic_rt_println_bool(int64_t value);\n",
+        "\n",
+    ));
 
     // Prototypes first so functions can call each other and recurse.
     for function in &emitter.functions {

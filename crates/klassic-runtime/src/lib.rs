@@ -10,6 +10,7 @@
 pub mod builtins;
 pub mod error;
 pub mod fs;
+pub mod rt;
 pub mod stdlib_bundle;
 pub mod system;
 
