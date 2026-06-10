@@ -4192,7 +4192,7 @@ fn from_known_type(ty: KnownType) -> Type {
 /// instantiation sites (`v: a` inside `enum Option<a>`).
 fn generify_named_params(ty: Type, type_params: &[String]) -> Type {
     match ty {
-        Type::Named(name) if type_params.iter().any(|param| *param == name) => Type::Generic(name),
+        Type::Named(name) if type_params.contains(&name) => Type::Generic(name),
         Type::List(inner) => Type::List(Box::new(generify_named_params(*inner, type_params))),
         Type::Set(inner) => Type::Set(Box::new(generify_named_params(*inner, type_params))),
         Type::Map(key, value) => Type::Map(
