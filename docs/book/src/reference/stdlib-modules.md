@@ -301,19 +301,66 @@ A passing check prints `[ OK ] <name>` on stdout; a failing one
 prints `[FAIL] <name>: <reason>` on stderr without aborting, so a
 script can run a whole suite and aggregate results.
 
+## std.json
+
+JSON parsing and rendering, written in pure Klassic on top of the ADT
+stack. `parse` returns `Result<Json, String>` with a character
+position in every error message; `stringify` renders compact JSON.
+
+```klassic
+import std.json.{parse, stringify}
+
+val rendered = parse("{\"a\": [1, 2, null], \"b\": \"hi\"}") match {
+  case Ok(j)  => stringify(j)   // {"a":[1,2,null],"b":"hi"}
+  case Err(e) => "ERR: " + e
+}
+println(rendered)
+
+parse("[1, 2") match {
+  case Ok(_)  => println("unreachable")
+  case Err(e) => println(e)     // expected `,` or `]` at position 5
+}
+```
+
+The value ADT:
+
+```klassic
+enum Json {
+  case JNull
+  case JBool(b: Bool)
+  case JNum(n: Int)
+  case JStr(s: String)
+  case JArr(items: List<Json>)
+  case JObj(entries: List<JsonMember>)
+}
+```
+
+v1 boundaries: numbers are integers, and `\uXXXX` escapes report an
+error rather than decoding.
+
+## std.time
+
+Wall-clock helpers over the `Time#nowMillis` builtin. `formatIso`
+renders UTC (`YYYY-MM-DDTHH:MM:SS.mmmZ`) for non-negative epoch
+milliseconds using integer-only civil-date conversion.
+
+```klassic
+import std.time.{nowMillis, nowIso, formatIso, durationMillis}
+
+println(formatIso(0))              // 1970-01-01T00:00:00.000Z
+println(formatIso(1718000000123))  // 2024-06-10T06:13:20.123Z
+println(durationMillis(100, 350))  // 250
+println(nowIso())                  // the current instant
+```
+
 ## Native availability
 
-Stdlib modules are currently loaded only by the evaluator. The
-native compiler (`klassic build file.kl`) emits a source-located
-diagnostic when user code does `import std.<X>`:
-
-```
-error: module `std.list` is part of the standard library but is not yet
-       available in native builds. Run the program with the evaluator
-       (klassic file.kl) or wait for the native stdlib module loader
-       described in docs/roadmap-targets-stdlib.md.
-```
-
-The bundled v0.1 `stdlibFoo` prelude helpers continue to work in
-native builds — the diagnostic only fires on the new
-module-qualified surface.
+Nearly every stdlib module compiles natively: `import std.<X>` splices
+the module's declarations into the translation unit (selective, bulk,
+and aliased imports all work), so `std.list`, `std.string`,
+`std.math`, `std.option`, `std.result`, `std.time`, and the rest run
+in `klassic build` output just like in the evaluator. The one current
+exception is `std.json`, whose `List<Json>` payload fields the native
+enum lowering does not support yet — importing it in a native build
+keeps the source-located "not yet available in native builds"
+diagnostic and runs fine under the evaluator.

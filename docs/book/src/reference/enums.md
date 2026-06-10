@@ -63,6 +63,12 @@ either a payload or a tag (Option, Result, parse trees, ...).
 
 ## Native compilation
 
-`enum` and `match` are evaluator-only at the moment. Native
-compilation (`klassic build file.kl`) emits a source-located
-"not yet supported in native builds" diagnostic.
+Native builds compile enums and `match`. Monomorphic enums lower to
+GC records with short-circuit tag dispatch; generic enums compile
+per instantiation, with payload shapes tracked through bindings,
+control-flow joins, and annotated function boundaries — so recursive
+functions over `Option<Int>`-style annotations work, and the checker
+also diagnoses match exhaustiveness and unreachable arms ahead of
+codegen. The remaining native gaps (for example a `List<SomeEnum>`
+payload field) fail at build time with a source-located diagnostic,
+never with wrong code.
