@@ -3746,8 +3746,22 @@ impl NativeCodeGenerator {
             "List<String>" => Some(self.runtime_lines_list_scratch_value()),
             text => self
                 .runtime_record_scratch_value_from_annotation(text)
+                .or_else(|| self.lowered_enum_param_value(text))
                 .or_else(|| native_value_from_annotation(annotation)),
         }
+    }
+
+    /// Map an annotation naming a lowered monomorphic enum to the
+    /// by-pointer calling convention: the value is a `__gc_record` heap
+    /// pointer, passed in a qword argument register / stack slot just
+    /// like a scalar. Generic enums stay unmapped (they need a shape
+    /// descriptor, milestone 3b).
+    fn lowered_enum_param_value(&self, annotation: &str) -> Option<NativeValue> {
+        let trimmed = annotation.trim();
+        let name = trimmed.strip_prefix('#').unwrap_or(trimmed);
+        self.lowered_enum_names
+            .contains(name)
+            .then_some(NativeValue::HeapPointer)
     }
 
     fn native_function_return_value(&mut self, annotation: &TypeAnnotation) -> Option<NativeValue> {
@@ -5946,6 +5960,13 @@ impl NativeCodeGenerator {
                 ),
             ));
         }
+        if function
+            .param_values
+            .iter()
+            .any(|value| matches!(value, NativeValue::HeapPointer))
+        {
+            return self.compile_pointer_abi_function_call(&function, arguments, span);
+        }
         let mut staged_runtime_arguments = Vec::new();
         let mut staged_record_arguments = Vec::new();
         let mut scalar_argument_count = 0usize;
@@ -6078,6 +6099,174 @@ impl NativeCodeGenerator {
             self.asm
                 .add_reg_imm32(Reg::Rsp, (scalar_argument_count * 8) as i32);
             self.release_temp_stack(scalar_argument_count * 8);
+        }
+        self.copy_function_return_to_call_site(function.return_value, span)
+    }
+
+    /// Call a non-inline function that takes at least one by-pointer
+    /// heap argument (a lowered enum). Qword arguments — scalar or heap
+    /// pointer — use the same balanced push/pop staging as the
+    /// scalar-only path, so enclosing expressions that pushed operands
+    /// before this call see an unchanged rsp. Each evaluated heap
+    /// pointer is additionally pinned in the GC root table so a
+    /// collection triggered while evaluating a later argument cannot
+    /// free it, and unpinned again just before the call — the callee
+    /// prologue roots its own per-frame copy before anything can
+    /// allocate.
+    fn compile_pointer_abi_function_call(
+        &mut self,
+        function: &NativeFunction,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let mut staged_runtime_arguments = Vec::new();
+        let mut staged_record_arguments = Vec::new();
+        let mut qword_arg_values = Vec::new();
+        for (argument, expected_value) in arguments.iter().zip(function.param_values.iter()) {
+            let value = self.compile_expr(argument)?;
+            if let NativeValue::RuntimeString { data, len } = expected_value {
+                let Some(input) = self.native_string_ref(value) else {
+                    return Err(unsupported(
+                        span,
+                        "native function string argument for this value type",
+                    ));
+                };
+                let staged = self.runtime_string_scratch_value();
+                let NativeValue::RuntimeString {
+                    data: staged_data,
+                    len: staged_len,
+                } = staged
+                else {
+                    unreachable!("runtime string scratch should be a runtime string")
+                };
+                self.emit_copy_native_string_to_runtime_string_buffer(
+                    staged_data,
+                    staged_len,
+                    input,
+                    span,
+                    "function string argument exceeds 65536 bytes",
+                );
+                staged_runtime_arguments.push((
+                    *data,
+                    *len,
+                    NativeStringRef {
+                        data: staged_data,
+                        len: NativeStringLen::Runtime(staged_len),
+                    },
+                    "function string argument exceeds 65536 bytes",
+                ));
+                continue;
+            }
+            if let NativeValue::RuntimeLinesList { data, len } = expected_value {
+                let input =
+                    self.native_lines_ref_from_value(value, span, "function line-list argument")?;
+                let staged = self.runtime_lines_list_scratch_value();
+                let NativeValue::RuntimeLinesList {
+                    data: staged_data,
+                    len: staged_len,
+                } = staged
+                else {
+                    unreachable!("runtime line-list scratch should be a runtime line list")
+                };
+                self.emit_copy_native_string_to_runtime_string_buffer(
+                    staged_data,
+                    staged_len,
+                    input,
+                    span,
+                    "function line-list argument exceeds 65536 bytes",
+                );
+                staged_runtime_arguments.push((
+                    *data,
+                    *len,
+                    NativeStringRef {
+                        data: staged_data,
+                        len: NativeStringLen::Runtime(staged_len),
+                    },
+                    "function line-list argument exceeds 65536 bytes",
+                ));
+                continue;
+            }
+            if let NativeValue::RuntimeRecord { label } = expected_value {
+                let staged_output = self.prepare_runtime_record_branch_output(*label, span)?;
+                self.emit_copy_record_value_to_branch_output(
+                    value,
+                    &staged_output,
+                    span,
+                    "function record argument exceeds 65536 bytes",
+                )?;
+                let target_output =
+                    self.runtime_record_branch_output_from_existing(*label, span)?;
+                staged_record_arguments.push((
+                    NativeValue::RuntimeRecord {
+                        label: staged_output.label,
+                    },
+                    target_output,
+                ));
+                continue;
+            }
+            if native_param_is_qword(expected_value) {
+                if value != *expected_value {
+                    return Err(unsupported(
+                        span,
+                        "native function argument for this value type",
+                    ));
+                }
+                if matches!(expected_value, NativeValue::HeapPointer) {
+                    self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+                    self.asm.call_label(self.gc_pin);
+                }
+                self.push_temp_reg(Reg::Rax);
+                qword_arg_values.push(*expected_value);
+                continue;
+            }
+            if value != *expected_value {
+                return Err(unsupported(
+                    span,
+                    "native function argument for this value type",
+                ));
+            }
+        }
+        for (data, len, input, overflow_message) in staged_runtime_arguments {
+            self.emit_copy_native_string_to_runtime_string_buffer(
+                data,
+                len,
+                input,
+                span,
+                overflow_message,
+            );
+        }
+        for (value, output) in staged_record_arguments {
+            self.emit_copy_record_value_to_branch_output(
+                value,
+                &output,
+                span,
+                "function record argument exceeds 65536 bytes",
+            )?;
+        }
+        // Every argument is evaluated; nothing below allocates, so the
+        // staging pins can drop before the call. Peek each pinned
+        // pointer from its push slot (gc_unpin only clobbers rax / r10
+        // / r11, never the argument registers).
+        let qword_count = qword_arg_values.len();
+        for (index, value) in qword_arg_values.iter().enumerate() {
+            if matches!(value, NativeValue::HeapPointer) {
+                let disp = ((qword_count - 1 - index) * 8) as i32;
+                self.asm.mov_reg_reg(Reg::R10, Reg::Rsp);
+                self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, disp);
+                self.asm.call_label(self.gc_unpin);
+            }
+        }
+        let arg_regs = argument_registers(qword_count);
+        let pass_on_stack = qword_count > arg_regs.len();
+        if !pass_on_stack {
+            for reg in arg_regs.into_iter().rev() {
+                self.pop_temp_reg(reg);
+            }
+        }
+        self.asm.call_label(function.label);
+        if pass_on_stack {
+            self.asm.add_reg_imm32(Reg::Rsp, (qword_count * 8) as i32);
+            self.release_temp_stack(qword_count * 8);
         }
         self.copy_function_return_to_call_site(function.return_value, span)
     }
@@ -35150,6 +35339,7 @@ impl NativeCodeGenerator {
         let saved_scopes = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
         let saved_static_scopes = std::mem::replace(&mut self.static_scopes, vec![HashMap::new()]);
         let saved_scope_base_offsets = std::mem::replace(&mut self.scope_base_offsets, vec![0]);
+        let saved_scope_gc_root_counts = std::mem::replace(&mut self.scope_gc_root_counts, vec![0]);
         let saved_next_stack_offset = self.next_stack_offset;
         let saved_active_function_name = self.active_function_name.replace(name.to_string());
         self.next_stack_offset = 0;
@@ -35158,33 +35348,46 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
 
-        let scalar_params = function
+        let qword_params = function
             .params
             .iter()
             .zip(function.param_values.iter().copied())
-            .filter(|(_, value)| matches!(value, NativeValue::Int | NativeValue::Bool))
+            .filter(|(_, value)| native_param_is_qword(value))
             .collect::<Vec<_>>();
-        let arg_regs = argument_registers(scalar_params.len());
-        if scalar_params.len() <= arg_regs.len() {
-            for ((param, value), reg) in scalar_params.iter().zip(arg_regs) {
-                let slot = self.allocate_slot((*param).clone(), *value);
+        let arg_regs = argument_registers(qword_params.len());
+        let mut heap_param_offsets = Vec::new();
+        if qword_params.len() <= arg_regs.len() {
+            for ((param, value), reg) in qword_params.iter().zip(arg_regs) {
+                let slot = self.allocate_param_slot((*param).clone(), *value);
                 self.asm.store_rbp_slot(slot.offset, reg);
+                if matches!(value, NativeValue::HeapPointer) {
+                    heap_param_offsets.push(slot.offset);
+                }
             }
         } else {
-            let param_count = scalar_params.len();
-            for (index, (param, value)) in scalar_params.iter().enumerate() {
-                let slot = self.allocate_slot((*param).clone(), *value);
+            let param_count = qword_params.len();
+            for (index, (param, value)) in qword_params.iter().enumerate() {
+                let slot = self.allocate_param_slot((*param).clone(), *value);
                 let offset = 16 + ((param_count - 1 - index) * 8);
                 self.asm.load_rbp_arg(Reg::Rax, offset as i32);
                 self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                if matches!(value, NativeValue::HeapPointer) {
+                    heap_param_offsets.push(slot.offset);
+                }
             }
+        }
+        // Root incoming by-pointer arguments only after every argument
+        // register has been spilled: the shadow push clobbers rcx/r8/r9,
+        // which carry arguments four through six.
+        for offset in &heap_param_offsets {
+            self.root_initialized_heap_slot(*offset);
         }
         for (param, value) in function
             .params
             .iter()
             .zip(function.param_values.iter().copied())
         {
-            if !matches!(value, NativeValue::Int | NativeValue::Bool) {
+            if !native_param_is_qword(&value) {
                 self.bind_constant(param.clone(), value);
             }
         }
@@ -35216,12 +35419,19 @@ impl NativeCodeGenerator {
             function.return_value,
             function.body.span(),
         )?;
+        // Drop this frame's shadow-stack roots (rooted pointer arguments
+        // plus any body slots whose counts bubbled up to the function
+        // scope) before the frame dies — stale entries would hand the
+        // collector slot addresses inside a popped frame.
+        let function_root_count = self.scope_gc_root_counts.last().copied().unwrap_or(0);
+        self.emit_gc_shadow_pop_n(function_root_count);
         self.asm.leave();
         self.asm.ret();
 
         self.scopes = saved_scopes;
         self.static_scopes = saved_static_scopes;
         self.scope_base_offsets = saved_scope_base_offsets;
+        self.scope_gc_root_counts = saved_scope_gc_root_counts;
         self.next_stack_offset = saved_next_stack_offset;
         self.active_function_name = saved_active_function_name;
         Ok(())
@@ -36263,6 +36473,39 @@ impl NativeCodeGenerator {
         slot
     }
 
+    /// Allocate a named slot for an incoming qword function argument
+    /// without the automatic zero-init + shadow registration that
+    /// `allocate_slot` performs for heap pointers: prologue rooting is
+    /// deferred until every argument register has been spilled (the
+    /// shadow push clobbers rcx/r8/r9). Pair heap-pointer slots with
+    /// `root_initialized_heap_slot`.
+    fn allocate_param_slot(&mut self, name: String, value: NativeValue) -> VarSlot {
+        self.next_stack_offset += 8;
+        self.asm.sub_reg_imm8(Reg::Rsp, 8);
+        let slot = VarSlot {
+            id: self.fresh_var_slot_id(),
+            offset: self.next_stack_offset,
+            value,
+        };
+        self.scopes
+            .last_mut()
+            .expect("native compiler always has a scope")
+            .insert(name, slot);
+        slot
+    }
+
+    /// Add an already-initialized heap-pointer slot to the GC shadow
+    /// stack. Unlike `register_heap_pointer_slot` the slot is not
+    /// zeroed — it holds a live pointer (a by-pointer argument spilled
+    /// by the function prologue).
+    fn root_initialized_heap_slot(&mut self, rbp_offset: i32) {
+        self.emit_gc_shadow_push(rbp_offset);
+        *self
+            .scope_gc_root_counts
+            .last_mut()
+            .expect("native compiler always has a scope") += 1;
+    }
+
     fn allocate_anonymous_slot(&mut self, value: NativeValue) -> VarSlot {
         self.next_stack_offset += 8;
         self.asm.sub_reg_imm8(Reg::Rsp, 8);
@@ -36446,6 +36689,18 @@ struct NativeInstanceMethod {
 fn argument_registers(count: usize) -> Vec<Reg> {
     const REGS: [Reg; 6] = [Reg::Rdi, Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
     REGS[..count.min(REGS.len())].to_vec()
+}
+
+/// Whether a function parameter of this `NativeValue` travels as a
+/// single qword in an argument register / caller stack push (scalars
+/// and by-pointer heap aggregates such as lowered enums), as opposed to
+/// the legacy shared scratch-buffer convention (strings, line lists,
+/// records).
+fn native_param_is_qword(value: &NativeValue) -> bool {
+    matches!(
+        value,
+        NativeValue::Int | NativeValue::Bool | NativeValue::HeapPointer
+    )
 }
 
 fn mkdir_prefixes(path: &str) -> Vec<String> {

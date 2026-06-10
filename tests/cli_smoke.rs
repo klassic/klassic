@@ -21362,6 +21362,149 @@ fn native_build_survives_enum_allocation_churn_across_collections() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "50000\n");
 }
 
+/// Functions whose annotations name a lowered monomorphic enum now use a
+/// per-frame by-pointer calling convention: the enum's `__gc_record`
+/// pointer travels in a qword argument register (or caller stack push)
+/// alongside scalars, and the callee prologue spills it to a GC-rooted
+/// frame slot. That makes recursive functions over enum arguments — and
+/// enum-returning recursion — compile and run, where they previously hit
+/// the "recursive function requiring call-site inlining" diagnostic.
+/// Covers plain recursion, enum-returning recursion, scalar/enum mixed
+/// argument order, and the 7+ argument stack-passing convention.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_compiles_recursive_enum_argument_functions() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_enum_abi_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_enum_abi_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Tree {\n\
+           case Leaf(v: Int)\n\
+           case Branch(l: Tree, r: Tree)\n\
+         }\n\
+         def total(t: Tree): Int = t match {\n\
+           case Leaf(v) => v\n\
+           case Branch(l, r) => total(l) + total(r)\n\
+         }\n\
+         def build(n: Int): Tree = if (n <= 0) Leaf(1) else Branch(build(n - 1), Leaf(n))\n\
+         def weight(a: Int, t: Tree, b: Int): Int = a * total(t) + b\n\
+         def big(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, t: Tree, g: Int): Int =\n\
+           a + b + c + d + e + f + total(t) + g\n\
+         println(total(Branch(Leaf(3), Branch(Leaf(4), Leaf(5)))))\n\
+         println(total(build(3)))\n\
+         println(weight(2, Branch(Leaf(10), Leaf(5)), 7))\n\
+         println(big(1, 2, 3, 4, 5, 6, Branch(Leaf(7), Leaf(8)), 9))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "12\n7\n37\n45\n"
+    );
+}
+
+/// Recursive enum functions under allocation churn heavy enough to run
+/// collections mid-recursion: pinned caller arguments and the callee's
+/// rooted parameter slots must keep every frame's tree alive while
+/// `build` keeps allocating. 3000 iterations of `total(build(40))`
+/// churn ~120k enum records through the 1 MiB heap.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_runs_recursive_enum_functions_across_collections() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_enum_abi_gc_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_enum_abi_gc_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Tree {\n\
+           case Leaf(v: Int)\n\
+           case Branch(l: Tree, r: Tree)\n\
+         }\n\
+         def total(t: Tree): Int = t match {\n\
+           case Leaf(v) => v\n\
+           case Branch(l, r) => total(l) + total(r)\n\
+         }\n\
+         def build(n: Int): Tree = if (n <= 0) Leaf(1) else Branch(build(n - 1), Leaf(n))\n\
+         mutable acc = 0\n\
+         mutable i = 0\n\
+         while (i < 3000) {\n\
+           acc = acc + total(build(40))\n\
+           i = i + 1\n\
+         }\n\
+         println(acc)\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "2463000\n");
+}
+
 /// PR 7: a `#!` shebang at the top of a `.kl` file is dropped during
 /// source loading so the rest of the script parses normally.
 #[test]

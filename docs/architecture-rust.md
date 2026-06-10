@@ -594,8 +594,21 @@ cargo run -- -e "1 + 2"
   several generic enums) without interference — each inlined call site
   resolves its own reprs. Generic enums whose payload is an applied
   generic (`List<a>` / a record)
-  and recursive functions over enum-typed parameters remain unsupported
-  and keep their compile-time diagnostics.
+  remain unsupported and keep their compile-time diagnostics.
+  Functions whose parameter or return annotations name a lowered
+  monomorphic enum use a per-frame by-pointer calling convention: the
+  enum's `__gc_record` pointer travels as a qword in the System V
+  argument registers (or the caller stack-push convention past six)
+  alongside scalars, the caller pins each evaluated heap argument in
+  the GC root table while later arguments evaluate (unpinning just
+  before the call), and the callee prologue spills pointer arguments
+  to frame slots that it registers on the GC shadow stack — after all
+  argument registers are spilled, because the shadow push clobbers
+  rcx/r8/r9 — and pops again before returning. That makes recursive
+  functions over monomorphic enum arguments, and enum-returning
+  recursion, compile and run; recursion over *generic* enum arguments
+  still requires per-instantiation function specialization and keeps
+  its diagnostic.
   Imports of the plain-Klassic `std.*` modules are inlined before type
   checking: the imported module's declarations are spliced between the
   bundled prelude and the user program (native name resolution is
