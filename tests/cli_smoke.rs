@@ -22460,6 +22460,66 @@ fn shebang_line_is_stripped_from_source() {
     );
 }
 
+/// `else` may start a continuation line (GitHub issue #429): the if
+/// parser peeks past newline tokens and only consumes them when an
+/// `else` actually follows, so the newline still terminates the
+/// expression otherwise. Covers else-if chains, eval and native.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn else_continues_on_the_next_line() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_else_line_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_else_line_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def g(x: Int): Int =\n\
+           if (x > 10) 100\n\
+           else if (x > 5) 50\n\
+           else 0\n\
+         println(g(20))\n\
+         println(g(7))\n\
+         println(g(1))\n",
+    )
+    .expect("temp source file should write");
+    let expected = "100\n50\n0\n";
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    assert!(
+        eval_output.status.success(),
+        "continuation else should parse\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&eval_output.stdout), expected);
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "continuation else should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
+}
+
 /// Top-level defs can forward-reference each other (GitHub issue
 /// #427): the type checker predeclares every unconstrained def in a
 /// block before checking statements (retiring the monomorphic

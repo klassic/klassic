@@ -1985,7 +1985,26 @@ impl Parser {
         self.expect_rparen()?;
         let then_branch = self.parse_branch_expression()?;
         let mut span = start.merge(condition.span()).merge(then_branch.span());
-        let else_branch = if matches!(self.peek().kind, TokenKind::Else) {
+        // Allow `else` at the start of a continuation line: peek past
+        // newline tokens, and only consume them when an `else` actually
+        // follows — otherwise the newline still terminates the `if`
+        // expression as before. `else` can never start a statement, so
+        // this lookahead cannot steal one.
+        let mut lookahead = self.index;
+        while matches!(
+            self.tokens.get(lookahead).map(|token| &token.kind),
+            Some(TokenKind::Newline)
+        ) {
+            lookahead += 1;
+        }
+        let else_follows = matches!(
+            self.tokens.get(lookahead).map(|token| &token.kind),
+            Some(TokenKind::Else)
+        );
+        let else_branch = if else_follows {
+            while matches!(self.peek().kind, TokenKind::Newline) {
+                self.bump();
+            }
             let else_token = self.bump().span;
             let branch = self.parse_branch_expression()?;
             span = span.merge(else_token).merge(branch.span());
