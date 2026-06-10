@@ -21572,6 +21572,102 @@ fn typecheck_reports_match_exhaustiveness_and_unreachable_arms() {
     assert_eq!(String::from_utf8_lossy(&exhaustive.stdout), "1\n()\n");
 }
 
+/// User module files resolve from the importing file's directory
+/// (GitHub issue #421): `import liba.{a}` loads `liba.kl`,
+/// `import util.base.{two}` loads `util/base.kl`, transitive and
+/// diamond-shaped graphs splice once in dependency order, a module may
+/// import `std.*` itself, and an import cycle is a clean error. The
+/// same program runs under the evaluator and a native build.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn user_module_imports_resolve_from_neighboring_files() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("klassic_user_modules_{stamp}"));
+    fs::create_dir_all(dir.join("util")).expect("temp module dir should create");
+    fs::write(
+        dir.join("util/base.kl"),
+        "module util.base\n\nimport std.math.{mod}\n\ndef two() = 2\ndef parity(n) = mod(n, 2)\n",
+    )
+    .expect("module should write");
+    fs::write(
+        dir.join("liba.kl"),
+        "module liba\nimport util.base.{two}\n\ndef a() = two() + 10\n",
+    )
+    .expect("module should write");
+    fs::write(
+        dir.join("libb.kl"),
+        "module libb\nimport util.base.{two, parity}\n\ndef b() = two() + 100 + parity(3)\n",
+    )
+    .expect("module should write");
+    let main_path = dir.join("main.kl");
+    fs::write(
+        &main_path,
+        "import liba.{a}\nimport libb.{b}\nprintln(a() + b())\n",
+    )
+    .expect("main should write");
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(main_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    assert!(
+        eval_output.status.success(),
+        "evaluator should resolve user modules\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stdout),
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&eval_output.stdout), "115\n");
+
+    let output_path = dir.join("main.bin");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            main_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should resolve user modules\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    assert!(run_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "115\n");
+
+    fs::write(
+        dir.join("cyca.kl"),
+        "module cyca\nimport cycb.{f}\ndef g() = 1\n",
+    )
+    .expect("module should write");
+    fs::write(
+        dir.join("cycb.kl"),
+        "module cycb\nimport cyca.{g}\ndef f() = 2\n",
+    )
+    .expect("module should write");
+    let cyc_main = dir.join("cyc.kl");
+    fs::write(&cyc_main, "import cyca.{g}\nprintln(g())\n").expect("main should write");
+    let cycle_output = Command::new(klassic_bin())
+        .arg(cyc_main.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(!cycle_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&cycle_output.stderr).contains("import cycle detected"),
+        "{}",
+        String::from_utf8_lossy(&cycle_output.stderr)
+    );
+}
+
 /// Allocating enum values in a loop long enough to exhaust the initial
 /// 1 MiB GC heap exercises collection and free-list reuse. A reused
 /// first-fit block used to keep stale payload bytes (and `__gc_record`'s

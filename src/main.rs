@@ -10,7 +10,11 @@ use cli::{
     ExecutionConfig, ParsedCommand, RunAction, parse_command_line, render_command_line_error,
 };
 use klassic_eval::{Evaluator, EvaluatorConfig, set_script_args};
-use klassic_native::{NativeCompilerConfig, NativeTarget, compile_source_with_prelude_for_target};
+use klassic_native::{
+    NativeCompilerConfig, NativeTarget, UserModuleSource,
+    compile_source_with_prelude_and_modules_for_target,
+};
+use std::path::Path;
 
 /// The standard prelude is bundled into the compiler at build time. It is
 /// loaded as a separate translation unit so user code is parsed in its own
@@ -66,10 +70,12 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
             };
-            let bytes = match compile_source_with_prelude_for_target(
+            let user_modules = user_modules_for(&input, &text)?;
+            let bytes = match compile_source_with_prelude_and_modules_for_target(
                 &input.display().to_string(),
                 STDLIB_PRELUDE,
                 &text,
+                &user_modules,
                 config,
             ) {
                 Ok(bytes) => bytes,
@@ -117,6 +123,12 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
             })?;
+            for module in user_modules_for(&path, &text)? {
+                if let Err(error) = evaluator.evaluate_text(&module.path, &module.source) {
+                    eprintln!("{error}");
+                    return Err(1);
+                }
+            }
             match evaluator.evaluate_text(&path.display().to_string(), &text) {
                 Ok(_) => Ok(()),
                 Err(error) => {
@@ -134,6 +146,84 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
             Ok(())
         }
     }
+}
+
+/// Discover user module files imported (directly or transitively) by
+/// `text`. A dotted import path resolves relative to `base_dir`:
+/// `import util.text` tries `util/text.kl` then `util.text.kl`, and a
+/// selective import (`import mylib.{f}` / `import mylib.f`) retries
+/// with the final segment dropped. Bundled `std.*` modules and paths
+/// with no matching file are skipped (the type checker keeps its
+/// `unknown module` diagnostic for those). Modules are returned in
+/// dependency order; an import cycle is reported as an error.
+fn collect_user_modules(
+    base_dir: &Path,
+    text: &str,
+    loading: &mut Vec<String>,
+    out: &mut Vec<UserModuleSource>,
+) -> Result<(), String> {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("import ") else {
+            continue;
+        };
+        let token = rest.split_whitespace().next().unwrap_or("");
+        let token = token.split(".{").next().unwrap_or(token);
+        let token = token.strip_suffix("._").unwrap_or(token);
+        let token = token.trim_end_matches(';');
+        if token.is_empty() || token.starts_with("std.") || token == "std" {
+            continue;
+        }
+        let mut candidates = vec![token.to_string()];
+        if let Some((parent, _)) = token.rsplit_once('.') {
+            candidates.push(parent.to_string());
+        }
+        let resolved = candidates.iter().find_map(|module_path| {
+            let slashed = base_dir.join(format!("{}.kl", module_path.replace('.', "/")));
+            let dotted = base_dir.join(format!("{module_path}.kl"));
+            if slashed.is_file() {
+                Some((module_path.clone(), slashed))
+            } else if dotted.is_file() {
+                Some((module_path.clone(), dotted))
+            } else {
+                None
+            }
+        });
+        let Some((module_path, file)) = resolved else {
+            continue;
+        };
+        if out.iter().any(|module| module.path == module_path) {
+            continue;
+        }
+        if loading.contains(&module_path) {
+            return Err(format!(
+                "import cycle detected through module `{module_path}`"
+            ));
+        }
+        let source = match fs::read_to_string(&file) {
+            Ok(source) => strip_shebang(source),
+            Err(error) => return Err(format!("{}: {error}", file.display())),
+        };
+        loading.push(module_path.clone());
+        collect_user_modules(base_dir, &source, loading, out)?;
+        loading.pop();
+        out.push(UserModuleSource {
+            path: module_path,
+            source,
+        });
+    }
+    Ok(())
+}
+
+fn user_modules_for(path: &Path, text: &str) -> Result<Vec<UserModuleSource>, u8> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut modules = Vec::new();
+    let mut loading = Vec::new();
+    if let Err(error) = collect_user_modules(base_dir, text, &mut loading, &mut modules) {
+        eprintln!("{error}");
+        return Err(1);
+    }
+    Ok(modules)
 }
 
 fn prepare_evaluator(config: EvaluatorConfig) -> Result<Evaluator, u8> {

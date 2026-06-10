@@ -431,7 +431,7 @@ pub fn compile_source_for_target(
     config: NativeCompilerConfig,
 ) -> Result<Vec<u8>, NativeCompileError> {
     let source = SourceFile::new(name, text);
-    compile_internal(source, None, config)
+    compile_internal(source, None, &[], config)
 }
 
 /// Compile `user_text` as if `prelude_text` were prepended in front of it.
@@ -460,6 +460,24 @@ pub fn compile_source_with_prelude_for_target(
     user_text: &str,
     config: NativeCompilerConfig,
 ) -> Result<Vec<u8>, NativeCompileError> {
+    compile_source_with_prelude_and_modules_for_target(name, prelude_text, user_text, &[], config)
+}
+
+/// A user module discovered next to the program being compiled: its
+/// dotted import path (`mylib`, `util.text`) and the file's source.
+#[derive(Clone, Debug)]
+pub struct UserModuleSource {
+    pub path: String,
+    pub source: String,
+}
+
+pub fn compile_source_with_prelude_and_modules_for_target(
+    name: &str,
+    prelude_text: &str,
+    user_text: &str,
+    user_modules: &[UserModuleSource],
+    config: NativeCompilerConfig,
+) -> Result<Vec<u8>, NativeCompileError> {
     let mut bundled = String::with_capacity(prelude_text.len() + user_text.len() + 1);
     bundled.push_str(prelude_text);
     if !prelude_text.ends_with('\n') {
@@ -472,13 +490,14 @@ pub fn compile_source_with_prelude_for_target(
         source: SourceFile::new(name, user_text),
         prelude_byte_offset,
     };
-    compile_internal(source, Some(user_view), config)
+    compile_internal(source, Some(user_view), user_modules, config)
 }
 
 #[allow(clippy::result_large_err)]
 fn compile_internal(
     source: SourceFile,
     user_view: Option<UserSourceView>,
+    user_modules: &[UserModuleSource],
     config: NativeCompilerConfig,
 ) -> Result<Vec<u8>, NativeCompileError> {
     let expr = parse_source(&source).map_err(|diagnostic| {
@@ -488,7 +507,7 @@ fn compile_internal(
     let prelude_offset = user_view
         .as_ref()
         .map_or(0, |view| view.prelude_byte_offset);
-    let expr = inline_stdlib_imports(expr, prelude_offset).map_err(|diagnostic| {
+    let expr = inline_module_imports(expr, prelude_offset, user_modules).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
     typecheck_program(&expr).map_err(|diagnostic| {
@@ -550,14 +569,21 @@ fn stdlib_module_source(path: &str) -> Option<&'static str> {
         .map(|module| module.source)
 }
 
-fn collect_inlinable_std_imports(expr: &Expr, out: &mut Vec<(String, Option<String>)>) {
+fn collect_inlinable_imports(
+    expr: &Expr,
+    user_modules: &[UserModuleSource],
+    out: &mut Vec<(String, Option<String>)>,
+) {
     match expr {
-        Expr::Import { path, alias, .. } if stdlib_module_is_inlinable(path) => {
+        Expr::Import { path, alias, .. }
+            if stdlib_module_is_inlinable(path)
+                || user_modules.iter().any(|module| module.path == *path) =>
+        {
             out.push((path.clone(), alias.clone()));
         }
         Expr::Block { expressions, .. } => {
             for sub in expressions {
-                collect_inlinable_std_imports(sub, out);
+                collect_inlinable_imports(sub, user_modules, out);
             }
         }
         _ => {}
@@ -826,30 +852,79 @@ fn rewrite_inlined(expr: Expr, inlined: &[String], aliases: &HashSet<String>) ->
 /// can only call earlier `def`s), and stdlib modules call prelude helpers,
 /// so the spliced declarations are inserted *after* the prelude and
 /// *before* the user program — i.e. `[prelude][modules][user]`.
-fn inline_stdlib_imports(expr: Expr, prelude_offset: usize) -> Result<Expr, Diagnostic> {
+fn inline_module_imports(
+    expr: Expr,
+    prelude_offset: usize,
+    user_modules: &[UserModuleSource],
+) -> Result<Expr, Diagnostic> {
     let mut imports = Vec::new();
-    collect_inlinable_std_imports(&expr, &mut imports);
+    collect_inlinable_imports(&expr, user_modules, &mut imports);
+    // A std module imported only from inside a user module still needs
+    // splicing; the module sources are plain text here, so scan them
+    // the same way the CLI discovers user modules.
+    for module in user_modules {
+        for line in module.source.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("import ") else {
+                continue;
+            };
+            let token = rest.split_whitespace().next().unwrap_or("");
+            let token = token.split(".{").next().unwrap_or(token);
+            if stdlib_module_is_inlinable(token) {
+                imports.push((token.to_string(), None));
+            }
+        }
+    }
     if imports.is_empty() {
         return Ok(expr);
     }
 
+    // Splice order: bundled std modules first, then every discovered
+    // user module in dependency order — user modules may import std
+    // modules and each other, and native name resolution is
+    // order-sensitive. User modules arrive transitively discovered, so
+    // splice them all even when the main program only imports the top
+    // of the graph.
     let mut paths: Vec<String> = Vec::new();
     let mut aliases: HashSet<String> = HashSet::new();
     for (path, alias) in &imports {
-        if !paths.iter().any(|existing| existing == path) {
+        if !paths.iter().any(|existing| existing == path)
+            && !user_modules.iter().any(|module| module.path == *path)
+        {
             paths.push(path.clone());
         }
         if let Some(alias) = alias {
             aliases.insert(alias.clone());
         }
     }
+    for module in user_modules {
+        if !paths.iter().any(|existing| *existing == module.path) {
+            paths.push(module.path.clone());
+        }
+    }
 
     let mut module_decls = Vec::new();
     for path in &paths {
-        let source = stdlib_module_source(path).expect("inlinable module has a source");
+        let user_source = user_modules
+            .iter()
+            .find(|module| module.path == *path)
+            .map(|module| module.source.as_str());
+        let source = user_source
+            .or_else(|| stdlib_module_source(path))
+            .expect("inlinable module has a source");
         let file = SourceFile::new(path, source.to_string());
         let parsed = rewrite_expression(parse_source(&file)?);
-        module_decls.extend(stdlib_module_decls(parsed));
+        // A module's own imports of other spliced modules are satisfied
+        // by the splice order — drop those nodes (anything else keeps
+        // its diagnostic).
+        for decl in stdlib_module_decls(parsed) {
+            if let Expr::Import { path: inner, .. } = &decl
+                && (paths.iter().any(|existing| existing == inner)
+                    || stdlib_module_is_inlinable(inner))
+            {
+                continue;
+            }
+            module_decls.push(decl);
+        }
     }
 
     let span = expr.span();
