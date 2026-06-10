@@ -644,9 +644,12 @@ cargo run -- -e "1 + 2"
   the heap at the call site; consumers inside bodies either handle
   heap strings directly (`length` counts UTF-8 characters in place,
   `isEmptyString` reads the length prefix, `assertResult` and `==`
-  compare through the heap-string equality) or materialize into a
-  fresh fixed buffer transitionally (`substring`, `at`,
-  `String#parseInt` — those sites keep the 64KB cap for now). The
+  compare through the heap-string equality, and the slicing emitters
+  behind `substring` / `at` read a heap input in place from a rooted
+  slot — only the slice *result* still lands in a fixed buffer, so a
+  result over 64KB is the remaining cap) or materialize into a fresh
+  fixed buffer transitionally (`String#parseInt`, where an input past
+  64KB cannot be a number anyway). The
   caller unpins heap-string arguments exactly like enum pointers —
   the pin/unpin pair must stay matched per argument or the root
   table fills after a few thousand calls — and the GC tables (root

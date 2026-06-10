@@ -9807,14 +9807,24 @@ impl NativeCodeGenerator {
                 if self.expr_may_yield_runtime_string(&arguments[0])
                     || self.expr_may_yield_heap_string(&arguments[0])
                 {
-                    let input = self.compile_expr(&arguments[0])?;
-                    let input = self.coerce_heap_string_to_runtime(
-                        input,
-                        span,
-                        "substring input exceeds 65536 bytes",
-                    );
-                    let Some(input) = self.native_string_ref(input) else {
-                        return Err(unsupported(span, "native substring for non-string"));
+                    let value = self.compile_expr(&arguments[0])?;
+                    // A heap-string input is read in place from a
+                    // rooted slot — no 64KB materialization. The scope
+                    // releases the slot (and its root) on every exit.
+                    self.push_scope();
+                    let input = match value {
+                        NativeValue::HeapString => {
+                            let slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+                            self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                            SliceInput::HeapSlot(slot.offset)
+                        }
+                        other => match self.native_string_ref(other) {
+                            Some(string) => SliceInput::Fixed(string),
+                            None => {
+                                self.pop_scope();
+                                return Err(unsupported(span, "native substring for non-string"));
+                            }
+                        },
                     };
                     if matches!(
                         (
@@ -9833,15 +9843,14 @@ impl NativeCodeGenerator {
                             name,
                             span,
                         )?;
-                        return Ok(self.emit_runtime_string_slice(
-                            input,
-                            start,
-                            end.max(start),
-                            span,
-                        ));
+                        let result =
+                            self.emit_runtime_string_slice(input, start, end.max(start), span);
+                        self.pop_scope();
+                        return Ok(result);
                     }
                     let start = self.compile_expr(&arguments[1])?;
                     if start != NativeValue::Int {
+                        self.pop_scope();
                         return Err(unsupported(
                             span,
                             "native substring for non-integer start index",
@@ -9852,6 +9861,7 @@ impl NativeCodeGenerator {
                     self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
                     let end = self.compile_expr(&arguments[2])?;
                     if end != NativeValue::Int {
+                        self.pop_scope();
                         return Err(unsupported(
                             span,
                             "native substring for non-integer end index",
@@ -9860,13 +9870,15 @@ impl NativeCodeGenerator {
                     let end_chars = self.asm.data_label_with_i64s(&[0]);
                     self.asm.mov_data_addr(Reg::Rcx, end_chars);
                     self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
-                    return Ok(self.emit_runtime_string_slice_dynamic_indices(
+                    let result = self.emit_runtime_string_slice_dynamic_indices(
                         input,
                         start_chars,
                         end_chars,
                         span,
                         name,
-                    ));
+                    );
+                    self.pop_scope();
+                    return Ok(result);
                 }
                 let input =
                     self.static_string_from_argument_preserving_effects(&arguments[0], span, name)?;
@@ -9902,7 +9914,7 @@ impl NativeCodeGenerator {
                     self.asm.mov_data_addr(Reg::Rcx, end_chars);
                     self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
                     return Ok(self.emit_runtime_string_slice_dynamic_indices(
-                        input,
+                        SliceInput::Fixed(input),
                         start_chars,
                         end_chars,
                         span,
@@ -9929,17 +9941,23 @@ impl NativeCodeGenerator {
                 if self.expr_may_yield_runtime_string(&arguments[0])
                     || self.expr_may_yield_heap_string(&arguments[0])
                 {
-                    let input = self.compile_expr(&arguments[0])?;
-                    // A heap-string input (by-pointer String parameter)
-                    // materializes into a fixed buffer for the slicing
-                    // machinery — transitional 64KB cap at this site.
-                    let input = self.coerce_heap_string_to_runtime(
-                        input,
-                        span,
-                        "at input exceeds 65536 bytes",
-                    );
-                    let Some(input) = self.native_string_ref(input) else {
-                        return Err(unsupported(span, "native at for non-string"));
+                    let value = self.compile_expr(&arguments[0])?;
+                    // A heap-string input is read in place from a
+                    // rooted slot — no 64KB materialization.
+                    self.push_scope();
+                    let input = match value {
+                        NativeValue::HeapString => {
+                            let slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+                            self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                            SliceInput::HeapSlot(slot.offset)
+                        }
+                        other => match self.native_string_ref(other) {
+                            Some(string) => SliceInput::Fixed(string),
+                            None => {
+                                self.pop_scope();
+                                return Err(unsupported(span, "native at for non-string"));
+                            }
+                        },
                     };
                     if matches!(
                         self.preview_static_value_after_effectful_eval(&arguments[1]),
@@ -9950,10 +9968,13 @@ impl NativeCodeGenerator {
                             name,
                             span,
                         )?;
-                        return Ok(self.emit_runtime_string_slice(input, index, index + 1, span));
+                        let result = self.emit_runtime_string_slice(input, index, index + 1, span);
+                        self.pop_scope();
+                        return Ok(result);
                     }
                     let index = self.compile_expr(&arguments[1])?;
                     if index != NativeValue::Int {
+                        self.pop_scope();
                         return Err(unsupported(span, "native at for non-integer index"));
                     }
                     let start_chars = self.asm.data_label_with_i64s(&[0]);
@@ -9963,13 +9984,15 @@ impl NativeCodeGenerator {
                     self.asm.inc_reg(Reg::Rax);
                     self.asm.mov_data_addr(Reg::Rcx, end_chars);
                     self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
-                    return Ok(self.emit_runtime_string_slice_dynamic_indices(
+                    let result = self.emit_runtime_string_slice_dynamic_indices(
                         input,
                         start_chars,
                         end_chars,
                         span,
                         name,
-                    ));
+                    );
+                    self.pop_scope();
+                    return Ok(result);
                 }
                 let input =
                     self.static_string_from_argument_preserving_effects(&arguments[0], span, name)?;
@@ -9993,7 +10016,7 @@ impl NativeCodeGenerator {
                     self.asm.mov_data_addr(Reg::Rcx, end_chars);
                     self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
                     return Ok(self.emit_runtime_string_slice_dynamic_indices(
-                        input,
+                        SliceInput::Fixed(input),
                         start_chars,
                         end_chars,
                         span,
@@ -34060,9 +34083,26 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(done);
     }
 
+    /// Where a string-slicing emitter reads its input bytes from: a
+    /// fixed-buffer string (data labels) or a GC heap string whose
+    /// pointer sits in a rooted rbp slot (`[i64 byte_len][bytes]`).
+    fn emit_slice_input_setup(&mut self, input: &SliceInput) {
+        match input {
+            SliceInput::Fixed(string) => {
+                self.asm.mov_data_addr(Reg::Rsi, string.data);
+                self.emit_load_native_string_len(Reg::Rdx, string.len);
+            }
+            SliceInput::HeapSlot(offset) => {
+                self.asm.load_rbp_slot(Reg::Rsi, *offset);
+                self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rsi, 0);
+                self.asm.add_reg_imm32(Reg::Rsi, 8);
+            }
+        }
+    }
+
     fn emit_runtime_string_slice(
         &mut self,
-        input: NativeStringRef,
+        input: SliceInput,
         start_chars: usize,
         end_chars: usize,
         span: Span,
@@ -34072,8 +34112,7 @@ impl NativeCodeGenerator {
         let len = self.asm.data_label_with_i64s(&[0]);
         let start_byte = self.asm.data_label_with_i64s(&[0]);
 
-        self.asm.mov_data_addr(Reg::Rsi, input.data);
-        self.emit_load_native_string_len(Reg::Rdx, input.len);
+        self.emit_slice_input_setup(&input);
         self.emit_native_string_byte_offset_for_char_index(start_chars);
         self.asm.mov_data_addr(Reg::R10, start_byte);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R8);
@@ -34093,7 +34132,7 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R10, len);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
         self.asm.mov_data_addr(Reg::Rbx, data);
-        self.asm.mov_data_addr(Reg::Rsi, input.data);
+        self.emit_slice_input_setup(&input);
         self.asm.mov_imm64(Reg::R8, 0);
         let loop_label = self.asm.create_text_label();
         let done = self.asm.create_text_label();
@@ -34113,7 +34152,7 @@ impl NativeCodeGenerator {
 
     fn emit_runtime_string_slice_dynamic_indices(
         &mut self,
-        input: NativeStringRef,
+        input: SliceInput,
         start_chars: DataLabel,
         end_chars: DataLabel,
         span: Span,
@@ -34152,14 +34191,12 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R10, effective_end_chars);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
 
-        self.asm.mov_data_addr(Reg::Rsi, input.data);
-        self.emit_load_native_string_len(Reg::Rdx, input.len);
+        self.emit_slice_input_setup(&input);
         self.emit_native_string_byte_offset_for_char_index_dynamic(start_chars);
         self.asm.mov_data_addr(Reg::R10, start_byte);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R8);
 
-        self.asm.mov_data_addr(Reg::Rsi, input.data);
-        self.emit_load_native_string_len(Reg::Rdx, input.len);
+        self.emit_slice_input_setup(&input);
         self.emit_native_string_byte_offset_for_char_index_dynamic(effective_end_chars);
         self.asm.mov_data_addr(Reg::R10, start_byte);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
@@ -34175,7 +34212,7 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R10, len);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
         self.asm.mov_data_addr(Reg::Rbx, data);
-        self.asm.mov_data_addr(Reg::Rsi, input.data);
+        self.emit_slice_input_setup(&input);
         self.asm.mov_imm64(Reg::R8, 0);
         let loop_label = self.asm.create_text_label();
         let done = self.asm.create_text_label();
@@ -37509,6 +37546,13 @@ fn argument_registers(count: usize) -> Vec<Reg> {
 /// and by-pointer heap aggregates such as lowered enums), as opposed to
 /// the legacy shared scratch-buffer convention (strings, line lists,
 /// records).
+/// Input source for the string slicing emitters.
+enum SliceInput {
+    Fixed(NativeStringRef),
+    /// rbp offset of a rooted slot holding a GC heap-string pointer.
+    HeapSlot(i32),
+}
+
 fn native_param_is_qword(value: &NativeValue) -> bool {
     matches!(
         value,

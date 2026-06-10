@@ -372,21 +372,25 @@ fn builds_native_executable_for_heap_string_parameters() {
         .as_nanos();
     let source_path = std::env::temp_dir().join(format!("klassic_heap_string_abi_{unique}.kl"));
     let output_path = std::env::temp_dir().join(format!("klassic_heap_string_abi_{unique}.bin"));
-    let big = "y".repeat(70000);
+    let big = format!("{}TAIL", "y".repeat(69996));
     fs::write(
         &source_path,
         format!(
             "def describe(s: String, n: Int): String = if (n <= 0) s else describe(s + \"x\", n - 1)\n\
              def ident(s: String): String = s\n\
              def churn(s: String, n: Int): Int = if (n <= 0) length(s) else churn(s + \"ab\", n - 1)\n\
+             def lastFour(s: String): String = substring(s, length(s) - 4, length(s))\n\
+             def pick(s: String, i: Int): String = s.at(i)\n\
              println(describe(\"r\", 4))\n\
              println(length(describe(\"あいう\", 2)))\n\
              println(length(ident(\"{big}\")))\n\
+             println(lastFour(ident(\"{big}\")))\n\
+             println(pick(ident(\"{big}\"), 69997))\n\
              println(churn(\"\", 2000))\n"
         ),
     )
     .expect("temp source file should write");
-    let expected = "rxxxx\n5\n70000\n4000\n";
+    let expected = "rxxxx\n5\n70000\nTAIL\nA\n4000\n";
 
     let build_output = Command::new(klassic_bin())
         .args([
