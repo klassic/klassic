@@ -425,6 +425,25 @@ pub fn compile_source_to_elf(
 }
 
 #[allow(clippy::result_large_err)]
+mod cbackend;
+
+/// Compile `text` to a portable C translation unit (`--backend c`).
+/// The supported subset is deliberately small (see `cbackend`);
+/// unsupported constructs produce source-located diagnostics. The
+/// returned string is C99 depending only on stdio/stdint, so any C
+/// compiler on any platform can finish the job.
+#[allow(clippy::result_large_err)]
+pub fn compile_source_to_c(name: &str, text: &str) -> Result<String, NativeCompileError> {
+    let source = SourceFile::new(name, text);
+    let expr = parse_source(&source)
+        .map_err(|diagnostic| NativeCompileError::with_view(source.clone(), None, diagnostic))?;
+    let expr = rewrite_expression(expr);
+    typecheck_program(&expr)
+        .map_err(|diagnostic| NativeCompileError::with_view(source.clone(), None, diagnostic))?;
+    cbackend::emit_c_program(&expr)
+        .map_err(|diagnostic| NativeCompileError::with_view(source, None, diagnostic))
+}
+
 pub fn compile_source_for_target(
     name: &str,
     text: &str,

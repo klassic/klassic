@@ -696,6 +696,18 @@ cargo run -- -e "1 + 2"
   a string-payload `mapOption` read back as a string rather than the
   `None` arm's defaulted scalar.
 
+  A portable C backend (roadmap PR 9) lives behind `--backend c`:
+  `klassic --backend c build program.kl -o program.c` emits one C99
+  translation unit (stdio/stdint only) for a deliberately small subset
+  — `Int` / `Bool` / `String` literals, arithmetic / comparison /
+  logical operators, `val` / `mutable` / assignment, `if` / `while`,
+  `println`, and annotated top-level `def`s including recursion.
+  Anything outside the subset is a source-located diagnostic, never
+  wrong code, and the direct ELF path is untouched. The emitter is
+  `crates/klassic-native/src/cbackend.rs`; the runtime-call shim that
+  will widen the subset (strings beyond literals, the GC types) is
+  roadmap PR 10.
+
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program
   startup, the prologue invokes `mmap(NULL, 1 MiB,

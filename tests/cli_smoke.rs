@@ -22460,6 +22460,132 @@ fn shebang_line_is_stripped_from_source() {
     );
 }
 
+/// The portable C backend (GitHub issue #425, roadmap PR 9) emits a
+/// single C99 translation unit for the Int/Bool/String/println/if/
+/// while/def subset behind `--backend c`. The generated source depends
+/// only on stdio/stdint; when a `cc` is available the test compiles
+/// and runs it and asserts evaluator-identical output. Unsupported
+/// constructs get source-located diagnostics.
+#[test]
+fn build_backend_c_emits_compilable_c() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_cbackend_{stamp}.kl"));
+    let c_path = dir.join(format!("klassic_cbackend_{stamp}.c"));
+    let bin_path = dir.join(format!("klassic_cbackend_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)\n\
+         def shout(flag: Bool): String = if (flag) \"yes\" else \"no\"\n\
+         println(\"hello from klassic via C\")\n\
+         println(fib(20))\n\
+         println(shout(true))\n\
+         mutable i = 0\n\
+         mutable total = 0\n\
+         while (i < 5) {\n\
+           total = total + i\n\
+           i = i + 1\n\
+         }\n\
+         println(total)\n\
+         println(i == 5)\n",
+    )
+    .expect("temp source file should write");
+    let expected = "hello from klassic via C\n6765\nyes\n10\ntrue\n";
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--backend",
+            "c",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            c_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "C backend should emit\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let c_source = fs::read_to_string(&c_path).expect("C output should exist");
+    assert!(c_source.contains("int main(void)"), "{c_source}");
+    assert!(
+        c_source.contains("int64_t kl_fib(int64_t kl_n)"),
+        "{c_source}"
+    );
+
+    let cc_available = Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|probe| probe.status.success());
+    if cc_available {
+        let compile = Command::new("cc")
+            .args([
+                "-o",
+                bin_path.to_str().expect("path should be utf-8"),
+                c_path.to_str().expect("path should be utf-8"),
+            ])
+            .output()
+            .expect("cc should run");
+        assert!(
+            compile.status.success(),
+            "cc should accept the generated source\nstderr:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run_output = Command::new(&bin_path)
+            .output()
+            .expect("compiled C binary should run");
+        assert!(run_output.status.success());
+        assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
+    }
+
+    let unsupported = Command::new(klassic_bin())
+        .args([
+            "--backend",
+            "c",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            c_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(unsupported.status.success());
+
+    let enum_source_path = dir.join(format!("klassic_cbackend_enum_{stamp}.kl"));
+    fs::write(
+        &enum_source_path,
+        "enum Color { case Red }\nprintln(Red match { case Red => 1 })\n",
+    )
+    .expect("temp source file should write");
+    let rejected = Command::new(klassic_bin())
+        .args([
+            "--backend",
+            "c",
+            "build",
+            enum_source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            c_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&enum_source_path);
+    let _ = fs::remove_file(&c_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("not supported by the portable C backend yet"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
 /// std.time wraps the Time#nowMillis builtin with ISO-8601 UTC
 /// formatting (Hinnant's days-to-civil on integer arithmetic) and
 /// duration helpers, in pure Klassic — parity-tested across the

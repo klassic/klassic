@@ -11,7 +11,7 @@ use cli::{
 };
 use klassic_eval::{Evaluator, EvaluatorConfig, set_script_args};
 use klassic_native::{
-    NativeCompilerConfig, NativeTarget, UserModuleSource,
+    NativeCompilerConfig, NativeTarget, UserModuleSource, compile_source_to_c,
     compile_source_with_prelude_and_modules_for_target,
 };
 use std::path::Path;
@@ -65,6 +65,20 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     return Err(1);
                 }
             };
+            if command.config.c_backend {
+                let c_source = match compile_source_to_c(&input.display().to_string(), &text) {
+                    Ok(c_source) => c_source,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return Err(1);
+                    }
+                };
+                if let Err(error) = fs::write(&output, c_source) {
+                    eprintln!("{}: {error}", output.display());
+                    return Err(1);
+                }
+                return Ok(());
+            }
             let config = NativeCompilerConfig {
                 target: command.config.native_target,
                 deny_trust: command.config.deny_trust,

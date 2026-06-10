@@ -7,6 +7,9 @@ pub struct ExecutionConfig {
     pub deny_trust: bool,
     pub warn_trust: bool,
     pub native_target: NativeTarget,
+    /// `--backend c`: `build` emits a portable C translation unit at
+    /// the output path instead of a direct ELF executable.
+    pub c_backend: bool,
 }
 
 impl ExecutionConfig {
@@ -15,6 +18,7 @@ impl ExecutionConfig {
             deny_trust,
             warn_trust,
             native_target,
+            c_backend: false,
         }
     }
 }
@@ -47,6 +51,8 @@ pub enum CommandLineError {
     Usage,
     /// `--target` was given without a value.
     MissingTargetArgument,
+    /// `--backend` was given without a value or with an unknown one.
+    UnknownBackend(String),
     /// `--target X` named a target the compiler knows about but doesn't
     /// have a backend for yet.
     PlannedTarget {
@@ -60,6 +66,7 @@ pub enum CommandLineError {
 
 pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineError> {
     let mut deny_trust = false;
+    let mut c_backend = false;
     let mut warn_trust = false;
     let mut native_target = NativeTarget::default();
     let mut others = Vec::new();
@@ -86,6 +93,16 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
                 warn_trust = true;
                 index += 1;
             }
+            "--backend" => {
+                let Some(backend) = args.get(index + 1) else {
+                    return Err(CommandLineError::UnknownBackend(String::new()));
+                };
+                if backend != "c" {
+                    return Err(CommandLineError::UnknownBackend(backend.clone()));
+                }
+                c_backend = true;
+                index += 2;
+            }
             "--target" => {
                 let Some(target_name) = args.get(index + 1) else {
                     return Err(CommandLineError::MissingTargetArgument);
@@ -111,7 +128,8 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
         }
     }
 
-    let config = ExecutionConfig::new(deny_trust, warn_trust, native_target);
+    let mut config = ExecutionConfig::new(deny_trust, warn_trust, native_target);
+    config.c_backend = c_backend;
     let action = match others.as_slice() {
         [command] if command == "targets" => RunAction::ListTargets,
         [flag] if flag == "--version" || flag == "-V" => RunAction::ShowVersion,
@@ -149,6 +167,7 @@ pub fn usage() -> String {
        --deny-trust       : reject programs that depend on trusted proofs\n\
        --warn-trust       : warn when trusted proofs are used\n\
        --target <target>  : native build target (supported: {})\n\
+       --backend c        : `build` emits a portable C translation unit instead of an ELF executable\n\
        <fileName>         : read a program from <fileName> and execute it\n\
        run <fileName>     : same as <fileName>; pairs naturally with `-- <args>`\n\
        -e <expression>    : evaluate <expression>\n\
@@ -168,6 +187,12 @@ pub fn render_command_line_error(error: &CommandLineError) -> String {
         CommandLineError::MissingTargetArgument => {
             format!("error: --target requires an argument\n{}", usage())
         }
+        CommandLineError::UnknownBackend(argument) if argument.is_empty() => {
+            format!("error: --backend requires an argument\n{}", usage())
+        }
+        CommandLineError::UnknownBackend(argument) => format!(
+            "error: unknown backend '{argument}'\n  help: supported backends: c (and the default direct ELF backend)\n"
+        ),
         CommandLineError::PlannedTarget { argument, planned } => format!(
             "error: target {} is recognized but not implemented yet\n  \
              help: tier {} target via the {} backend producing a {}\n  \
