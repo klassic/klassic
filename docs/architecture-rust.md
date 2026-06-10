@@ -362,7 +362,13 @@ cargo run -- -e "1 + 2"
   Static `if` values, static binary folds, and
   static call folds use the same purity gate before native folding, and
   dynamic-control assignments invalidate static facts for runtime integer/boolean
-  locals. Numeric Float/Double binary expressions and string concatenation can
+  locals. Call-body folding is budgeted per top-level attempt: a fuel
+  tank (1024 body evaluations, refilled at depth zero) bounds total
+  fold time even when sibling strategies re-evaluate the same subtree,
+  and a 128-level nesting cap bounds the compiler's own stack; a fold
+  that exhausts either budget compiles to regular runtime code, so a
+  deep recursive call like `down(200000)` neither overflows the
+  compiler's stack nor hangs it. Numeric Float/Double binary expressions and string concatenation can
   still preserve mutable block-prefix effects when their operands ultimately
   yield static values.
   Static equality and `assertResult` over aggregates preserve effectful

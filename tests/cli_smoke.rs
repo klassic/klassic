@@ -21341,6 +21341,63 @@ fn native_build_propagates_generic_enum_shape_through_match() {
     );
 }
 
+/// Compile-time constant folding of recursive calls is budgeted: a
+/// deep-but-valid recursion (`down(200000)`) used to walk the compiler
+/// off its own stack, and a depth-only cap turned the crash into an
+/// exponential-time hang (sibling fold strategies re-evaluated the same
+/// recursion per level). With the fuel-tank budget the fold gives up
+/// fast, the call compiles to regular runtime code, and shallow folds
+/// (`down(100)`) still constant-fold. GitHub issue #417.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_bounds_compile_time_recursion_folding() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_fold_fuel_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_fold_fuel_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def down(n: Int): Int = if (n <= 0) 0 else 1 + down(n - 1)\n\
+         println(down(100))\n\
+         println(down(200000))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "100\n200000\n");
+}
+
 /// Allocating enum values in a loop long enough to exhaust the initial
 /// 1 MiB GC heap exercises collection and free-list reuse. A reused
 /// first-fit block used to keep stale payload bytes (and `__gc_record`'s

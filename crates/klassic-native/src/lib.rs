@@ -3048,6 +3048,20 @@ struct NativeCodeGenerator {
     pending_enum_shape: Option<ConcreteEnumShape>,
     /// Fresh-name counter for synthesized generic-enum lowering trees.
     generic_enum_counter: usize,
+    /// Nesting depth of compile-time function/lambda body evaluation
+    /// (tracks where a top-level fold attempt begins so the fuel tank
+    /// refills there).
+    static_eval_call_depth: usize,
+    /// Remaining call-body evaluations for the current top-level fold
+    /// attempt. Static folding of a recursive call re-evaluates the
+    /// body per level — unbounded, that walks the compiler off its own
+    /// stack; bounded only by depth, sibling fold strategies (numeric,
+    /// then string-concat, ...) re-evaluate the same subtree per level
+    /// and the retries multiply into exponential time. The tank is
+    /// consumed monotonically across one whole attempt, so total work
+    /// stays linear; when it runs dry every nested fold gives up and
+    /// the call compiles to regular runtime code.
+    static_eval_fuel: usize,
 }
 
 impl NativeCodeGenerator {
@@ -3203,7 +3217,38 @@ impl NativeCodeGenerator {
             enum_shape_hints: Vec::new(),
             pending_enum_shape: None,
             generic_enum_counter: 0,
+            static_eval_call_depth: 0,
+            static_eval_fuel: 0,
         }
+    }
+
+    /// Call-body evaluations granted to one top-level fold attempt —
+    /// bounds total *time*, including the re-evaluation that sibling
+    /// fold strategies perform.
+    const STATIC_EVAL_FUEL: usize = 1024;
+    /// Maximum nesting of call-body evaluation — bounds the compiler's
+    /// own *stack* (each level costs several deep Rust frames,
+    /// especially in debug builds).
+    const STATIC_EVAL_MAX_CALL_DEPTH: usize = 128;
+
+    /// Enter one level of compile-time call-body evaluation, or `None`
+    /// when the current attempt's budget is spent. The fuel tank
+    /// refills only when a fresh top-level attempt begins (depth zero),
+    /// so once a deep recursion drains it, every sibling retry inside
+    /// the same attempt fails fast instead of re-walking the recursion.
+    /// Pair with a depth decrement after the body evaluation finishes.
+    fn enter_static_eval_call(&mut self) -> Option<()> {
+        if self.static_eval_call_depth == 0 {
+            self.static_eval_fuel = Self::STATIC_EVAL_FUEL;
+        }
+        if self.static_eval_fuel == 0
+            || self.static_eval_call_depth >= Self::STATIC_EVAL_MAX_CALL_DEPTH
+        {
+            return None;
+        }
+        self.static_eval_fuel -= 1;
+        self.static_eval_call_depth += 1;
+        Some(())
     }
 
     /// Collect generic (`type_params` non-empty) `enum` declarations whose
@@ -24523,12 +24568,14 @@ impl NativeCodeGenerator {
             .iter()
             .map(|argument| self.static_value_from_pure_expr(argument))
             .collect::<Option<Vec<_>>>()?;
+        self.enter_static_eval_call()?;
         self.push_scope();
         for (param, value) in function.params.iter().zip(values) {
             self.bind_static_value(param.clone(), value);
         }
         let result = self.static_value_from_expr(&function.body);
         self.pop_scope();
+        self.static_eval_call_depth -= 1;
         result
     }
 
@@ -24546,12 +24593,14 @@ impl NativeCodeGenerator {
         if arguments.len() != function.params.len() {
             return None;
         }
+        self.enter_static_eval_call()?;
         self.push_scope();
         for (param, value) in function.params.iter().zip(arguments.iter().cloned()) {
             self.bind_static_value(param.clone(), value);
         }
         let result = self.static_value_from_expr(&function.body);
         self.pop_scope();
+        self.static_eval_call_depth -= 1;
         result
     }
 
@@ -24584,12 +24633,14 @@ impl NativeCodeGenerator {
             {
                 continue;
             }
+            self.enter_static_eval_call()?;
             self.push_scope();
             for (param, value) in method.params.iter().zip(arg_values.iter().cloned()) {
                 self.bind_static_value(param.clone(), value);
             }
             let result = self.static_value_from_expr(&method.body);
             self.pop_scope();
+            self.static_eval_call_depth -= 1;
             if result.is_some() {
                 return result;
             }
@@ -24889,12 +24940,14 @@ impl NativeCodeGenerator {
             bindings.push((param.as_str(), value));
         }
 
+        self.enter_static_eval_call()?;
         self.push_scope();
         for (name, value) in lambda.captures.clone() {
             self.bind_static_value(name, value);
         }
         let result = self.static_value_from_expr_with_bindings(&lambda.body, &bindings);
         self.pop_scope();
+        self.static_eval_call_depth -= 1;
         result
     }
 
