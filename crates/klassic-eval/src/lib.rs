@@ -904,6 +904,7 @@ impl Evaluator {
 
     /// Evaluate `text` and also return the displayed static type of
     /// its final expression (the REPL prints `value: Type`).
+    #[allow(clippy::result_large_err)]
     pub fn evaluate_text_typed(
         &mut self,
         name: &str,

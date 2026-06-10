@@ -19,8 +19,9 @@ pub struct NativeCompilerConfig {
     pub warn_trust: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum NativeTarget {
+    #[default]
     LinuxX86_64,
 }
 
@@ -67,12 +68,6 @@ pub struct NativeTargetSpec {
     pub operating_system: NativeOperatingSystem,
     pub abi: NativeAbi,
     pub executable_format: NativeExecutableFormat,
-}
-
-impl Default for NativeTarget {
-    fn default() -> Self {
-        Self::LinuxX86_64
-    }
 }
 
 const LINUX_X86_64_ALIASES: &[&str] = &["linux-x86_64", "x86_64-unknown-linux-gnu"];
@@ -1431,10 +1426,7 @@ fn merge_enum_shapes(
             for (name, b_variant) in b.variants {
                 match variants.get_mut(&name) {
                     Some(a_variant) if a_variant.fields.len() == b_variant.fields.len() => {
-                        for (a_field, b_field) in a_variant
-                            .fields
-                            .iter_mut()
-                            .zip(b_variant.fields.into_iter())
+                        for (a_field, b_field) in a_variant.fields.iter_mut().zip(b_variant.fields)
                         {
                             *a_field = merge_shaped_field(a_field.clone(), b_field);
                         }
