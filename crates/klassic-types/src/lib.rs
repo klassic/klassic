@@ -34,6 +34,11 @@ enum Type {
     Set(Box<Type>),
     Function(Vec<Type>, Box<Type>),
     Record(String, Vec<Type>),
+    /// A nominal algebraic data type instantiated at the given type
+    /// arguments (`Option<Int>` = `Enum("Option", [Int])`). Kept apart
+    /// from `Record` so structural-record interop and field-access
+    /// rules never apply to sum values.
+    Enum(String, Vec<Type>),
     Applied(Box<Type>, Vec<Type>),
     StructuralRecord(Box<Type>),
     RowEmpty,
@@ -97,6 +102,14 @@ struct RecordSchema {
     fields: Vec<(String, Type)>,
 }
 
+/// A declared algebraic data type: its type parameters and each
+/// variant's field types, expressed over `Type::Generic` parameters.
+#[derive(Clone, Debug)]
+struct EnumSchema {
+    type_params: Vec<String>,
+    variants: Vec<(String, Vec<Type>)>,
+}
+
 #[derive(Clone, Debug)]
 struct TypeClassMethodInfo {
     name: String,
@@ -132,6 +145,7 @@ struct TypeChecker {
     scopes: Vec<HashMap<String, Binding>>,
     proof_scopes: Vec<HashMap<String, ProofSignature>>,
     record_schemas: HashMap<String, RecordSchema>,
+    enum_schemas: HashMap<String, EnumSchema>,
     typeclasses: HashMap<String, TypeClassInfo>,
     instances: Vec<InstanceInfo>,
     current_module: Option<String>,
@@ -184,7 +198,7 @@ fn dispatch_key_for_type(ty: &Type) -> Option<String> {
         Type::List(_) => "List".to_string(),
         Type::Map(_, _) => "Map".to_string(),
         Type::Set(_) => "Set".to_string(),
-        Type::Record(name, _) | Type::Named(name) => name.clone(),
+        Type::Record(name, _) | Type::Enum(name, _) | Type::Named(name) => name.clone(),
         Type::Applied(inner, _) => dispatch_key_for_type(inner)?,
         _ => return None,
     })
@@ -486,9 +500,44 @@ impl TypeChecker {
                 );
                 Ok(())
             }
-            klassic_syntax::Pattern::Constructor { args, .. } => {
-                for arg in args {
-                    self.declare_pattern_bindings(arg, &Type::Dynamic)?;
+            klassic_syntax::Pattern::Constructor { name, args, span } => {
+                // A known variant pins the scrutinee to its enum (with
+                // fresh type arguments) and types each sub-pattern at
+                // the instantiated field type; unknown constructors
+                // keep the legacy Dynamic bindings.
+                let Some((enum_name, type_params, field_types)) = self.enum_variant_schema(name)
+                else {
+                    for arg in args {
+                        self.declare_pattern_bindings(arg, &Type::Dynamic)?;
+                    }
+                    return Ok(());
+                };
+                if args.len() != field_types.len() {
+                    return Err(type_error(
+                        *span,
+                        format!(
+                            "variant `{name}` expects {} fields but got {}",
+                            field_types.len(),
+                            args.len()
+                        ),
+                    ));
+                }
+                let substitutions: HashMap<String, Type> = type_params
+                    .iter()
+                    .map(|param| (param.clone(), self.fresh_var()))
+                    .collect();
+                let instantiated = Type::Enum(
+                    enum_name,
+                    type_params
+                        .iter()
+                        .map(|param| substitutions[param].clone())
+                        .collect(),
+                );
+                let _ = self.unify(scrutinee_type.clone(), instantiated, *span)?;
+                for (arg, field) in args.iter().zip(field_types.iter()) {
+                    let field_type = substitute_generics(field, &substitutions);
+                    let field_type = self.resolve(&field_type);
+                    self.declare_pattern_bindings(arg, &field_type)?;
                 }
                 Ok(())
             }
@@ -526,11 +575,34 @@ impl TypeChecker {
                 params.iter().map(|param| self.resolve(param)).collect(),
                 Box::new(self.resolve(result)),
             ),
-            Type::Applied(head, args) => Type::Applied(
-                Box::new(self.resolve(head)),
+            Type::Applied(head, args) => {
+                let head = self.resolve(head);
+                let args: Vec<Type> = args.iter().map(|arg| self.resolve(arg)).collect();
+                // Annotations parse enum names as `Named` / applied
+                // `Named`; normalize to the nominal enum type here so
+                // every consumer sees one representation. The head may
+                // already have normalized to a bare (zero-argument)
+                // enum on its own resolve — adopt the application's
+                // arguments in that case.
+                match &head {
+                    Type::Named(name) if self.enum_schemas.contains_key(name) => {
+                        return Type::Enum(name.clone(), args);
+                    }
+                    Type::Enum(name, head_args) if head_args.is_empty() => {
+                        return Type::Enum(name.clone(), args);
+                    }
+                    _ => {}
+                }
+                Type::Applied(Box::new(head), args)
+            }
+            Type::Named(name) if self.enum_schemas.contains_key(name) => {
+                Type::Enum(name.clone(), Vec::new())
+            }
+            Type::Record(name, args) => Type::Record(
+                name.clone(),
                 args.iter().map(|arg| self.resolve(arg)).collect(),
             ),
-            Type::Record(name, args) => Type::Record(
+            Type::Enum(name, args) => Type::Enum(
                 name.clone(),
                 args.iter().map(|arg| self.resolve(arg)).collect(),
             ),
@@ -768,6 +840,11 @@ impl TypeChecker {
             {
                 self.unify_record_types(left_name, left_args, right_args, span)
             }
+            (Type::Enum(left_name, left_args), Type::Enum(right_name, right_args))
+                if left_name == right_name =>
+            {
+                self.unify_enum_types(left_name, left_args, right_args, span)
+            }
             (Type::StructuralRecord(left), Type::Record(name, args)) => {
                 let row = self
                     .structural_row_for_record_type(&name, &args)
@@ -982,6 +1059,11 @@ impl TypeChecker {
             {
                 self.unify_record_types(left_name, left_args, right_args, span)
             }
+            (Type::Enum(left_name, left_args), Type::Enum(right_name, right_args))
+                if left_name == right_name =>
+            {
+                self.unify_enum_types(left_name, left_args, right_args, span)
+            }
             (Type::StructuralRecord(expected_row), Type::Record(name, args)) => {
                 let actual_row = self
                     .structural_row_for_record_type(&name, &args)
@@ -1036,6 +1118,35 @@ impl TypeChecker {
                 ),
             )),
         }
+    }
+
+    /// Mirror of `unify_record_types` for nominal enums: an empty
+    /// argument list (a bare `Option` annotation) adopts the other
+    /// side's arguments; otherwise arguments unify pairwise.
+    fn unify_enum_types(
+        &mut self,
+        name: String,
+        left_args: Vec<Type>,
+        right_args: Vec<Type>,
+        span: Span,
+    ) -> Result<Type, Diagnostic> {
+        if left_args.is_empty() {
+            return Ok(Type::Enum(name, right_args));
+        }
+        if right_args.is_empty() {
+            return Ok(Type::Enum(name, left_args));
+        }
+        if left_args.len() != right_args.len() {
+            return Err(type_error(
+                span,
+                format!("enum `{name}` used with mismatched type argument counts"),
+            ));
+        }
+        let mut args = Vec::with_capacity(left_args.len());
+        for (left, right) in left_args.into_iter().zip(right_args) {
+            args.push(self.unify(left, right, span)?);
+        }
+        Ok(Type::Enum(name, args))
     }
 
     fn unify_record_types(
@@ -1289,7 +1400,7 @@ impl TypeChecker {
                 // the constructors to the runtime scope via eval.
                 // Typecheck accepts the declaration as Unit so the
                 // syntax flows through.
-                self.register_enum_constructors_as_dynamic(expr);
+                self.register_enum_declaration(expr);
                 Ok(Type::Unit)
             }
             Expr::Match {
@@ -3104,6 +3215,12 @@ impl TypeChecker {
                     .map(|arg| self.normalize_constraint_type(arg))
                     .collect(),
             ),
+            Type::Enum(name, args) => Type::Enum(
+                name,
+                args.into_iter()
+                    .map(|arg| self.normalize_constraint_type(arg))
+                    .collect(),
+            ),
             Type::StructuralRecord(row) => {
                 Type::StructuralRecord(Box::new(self.normalize_constraint_type(*row)))
             }
@@ -3453,27 +3570,84 @@ impl TypeChecker {
         Some(row)
     }
 
-    fn register_enum_constructors_as_dynamic(&mut self, expr: &Expr) {
+    fn register_enum_declaration(&mut self, expr: &Expr) {
         let Expr::EnumDeclaration {
-            name: _enum_name,
+            name: enum_name,
+            type_params,
             variants,
             ..
         } = expr
         else {
             return;
         };
+        let mut schema_variants = Vec::new();
         for variant in variants {
-            let arity = variant.params.len();
-            let ty = if arity == 0 {
-                Type::Dynamic
-            } else {
-                Type::Function(vec![Type::Dynamic; arity], Box::new(Type::Dynamic))
-            };
-            // Bind the variant name so user code can reference it
-            // without typecheck errors. Once the proper sum-type
-            // story lands this will register a real ADT constructor.
-            self.declare_poly(variant.name.clone(), false, ty);
+            let field_types: Vec<Type> = variant
+                .params
+                .iter()
+                .map(|(_, annotation)| {
+                    generify_named_params(
+                        parse_schema_type_annotation(&annotation.text, type_params),
+                        type_params,
+                    )
+                })
+                .collect();
+            schema_variants.push((variant.name.clone(), field_types));
         }
+        self.enum_schemas.insert(
+            enum_name.clone(),
+            EnumSchema {
+                type_params: type_params.clone(),
+                variants: schema_variants.clone(),
+            },
+        );
+        // Each constructor is a polymorphic function into the enum
+        // (`Some : forall a. (a) -> Option<a>`); a nullary variant is a
+        // polymorphic value of the enum type itself. The quantified
+        // positions must be fresh `Var`s — `Type::Generic` is treated
+        // as dynamic-like by unification (the gradual-typing escape
+        // hatch), which would let payload constraints evaporate.
+        for (variant_name, field_types) in schema_variants {
+            let substitutions: HashMap<String, Type> = type_params
+                .iter()
+                .map(|param| (param.clone(), self.fresh_var()))
+                .collect();
+            let enum_type = Type::Enum(
+                enum_name.clone(),
+                type_params
+                    .iter()
+                    .map(|param| substitutions[param].clone())
+                    .collect(),
+            );
+            let ty = if field_types.is_empty() {
+                enum_type
+            } else {
+                Type::Function(
+                    field_types
+                        .iter()
+                        .map(|field| substitute_generics(field, &substitutions))
+                        .collect(),
+                    Box::new(enum_type),
+                )
+            };
+            self.declare_poly(variant_name, false, ty);
+        }
+    }
+
+    /// Look up the enum owning `variant`, returning the enum name, its
+    /// type parameters, and the variant's field types (over
+    /// `Type::Generic` parameters).
+    fn enum_variant_schema(&self, variant: &str) -> Option<(String, Vec<String>, Vec<Type>)> {
+        for (enum_name, schema) in &self.enum_schemas {
+            if let Some((_, fields)) = schema.variants.iter().find(|(name, _)| name == variant) {
+                return Some((
+                    enum_name.clone(),
+                    schema.type_params.clone(),
+                    fields.clone(),
+                ));
+            }
+        }
+        None
     }
 
     fn infer_extension_declaration(
@@ -3602,6 +3776,7 @@ impl TypeChecker {
             | Type::Bool
             | Type::Unit
             | Type::Record(_, _)
+            | Type::Enum(_, _)
             | Type::Named(_) => match field {
                 "toString" => Some(Type::Function(vec![], Box::new(Type::String))),
                 _ => None,
@@ -4012,6 +4187,47 @@ fn from_known_type(ty: KnownType) -> Type {
     }
 }
 
+/// Rewrite bare `Named` references to a declaration's type parameters
+/// into `Type::Generic`, so schema field types substitute correctly at
+/// instantiation sites (`v: a` inside `enum Option<a>`).
+fn generify_named_params(ty: Type, type_params: &[String]) -> Type {
+    match ty {
+        Type::Named(name) if type_params.iter().any(|param| *param == name) => Type::Generic(name),
+        Type::List(inner) => Type::List(Box::new(generify_named_params(*inner, type_params))),
+        Type::Set(inner) => Type::Set(Box::new(generify_named_params(*inner, type_params))),
+        Type::Map(key, value) => Type::Map(
+            Box::new(generify_named_params(*key, type_params)),
+            Box::new(generify_named_params(*value, type_params)),
+        ),
+        Type::Function(params, result) => Type::Function(
+            params
+                .into_iter()
+                .map(|param| generify_named_params(param, type_params))
+                .collect(),
+            Box::new(generify_named_params(*result, type_params)),
+        ),
+        Type::Applied(head, args) => Type::Applied(
+            Box::new(generify_named_params(*head, type_params)),
+            args.into_iter()
+                .map(|arg| generify_named_params(arg, type_params))
+                .collect(),
+        ),
+        Type::Record(name, args) => Type::Record(
+            name,
+            args.into_iter()
+                .map(|arg| generify_named_params(arg, type_params))
+                .collect(),
+        ),
+        Type::Enum(name, args) => Type::Enum(
+            name,
+            args.into_iter()
+                .map(|arg| generify_named_params(arg, type_params))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn parse_schema_type_annotation(text: &str, type_params: &[String]) -> Type {
     let text = text.trim();
     if text.is_empty() {
@@ -4074,7 +4290,7 @@ fn parse_schema_type_annotation(text: &str, type_params: &[String]) -> Type {
         "Long" => Type::Long,
         "Float" => Type::Float,
         "Double" => Type::Double,
-        "Boolean" => Type::Bool,
+        "Boolean" | "Bool" => Type::Bool,
         "Prop" => Type::Prop,
         "String" => Type::String,
         "Unit" => Type::Unit,
@@ -4187,7 +4403,7 @@ fn parse_type_annotation_with_named_vars(
         "Long" => Type::Long,
         "Float" => Type::Float,
         "Double" => Type::Double,
-        "Boolean" => Type::Bool,
+        "Boolean" | "Bool" => Type::Bool,
         "Prop" => Type::Prop,
         "String" => Type::String,
         "Unit" => Type::Unit,
@@ -4409,6 +4625,12 @@ fn substitute_generics(ty: &Type, substitutions: &HashMap<String, Type>) -> Type
                 .map(|arg| substitute_generics(arg, substitutions))
                 .collect(),
         ),
+        Type::Enum(name, args) => Type::Enum(
+            name.clone(),
+            args.iter()
+                .map(|arg| substitute_generics(arg, substitutions))
+                .collect(),
+        ),
         Type::StructuralRecord(row) => {
             Type::StructuralRecord(Box::new(substitute_generics(row, substitutions)))
         }
@@ -4451,6 +4673,12 @@ fn replace_generic_vars(ty: &Type, replacements: &HashMap<GenericVar, Type>) -> 
                 .collect(),
         ),
         Type::Record(name, args) => Type::Record(
+            name.clone(),
+            args.iter()
+                .map(|arg| replace_generic_vars(arg, replacements))
+                .collect(),
+        ),
+        Type::Enum(name, args) => Type::Enum(
             name.clone(),
             args.iter()
                 .map(|arg| replace_generic_vars(arg, replacements))
@@ -4503,7 +4731,7 @@ fn collect_var_ids(ty: &Type, type_map: &mut HashMap<u32, u32>, row_map: &mut Ha
             }
             collect_var_ids(result, type_map, row_map);
         }
-        Type::Record(_, args) => {
+        Type::Record(_, args) | Type::Enum(_, args) => {
             for arg in args {
                 collect_var_ids(arg, type_map, row_map);
             }
@@ -4543,6 +4771,12 @@ fn rewrite_var_ids(ty: &Type, type_map: &HashMap<u32, u32>, row_map: &HashMap<u3
             Box::new(rewrite_var_ids(result, type_map, row_map)),
         ),
         Type::Record(name, args) => Type::Record(
+            name.clone(),
+            args.iter()
+                .map(|a| rewrite_var_ids(a, type_map, row_map))
+                .collect(),
+        ),
+        Type::Enum(name, args) => Type::Enum(
             name.clone(),
             args.iter()
                 .map(|a| rewrite_var_ids(a, type_map, row_map))
@@ -4655,6 +4889,16 @@ fn match_type_pattern(
                         .zip(actual_args.iter())
                         .all(|(expected, actual)| match_type_pattern(expected, actual, replacements))
         ),
+        Type::Enum(expected_name, expected_args) => matches!(
+            actual,
+            Type::Enum(actual_name, actual_args)
+                if expected_name == actual_name
+                    && expected_args.len() == actual_args.len()
+                    && expected_args
+                        .iter()
+                        .zip(actual_args.iter())
+                        .all(|(expected, actual)| match_type_pattern(expected, actual, replacements))
+        ),
         Type::StructuralRecord(expected) => matches!(
             actual,
             Type::StructuralRecord(actual_row)
@@ -4710,7 +4954,7 @@ fn collect_free_vars(ty: &Type, vars: &mut Vec<GenericVar>) {
                 collect_free_vars(arg, vars);
             }
         }
-        Type::Record(_, args) => {
+        Type::Record(_, args) | Type::Enum(_, args) => {
             for arg in args {
                 collect_free_vars(arg, vars);
             }
@@ -4737,7 +4981,9 @@ fn occurs_in(var: GenericVar, ty: &Type) -> bool {
         Type::Applied(head, args) => {
             occurs_in(var.clone(), head) || args.iter().any(|arg| occurs_in(var.clone(), arg))
         }
-        Type::Record(_, args) => args.iter().any(|arg| occurs_in(var.clone(), arg)),
+        Type::Record(_, args) | Type::Enum(_, args) => {
+            args.iter().any(|arg| occurs_in(var.clone(), arg))
+        }
         Type::RowExtend(_, field, rest) => occurs_in(var.clone(), field) || occurs_in(var, rest),
         _ => false,
     }
@@ -4790,6 +5036,12 @@ fn display_type(ty: &Type) -> String {
         Type::Record(name, args) if args.is_empty() => format!("#{name}"),
         Type::Record(name, args) => format!(
             "#{}<{}>",
+            name,
+            args.iter().map(display_type).collect::<Vec<_>>().join(", ")
+        ),
+        Type::Enum(name, args) if args.is_empty() => name.clone(),
+        Type::Enum(name, args) => format!(
+            "{}<{}>",
             name,
             args.iter().map(display_type).collect::<Vec<_>>().join(", ")
         ),

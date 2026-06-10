@@ -583,6 +583,22 @@ cargo run -- -e "1 + 2"
   integer/string literal and variable/wildcard patterns, and guards;
   literal/variable `match` over non-enum scrutinees lowers the same way,
   and a fully non-matching scrutinee aborts through `__match_fail()`.
+  Enums are real nominal types in `klassic-types` now: a declaration
+  registers an `EnumSchema` (type parameters + per-variant field types)
+  and declares each constructor as a polymorphic function into
+  `Type::Enum(name, args)` — quantified positions are fresh inference
+  variables, not `Type::Generic` (which unification treats as
+  dynamic-like and would let payload constraints evaporate). `match`
+  pins the scrutinee to the pattern's enum at fresh type arguments and
+  types payload bindings at the instantiated field types, so
+  `takeInt(Full("oops"))` against `Box<Int>` is a call-site type error
+  and `case Full(v) => v + 1` knows `v : Int`. Annotations reach the
+  checker as `Named` / applied `Named` and normalize to `Type::Enum`
+  inside `resolve`. Every type walker (free-variable collection,
+  instantiation, generic substitution, var renumbering, occurs check)
+  descends through enum type arguments — missing any one of them
+  silently desynchronizes quantification from instantiation. Native
+  codegen's shape compatibility check remains as a backstop.
   Generic enums with scalar payloads compile by per-instantiation
   specialization at codegen time: a generic `enum` declaration is
   registered (variant tags + each field classified as a fixed repr or a

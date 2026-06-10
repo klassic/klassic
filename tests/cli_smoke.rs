@@ -21461,6 +21461,62 @@ fn native_build_reports_stack_overflow_gracefully() {
     );
 }
 
+/// Enums are real nominal types in the checker now (GitHub issue #419):
+/// constructors are polymorphic functions into `Enum(name, args)`,
+/// `match` pins the scrutinee to the pattern's enum with fresh type
+/// arguments and types payload bindings at the instantiated field
+/// types. Passing `Full("oops")` where `Box<Int>` is expected is a
+/// compile-time type error instead of flowing through as Dynamic.
+#[test]
+fn typecheck_rejects_generic_enum_payload_mismatch() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Box<a> { case Full(v: a); case Empty }\n\
+             def takeInt(b: Box<Int>): Int = b match { case Full(v) => v; case Empty => 0 }\n\
+             println(takeInt(Full(\"oops\")))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !output.status.success(),
+        "payload type mismatch should fail to typecheck\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("type") || stderr.contains("compatible") || stderr.contains("numbers"),
+        "stderr should carry a type diagnostic, got:\n{stderr}"
+    );
+}
+
+/// The positive side of #419: well-typed generic enum programs infer
+/// payload types through constructors, matches, and unannotated
+/// helpers.
+#[test]
+fn typecheck_accepts_well_typed_generic_enums() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Box<a> { case Full(v: a); case Empty }\n\
+             def takeInt(b: Box<Int>): Int = b match { case Full(v) => v + 1; case Empty => 0 }\n\
+             def first(b, d) = b match { case Full(v) => v; case Empty => d }\n\
+             println(takeInt(Full(41)))\n\
+             println(first(Full(\"hi\"), \"none\"))\n\
+             println(first(Empty, 9))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "well-typed program should pass\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // `-e` prints the final expression's value (the trailing unit).
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\nhi\n9\n()\n");
+}
+
 /// Allocating enum values in a loop long enough to exhaust the initial
 /// 1 MiB GC heap exercises collection and free-list reuse. A reused
 /// first-fit block used to keep stale payload bytes (and `__gc_record`'s
@@ -22208,11 +22264,14 @@ fn native_build_rejects_generic_enum_argument_shape_mismatch() {
     let _ = fs::remove_file(&output_path);
 
     assert!(!build.status.success());
+    // The type checker now catches the payload mismatch before native
+    // codegen's shape check gets a chance (#419); the codegen check
+    // remains as a backstop for shapes the checker cannot see.
+    let stderr = String::from_utf8_lossy(&build.stderr);
     assert!(
-        String::from_utf8_lossy(&build.stderr)
-            .contains("payload shape does not match the parameter annotation"),
-        "{}",
-        String::from_utf8_lossy(&build.stderr)
+        stderr.contains("is not compatible with")
+            || stderr.contains("payload shape does not match the parameter annotation"),
+        "{stderr}"
     );
 }
 
