@@ -444,6 +444,7 @@ pub fn compile_source_to_c(name: &str, text: &str) -> Result<String, NativeCompi
         .map_err(|diagnostic| NativeCompileError::with_view(source, None, diagnostic))
 }
 
+#[allow(clippy::result_large_err)]
 pub fn compile_source_for_target(
     name: &str,
     text: &str,
@@ -490,6 +491,7 @@ pub struct UserModuleSource {
     pub source: String,
 }
 
+#[allow(clippy::result_large_err)]
 pub fn compile_source_with_prelude_and_modules_for_target(
     name: &str,
     prelude_text: &str,
@@ -923,7 +925,7 @@ fn inline_module_imports(
         }
     }
     for module in user_modules {
-        if !paths.iter().any(|existing| *existing == module.path) {
+        if !paths.contains(&module.path) {
             paths.push(module.path.clone());
         }
     }
