@@ -16,6 +16,7 @@ use klassic_syntax::{BinaryOp, Expr};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CType {
     Int,
+    Double,
     Bool,
     Str,
     Unit,
@@ -25,6 +26,7 @@ impl CType {
     fn c_name(self) -> &'static str {
         match self {
             CType::Int => "int64_t",
+            CType::Double => "double",
             CType::Bool => "int64_t",
             CType::Str => "KStr",
             CType::Unit => "void",
@@ -42,6 +44,7 @@ fn unsupported(span: Span, feature: &str) -> Diagnostic {
 fn ctype_from_annotation(text: &str, span: Span) -> Result<CType, Diagnostic> {
     match text.trim() {
         "Int" | "Long" | "Short" | "Byte" => Ok(CType::Int),
+        "Double" | "Float" => Ok(CType::Double),
         "Bool" | "Boolean" => Ok(CType::Bool),
         "String" => Ok(CType::Str),
         "Unit" => Ok(CType::Unit),
@@ -111,6 +114,10 @@ impl CEmitter {
     fn expr(&mut self, expr: &Expr) -> Result<(String, CType), Diagnostic> {
         match expr {
             Expr::Int { value, .. } => Ok((format!("INT64_C({value})"), CType::Int)),
+            Expr::Double { value, .. } => {
+                // {value:?} keeps a trailing .0 so C parses a double.
+                Ok((format!("{value:?}"), CType::Double))
+            }
             Expr::Bool { value, .. } => Ok((if *value { "1" } else { "0" }.into(), CType::Bool)),
             Expr::String { value, span } => {
                 if value.contains("#{") {
@@ -163,9 +170,12 @@ impl CEmitter {
                         _ => Err(unsupported(*span, "this string operator")),
                     };
                 }
+                if left_ty != right_ty {
+                    return Err(unsupported(*span, "mixed numeric operand types"));
+                }
                 let ty = match op {
                     BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
-                        CType::Int
+                        left_ty
                     }
                     _ => CType::Bool,
                 };
@@ -280,6 +290,7 @@ impl CEmitter {
                 let (value, ty) = self.expr(&arguments[0])?;
                 let code = match ty {
                     CType::Int => format!("klassic_rt_i64_to_str({value})"),
+                    CType::Double => format!("klassic_rt_f64_to_str({value})"),
                     CType::Bool => format!("klassic_rt_bool_to_str({value})"),
                     CType::Str => value,
                     CType::Unit => return Err(unsupported(span, "toString of unit")),
@@ -359,6 +370,7 @@ impl CEmitter {
                 let (code, ty) = self.expr(&arguments[0])?;
                 match ty {
                     CType::Int => self.line(&format!("klassic_rt_println_i64({code});")),
+                    CType::Double => self.line(&format!("klassic_rt_println_f64({code});")),
                     CType::Bool => self.line(&format!("klassic_rt_println_bool({code});")),
                     CType::Str => self.line(&format!("klassic_rt_println_str({code});")),
                     CType::Unit => return Err(unsupported(expr.span(), "printing unit")),
@@ -438,9 +450,11 @@ pub(crate) fn emit_c_program(expr: &Expr) -> Result<String, Diagnostic> {
         "extern KStr klassic_rt_str_at(KStr s, int64_t index);\n",
         "extern KStr klassic_rt_i64_to_str(int64_t value);\n",
         "extern KStr klassic_rt_bool_to_str(int64_t value);\n",
+        "extern KStr klassic_rt_f64_to_str(double value);\n",
         "extern void klassic_rt_print_str(KStr s);\n",
         "extern void klassic_rt_println_str(KStr s);\n",
         "extern void klassic_rt_println_i64(int64_t value);\n",
+        "extern void klassic_rt_println_f64(double value);\n",
         "extern void klassic_rt_println_bool(int64_t value);\n",
         "\n",
     ));

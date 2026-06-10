@@ -145,6 +145,11 @@ pub extern "C" fn klassic_rt_i64_to_str(value: i64) -> KStr {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn klassic_rt_f64_to_str(value: f64) -> KStr {
+    kstr_from_owned(value.to_string())
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn klassic_rt_bool_to_str(value: i64) -> KStr {
     kstr_from_owned(if value != 0 { "true" } else { "false" }.to_string())
 }

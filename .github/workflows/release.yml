@@ -31,6 +31,11 @@ jobs:
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Build runtime staticlib
+        # cargo test alone doesn't produce libklassic_runtime.a, which
+        # the C-backend link tests resolve next to the klassic binary.
+        run: cargo build -p klassic-runtime
+
       - name: Test
         run: cargo test
 
@@ -63,6 +68,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Build runtime staticlib
+        # cargo test alone doesn't produce libklassic_runtime.a, which
+        # the C-backend link tests resolve next to the klassic binary.
+        run: cargo build -p klassic-runtime
 
       - name: Test
         run: cargo test

@@ -22815,16 +22815,20 @@ fn build_backend_c_strings_match_the_evaluator() {
         &source_path,
         "def greet(name: String): String = \"hello, \" + name + \"!\"\n\
          def shout(s: String, n: Int): String = if (n <= 0) s else shout(s + \"!\", n - 1)\n\
+         def area(r: Double): Double = r * r * 3.14159\n\
          println(greet(\"klassic\"))\n\
          println(length(\"あいう\"))\n\
          println(substring(\"hello world\", 6, 11))\n\
          println(at(\"abc\", 1))\n\
          println(greet(\"a\") == \"hello, a!\")\n\
          println(toString(42) + \"-\" + toString(true))\n\
-         println(shout(\"hey\", 3))\n",
+         println(shout(\"hey\", 3))\n\
+         println(area(2.0))\n\
+         println(1.5 + 2.25)\n\
+         println(toString(0.5) + \"!\")\n",
     )
     .expect("temp source file should write");
-    let expected = "hello, klassic!\n3\nworld\nb\ntrue\n42-true\nhey!!!\n";
+    let expected = "hello, klassic!\n3\nworld\nb\ntrue\n42-true\nhey!!!\n12.56636\n3.75\n0.5!\n";
 
     let eval_output = Command::new(klassic_bin())
         .arg(source_path.to_str().expect("path should be utf-8"))
