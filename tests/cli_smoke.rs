@@ -21508,9 +21508,10 @@ fn native_build_runs_recursive_enum_functions_across_collections() {
 /// A function recursing only inside a `match` arm used to slip past the
 /// self-recursion detector (the expression walker treated `Expr::Match`
 /// as reference-free), so a recursive generic-enum helper was call-site
-/// inlined into itself until the compiler overflowed its stack. It now
-/// gets the regular recursive-inline diagnostic. Generic-enum recursion
-/// itself is milestone 3b (per-instantiation function specialization).
+/// inlined into itself until the compiler overflowed its stack. Without
+/// a return annotation the function still requires call-site inlining
+/// (no return hint), so it keeps the regular recursive-inline
+/// diagnostic; annotating the return moves it onto the by-pointer ABI.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_reports_recursive_generic_enum_functions() {
@@ -21525,7 +21526,7 @@ fn native_build_reports_recursive_generic_enum_functions() {
     fs::write(
         &source_path,
         "enum Option<a> { case Some(v: a); case None }\n\
-         def depth(o: Option<Int>): Int = o match {\n\
+         def depth(o: Option<Int>) = o match {\n\
            case Some(v) => 1 + depth(None)\n\
            case None => 0\n\
          }\n\
@@ -21550,6 +21551,203 @@ fn native_build_reports_recursive_generic_enum_functions() {
     assert!(
         String::from_utf8_lossy(&build.stderr)
             .contains("native recursive function requiring call-site inlining"),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+/// Functions whose annotations name a fully-applied generic enum
+/// (`Option<Int>`, `Option<String>`, `Option<Option<Int>>`) derive the
+/// enum's concrete shape from the annotation text alone and ride the
+/// by-pointer ABI, so they can recurse — including recursion that
+/// constructs a fresh argument (`countdown(Some(v - 1))`), recursion
+/// returning the generic enum itself (`dec`), a String payload, a
+/// nested instantiation matched with nested patterns, and matching
+/// directly on a call's result (the return annotation publishes the
+/// shape).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_compiles_recursive_generic_enum_functions() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_generic_abi_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_generic_abi_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Option<a> { case Some(v: a); case None }\n\
+         def countdown(o: Option<Int>): Int = o match {\n\
+           case Some(v) => if (v <= 0) 0 else 1 + countdown(Some(v - 1))\n\
+           case None => 0\n\
+         }\n\
+         def dec(o: Option<Int>): Option<Int> = o match {\n\
+           case Some(v) => if (v <= 0) None else dec(Some(v - 1))\n\
+           case None => None\n\
+         }\n\
+         def label(o: Option<String>): Int = o match {\n\
+           case Some(s) => if (s == \"go\") 1 + label(None) else 0\n\
+           case None => 100\n\
+         }\n\
+         def unwrapDepth(o: Option<Option<Int>>): Int = o match {\n\
+           case Some(Some(v)) => v\n\
+           case Some(None) => 0 - 1\n\
+           case None => 0 - 2\n\
+         }\n\
+         println(countdown(Some(4)))\n\
+         println(dec(Some(3)) match { case Some(v) => v; case None => 0 - 1 })\n\
+         println(label(Some(\"go\")))\n\
+         println(unwrapDepth(Some(Some(42))))\n\
+         println(unwrapDepth(Some(None)))\n\
+         println(unwrapDepth(None))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "4\n-1\n101\n42\n-1\n-2\n"
+    );
+}
+
+/// Recursive generic-enum functions under allocation churn: every
+/// `countdown` call chain constructs 50 fresh `Some` cells, so 2000
+/// iterations push well past the initial 1 MiB heap and exercise
+/// collections firing mid-recursion with by-pointer generic arguments
+/// rooted across frames.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_runs_recursive_generic_enum_functions_across_collections() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_abi_gc_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_abi_gc_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Option<a> { case Some(v: a); case None }\n\
+         def countdown(o: Option<Int>): Int = o match {\n\
+           case Some(v) => if (v <= 0) 0 else 1 + countdown(Some(v - 1))\n\
+           case None => 0\n\
+         }\n\
+         mutable acc = 0\n\
+         mutable i = 0\n\
+         while (i < 2000) {\n\
+           acc = acc + countdown(Some(50))\n\
+           i = i + 1\n\
+         }\n\
+         println(acc)\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "100000\n");
+}
+
+/// Passing a generic enum whose tracked payload shape contradicts the
+/// parameter annotation (`Some(\"oops\")` into `Option<Int>`) is a
+/// compile-time diagnostic — the callee would read the payload per its
+/// annotation and silently misinterpret the heap string.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_rejects_generic_enum_argument_shape_mismatch() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_mismatch_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_generic_mismatch_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Option<a> { case Some(v: a); case None }\n\
+         def countdown(o: Option<Int>): Int = o match {\n\
+           case Some(v) => if (v <= 0) 0 else 1 + countdown(Some(v - 1))\n\
+           case None => 0\n\
+         }\n\
+         println(countdown(Some(\"oops\")))\n",
+    )
+    .expect("temp source file should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(!build.status.success());
+    assert!(
+        String::from_utf8_lossy(&build.stderr)
+            .contains("payload shape does not match the parameter annotation"),
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );

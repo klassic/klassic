@@ -889,7 +889,7 @@ fn inline_stdlib_imports(expr: Expr, prelude_offset: usize) -> Result<Expr, Diag
 /// the collector's pointer-tracing stays sound. Integer and boolean
 /// fields are boxed into an 8-byte raw cell (booleans as 0/1) while
 /// already-heap payloads (nested enums) are stored by pointer directly.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnumFieldRepr {
     Scalar,
     BoolField,
@@ -941,7 +941,7 @@ struct GenericEnumInfo {
 /// right per-instance reprs. `nested` is `None` for non-enum payloads and
 /// for enum payloads whose shape could not be tracked (a later match on
 /// such a field emits a precise diagnostic instead of miscompiling).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ShapedField {
     repr: EnumFieldRepr,
     nested: Option<Box<ConcreteEnumShape>>,
@@ -956,7 +956,7 @@ struct ShapedField {
 }
 
 /// A variant within a concrete enum shape: its tag index and shaped fields.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ShapedVariant {
     index: i64,
     fields: Vec<ShapedField>,
@@ -966,7 +966,7 @@ struct ShapedVariant {
 /// the resolved (possibly nested) field reprs. Built at a construction site
 /// and attached to the value's slot so a later `match` knows how to read
 /// each payload — including descending into nested generic enums.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ConcreteEnumShape {
     variants: HashMap<String, ShapedVariant>,
 }
@@ -1036,6 +1036,78 @@ fn classify_generic_field(
         return Some(GenericField::Param(index));
     }
     classify_enum_field(trimmed, supported_mono).map(GenericField::Fixed)
+}
+
+/// Split an applied type annotation like `Option<Int>` /
+/// `Result<Int, String>` / `Option<Option<Int>>` into its head name and
+/// top-level type arguments. Returns `None` when the text is not an
+/// applied form (or the angle brackets are unbalanced).
+fn parse_applied_annotation(text: &str) -> Option<(&str, Vec<&str>)> {
+    let trimmed = text.trim();
+    let trimmed = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    let open = trimmed.find('<')?;
+    if !trimmed.ends_with('>') {
+        return None;
+    }
+    let head = trimmed[..open].trim();
+    if head.is_empty() {
+        return None;
+    }
+    let inner = &trimmed[open + 1..trimmed.len() - 1];
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                args.push(inner[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    let last = inner[start..].trim();
+    if last.is_empty() {
+        return None;
+    }
+    args.push(last);
+    Some((head, args))
+}
+
+/// Whether a value laid out as `actual` can be handed to a reader that
+/// expects `expected`. Unresolved fields pass (they are only ever read
+/// in tag-guarded dead arms); resolved fields must agree on repr, and
+/// nested shapes are checked recursively. A variant present in the
+/// value but absent from the expectation means the shapes describe
+/// different enums.
+fn enum_shapes_compatible(actual: &ConcreteEnumShape, expected: &ConcreteEnumShape) -> bool {
+    actual.variants.iter().all(|(name, actual_variant)| {
+        expected.variants.get(name).is_some_and(|expected_variant| {
+            actual_variant.index == expected_variant.index
+                && actual_variant.fields.len() == expected_variant.fields.len()
+                && actual_variant
+                    .fields
+                    .iter()
+                    .zip(expected_variant.fields.iter())
+                    .all(|(actual_field, expected_field)| {
+                        if !actual_field.resolved || !expected_field.resolved {
+                            return true;
+                        }
+                        actual_field.repr == expected_field.repr
+                            && match (&actual_field.nested, &expected_field.nested) {
+                                (Some(actual_nested), Some(expected_nested)) => {
+                                    enum_shapes_compatible(actual_nested, expected_nested)
+                                }
+                                _ => true,
+                            }
+                    })
+        })
+    })
 }
 
 /// Project a constructor argument's `NativeValue` to the enum field repr
@@ -3226,6 +3298,50 @@ impl NativeCodeGenerator {
         ConcreteEnumShape { variants }
     }
 
+    /// Derive the concrete shape of a fully-applied generic enum
+    /// annotation (`Option<Int>`, `Result<Int, String>`,
+    /// `Option<Option<Int>>`). Every type parameter is fixed by the
+    /// annotation text alone, so a function annotated this way can take
+    /// or return the enum by pointer without call-site shape tracking —
+    /// which is what lets such functions recurse.
+    fn generic_enum_annotation_shape(&self, text: &str) -> Option<ConcreteEnumShape> {
+        let (head, args) = parse_applied_annotation(text)?;
+        let info = self.generic_enums.get(head)?;
+        if info.type_params.len() != args.len() {
+            return None;
+        }
+        let mut param_reprs = Vec::with_capacity(args.len());
+        let mut param_nested = Vec::with_capacity(args.len());
+        for arg in args {
+            let (repr, nested) = self.annotation_payload_repr(arg)?;
+            param_reprs.push(Some(repr));
+            param_nested.push(nested);
+        }
+        Some(self.resolve_enum_shape(head, &param_reprs, &param_nested))
+    }
+
+    /// Map a type-argument annotation to the payload repr it stores in
+    /// an enum slot, plus the nested shape when the argument is itself
+    /// an applied generic enum.
+    fn annotation_payload_repr(
+        &self,
+        text: &str,
+    ) -> Option<(EnumFieldRepr, Option<ConcreteEnumShape>)> {
+        let trimmed = text.trim();
+        let trimmed = trimmed.strip_prefix('#').unwrap_or(trimmed);
+        match trimmed {
+            "Int" | "Long" | "Short" | "Byte" => return Some((EnumFieldRepr::Scalar, None)),
+            "Bool" | "Boolean" => return Some((EnumFieldRepr::BoolField, None)),
+            "String" => return Some((EnumFieldRepr::StringField, None)),
+            _ => {}
+        }
+        if self.lowered_enum_names.contains(trimmed) {
+            return Some((EnumFieldRepr::EnumField, None));
+        }
+        let nested = self.generic_enum_annotation_shape(trimmed)?;
+        Some((EnumFieldRepr::EnumField, Some(nested)))
+    }
+
     /// Bind a just-compiled (rax-resident) value to a fresh temp slot so a
     /// synthesized lowering tree can reference it without recompiling the
     /// original argument (and so heap pointers stay GC-rooted across the
@@ -3299,6 +3415,14 @@ impl NativeCodeGenerator {
                 ),
             ));
         }
+        // The argument temps live in their own scope so the construct
+        // leaves rsp exactly where it found it: an enclosing expression
+        // may have spilled operands onto the machine stack (a binary
+        // op's lhs, a call's staged argument), and slot allocations
+        // persisting past this construct would land between that spill
+        // and its pop. The temps are dead once the record holds the
+        // values; the record itself keeps them alive for the GC.
+        self.push_scope();
         let mut arg_idents = Vec::with_capacity(args.len());
         let mut field_reprs = Vec::with_capacity(args.len());
         let mut param_reprs: Vec<Option<EnumFieldRepr>> = vec![None; type_param_count];
@@ -3338,36 +3462,72 @@ impl NativeCodeGenerator {
             span,
         );
         let result = self.compile_expr(&tree)?;
+        self.pop_scope();
         let shape = self.resolve_enum_shape(enum_name, &param_reprs, &param_nested);
         self.pending_enum_shape = Some(shape);
         Ok(result)
     }
 
     /// Lower a `match` whose constructor patterns are generic-enum variants,
-    /// using the scrutinee value's recorded shape. Only an identifier
-    /// scrutinee with a known shape is supported (M1); anything else emits a
-    /// precise diagnostic rather than miscompiling.
+    /// using the scrutinee value's recorded shape. An identifier scrutinee
+    /// reads the shape from its slot; any other scrutinee expression is
+    /// compiled first and matched when it published a shape (a fresh
+    /// construction, or a call whose return annotation fixed one).
+    /// Shape-less scrutinees emit a precise diagnostic rather than
+    /// miscompiling.
     fn compile_generic_enum_match(
         &mut self,
         scrutinee: &Expr,
         arms: &[MatchArm],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        let shape = match scrutinee {
-            Expr::Identifier { name, .. } => self
+        if let Expr::Identifier { name, .. } = scrutinee {
+            let shape = self
                 .lookup_var(name)
-                .and_then(|slot| self.enum_shapes.get(&slot.id).cloned()),
-            _ => None,
-        };
-        let Some(shape) = shape else {
+                .and_then(|slot| self.enum_shapes.get(&slot.id).cloned());
+            let Some(shape) = shape else {
+                return Err(unsupported(
+                    span,
+                    "native generic enum match: scrutinee shape is not statically known",
+                ));
+            };
+            return self.compile_generic_enum_match_shaped(scrutinee.clone(), &shape, arms, span);
+        }
+        // Compile the scrutinee and bind it (with its just-published
+        // shape) to a temp inside a dedicated scope, so the slot does
+        // not outlive the match — an enclosing expression may have
+        // operands spilled on the machine stack.
+        self.push_scope();
+        let value = self.compile_expr(scrutinee)?;
+        let shape = self.pending_enum_shape.take();
+        let (Some(shape), NativeValue::HeapPointer) = (shape, value) else {
+            self.pop_scope();
             return Err(unsupported(
                 span,
                 "native generic enum match: scrutinee shape is not statically known",
             ));
         };
+        self.generic_enum_counter += 1;
+        let temp = format!("__gen_scrut{}", self.generic_enum_counter);
+        let slot = self.allocate_slot(temp.clone(), NativeValue::HeapPointer);
+        self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+        self.enum_shapes.insert(slot.id, shape.clone());
+        let result =
+            self.compile_generic_enum_match_shaped(en_ident(&temp, span), &shape, arms, span);
+        self.pop_scope();
+        result
+    }
+
+    fn compile_generic_enum_match_shaped(
+        &mut self,
+        scrutinee: Expr,
+        shape: &ConcreteEnumShape,
+        arms: &[MatchArm],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
         if !arms
             .iter()
-            .all(|arm| en_pattern_supported_shaped(&shape, &arm.pattern))
+            .all(|arm| en_pattern_supported_shaped(shape, &arm.pattern))
         {
             return Err(unsupported(
                 span,
@@ -3376,8 +3536,8 @@ impl NativeCodeGenerator {
         }
         let tree = en_build_match_shaped(
             &mut self.generic_enum_counter,
-            &shape,
-            scrutinee.clone(),
+            shape,
+            scrutinee,
             arms.to_vec(),
             span,
         );
@@ -3504,17 +3664,33 @@ impl NativeCodeGenerator {
                     let mut flexible_params = Vec::new();
                     let mut param_values = Vec::new();
                     let mut param_unannotated = Vec::new();
+                    let mut param_enum_shapes = Vec::new();
                     for annotation in param_annotations {
-                        let value = annotation
-                            .as_ref()
-                            .and_then(|annotation| self.native_function_param_value(annotation));
+                        let shape = annotation.as_ref().and_then(|annotation| {
+                            self.generic_enum_annotation_shape(&annotation.text)
+                        });
+                        let value = if shape.is_some() {
+                            Some(NativeValue::HeapPointer)
+                        } else {
+                            annotation
+                                .as_ref()
+                                .and_then(|annotation| self.native_function_param_value(annotation))
+                        };
+                        param_enum_shapes.push(shape);
                         param_unannotated.push(annotation.is_none());
                         flexible_params.push(value.is_none() && annotation.is_some());
                         param_values.push(value.unwrap_or(NativeValue::Int));
                     }
-                    let annotated_return_value = return_annotation
-                        .as_ref()
-                        .and_then(|annotation| self.native_function_return_value(annotation));
+                    let return_enum_shape = return_annotation.as_ref().and_then(|annotation| {
+                        self.generic_enum_annotation_shape(&annotation.text)
+                    });
+                    let annotated_return_value = if return_enum_shape.is_some() {
+                        Some(NativeValue::HeapPointer)
+                    } else {
+                        return_annotation
+                            .as_ref()
+                            .and_then(|annotation| self.native_function_return_value(annotation))
+                    };
                     let return_hint = native_value_hint_from_expr(body);
                     let inferred_return_requires_inline =
                         return_annotation.is_none() && return_hint.is_none();
@@ -3548,7 +3724,9 @@ impl NativeCodeGenerator {
                         param_values,
                         flexible_params,
                         param_unannotated,
+                        param_enum_shapes,
                         return_value,
+                        return_enum_shape,
                         body.as_ref().clone(),
                         inline_at_call_site,
                         flexible_return,
@@ -3582,13 +3760,16 @@ impl NativeCodeGenerator {
                             param_values.push(value.unwrap_or(NativeValue::Int));
                         }
                         let contains_thread_call = expr_contains_thread_call(body, &thread_aliases);
+                        let param_count = params.len();
                         self.predeclare_function(
                             name.clone(),
                             params.clone(),
                             param_values,
                             flexible_params,
                             param_unannotated,
+                            vec![None; param_count],
                             native_value_hint_from_expr(body).unwrap_or(NativeValue::Int),
+                            None,
                             body.as_ref().clone(),
                             true,
                             false,
@@ -3637,7 +3818,9 @@ impl NativeCodeGenerator {
         param_values: Vec<NativeValue>,
         flexible_params: Vec<bool>,
         param_unannotated: Vec<bool>,
+        param_enum_shapes: Vec<Option<ConcreteEnumShape>>,
         return_value: NativeValue,
+        return_enum_shape: Option<ConcreteEnumShape>,
         body: Expr,
         inline_at_call_site: bool,
         flexible_return: bool,
@@ -3658,7 +3841,9 @@ impl NativeCodeGenerator {
                 param_values,
                 flexible_params,
                 param_unannotated,
+                param_enum_shapes,
                 return_value,
+                return_enum_shape,
                 body,
                 inline_at_call_site,
                 flexible_return,
@@ -6100,7 +6285,11 @@ impl NativeCodeGenerator {
                 .add_reg_imm32(Reg::Rsp, (scalar_argument_count * 8) as i32);
             self.release_temp_stack(scalar_argument_count * 8);
         }
-        self.copy_function_return_to_call_site(function.return_value, span)
+        let result = self.copy_function_return_to_call_site(function.return_value, span)?;
+        if let Some(shape) = &function.return_enum_shape {
+            self.pending_enum_shape = Some(shape.clone());
+        }
+        Ok(result)
     }
 
     /// Call a non-inline function that takes at least one by-pointer
@@ -6122,7 +6311,11 @@ impl NativeCodeGenerator {
         let mut staged_runtime_arguments = Vec::new();
         let mut staged_record_arguments = Vec::new();
         let mut qword_arg_values = Vec::new();
-        for (argument, expected_value) in arguments.iter().zip(function.param_values.iter()) {
+        for (index, (argument, expected_value)) in arguments
+            .iter()
+            .zip(function.param_values.iter())
+            .enumerate()
+        {
             let value = self.compile_expr(argument)?;
             if let NativeValue::RuntimeString { data, len } = expected_value {
                 let Some(input) = self.native_string_ref(value) else {
@@ -6212,6 +6405,25 @@ impl NativeCodeGenerator {
                     ));
                 }
                 if matches!(expected_value, NativeValue::HeapPointer) {
+                    // A generic enum argument with a statically-known
+                    // shape must be laid out the way the parameter's
+                    // annotation says it will be read.
+                    let argument_shape = self.pending_enum_shape.take();
+                    if let (Some(expected_shape), Some(actual_shape)) = (
+                        function
+                            .param_enum_shapes
+                            .get(index)
+                            .and_then(Option::as_ref),
+                        argument_shape.as_ref(),
+                    ) && !enum_shapes_compatible(actual_shape, expected_shape)
+                    {
+                        return Err(Diagnostic::compile(
+                            argument.span(),
+                            "native function argument is a generic enum whose payload shape \
+                             does not match the parameter annotation"
+                                .to_string(),
+                        ));
+                    }
                     self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
                     self.asm.call_label(self.gc_pin);
                 }
@@ -6268,7 +6480,11 @@ impl NativeCodeGenerator {
             self.asm.add_reg_imm32(Reg::Rsp, (qword_count * 8) as i32);
             self.release_temp_stack(qword_count * 8);
         }
-        self.copy_function_return_to_call_site(function.return_value, span)
+        let result = self.copy_function_return_to_call_site(function.return_value, span)?;
+        if let Some(shape) = &function.return_enum_shape {
+            self.pending_enum_shape = Some(shape.clone());
+        }
+        Ok(result)
     }
 
     fn should_inline_unannotated_runtime_function_call(
@@ -35352,27 +35568,35 @@ impl NativeCodeGenerator {
             .params
             .iter()
             .zip(function.param_values.iter().copied())
-            .filter(|(_, value)| native_param_is_qword(value))
+            .zip(function.param_enum_shapes.iter())
+            .filter(|((_, value), _)| native_param_is_qword(value))
+            .map(|((param, value), shape)| (param, value, shape))
             .collect::<Vec<_>>();
         let arg_regs = argument_registers(qword_params.len());
         let mut heap_param_offsets = Vec::new();
         if qword_params.len() <= arg_regs.len() {
-            for ((param, value), reg) in qword_params.iter().zip(arg_regs) {
+            for ((param, value, shape), reg) in qword_params.iter().zip(arg_regs) {
                 let slot = self.allocate_param_slot((*param).clone(), *value);
                 self.asm.store_rbp_slot(slot.offset, reg);
                 if matches!(value, NativeValue::HeapPointer) {
                     heap_param_offsets.push(slot.offset);
+                    if let Some(shape) = shape {
+                        self.enum_shapes.insert(slot.id, shape.clone());
+                    }
                 }
             }
         } else {
             let param_count = qword_params.len();
-            for (index, (param, value)) in qword_params.iter().enumerate() {
+            for (index, (param, value, shape)) in qword_params.iter().enumerate() {
                 let slot = self.allocate_param_slot((*param).clone(), *value);
                 let offset = 16 + ((param_count - 1 - index) * 8);
                 self.asm.load_rbp_arg(Reg::Rax, offset as i32);
                 self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                 if matches!(value, NativeValue::HeapPointer) {
                     heap_param_offsets.push(slot.offset);
+                    if let Some(shape) = shape {
+                        self.enum_shapes.insert(slot.id, shape.clone());
+                    }
                 }
             }
         }
@@ -35414,6 +35638,20 @@ impl NativeCodeGenerator {
         }
 
         let value = self.compile_expr(&function.body)?;
+        // The body's freshly-constructed enum shape (if any) must agree
+        // with the return annotation where both sides are resolved —
+        // callers will read payloads per the annotation's shape.
+        let body_enum_shape = self.pending_enum_shape.take();
+        if let (Some(expected), Some(actual)) = (&function.return_enum_shape, &body_enum_shape)
+            && !enum_shapes_compatible(actual, expected)
+        {
+            return Err(Diagnostic::compile(
+                function.body.span(),
+                "native function returns a generic enum whose payload shape does not match \
+                 its return annotation"
+                    .to_string(),
+            ));
+        }
         self.copy_function_body_value_to_return_buffer(
             value,
             function.return_value,
@@ -36669,7 +36907,16 @@ struct NativeFunction {
     param_values: Vec<NativeValue>,
     flexible_params: Vec<bool>,
     param_unannotated: Vec<bool>,
+    /// Concrete enum shape per parameter when its annotation names a
+    /// fully-applied generic enum (`Option<Int>`); the parameter then
+    /// travels by pointer and the callee prologue binds the shape to
+    /// its slot so matches inside the body resolve payload reprs.
+    param_enum_shapes: Vec<Option<ConcreteEnumShape>>,
     return_value: NativeValue,
+    /// Shape of the returned value when the return annotation names a
+    /// fully-applied generic enum; published at call sites so a later
+    /// `match` on the result knows its payload reprs.
+    return_enum_shape: Option<ConcreteEnumShape>,
     body: Expr,
     inline_at_call_site: bool,
     flexible_return: bool,

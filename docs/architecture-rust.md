@@ -606,9 +606,27 @@ cargo run -- -e "1 + 2"
   argument registers are spilled, because the shadow push clobbers
   rcx/r8/r9 — and pops again before returning. That makes recursive
   functions over monomorphic enum arguments, and enum-returning
-  recursion, compile and run; recursion over *generic* enum arguments
-  still requires per-instantiation function specialization and keeps
-  its diagnostic.
+  recursion, compile and run.
+  Annotations naming a *fully-applied* generic enum (`Option<Int>`,
+  `Option<String>`, `Option<Option<Int>>`) ride the same ABI: the
+  annotation text alone fixes every type parameter, so the parameter's
+  concrete shape is derived at predeclaration time and bound to the
+  spilled slot in the prologue — no call-site shape tracking, hence
+  recursion works. A return annotation of that form publishes the
+  shape at each call site, so matching directly on a call's result
+  works too, and a generic `match` whose scrutinee is any expression
+  that published a shape (a fresh construction or such a call) now
+  binds it to a scoped temp instead of demanding an identifier. The
+  caller checks a tracked argument shape against the parameter's
+  annotation-derived shape where both are resolved and rejects
+  mismatches (`Some("x")` into `Option<Int>`) at compile time.
+  Generic-enum constructions also evaluate their argument temps in a
+  dedicated scope now: the slots used to outlive the construct, and
+  an enclosing expression with operands spilled on the machine stack
+  (a binary op's lhs) popped a temp instead of its operand once the
+  construct appeared as a by-pointer call argument. Recursion over
+  generic parameters *without* a concrete annotation (true
+  per-call-site monomorphization) remains diagnosed.
   Imports of the plain-Klassic `std.*` modules are inlined before type
   checking: the imported module's declarations are spliced between the
   bundled prelude and the user program (native name resolution is
