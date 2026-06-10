@@ -494,7 +494,7 @@ fn compile_internal(
     typecheck_program(&expr).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
-    let expr = desugar_enums(expr);
+    let (expr, lowered_enum_names) = desugar_enums(expr);
     let expr = desugar_extensions(expr);
     analyze_proofs(
         &expr,
@@ -510,8 +510,10 @@ fn compile_internal(
     let target = NativeTargetContext::for_target(config.target);
     let object = match target.spec.backend {
         NativeBackend::DirectX86_64 => {
-            NativeCodeGenerator::new(source.clone(), user_view.clone(), target.platform)
-                .compile(&expr)
+            let mut generator =
+                NativeCodeGenerator::new(source.clone(), user_view.clone(), target.platform);
+            generator.lowered_enum_names = lowered_enum_names;
+            generator.compile(&expr)
         }
     }
     .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic))?;
@@ -1090,7 +1092,7 @@ fn collect_enum_decls(expr: &Expr, out: &mut Vec<(String, Vec<String>, Vec<EnumV
     }
 }
 
-fn desugar_enums(expr: Expr) -> Expr {
+fn desugar_enums(expr: Expr) -> (Expr, HashSet<String>) {
     let mut decls = Vec::new();
     collect_enum_decls(&expr, &mut decls);
 
@@ -1173,7 +1175,8 @@ fn desugar_enums(expr: Expr) -> Expr {
         lowered_enums: supported,
         counter: 0,
     };
-    lowering.lower(expr)
+    let lowered = lowering.lower(expr);
+    (lowered, lowering.lowered_enums)
 }
 
 /// Fresh synthetic-name generator shared by the enum lowering and the
@@ -2927,6 +2930,11 @@ struct NativeCodeGenerator {
     queued_threads: Vec<QueuedThread>,
     dynamic_control_depth: usize,
     mergeable_dynamic_branch_depth: usize,
+    /// Monomorphic enums lowered to `__gc_record` shape by
+    /// `desugar_enums`, so annotated function params/returns naming one
+    /// of them can map to a by-pointer (`HeapPointer`) calling
+    /// convention. Threaded in by `compile_internal`.
+    lowered_enum_names: HashSet<String>,
     /// Generic enum declarations, by enum name. Populated before codegen.
     generic_enums: HashMap<String, GenericEnumInfo>,
     /// Variant name -> owning generic enum name.
@@ -3087,6 +3095,7 @@ impl NativeCodeGenerator {
             queued_threads: Vec::new(),
             dynamic_control_depth: 0,
             mergeable_dynamic_branch_depth: 0,
+            lowered_enum_names: HashSet::new(),
             generic_enums: HashMap::new(),
             variant_to_generic_enum: HashMap::new(),
             enum_shapes: HashMap::new(),
