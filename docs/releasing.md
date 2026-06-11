@@ -9,8 +9,8 @@ Releases are fully automated by `.github/workflows/release.yml`.
 2. Tag and push:
 
    ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
+   git tag v0.3.0
+   git push origin v0.3.0
    ```
 
 The workflow runs the full test suite on Linux and macOS, builds a

@@ -47,7 +47,7 @@ The installer detects your platform, downloads the latest
 [release](https://github.com/klassic/klassic/releases) into
 `~/.klassic/bin` (binary plus `libklassic_runtime.a` for the C
 backend), and verifies the install by running a Klassic program with
-it. Set `KLASSIC_VERSION=v0.2.0` to pin a release, `KLASSIC_HOME` to
+it. Set `KLASSIC_VERSION=v0.3.0` to pin a release, `KLASSIC_HOME` to
 change the install root. The Linux build is statically linked (musl)
 and runs on any x86_64 Linux.
 
@@ -99,16 +99,18 @@ klassic path/to/program.kl
 klassic -f path/to/program.kl
 ```
 
-Build a Linux x86_64 native executable:
+Build a native executable for the host:
 
 ```bash
 klassic build path/to/program.kl -o program
 ./program
 ```
 
-Pass `--target linux-x86_64` or `--target x86_64-unknown-linux-gnu` to select
-the native target explicitly, or `--target native` on a matching host. Linux
-x86_64 is currently the only implemented direct target.
+Pass `--target` to select a target explicitly — `linux-x86_64` /
+`x86_64-unknown-linux-gnu` (direct ELF) and `macos-aarch64` /
+`aarch64-apple-darwin` (direct signed Mach-O, cross-buildable from any
+host) are the implemented direct targets; `--target native` picks the
+host's. `klassic targets` lists the full matrix.
 
 Emit portable C instead of an ELF executable:
 
@@ -150,9 +152,12 @@ proof graph that depends on a trusted theorem or axiom.
 ## Native Compiler Coverage
 
 The native compiler lowers a growing slice of the language directly to a
-selected native target. The only implemented target is currently Linux x86_64,
-selectable as `linux-x86_64`, `x86_64-unknown-linux-gnu`, or `native` on a
-matching host, and it emits ELF64 without an external linker. Highlights:
+selected native target with no external toolchain. Linux x86_64
+(`linux-x86_64` / `x86_64-unknown-linux-gnu`) emits ELF64 and covers the most
+language surface; Apple Silicon macOS (`macos-aarch64` /
+`aarch64-apple-darwin`) emits ad-hoc-signed Mach-O arm64 for a growing subset
+(Int/Bool/String expressions, locals, control flow, functions with recursion,
+string builtins, monomorphic enums and match). Linux x86_64 highlights:
 
 - Core integer / boolean / string / list expressions, control flow, and
   recursive `def`s (including annotated `String` and `List<String>` parameters).
