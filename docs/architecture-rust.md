@@ -744,6 +744,24 @@ cargo run -- -e "1 + 2"
   could not execute was a bug; an explicit `--target` still selects a
   cross build.
 
+  A direct AArch64 backend for `aarch64-apple-darwin` lives in
+  `crates/klassic-native/src/aarch64.rs` (A64 instruction encoding and
+  codegen) and `crates/klassic-native/src/macho.rs` (the Mach-O arm64
+  executable writer). Like the ELF path it needs no external
+  toolchain: the writer lays the image out as a static `LC_UNIXTHREAD`
+  executable whose code talks to the kernel via `svc #0x80` (Darwin
+  syscall numbers in `x16`), and embeds the ad-hoc code signature —
+  a SHA-256 CodeDirectory computed in-process — that the Apple
+  Silicon kernel demands before executing any arm64 binary. Code is
+  position-independent (`adrp`+`add` data addressing) because the
+  kernel slides `MH_PIE` images. The backend starts from the same
+  kind of small vertical slice the x86_64 backend grew from —
+  currently top-level `println` of literals — and unsupported
+  constructs fail with source-located diagnostics. `--target
+  aarch64-apple-darwin` selects it from any host (cross builds work);
+  a target-less `build` on macOS keeps routing through the C backend
+  until the direct backend reaches useful parity.
+
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program
   startup, the prologue invokes `mmap(NULL, 1 MiB,

@@ -22789,6 +22789,106 @@ fn top_level_defs_support_mutual_recursion() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
 }
 
+/// The direct aarch64-apple-darwin backend cross-builds from any
+/// host: `--target aarch64-apple-darwin` produces a signed Mach-O
+/// arm64 image. This structural check runs everywhere; actual
+/// execution is asserted by the macOS-gated test below.
+#[test]
+fn build_target_aarch64_apple_darwin_emits_macho() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_{stamp}.bin"));
+    fs::write(&source_path, "println(\"hello mac\")\nprintln(7)\n")
+        .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let image = fs::read(&bin_path).expect("output should exist");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    // MH_MAGIC_64 + CPU_TYPE_ARM64, and the embedded ad-hoc code
+    // signature SuperBlob magic must terminate the file.
+    assert_eq!(&image[0..4], &0xfeed_facf_u32.to_le_bytes());
+    assert_eq!(&image[4..8], &0x0100_000c_u32.to_le_bytes());
+    assert!(
+        image
+            .windows(4)
+            .any(|window| window == 0xfade_0cc0_u32.to_be_bytes()),
+        "embedded signature SuperBlob missing"
+    );
+}
+
+/// On an Apple Silicon mac the generated Mach-O actually runs — this
+/// is the acceptance test for the M1 slice of the direct aarch64
+/// backend (it executes on macOS CI's arm64 runners).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_binary_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_run_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_run_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(\"hello from klassic on apple silicon\")\n\
+         println(42)\n\
+         println(true)\n\
+         println(2.5)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "hello from klassic on apple silicon\n42\ntrue\n2.5\n"
+    );
+}
+
 /// A target-less `klassic build` must produce a binary the host can
 /// actually execute. Linux x86_64 uses the direct ELF backend; hosts
 /// without a direct backend (macOS CI) route through the portable C

@@ -502,7 +502,7 @@ lands. See `docs/roadmap-targets-stdlib.md` for the wider rationale.
 | `aarch64-unknown-linux-gnu`    | direct ELF writer      | executable    | 1    | planned     |
 | `wasm32-wasi`                  | wasm module emitter    | wasm-module   | 2    | planned     |
 | `x86_64-apple-darwin`          | portable C backend     | executable    | 2    | planned     |
-| `aarch64-apple-darwin`         | portable C backend     | executable    | 2    | planned     |
+| `aarch64-apple-darwin`         | direct Mach-O writer   | executable    | 1    | supported (small subset, growing) |
 | `x86_64-pc-windows-msvc`       | portable C backend     | executable    | 2    | planned     |
 
 Rules:

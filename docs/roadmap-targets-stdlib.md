@@ -84,14 +84,21 @@ Targets are tracked as tiers; status lives in
   practice, same direct syscall path), `aarch64-unknown-linux-gnu`
   (new emitter, starts from a small subset). Both Linux, both still
   direct ELF.
+- **Tier 1 (direct Mach-O)** — `aarch64-apple-darwin`: a direct
+  AArch64 backend emitting signed Mach-O arm64 executables (ad-hoc
+  CodeDirectory generated in-process, `svc #0x80` syscalls, no
+  external toolchain). Grows from a small subset exactly like the
+  x86_64 backend did; the portable C backend stays available as the
+  full-coverage path on macOS until the direct backend reaches
+  parity.
 - **Tier 2** — `wasm32-wasi` (WASI imports for I/O and env, no
-  threads / processes initially), `x86_64-apple-darwin` and
-  `aarch64-apple-darwin` (via runtime call path / C backend, not
-  direct syscalls), `x86_64-pc-windows-msvc` (same).
+  threads / processes initially), `x86_64-apple-darwin` (via runtime
+  call path / C backend), `x86_64-pc-windows-msvc` (same).
 
-The key rule: do **not** add Mach-O or PE direct syscall paths. macOS
-and Windows enter the matrix through the portable runtime call path
-once that path exists.
+The original key rule here ("no Mach-O / PE direct syscall paths")
+was revised on 2026-06-11: macOS arm64 is important enough to deserve
+a direct backend, and the C backend remains the portable fallback.
+Windows still enters through the portable runtime call path only.
 
 ## Runtime Sharing Strategy
 

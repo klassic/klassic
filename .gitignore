@@ -34,3 +34,7 @@ docs/book/book/
 /hello.kl
 /examples/tc
 
+
+# Local Claude Code session files (never commit; .mcp.json may hold API keys)
+.mcp.json
+klassic_claude_code_plan.md

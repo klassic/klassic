@@ -23,16 +23,19 @@ pub struct NativeCompilerConfig {
 pub enum NativeTarget {
     #[default]
     LinuxX86_64,
+    MacosAarch64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeArchitecture {
     X86_64,
+    Aarch64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeBackend {
     DirectX86_64,
+    DirectAarch64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,11 +52,13 @@ pub struct NativeDataLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeOperatingSystem {
     Linux,
+    MacOs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeAbi {
     Gnu,
+    Apple,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,19 +80,36 @@ const X86_64_DATA_LAYOUT: NativeDataLayout = NativeDataLayout {
     pointer_width_bits: 64,
     endianness: NativeEndianness::Little,
 };
+const AARCH64_DATA_LAYOUT: NativeDataLayout = X86_64_DATA_LAYOUT;
 
-const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[NativeTargetSpec {
-    target: NativeTarget::LinuxX86_64,
-    canonical_name: "linux-x86_64",
-    standard_triple: "x86_64-unknown-linux-gnu",
-    aliases: LINUX_X86_64_ALIASES,
-    architecture: NativeArchitecture::X86_64,
-    backend: NativeBackend::DirectX86_64,
-    data_layout: X86_64_DATA_LAYOUT,
-    operating_system: NativeOperatingSystem::Linux,
-    abi: NativeAbi::Gnu,
-    executable_format: NativeExecutableFormat::Elf64,
-}];
+const MACOS_AARCH64_ALIASES: &[&str] = &["macos-aarch64", "aarch64-apple-darwin"];
+
+const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[
+    NativeTargetSpec {
+        target: NativeTarget::LinuxX86_64,
+        canonical_name: "linux-x86_64",
+        standard_triple: "x86_64-unknown-linux-gnu",
+        aliases: LINUX_X86_64_ALIASES,
+        architecture: NativeArchitecture::X86_64,
+        backend: NativeBackend::DirectX86_64,
+        data_layout: X86_64_DATA_LAYOUT,
+        operating_system: NativeOperatingSystem::Linux,
+        abi: NativeAbi::Gnu,
+        executable_format: NativeExecutableFormat::Elf64,
+    },
+    NativeTargetSpec {
+        target: NativeTarget::MacosAarch64,
+        canonical_name: "macos-aarch64",
+        standard_triple: "aarch64-apple-darwin",
+        aliases: MACOS_AARCH64_ALIASES,
+        architecture: NativeArchitecture::Aarch64,
+        backend: NativeBackend::DirectAarch64,
+        data_layout: AARCH64_DATA_LAYOUT,
+        operating_system: NativeOperatingSystem::MacOs,
+        abi: NativeAbi::Apple,
+        executable_format: NativeExecutableFormat::MachO64,
+    },
+];
 
 /// A target that is acknowledged by the compiler but not yet wired up
 /// to a working backend. Listing planned targets here lets `--target`
@@ -133,13 +155,6 @@ const PLANNED_TARGETS: &[PlannedTarget] = &[
         tier: 2,
     },
     PlannedTarget {
-        triple: "aarch64-apple-darwin",
-        aliases: &["macos-aarch64"],
-        backend: "portable-c",
-        artifact: "executable",
-        tier: 2,
-    },
-    PlannedTarget {
         triple: "x86_64-pc-windows-msvc",
         aliases: &["windows-x86_64"],
         backend: "portable-c",
@@ -159,8 +174,13 @@ pub enum TargetRecognition {
 }
 
 impl NativeTarget {
-    pub const SUPPORTED_NAMES: &'static [&'static str] =
-        &["linux-x86_64", "x86_64-unknown-linux-gnu", "native"];
+    pub const SUPPORTED_NAMES: &'static [&'static str] = &[
+        "linux-x86_64",
+        "x86_64-unknown-linux-gnu",
+        "macos-aarch64",
+        "aarch64-apple-darwin",
+        "native",
+    ];
 
     pub fn supported_names() -> &'static [&'static str] {
         Self::SUPPORTED_NAMES
@@ -309,12 +329,14 @@ impl NativeTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeExecutableFormat {
     Elf64,
+    MachO64,
 }
 
 impl NativeArchitecture {
     fn elf_machine(self) -> u16 {
         match self {
             NativeArchitecture::X86_64 => 62,
+            NativeArchitecture::Aarch64 => 183,
         }
     }
 }
@@ -323,12 +345,14 @@ impl NativeBackend {
     pub fn name(self) -> &'static str {
         match self {
             NativeBackend::DirectX86_64 => "direct-x86_64",
+            NativeBackend::DirectAarch64 => "direct-aarch64",
         }
     }
 
     pub fn architecture(self) -> NativeArchitecture {
         match self {
             NativeBackend::DirectX86_64 => NativeArchitecture::X86_64,
+            NativeBackend::DirectAarch64 => NativeArchitecture::Aarch64,
         }
     }
 }
@@ -421,6 +445,10 @@ pub fn compile_source_to_elf(
 
 #[allow(clippy::result_large_err)]
 mod cbackend;
+
+#[allow(clippy::result_large_err)]
+mod aarch64;
+mod macho;
 
 /// Compile `text` to a portable C translation unit (`--backend c`).
 /// The supported subset is deliberately small (see `cbackend`);
@@ -542,17 +570,20 @@ fn compile_internal(
     .map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
-    let target = NativeTargetContext::for_target(config.target);
-    let object = match target.spec.backend {
+    match config.target.backend() {
         NativeBackend::DirectX86_64 => {
+            let target = NativeTargetContext::for_target(config.target);
             let mut generator =
                 NativeCodeGenerator::new(source.clone(), user_view.clone(), target.platform);
             generator.lowered_enum_names = lowered_enum_names;
-            generator.compile(&expr)
+            let object = generator.compile(&expr).map_err(|diagnostic| {
+                NativeCompileError::with_view(source, user_view, diagnostic)
+            })?;
+            Ok(write_executable_for_target(target, object))
         }
+        NativeBackend::DirectAarch64 => aarch64::emit_macho_program(&expr)
+            .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic)),
     }
-    .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic))?;
-    Ok(write_executable_for_target(target, object))
 }
 
 /// Rewrite every `Expr::ExtensionDeclaration` into a `Expr::Block` of
@@ -2534,6 +2565,12 @@ fn normalise_native_receiver(text: &str) -> String {
 fn write_executable_for_target(target: NativeTargetContext, object: ObjectFile) -> Vec<u8> {
     match target.spec.executable_format {
         NativeExecutableFormat::Elf64 => elf::write_executable(object, target.spec),
+        // Mach-O images are laid out and signed by the aarch64 backend
+        // itself (`aarch64::emit_macho_program`); the ObjectFile path
+        // is ELF-only.
+        NativeExecutableFormat::MachO64 => {
+            unreachable!("Mach-O executables are written by the aarch64 backend")
+        }
     }
 }
 
@@ -39817,15 +39854,29 @@ mod tests {
         assert_eq!(NativeTarget::parse("native"), NativeTarget::host());
         assert_eq!(NativeTarget::parse("linux-aarch64"), None);
         assert_eq!(
+            NativeTarget::parse("aarch64-apple-darwin"),
+            Some(NativeTarget::MacosAarch64)
+        );
+        assert_eq!(
+            NativeTarget::parse("macos-aarch64"),
+            Some(NativeTarget::MacosAarch64)
+        );
+        assert_eq!(
             NativeTarget::supported_names(),
-            &["linux-x86_64", "x86_64-unknown-linux-gnu", "native"]
+            &[
+                "linux-x86_64",
+                "x86_64-unknown-linux-gnu",
+                "macos-aarch64",
+                "aarch64-apple-darwin",
+                "native"
+            ]
         );
     }
 
     #[test]
     fn native_target_metadata_is_registry_backed() {
         let specs = NativeTarget::supported_specs();
-        assert_eq!(specs.len(), 1);
+        assert_eq!(specs.len(), 2);
         let linux = NativeTarget::LinuxX86_64;
         let spec = linux.spec();
         assert_eq!(spec.target, linux);
@@ -39846,6 +39897,18 @@ mod tests {
         assert_eq!(linux.operating_system(), NativeOperatingSystem::Linux);
         assert_eq!(linux.abi(), NativeAbi::Gnu);
         assert_eq!(linux.executable_format(), NativeExecutableFormat::Elf64);
+
+        let macos = NativeTarget::MacosAarch64;
+        let spec = macos.spec();
+        assert_eq!(spec.target, macos);
+        assert_eq!(spec.canonical_name, "macos-aarch64");
+        assert_eq!(spec.standard_triple, "aarch64-apple-darwin");
+        assert_eq!(macos.architecture(), NativeArchitecture::Aarch64);
+        assert_eq!(macos.backend(), NativeBackend::DirectAarch64);
+        assert_eq!(macos.backend().name(), "direct-aarch64");
+        assert_eq!(macos.operating_system(), NativeOperatingSystem::MacOs);
+        assert_eq!(macos.abi(), NativeAbi::Apple);
+        assert_eq!(macos.executable_format(), NativeExecutableFormat::MachO64);
     }
 
     #[test]
