@@ -35,18 +35,17 @@ println(double(10))   // 20
 
 ## Module aliases
 
-Bind the whole module to a shorter name and access members with a dot:
+Bind the whole module to a shorter name. Members are reachable with a
+dot or with `#` (the same accessor the builtin objects like
+`CommandLine#args` use) — both forms work in the evaluator and in
+native builds:
 
 ```kl
 import math.demo as M
 
 println(M.double(10))   // 20
-println(M.triple(10))   // 30
+println(M#triple(10))   // 30
 ```
-
-> **Note:** aliased imports currently work in native builds
-> (`klassic build`) but not yet in the evaluator — a known parity gap.
-> Selective imports work everywhere.
 
 ## Deeper names
 

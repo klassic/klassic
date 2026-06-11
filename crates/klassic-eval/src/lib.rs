@@ -1206,6 +1206,16 @@ fn eval_expr_inner(
             field,
             span,
         } => {
+            // `M.member` where `M` is an aliased module import: the
+            // import declared `M#member` bindings, so dot access on an
+            // otherwise-unbound identifier resolves through them
+            // (parity with the native backend's rewrite).
+            if let Expr::Identifier { name, .. } = target.as_ref()
+                && environment.lookup_value(name).is_none()
+                && let Some(value) = environment.lookup_value(&format!("{name}#{field}"))
+            {
+                return Ok(value);
+            }
             let target = eval_expr(target, environment, state)?;
             match target {
                 record @ Value::Record { .. } => {
@@ -1793,6 +1803,19 @@ fn eval_call(
     state: &mut EvaluationState,
 ) -> Result<Value, Diagnostic> {
     if let Expr::FieldAccess { target, field, .. } = callee {
+        // `M.member(args)` where `M` is an aliased module import: the
+        // import declared `M#member`, so the dot call dispatches
+        // through it (parity with the native backend's rewrite).
+        if let Expr::Identifier { name, .. } = target.as_ref()
+            && environment.lookup_value(name).is_none()
+            && let Some(member) = environment.lookup_value(&format!("{name}#{field}"))
+        {
+            let argument_values = arguments
+                .iter()
+                .map(|argument| eval_expr(argument, environment, state))
+                .collect::<Result<Vec<_>, _>>()?;
+            return apply_callable(member, argument_values, span);
+        }
         let target_value = eval_expr(target, environment, state)?;
         if let Some(builtin) = value_method_builtin_name(&target_value, field) {
             let mut all_arguments = Vec::with_capacity(arguments.len() + 1);

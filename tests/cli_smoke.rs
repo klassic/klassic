@@ -21301,9 +21301,31 @@ fn native_build_inlines_stdlib_module_imports() {
     );
 }
 
+/// Aliased imports resolve in the evaluator too — both the dot form
+/// (`M.max(3, 9)`) and the hash form (`M#max(3, 9)`) dispatch through
+/// the `M#member` bindings the import declares (issue #436: the dot
+/// form used to work only in native builds).
+#[test]
+fn evaluator_resolves_aliased_imports_in_both_forms() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.math as M\nprintln(M.max(3, 9))\nprintln(M#clamp(99, 0, 10))\nval pick = M.min\nprintln(pick(4, 2))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "aliased imports should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("9\n10\n2\n"));
+}
+
 /// Aliased stdlib imports work too: `import std.math as M` inlines the
-/// module and rewrites every `M.func` access to a bare `func`, so the
-/// compiled binary calls the spliced helpers.
+/// module and rewrites every `M.func` access (and the `M#func`
+/// identifier form) to a bare `func`, so the compiled binary calls the
+/// spliced helpers.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_inlines_aliased_stdlib_import() {
@@ -21318,7 +21340,7 @@ fn native_build_inlines_aliased_stdlib_import() {
         "import std.math as M\n\
          import std.list as L\n\
          println(M.sign(-7))\n\
-         println(M.clamp(99, 0, 10))\n\
+         println(M#clamp(99, 0, 10))\n\
          println(L.sum(L.range(1, 6)))\n",
     )
     .expect("temp source file should write");

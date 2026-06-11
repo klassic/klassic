@@ -1806,6 +1806,16 @@ impl TypeChecker {
                 field,
                 span,
             } => {
+                // `M.member` where `M` is an aliased module import: the
+                // import declared `M#member` bindings, so dot access on
+                // an otherwise-unbound identifier resolves through them
+                // (parity with the native backend's rewrite).
+                if let Expr::Identifier { name, .. } = target.as_ref()
+                    && self.lookup(name).is_none()
+                    && let Some(binding) = self.lookup(&format!("{name}#{field}")).cloned()
+                {
+                    return Ok(self.instantiate(&binding));
+                }
                 let target_type = self.infer_expr(target)?;
                 if let Some(method_type) = self.builtin_value_method_type(&target_type, field) {
                     return Ok(method_type);

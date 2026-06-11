@@ -699,6 +699,21 @@ fn rewrite_inlined(expr: Expr, inlined: &[String], aliases: &HashSet<String>) ->
                 span,
             }
         }
+        // `M#field` parses as one identifier; collapse it the same way
+        // so the hash form works in native builds too (the evaluator
+        // accepts both forms).
+        Expr::Identifier { name, span }
+            if name
+                .split_once('#')
+                .is_some_and(|(prefix, _)| aliases.contains(prefix)) =>
+        {
+            let member = name
+                .split_once('#')
+                .expect("guard checked the separator")
+                .1
+                .to_string();
+            Expr::Identifier { name: member, span }
+        }
         Expr::Block { expressions, span } => Expr::Block {
             expressions: go_vec(expressions, inlined, aliases),
             span,
