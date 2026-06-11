@@ -7,13 +7,13 @@ primitives. They are deliberately small — the goal is to cover the
 ## Threads
 
 ```kl
-thread {
+thread(() => {
   println("from a queued thread")
-}
+})
 println("from the main thread")
 ```
 
-`thread { ... }` queues the body to run after the main expression
+`thread(() => { ... })` queues the body to run after the main expression
 finishes. The current native sample surface focuses on literal
 bodies and lambda values; future iterations will widen what can be
 launched from inside a thread.

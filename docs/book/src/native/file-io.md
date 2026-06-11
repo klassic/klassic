@@ -46,11 +46,11 @@ if (FileOutput#exists("scratch.txt")) {
 ## Directories
 
 ```kl
-Dir.mkdir("/tmp/klassic-demo")
-Dir.mkdirs("/tmp/klassic-demo/nested/path")
+Dir#mkdir("/tmp/klassic-demo")
+Dir#mkdirs("/tmp/klassic-demo/nested/path")
 
-if (Dir.exists("/tmp/klassic-demo")) {
-  foreach (entry in Dir.list("/tmp/klassic-demo")) {
+if (Dir#exists("/tmp/klassic-demo")) {
+  foreach (entry in Dir#list("/tmp/klassic-demo")) {
     println(entry)
   }
 }
@@ -58,17 +58,17 @@ if (Dir.exists("/tmp/klassic-demo")) {
 
 | Function | Behaviour |
 |---|---|
-| `Dir.exists(path)` | Boolean |
-| `Dir.isFile(path)`, `Dir.isDirectory(path)` | Boolean |
-| `Dir.mkdir(path)` | Single directory |
-| `Dir.mkdirs(path)` | Whole chain (`mkdir -p`) |
-| `Dir.delete(path)` | Single directory |
-| `Dir.list(path)` | Entries (no parent path prefix) |
-| `Dir.listFull(path)` | Entries with the directory prefix |
-| `Dir.copy(src, dst)`, `Dir.move(src, dst)` | Recursive |
-| `Dir.current()` | `getcwd` |
-| `Dir.home()` | `$HOME` |
-| `Dir.temp()` | `$TMPDIR`, falling back to `/tmp` |
+| `Dir#exists(path)` | Boolean |
+| `Dir#isFile(path)`, `Dir#isDirectory(path)` | Boolean |
+| `Dir#mkdir(path)` | Single directory |
+| `Dir#mkdirs(path)` | Whole chain (`mkdir -p`) |
+| `Dir#delete(path)` | Single directory |
+| `Dir#list(path)` | Entries (no parent path prefix) |
+| `Dir#listFull(path)` | Entries with the directory prefix |
+| `Dir#copy(src, dst)`, `Dir#move(src, dst)` | Recursive |
+| `Dir#current()` | `getcwd` |
+| `Dir#home()` | `$HOME` |
+| `Dir#temp()` | `$TMPDIR`, falling back to `/tmp` |
 
 ## Callback style
 
@@ -77,12 +77,12 @@ afterwards:
 
 ```kl
 FileInput#open("config.txt", (stream) => {
-  println(stream.readAll())
+  println(FileInput#readAll(stream))
 })
 ```
 
 The native compiler tracks the stream's path through the callback so
-`stream.readAll()`, `stream.readLines()`, and `cleanup` blocks all
+`FileInput#readAll(stream)`, `FileInput#readLines(stream)`, and `cleanup` blocks all
 compose correctly.
 
 ## Errors
