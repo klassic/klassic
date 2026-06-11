@@ -23033,6 +23033,74 @@ fn build_target_aarch64_apple_darwin_strings_run() {
     );
 }
 
+/// Cons lists on the direct aarch64 backend: literals, head / tail /
+/// isEmpty / size, curried cons, evaluator-format printing, and
+/// list-typed parameters / returns with recursion (which the x86_64
+/// backend's call-site-inline limitation still rejects) — asserted
+/// against the evaluator's output.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_lists_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_list_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_list_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def sum(xs: List<Int>): Int = if (isEmpty(xs)) 0 else head(xs) + sum(tail(xs))\n\
+         def range2(a: Int, b: Int): List<Int> = if (a >= b) [] else cons(a)(range2(a + 1, b))\n\
+         def rev(xs: List<String>, acc: List<String>): List<String> = if (isEmpty(xs)) acc else rev(tail(xs), cons(head(xs))(acc))\n\
+         println([1, 2, 3])\n\
+         println([\"a\" \"b\"])\n\
+         println([true false])\n\
+         println([])\n\
+         println(head([7 8 9]))\n\
+         println(tail([7 8 9]))\n\
+         println(isEmpty([]))\n\
+         println(isEmpty([1]))\n\
+         println(size([4 5 6]))\n\
+         println(cons(1)([2 3]))\n\
+         println(sum(range2(1, 101)))\n\
+         println(rev([\"x\" \"y\" \"z\"], []))\n\
+         println(size(range2(0, 150)))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin list build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "[1, 2, 3]\n[a, b]\n[true, false]\n[]\n7\n[8, 9]\ntrue\nfalse\n3\n[1, 2, 3]\n5050\n[z, y, x]\n150\n"
+    );
+}
+
 /// Monomorphic enums and match on the direct aarch64 backend, riding
 /// the shared `desugar_enums` lowering: construction, recursive enum
 /// functions (per-frame by design), nested patterns, guards, String

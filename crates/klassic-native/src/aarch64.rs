@@ -503,14 +503,27 @@ fn unsupported(span: Span, feature: &str) -> Diagnostic {
     )
 }
 
+/// Element types a list can carry in the current subset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListElem {
+    Int,
+    Bool,
+    Str,
+}
+
 /// The value types the current subset can hold in a register / local.
 /// `Str` is a pointer to a `[len: u64][bytes]` object in rodata or on
-/// the bump heap.
+/// the bump heap; `List` is a pointer to a `[value: u64][next: ptr]`
+/// cons cell (nil is the null pointer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueType {
     Int,
     Bool,
     Str,
+    List(ListElem),
+    /// The type of `[]` before any element pins it down; assignable
+    /// to every list type (it is the null pointer).
+    EmptyList,
     /// An untyped heap pointer: lowered enum values and the box cells
     /// the enum desugaring builds around scalars.
     Ptr,
@@ -521,13 +534,25 @@ enum ValueType {
 }
 
 /// Merge the types of two branches of an `if` expression: a diverging
-/// branch adopts the other branch's type.
+/// branch adopts the other branch's type, and an empty-list branch
+/// adopts the other branch's list type.
 fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueType> {
     match (then_ty, else_ty) {
         (ValueType::Never, other) | (other, ValueType::Never) => Some(other),
+        (ValueType::EmptyList, other @ ValueType::List(_))
+        | (other @ ValueType::List(_), ValueType::EmptyList) => Some(other),
         (left, right) if left == right => Some(left),
         _ => None,
     }
+}
+
+/// Whether a value of type `actual` can flow into a slot of type
+/// `expected` (locals, arguments, returns): exact match, or the
+/// polymorphic empty list into any list slot.
+fn assignable(actual: ValueType, expected: ValueType) -> bool {
+    actual == expected
+        || (actual == ValueType::EmptyList
+            && matches!(expected, ValueType::List(_) | ValueType::EmptyList))
 }
 
 fn value_type_from_annotation(
@@ -544,8 +569,30 @@ fn value_type_from_annotation(
         "Int" | "Long" | "Short" | "Byte" => Ok(ValueType::Int),
         "Bool" | "Boolean" => Ok(ValueType::Bool),
         "String" => Ok(ValueType::Str),
+        "List<Int>" => Ok(ValueType::List(ListElem::Int)),
+        "List<Bool>" => Ok(ValueType::List(ListElem::Bool)),
+        "List<String>" => Ok(ValueType::List(ListElem::Str)),
         "Unit" => Ok(ValueType::Unit),
         other => Err(unsupported(span, &format!("type annotation `{other}`"))),
+    }
+}
+
+/// The value type of one list element of element type `elem`.
+fn elem_value_type(elem: ListElem) -> ValueType {
+    match elem {
+        ListElem::Int => ValueType::Int,
+        ListElem::Bool => ValueType::Bool,
+        ListElem::Str => ValueType::Str,
+    }
+}
+
+/// The element type a value of type `ty` can be a list element of.
+fn list_elem_of(ty: ValueType) -> Option<ListElem> {
+    match ty {
+        ValueType::Int => Some(ListElem::Int),
+        ValueType::Bool => Some(ListElem::Bool),
+        ValueType::Str => Some(ListElem::Str),
+        _ => None,
     }
 }
 
@@ -623,11 +670,61 @@ impl Emitter {
                 Ok(ty)
             }
             Expr::Binary { lhs, op, rhs, span } => self.binary(lhs, *op, rhs, *span),
+            Expr::ListLiteral { elements, span } => {
+                // Build the cons chain back to front: all elements go
+                // onto the machine stack first, then each pop becomes
+                // the head of a fresh cell whose tail is in x0.
+                let mut elem = None;
+                for element in elements {
+                    let ty = self.expression(element)?;
+                    let Some(this_elem) = list_elem_of(ty) else {
+                        return Err(unsupported(element.span(), "a list element of this type"));
+                    };
+                    if *elem.get_or_insert(this_elem) != this_elem {
+                        return Err(unsupported(*span, "mixed list element types"));
+                    }
+                    self.asm.push(Reg::X0);
+                }
+                self.asm.mov_imm64(Reg::X0, 0); // nil
+                for _ in elements {
+                    self.emit_cons_cell();
+                }
+                Ok(match elem {
+                    Some(elem) => ValueType::List(elem),
+                    None => ValueType::EmptyList,
+                })
+            }
             Expr::Call {
                 callee,
                 arguments,
                 span,
             } => {
+                // Curried `cons(head)(tail)` — the evaluator's list
+                // prepend builtin.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: head_args,
+                        ..
+                    } = callee.as_ref()
+                    && head_args.len() == 1
+                    && matches!(inner.as_ref(), Expr::Identifier { name, .. } if name == "cons")
+                {
+                    let head_ty = self.expression(&head_args[0])?;
+                    let Some(elem) = list_elem_of(head_ty) else {
+                        return Err(unsupported(
+                            head_args[0].span(),
+                            "a list element of this type",
+                        ));
+                    };
+                    self.asm.push(Reg::X0);
+                    let tail_ty = self.expression(&arguments[0])?;
+                    if !assignable(tail_ty, ValueType::List(elem)) {
+                        return Err(unsupported(arguments[0].span(), "consing onto this value"));
+                    }
+                    self.emit_cons_cell();
+                    return Ok(ValueType::List(elem));
+                }
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return Err(unsupported(*span, "calling a non-identifier"));
                 };
@@ -1008,6 +1105,78 @@ impl Emitter {
         self.asm.bind(end_label);
     }
 
+    /// Prepend a cons cell: head value on top of the machine stack,
+    /// tail pointer in x0 → fresh cell pointer in x0.
+    fn emit_cons_cell(&mut self) {
+        self.asm.mov_imm64(Reg::X4, 16);
+        self.emit_alloc();
+        self.asm.pop(Reg::X1);
+        self.asm.str_imm(Reg::X1, Reg::X5, 0);
+        self.asm.str_imm(Reg::X0, Reg::X5, 8);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
+    /// Print one element value in x0 without a newline; clobbers
+    /// x0-x5/x16.
+    fn emit_print_elem(&mut self, elem: ListElem) {
+        match elem {
+            ListElem::Int => {
+                self.asm.sub_sp_imm(32);
+                self.asm.emit_int_digits(false);
+                self.asm.add_reg_sp_imm(Reg::X2, 32);
+                self.asm.sub_reg(Reg::X2, Reg::X2, Reg::X1);
+                self.asm.mov_imm64(Reg::X0, STDOUT_FD);
+                self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+                self.asm.svc_0x80();
+                self.asm.add_sp_imm(32);
+            }
+            ListElem::Str => {
+                self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+                self.asm.add_reg_imm(Reg::X1, Reg::X0, 8);
+                self.asm.mov_imm64(Reg::X0, STDOUT_FD);
+                self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+                self.asm.svc_0x80();
+            }
+            ListElem::Bool => {
+                let false_label = self.asm.new_label();
+                let end_label = self.asm.new_label();
+                self.asm
+                    .branch(false_label, BranchKind::CompareZero(Reg::X0));
+                self.asm.emit_write_rodata(STDOUT_FD, b"true");
+                self.asm.branch(end_label, BranchKind::Unconditional);
+                self.asm.bind(false_label);
+                self.asm.emit_write_rodata(STDOUT_FD, b"false");
+                self.asm.bind(end_label);
+            }
+        }
+    }
+
+    /// println of the list in x0 in the evaluator's format:
+    /// `[e1, e2, ...]` (strings unquoted).
+    fn emit_println_list(&mut self, elem: ListElem) {
+        let loop_start = self.asm.new_label();
+        let close = self.asm.new_label();
+        self.asm.push(Reg::X0); // cursor survives the writes below
+        self.asm.emit_write_rodata(STDOUT_FD, b"[");
+        self.asm.pop(Reg::X3);
+        self.asm.push(Reg::X3);
+        self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
+        self.asm.bind(loop_start);
+        self.asm.pop(Reg::X3);
+        self.asm.push(Reg::X3);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        self.emit_print_elem(elem);
+        self.asm.pop(Reg::X3);
+        self.asm.ldr_imm(Reg::X3, Reg::X3, 8);
+        self.asm.push(Reg::X3);
+        self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
+        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(close);
+        self.asm.pop(Reg::X3); // discard the cursor slot
+        self.asm.emit_write_rodata(STDOUT_FD, b"]\n");
+    }
+
     /// println of the string object in x0: one write for the payload,
     /// one for the newline.
     fn emit_println_str(&mut self) {
@@ -1116,6 +1285,59 @@ impl Emitter {
                 self.emit_substring();
                 Ok(Some(ValueType::Str))
             }
+            ("head", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                let ValueType::List(elem) = ty else {
+                    return Err(unsupported(span, "head of a non-list"));
+                };
+                let non_empty = self.asm.new_label();
+                self.asm
+                    .branch(non_empty, BranchKind::CompareNonZero(Reg::X0));
+                self.asm
+                    .emit_write_rodata(STDERR_FD, b"klassic: head expects a non-empty list\n");
+                self.asm.emit_exit(1);
+                self.asm.bind(non_empty);
+                self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+                Ok(Some(elem_value_type(elem)))
+            }
+            ("tail", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                if !matches!(ty, ValueType::List(_) | ValueType::EmptyList) {
+                    return Err(unsupported(span, "tail of a non-list"));
+                }
+                // The evaluator's tail([]) is [] — nil stays nil.
+                let end = self.asm.new_label();
+                self.asm.branch(end, BranchKind::CompareZero(Reg::X0));
+                self.asm.ldr_imm(Reg::X0, Reg::X0, 8);
+                self.asm.bind(end);
+                Ok(Some(ty))
+            }
+            ("isEmpty", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                if !matches!(ty, ValueType::List(_) | ValueType::EmptyList) {
+                    return Err(unsupported(span, "isEmpty of a non-list"));
+                }
+                self.asm.cmp_imm(Reg::X0, 0);
+                self.asm.cset(Reg::X0, Cond::Eq);
+                Ok(Some(ValueType::Bool))
+            }
+            ("size", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                if !matches!(ty, ValueType::List(_) | ValueType::EmptyList) {
+                    return Err(unsupported(span, "size of a non-list"));
+                }
+                let count_loop = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.bind(count_loop);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X1));
+                self.asm.ldr_imm(Reg::X1, Reg::X1, 8);
+                self.asm.add_reg_imm(Reg::X0, Reg::X0, 1);
+                self.asm.branch(count_loop, BranchKind::Unconditional);
+                self.asm.bind(done);
+                Ok(Some(ValueType::Int))
+            }
             // ---- enum-lowering primitives (`desugar_enums`) ----
             // `__gc_record(n)` / `__gc_alloc(bytes)`: zeroed heap
             // memory from the bump allocator (segments are fresh mmap
@@ -1223,7 +1445,7 @@ impl Emitter {
         }
         for (argument, (_, expected)) in arguments.iter().zip(params.iter()) {
             let ty = self.expression(argument)?;
-            if ty != *expected {
+            if !assignable(ty, *expected) {
                 return Err(unsupported(argument.span(), "an argument of this type"));
             }
             self.asm.push(Reg::X0);
@@ -1265,7 +1487,7 @@ impl Emitter {
         let body_ty = self.expression(&body)?;
         self.scopes.pop();
         self.next_local_offset = saved_offset;
-        if body_ty != ret {
+        if !assignable(body_ty, ret) {
             return Err(unsupported(
                 body.span(),
                 "a function body of a different type than its return annotation",
@@ -1317,6 +1539,14 @@ impl Emitter {
                 self.emit_println_str();
                 Ok(())
             }
+            ValueType::List(elem) => {
+                self.emit_println_list(elem);
+                Ok(())
+            }
+            ValueType::EmptyList => {
+                self.asm.emit_write_rodata(STDOUT_FD, b"[]\n");
+                Ok(())
+            }
             ValueType::Bool => {
                 let false_label = self.asm.new_label();
                 let end_label = self.asm.new_label();
@@ -1364,7 +1594,7 @@ impl Emitter {
                     return Err(unsupported(*span, &format!("assignment to `{name}`")));
                 };
                 let ty = self.expression(value)?;
-                if ty != expected {
+                if !assignable(ty, expected) {
                     return Err(unsupported(*span, "assignment changing a type"));
                 }
                 self.asm.store_local(Reg::X0, offset);
@@ -1454,7 +1684,10 @@ fn count_var_decls(expr: &Expr) -> u32 {
                     .map_or(0, |branch| count_var_decls(branch))
         }
         Expr::Binary { lhs, rhs, .. } => count_var_decls(lhs) + count_var_decls(rhs),
-        Expr::Call { arguments, .. } => arguments.iter().map(count_var_decls).sum(),
+        Expr::Call {
+            callee, arguments, ..
+        } => count_var_decls(callee) + arguments.iter().map(count_var_decls).sum::<u32>(),
+        Expr::ListLiteral { elements, .. } => elements.iter().map(count_var_decls).sum(),
         _ => 0,
     }
 }
