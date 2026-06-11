@@ -23169,6 +23169,74 @@ fn build_target_aarch64_apple_darwin_records_run() {
     );
 }
 
+/// Sets on the direct aarch64 backend: `%(...)` literals de-duplicate
+/// (first occurrence wins, insertion order preserved), `.contains` /
+/// `.size` dispatch as method calls, and Int / Bool / String element
+/// sets plus the empty set all print in evaluator format. Asserted
+/// against the evaluator on Apple Silicon.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_sets_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_set_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_set_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "val s = %(1, 2, 3, 2, 1)\n\
+         println(s)\n\
+         println(s.contains(2))\n\
+         println(s.contains(9))\n\
+         println(s.size())\n\
+         val names = %(\"alice\", \"bob\", \"alice\", \"carol\")\n\
+         println(names)\n\
+         println(names.contains(\"bob\"))\n\
+         println(names.contains(\"dave\"))\n\
+         println(names.size())\n\
+         val bs = %(true, false, true)\n\
+         println(bs)\n\
+         println(bs.size())\n\
+         val empty = %()\n\
+         println(empty)\n\
+         println(empty.size())\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin set build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "%(1, 2, 3)\ntrue\nfalse\n3\n%(alice, bob, carol)\ntrue\nfalse\n3\n%(true, false)\n2\n%()\n0\n"
+    );
+}
+
 /// Double arithmetic and comparison on the direct aarch64 backend:
 /// values travel as raw IEEE 754 bits in GP registers and bounce
 /// through the FP unit for add/sub/mul/div and fcmp-based ordering.

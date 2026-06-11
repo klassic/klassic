@@ -567,6 +567,12 @@ enum ValueType {
     /// The type of `[]` before any element pins it down; assignable
     /// to every list type (it is the null pointer).
     EmptyList,
+    /// An insertion-ordered, de-duplicated set, stored as the same
+    /// cons-cell list as `List` (membership and dedup are linear
+    /// scans).
+    Set(ListElem),
+    /// The type of `%()` before any element pins it down.
+    EmptySet,
     /// A record value: index into the emitter's record table (nominal
     /// declarations and interned structural shapes).
     Record(u32),
@@ -587,6 +593,8 @@ fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueTyp
         (ValueType::Never, other) | (other, ValueType::Never) => Some(other),
         (ValueType::EmptyList, other @ ValueType::List(_))
         | (other @ ValueType::List(_), ValueType::EmptyList) => Some(other),
+        (ValueType::EmptySet, other @ ValueType::Set(_))
+        | (other @ ValueType::Set(_), ValueType::EmptySet) => Some(other),
         (left, right) if left == right => Some(left),
         _ => None,
     }
@@ -599,6 +607,8 @@ fn assignable(actual: ValueType, expected: ValueType) -> bool {
     actual == expected
         || (actual == ValueType::EmptyList
             && matches!(expected, ValueType::List(_) | ValueType::EmptyList))
+        || (actual == ValueType::EmptySet
+            && matches!(expected, ValueType::Set(_) | ValueType::EmptySet))
 }
 
 /// One nominal record declaration or interned structural shape:
@@ -656,6 +666,11 @@ struct Emitter {
     /// Lazily created label of the shared heap-segment mmap routine;
     /// emitted at the end only when some allocation referenced it.
     heap_grow_label: Option<Label>,
+    /// Lazily emitted set helpers (called via `bl`): scalar / string
+    /// membership scans and a cons-list reverse.
+    member_scalar_label: Option<Label>,
+    member_string_label: Option<Label>,
+    list_reverse_label: Option<Label>,
     /// Names of enums `desugar_enums` lowered to `__gc_record` shape;
     /// annotations naming them type as plain heap pointers.
     lowered_enums: std::collections::HashSet<String>,
@@ -696,6 +711,9 @@ impl Emitter {
             "List<Int>" => Ok(ValueType::List(ListElem::Int)),
             "List<Bool>" => Ok(ValueType::List(ListElem::Bool)),
             "List<String>" => Ok(ValueType::List(ListElem::Str)),
+            "Set<Int>" => Ok(ValueType::Set(ListElem::Int)),
+            "Set<Bool>" => Ok(ValueType::Set(ListElem::Bool)),
+            "Set<String>" => Ok(ValueType::Set(ListElem::Str)),
             "Unit" => Ok(ValueType::Unit),
             other => Err(unsupported(span, &format!("type annotation `{other}`"))),
         }
@@ -786,6 +804,7 @@ impl Emitter {
                     None => ValueType::EmptyList,
                 })
             }
+            Expr::SetLiteral { elements, span } => self.set_literal(elements, *span),
             // Nominal construction `#Point(3, 4)`.
             Expr::RecordConstructor {
                 name,
@@ -888,6 +907,18 @@ impl Emitter {
                     }
                     self.emit_cons_cell();
                     return Ok(ValueType::List(elem));
+                }
+                // Method-style builtin call `target.method(args)`:
+                // dispatch as `method(target, args)`, the same way the
+                // evaluator and C backend resolve value methods.
+                if let Expr::FieldAccess { target, field, .. } = callee.as_ref() {
+                    let mut all = Vec::with_capacity(arguments.len() + 1);
+                    all.push((**target).clone());
+                    all.extend(arguments.iter().cloned());
+                    if let Some(ty) = self.builtin_call(field, &all, *span)? {
+                        return Ok(ty);
+                    }
+                    return Err(unsupported(*span, &format!("method `{field}`")));
                 }
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return Err(unsupported(*span, "calling a non-identifier"));
@@ -1330,6 +1361,193 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X5);
     }
 
+    /// Get/create the lazily-emitted membership-scan routine label for
+    /// an element type. Both the routines take `x0` = list head and
+    /// `x1` = candidate and return a Bool in `x0`.
+    fn member_label(&mut self, elem: ListElem) -> Label {
+        let slot = match elem {
+            ListElem::Str => &mut self.member_string_label,
+            _ => &mut self.member_scalar_label,
+        };
+        match slot {
+            Some(label) => *label,
+            None => {
+                let label = self.asm.new_label();
+                *slot = Some(label);
+                label
+            }
+        }
+    }
+
+    fn reverse_label(&mut self) -> Label {
+        match self.list_reverse_label {
+            Some(label) => label,
+            None => {
+                let label = self.asm.new_label();
+                self.list_reverse_label = Some(label);
+                label
+            }
+        }
+    }
+
+    /// Compile a `%(...)` set literal: each element is added to a
+    /// cons-list accumulator only if a membership scan does not find
+    /// it, so duplicates collapse to their first occurrence. The
+    /// accumulator ends up in reverse-insertion order, so a final
+    /// reverse restores insertion order for printing.
+    fn set_literal(&mut self, elements: &[Expr], span: Span) -> Result<ValueType, Diagnostic> {
+        // Frame slot for the partial set; survives the bl calls below.
+        let acc = self.next_local_offset;
+        self.next_local_offset += 8;
+        self.asm.mov_imm64(Reg::X0, 0); // nil
+        self.asm.store_local(Reg::X0, acc);
+
+        let mut elem_ty = None;
+        for element in elements {
+            let ty = self.expression(element)?;
+            let Some(this) = list_elem_of(ty) else {
+                return Err(unsupported(element.span(), "a set element of this type"));
+            };
+            if *elem_ty.get_or_insert(this) != this {
+                return Err(unsupported(span, "mixed set element types"));
+            }
+            // Is the candidate (x0) already in the partial set?
+            self.asm.mov_reg(Reg::X1, Reg::X0);
+            self.asm.push(Reg::X1); // candidate survives the bl
+            self.asm.load_local(Reg::X0, acc);
+            let member = self.member_label(this);
+            self.asm.branch(member, BranchKind::Link);
+            let skip = self.asm.new_label();
+            self.asm.branch(skip, BranchKind::CompareNonZero(Reg::X0));
+            // Absent: prepend the candidate to the accumulator.
+            self.asm.pop(Reg::X1);
+            self.asm.push(Reg::X1); // head for emit_cons_cell
+            self.asm.load_local(Reg::X0, acc);
+            self.emit_cons_cell();
+            self.asm.store_local(Reg::X0, acc);
+            let after = self.asm.new_label();
+            self.asm.branch(after, BranchKind::Unconditional);
+            self.asm.bind(skip);
+            self.asm.pop(Reg::X1); // discard the candidate
+            self.asm.bind(after);
+        }
+
+        self.asm.load_local(Reg::X0, acc);
+        let reverse = self.reverse_label();
+        self.asm.branch(reverse, BranchKind::Link);
+        Ok(match elem_ty {
+            Some(elem) => ValueType::Set(elem),
+            None => ValueType::EmptySet,
+        })
+    }
+
+    /// println of the set in x0 in the evaluator's format: `%(e1, e2)`.
+    fn emit_println_set(&mut self, elem: ListElem) {
+        let loop_start = self.asm.new_label();
+        let close = self.asm.new_label();
+        self.asm.push(Reg::X0);
+        self.asm.emit_write_rodata(STDOUT_FD, b"%(");
+        self.asm.pop(Reg::X3);
+        self.asm.push(Reg::X3);
+        self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
+        self.asm.bind(loop_start);
+        self.asm.pop(Reg::X3);
+        self.asm.push(Reg::X3);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        self.emit_print_elem(elem);
+        self.asm.pop(Reg::X3);
+        self.asm.ldr_imm(Reg::X3, Reg::X3, 8);
+        self.asm.push(Reg::X3);
+        self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
+        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(close);
+        self.asm.pop(Reg::X3);
+        self.asm.emit_write_rodata(STDOUT_FD, b")\n");
+    }
+
+    /// `bl`-called scalar membership scan: x0 = list, x1 = candidate
+    /// (a raw Int/Bool qword) → x0 = Bool. No frame: it calls nothing.
+    fn emit_member_scalar_routine(&mut self, label: Label) {
+        self.asm.bind(label);
+        self.asm.mov_reg(Reg::X2, Reg::X0); // cursor
+        let loop_start = self.asm.new_label();
+        let found = self.asm.new_label();
+        let not_found = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.branch(not_found, BranchKind::CompareZero(Reg::X2));
+        self.asm.ldr_imm(Reg::X3, Reg::X2, 0);
+        self.asm.cmp_reg(Reg::X3, Reg::X1);
+        self.asm.branch(found, BranchKind::Conditional(Cond::Eq));
+        self.asm.ldr_imm(Reg::X2, Reg::X2, 8);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(found);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.ret();
+        self.asm.bind(not_found);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.ret();
+    }
+
+    /// `bl`-called string membership scan: x0 = list, x1 = candidate
+    /// (a string pointer) → x0 = Bool. The candidate and cursor live
+    /// in a 16-byte stack scratch addressed off x5, which the inlined
+    /// `str_eq` (using x0-x4/x6/x7) never touches.
+    fn emit_member_string_routine(&mut self, label: Label) {
+        self.asm.bind(label);
+        self.asm.sub_sp_imm(16);
+        self.asm.add_reg_sp_imm(Reg::X5, 0); // scratch base
+        self.asm.str_imm(Reg::X1, Reg::X5, 0); // candidate
+        self.asm.mov_reg(Reg::X2, Reg::X0); // cursor
+        let loop_start = self.asm.new_label();
+        let found = self.asm.new_label();
+        let not_found = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.branch(not_found, BranchKind::CompareZero(Reg::X2));
+        self.asm.str_imm(Reg::X2, Reg::X5, 8); // save cursor
+        self.asm.ldr_imm(Reg::X0, Reg::X2, 0); // element
+        self.asm.ldr_imm(Reg::X1, Reg::X5, 0); // candidate
+        self.emit_str_eq();
+        self.asm.branch(found, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.ldr_imm(Reg::X2, Reg::X5, 8); // restore cursor
+        self.asm.ldr_imm(Reg::X2, Reg::X2, 8); // next
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(found);
+        self.asm.add_sp_imm(16);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.ret();
+        self.asm.bind(not_found);
+        self.asm.add_sp_imm(16);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.ret();
+    }
+
+    /// `bl`-called cons-list reverse: x0 = list → x0 = fresh reversed
+    /// list. Needs a frame record because it allocates (which can
+    /// `bl` the heap-grow routine).
+    fn emit_list_reverse_routine(&mut self, label: Label) {
+        self.asm.bind(label);
+        self.asm.push_frame_record();
+        self.asm.mov_imm64(Reg::X1, 0); // acc = nil
+        let loop_start = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // head
+        self.asm.ldr_imm(Reg::X0, Reg::X0, 8); // advance input
+        // Build [head][acc]; emit_alloc preserves x0-x5 across grow.
+        self.asm.mov_imm64(Reg::X4, 16);
+        self.emit_alloc();
+        self.asm.str_imm(Reg::X2, Reg::X5, 0); // head
+        self.asm.str_imm(Reg::X1, Reg::X5, 8); // next = acc
+        self.asm.mov_reg(Reg::X1, Reg::X5); // acc = new cell
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(done);
+        self.asm.mov_reg(Reg::X0, Reg::X1);
+        self.asm.pop_frame_record();
+        self.asm.ret();
+    }
+
     /// Print one element value in x0 without a newline; clobbers
     /// x0-x5/x16.
     fn emit_print_elem(&mut self, elem: ListElem) {
@@ -1565,9 +1783,17 @@ impl Emitter {
             }
             ("size", 1) => {
                 let ty = self.expression(&arguments[0])?;
-                if !matches!(ty, ValueType::List(_) | ValueType::EmptyList) {
-                    return Err(unsupported(span, "size of a non-list"));
+                if !matches!(
+                    ty,
+                    ValueType::List(_)
+                        | ValueType::EmptyList
+                        | ValueType::Set(_)
+                        | ValueType::EmptySet
+                ) {
+                    return Err(unsupported(span, "size of a non-collection"));
                 }
+                // Both lists and sets are cons-cell chains, so the
+                // length walk is identical.
                 let count_loop = self.asm.new_label();
                 let done = self.asm.new_label();
                 self.asm.mov_reg(Reg::X1, Reg::X0);
@@ -1579,6 +1805,30 @@ impl Emitter {
                 self.asm.branch(count_loop, BranchKind::Unconditional);
                 self.asm.bind(done);
                 Ok(Some(ValueType::Int))
+            }
+            ("contains", 2) => {
+                let set_ty = self.expression(&arguments[0])?;
+                let elem = match set_ty {
+                    ValueType::Set(elem) => Some(elem),
+                    ValueType::EmptySet => None,
+                    _ => return Err(unsupported(span, "contains on a non-set")),
+                };
+                self.asm.push(Reg::X0); // the set survives the candidate eval
+                let candidate_ty = self.expression(&arguments[1])?;
+                self.asm.mov_reg(Reg::X1, Reg::X0); // candidate
+                self.asm.pop(Reg::X0); // set head
+                match elem {
+                    Some(elem) => {
+                        if list_elem_of(candidate_ty) != Some(elem) {
+                            return Err(unsupported(span, "contains with a mismatched element"));
+                        }
+                        let member = self.member_label(elem);
+                        self.asm.branch(member, BranchKind::Link);
+                    }
+                    // Nothing is a member of the empty set.
+                    None => self.asm.mov_imm64(Reg::X0, 0),
+                }
+                Ok(Some(ValueType::Bool))
             }
             // ---- enum-lowering primitives (`desugar_enums`) ----
             // `__gc_record(n)` / `__gc_alloc(bytes)`: zeroed heap
@@ -1789,6 +2039,14 @@ impl Emitter {
                 self.asm.emit_write_rodata(STDOUT_FD, b"[]\n");
                 Ok(())
             }
+            ValueType::Set(elem) => {
+                self.emit_println_set(elem);
+                Ok(())
+            }
+            ValueType::EmptySet => {
+                self.asm.emit_write_rodata(STDOUT_FD, b"%()\n");
+                Ok(())
+            }
             ValueType::Record(index) => {
                 self.emit_println_record(index, argument.span())?;
                 Ok(())
@@ -1937,6 +2195,9 @@ fn count_var_decls(expr: &Expr) -> u32 {
             callee, arguments, ..
         } => count_var_decls(callee) + arguments.iter().map(count_var_decls).sum::<u32>(),
         Expr::ListLiteral { elements, .. } => elements.iter().map(count_var_decls).sum(),
+        // A set literal reserves one frame slot for its accumulator,
+        // plus whatever its elements declare.
+        Expr::SetLiteral { elements, .. } => 1 + elements.iter().map(count_var_decls).sum::<u32>(),
         Expr::RecordConstructor { arguments, .. } => arguments.iter().map(count_var_decls).sum(),
         Expr::RecordLiteral { fields, .. } => {
             fields.iter().map(|(_, value)| count_var_decls(value)).sum()
@@ -2102,6 +2363,17 @@ pub(crate) fn emit_macho_program(
             emitted[index] = true;
             emitter.emit_function(index)?;
         }
+    }
+    // Set helpers before heap-grow: the reverse routine allocates, so
+    // it can be what first references the heap-grow routine.
+    if let Some(label) = emitter.member_scalar_label {
+        emitter.emit_member_scalar_routine(label);
+    }
+    if let Some(label) = emitter.member_string_label {
+        emitter.emit_member_string_routine(label);
+    }
+    if let Some(label) = emitter.list_reverse_label {
+        emitter.emit_list_reverse_routine(label);
     }
     if let Some(label) = emitter.heap_grow_label {
         emitter.emit_heap_grow_routine(label);
