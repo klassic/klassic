@@ -760,14 +760,22 @@ cargo run -- -e "1 + 2"
   (`MH_DYLDLINK` + `LC_LOAD_DYLINKER` + `LC_MAIN`, plus the empty
   `LC_SYMTAB`/`LC_DYSYMTAB` pair dyld dereferences) even though the
   generated code imports nothing. The backend starts from the same
-  kind of small vertical slice the x86_64 backend grew from — the
-  current subset covers top-level Int/Bool expressions (arithmetic
-  with an evaluator-matching division-by-zero abort, comparisons,
-  short-circuit logic), `val`/`mutable` locals addressed off a frame
-  pointer, `if`/`while`, and `println` of runtime Int/Bool values
-  (integers are decomposed into a stack buffer and written with one
-  syscall) plus string/double literals — and unsupported
-  constructs fail with source-located diagnostics. `--target
+  kind of small vertical slice the x86_64 backend grew from. The
+  current subset: Int/Bool/String expressions (arithmetic with an
+  evaluator-matching division-by-zero abort, comparisons,
+  short-circuit logic, heap string concatenation off an x19/x20
+  bump allocator the kernel feeds via mmap), `val`/`mutable` locals
+  addressed off a frame pointer, `if`/`while`, annotated `def`s as
+  real AAPCS64 functions with per-frame recursion, the string
+  builtins (length/substring/at/toString/isEmptyString with
+  evaluator clamping semantics), monomorphic enums and `match`
+  (riding the shared `desugar_enums` lowering — the emitter just
+  implements its `__gc_*` primitive surface), cons lists (curried
+  `cons`, head/tail/isEmpty/size, list-typed recursion the x86_64
+  backend still rejects), records (nominal and structural, nested
+  field access), and evaluator-format `println` for all of the
+  above. Unsupported constructs fail with source-located
+  diagnostics. `--target
   aarch64-apple-darwin` selects it from any host (cross builds work).
   A target-less `build` compiles for the detected host — Apple
   Silicon defaults to this backend and falls back to the portable C
