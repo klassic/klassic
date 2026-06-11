@@ -215,9 +215,13 @@ impl NativeTarget {
             .map(|spec| spec.target)
     }
 
+    /// The direct-backend target this build of the compiler runs on,
+    /// if any. A target-less `build` compiles for the detected host.
     pub fn host() -> Option<Self> {
         if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             Some(Self::LinuxX86_64)
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some(Self::MacosAarch64)
         } else {
             None
         }

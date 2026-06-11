@@ -51,13 +51,13 @@ it. Set `KLASSIC_VERSION=v0.2.0` to pin a release, `KLASSIC_HOME` to
 change the install root. The Linux build is statically linked (musl)
 and runs on any x86_64 Linux.
 
-On macOS the evaluator, REPL, and native builds are fully supported:
-`klassic build program.kl -o program` routes through the portable C
-backend automatically (the system `cc` links against the bundled
-runtime). The direct-to-ELF backend stays Linux-only, so the C path
-currently covers a subset of the language — unsupported constructs
-fail with a source-located diagnostic; run them with `klassic
-program.kl` instead.
+On macOS the evaluator, REPL, and native builds are fully supported.
+On Apple Silicon, `klassic build program.kl -o program` targets the
+host automatically: the direct Mach-O arm64 backend compiles and
+ad-hoc-signs the executable with no external toolchain, and programs
+outside its (growing) subset fall back to the portable C backend
+(the system `cc` links against the bundled runtime). Anything beyond
+both paths runs with `klassic program.kl`.
 
 Alternatively, build from source with Cargo:
 

@@ -768,9 +768,11 @@ cargo run -- -e "1 + 2"
   (integers are decomposed into a stack buffer and written with one
   syscall) plus string/double literals — and unsupported
   constructs fail with source-located diagnostics. `--target
-  aarch64-apple-darwin` selects it from any host (cross builds work);
-  a target-less `build` on macOS keeps routing through the C backend
-  until the direct backend reaches useful parity.
+  aarch64-apple-darwin` selects it from any host (cross builds work).
+  A target-less `build` compiles for the detected host — Apple
+  Silicon defaults to this backend and falls back to the portable C
+  backend for programs outside the direct subset; Linux x86_64 keeps
+  the full-featured direct ELF backend with no fallback.
 
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program

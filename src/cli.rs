@@ -181,7 +181,8 @@ pub fn usage() -> String {
        run <fileName>     : same as <fileName>; pairs naturally with `-- <args>`\n\
        -e <expression>    : evaluate <expression>\n\
        build <fileName> -o <output>: compile <fileName> to a native executable \
-(hosts without a direct backend, such as macOS, build via the portable C backend)\n\
+for the detected host (or for an explicit --target); the portable C backend \
+covers hosts and constructs the direct backends do not handle yet\n\
        targets            : list known native targets and their support status\n\
        --                 : separates klassic flags from arguments visible to \
 the user script via CommandLine#args()\n",

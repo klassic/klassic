@@ -22962,6 +22962,95 @@ fn build_target_aarch64_apple_darwin_functions_run() {
     );
 }
 
+/// On Apple Silicon a target-less `build` detects the host: programs
+/// inside the direct subset get the toolchain-free Mach-O backend
+/// (no libSystem linkage), and programs outside it silently fall
+/// back to the portable C backend. Both must run correctly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_host_default_uses_direct_backend_with_c_fallback() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+
+    // Direct-subset program: must come out of the direct backend.
+    let direct_source = dir.join(format!("klassic_hostdetect_a_{stamp}.kl"));
+    let direct_bin = dir.join(format!("klassic_hostdetect_a_{stamp}.bin"));
+    fs::write(
+        &direct_source,
+        "def fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)\nprintln(fib(20))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            direct_source.to_str().expect("path should be utf-8"),
+            "-o",
+            direct_bin.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "host-default build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let image = fs::read(&direct_bin).expect("output should exist");
+    assert!(
+        !image
+            .windows(b"libSystem".len())
+            .any(|window| window == b"libSystem"),
+        "direct-subset program should not be cc-linked"
+    );
+    let run_output = Command::new(&direct_bin)
+        .output()
+        .expect("direct binary should run");
+    let _ = fs::remove_file(&direct_source);
+    let _ = fs::remove_file(&direct_bin);
+    assert!(run_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "6765\n");
+
+    // String-manipulating program: outside the direct subset, so the
+    // C fallback (cc + bundled runtime) must kick in transparently.
+    let cc_available = Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|probe| probe.status.success());
+    if !cc_available {
+        return;
+    }
+    let fallback_source = dir.join(format!("klassic_hostdetect_b_{stamp}.kl"));
+    let fallback_bin = dir.join(format!("klassic_hostdetect_b_{stamp}.bin"));
+    fs::write(
+        &fallback_source,
+        "def greet(name: String): String = \"hello, \" + name + \"!\"\nprintln(greet(\"mac\"))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            fallback_source.to_str().expect("path should be utf-8"),
+            "-o",
+            fallback_bin.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "C fallback build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&fallback_bin)
+        .output()
+        .expect("fallback binary should run");
+    let _ = fs::remove_file(&fallback_source);
+    let _ = fs::remove_file(&fallback_bin);
+    assert!(run_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "hello, mac!\n");
+}
+
 /// A target-less `klassic build` must produce a binary the host can
 /// actually execute. Linux x86_64 uses the direct ELF backend; hosts
 /// without a direct backend (macOS CI) route through the portable C

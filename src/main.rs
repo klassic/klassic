@@ -11,10 +11,44 @@ use cli::{
 };
 use klassic_eval::{Evaluator, EvaluatorConfig, set_script_args};
 use klassic_native::{
-    NativeCompilerConfig, NativeTarget, UserModuleSource, compile_source_to_c,
+    NativeBackend, NativeCompilerConfig, NativeTarget, UserModuleSource, compile_source_to_c,
     compile_source_with_prelude_and_modules_for_target,
 };
 use std::path::Path;
+
+/// Build through the portable C backend: emit the translation unit
+/// and, unless the output name ends in `.c`, compile and link it with
+/// the system C compiler against the bundled runtime staticlib.
+fn build_with_c_backend(input: &Path, text: &str, output: &Path) -> Result<(), u8> {
+    let c_source = match compile_source_to_c(&input.display().to_string(), text) {
+        Ok(c_source) => c_source,
+        Err(error) => {
+            eprintln!("{error}");
+            return Err(1);
+        }
+    };
+    if output.extension().is_some_and(|extension| extension == "c") {
+        if let Err(error) = fs::write(output, c_source) {
+            eprintln!("{}: {error}", output.display());
+            return Err(1);
+        }
+        return Ok(());
+    }
+    link_c_program(&c_source, output)
+}
+
+fn write_executable_output(output: &Path, bytes: &[u8]) -> Result<(), u8> {
+    if let Err(error) = fs::write(output, bytes) {
+        eprintln!("{}: {error}", output.display());
+        return Err(1);
+    }
+    #[cfg(unix)]
+    if let Err(error) = fs::set_permissions(output, fs::Permissions::from_mode(0o755)) {
+        eprintln!("{}: {error}", output.display());
+        return Err(1);
+    }
+    Ok(())
+}
 
 /// The standard prelude is bundled into the compiler at build time. It is
 /// loaded as a separate translation unit so user code is parsed in its own
@@ -65,42 +99,23 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     return Err(1);
                 }
             };
-            // Hosts without a direct native backend (e.g. macOS) build
-            // through the portable C path unless an explicit --target
-            // asks for a cross build; the old behavior silently emitted
-            // a Linux ELF that the host cannot execute.
-            let host_routes_through_c =
-                !command.config.explicit_target && NativeTarget::host().is_none();
-            if command.config.c_backend || host_routes_through_c {
-                let c_source = match compile_source_to_c(&input.display().to_string(), &text) {
-                    Ok(c_source) => c_source,
-                    Err(error) => {
-                        eprintln!("{error}");
-                        if host_routes_through_c && !command.config.c_backend {
-                            eprintln!(
-                                "note: this host has no direct native backend, so `build` \
-                                 uses the portable C backend; it supports a subset of the \
-                                 language (run the program with `klassic {}` instead)",
-                                input.display()
-                            );
-                        }
-                        return Err(1);
-                    }
-                };
-                // `-o foo.c` writes the C source; any other output
-                // name compiles and links it into an executable with
-                // the system C compiler and the bundled runtime.
-                if output.extension().is_some_and(|extension| extension == "c") {
-                    if let Err(error) = fs::write(&output, c_source) {
-                        eprintln!("{}: {error}", output.display());
-                        return Err(1);
-                    }
-                    return Ok(());
-                }
-                return link_c_program(&c_source, &output);
+            if command.config.c_backend {
+                return build_with_c_backend(&input, &text, &output);
             }
+            // The default target is the detected host (macOS arm64 →
+            // the direct Mach-O backend, Linux x86_64 → direct ELF);
+            // an explicit --target selects a cross build. Hosts with
+            // no direct backend route through the portable C path.
+            let target = if command.config.explicit_target {
+                Some(command.config.native_target)
+            } else {
+                NativeTarget::host()
+            };
+            let Some(target) = target else {
+                return build_with_c_backend(&input, &text, &output);
+            };
             let config = NativeCompilerConfig {
-                target: command.config.native_target,
+                target,
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
             };
@@ -114,20 +129,20 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
             ) {
                 Ok(bytes) => bytes,
                 Err(error) => {
+                    // The aarch64 direct backend is still growing; on
+                    // the host default (not an explicit --target) a
+                    // program outside its subset falls back to the
+                    // portable C backend, which covers more today.
+                    if !command.config.explicit_target
+                        && target.backend() == NativeBackend::DirectAarch64
+                    {
+                        return build_with_c_backend(&input, &text, &output);
+                    }
                     eprintln!("{error}");
                     return Err(1);
                 }
             };
-            if let Err(error) = fs::write(&output, bytes) {
-                eprintln!("{}: {error}", output.display());
-                return Err(1);
-            }
-            #[cfg(unix)]
-            if let Err(error) = fs::set_permissions(&output, fs::Permissions::from_mode(0o755)) {
-                eprintln!("{}: {error}", output.display());
-                return Err(1);
-            }
-            Ok(())
+            write_executable_output(&output, &bytes)
         }
         RunAction::EvaluateExpression(expression) => {
             let mut evaluator = prepare_evaluator(EvaluatorConfig {
