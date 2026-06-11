@@ -21,12 +21,13 @@ The most common idiom is "release this resource regardless of how the
 preceding expression ends":
 
 ```kl
-val handle = FileInput.open("config.txt")
-val content = handle.readAll()
-process(content)
-cleanup {
-  handle.close()
+FileOutput#write("notes.txt", "hello")
+val content = {
+  FileInput#readAll("notes.txt")
+} cleanup {
+  FileOutput#delete("notes.txt")
 }
+println(content)
 ```
 
 The native compiler tracks `cleanup` blocks across both pure and

@@ -46,7 +46,7 @@ val ages = %["alice": 30, "bob": 27, "carol": 42]
 
 println(ages.get("alice"))               // 30
 println(ages.containsKey("dave"))        // false
-println(size(ages))                      // 3
+println(ages.size())                     // 3
 ```
 
 ### Map helpers
@@ -65,7 +65,7 @@ checks without materializing a tagged null.
 
 ```kl
 val tags = %("rust", "klassic", "compiler", "rust")
-println(size(tags))               // 3 — duplicates collapse
+println(tags.size())              // 3 — duplicates collapse
 println(tags.contains("rust"))    // true
 ```
 

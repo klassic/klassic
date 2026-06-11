@@ -5,18 +5,19 @@ result. Demonstrates file I/O, splitting strings, and the heap-backed
 `smap` dictionary.
 
 ```kl
-val args = CommandLine.args()
+val args = CommandLine#args()
 if (size(args) != 1) {
   printlnError("usage: wc <path>")
-  Process.exit(1)
+  Process#exit(1)
 }
 
 val path = head(args)
-val raw = FileInput.readAll(path)
+val raw = FileInput#readAll(path)
 
-// Split on the space character (32). Real-world tools would handle
-// punctuation; this recipe focuses on the GC plumbing.
-val words = __gc_string_split(__gc_string(raw), 32)
+// Trim the trailing newline, then split on the space character (32).
+// Real-world tools would handle punctuation; this recipe focuses on
+// the GC plumbing.
+val words = __gc_string_split(__gc_string_trim(__gc_string(raw)), 32)
 
 mutable counts = __gc_smap_new()
 mutable i = 0

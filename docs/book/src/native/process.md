@@ -6,17 +6,17 @@ launched in — not the environment that built them.
 ## Standard input
 
 ```kl
-val all = StandardInput.all()
+val all = StandardInput#all()
 println("Read #{length(all)} bytes")
 
-val lines = StandardInput.lines()
+val lines = StandardInput#lines()
 foreach (line in lines) {
   println("> " + line)
 }
 ```
 
 Aliases: `stdin()` and `stdinLines()` work as shorthand for
-`StandardInput.all()` and `StandardInput.lines()`.
+`StandardInput#all()` and `StandardInput#lines()`.
 
 ## Standard output / error
 
@@ -28,14 +28,14 @@ printlnError("warning")         // → stderr
 ## Command-line arguments
 
 ```kl
-val rest = CommandLine.args()
+val rest = CommandLine#args()
 println("got #{size(rest)} arguments")
 foreach (a in rest) {
   println(a)
 }
 ```
 
-`args()` is shorthand for `CommandLine.args()`. Both forms strip
+`args()` is shorthand for `CommandLine#args()`. Both forms strip
 `argv[0]` (the binary path).
 
 ## Process exit
@@ -43,7 +43,7 @@ foreach (a in rest) {
 ```kl
 if (size(args) == 0) {
   printlnError("usage: tool <input>")
-  Process.exit(1)
+  Process#exit(1)
 }
 ```
 
@@ -52,36 +52,36 @@ if (size(args) == 0) {
 ## Environment variables
 
 ```kl
-if (Environment.exists("DEBUG")) {
-  println("DEBUG=" + Environment.get("DEBUG"))
+if (Environment#exists("DEBUG")) {
+  println("DEBUG=" + Environment#get("DEBUG"))
 }
 
-foreach (entry in Environment.vars()) {
+foreach (entry in Environment#vars()) {
   println(entry)
 }
 ```
 
 Aliases:
-- `getEnv(name)` for `Environment.get`
-- `hasEnv(name)` for `Environment.exists`
-- `env()` for `Environment.vars`
+- `getEnv(name)` for `Environment#get`
+- `hasEnv(name)` for `Environment#exists`
+- `env()` for `Environment#vars`
 
 ## Sample CLI tool
 
 ```kl
-val args = CommandLine.args()
+val args = CommandLine#args()
 if (size(args) != 1) {
   printlnError("usage: cat <path>")
-  Process.exit(1)
+  Process#exit(1)
 }
 
 val path = head(args)
-if (!FileOutput.exists(path)) {
+if (!FileOutput#exists(path)) {
   printlnError("error: " + path + " does not exist")
-  Process.exit(2)
+  Process#exit(2)
 }
 
-println(FileInput.readAll(path))
+println(FileInput#readAll(path))
 ```
 
 ```bash

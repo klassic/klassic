@@ -9,18 +9,20 @@ We split on spaces and only handle `+`, `-`, `*`, `/` in left-to-right
 order — perfect for showing the moving parts without a full grammar.
 
 ```kl
-val args = CommandLine.args()
+import std.math.{mod}
+
+val args = CommandLine#args()
 if (size(args) != 1) {
   printlnError("usage: calc \"2 + 3 * 4\"")
-  Process.exit(1)
+  Process#exit(1)
 }
 
 val tokens = __gc_string_split(__gc_string(head(args)), 32)
 val n = __gc_list_ptr_len(tokens)
 
-if (n == 0 || n % 2 == 0) {
+if (n == 0 || mod(n, 2) == 0) {
   printlnError("expected: NUM (OP NUM)*")
-  Process.exit(2)
+  Process#exit(2)
 }
 
 mutable acc = __gc_string_to_int(__gc_list_ptr_get(tokens, 0))
@@ -40,13 +42,14 @@ while (i < n) {
         if (__gc_string_eq(op, __gc_string("/"))) {
           if (rhs == 0) {
             printlnError("division by zero")
-            Process.exit(3)
+            Process#exit(3)
           }
           acc = acc / rhs
         } else {
           printlnError("unknown operator: ")
           __gc_string_println(op)
-          Process.exit(4)
+          Process#exit(4)
+          acc = 0   // unreachable; aligns the branch types
         }
       }
     }

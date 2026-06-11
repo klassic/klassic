@@ -1,15 +1,24 @@
 # Modules and Imports
 
-Klassic groups related definitions into modules. A module declares a
-dotted name and brackets its contents in `{ ... }`.
+A Klassic module is a file whose first line declares a dotted module
+name. The body of the file — everything after the header — belongs to
+that module:
 
 ```kl
-module math.demo {
-  def double(x) = x * 2
-  def triple(x) = x * 3
-}
+module math.demo
 
+def double(x) = x * 2
+def triple(x) = x * 3
+```
+
+Save that as `math/demo.kl` next to your program: imports resolve
+modules from neighboring files, mapping `math.demo` to
+`math/demo.kl` (or `math.demo.kl`). Both the evaluator and native
+builds do this resolution.
+
+```kl
 import math.demo.{double, triple}
+
 println(double(21))   // 42
 println(triple(7))    // 21
 ```
@@ -20,39 +29,58 @@ Pick out exactly what you need:
 
 ```kl
 import math.demo.{double}
-double(10)
+
+println(double(10))   // 20
 ```
 
 ## Module aliases
 
-Bind the whole module to a shorter name:
+Bind the whole module to a shorter name and access members with a dot:
 
 ```kl
 import math.demo as M
-M.double(10)
-M.triple(10)
+
+println(M.double(10))   // 20
+println(M.triple(10))   // 30
 ```
 
-## Aliasing builtin modules
+> **Note:** aliased imports currently work in native builds
+> (`klassic build`) but not yet in the evaluator — a known parity gap.
+> Selective imports work everywhere.
 
-The same syntax works for the language's own standard names:
+## Deeper names
+
+Dotted names nest as deep as your directory tree:
 
 ```kl
-import Map as M
-import FileInput.{readAll}
+module outer.inner
 
-val sizes = %["a": 1, "b": 2]
-println(M.size(sizes))
+def f() = 42
 ```
 
-## Nesting
-
-Modules can nest:
+stored as `outer/inner.kl`, imported with:
 
 ```kl
-module outer.inner {
-  def f() = 42
-}
+import outer.inner.{f}
 
-println(outer.inner.f())
+println(f())   // 42
 ```
+
+## The standard library
+
+The same syntax brings in the bundled standard library — no files
+needed on disk:
+
+```kl
+import std.math.{max, clamp}
+import std.list.{range}
+
+println(max(3, 9))       // 9
+println(clamp(99, 0, 10)) // 10
+println(range(0, 4))     // [0, 1, 2, 3]
+```
+
+`std.option` and `std.result` ship real enums (`Some` / `None`,
+`Ok` / `Err`) plus the helpers and extension methods you would
+expect; `std.json` and `std.time` are written in pure Klassic on top
+of them.

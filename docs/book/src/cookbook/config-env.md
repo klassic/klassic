@@ -5,7 +5,7 @@ defaults. A common pattern for twelve-factor-style services.
 
 ```kl
 def env_or(name: String, fallback: String): String =
-  if (Environment.exists(name)) Environment.get(name)
+  if (Environment#exists(name)) Environment#get(name)
   else fallback
 
 val host = env_or("APP_HOST", "0.0.0.0")
@@ -34,7 +34,7 @@ APP_PORT=4000 LOG_LEVEL=debug ./config
 
 ## Aliases
 
-`Environment.get` / `Environment.exists` / `Environment.vars` all
+`Environment#get` / `Environment#exists` / `Environment#vars` all
 have short aliases (`getEnv`, `hasEnv`, `env`):
 
 ```kl

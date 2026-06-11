@@ -38,9 +38,7 @@ def square(n: Int): Int = n * n
 ## Numeric literals
 
 ```kl
-val byte = 0xff             // hex
-val short = 256s            // 16-bit suffix
-val long = 1_000L           // underscore separators allowed
+val big = 1000L             // L → Long
 val pi = 3.14F              // F → Float, no suffix → Double
 ```
 

@@ -7,7 +7,7 @@ folder and run.
 | Recipe | What it teaches |
 |---|---|
 | [Hello, World variations](./hello.md) | Static vs heap-allocated strings, `println` end-to-end. |
-| [Greeter with arguments](./greeter.md) | `CommandLine.args()`, error exits, native CLI. |
+| [Greeter with arguments](./greeter.md) | `CommandLine#args()`, error exits, native CLI. |
 | [Uppercase filter](./uppercase-filter.md) | `stdin` / `stdout`, line-by-line processing. |
 | [Word count](./word-count.md) | File I/O, splitting, heap-backed `smap`. |
 | [Config from environment](./config-env.md) | Environment variables, defaults, `Map#get`. |

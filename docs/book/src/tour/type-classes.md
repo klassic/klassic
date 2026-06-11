@@ -41,6 +41,14 @@ def display<Show 'a>(x: 'a): String = show(x)
 constraint in one go. Multiple constraints stack naturally:
 
 ```kl
+typeclass Eq<'a> where {
+  equals: ('a, 'a) => Boolean
+}
+
+instance Eq<Int> where {
+  def equals(x: Int, y: Int): Boolean = x == y
+}
+
 def show_equal<Show 'a, Eq 'a>(x: 'a, y: 'a): String =
   if (equals(x, y)) show(x) + " equals " + show(y)
   else show(x) + " not equals " + show(y)

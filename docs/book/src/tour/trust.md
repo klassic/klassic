@@ -31,10 +31,10 @@ production" while still allowing scaffolding during development.
 
 ## Adding trust
 
-Mark a declaration as trusted with the `trusted` keyword:
+Mark a declaration as trusted with the `trust` keyword:
 
 ```kl
-trusted theorem foo(): { true } = ...
+trust theorem foo(): { true } = assert(true)
 ```
 
 This is informational — it doesn't change the compile semantics, only

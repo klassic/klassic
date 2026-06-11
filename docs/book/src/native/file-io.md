@@ -6,40 +6,40 @@ Native binaries talk directly to the kernel through `open`, `read`,
 ## Reading
 
 ```kl
-val content = FileInput.readAll("notes.txt")
+val content = FileInput#readAll("notes.txt")
 println(content)
 ```
 
 Or stream it line-by-line:
 
 ```kl
-val lines = FileInput.readLines("notes.txt")
+val lines = FileInput#readLines("notes.txt")
 foreach (line in lines) {
   println(line)
 }
 ```
 
-`FileInput.readAll` and `FileInput.readLines` accept both static
+`FileInput#readAll` and `FileInput#readLines` accept both static
 literal paths and runtime string paths.
 
 ## Writing
 
 ```kl
-FileOutput.write("output.txt", "Hello!\n")
-FileOutput.append("output.txt", "Another line.\n")
+FileOutput#write("output.txt", "Hello!\n")
+FileOutput#append("output.txt", "Another line.\n")
 ```
 
 You can also write a list of lines in one call:
 
 ```kl
-FileOutput.writeLines("output.txt", ["one", "two", "three"])
+FileOutput#writeLines("output.txt", ["one", "two", "three"])
 ```
 
 ## Existence and deletion
 
 ```kl
-if (FileOutput.exists("scratch.txt")) {
-  FileOutput.delete("scratch.txt")
+if (FileOutput#exists("scratch.txt")) {
+  FileOutput#delete("scratch.txt")
 }
 ```
 
@@ -72,11 +72,11 @@ if (Dir.exists("/tmp/klassic-demo")) {
 
 ## Callback style
 
-`FileInput.open` runs a callback with an open stream and closes it
+`FileInput#open` runs a callback with an open stream and closes it
 afterwards:
 
 ```kl
-FileInput.open("config.txt", (stream) => {
+FileInput#open("config.txt", (stream) => {
   println(stream.readAll())
 })
 ```

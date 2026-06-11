@@ -5,12 +5,14 @@
 `if` is an expression — every branch must return the same type.
 
 ```kl
-val parity = if (n % 2 == 0) "even" else "odd"
+val n = 7
+val parity = if (n > 0) "positive" else "non-positive"
 ```
 
 Without an `else`, the value is `Unit`:
 
 ```kl
+val debug = true
 if (debug) println("hello")
 ```
 
@@ -37,8 +39,8 @@ foreach (x in [1, 2, 3]) {
   println(x)
 }
 
-foreach (entry in %["alice": 30, "bob": 27]) {
-  println(entry)
+foreach (name in ["alice", "bob"]) {
+  println(name)
 }
 ```
 
@@ -51,6 +53,8 @@ Curly braces make a block. The last expression in the block becomes
 the value of the block.
 
 ```kl
+def compute() = 87
+
 val score = {
   val raw = compute()
   val clamped = if (raw < 0) 0 else raw
