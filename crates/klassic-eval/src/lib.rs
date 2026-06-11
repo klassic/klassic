@@ -29,8 +29,9 @@ mod value;
 
 use builtin_registry::{builtin_arity, builtin_name, value_method_builtin_name};
 use builtin_support::{
-    clamp_index, ensure_arity, expect_int, expect_list, expect_map, expect_non_negative_int,
-    expect_set, expect_string, simple_regex_is_match, simple_regex_replace_all,
+    clamp_index, ensure_arity, expect_clamped_index, expect_list, expect_map,
+    expect_non_negative_int, expect_set, expect_string, simple_regex_is_match,
+    simple_regex_replace_all,
 };
 use environment::{AssignmentFailure, Binding, Environment};
 use ops::{eval_binary, eval_unary};
@@ -2697,8 +2698,8 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
         "substring" => {
             ensure_arity(name, arguments, 3, span)?;
             let input = expect_string(&arguments[0], "substring", span)?;
-            let start = expect_int(&arguments[1], "substring", span)?;
-            let end = expect_int(&arguments[2], "substring", span)?;
+            let start = expect_clamped_index(&arguments[1], "substring", span)?;
+            let end = expect_clamped_index(&arguments[2], "substring", span)?;
             let chars = input.chars().collect::<Vec<_>>();
             let start = clamp_index(start, chars.len());
             let end = clamp_index(end, chars.len()).max(start);
@@ -2707,7 +2708,7 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
         "at" => {
             ensure_arity(name, arguments, 2, span)?;
             let input = expect_string(&arguments[0], "at", span)?;
-            let index = expect_int(&arguments[1], "at", span)?;
+            let index = expect_clamped_index(&arguments[1], "at", span)?;
             let chars = input.chars().collect::<Vec<_>>();
             let index = clamp_index(index, chars.len());
             let value = chars.get(index).copied().unwrap_or_default();

@@ -35,18 +35,17 @@ pub(crate) fn expect_string<'a>(
     }
 }
 
-pub(crate) fn expect_int(value: &Value, name: &str, span: Span) -> Result<usize, Diagnostic> {
+/// An index argument for the clamping string slicers (`substring` /
+/// `at`): negatives clamp to 0, matching `klassic_rt` and both native
+/// backends (issue #434 — the evaluator used to reject them).
+pub(crate) fn expect_clamped_index(
+    value: &Value,
+    name: &str,
+    span: Span,
+) -> Result<usize, Diagnostic> {
     match value {
-        Value::Int(number) if *number >= 0 => Ok(*number as usize),
-        Value::Int(_) => Err(Diagnostic::runtime(
-            span,
-            format!("{name} expects a non-negative integer index"),
-        )),
-        Value::Long(number) if *number >= 0 => Ok(*number as usize),
-        Value::Long(_) => Err(Diagnostic::runtime(
-            span,
-            format!("{name} expects a non-negative integer index"),
-        )),
+        Value::Int(number) => Ok((*number).max(0) as usize),
+        Value::Long(number) => Ok((*number).max(0) as usize),
         _ => Err(Diagnostic::runtime(
             span,
             format!("{name} expects an integer"),
@@ -59,7 +58,18 @@ pub(crate) fn expect_non_negative_int(
     name: &str,
     span: Span,
 ) -> Result<usize, Diagnostic> {
-    expect_int(value, name, span)
+    match value {
+        Value::Int(number) if *number >= 0 => Ok(*number as usize),
+        Value::Long(number) if *number >= 0 => Ok(*number as usize),
+        Value::Int(_) | Value::Long(_) => Err(Diagnostic::runtime(
+            span,
+            format!("{name} expects a non-negative integer index"),
+        )),
+        _ => Err(Diagnostic::runtime(
+            span,
+            format!("{name} expects an integer"),
+        )),
+    }
 }
 
 pub(crate) fn expect_list<'a>(

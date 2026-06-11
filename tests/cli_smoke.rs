@@ -18537,6 +18537,63 @@ fn builds_native_executable_for_todo_runtime_error() {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// Negative `substring` / `at` indices clamp to 0 everywhere — the
+/// evaluator used to reject them while klassic_rt and the backends
+/// clamped (issue #434). Static and dynamic index paths both covered.
+#[test]
+fn substring_and_at_clamp_negative_indices() {
+    let program = "mutable s = 0 - 2\n\
+         println(substring(\"abc\", 0 - 2, 1))\n\
+         println(at(\"abc\", 0 - 1))\n\
+         println(substring(\"abc\", s, 1))\n\
+         println(at(\"abc\", s))\n";
+    let expected = "a\na\na\na\n";
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_clamp_{stamp}.kl"));
+    fs::write(&source_path, program).expect("temp source file should write");
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    assert!(
+        eval_output.status.success(),
+        "evaluator should clamp\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&eval_output.stdout), expected);
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let output_path = std::env::temp_dir().join(format!("klassic_clamp_{stamp}.bin"));
+        let build_output = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_str().expect("path should be utf-8"),
+                "-o",
+                output_path.to_str().expect("path should be utf-8"),
+            ])
+            .output()
+            .expect("binary should run");
+        assert!(
+            build_output.status.success(),
+            "native build should succeed\nstderr:\n{}",
+            String::from_utf8_lossy(&build_output.stderr)
+        );
+        let run_output = Command::new(&output_path)
+            .output()
+            .expect("compiled binary should run");
+        let _ = fs::remove_file(&output_path);
+        assert!(run_output.status.success());
+        assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
+    }
+    let _ = fs::remove_file(&source_path);
+}
+
 #[test]
 fn builds_native_executable_for_assertion_runtime_errors() {
     let cases = [
@@ -18571,18 +18628,6 @@ fn builds_native_executable_for_assertion_runtime_errors() {
             2,
             1,
             "head expects a non-empty list",
-        ),
-        (
-            "at(\"abc\", -1)\n",
-            1,
-            1,
-            "at expects a non-negative integer index",
-        ),
-        (
-            "substring(\"abc\", -1, 2)\n",
-            1,
-            1,
-            "substring expects a non-negative integer index",
         ),
         (
             "repeat(\"a\", -1)\n",

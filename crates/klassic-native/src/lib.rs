@@ -9881,12 +9881,12 @@ impl NativeCodeGenerator {
                         ),
                         (Some(StaticValue::Int(_)), Some(StaticValue::Int(_)))
                     ) {
-                        let start = self.static_non_negative_int_argument_preserving_effects(
+                        let start = self.static_clamped_index_argument_preserving_effects(
                             &arguments[1],
                             name,
                             span,
                         )?;
-                        let end = self.static_non_negative_int_argument_preserving_effects(
+                        let end = self.static_clamped_index_argument_preserving_effects(
                             &arguments[2],
                             name,
                             span,
@@ -9923,7 +9923,6 @@ impl NativeCodeGenerator {
                         start_chars,
                         end_chars,
                         span,
-                        name,
                     );
                     self.pop_scope();
                     return Ok(result);
@@ -9966,15 +9965,14 @@ impl NativeCodeGenerator {
                         start_chars,
                         end_chars,
                         span,
-                        name,
                     ));
                 }
-                let start = self.static_non_negative_int_argument_preserving_effects(
+                let start = self.static_clamped_index_argument_preserving_effects(
                     &arguments[1],
                     name,
                     span,
                 )?;
-                let end = self.static_non_negative_int_argument_preserving_effects(
+                let end = self.static_clamped_index_argument_preserving_effects(
                     &arguments[2],
                     name,
                     span,
@@ -10011,7 +10009,7 @@ impl NativeCodeGenerator {
                         self.preview_static_value_after_effectful_eval(&arguments[1]),
                         Some(StaticValue::Int(_))
                     ) {
-                        let index = self.static_non_negative_int_argument_preserving_effects(
+                        let index = self.static_clamped_index_argument_preserving_effects(
                             &arguments[1],
                             name,
                             span,
@@ -10037,7 +10035,6 @@ impl NativeCodeGenerator {
                         start_chars,
                         end_chars,
                         span,
-                        name,
                     );
                     self.pop_scope();
                     return Ok(result);
@@ -10068,10 +10065,9 @@ impl NativeCodeGenerator {
                         start_chars,
                         end_chars,
                         span,
-                        name,
                     ));
                 }
-                let index = self.static_non_negative_int_argument_preserving_effects(
+                let index = self.static_clamped_index_argument_preserving_effects(
                     &arguments[1],
                     name,
                     span,
@@ -27177,6 +27173,29 @@ impl NativeCodeGenerator {
         }
     }
 
+    /// Like `static_non_negative_int_argument_preserving_effects`, but
+    /// negatives clamp to 0 — the contract of the string slicers
+    /// (`substring` / `at`), shared with the evaluator and klassic_rt
+    /// (issue #434).
+    fn static_clamped_index_argument_preserving_effects(
+        &mut self,
+        expr: &Expr,
+        name: &str,
+        span: Span,
+    ) -> Result<usize, Diagnostic> {
+        match self.static_value_from_argument_preserving_effects(
+            expr,
+            span,
+            &format!("native {name} for non-static integer argument"),
+        )? {
+            StaticValue::Int(value) => Ok(value.max(0) as usize),
+            _ => Err(unsupported(
+                span,
+                &format!("native {name} for non-static integer argument"),
+            )),
+        }
+    }
+
     fn string_from_data_label(
         &self,
         label: DataLabel,
@@ -34204,7 +34223,6 @@ impl NativeCodeGenerator {
         start_chars: DataLabel,
         end_chars: DataLabel,
         span: Span,
-        name: &str,
     ) -> NativeValue {
         const RUNTIME_STRING_CAP: usize = 65_536;
         let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
@@ -34214,13 +34232,16 @@ impl NativeCodeGenerator {
         let non_negative = self.asm.create_text_label();
         let end_non_negative = self.asm.create_text_label();
         let store_effective_end = self.asm.create_text_label();
-        let error_message = format!("{name} expects a non-negative integer index");
 
+        // Negative indices clamp to 0 (issue #434), and the clamped
+        // value is written back because the char-offset scans re-read
+        // the index labels below.
         self.asm.mov_data_addr(Reg::R10, start_chars);
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
         self.asm.cmp_reg_imm8(Reg::R8, 0);
         self.asm.jcc_label(Condition::GreaterEqual, non_negative);
-        self.emit_runtime_error(span, &error_message);
+        self.asm.mov_imm64(Reg::R8, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R8);
 
         self.asm.bind_text_label(non_negative);
         self.asm.mov_data_addr(Reg::R10, end_chars);
@@ -34228,7 +34249,8 @@ impl NativeCodeGenerator {
         self.asm.cmp_reg_imm8(Reg::R9, 0);
         self.asm
             .jcc_label(Condition::GreaterEqual, end_non_negative);
-        self.emit_runtime_error(span, &error_message);
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
 
         self.asm.bind_text_label(end_non_negative);
         self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
