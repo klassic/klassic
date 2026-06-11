@@ -2,35 +2,89 @@
 //! macOS). Like the x86_64 ELF backend it emits machine code and the
 //! executable container directly — no `cc` / `as` / `ld` / `codesign`
 //! — and like that backend's early history it starts from a small
-//! vertical slice and grows: the current subset compiles top-level
-//! `println` of literals (strings without interpolation, integers,
-//! booleans, doubles) to Darwin `write` syscalls and exits cleanly.
-//! Everything else fails with a source-located diagnostic, never
-//! wrong code. The code is position-independent (`adrp`+`add` for
-//! data, no absolute addresses) because the kernel slides `MH_PIE`
-//! images.
+//! vertical slice and grows. The current subset covers top-level
+//! `Int` / `Bool` expressions (arithmetic, comparisons, short-circuit
+//! logic), `val` / `mutable` locals with assignment, `if` / `while`,
+//! and `println` of runtime `Int` / `Bool` values plus string and
+//! double literals. Everything else fails with a source-located
+//! diagnostic, never wrong code. Generated code is
+//! position-independent (`adrp`+`add` for data, relative branches)
+//! because the kernel slides `MH_PIE` images.
 //!
 //! Darwin arm64 syscall convention: number in `x16`, arguments in
 //! `x0..`, trap via `svc #0x80`. BSD numbers: `exit` = 1, `write` = 4.
 
+use std::collections::HashMap;
+
 use klassic_span::{Diagnostic, Span};
-use klassic_syntax::Expr;
+use klassic_syntax::{BinaryOp, Expr};
 
 use crate::macho::{self, DataFixup};
 
 const SYS_EXIT: u16 = 1;
 const SYS_WRITE: u16 = 4;
-const STDOUT_FD: u16 = 1;
+const STDOUT_FD: u64 = 1;
+const STDERR_FD: u64 = 2;
 
 /// AArch64 general-purpose registers used by the subset. The numeric
-/// value is the register number in instruction encodings.
+/// value is the register number in instruction encodings; 31 encodes
+/// `xzr` or `sp` depending on position and is handled inside the
+/// emission helpers rather than exposed here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reg {
     X0 = 0,
     X1 = 1,
     X2 = 2,
+    X3 = 3,
+    X4 = 4,
+    X5 = 5,
     /// Darwin syscall number register.
     X16 = 16,
+}
+
+/// Frame pointer register number: locals live at `[x29, #offset]` so
+/// the operand stack can move `sp` freely. Only ever a base register,
+/// so it stays out of the `Reg` enum.
+const FP: u32 = 29;
+
+/// AArch64 condition codes (B.cond / CSINC encodings).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cond {
+    Eq = 0,
+    Ne = 1,
+    Ge = 10,
+    Lt = 11,
+    Gt = 12,
+    Le = 13,
+}
+
+impl Cond {
+    /// The AArch64 condition encoding flips the polarity in the low
+    /// bit, which `cset` (alias of `csinc` with the inverted
+    /// condition) relies on.
+    fn inverted_bits(self) -> u32 {
+        (self as u32) ^ 1
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Label(usize);
+
+enum BranchKind {
+    /// `b label` — 26-bit signed word offset.
+    Unconditional,
+    /// `b.cond label` — 19-bit signed word offset.
+    Conditional(Cond),
+    /// `cbz xreg, label`.
+    CompareZero(Reg),
+    /// `cbnz xreg, label`.
+    CompareNonZero(Reg),
+}
+
+struct BranchFixup {
+    code_offset: usize,
+    label: Label,
+    kind: BranchKind,
 }
 
 #[derive(Default)]
@@ -38,11 +92,58 @@ struct Assembler {
     code: Vec<u8>,
     rodata: Vec<u8>,
     fixups: Vec<DataFixup>,
+    labels: Vec<Option<usize>>,
+    branches: Vec<BranchFixup>,
 }
 
 impl Assembler {
     fn word(&mut self, instruction: u32) {
         self.code.extend_from_slice(&instruction.to_le_bytes());
+    }
+
+    fn new_label(&mut self) -> Label {
+        self.labels.push(None);
+        Label(self.labels.len() - 1)
+    }
+
+    fn bind(&mut self, label: Label) {
+        debug_assert!(self.labels[label.0].is_none(), "label bound twice");
+        self.labels[label.0] = Some(self.code.len());
+    }
+
+    fn branch(&mut self, label: Label, kind: BranchKind) {
+        self.branches.push(BranchFixup {
+            code_offset: self.code.len(),
+            label,
+            kind,
+        });
+        // Placeholder opcodes; offsets are patched in `finish`.
+        match self.branches.last().expect("just pushed").kind {
+            BranchKind::Unconditional => self.word(0x1400_0000),
+            BranchKind::Conditional(cond) => self.word(0x5400_0000 | cond as u32),
+            BranchKind::CompareZero(reg) => self.word(0xb400_0000 | reg as u32),
+            BranchKind::CompareNonZero(reg) => self.word(0xb500_0000 | reg as u32),
+        }
+    }
+
+    /// Resolve every recorded branch against its bound label.
+    fn finish(&mut self) {
+        for fixup in &self.branches {
+            let target = self.labels[fixup.label.0].expect("branch target label never bound");
+            let delta_words = (target as i64 - fixup.code_offset as i64) / 4;
+            let mut word_bytes = [0u8; 4];
+            word_bytes.copy_from_slice(&self.code[fixup.code_offset..fixup.code_offset + 4]);
+            let word = u32::from_le_bytes(word_bytes);
+            let patched = match fixup.kind {
+                BranchKind::Unconditional => word | ((delta_words as u32) & 0x03ff_ffff),
+                BranchKind::Conditional(_)
+                | BranchKind::CompareZero(_)
+                | BranchKind::CompareNonZero(_) => word | (((delta_words as u32) & 0x7_ffff) << 5),
+            };
+            self.code[fixup.code_offset..fixup.code_offset + 4]
+                .copy_from_slice(&patched.to_le_bytes());
+        }
+        self.branches.clear();
     }
 
     /// `movz xd, #imm16, lsl #(16 * shift)`
@@ -55,7 +156,8 @@ impl Assembler {
         self.word(0xf280_0000 | (shift << 21) | (u32::from(imm16) << 5) | reg as u32);
     }
 
-    /// Materialize an arbitrary 64-bit constant.
+    /// Materialize an arbitrary 64-bit constant. Negative values get
+    /// the movn-free simple form: movz/movk all four halfwords.
     fn mov_imm64(&mut self, reg: Reg, value: u64) {
         self.movz(reg, value as u16, 0);
         for shift in 1..4u32 {
@@ -64,6 +166,106 @@ impl Assembler {
                 self.movk(reg, part, shift);
             }
         }
+    }
+
+    /// `mov xd, xm` (orr xd, xzr, xm)
+    fn mov_reg(&mut self, dst: Reg, src: Reg) {
+        self.word(0xaa00_03e0 | ((src as u32) << 16) | dst as u32);
+    }
+
+    fn add_reg(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        self.word(0x8b00_0000 | ((rhs as u32) << 16) | ((lhs as u32) << 5) | dst as u32);
+    }
+
+    fn sub_reg(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        self.word(0xcb00_0000 | ((rhs as u32) << 16) | ((lhs as u32) << 5) | dst as u32);
+    }
+
+    /// `mul xd, xn, xm` (madd with xzr accumulator)
+    fn mul_reg(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        self.word(0x9b00_7c00 | ((rhs as u32) << 16) | ((lhs as u32) << 5) | dst as u32);
+    }
+
+    fn sdiv_reg(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        self.word(0x9ac0_0c00 | ((rhs as u32) << 16) | ((lhs as u32) << 5) | dst as u32);
+    }
+
+    /// `msub xd, xn, xm, xa` — xd = xa - xn * xm (remainder helper).
+    fn msub_reg(&mut self, dst: Reg, lhs: Reg, rhs: Reg, acc: Reg) {
+        self.word(
+            0x9b00_8000
+                | ((rhs as u32) << 16)
+                | ((acc as u32) << 10)
+                | ((lhs as u32) << 5)
+                | dst as u32,
+        );
+    }
+
+    /// `cmp xn, xm` (subs xzr, xn, xm)
+    fn cmp_reg(&mut self, lhs: Reg, rhs: Reg) {
+        self.word(0xeb00_001f | ((rhs as u32) << 16) | ((lhs as u32) << 5));
+    }
+
+    /// `cset xd, cond`
+    fn cset(&mut self, dst: Reg, cond: Cond) {
+        self.word(0x9a9f_07e0 | (cond.inverted_bits() << 12) | dst as u32);
+    }
+
+    /// `sub sp, sp, #imm12`
+    fn sub_sp_imm(&mut self, imm: u32) {
+        debug_assert!(imm < 4096);
+        self.word(0xd100_03ff | (imm << 10));
+    }
+
+    /// `add sp, sp, #imm12`
+    fn add_sp_imm(&mut self, imm: u32) {
+        debug_assert!(imm < 4096);
+        self.word(0x9100_03ff | (imm << 10));
+    }
+
+    /// `add xd, sp, #imm12`
+    fn add_reg_sp_imm(&mut self, dst: Reg, imm: u32) {
+        debug_assert!(imm < 4096);
+        self.word(0x9100_0000 | (imm << 10) | (31 << 5) | dst as u32);
+    }
+
+    /// `add xd, xn, #imm12`
+    fn add_reg_imm(&mut self, dst: Reg, src: Reg, imm: u32) {
+        debug_assert!(imm < 4096);
+        self.word(0x9100_0000 | (imm << 10) | ((src as u32) << 5) | dst as u32);
+    }
+
+    /// `mov x29, sp`
+    fn mov_fp_sp(&mut self) {
+        self.word(0x9100_03fd);
+    }
+
+    /// `str xt, [sp, #-16]!` — 16-byte stride keeps sp aligned, which
+    /// Darwin arm64 enforces in hardware on sp-based accesses.
+    fn push(&mut self, reg: Reg) {
+        self.word(0xf81f_0fe0 | reg as u32);
+    }
+
+    /// `ldr xt, [sp], #16`
+    fn pop(&mut self, reg: Reg) {
+        self.word(0xf841_07e0 | reg as u32);
+    }
+
+    /// `str xt, [x29, #offset]` (unsigned, 8-byte scaled)
+    fn store_local(&mut self, reg: Reg, offset: u32) {
+        debug_assert!(offset.is_multiple_of(8) && offset / 8 < 4096);
+        self.word(0xf900_0000 | ((offset / 8) << 10) | (FP << 5) | reg as u32);
+    }
+
+    /// `ldr xt, [x29, #offset]`
+    fn load_local(&mut self, reg: Reg, offset: u32) {
+        debug_assert!(offset.is_multiple_of(8) && offset / 8 < 4096);
+        self.word(0xf940_0000 | ((offset / 8) << 10) | (FP << 5) | reg as u32);
+    }
+
+    /// `strb wt, [xn, #-1]!`
+    fn store_byte_pre_decrement(&mut self, reg: Reg, base: Reg) {
+        self.word(0x3800_0c00 | (0x1ff << 12) | ((base as u32) << 5) | reg as u32);
     }
 
     /// `adrp xd, <page>` + `add xd, xd, #<pageoff>` addressing a byte
@@ -93,10 +295,10 @@ impl Assembler {
         offset
     }
 
-    /// write(1, <rodata bytes>, len)
-    fn emit_write_rodata(&mut self, bytes: &[u8]) {
+    /// write(fd, <rodata bytes>, len) — clobbers x0/x1/x2/x16.
+    fn emit_write_rodata(&mut self, fd: u64, bytes: &[u8]) {
         let data_offset = self.intern_rodata(bytes);
-        self.mov_imm64(Reg::X0, u64::from(STDOUT_FD));
+        self.mov_imm64(Reg::X0, fd);
         self.load_rodata_address(Reg::X1, data_offset);
         self.mov_imm64(Reg::X2, bytes.len() as u64);
         self.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
@@ -108,6 +310,55 @@ impl Assembler {
         self.mov_imm64(Reg::X16, u64::from(SYS_EXIT));
         self.svc_0x80();
     }
+
+    /// Print the signed integer in x0 followed by a newline: digits
+    /// are decomposed into a 32-byte stack buffer back to front, then
+    /// written with one syscall. Clobbers x0-x5/x16.
+    fn emit_print_int_line(&mut self) {
+        self.sub_sp_imm(32);
+        self.add_reg_sp_imm(Reg::X1, 32); // one past the buffer end
+        self.mov_imm64(Reg::X3, b'\n' as u64);
+        self.store_byte_pre_decrement(Reg::X3, Reg::X1);
+        // x5 = 1 when negative, then continue with |value|.
+        self.cmp_x0_zero();
+        self.cset(Reg::X5, Cond::Lt);
+        let non_negative = self.new_label();
+        self.branch(non_negative, BranchKind::Conditional(Cond::Ge));
+        self.neg_x0();
+        self.bind(non_negative);
+        // Digit loop: do { x4 = x0 / 10; digit = x0 - x4*10; } while x0.
+        let digit_loop = self.new_label();
+        self.bind(digit_loop);
+        self.mov_imm64(Reg::X3, 10);
+        self.sdiv_reg(Reg::X4, Reg::X0, Reg::X3);
+        self.msub_reg(Reg::X2, Reg::X4, Reg::X3, Reg::X0);
+        self.add_reg_imm(Reg::X2, Reg::X2, u32::from(b'0'));
+        self.store_byte_pre_decrement(Reg::X2, Reg::X1);
+        self.mov_reg(Reg::X0, Reg::X4);
+        self.branch(digit_loop, BranchKind::CompareNonZero(Reg::X0));
+        let no_sign = self.new_label();
+        self.branch(no_sign, BranchKind::CompareZero(Reg::X5));
+        self.mov_imm64(Reg::X3, b'-' as u64);
+        self.store_byte_pre_decrement(Reg::X3, Reg::X1);
+        self.bind(no_sign);
+        // write(1, x1, (sp+32) - x1)
+        self.add_reg_sp_imm(Reg::X2, 32);
+        self.sub_reg(Reg::X2, Reg::X2, Reg::X1);
+        self.mov_imm64(Reg::X0, STDOUT_FD);
+        self.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+        self.svc_0x80();
+        self.add_sp_imm(32);
+    }
+
+    /// `cmp x0, #0`
+    fn cmp_x0_zero(&mut self) {
+        self.word(0xf100_001f);
+    }
+
+    /// `neg x0, x0` (sub x0, xzr, x0)
+    fn neg_x0(&mut self) {
+        self.word(0xcb00_03e0);
+    }
 }
 
 fn unsupported(span: Span, feature: &str) -> Diagnostic {
@@ -117,68 +368,361 @@ fn unsupported(span: Span, feature: &str) -> Diagnostic {
     )
 }
 
-/// Render a `println` argument that is a compile-time literal to its
-/// evaluator-identical line. Doubles go through Rust's `f64` Display,
-/// the same formatter the evaluator and klassic_rt use.
-fn literal_line(argument: &Expr) -> Result<Option<String>, Diagnostic> {
-    match argument {
-        Expr::String { value, span } => {
-            if value.contains("#{") {
-                return Err(unsupported(*span, "string interpolation"));
+/// The value types the M2 subset can hold in a register / local.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValueType {
+    Int,
+    Bool,
+    Unit,
+}
+
+#[derive(Default)]
+struct Emitter {
+    asm: Assembler,
+    scopes: Vec<HashMap<String, (u32, ValueType)>>,
+    next_local_offset: u32,
+}
+
+impl Emitter {
+    fn lookup(&self, name: &str) -> Option<(u32, ValueType)> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
+    fn declare_local(&mut self, name: &str, ty: ValueType) -> u32 {
+        let offset = self.next_local_offset;
+        self.next_local_offset += 8;
+        self.scopes
+            .last_mut()
+            .expect("emitter scope")
+            .insert(name.to_string(), (offset, ty));
+        offset
+    }
+
+    /// Compile `expr`, leaving its value in x0. Binary operands use
+    /// the machine stack (16-byte strides keep sp aligned).
+    fn expression(&mut self, expr: &Expr) -> Result<ValueType, Diagnostic> {
+        match expr {
+            Expr::Int { value, .. } => {
+                self.asm.mov_imm64(Reg::X0, *value as u64);
+                Ok(ValueType::Int)
             }
-            Ok(Some(format!("{value}\n")))
+            Expr::Bool { value, .. } => {
+                self.asm.mov_imm64(Reg::X0, u64::from(*value));
+                Ok(ValueType::Bool)
+            }
+            Expr::Identifier { name, span } => {
+                let Some((offset, ty)) = self.lookup(name) else {
+                    return Err(unsupported(*span, &format!("identifier `{name}`")));
+                };
+                self.asm.load_local(Reg::X0, offset);
+                Ok(ty)
+            }
+            Expr::Binary { lhs, op, rhs, span } => self.binary(lhs, *op, rhs, *span),
+            Expr::If {
+                condition,
+                then_branch,
+                else_branch,
+                span,
+            } => {
+                let Some(else_branch) = else_branch else {
+                    return Err(unsupported(*span, "if without else as an expression"));
+                };
+                let condition_ty = self.expression(condition)?;
+                if condition_ty != ValueType::Bool {
+                    return Err(unsupported(condition.span(), "a non-Bool condition"));
+                }
+                let else_label = self.asm.new_label();
+                let end_label = self.asm.new_label();
+                self.asm
+                    .branch(else_label, BranchKind::CompareZero(Reg::X0));
+                let then_ty = self.expression(then_branch)?;
+                self.asm.branch(end_label, BranchKind::Unconditional);
+                self.asm.bind(else_label);
+                let else_ty = self.expression(else_branch)?;
+                self.asm.bind(end_label);
+                if then_ty != else_ty {
+                    return Err(unsupported(*span, "if branches with different types"));
+                }
+                Ok(then_ty)
+            }
+            other => Err(unsupported(other.span(), "this expression")),
         }
-        Expr::Int { value, .. } => Ok(Some(format!("{value}\n"))),
-        Expr::Bool { value, .. } => Ok(Some(format!("{value}\n"))),
-        Expr::Double { value, .. } => Ok(Some(format!("{value}\n"))),
-        _ => Ok(None),
+    }
+
+    fn binary(
+        &mut self,
+        lhs: &Expr,
+        op: BinaryOp,
+        rhs: &Expr,
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        // Short-circuit logic first: rhs must not evaluate eagerly.
+        if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
+            let lhs_ty = self.expression(lhs)?;
+            let end_label = self.asm.new_label();
+            match op {
+                BinaryOp::LogicalAnd => {
+                    self.asm.branch(end_label, BranchKind::CompareZero(Reg::X0))
+                }
+                _ => self
+                    .asm
+                    .branch(end_label, BranchKind::CompareNonZero(Reg::X0)),
+            }
+            let rhs_ty = self.expression(rhs)?;
+            self.asm.bind(end_label);
+            if lhs_ty != ValueType::Bool || rhs_ty != ValueType::Bool {
+                return Err(unsupported(span, "logical operator on non-Bool operands"));
+            }
+            return Ok(ValueType::Bool);
+        }
+
+        let lhs_ty = self.expression(lhs)?;
+        self.asm.push(Reg::X0);
+        let rhs_ty = self.expression(rhs)?;
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        self.asm.pop(Reg::X0);
+        if lhs_ty != rhs_ty {
+            return Err(unsupported(span, "mixed operand types"));
+        }
+        match op {
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
+                if lhs_ty != ValueType::Int {
+                    return Err(unsupported(span, "arithmetic on non-Int operands"));
+                }
+                match op {
+                    BinaryOp::Add => self.asm.add_reg(Reg::X0, Reg::X0, Reg::X1),
+                    BinaryOp::Subtract => self.asm.sub_reg(Reg::X0, Reg::X0, Reg::X1),
+                    BinaryOp::Multiply => self.asm.mul_reg(Reg::X0, Reg::X0, Reg::X1),
+                    _ => {
+                        // Match the evaluator: division by zero is a
+                        // runtime error, not an arm64 zero result.
+                        let ok_label = self.asm.new_label();
+                        self.asm
+                            .branch(ok_label, BranchKind::CompareNonZero(Reg::X1));
+                        self.asm
+                            .emit_write_rodata(STDERR_FD, b"klassic: division by zero\n");
+                        self.asm.emit_exit(1);
+                        self.asm.bind(ok_label);
+                        self.asm.sdiv_reg(Reg::X0, Reg::X0, Reg::X1);
+                    }
+                }
+                Ok(ValueType::Int)
+            }
+            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
+                if lhs_ty != ValueType::Int {
+                    return Err(unsupported(span, "comparison on non-Int operands"));
+                }
+                let cond = match op {
+                    BinaryOp::Less => Cond::Lt,
+                    BinaryOp::LessEqual => Cond::Le,
+                    BinaryOp::Greater => Cond::Gt,
+                    _ => Cond::Ge,
+                };
+                self.asm.cmp_reg(Reg::X0, Reg::X1);
+                self.asm.cset(Reg::X0, cond);
+                Ok(ValueType::Bool)
+            }
+            BinaryOp::Equal | BinaryOp::NotEqual => {
+                let cond = if op == BinaryOp::Equal {
+                    Cond::Eq
+                } else {
+                    Cond::Ne
+                };
+                self.asm.cmp_reg(Reg::X0, Reg::X1);
+                self.asm.cset(Reg::X0, cond);
+                Ok(ValueType::Bool)
+            }
+            _ => Err(unsupported(span, "this binary operator")),
+        }
+    }
+
+    /// Render a `println` argument that is a compile-time literal to
+    /// its evaluator-identical line. Doubles go through Rust's `f64`
+    /// Display, the same formatter the evaluator and klassic_rt use.
+    fn literal_line(argument: &Expr) -> Result<Option<String>, Diagnostic> {
+        match argument {
+            Expr::String { value, span } => {
+                if value.contains("#{") {
+                    return Err(unsupported(*span, "string interpolation"));
+                }
+                Ok(Some(format!("{value}\n")))
+            }
+            Expr::Double { value, .. } => Ok(Some(format!("{value}\n"))),
+            _ => Ok(None),
+        }
+    }
+
+    fn println_call(&mut self, arguments: &[Expr], span: Span) -> Result<(), Diagnostic> {
+        if arguments.len() != 1 {
+            return Err(Diagnostic::compile(
+                span,
+                format!("println expects 1 argument but got {}", arguments.len()),
+            ));
+        }
+        let argument = &arguments[0];
+        if let Some(line) = Self::literal_line(argument)? {
+            self.asm.emit_write_rodata(STDOUT_FD, line.as_bytes());
+            return Ok(());
+        }
+        match self.expression(argument)? {
+            ValueType::Int => {
+                self.asm.emit_print_int_line();
+                Ok(())
+            }
+            ValueType::Bool => {
+                let false_label = self.asm.new_label();
+                let end_label = self.asm.new_label();
+                self.asm
+                    .branch(false_label, BranchKind::CompareZero(Reg::X0));
+                self.asm.emit_write_rodata(STDOUT_FD, b"true\n");
+                self.asm.branch(end_label, BranchKind::Unconditional);
+                self.asm.bind(false_label);
+                self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
+                self.asm.bind(end_label);
+                Ok(())
+            }
+            ValueType::Unit => Err(unsupported(argument.span(), "printing unit")),
+        }
+    }
+
+    fn statement(&mut self, expr: &Expr) -> Result<(), Diagnostic> {
+        match expr {
+            Expr::Block { expressions, .. } => {
+                self.scopes.push(HashMap::new());
+                for expression in expressions {
+                    self.statement(expression)?;
+                }
+                self.scopes.pop();
+                Ok(())
+            }
+            // Declarations have no runtime effect in the current
+            // subset; calling a declared function is rejected at the
+            // call site.
+            Expr::ModuleHeader { .. } | Expr::Import { .. } | Expr::DefDecl { .. } => Ok(()),
+            Expr::VarDecl { name, value, .. } => {
+                let ty = self.expression(value)?;
+                if ty == ValueType::Unit {
+                    return Err(unsupported(value.span(), "a unit-typed binding"));
+                }
+                let offset = self.declare_local(name, ty);
+                self.asm.store_local(Reg::X0, offset);
+                Ok(())
+            }
+            Expr::Assign { name, value, span } => {
+                let Some((offset, expected)) = self.lookup(name) else {
+                    return Err(unsupported(*span, &format!("assignment to `{name}`")));
+                };
+                let ty = self.expression(value)?;
+                if ty != expected {
+                    return Err(unsupported(*span, "assignment changing a type"));
+                }
+                self.asm.store_local(Reg::X0, offset);
+                Ok(())
+            }
+            Expr::While {
+                condition, body, ..
+            } => {
+                let loop_label = self.asm.new_label();
+                let end_label = self.asm.new_label();
+                self.asm.bind(loop_label);
+                let condition_ty = self.expression(condition)?;
+                if condition_ty != ValueType::Bool {
+                    return Err(unsupported(condition.span(), "a non-Bool condition"));
+                }
+                self.asm.branch(end_label, BranchKind::CompareZero(Reg::X0));
+                self.statement(body)?;
+                self.asm.branch(loop_label, BranchKind::Unconditional);
+                self.asm.bind(end_label);
+                Ok(())
+            }
+            Expr::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let condition_ty = self.expression(condition)?;
+                if condition_ty != ValueType::Bool {
+                    return Err(unsupported(condition.span(), "a non-Bool condition"));
+                }
+                let else_label = self.asm.new_label();
+                let end_label = self.asm.new_label();
+                self.asm
+                    .branch(else_label, BranchKind::CompareZero(Reg::X0));
+                self.statement(then_branch)?;
+                self.asm.branch(end_label, BranchKind::Unconditional);
+                self.asm.bind(else_label);
+                if let Some(else_branch) = else_branch {
+                    self.statement(else_branch)?;
+                }
+                self.asm.bind(end_label);
+                Ok(())
+            }
+            Expr::Call {
+                callee, arguments, ..
+            } if matches!(callee.as_ref(), Expr::Identifier { name, .. } if name == "println") => {
+                self.println_call(arguments, expr.span())
+            }
+            other => {
+                // An expression in statement position: evaluate for
+                // effect (the subset's expressions are pure, but a
+                // discarded value is harmless and keeps parity with
+                // the C backend).
+                self.expression(other)?;
+                Ok(())
+            }
+        }
     }
 }
 
-fn emit_statement(expr: &Expr, asm: &mut Assembler) -> Result<(), Diagnostic> {
+/// Count every local the program can declare so the frame can be
+/// reserved once up front (slots are never reused; fine at this
+/// scale). The recursion mirrors exactly the statement positions the
+/// code generator walks, so it never undercounts a compilable
+/// program.
+fn count_var_decls(expr: &Expr) -> u32 {
     match expr {
-        Expr::Block { expressions, .. } => {
-            for expression in expressions {
-                emit_statement(expression, asm)?;
-            }
-            Ok(())
+        Expr::VarDecl { .. } => 1,
+        Expr::Block { expressions, .. } => expressions.iter().map(count_var_decls).sum(),
+        Expr::While { body, .. } => count_var_decls(body),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            count_var_decls(then_branch)
+                + else_branch
+                    .as_ref()
+                    .map_or(0, |branch| count_var_decls(branch))
         }
-        // Declarations have no runtime effect in the current subset;
-        // calling a declared function is rejected at the call site.
-        Expr::ModuleHeader { .. } | Expr::Import { .. } | Expr::DefDecl { .. } => Ok(()),
-        Expr::Call {
-            callee, arguments, ..
-        } if matches!(callee.as_ref(), Expr::Identifier { name, .. } if name == "println") => {
-            if arguments.len() != 1 {
-                return Err(Diagnostic::compile(
-                    expr.span(),
-                    format!("println expects 1 argument but got {}", arguments.len()),
-                ));
-            }
-            match literal_line(&arguments[0])? {
-                Some(line) => {
-                    asm.emit_write_rodata(line.as_bytes());
-                    Ok(())
-                }
-                None => Err(unsupported(
-                    arguments[0].span(),
-                    "printing a non-literal expression",
-                )),
-            }
-        }
-        other => Err(unsupported(other.span(), "this expression")),
+        _ => 0,
     }
 }
 
 /// Compile the whole program to a signed Mach-O arm64 executable.
 pub(crate) fn emit_macho_program(expr: &Expr) -> Result<Vec<u8>, Diagnostic> {
-    let mut asm = Assembler::default();
-    emit_statement(expr, &mut asm)?;
-    asm.emit_exit(0);
+    let mut emitter = Emitter::default();
+    emitter.scopes.push(HashMap::new());
+
+    let frame_size = (count_var_decls(expr) * 8).div_ceil(16) * 16;
+    if frame_size >= 4096 {
+        return Err(unsupported(expr.span(), "this many local variables"));
+    }
+    if frame_size > 0 {
+        emitter.asm.sub_sp_imm(frame_size);
+    }
+    emitter.asm.mov_fp_sp();
+
+    emitter.statement(expr)?;
+    emitter.asm.emit_exit(0);
+    emitter.asm.finish();
     Ok(macho::write_executable(
-        asm.code,
-        asm.rodata,
-        &asm.fixups,
+        emitter.asm.code,
+        emitter.asm.rodata,
+        &emitter.asm.fixups,
         "klassic",
     ))
 }
@@ -201,6 +745,17 @@ mod tests {
         asm.movz(Reg::X16, 4, 0);
         asm.movk(Reg::X2, 0xbeef, 1);
         asm.svc_0x80();
+        asm.add_reg(Reg::X0, Reg::X0, Reg::X1);
+        asm.sub_reg(Reg::X2, Reg::X3, Reg::X4);
+        asm.mul_reg(Reg::X0, Reg::X0, Reg::X1);
+        asm.sdiv_reg(Reg::X0, Reg::X0, Reg::X1);
+        asm.cmp_reg(Reg::X0, Reg::X1);
+        asm.cset(Reg::X0, Cond::Lt);
+        asm.mov_reg(Reg::X1, Reg::X0);
+        asm.push(Reg::X0);
+        asm.pop(Reg::X1);
+        asm.store_local(Reg::X0, 16);
+        asm.load_local(Reg::X2, 8);
         assert_eq!(
             words(&asm),
             vec![
@@ -208,8 +763,38 @@ mod tests {
                 0xd280_0090, // movz x16, #4
                 0xf2b7_dde2, // movk x2, #0xbeef, lsl #16
                 0xd400_1001, // svc #0x80
+                0x8b01_0000, // add x0, x0, x1
+                0xcb04_0062, // sub x2, x3, x4
+                0x9b01_7c00, // mul x0, x0, x1
+                0x9ac1_0c00, // sdiv x0, x0, x1
+                0xeb01_001f, // cmp x0, x1
+                0x9a9f_a7e0, // cset x0, lt
+                0xaa00_03e1, // mov x1, x0
+                0xf81f_0fe0, // str x0, [sp, #-16]!
+                0xf841_07e1, // ldr x1, [sp], #16
+                0xf900_0ba0, // str x0, [x29, #16]
+                0xf940_07a2, // ldr x2, [x29, #8]
             ]
         );
+    }
+
+    #[test]
+    fn branches_resolve_forward_and_backward() {
+        let mut asm = Assembler::default();
+        let back = asm.new_label();
+        let forward = asm.new_label();
+        asm.bind(back);
+        asm.movz(Reg::X0, 0, 0);
+        asm.branch(forward, BranchKind::CompareZero(Reg::X0));
+        asm.branch(back, BranchKind::Unconditional);
+        asm.bind(forward);
+        asm.movz(Reg::X0, 1, 0);
+        asm.finish();
+        let words = words(&asm);
+        // cbz x0, +2 words
+        assert_eq!(words[1], 0xb400_0000 | (2 << 5));
+        // b -2 words (back to offset 0 from offset 8)
+        assert_eq!(words[2], 0x1400_0000 | (0x03ff_ffff & (-2i32 as u32)));
     }
 
     #[test]
@@ -229,8 +814,8 @@ mod tests {
     #[test]
     fn write_sequence_records_one_fixup_per_string() {
         let mut asm = Assembler::default();
-        asm.emit_write_rodata(b"hello\n");
-        asm.emit_write_rodata(b"bye\n");
+        asm.emit_write_rodata(STDOUT_FD, b"hello\n");
+        asm.emit_write_rodata(STDOUT_FD, b"bye\n");
         assert_eq!(asm.fixups.len(), 2);
         assert_eq!(asm.fixups[0].data_offset, 0);
         assert_eq!(asm.fixups[1].data_offset, 6);

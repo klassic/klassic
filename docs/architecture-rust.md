@@ -760,8 +760,13 @@ cargo run -- -e "1 + 2"
   (`MH_DYLDLINK` + `LC_LOAD_DYLINKER` + `LC_MAIN`, plus the empty
   `LC_SYMTAB`/`LC_DYSYMTAB` pair dyld dereferences) even though the
   generated code imports nothing. The backend starts from the same
-  kind of small vertical slice the x86_64 backend grew from —
-  currently top-level `println` of literals — and unsupported
+  kind of small vertical slice the x86_64 backend grew from — the
+  current subset covers top-level Int/Bool expressions (arithmetic
+  with an evaluator-matching division-by-zero abort, comparisons,
+  short-circuit logic), `val`/`mutable` locals addressed off a frame
+  pointer, `if`/`while`, and `println` of runtime Int/Bool values
+  (integers are decomposed into a stack buffer and written with one
+  syscall) plus string/double literals — and unsupported
   constructs fail with source-located diagnostics. `--target
   aarch64-apple-darwin` selects it from any host (cross builds work);
   a target-less `build` on macOS keeps routing through the C backend

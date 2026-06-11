@@ -22850,9 +22850,22 @@ fn build_target_aarch64_apple_darwin_binary_runs() {
     let bin_path = dir.join(format!("klassic_macho_run_{stamp}.bin"));
     fs::write(
         &source_path,
-        "println(\"hello from klassic on apple silicon\")\n\
-         println(42)\n\
-         println(true)\n\
+        "val a = 6\n\
+         mutable i = 0\n\
+         mutable total = 0\n\
+         while (i < 10) {\n\
+           total = total + i\n\
+           i = i + 1\n\
+         }\n\
+         println(\"hello from klassic on apple silicon\")\n\
+         println(total)\n\
+         println(a * 7)\n\
+         println(0 - a)\n\
+         println(if (total > 40) 111 else 222)\n\
+         println(total == 45)\n\
+         println(i >= 10 && a < 7)\n\
+         println(false || total < 0)\n\
+         println(100000000 / 7)\n\
          println(2.5)\n",
     )
     .expect("temp source file should write");
@@ -22885,7 +22898,7 @@ fn build_target_aarch64_apple_darwin_binary_runs() {
     );
     assert_eq!(
         String::from_utf8_lossy(&run_output.stdout),
-        "hello from klassic on apple silicon\n42\ntrue\n2.5\n"
+        "hello from klassic on apple silicon\n45\n42\n-6\n111\ntrue\ntrue\nfalse\n14285714\n2.5\n"
     );
 }
 
