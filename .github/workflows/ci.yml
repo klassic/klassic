@@ -31,9 +31,12 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-  # The evaluator, REPL, and C backend are host-independent; only the
-  # direct ELF backend is Linux-only and its tests are cfg-gated. This
-  # job keeps the macOS path honest.
+  # Apple Silicon job. Beyond keeping the evaluator / REPL / C backend
+  # honest on macOS, this runner is where the direct aarch64 Mach-O
+  # backend's output is actually *executed*: the build-and-run tests
+  # are cfg-gated to macOS + aarch64, so the generated machine code is
+  # crash-checked here on every push. A guard test fails the job if the
+  # runner ever stops being arm64 (which would silently skip them).
   test-macos:
     runs-on: macos-latest
     steps:
@@ -42,6 +45,9 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Show runner architecture
+        run: uname -m  # must be arm64; the aarch64 backend executes here
 
       - name: Build runtime staticlib
         # cargo test alone doesn't produce libklassic_runtime.a, which

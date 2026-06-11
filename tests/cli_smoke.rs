@@ -7,6 +7,30 @@ fn klassic_bin() -> &'static str {
     env!("CARGO_BIN_EXE_klassic")
 }
 
+/// CI guard: the direct Mach-O backend's binaries can only run on
+/// Apple Silicon, so every test that builds *and executes* that
+/// backend's output is `#[cfg(all(target_os = "macos", target_arch =
+/// "aarch64"))]`. If the macOS CI runner ever stops being arm64,
+/// those tests compile out **silently** and the aarch64 machine-code
+/// crash-check vanishes while CI stays green. This fails the macOS
+/// job loudly in that case (it only enforces under CI, so local Intel
+/// macs are unaffected).
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_ci_must_be_apple_silicon_for_aarch64_execution() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    assert_eq!(
+        std::env::consts::ARCH,
+        "aarch64",
+        "macOS CI is no longer Apple Silicon: the direct aarch64 \
+         Mach-O backend's build-and-run tests are being skipped, so \
+         generated machine code is no longer crash-checked. Re-point \
+         the runner to an arm64 image."
+    );
+}
+
 #[test]
 fn evaluates_expression_argument() {
     let output = Command::new(klassic_bin())
