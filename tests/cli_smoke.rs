@@ -22962,6 +22962,77 @@ fn build_target_aarch64_apple_darwin_functions_run() {
     );
 }
 
+/// Strings on the direct aarch64 backend: rodata-interned literals,
+/// heap concatenation through the x19/x20 bump allocator (the first
+/// allocation exercises the mmap grow routine), equality, UTF-8
+/// character counts, and String-typed locals / parameters / returns
+/// including recursion — all asserted against the evaluator's output.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_strings_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_str_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_str_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def greet(name: String): String = \"hello, \" + name + \"!\"\n\
+         def repeat(s: String, n: Int): String = if (n <= 0) \"\" else s + repeat(s, n - 1)\n\
+         val w = \"世界\"\n\
+         println(greet(\"mac\"))\n\
+         println(\"こんにちは\" + \"、\" + w)\n\
+         println(length(\"あいうえお\"))\n\
+         println(length(\"\"))\n\
+         println(repeat(\"ab\", 3))\n\
+         println(greet(\"a\") == \"hello, a!\")\n\
+         println(greet(\"a\") != \"hello, a!\")\n\
+         println(\"x\" == \"y\")\n\
+         mutable s = \"\"\n\
+         mutable i = 0\n\
+         while (i < 5) {\n\
+           s = s + \"z\"\n\
+           i = i + 1\n\
+         }\n\
+         println(s)\n\
+         println(length(s))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin string build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "hello, mac!\nこんにちは、世界\n5\n0\nababab\ntrue\nfalse\nfalse\nzzzzz\n5\n"
+    );
+}
+
 /// On Apple Silicon a target-less `build` detects the host: programs
 /// inside the direct subset get the toolchain-free Mach-O backend
 /// (no libSystem linkage), and programs outside it silently fall
@@ -23023,9 +23094,11 @@ fn build_host_default_uses_direct_backend_with_c_fallback() {
     }
     let fallback_source = dir.join(format!("klassic_hostdetect_b_{stamp}.kl"));
     let fallback_bin = dir.join(format!("klassic_hostdetect_b_{stamp}.bin"));
+    // Double arithmetic stays outside the direct subset for now, so
+    // this exercises the silent C fallback.
     fs::write(
         &fallback_source,
-        "def greet(name: String): String = \"hello, \" + name + \"!\"\nprintln(greet(\"mac\"))\n",
+        "def area(r: Double): Double = r * r * 3.14159\nprintln(area(2.0))\n",
     )
     .expect("temp source file should write");
     let build_output = Command::new(klassic_bin())
@@ -23048,7 +23121,7 @@ fn build_host_default_uses_direct_backend_with_c_fallback() {
     let _ = fs::remove_file(&fallback_source);
     let _ = fs::remove_file(&fallback_bin);
     assert!(run_output.status.success());
-    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "hello, mac!\n");
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "12.56636\n");
 }
 
 /// A target-less `klassic build` must produce a binary the host can

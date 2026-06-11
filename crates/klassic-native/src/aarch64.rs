@@ -23,8 +23,17 @@ use crate::macho::{self, DataFixup};
 
 const SYS_EXIT: u16 = 1;
 const SYS_WRITE: u16 = 4;
+/// Darwin `mmap`. Heap segments come straight from the kernel.
+const SYS_MMAP: u16 = 197;
 const STDOUT_FD: u64 = 1;
 const STDERR_FD: u64 = 2;
+/// One bump-allocator segment. Exhaustion mmaps a fresh segment (the
+/// old one leaks until the backend grows a collector — same place the
+/// x86_64 backend started).
+const HEAP_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+/// Darwin MAP_ANON | MAP_PRIVATE.
+const MMAP_ANON_PRIVATE: u64 = 0x1002;
+const PROT_READ_WRITE: u64 = 3;
 
 /// AArch64 general-purpose registers used by the subset. The numeric
 /// value is the register number in instruction encodings; 31 encodes
@@ -42,6 +51,12 @@ enum Reg {
     X7 = 7,
     /// Darwin syscall number register.
     X16 = 16,
+    /// Callee-saved: bump-allocator next pointer. The generated code
+    /// never spills it, which is exactly why a heap exists without a
+    /// writable data segment.
+    X19 = 19,
+    /// Callee-saved: bump-allocator end pointer.
+    X20 = 20,
 }
 
 /// AAPCS64 integer argument registers, in order.
@@ -314,6 +329,20 @@ impl Assembler {
         offset
     }
 
+    /// Intern a string literal as a `[len: u64][bytes]` object —
+    /// byte-identical to what the bump allocator produces, so every
+    /// string value is one pointer regardless of where it lives.
+    fn intern_string_object(&mut self, text: &str) -> usize {
+        while !self.rodata.len().is_multiple_of(8) {
+            self.rodata.push(0);
+        }
+        let offset = self.rodata.len();
+        self.rodata
+            .extend_from_slice(&(text.len() as u64).to_le_bytes());
+        self.rodata.extend_from_slice(text.as_bytes());
+        offset
+    }
+
     /// write(fd, <rodata bytes>, len) — clobbers x0/x1/x2/x16.
     fn emit_write_rodata(&mut self, fd: u64, bytes: &[u8]) {
         let data_offset = self.intern_rodata(bytes);
@@ -379,6 +408,54 @@ impl Assembler {
         self.word(0xcb00_03e0);
     }
 
+    /// `sub xd, xn, #imm12`
+    fn sub_reg_imm(&mut self, dst: Reg, src: Reg, imm: u32) {
+        debug_assert!(imm < 4096);
+        self.word(0xd100_0000 | (imm << 10) | ((src as u32) << 5) | dst as u32);
+    }
+
+    /// `cmp xn, #imm12` (subs xzr, xn, #imm)
+    fn cmp_imm(&mut self, reg: Reg, imm: u32) {
+        debug_assert!(imm < 4096);
+        self.word(0xf100_001f | (imm << 10) | ((reg as u32) << 5));
+    }
+
+    /// `lsr xd, xn, #shift`
+    fn lsr_imm(&mut self, dst: Reg, src: Reg, shift: u32) {
+        debug_assert!(shift < 64);
+        self.word(0xd340_0000 | (shift << 16) | (63 << 10) | ((src as u32) << 5) | dst as u32);
+    }
+
+    /// `lsl xd, xn, #shift`
+    fn lsl_imm(&mut self, dst: Reg, src: Reg, shift: u32) {
+        debug_assert!(0 < shift && shift < 64);
+        let immr = 64 - shift;
+        let imms = 63 - shift;
+        self.word(0xd340_0000 | (immr << 16) | (imms << 10) | ((src as u32) << 5) | dst as u32);
+    }
+
+    /// `ldr xt, [xn, #imm]` (unsigned, 8-byte scaled)
+    fn ldr_imm(&mut self, dst: Reg, base: Reg, imm: u32) {
+        debug_assert!(imm.is_multiple_of(8) && imm / 8 < 4096);
+        self.word(0xf940_0000 | ((imm / 8) << 10) | ((base as u32) << 5) | dst as u32);
+    }
+
+    /// `str xt, [xn, #imm]` (unsigned, 8-byte scaled)
+    fn str_imm(&mut self, src: Reg, base: Reg, imm: u32) {
+        debug_assert!(imm.is_multiple_of(8) && imm / 8 < 4096);
+        self.word(0xf900_0000 | ((imm / 8) << 10) | ((base as u32) << 5) | src as u32);
+    }
+
+    /// `ldrb wt, [xn], #1`
+    fn ldrb_post_increment(&mut self, dst: Reg, base: Reg) {
+        self.word(0x3840_1400 | ((base as u32) << 5) | dst as u32);
+    }
+
+    /// `strb wt, [xn], #1`
+    fn strb_post_increment(&mut self, src: Reg, base: Reg) {
+        self.word(0x3800_1400 | ((base as u32) << 5) | src as u32);
+    }
+
     /// `stp x29, x30, [sp, #-16]!` — function prologue link save.
     fn push_frame_record(&mut self) {
         self.word(0xa9bf_7bfd);
@@ -403,10 +480,13 @@ fn unsupported(span: Span, feature: &str) -> Diagnostic {
 }
 
 /// The value types the current subset can hold in a register / local.
+/// `Str` is a pointer to a `[len: u64][bytes]` object in rodata or on
+/// the bump heap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueType {
     Int,
     Bool,
+    Str,
     Unit,
 }
 
@@ -414,6 +494,7 @@ fn value_type_from_annotation(text: &str, span: Span) -> Result<ValueType, Diagn
     match text.trim() {
         "Int" | "Long" | "Short" | "Byte" => Ok(ValueType::Int),
         "Bool" | "Boolean" => Ok(ValueType::Bool),
+        "String" => Ok(ValueType::Str),
         "Unit" => Ok(ValueType::Unit),
         other => Err(unsupported(span, &format!("type annotation `{other}`"))),
     }
@@ -437,6 +518,9 @@ struct Emitter {
     /// are emitted (the stdlib prelude declares many functions the
     /// subset cannot compile — they only fail if actually called).
     pending: Vec<usize>,
+    /// Lazily created label of the shared heap-segment mmap routine;
+    /// emitted at the end only when some allocation referenced it.
+    heap_grow_label: Option<Label>,
     scopes: Vec<HashMap<String, (u32, ValueType)>>,
     next_local_offset: u32,
 }
@@ -471,6 +555,14 @@ impl Emitter {
                 self.asm.mov_imm64(Reg::X0, u64::from(*value));
                 Ok(ValueType::Bool)
             }
+            Expr::String { value, span } => {
+                if value.contains("#{") {
+                    return Err(unsupported(*span, "string interpolation"));
+                }
+                let offset = self.asm.intern_string_object(value);
+                self.asm.load_rodata_address(Reg::X0, offset);
+                Ok(ValueType::Str)
+            }
             Expr::Identifier { name, span } => {
                 let Some((offset, ty)) = self.lookup(name) else {
                     return Err(unsupported(*span, &format!("identifier `{name}`")));
@@ -487,6 +579,15 @@ impl Emitter {
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return Err(unsupported(*span, "calling a non-identifier"));
                 };
+                // Builtins first, mirroring the C backend's dispatch.
+                if name == "length" && arguments.len() == 1 {
+                    let ty = self.expression(&arguments[0])?;
+                    if ty != ValueType::Str {
+                        return Err(unsupported(*span, "length of a non-string"));
+                    }
+                    self.emit_str_char_count();
+                    return Ok(ValueType::Int);
+                }
                 self.function_call(name, arguments, *span)
             }
             Expr::If {
@@ -555,6 +656,25 @@ impl Emitter {
         if lhs_ty != rhs_ty {
             return Err(unsupported(span, "mixed operand types"));
         }
+        if lhs_ty == ValueType::Str {
+            return match op {
+                BinaryOp::Add => {
+                    self.emit_str_concat();
+                    Ok(ValueType::Str)
+                }
+                BinaryOp::Equal => {
+                    self.emit_str_eq();
+                    Ok(ValueType::Bool)
+                }
+                BinaryOp::NotEqual => {
+                    self.emit_str_eq();
+                    self.asm.cmp_imm(Reg::X0, 0);
+                    self.asm.cset(Reg::X0, Cond::Eq);
+                    Ok(ValueType::Bool)
+                }
+                _ => Err(unsupported(span, "this string operator")),
+            };
+        }
         match op {
             BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
                 if lhs_ty != ValueType::Int {
@@ -605,6 +725,154 @@ impl Emitter {
             }
             _ => Err(unsupported(span, "this binary operator")),
         }
+    }
+
+    /// Bump-allocate `x4` bytes (already 8-aligned): result pointer in
+    /// x5, x19 advanced. Calls the shared mmap routine when the
+    /// current segment is too small; that routine preserves x0-x5.
+    fn emit_alloc(&mut self) {
+        let fits = self.asm.new_label();
+        self.asm.sub_reg(Reg::X6, Reg::X20, Reg::X19);
+        self.asm.cmp_reg(Reg::X6, Reg::X4);
+        self.asm.branch(fits, BranchKind::Conditional(Cond::Ge));
+        let grow = match self.heap_grow_label {
+            Some(label) => label,
+            None => {
+                let label = self.asm.new_label();
+                self.heap_grow_label = Some(label);
+                label
+            }
+        };
+        self.asm.branch(grow, BranchKind::Link);
+        self.asm.bind(fits);
+        self.asm.mov_reg(Reg::X5, Reg::X19);
+        self.asm.add_reg(Reg::X19, Reg::X19, Reg::X4);
+    }
+
+    /// Copy `[count]` bytes between the byte pointers in `src`/`dst`;
+    /// `count` reaches zero, `src`/`dst` advance, `scratch` clobbered.
+    fn emit_copy_bytes(&mut self, count: Reg, src: Reg, dst: Reg, scratch: Reg) {
+        let copy_loop = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(copy_loop);
+        self.asm.branch(done, BranchKind::CompareZero(count));
+        self.asm.ldrb_post_increment(scratch, src);
+        self.asm.strb_post_increment(scratch, dst);
+        self.asm.sub_reg_imm(count, count, 1);
+        self.asm.branch(copy_loop, BranchKind::Unconditional);
+        self.asm.bind(done);
+    }
+
+    /// String concatenation: a in x0, b in x1 → fresh heap object in
+    /// x0. Layout is `[len][a bytes][b bytes]`.
+    fn emit_str_concat(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.ldr_imm(Reg::X3, Reg::X1, 0);
+        self.asm.add_reg(Reg::X2, Reg::X2, Reg::X3);
+        // size = align8(total + 8 header)
+        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        self.emit_alloc();
+        self.asm.str_imm(Reg::X2, Reg::X5, 0);
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.add_reg_imm(Reg::X6, Reg::X0, 8);
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X3);
+        self.asm.ldr_imm(Reg::X2, Reg::X1, 0);
+        self.asm.add_reg_imm(Reg::X6, Reg::X1, 8);
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X3);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
+    /// String equality: a in x0, b in x1 → Bool in x0.
+    fn emit_str_eq(&mut self) {
+        let differ = self.asm.new_label();
+        let same = self.asm.new_label();
+        let end = self.asm.new_label();
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.ldr_imm(Reg::X3, Reg::X1, 0);
+        self.asm.cmp_reg(Reg::X2, Reg::X3);
+        self.asm.branch(differ, BranchKind::Conditional(Cond::Ne));
+        self.asm.add_reg_imm(Reg::X6, Reg::X0, 8);
+        self.asm.add_reg_imm(Reg::X7, Reg::X1, 8);
+        let byte_loop = self.asm.new_label();
+        self.asm.bind(byte_loop);
+        self.asm.branch(same, BranchKind::CompareZero(Reg::X2));
+        self.asm.ldrb_post_increment(Reg::X3, Reg::X6);
+        self.asm.ldrb_post_increment(Reg::X4, Reg::X7);
+        self.asm.cmp_reg(Reg::X3, Reg::X4);
+        self.asm.branch(differ, BranchKind::Conditional(Cond::Ne));
+        self.asm.sub_reg_imm(Reg::X2, Reg::X2, 1);
+        self.asm.branch(byte_loop, BranchKind::Unconditional);
+        self.asm.bind(same);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(end, BranchKind::Unconditional);
+        self.asm.bind(differ);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(end);
+    }
+
+    /// `length(s)`: UTF-8 character count, matching the evaluator —
+    /// bytes whose top two bits are not `10` start a character.
+    fn emit_str_char_count(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
+        self.asm.mov_imm64(Reg::X4, 0);
+        let count_loop = self.asm.new_label();
+        let done = self.asm.new_label();
+        let continuation = self.asm.new_label();
+        self.asm.bind(count_loop);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X2));
+        self.asm.ldrb_post_increment(Reg::X5, Reg::X3);
+        self.asm.lsr_imm(Reg::X5, Reg::X5, 6);
+        self.asm.cmp_imm(Reg::X5, 2);
+        self.asm
+            .branch(continuation, BranchKind::Conditional(Cond::Eq));
+        self.asm.add_reg_imm(Reg::X4, Reg::X4, 1);
+        self.asm.bind(continuation);
+        self.asm.sub_reg_imm(Reg::X2, Reg::X2, 1);
+        self.asm.branch(count_loop, BranchKind::Unconditional);
+        self.asm.bind(done);
+        self.asm.mov_reg(Reg::X0, Reg::X4);
+    }
+
+    /// println of the string object in x0: one write for the payload,
+    /// one for the newline.
+    fn emit_println_str(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.add_reg_imm(Reg::X1, Reg::X0, 8);
+        self.asm.mov_imm64(Reg::X0, STDOUT_FD);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+        self.asm.svc_0x80();
+        self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+    }
+
+    /// The shared heap-grow routine: mmap a fresh segment into
+    /// x19/x20. Preserves x0-x5 because allocation sites have live
+    /// operands in them.
+    fn emit_heap_grow_routine(&mut self, label: Label) {
+        self.asm.bind(label);
+        self.asm.push_frame_record();
+        for reg in [Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5] {
+            self.asm.push(reg);
+        }
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.mov_imm64(Reg::X1, HEAP_SEGMENT_BYTES);
+        self.asm.mov_imm64(Reg::X2, PROT_READ_WRITE);
+        self.asm.mov_imm64(Reg::X3, MMAP_ANON_PRIVATE);
+        self.asm.mov_imm64(Reg::X4, u64::MAX); // fd = -1
+        self.asm.mov_imm64(Reg::X5, 0);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_MMAP));
+        self.asm.svc_0x80();
+        self.asm.mov_reg(Reg::X19, Reg::X0);
+        self.asm.mov_imm64(Reg::X1, HEAP_SEGMENT_BYTES);
+        self.asm.add_reg(Reg::X20, Reg::X19, Reg::X1);
+        for reg in [Reg::X5, Reg::X4, Reg::X3, Reg::X2, Reg::X1, Reg::X0] {
+            self.asm.pop(reg);
+        }
+        self.asm.pop_frame_record();
+        self.asm.ret();
     }
 
     /// Call a top-level annotated function: arguments are evaluated
@@ -728,6 +996,10 @@ impl Emitter {
         match self.expression(argument)? {
             ValueType::Int => {
                 self.asm.emit_print_int_line();
+                Ok(())
+            }
+            ValueType::Str => {
+                self.emit_println_str();
                 Ok(())
             }
             ValueType::Bool => {
@@ -921,6 +1193,11 @@ pub(crate) fn emit_macho_program(expr: &Expr) -> Result<Vec<u8>, Diagnostic> {
     emitter.scopes.push(HashMap::new());
     collect_functions(expr, &mut emitter);
 
+    // Empty heap: the first allocation's capacity check fails and
+    // mmaps the first segment.
+    emitter.asm.mov_imm64(Reg::X19, 0);
+    emitter.asm.mov_imm64(Reg::X20, 0);
+
     let frame_size = (count_var_decls(expr) * 8).div_ceil(16) * 16;
     if frame_size >= 4096 {
         return Err(unsupported(expr.span(), "this many local variables"));
@@ -940,6 +1217,9 @@ pub(crate) fn emit_macho_program(expr: &Expr) -> Result<Vec<u8>, Diagnostic> {
             emitted[index] = true;
             emitter.emit_function(index)?;
         }
+    }
+    if let Some(label) = emitter.heap_grow_label {
+        emitter.emit_heap_grow_routine(label);
     }
 
     emitter.asm.finish();
