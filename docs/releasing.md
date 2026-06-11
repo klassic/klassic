@@ -20,6 +20,13 @@ for `aarch64-apple-darwin` and `x86_64-apple-darwin`, and attaches
 `klassic-<tag>-<target>.tar.gz` for each to a GitHub Release with
 generated notes.
 
+Users install releases with the one-liner (`install.sh` at the repo
+root, served raw from `main`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/klassic/klassic/main/install.sh | sh
+```
+
 ## Dry run
 
 To verify the build and packaging without publishing anything, run the

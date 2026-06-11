@@ -37,20 +37,19 @@ Rust. The implementation builds a native `klassic` executable with Cargo.
 
 ## Install
 
-Prebuilt binaries are attached to
-[GitHub Releases](https://github.com/klassic/klassic/releases): a static
-Linux (x86_64) build that runs on any x86_64 Linux with no Rust toolchain
-or shared-library dependencies, plus macOS builds for Apple Silicon
-(`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`).
+One line, Linux (x86_64) or macOS (Apple Silicon / Intel):
 
 ```bash
-# Linux x86_64
-curl -L https://github.com/klassic/klassic/releases/latest/download/klassic-$(curl -s https://api.github.com/repos/klassic/klassic/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4)-x86_64-unknown-linux-musl.tar.gz | tar xz
-# macOS (Apple Silicon — use x86_64-apple-darwin on Intel)
-curl -L https://github.com/klassic/klassic/releases/latest/download/klassic-$(curl -s https://api.github.com/repos/klassic/klassic/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4)-aarch64-apple-darwin.tar.gz | tar xz
-./klassic --version
-./klassic -e "1 + 2"
+curl -fsSL https://raw.githubusercontent.com/klassic/klassic/main/install.sh | sh
 ```
+
+The installer detects your platform, downloads the latest
+[release](https://github.com/klassic/klassic/releases) into
+`~/.klassic/bin` (binary plus `libklassic_runtime.a` for the C
+backend), and verifies the install by running a Klassic program with
+it. Set `KLASSIC_VERSION=v0.2.0` to pin a release, `KLASSIC_HOME` to
+change the install root. The Linux build is statically linked (musl)
+and runs on any x86_64 Linux.
 
 On macOS the evaluator, REPL, and the portable C backend are fully
 supported; the direct-to-ELF native backend stays Linux-only — on a Mac,
