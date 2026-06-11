@@ -23033,6 +23033,75 @@ fn build_target_aarch64_apple_darwin_strings_run() {
     );
 }
 
+/// Records on the direct aarch64 backend: nominal declarations with
+/// `#Point(...)` construction, record-typed fields (nested access),
+/// record parameters / returns, structural literals with interned
+/// shapes, and evaluator-format printing — asserted against the
+/// evaluator's output.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_records_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_rec_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_rec_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "record Point {\n  x: Int\n  y: Int\n}\n\
+         record Person {\n  name: String\n  age: Int\n}\n\
+         record Line {\n  a: #Point\n  b: #Point\n}\n\
+         def manhattan(l: #Line): Int = l.b.x - l.a.x + l.b.y - l.a.y\n\
+         def mk(x: Int, y: Int): #Point = #Point(x, y)\n\
+         val p = #Point(3, 4)\n\
+         println(p.x * p.y)\n\
+         println(p)\n\
+         val who = #Person(\"kokone\", 0)\n\
+         println(who)\n\
+         println(who.name)\n\
+         val line = #Line(#Point(1, 2), #Point(10, 20))\n\
+         println(manhattan(line))\n\
+         println(mk(7, 8).y)\n\
+         val r = record { x: 1; y: 2 }\n\
+         println(r.x + r.y)\n\
+         println(r)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin record build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "12\n#Point(3, 4)\n#Person(kokone, 0)\nkokone\n27\n8\n3\n#(1, 2)\n"
+    );
+}
+
 /// Cons lists on the direct aarch64 backend: literals, head / tail /
 /// isEmpty / size, curried cons, evaluator-format printing, and
 /// list-typed parameters / returns with recursion (which the x86_64

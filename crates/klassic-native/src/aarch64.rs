@@ -524,6 +524,9 @@ enum ValueType {
     /// The type of `[]` before any element pins it down; assignable
     /// to every list type (it is the null pointer).
     EmptyList,
+    /// A record value: index into the emitter's record table (nominal
+    /// declarations and interned structural shapes).
+    Record(u32),
     /// An untyped heap pointer: lowered enum values and the box cells
     /// the enum desugaring builds around scalars.
     Ptr,
@@ -555,26 +558,16 @@ fn assignable(actual: ValueType, expected: ValueType) -> bool {
             && matches!(expected, ValueType::List(_) | ValueType::EmptyList))
 }
 
-fn value_type_from_annotation(
-    text: &str,
-    span: Span,
-    lowered_enums: &std::collections::HashSet<String>,
-) -> Result<ValueType, Diagnostic> {
-    let trimmed = text.trim();
-    // Lowered monomorphic enum values travel as plain heap pointers.
-    if lowered_enums.contains(trimmed.trim_start_matches('#')) {
-        return Ok(ValueType::Ptr);
-    }
-    match trimmed {
-        "Int" | "Long" | "Short" | "Byte" => Ok(ValueType::Int),
-        "Bool" | "Boolean" => Ok(ValueType::Bool),
-        "String" => Ok(ValueType::Str),
-        "List<Int>" => Ok(ValueType::List(ListElem::Int)),
-        "List<Bool>" => Ok(ValueType::List(ListElem::Bool)),
-        "List<String>" => Ok(ValueType::List(ListElem::Str)),
-        "Unit" => Ok(ValueType::Unit),
-        other => Err(unsupported(span, &format!("type annotation `{other}`"))),
-    }
+/// One nominal record declaration or interned structural shape:
+/// values are heap objects with one qword per field in declaration
+/// order. A structural shape has an empty name.
+struct RecordInfo {
+    name: String,
+    fields: Vec<(String, ValueType)>,
+    /// False when the declaration could not be typed (generics,
+    /// function-typed fields): the entry stays so `Record` indices
+    /// remain stable, but every lookup skips it.
+    usable: bool,
 }
 
 /// The value type of one list element of element type `elem`.
@@ -614,6 +607,9 @@ struct Emitter {
     /// are emitted (the stdlib prelude declares many functions the
     /// subset cannot compile — they only fail if actually called).
     pending: Vec<usize>,
+    /// Nominal record declarations plus interned structural shapes;
+    /// `ValueType::Record` carries an index into this table.
+    records: Vec<RecordInfo>,
     /// Lazily created label of the shared heap-segment mmap routine;
     /// emitted at the end only when some allocation referenced it.
     heap_grow_label: Option<Label>,
@@ -630,6 +626,53 @@ impl Emitter {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).copied())
+    }
+
+    /// Resolve a type annotation against scalars, list types, lowered
+    /// enums, and declared records (`#Point` or `Point`).
+    fn annotation_type(&self, text: &str, span: Span) -> Result<ValueType, Diagnostic> {
+        let trimmed = text.trim();
+        let bare = trimmed.trim_start_matches('#');
+        // Lowered monomorphic enum values travel as plain heap
+        // pointers.
+        if self.lowered_enums.contains(bare) {
+            return Ok(ValueType::Ptr);
+        }
+        if let Some(index) = self
+            .records
+            .iter()
+            .position(|record| record.usable && !record.name.is_empty() && record.name == bare)
+        {
+            return Ok(ValueType::Record(index as u32));
+        }
+        match trimmed {
+            "Int" | "Long" | "Short" | "Byte" => Ok(ValueType::Int),
+            "Bool" | "Boolean" => Ok(ValueType::Bool),
+            "String" => Ok(ValueType::Str),
+            "List<Int>" => Ok(ValueType::List(ListElem::Int)),
+            "List<Bool>" => Ok(ValueType::List(ListElem::Bool)),
+            "List<String>" => Ok(ValueType::List(ListElem::Str)),
+            "Unit" => Ok(ValueType::Unit),
+            other => Err(unsupported(span, &format!("type annotation `{other}`"))),
+        }
+    }
+
+    /// Intern a structural record shape, reusing an existing entry so
+    /// equal shapes share one `ValueType::Record` index.
+    fn intern_structural_record(&mut self, fields: Vec<(String, ValueType)>) -> u32 {
+        if let Some(index) = self
+            .records
+            .iter()
+            .position(|record| record.usable && record.name.is_empty() && record.fields == fields)
+        {
+            return index as u32;
+        }
+        self.records.push(RecordInfo {
+            name: String::new(),
+            fields,
+            usable: true,
+        });
+        (self.records.len() - 1) as u32
     }
 
     fn declare_local(&mut self, name: &str, ty: ValueType) -> u32 {
@@ -693,6 +736,78 @@ impl Emitter {
                     Some(elem) => ValueType::List(elem),
                     None => ValueType::EmptyList,
                 })
+            }
+            // Nominal construction `#Point(3, 4)`.
+            Expr::RecordConstructor {
+                name,
+                arguments,
+                span,
+            } => {
+                let Some(index) = self
+                    .records
+                    .iter()
+                    .position(|record| record.usable && record.name == *name)
+                else {
+                    return Err(unsupported(*span, &format!("record `{name}`")));
+                };
+                let fields = self.records[index].fields.clone();
+                if fields.len() != arguments.len() {
+                    return Err(Diagnostic::compile(
+                        *span,
+                        format!(
+                            "{name} expects {} fields but got {}",
+                            fields.len(),
+                            arguments.len()
+                        ),
+                    ));
+                }
+                for (argument, (_, expected)) in arguments.iter().zip(fields.iter()) {
+                    let ty = self.expression(argument)?;
+                    if !assignable(ty, *expected) {
+                        return Err(unsupported(argument.span(), "a record field of this type"));
+                    }
+                    self.asm.push(Reg::X0);
+                }
+                self.emit_record_object(arguments.len());
+                Ok(ValueType::Record(index as u32))
+            }
+            // Structural literal `record { x: 1; y: 2 }`: the shape
+            // is interned so equal shapes share one type.
+            Expr::RecordLiteral { fields, .. } => {
+                let mut typed = Vec::with_capacity(fields.len());
+                for (field_name, value) in fields {
+                    let ty = self.expression(value)?;
+                    if ty == ValueType::Unit || ty == ValueType::Never {
+                        return Err(unsupported(value.span(), "a record field of this type"));
+                    }
+                    typed.push((field_name.clone(), ty));
+                    self.asm.push(Reg::X0);
+                }
+                let count = fields.len();
+                let index = self.intern_structural_record(typed);
+                self.emit_record_object(count);
+                Ok(ValueType::Record(index))
+            }
+            Expr::FieldAccess {
+                target,
+                field,
+                span,
+            } => {
+                let target_ty = self.expression(target)?;
+                let ValueType::Record(index) = target_ty else {
+                    return Err(unsupported(*span, "field access on this value"));
+                };
+                let info = &self.records[index as usize];
+                let Some(position) = info
+                    .fields
+                    .iter()
+                    .position(|(field_name, _)| field_name == field)
+                else {
+                    return Err(unsupported(*span, &format!("field `{field}`")));
+                };
+                let ty = info.fields[position].1;
+                self.asm.ldr_imm(Reg::X0, Reg::X0, (position * 8) as u32);
+                Ok(ty)
             }
             Expr::Call {
                 callee,
@@ -1105,6 +1220,18 @@ impl Emitter {
         self.asm.bind(end_label);
     }
 
+    /// Build a record object from `count` field values pushed onto
+    /// the machine stack in declaration order → object pointer in x0.
+    fn emit_record_object(&mut self, count: usize) {
+        self.asm.mov_imm64(Reg::X4, (count * 8) as u64);
+        self.emit_alloc();
+        for position in (0..count).rev() {
+            self.asm.pop(Reg::X1);
+            self.asm.str_imm(Reg::X1, Reg::X5, (position * 8) as u32);
+        }
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
     /// Prepend a cons cell: head value on top of the machine stack,
     /// tail pointer in x0 → fresh cell pointer in x0.
     fn emit_cons_cell(&mut self) {
@@ -1149,6 +1276,34 @@ impl Emitter {
                 self.asm.bind(end_label);
             }
         }
+    }
+
+    /// println of the record object in x0 in the evaluator's format:
+    /// `#Name(v1, v2)` for nominal records, `#(v1, v2)` for
+    /// structural shapes. Scalar and string fields only for now.
+    fn emit_println_record(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
+        let info = &self.records[index as usize];
+        let opener = format!("#{}(", info.name);
+        let fields = info.fields.clone();
+        for (_, ty) in &fields {
+            if list_elem_of(*ty).is_none() {
+                return Err(unsupported(span, "printing a record with this field type"));
+            }
+        }
+        self.asm.push(Reg::X0); // the object survives the writes
+        self.asm.emit_write_rodata(STDOUT_FD, opener.as_bytes());
+        for (position, (_, ty)) in fields.iter().enumerate() {
+            if position > 0 {
+                self.asm.emit_write_rodata(STDOUT_FD, b", ");
+            }
+            self.asm.pop(Reg::X0);
+            self.asm.push(Reg::X0);
+            self.asm.ldr_imm(Reg::X0, Reg::X0, (position * 8) as u32);
+            self.emit_print_elem(list_elem_of(*ty).expect("checked above"));
+        }
+        self.asm.pop(Reg::X0); // discard the saved object
+        self.asm.emit_write_rodata(STDOUT_FD, b")\n");
+        Ok(())
     }
 
     /// println of the list in x0 in the evaluator's format:
@@ -1547,6 +1702,10 @@ impl Emitter {
                 self.asm.emit_write_rodata(STDOUT_FD, b"[]\n");
                 Ok(())
             }
+            ValueType::Record(index) => {
+                self.emit_println_record(index, argument.span())?;
+                Ok(())
+            }
             ValueType::Bool => {
                 let false_label = self.asm.new_label();
                 let end_label = self.asm.new_label();
@@ -1579,7 +1738,10 @@ impl Emitter {
             // Declarations have no runtime effect in the current
             // subset; calling a declared function is rejected at the
             // call site.
-            Expr::ModuleHeader { .. } | Expr::Import { .. } | Expr::DefDecl { .. } => Ok(()),
+            Expr::ModuleHeader { .. }
+            | Expr::Import { .. }
+            | Expr::DefDecl { .. }
+            | Expr::RecordDeclaration { .. } => Ok(()),
             Expr::VarDecl { name, value, .. } => {
                 let ty = self.expression(value)?;
                 if ty == ValueType::Unit {
@@ -1688,7 +1850,74 @@ fn count_var_decls(expr: &Expr) -> u32 {
             callee, arguments, ..
         } => count_var_decls(callee) + arguments.iter().map(count_var_decls).sum::<u32>(),
         Expr::ListLiteral { elements, .. } => elements.iter().map(count_var_decls).sum(),
+        Expr::RecordConstructor { arguments, .. } => arguments.iter().map(count_var_decls).sum(),
+        Expr::RecordLiteral { fields, .. } => {
+            fields.iter().map(|(_, value)| count_var_decls(value)).sum()
+        }
+        Expr::FieldAccess { target, .. } => count_var_decls(target),
         _ => 0,
+    }
+}
+
+/// Register every monomorphic, fully annotated top-level record
+/// declaration. Two passes so records can reference each other in any
+/// order; declarations the subset cannot type (generics, function
+/// fields) are skipped and produce a use-site diagnostic instead.
+fn collect_records(expr: &Expr, emitter: &mut Emitter) {
+    let Expr::Block { expressions, .. } = expr else {
+        return;
+    };
+    // Pass 1: names, so field annotations can reference any record.
+    for expression in expressions {
+        if let Expr::RecordDeclaration {
+            name, type_params, ..
+        } = expression
+            && type_params.is_empty()
+        {
+            // Provisionally usable so pass 2 can resolve mutual
+            // references; refined below.
+            emitter.records.push(RecordInfo {
+                name: name.clone(),
+                fields: Vec::new(),
+                usable: true,
+            });
+        }
+    }
+    // Pass 2: field types; undecodable declarations are marked
+    // unusable (indices must stay stable).
+    for expression in expressions {
+        let Expr::RecordDeclaration {
+            name,
+            type_params,
+            fields,
+            span,
+        } = expression
+        else {
+            continue;
+        };
+        if !type_params.is_empty() {
+            continue;
+        }
+        let mut typed = Vec::with_capacity(fields.len());
+        let mut usable = true;
+        for field in fields {
+            let Some(annotation) = &field.annotation else {
+                usable = false;
+                break;
+            };
+            let Ok(ty) = emitter.annotation_type(&annotation.text, *span) else {
+                usable = false;
+                break;
+            };
+            typed.push((field.name.clone(), ty));
+        }
+        let index = emitter
+            .records
+            .iter()
+            .position(|record| record.name == *name)
+            .expect("registered in pass 1");
+        emitter.records[index].fields = typed;
+        emitter.records[index].usable = usable;
     }
 }
 
@@ -1719,9 +1948,7 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
                 signature.clear();
                 break;
             };
-            let Ok(ty) =
-                value_type_from_annotation(&annotation.text, *span, &emitter.lowered_enums)
-            else {
+            let Ok(ty) = emitter.annotation_type(&annotation.text, *span) else {
                 signature.clear();
                 break;
             };
@@ -1733,9 +1960,7 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
         let Some(return_annotation) = return_annotation else {
             continue;
         };
-        let Ok(ret) =
-            value_type_from_annotation(&return_annotation.text, *span, &emitter.lowered_enums)
-        else {
+        let Ok(ret) = emitter.annotation_type(&return_annotation.text, *span) else {
             continue;
         };
         let label = emitter.asm.new_label();
@@ -1763,6 +1988,7 @@ pub(crate) fn emit_macho_program(
         ..Emitter::default()
     };
     emitter.scopes.push(HashMap::new());
+    collect_records(expr, &mut emitter);
     collect_functions(expr, &mut emitter);
 
     // Empty heap: the first allocation's capacity check fails and
