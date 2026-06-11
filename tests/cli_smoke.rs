@@ -22902,6 +22902,66 @@ fn build_target_aarch64_apple_darwin_binary_runs() {
     );
 }
 
+/// Annotated top-level functions on the direct aarch64 backend:
+/// AAPCS64 calls, deep recursion, mutual recursion with forward
+/// references, multi-argument calls — asserted against the
+/// evaluator's output on Apple Silicon.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_functions_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_fn_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_fn_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)\n\
+         def isEven(n: Int): Bool = if (n == 0) true else isOdd(n - 1)\n\
+         def isOdd(n: Int): Bool = if (n == 0) false else isEven(n - 1)\n\
+         def sum3(a: Int, b: Int, c: Int): Int = a + b + c\n\
+         println(fib(25))\n\
+         println(isEven(10))\n\
+         println(isOdd(7))\n\
+         println(sum3(100, 20, 3))\n\
+         println(fib(10) * sum3(1, 2, 3))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin function build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "75025\ntrue\ntrue\n123\n330\n"
+    );
+}
+
 /// A target-less `klassic build` must produce a binary the host can
 /// actually execute. Linux x86_64 uses the direct ELF backend; hosts
 /// without a direct backend (macOS CI) route through the portable C

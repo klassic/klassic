@@ -38,9 +38,23 @@ enum Reg {
     X3 = 3,
     X4 = 4,
     X5 = 5,
+    X6 = 6,
+    X7 = 7,
     /// Darwin syscall number register.
     X16 = 16,
 }
+
+/// AAPCS64 integer argument registers, in order.
+const ARG_REGS: [Reg; 8] = [
+    Reg::X0,
+    Reg::X1,
+    Reg::X2,
+    Reg::X3,
+    Reg::X4,
+    Reg::X5,
+    Reg::X6,
+    Reg::X7,
+];
 
 /// Frame pointer register number: locals live at `[x29, #offset]` so
 /// the operand stack can move `sp` freely. Only ever a base register,
@@ -73,6 +87,8 @@ struct Label(usize);
 enum BranchKind {
     /// `b label` — 26-bit signed word offset.
     Unconditional,
+    /// `bl label` — 26-bit signed word offset, link register.
+    Link,
     /// `b.cond label` — 19-bit signed word offset.
     Conditional(Cond),
     /// `cbz xreg, label`.
@@ -120,6 +136,7 @@ impl Assembler {
         // Placeholder opcodes; offsets are patched in `finish`.
         match self.branches.last().expect("just pushed").kind {
             BranchKind::Unconditional => self.word(0x1400_0000),
+            BranchKind::Link => self.word(0x9400_0000),
             BranchKind::Conditional(cond) => self.word(0x5400_0000 | cond as u32),
             BranchKind::CompareZero(reg) => self.word(0xb400_0000 | reg as u32),
             BranchKind::CompareNonZero(reg) => self.word(0xb500_0000 | reg as u32),
@@ -135,7 +152,9 @@ impl Assembler {
             word_bytes.copy_from_slice(&self.code[fixup.code_offset..fixup.code_offset + 4]);
             let word = u32::from_le_bytes(word_bytes);
             let patched = match fixup.kind {
-                BranchKind::Unconditional => word | ((delta_words as u32) & 0x03ff_ffff),
+                BranchKind::Unconditional | BranchKind::Link => {
+                    word | ((delta_words as u32) & 0x03ff_ffff)
+                }
                 BranchKind::Conditional(_)
                 | BranchKind::CompareZero(_)
                 | BranchKind::CompareNonZero(_) => word | (((delta_words as u32) & 0x7_ffff) << 5),
@@ -359,6 +378,21 @@ impl Assembler {
     fn neg_x0(&mut self) {
         self.word(0xcb00_03e0);
     }
+
+    /// `stp x29, x30, [sp, #-16]!` — function prologue link save.
+    fn push_frame_record(&mut self) {
+        self.word(0xa9bf_7bfd);
+    }
+
+    /// `ldp x29, x30, [sp], #16` — function epilogue link restore.
+    fn pop_frame_record(&mut self) {
+        self.word(0xa8c1_7bfd);
+    }
+
+    /// `ret`
+    fn ret(&mut self) {
+        self.word(0xd65f_03c0);
+    }
 }
 
 fn unsupported(span: Span, feature: &str) -> Diagnostic {
@@ -368,7 +402,7 @@ fn unsupported(span: Span, feature: &str) -> Diagnostic {
     )
 }
 
-/// The value types the M2 subset can hold in a register / local.
+/// The value types the current subset can hold in a register / local.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueType {
     Int,
@@ -376,9 +410,33 @@ enum ValueType {
     Unit,
 }
 
+fn value_type_from_annotation(text: &str, span: Span) -> Result<ValueType, Diagnostic> {
+    match text.trim() {
+        "Int" | "Long" | "Short" | "Byte" => Ok(ValueType::Int),
+        "Bool" | "Boolean" => Ok(ValueType::Bool),
+        "Unit" => Ok(ValueType::Unit),
+        other => Err(unsupported(span, &format!("type annotation `{other}`"))),
+    }
+}
+
+/// A top-level annotated `def` compiled as a real AAPCS64 function:
+/// arguments in x0..x7, result in x0, frame record saved by the
+/// callee prologue (which is what makes recursion per-frame safe).
+struct FunctionInfo {
+    label: Label,
+    params: Vec<(String, ValueType)>,
+    ret: ValueType,
+    body: Expr,
+}
+
 #[derive(Default)]
 struct Emitter {
     asm: Assembler,
+    functions: Vec<(String, FunctionInfo)>,
+    /// Indices of functions reached from compiled code; only these
+    /// are emitted (the stdlib prelude declares many functions the
+    /// subset cannot compile — they only fail if actually called).
+    pending: Vec<usize>,
     scopes: Vec<HashMap<String, (u32, ValueType)>>,
     next_local_offset: u32,
 }
@@ -421,6 +479,16 @@ impl Emitter {
                 Ok(ty)
             }
             Expr::Binary { lhs, op, rhs, span } => self.binary(lhs, *op, rhs, *span),
+            Expr::Call {
+                callee,
+                arguments,
+                span,
+            } => {
+                let Expr::Identifier { name, .. } = callee.as_ref() else {
+                    return Err(unsupported(*span, "calling a non-identifier"));
+                };
+                self.function_call(name, arguments, *span)
+            }
             Expr::If {
                 condition,
                 then_branch,
@@ -537,6 +605,96 @@ impl Emitter {
             }
             _ => Err(unsupported(span, "this binary operator")),
         }
+    }
+
+    /// Call a top-level annotated function: arguments are evaluated
+    /// left to right onto the machine stack, then popped into the
+    /// AAPCS64 argument registers right to left.
+    fn function_call(
+        &mut self,
+        name: &str,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        // rposition: a later (user) definition shadows an earlier
+        // (prelude) one, matching evaluator scoping.
+        let Some(index) = self.functions.iter().rposition(|(n, _)| n == name) else {
+            return Err(unsupported(span, &format!("function `{name}`")));
+        };
+        let (label, params, ret) = {
+            let info = &self.functions[index].1;
+            (info.label, info.params.clone(), info.ret)
+        };
+        if arguments.len() != params.len() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "{name} expects {} arguments but got {}",
+                    params.len(),
+                    arguments.len()
+                ),
+            ));
+        }
+        if arguments.len() > ARG_REGS.len() {
+            return Err(unsupported(span, "calls with more than 8 arguments"));
+        }
+        for (argument, (_, expected)) in arguments.iter().zip(params.iter()) {
+            let ty = self.expression(argument)?;
+            if ty != *expected {
+                return Err(unsupported(argument.span(), "an argument of this type"));
+            }
+            self.asm.push(Reg::X0);
+        }
+        for register in ARG_REGS.iter().take(arguments.len()).rev() {
+            self.asm.pop(*register);
+        }
+        self.asm.branch(label, BranchKind::Link);
+        self.pending.push(index);
+        Ok(ret)
+    }
+
+    /// Emit one collected function: prologue saves the frame record
+    /// and binds parameters to frame-pointer slots, the body is a
+    /// single expression whose value stays in x0.
+    fn emit_function(&mut self, index: usize) -> Result<(), Diagnostic> {
+        let (label, params, ret, body) = {
+            let info = &self.functions[index].1;
+            (info.label, info.params.clone(), info.ret, info.body.clone())
+        };
+        self.asm.bind(label);
+        self.asm.push_frame_record();
+        let frame_size = ((params.len() as u32 + count_var_decls(&body)) * 8).div_ceil(16) * 16;
+        if frame_size >= 4096 {
+            return Err(unsupported(body.span(), "this many local variables"));
+        }
+        if frame_size > 0 {
+            self.asm.sub_sp_imm(frame_size);
+        }
+        self.asm.mov_fp_sp();
+
+        self.scopes.push(HashMap::new());
+        let saved_offset = self.next_local_offset;
+        self.next_local_offset = 0;
+        for (position, (param, ty)) in params.iter().enumerate() {
+            let offset = self.declare_local(param, *ty);
+            self.asm.store_local(ARG_REGS[position], offset);
+        }
+        let body_ty = self.expression(&body)?;
+        self.scopes.pop();
+        self.next_local_offset = saved_offset;
+        if body_ty != ret {
+            return Err(unsupported(
+                body.span(),
+                "a function body of a different type than its return annotation",
+            ));
+        }
+
+        if frame_size > 0 {
+            self.asm.add_sp_imm(frame_size);
+        }
+        self.asm.pop_frame_record();
+        self.asm.ret();
+        Ok(())
     }
 
     /// Render a `println` argument that is a compile-time literal to
@@ -702,10 +860,66 @@ fn count_var_decls(expr: &Expr) -> u32 {
     }
 }
 
+/// Register every fully annotated top-level `def` as a callable
+/// function. Defs with missing or unsupported annotations are skipped
+/// silently — the stdlib prelude is full of them — and calling one
+/// produces the call-site diagnostic instead.
+fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
+    let Expr::Block { expressions, .. } = expr else {
+        return;
+    };
+    for expression in expressions {
+        let Expr::DefDecl {
+            name,
+            params,
+            param_annotations,
+            return_annotation,
+            body,
+            span,
+            ..
+        } = expression
+        else {
+            continue;
+        };
+        let mut signature = Vec::with_capacity(params.len());
+        for (param, annotation) in params.iter().zip(param_annotations.iter()) {
+            let Some(annotation) = annotation else {
+                signature.clear();
+                break;
+            };
+            let Ok(ty) = value_type_from_annotation(&annotation.text, *span) else {
+                signature.clear();
+                break;
+            };
+            signature.push((param.clone(), ty));
+        }
+        if signature.len() != params.len() {
+            continue;
+        }
+        let Some(return_annotation) = return_annotation else {
+            continue;
+        };
+        let Ok(ret) = value_type_from_annotation(&return_annotation.text, *span) else {
+            continue;
+        };
+        let label = emitter.asm.new_label();
+        emitter.functions.push((
+            name.clone(),
+            FunctionInfo {
+                label,
+                params: signature,
+                ret,
+                body: body.as_ref().clone(),
+            },
+        ));
+    }
+}
+
 /// Compile the whole program to a signed Mach-O arm64 executable.
 pub(crate) fn emit_macho_program(expr: &Expr) -> Result<Vec<u8>, Diagnostic> {
     let mut emitter = Emitter::default();
     emitter.scopes.push(HashMap::new());
+    collect_functions(expr, &mut emitter);
 
     let frame_size = (count_var_decls(expr) * 8).div_ceil(16) * 16;
     if frame_size >= 4096 {
@@ -718,6 +932,16 @@ pub(crate) fn emit_macho_program(expr: &Expr) -> Result<Vec<u8>, Diagnostic> {
 
     emitter.statement(expr)?;
     emitter.asm.emit_exit(0);
+
+    // Emit reached functions; their bodies may reach more.
+    let mut emitted = vec![false; emitter.functions.len()];
+    while let Some(index) = emitter.pending.pop() {
+        if !emitted[index] {
+            emitted[index] = true;
+            emitter.emit_function(index)?;
+        }
+    }
+
     emitter.asm.finish();
     Ok(macho::write_executable(
         emitter.asm.code,
