@@ -1,15 +1,17 @@
 //! Mach-O arm64 executable writer for the aarch64-apple-darwin
 //! direct backend. Mirrors the ELF writer's role: codegen hands over
 //! flat code/rodata blobs plus adrp/add data fixups and this module
-//! serializes a complete, runnable executable. Two Darwin-specific
-//! obligations live here: the image is laid out as a static
-//! `LC_UNIXTHREAD` executable (no dyld, the generated code talks to
-//! the kernel through `svc #0x80` exactly like the ELF backend talks
-//! through `syscall`), and the file carries an embedded ad-hoc code
-//! signature (a SHA-256 CodeDirectory) because the Apple Silicon
-//! kernel refuses to execute unsigned arm64 binaries. No external
-//! `codesign` / `cc` / `ld` is involved, keeping the no-toolchain
-//! policy of the direct backends.
+//! serializes a complete, runnable executable. Darwin-specific
+//! obligations live here: the Apple Silicon kernel only executes
+//! arm64 mains that are dyld-linked (`MH_DYLDLINK` +
+//! `LC_LOAD_DYLINKER` + `LC_MAIN`; fully static `LC_UNIXTHREAD`
+//! images are rejected with EBADEXEC) and carry a valid embedded
+//! ad-hoc code signature (a SHA-256 CodeDirectory). dyld also needs
+//! empty `LC_SYMTAB` / `LC_DYSYMTAB` to not crash. The generated
+//! code still imports nothing — it talks to the kernel through
+//! `svc #0x80` exactly like the ELF backend talks through `syscall`
+//! — and no external `codesign` / `cc` / `ld` is involved, keeping
+//! the no-toolchain policy of the direct backends.
 
 /// An `adrp`+`add` pair in `code` that must be patched to address a
 /// byte in `rodata` once the final image layout is known.
@@ -28,10 +30,14 @@ const MH_MAGIC_64: u32 = 0xfeed_facf;
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const MH_EXECUTE: u32 = 2;
 const MH_NOUNDEFS: u32 = 0x1;
+const MH_DYLDLINK: u32 = 0x4;
 const MH_PIE: u32 = 0x0020_0000;
 
 const LC_SEGMENT_64: u32 = 0x19;
-const LC_UNIXTHREAD: u32 = 0x5;
+const LC_SYMTAB: u32 = 0x2;
+const LC_DYSYMTAB: u32 = 0xb;
+const LC_LOAD_DYLINKER: u32 = 0xe;
+const LC_MAIN: u32 = 0x8000_0028;
 const LC_BUILD_VERSION: u32 = 0x32;
 const LC_CODE_SIGNATURE: u32 = 0x1d;
 
@@ -40,12 +46,13 @@ const VM_PROT_EXECUTE: u32 = 0x4;
 
 const SEGMENT_COMMAND_SIZE: u32 = 72;
 const SECTION_SIZE: u32 = 80;
-/// cmd + cmdsize + flavor + count + arm_thread_state64 (272 bytes).
-const UNIXTHREAD_COMMAND_SIZE: u32 = 16 + 272;
+/// cmd + cmdsize + name offset + "/usr/lib/dyld\0" padded to 8.
+const LOAD_DYLINKER_COMMAND_SIZE: u32 = 32;
+const MAIN_COMMAND_SIZE: u32 = 24;
+const SYMTAB_COMMAND_SIZE: u32 = 24;
+const DYSYMTAB_COMMAND_SIZE: u32 = 80;
 const BUILD_VERSION_COMMAND_SIZE: u32 = 24;
 const CODE_SIGNATURE_COMMAND_SIZE: u32 = 16;
-const ARM_THREAD_STATE64: u32 = 6;
-const ARM_THREAD_STATE64_COUNT: u32 = 68;
 const PLATFORM_MACOS: u32 = 1;
 /// 11.0.0 encoded as xxxx.yy.zz nibbles.
 const MACOS_11_0: u32 = 0x000b_0000;
@@ -101,16 +108,18 @@ pub(crate) fn write_executable(
     let sizeofcmds = SEGMENT_COMMAND_SIZE          // __PAGEZERO
         + SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE  // __TEXT (__text, __const)
         + SEGMENT_COMMAND_SIZE                     // __LINKEDIT
+        + LOAD_DYLINKER_COMMAND_SIZE
+        + MAIN_COMMAND_SIZE
+        + SYMTAB_COMMAND_SIZE
+        + DYSYMTAB_COMMAND_SIZE
         + BUILD_VERSION_COMMAND_SIZE
-        + UNIXTHREAD_COMMAND_SIZE
         + CODE_SIGNATURE_COMMAND_SIZE;
-    let ncmds = 6u32;
+    let ncmds = 9u32;
     let header_end = 32 + u64::from(sizeofcmds);
     let code_offset = align_to(header_end, 16);
     let rodata_offset = align_to(code_offset + code.len() as u64, 8);
     let text_filesize = align_to(rodata_offset + rodata.len() as u64, PAGE_SIZE);
     let signature_offset = text_filesize;
-    let entry_address = TEXT_BASE + code_offset;
 
     for fixup in fixups {
         patch_data_fixup(&mut code, code_offset, rodata_offset, fixup);
@@ -134,7 +143,7 @@ pub(crate) fn write_executable(
     out.u32(MH_EXECUTE);
     out.u32(ncmds);
     out.u32(sizeofcmds);
-    out.u32(MH_NOUNDEFS | MH_PIE);
+    out.u32(MH_NOUNDEFS | MH_DYLDLINK | MH_PIE);
     out.u32(0); // reserved
 
     // __PAGEZERO
@@ -204,6 +213,37 @@ pub(crate) fn write_executable(
     out.u32(0);
     out.u32(0);
 
+    // LC_LOAD_DYLINKER: the Apple Silicon kernel refuses arm64 main
+    // executables that are not dyld-linked (MH_DYLDLINK + dyld are
+    // load-time requirements even though the generated code never
+    // imports a dylib and talks to the kernel via raw syscalls).
+    out.u32(LC_LOAD_DYLINKER);
+    out.u32(LOAD_DYLINKER_COMMAND_SIZE);
+    out.u32(12); // name offset
+    out.bytes.extend_from_slice(b"/usr/lib/dyld\0\0\0\0\0\0\0");
+
+    // LC_MAIN: dyld jumps to this file offset; the program exits via
+    // the exit syscall and never returns into dyld's glue.
+    out.u32(LC_MAIN);
+    out.u32(MAIN_COMMAND_SIZE);
+    out.u64(code_offset); // entryoff
+    out.u64(0); // stacksize: default
+
+    // Empty LC_SYMTAB / LC_DYSYMTAB: dyld dereferences both
+    // unconditionally and crashes when they are absent.
+    out.u32(LC_SYMTAB);
+    out.u32(SYMTAB_COMMAND_SIZE);
+    out.u32(0); // symoff
+    out.u32(0); // nsyms
+    out.u32(0); // stroff
+    out.u32(0); // strsize
+
+    out.u32(LC_DYSYMTAB);
+    out.u32(DYSYMTAB_COMMAND_SIZE);
+    for _ in 0..18 {
+        out.u32(0);
+    }
+
     // LC_BUILD_VERSION
     out.u32(LC_BUILD_VERSION);
     out.u32(BUILD_VERSION_COMMAND_SIZE);
@@ -211,18 +251,6 @@ pub(crate) fn write_executable(
     out.u32(MACOS_11_0); // minos
     out.u32(MACOS_11_0); // sdk
     out.u32(0); // ntools
-
-    // LC_UNIXTHREAD: the kernel builds the stack and applies the PIE
-    // slide to pc; everything else starts zeroed.
-    out.u32(LC_UNIXTHREAD);
-    out.u32(UNIXTHREAD_COMMAND_SIZE);
-    out.u32(ARM_THREAD_STATE64);
-    out.u32(ARM_THREAD_STATE64_COUNT);
-    for _ in 0..32 {
-        out.u64(0); // x0-x28, fp, lr, sp
-    }
-    out.u64(entry_address); // pc
-    out.u64(0); // cpsr + padding
 
     // LC_CODE_SIGNATURE
     out.u32(LC_CODE_SIGNATURE);
@@ -444,9 +472,13 @@ mod tests {
         assert_eq!(&image[4..8], &CPU_TYPE_ARM64.to_le_bytes());
         assert_eq!(&image[12..16], &MH_EXECUTE.to_le_bytes());
         let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap());
-        assert_eq!(ncmds, 6);
+        assert_eq!(ncmds, 9);
         let flags = u32::from_le_bytes(image[24..28].try_into().unwrap());
-        assert_eq!(flags, MH_NOUNDEFS | MH_PIE);
+        assert_eq!(flags, MH_NOUNDEFS | MH_DYLDLINK | MH_PIE);
+        assert!(
+            image.windows(14).any(|window| window == b"/usr/lib/dyld\0"),
+            "LC_LOAD_DYLINKER path missing"
+        );
 
         // The signature begins at the 16K-aligned end of __TEXT and
         // opens with the SuperBlob magic (big-endian).
