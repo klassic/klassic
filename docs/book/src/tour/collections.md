@@ -44,22 +44,31 @@ println(sum)                 // 15
 ```kl
 val ages = %["alice": 30, "bob": 27, "carol": 42]
 
-println(ages.get("alice"))               // 30
+println(ages.getOrElse("alice", 0))      // 30
+println(ages.getOrElse("dave", 0))       // 0 — the default
 println(ages.containsKey("dave"))        // false
 println(ages.size())                     // 3
+
+foreach (name in ages.keys()) {
+  println(name + " is " + toString(ages.getOrElse(name, 0)))
+}
 ```
 
 ### Map helpers
 
-| Function | Behaviour |
+| Method | Behaviour |
 |---|---|
-| `Map#get(m, key)` (also `m.get(key)`) | Returns value or null |
-| `Map#containsKey(m, key)` | Boolean |
-| `Map#containsValue(m, value)` | Boolean |
-| `Map#size(m)`, `Map#isEmpty(m)` | Self-explanatory |
+| `m.getOrElse(key, default)` | The value for `key`, or `default` if absent — typed as the value type |
+| `m.keys()` | The keys as `List<K>`, in insertion order |
+| `m.values()` | The values as `List<V>`, in insertion order |
+| `m.get(key)` | The value, or `null` if absent |
+| `m.containsKey(key)` / `m.containsValue(value)` | Boolean |
+| `m.size()` / `m.isEmpty()` | Self-explanatory |
 
-`m.get(key) == null` and `m.get(key) != null` work for missing-key
-checks without materializing a tagged null.
+`keys()` and `values()` return real lists, so they iterate with
+`foreach` and feed the `std.list` helpers. Reach for `getOrElse` over
+`get` when you have a sensible default — it keeps the result a plain
+value instead of a nullable one.
 
 ## Sets
 
