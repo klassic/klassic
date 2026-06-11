@@ -3478,10 +3478,13 @@ mod tests {
 
     #[test]
     fn shares_mutable_captures_with_threads() {
+        // A generous main-thread sleep: loaded CI runners (macOS
+        // especially) have delayed the spawned thread well past the
+        // old 10ms budget and flaked this test.
         assert_eq!(
             evaluate_text(
                 "<expr>",
-                "mutable counter = 0\nthread(() => {\n  sleep(1)\n  counter = counter + 1\n})\nsleep(10)\ncounter",
+                "mutable counter = 0\nthread(() => {\n  sleep(1)\n  counter = counter + 1\n})\nsleep(300)\ncounter",
             )
             .unwrap(),
             Value::Int(1)
