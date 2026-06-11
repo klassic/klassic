@@ -585,7 +585,7 @@ fn compile_internal(
             })?;
             Ok(write_executable_for_target(target, object))
         }
-        NativeBackend::DirectAarch64 => aarch64::emit_macho_program(&expr)
+        NativeBackend::DirectAarch64 => aarch64::emit_macho_program(&expr, lowered_enum_names)
             .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic)),
     }
 }

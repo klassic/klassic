@@ -23033,6 +23033,69 @@ fn build_target_aarch64_apple_darwin_strings_run() {
     );
 }
 
+/// Monomorphic enums and match on the direct aarch64 backend, riding
+/// the shared `desugar_enums` lowering: construction, recursive enum
+/// functions (per-frame by design), nested patterns, guards, String
+/// payloads — asserted against the evaluator's output.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_enums_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_enum_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_enum_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         enum Shape { case Tag(label: String, n: Int); case Empty }\n\
+         def total(t: Tree): Int = t match { case Leaf(v) => v; case Branch(l, r) => total(l) + total(r) }\n\
+         def build(n: Int): Tree = if (n <= 0) Leaf(1) else Branch(build(n - 1), Leaf(n))\n\
+         println(total(Branch(Leaf(3), Branch(Leaf(4), Leaf(5)))))\n\
+         println(total(build(40)))\n\
+         val s = Tag(\"answer\", 42)\n\
+         println(s match { case Tag(label, n) => label + \"=\" + toString(n); case Empty => \"none\" })\n\
+         println(Empty match { case Tag(label, n) => label; case Empty => \"none\" })\n\
+         val t = Branch(Leaf(7), Leaf(2))\n\
+         println(t match { case Leaf(v) => v; case Branch(Leaf(a), r) => a * 100 + total(r) })\n\
+         println(Leaf(5) match { case Leaf(v) if v > 3 => \"big\"; case Leaf(v) => \"small\"; case Branch(l, r) => \"branch\" })\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin enum build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "12\n821\nanswer=42\nnone\n702\nbig\n"
+    );
+}
+
 /// String builtins on the direct aarch64 backend: toString of
 /// Int/Bool/String, char-indexed clamping substring/at (matching the
 /// evaluator and klassic_rt), and isEmptyString — asserted against

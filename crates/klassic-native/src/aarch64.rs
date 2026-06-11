@@ -460,6 +460,16 @@ impl Assembler {
         self.word(0x3940_0000 | ((base as u32) << 5) | dst as u32);
     }
 
+    /// `ldr xt, [xn, xm]` — register-offset load.
+    fn ldr_reg_offset(&mut self, dst: Reg, base: Reg, offset: Reg) {
+        self.word(0xf860_6800 | ((offset as u32) << 16) | ((base as u32) << 5) | dst as u32);
+    }
+
+    /// `str xt, [xn, xm]` — register-offset store.
+    fn str_reg_offset(&mut self, src: Reg, base: Reg, offset: Reg) {
+        self.word(0xf820_6800 | ((offset as u32) << 16) | ((base as u32) << 5) | src as u32);
+    }
+
     /// `ldrb wt, [xn], #1`
     fn ldrb_post_increment(&mut self, dst: Reg, base: Reg) {
         self.word(0x3840_1400 | ((base as u32) << 5) | dst as u32);
@@ -501,11 +511,36 @@ enum ValueType {
     Int,
     Bool,
     Str,
+    /// An untyped heap pointer: lowered enum values and the box cells
+    /// the enum desugaring builds around scalars.
+    Ptr,
     Unit,
+    /// The "type" of diverging expressions (`__match_fail()`): merges
+    /// with anything in an if join.
+    Never,
 }
 
-fn value_type_from_annotation(text: &str, span: Span) -> Result<ValueType, Diagnostic> {
-    match text.trim() {
+/// Merge the types of two branches of an `if` expression: a diverging
+/// branch adopts the other branch's type.
+fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueType> {
+    match (then_ty, else_ty) {
+        (ValueType::Never, other) | (other, ValueType::Never) => Some(other),
+        (left, right) if left == right => Some(left),
+        _ => None,
+    }
+}
+
+fn value_type_from_annotation(
+    text: &str,
+    span: Span,
+    lowered_enums: &std::collections::HashSet<String>,
+) -> Result<ValueType, Diagnostic> {
+    let trimmed = text.trim();
+    // Lowered monomorphic enum values travel as plain heap pointers.
+    if lowered_enums.contains(trimmed.trim_start_matches('#')) {
+        return Ok(ValueType::Ptr);
+    }
+    match trimmed {
         "Int" | "Long" | "Short" | "Byte" => Ok(ValueType::Int),
         "Bool" | "Boolean" => Ok(ValueType::Bool),
         "String" => Ok(ValueType::Str),
@@ -535,6 +570,9 @@ struct Emitter {
     /// Lazily created label of the shared heap-segment mmap routine;
     /// emitted at the end only when some allocation referenced it.
     heap_grow_label: Option<Label>,
+    /// Names of enums `desugar_enums` lowered to `__gc_record` shape;
+    /// annotations naming them type as plain heap pointers.
+    lowered_enums: std::collections::HashSet<String>,
     scopes: Vec<HashMap<String, (u32, ValueType)>>,
     next_local_offset: u32,
 }
@@ -621,10 +659,24 @@ impl Emitter {
                 self.asm.bind(else_label);
                 let else_ty = self.expression(else_branch)?;
                 self.asm.bind(end_label);
-                if then_ty != else_ty {
-                    return Err(unsupported(*span, "if branches with different types"));
+                merge_branch_types(then_ty, else_ty)
+                    .ok_or_else(|| unsupported(*span, "if branches with different types"))
+            }
+            // A block in expression position: statements, then the
+            // value of the final expression (the enum lowering leans
+            // on this shape heavily).
+            Expr::Block { expressions, .. } => {
+                let Some((last, init)) = expressions.split_last() else {
+                    self.asm.mov_imm64(Reg::X0, 0);
+                    return Ok(ValueType::Unit);
+                };
+                self.scopes.push(HashMap::new());
+                for expression in init {
+                    self.statement(expression)?;
                 }
-                Ok(then_ty)
+                let ty = self.expression(last)?;
+                self.scopes.pop();
+                Ok(ty)
             }
             other => Err(unsupported(other.span(), "this expression")),
         }
@@ -1025,7 +1077,9 @@ impl Emitter {
                     ValueType::Int => self.emit_int_to_str(),
                     ValueType::Bool => self.emit_bool_to_str(),
                     ValueType::Str => {}
-                    ValueType::Unit => return Err(unsupported(span, "toString of unit")),
+                    other => {
+                        return Err(unsupported(span, &format!("toString of {other:?}")));
+                    }
                 }
                 Ok(Some(ValueType::Str))
             }
@@ -1061,6 +1115,76 @@ impl Emitter {
                 self.asm.add_reg_imm(Reg::X2, Reg::X1, 1);
                 self.emit_substring();
                 Ok(Some(ValueType::Str))
+            }
+            // ---- enum-lowering primitives (`desugar_enums`) ----
+            // `__gc_record(n)` / `__gc_alloc(bytes)`: zeroed heap
+            // memory from the bump allocator (segments are fresh mmap
+            // pages, so zeroing is free by construction).
+            ("__gc_record", 1) | ("__gc_alloc", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, &format!("{name} with a non-Int size")));
+                }
+                if name == "__gc_record" {
+                    // n pointer slots → n * 8 bytes.
+                    self.asm.lsl_imm(Reg::X4, Reg::X0, 3);
+                } else {
+                    self.asm.add_reg_imm(Reg::X4, Reg::X0, 7);
+                    self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+                    self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+                }
+                self.emit_alloc();
+                self.asm.mov_reg(Reg::X0, Reg::X5);
+                Ok(Some(ValueType::Ptr))
+            }
+            ("__gc_write", 3) => {
+                if self.expression(&arguments[0])? != ValueType::Ptr {
+                    return Err(unsupported(span, "__gc_write to a non-pointer"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Int {
+                    return Err(unsupported(span, "__gc_write with a non-Int offset"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[2])? == ValueType::Unit {
+                    return Err(unsupported(span, "__gc_write of unit"));
+                }
+                self.asm.mov_reg(Reg::X2, Reg::X0);
+                self.asm.pop(Reg::X1);
+                self.asm.pop(Reg::X0);
+                self.asm.str_reg_offset(Reg::X2, Reg::X0, Reg::X1);
+                Ok(Some(ValueType::Unit))
+            }
+            ("__gc_read", 2) | ("__gc_read_ptr", 2) | ("__gc_read_string", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Ptr {
+                    return Err(unsupported(span, &format!("{name} of a non-pointer")));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Int {
+                    return Err(unsupported(span, &format!("{name} with a non-Int offset")));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.pop(Reg::X0);
+                self.asm.ldr_reg_offset(Reg::X0, Reg::X0, Reg::X1);
+                Ok(Some(match name {
+                    "__gc_read" => ValueType::Int,
+                    "__gc_read_string" => ValueType::Str,
+                    _ => ValueType::Ptr,
+                }))
+            }
+            // On this backend rodata literals and heap strings are
+            // already the same one-pointer layout; normalization is
+            // the identity until a tracing collector exists.
+            ("__gc_string", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "__gc_string of a non-string"));
+                }
+                Ok(Some(ValueType::Str))
+            }
+            ("__match_fail", 0) => {
+                self.asm
+                    .emit_write_rodata(STDERR_FD, b"klassic: match: no pattern matched\n");
+                self.asm.emit_exit(1);
+                Ok(Some(ValueType::Never))
             }
             _ => Ok(None),
         }
@@ -1205,7 +1329,10 @@ impl Emitter {
                 self.asm.bind(end_label);
                 Ok(())
             }
-            ValueType::Unit => Err(unsupported(argument.span(), "printing unit")),
+            other => Err(unsupported(
+                argument.span(),
+                &format!("printing a {other:?} value"),
+            )),
         }
     }
 
@@ -1301,24 +1428,33 @@ impl Emitter {
 
 /// Count every local the program can declare so the frame can be
 /// reserved once up front (slots are never reused; fine at this
-/// scale). The recursion mirrors exactly the statement positions the
-/// code generator walks, so it never undercounts a compilable
-/// program.
+/// scale). The recursion mirrors exactly the expression shapes the
+/// code generator walks — the enum lowering plants `val`s inside
+/// expression-position blocks — so it never undercounts a compilable
+/// program; anything it cannot see fails compilation before a slot
+/// is touched.
 fn count_var_decls(expr: &Expr) -> u32 {
     match expr {
-        Expr::VarDecl { .. } => 1,
+        Expr::VarDecl { value, .. } => 1 + count_var_decls(value),
+        Expr::Assign { value, .. } => count_var_decls(value),
         Expr::Block { expressions, .. } => expressions.iter().map(count_var_decls).sum(),
-        Expr::While { body, .. } => count_var_decls(body),
+        Expr::While {
+            condition, body, ..
+        } => count_var_decls(condition) + count_var_decls(body),
         Expr::If {
+            condition,
             then_branch,
             else_branch,
             ..
         } => {
-            count_var_decls(then_branch)
+            count_var_decls(condition)
+                + count_var_decls(then_branch)
                 + else_branch
                     .as_ref()
                     .map_or(0, |branch| count_var_decls(branch))
         }
+        Expr::Binary { lhs, rhs, .. } => count_var_decls(lhs) + count_var_decls(rhs),
+        Expr::Call { arguments, .. } => arguments.iter().map(count_var_decls).sum(),
         _ => 0,
     }
 }
@@ -1350,7 +1486,9 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
                 signature.clear();
                 break;
             };
-            let Ok(ty) = value_type_from_annotation(&annotation.text, *span) else {
+            let Ok(ty) =
+                value_type_from_annotation(&annotation.text, *span, &emitter.lowered_enums)
+            else {
                 signature.clear();
                 break;
             };
@@ -1362,7 +1500,9 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
         let Some(return_annotation) = return_annotation else {
             continue;
         };
-        let Ok(ret) = value_type_from_annotation(&return_annotation.text, *span) else {
+        let Ok(ret) =
+            value_type_from_annotation(&return_annotation.text, *span, &emitter.lowered_enums)
+        else {
             continue;
         };
         let label = emitter.asm.new_label();
@@ -1379,8 +1519,16 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
 }
 
 /// Compile the whole program to a signed Mach-O arm64 executable.
-pub(crate) fn emit_macho_program(expr: &Expr) -> Result<Vec<u8>, Diagnostic> {
-    let mut emitter = Emitter::default();
+/// `lowered_enums` names the enums `desugar_enums` already lowered to
+/// `__gc_record` shape.
+pub(crate) fn emit_macho_program(
+    expr: &Expr,
+    lowered_enums: std::collections::HashSet<String>,
+) -> Result<Vec<u8>, Diagnostic> {
+    let mut emitter = Emitter {
+        lowered_enums,
+        ..Emitter::default()
+    };
     emitter.scopes.push(HashMap::new());
     collect_functions(expr, &mut emitter);
 
