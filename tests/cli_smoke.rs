@@ -22789,6 +22789,63 @@ fn top_level_defs_support_mutual_recursion() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
 }
 
+/// A target-less `klassic build` must produce a binary the host can
+/// actually execute. Linux x86_64 uses the direct ELF backend; hosts
+/// without a direct backend (macOS CI) route through the portable C
+/// backend automatically instead of silently emitting a Linux ELF
+/// (the v0.2.0 "exec format error" regression).
+#[test]
+fn build_without_target_produces_runnable_host_binary() {
+    // The C route needs a system C compiler; only required off Linux.
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let cc_available = Command::new("cc")
+            .arg("--version")
+            .output()
+            .is_ok_and(|probe| probe.status.success());
+        if !cc_available {
+            return;
+        }
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_hostbuild_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_hostbuild_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)\n\
+         println(\"hello from \" + \"klassic\")\n\
+         println(fib(15))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "target-less build should succeed on the host\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("compiled binary should run on the host");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(run_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "hello from klassic\n610\n"
+    );
+}
+
 /// The C backend's string surface (roadmap PR 10): strings are KStr
 /// values served by the klassic_rt_* shims in libklassic_runtime.a,
 /// sharing semantics with the evaluator — character-counted length,

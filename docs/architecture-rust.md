@@ -737,7 +737,12 @@ cargo run -- -e "1 + 2"
   macOS native-binary path (no Mach-O direct emission, per the
   roadmap). Anything outside the subset is a source-located
   diagnostic, never wrong code, and the direct ELF path is untouched.
-  The emitter is `crates/klassic-native/src/cbackend.rs`.
+  The emitter is `crates/klassic-native/src/cbackend.rs`. On hosts
+  with no direct native backend (macOS today), a target-less
+  `klassic build` routes through this C path automatically — the
+  v0.2.0 behavior of silently cross-emitting a Linux ELF the host
+  could not execute was a bug; an explicit `--target` still selects a
+  cross build.
 
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program

@@ -10,6 +10,11 @@ pub struct ExecutionConfig {
     /// `--backend c`: `build` emits a portable C translation unit at
     /// the output path instead of a direct ELF executable.
     pub c_backend: bool,
+    /// True when `--target` was given on the command line. Hosts with
+    /// no direct native backend (e.g. macOS) route a target-less
+    /// `build` through the portable C backend instead of silently
+    /// cross-building for the default Linux target.
+    pub explicit_target: bool,
 }
 
 impl ExecutionConfig {
@@ -19,6 +24,7 @@ impl ExecutionConfig {
             warn_trust,
             native_target,
             c_backend: false,
+            explicit_target: false,
         }
     }
 }
@@ -69,6 +75,7 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     let mut c_backend = false;
     let mut warn_trust = false;
     let mut native_target = NativeTarget::default();
+    let mut explicit_target = false;
     let mut others = Vec::new();
     let mut script_args = Vec::new();
     let mut seen_separator = false;
@@ -119,6 +126,7 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
                         return Err(CommandLineError::UnknownTarget(target_name.clone()));
                     }
                 };
+                explicit_target = true;
                 index += 2;
             }
             other => {
@@ -130,6 +138,7 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
 
     let mut config = ExecutionConfig::new(deny_trust, warn_trust, native_target);
     config.c_backend = c_backend;
+    config.explicit_target = explicit_target;
     let action = match others.as_slice() {
         [command] if command == "targets" => RunAction::ListTargets,
         [flag] if flag == "--version" || flag == "-V" => RunAction::ShowVersion,
@@ -171,7 +180,8 @@ pub fn usage() -> String {
        <fileName>         : read a program from <fileName> and execute it\n\
        run <fileName>     : same as <fileName>; pairs naturally with `-- <args>`\n\
        -e <expression>    : evaluate <expression>\n\
-       build <fileName> -o <output>: compile <fileName> to a native executable\n\
+       build <fileName> -o <output>: compile <fileName> to a native executable \
+(hosts without a direct backend, such as macOS, build via the portable C backend)\n\
        targets            : list known native targets and their support status\n\
        --                 : separates klassic flags from arguments visible to \
 the user script via CommandLine#args()\n",
@@ -269,6 +279,7 @@ mod tests {
                 assert_eq!(input.to_string_lossy(), "sample.kl");
                 assert_eq!(output.to_string_lossy(), "sample");
                 assert_eq!(parsed.config.native_target, NativeTarget::LinuxX86_64);
+                assert!(!parsed.config.explicit_target);
             }
             other => panic!("unexpected action: {other:?}"),
         }
@@ -287,6 +298,7 @@ mod tests {
             ];
             let parsed = parse_command_line(&args).expect("build command should parse");
             assert_eq!(parsed.config.native_target, NativeTarget::LinuxX86_64);
+            assert!(parsed.config.explicit_target);
             match parsed.action {
                 RunAction::BuildFile { input, output } => {
                     assert_eq!(input.to_string_lossy(), "sample.kl");

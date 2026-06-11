@@ -65,11 +65,25 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     return Err(1);
                 }
             };
-            if command.config.c_backend {
+            // Hosts without a direct native backend (e.g. macOS) build
+            // through the portable C path unless an explicit --target
+            // asks for a cross build; the old behavior silently emitted
+            // a Linux ELF that the host cannot execute.
+            let host_routes_through_c =
+                !command.config.explicit_target && NativeTarget::host().is_none();
+            if command.config.c_backend || host_routes_through_c {
                 let c_source = match compile_source_to_c(&input.display().to_string(), &text) {
                     Ok(c_source) => c_source,
                     Err(error) => {
                         eprintln!("{error}");
+                        if host_routes_through_c && !command.config.c_backend {
+                            eprintln!(
+                                "note: this host has no direct native backend, so `build` \
+                                 uses the portable C backend; it supports a subset of the \
+                                 language (run the program with `klassic {}` instead)",
+                                input.display()
+                            );
+                        }
                         return Err(1);
                     }
                 };
