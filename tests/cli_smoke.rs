@@ -18536,7 +18536,6 @@ fn builds_native_executable_for_todo_runtime_error() {
     );
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 /// Negative `substring` / `at` indices clamp to 0 everywhere — the
 /// evaluator used to reject them while klassic_rt and the backends
 /// clamped (issue #434). Static and dynamic index paths both covered.
@@ -18594,6 +18593,7 @@ fn substring_and_at_clamp_negative_indices() {
     let _ = fs::remove_file(&source_path);
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_assertion_runtime_errors() {
     let cases = [
