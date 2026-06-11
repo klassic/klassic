@@ -1836,7 +1836,19 @@ fn eval_call(
                     .map(|argument| eval_expr(argument, environment, state))
                     .collect::<Result<Vec<_>, _>>()?,
             );
-            return eval_builtin(builtin, &all_arguments, span);
+            // Go through apply_callable rather than eval_builtin so a
+            // curried builtin (e.g. `foldLeft`, arity 3) partial-
+            // applies when the method call supplies fewer args than
+            // its arity: `xs.foldLeft(init)(f)` binds [xs, init] here,
+            // then the trailing `(f)` completes it.
+            return apply_callable(
+                Value::BuiltinFunction(Rc::new(BuiltinFunctionValue {
+                    name: builtin,
+                    bound_args: Vec::new(),
+                })),
+                all_arguments,
+                span,
+            );
         }
         if let Some(method) = resolve_user_extension_method(&target_value, field) {
             let mut all_arguments = Vec::with_capacity(arguments.len() + 1);

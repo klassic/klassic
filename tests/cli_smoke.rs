@@ -31,6 +31,31 @@ fn macos_ci_must_be_apple_silicon_for_aarch64_execution() {
     );
 }
 
+/// std.list grew the fundamental higher-order operations it lacked —
+/// reverse, flatMap, distinct, indexOf, containsItem — plus method
+/// forms (`.reversed()`, `.fold(init)(f)`, `.reduce(f)`, ...). The
+/// curried `xs.fold(init)(f)` reads Scala-style; the builtin
+/// `xs.foldLeft(init, f)` still takes both args at once.
+#[test]
+fn std_list_higher_order_helpers() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.list\nprintln(reverseList([1, 2, 3]))\nprintln(flatMap([1, 2], (x) => [x, x]))\nprintln(distinct([1, 2, 2, 3, 1]))\nprintln(indexOf([\"a\", \"b\", \"c\"], \"c\"))\nprintln([1, 2, 3, 4].fold(0)((a, b) => a + b))\nprintln([5, 3, 8].reduce((a, b) => if (a < b) a else b))\nprintln([1, 2, 3].reversed())\nprintln([1, 2, 3, 4].foldLeft(0, (a, b) => a + b))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "std.list helpers should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[3, 2, 1]\n[1, 1, 2, 2]\n[1, 2, 3]\n2\n10\n3\n[3, 2, 1]\n10\n()\n"
+    );
+}
+
 /// Maps gained a null-free accessor and iteration helpers:
 /// `getOrElse(key, default)`, `keys()`, and `values()`. They type
 /// precisely (`keys()` is `List<K>`, `values()` is `List<V>`), so the

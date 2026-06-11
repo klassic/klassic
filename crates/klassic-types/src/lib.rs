@@ -4017,6 +4017,10 @@ impl TypeChecker {
                 "contains" => Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Bool))),
                 "join" => Some(Type::Function(vec![Type::String], Box::new(Type::String))),
                 "map" => Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic))),
+                // Accepts both `xs.foldLeft(init, f)` (two args at
+                // once) and `xs.foldLeft(init)(f)` (curried) — the
+                // latter partial-applies this type, and the runtime
+                // goes through apply_callable so the partial completes.
                 "foldLeft" => Some(Type::Function(
                     vec![Type::Dynamic, Type::Dynamic],
                     Box::new(Type::Dynamic),
