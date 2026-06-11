@@ -23169,6 +23169,73 @@ fn build_target_aarch64_apple_darwin_records_run() {
     );
 }
 
+/// Double arithmetic and comparison on the direct aarch64 backend:
+/// values travel as raw IEEE 754 bits in GP registers and bounce
+/// through the FP unit for add/sub/mul/div and fcmp-based ordering.
+/// Results are observed through Bool comparisons (runtime-Double
+/// `println` still needs float formatting and stays diagnosed).
+/// Asserted against the evaluator on Apple Silicon.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_doubles_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_dbl_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_dbl_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def area(r: Double): Double = r * r * 3.14159\n\
+         def bigger(a: Double, b: Double): Double = if (a > b) a else b\n\
+         val x = area(2.0)\n\
+         println(x > 12.56 && x < 12.57)\n\
+         println(area(1.0) == 3.14159)\n\
+         println(area(1.0) != 3.14159)\n\
+         println(bigger(2.5, 7.25) >= 7.25)\n\
+         val third = 1.0 / 3.0\n\
+         println(third * 3.0 == 1.0)\n\
+         println(7.5 / 2.5 == 3.0)\n\
+         mutable acc = 0.5\n\
+         acc = acc + 0.25\n\
+         println(acc == 0.75)\n\
+         println(0.0 - 1.5 < 0.0)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin double build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "true\ntrue\nfalse\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+    );
+}
+
 /// Cons lists on the direct aarch64 backend: literals, head / tail /
 /// isEmpty / size, curried cons, evaluator-format printing, and
 /// list-typed parameters / returns with recursion (which the x86_64

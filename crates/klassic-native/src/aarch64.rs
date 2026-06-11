@@ -81,6 +81,10 @@ const FP: u32 = 29;
 enum Cond {
     Eq = 0,
     Ne = 1,
+    /// After `fcmp`: strictly less, unordered fails — the float `<`.
+    Mi = 4,
+    /// After `fcmp`: less-or-equal, unordered fails — the float `<=`.
+    Ls = 9,
     Ge = 10,
     Lt = 11,
     Gt = 12,
@@ -417,6 +421,40 @@ impl Assembler {
         self.word(0xcb00_03e0);
     }
 
+    // --- scalar double FP (the value lives in a GP register as raw
+    // bits; these move it through d0/d1 for the actual operation) ---
+
+    /// `fmov dd, xn` — reinterpret the GP bits as a double in dN.
+    fn fmov_d_from_x(&mut self, d: u32, x: Reg) {
+        self.word(0x9e67_0000 | ((x as u32) << 5) | d);
+    }
+
+    /// `fmov xd, dn` — reinterpret the double bits back into a GP reg.
+    fn fmov_x_from_d(&mut self, x: Reg, d: u32) {
+        self.word(0x9e66_0000 | (d << 5) | x as u32);
+    }
+
+    fn fadd_d(&mut self, dd: u32, dn: u32, dm: u32) {
+        self.word(0x1e60_2800 | (dm << 16) | (dn << 5) | dd);
+    }
+
+    fn fsub_d(&mut self, dd: u32, dn: u32, dm: u32) {
+        self.word(0x1e60_3800 | (dm << 16) | (dn << 5) | dd);
+    }
+
+    fn fmul_d(&mut self, dd: u32, dn: u32, dm: u32) {
+        self.word(0x1e60_0800 | (dm << 16) | (dn << 5) | dd);
+    }
+
+    fn fdiv_d(&mut self, dd: u32, dn: u32, dm: u32) {
+        self.word(0x1e60_1800 | (dm << 16) | (dn << 5) | dd);
+    }
+
+    /// `fcmp dn, dm` — sets NZCV for a conditional-set.
+    fn fcmp_d(&mut self, dn: u32, dm: u32) {
+        self.word(0x1e60_2000 | (dm << 16) | (dn << 5));
+    }
+
     /// `sub xd, xn, #imm12`
     fn sub_reg_imm(&mut self, dst: Reg, src: Reg, imm: u32) {
         debug_assert!(imm < 4096);
@@ -518,6 +556,11 @@ enum ListElem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueType {
     Int,
+    /// An IEEE 754 double held as raw bits in a GP register / frame
+    /// slot, exactly like an Int; arithmetic and comparison bounce
+    /// through the FP registers, everything else (storage, calls,
+    /// locals) treats it as an opaque qword.
+    Double,
     Bool,
     Str,
     List(ListElem),
@@ -647,6 +690,7 @@ impl Emitter {
         }
         match trimmed {
             "Int" | "Long" | "Short" | "Byte" => Ok(ValueType::Int),
+            "Double" | "Float" => Ok(ValueType::Double),
             "Bool" | "Boolean" => Ok(ValueType::Bool),
             "String" => Ok(ValueType::Str),
             "List<Int>" => Ok(ValueType::List(ListElem::Int)),
@@ -692,6 +736,11 @@ impl Emitter {
             Expr::Int { value, .. } => {
                 self.asm.mov_imm64(Reg::X0, *value as u64);
                 Ok(ValueType::Int)
+            }
+            Expr::Double { value, .. } => {
+                // The double travels as its raw IEEE 754 bits in x0.
+                self.asm.mov_imm64(Reg::X0, value.to_bits());
+                Ok(ValueType::Double)
             }
             Expr::Bool { value, .. } => {
                 self.asm.mov_imm64(Reg::X0, u64::from(*value));
@@ -946,6 +995,44 @@ impl Emitter {
                     Ok(ValueType::Bool)
                 }
                 _ => Err(unsupported(span, "this string operator")),
+            };
+        }
+        if lhs_ty == ValueType::Double {
+            // Both operands are raw double bits in x0 / x1; move them
+            // into d0 / d1 for the FP unit. IEEE division by zero is
+            // defined (it yields an infinity), so no zero guard.
+            self.asm.fmov_d_from_x(0, Reg::X0);
+            self.asm.fmov_d_from_x(1, Reg::X1);
+            return match op {
+                BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
+                    match op {
+                        BinaryOp::Add => self.asm.fadd_d(0, 0, 1),
+                        BinaryOp::Subtract => self.asm.fsub_d(0, 0, 1),
+                        BinaryOp::Multiply => self.asm.fmul_d(0, 0, 1),
+                        _ => self.asm.fdiv_d(0, 0, 1),
+                    }
+                    self.asm.fmov_x_from_d(Reg::X0, 0);
+                    Ok(ValueType::Double)
+                }
+                BinaryOp::Less
+                | BinaryOp::LessEqual
+                | BinaryOp::Greater
+                | BinaryOp::GreaterEqual
+                | BinaryOp::Equal
+                | BinaryOp::NotEqual => {
+                    let cond = match op {
+                        BinaryOp::Less => Cond::Mi,
+                        BinaryOp::LessEqual => Cond::Ls,
+                        BinaryOp::Greater => Cond::Gt,
+                        BinaryOp::GreaterEqual => Cond::Ge,
+                        BinaryOp::Equal => Cond::Eq,
+                        _ => Cond::Ne,
+                    };
+                    self.asm.fcmp_d(0, 1);
+                    self.asm.cset(Reg::X0, cond);
+                    Ok(ValueType::Bool)
+                }
+                _ => Err(unsupported(span, "this double operator")),
             };
         }
         match op {
