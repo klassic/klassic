@@ -1002,11 +1002,15 @@ fn eval_program(
 /// trampoline today, so plain user-defined recursion piles host
 /// frames 1:1 with Klassic frames. Without this, even `def loop(n) =
 /// if (n == 0) 0 else loop(n - 1)` blows the host stack at a few
-/// hundred levels. `stacker::maybe_grow` adds a fresh 1 MiB segment
-/// when only 64 KiB remain, so call depths typical of recursive list
-/// processing comfortably fit.
-const STACK_RED_ZONE: usize = 64 * 1024;
-const STACK_GROW_SIZE: usize = 1024 * 1024;
+/// hundred levels. `stacker::maybe_grow` adds a fresh segment when
+/// the red zone is reached. The red zone must out-size the worst
+/// non-checkpointed frame chain between two `eval_expr` entries —
+/// 64 KiB proved too thin for debug builds threading a curried
+/// builtin application through an annotated recursive def (issue
+/// #435 segfaulted ~200 frames deep), so both knobs are sized
+/// generously; the cost is one virtual allocation per segment.
+const STACK_RED_ZONE: usize = 512 * 1024;
+const STACK_GROW_SIZE: usize = 8 * 1024 * 1024;
 
 fn eval_expr(
     expr: &Expr,
@@ -3473,6 +3477,22 @@ mod tests {
         assert_eq!(
             evaluate_text("<expr>", "thread(() => {\n  sleep(1)\n})").unwrap(),
             Value::Unit
+        );
+    }
+
+    #[test]
+    fn survives_deep_recursion_through_curried_builtins() {
+        // Issue #435: an annotated recursive def threading a curried
+        // builtin (`cons(a)(...)`) segfaulted ~200 frames deep in
+        // debug builds — the non-checkpointed frames between two
+        // eval_expr entries outgrew the 64 KiB stacker red zone.
+        assert_eq!(
+            evaluate_text(
+                "<expr>",
+                "def range2(a: Int, b: Int): List<Int> = if (a >= b) [] else cons(a)(range2(a + 1, b))\nsize(range2(0, 2000))",
+            )
+            .unwrap(),
+            Value::Int(2000)
         );
     }
 
