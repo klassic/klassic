@@ -1537,7 +1537,16 @@ fn builtin_module_members(path: &str) -> Option<&'static [&'static str]> {
             "copy",
             "move",
         ]),
-        "Map" => Some(&["containsKey", "containsValue", "get", "isEmpty", "size"]),
+        "Map" => Some(&[
+            "containsKey",
+            "containsValue",
+            "get",
+            "getOrElse",
+            "keys",
+            "values",
+            "isEmpty",
+            "size",
+        ]),
         "Set" => Some(&["contains", "isEmpty", "size"]),
         _ => None,
     }
@@ -3193,6 +3202,29 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
                 .find(|(key, _)| key == &arguments[1])
                 .map(|(_, value)| value.clone())
                 .unwrap_or(Value::Null))
+        }
+        "Map#getOrElse" => {
+            ensure_arity(name, arguments, 3, span)?;
+            let entries = expect_map(&arguments[0], "Map#getOrElse", span)?;
+            Ok(entries
+                .iter()
+                .find(|(key, _)| key == &arguments[1])
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| arguments[2].clone()))
+        }
+        "Map#keys" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let entries = expect_map(&arguments[0], "Map#keys", span)?;
+            Ok(Value::List(
+                entries.iter().map(|(key, _)| key.clone()).collect(),
+            ))
+        }
+        "Map#values" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let entries = expect_map(&arguments[0], "Map#values", span)?;
+            Ok(Value::List(
+                entries.iter().map(|(_, value)| value.clone()).collect(),
+            ))
         }
         "Map#isEmpty" => {
             ensure_arity(name, arguments, 1, span)?;

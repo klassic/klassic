@@ -2927,6 +2927,21 @@ impl TypeChecker {
                     Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
                 ),
                 (
+                    "getOrElse",
+                    Type::Function(
+                        vec![Type::Dynamic, Type::Dynamic, Type::Dynamic],
+                        Box::new(Type::Dynamic),
+                    ),
+                ),
+                (
+                    "keys",
+                    Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
+                (
+                    "values",
+                    Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
+                (
                     "isEmpty",
                     Type::Function(vec![Type::Dynamic], Box::new(Type::Bool)),
                 ),
@@ -4008,11 +4023,23 @@ impl TypeChecker {
                 )),
                 _ => None,
             },
-            Type::Map(_, _) => match field {
+            Type::Map(key, value) => match field {
                 "containsKey" | "containsValue" => {
                     Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Bool)))
                 }
                 "get" => Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic))),
+                "getOrElse" => Some(Type::Function(
+                    vec![(*key).clone(), (*value).clone()],
+                    Box::new((*value).clone()),
+                )),
+                "keys" => Some(Type::Function(
+                    vec![],
+                    Box::new(Type::List(Box::new((*key).clone()))),
+                )),
+                "values" => Some(Type::Function(
+                    vec![],
+                    Box::new(Type::List(Box::new((*value).clone()))),
+                )),
                 "isEmpty" => Some(Type::Function(vec![], Box::new(Type::Bool))),
                 "size" => Some(Type::Function(vec![], Box::new(Type::Int))),
                 _ => None,
@@ -4120,6 +4147,21 @@ fn builtin_module_type_exports(path: &str) -> Option<ModuleTypeExports> {
             (
                 "get",
                 Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+            ),
+            (
+                "getOrElse",
+                Type::Function(
+                    vec![Type::Dynamic, Type::Dynamic, Type::Dynamic],
+                    Box::new(Type::Dynamic),
+                ),
+            ),
+            (
+                "keys",
+                Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+            ),
+            (
+                "values",
+                Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
             ),
             (
                 "isEmpty",

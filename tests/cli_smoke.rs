@@ -31,6 +31,32 @@ fn macos_ci_must_be_apple_silicon_for_aarch64_execution() {
     );
 }
 
+/// Maps gained a null-free accessor and iteration helpers:
+/// `getOrElse(key, default)`, `keys()`, and `values()`. They type
+/// precisely (`keys()` is `List<K>`, `values()` is `List<V>`), so the
+/// keys flow straight into a `foreach`.
+#[test]
+fn map_keys_values_get_or_else() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "val m = %[\"a\": 10, \"b\": 20]\nprintln(m.getOrElse(\"a\", 0))\nprintln(m.getOrElse(\"z\", 0))\nprintln(m.keys())\nprintln(m.values())\nforeach (k in m.keys()) { println(k) }",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "map helpers should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        // The trailing `()` is the Unit result of the final foreach,
+        // which `-e` echoes.
+        "10\n0\n[a, b]\n[10, 20]\na\nb\n()\n"
+    );
+}
+
 #[test]
 fn evaluates_expression_argument() {
     let output = Command::new(klassic_bin())

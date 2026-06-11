@@ -424,6 +424,21 @@ pub const BUILTINS: &[BuiltinDescriptor] = &[
         arity: 2,
     },
     BuiltinDescriptor {
+        canonical: "Map#getOrElse",
+        aliases: &[],
+        arity: 3,
+    },
+    BuiltinDescriptor {
+        canonical: "Map#keys",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "Map#values",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
         canonical: "Map#isEmpty",
         aliases: &[],
         arity: 1,
