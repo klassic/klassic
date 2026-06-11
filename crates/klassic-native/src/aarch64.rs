@@ -359,14 +359,16 @@ impl Assembler {
         self.svc_0x80();
     }
 
-    /// Print the signed integer in x0 followed by a newline: digits
-    /// are decomposed into a 32-byte stack buffer back to front, then
-    /// written with one syscall. Clobbers x0-x5/x16.
-    fn emit_print_int_line(&mut self) {
-        self.sub_sp_imm(32);
+    /// Decompose the signed integer in x0 into decimal digits at the
+    /// tail of a 32-byte stack buffer the caller has reserved
+    /// (`sub sp, #32`). Leaves x1 = first byte, sp+32 = one past the
+    /// end. Clobbers x0/x2-x5.
+    fn emit_int_digits(&mut self, include_newline: bool) {
         self.add_reg_sp_imm(Reg::X1, 32); // one past the buffer end
-        self.mov_imm64(Reg::X3, b'\n' as u64);
-        self.store_byte_pre_decrement(Reg::X3, Reg::X1);
+        if include_newline {
+            self.mov_imm64(Reg::X3, b'\n' as u64);
+            self.store_byte_pre_decrement(Reg::X3, Reg::X1);
+        }
         // x5 = 1 when negative, then continue with |value|.
         self.cmp_x0_zero();
         self.cset(Reg::X5, Cond::Lt);
@@ -389,6 +391,13 @@ impl Assembler {
         self.mov_imm64(Reg::X3, b'-' as u64);
         self.store_byte_pre_decrement(Reg::X3, Reg::X1);
         self.bind(no_sign);
+    }
+
+    /// Print the signed integer in x0 followed by a newline with one
+    /// write syscall. Clobbers x0-x5/x16.
+    fn emit_print_int_line(&mut self) {
+        self.sub_sp_imm(32);
+        self.emit_int_digits(true);
         // write(1, x1, (sp+32) - x1)
         self.add_reg_sp_imm(Reg::X2, 32);
         self.sub_reg(Reg::X2, Reg::X2, Reg::X1);
@@ -444,6 +453,11 @@ impl Assembler {
     fn str_imm(&mut self, src: Reg, base: Reg, imm: u32) {
         debug_assert!(imm.is_multiple_of(8) && imm / 8 < 4096);
         self.word(0xf900_0000 | ((imm / 8) << 10) | ((base as u32) << 5) | src as u32);
+    }
+
+    /// `ldrb wt, [xn]` — peek without advancing.
+    fn ldrb(&mut self, dst: Reg, base: Reg) {
+        self.word(0x3940_0000 | ((base as u32) << 5) | dst as u32);
     }
 
     /// `ldrb wt, [xn], #1`
@@ -580,13 +594,8 @@ impl Emitter {
                     return Err(unsupported(*span, "calling a non-identifier"));
                 };
                 // Builtins first, mirroring the C backend's dispatch.
-                if name == "length" && arguments.len() == 1 {
-                    let ty = self.expression(&arguments[0])?;
-                    if ty != ValueType::Str {
-                        return Err(unsupported(*span, "length of a non-string"));
-                    }
-                    self.emit_str_char_count();
-                    return Ok(ValueType::Int);
+                if let Some(ty) = self.builtin_call(name, arguments, *span)? {
+                    return Ok(ty);
                 }
                 self.function_call(name, arguments, *span)
             }
@@ -837,6 +846,116 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X4);
     }
 
+    /// Advance over up to x5 UTF-8 characters: x3 = byte pointer
+    /// (advanced), x4 = remaining bytes (decremented), x5 destroyed,
+    /// x6 clobbered. Stops early when the bytes run out, which is
+    /// what clamps out-of-range indices.
+    fn emit_skip_chars(&mut self) {
+        let scan_loop = self.asm.new_label();
+        let done = self.asm.new_label();
+        let char_done = self.asm.new_label();
+        let continuation_loop = self.asm.new_label();
+        self.asm.bind(scan_loop);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X5));
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X4));
+        // Consume the lead byte, then any continuation bytes (top
+        // bits `10`).
+        self.asm.ldrb_post_increment(Reg::X6, Reg::X3);
+        self.asm.sub_reg_imm(Reg::X4, Reg::X4, 1);
+        self.asm.bind(continuation_loop);
+        self.asm.branch(char_done, BranchKind::CompareZero(Reg::X4));
+        self.asm.ldrb(Reg::X6, Reg::X3);
+        self.asm.lsr_imm(Reg::X6, Reg::X6, 6);
+        self.asm.cmp_imm(Reg::X6, 2);
+        self.asm
+            .branch(char_done, BranchKind::Conditional(Cond::Ne));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.sub_reg_imm(Reg::X4, Reg::X4, 1);
+        self.asm
+            .branch(continuation_loop, BranchKind::Unconditional);
+        self.asm.bind(char_done);
+        self.asm.sub_reg_imm(Reg::X5, Reg::X5, 1);
+        self.asm.branch(scan_loop, BranchKind::Unconditional);
+        self.asm.bind(done);
+    }
+
+    /// `substring(s, start, end)` with the evaluator's semantics:
+    /// char-indexed, negatives clamp to 0, everything clamps to the
+    /// string, `end < start` yields the empty string. In: s = x0,
+    /// start = x1, end = x2; out: fresh object pointer in x0.
+    fn emit_substring(&mut self) {
+        // Clamp negative indices to zero.
+        for reg in [Reg::X1, Reg::X2] {
+            let non_negative = self.asm.new_label();
+            self.asm.cmp_imm(reg, 0);
+            self.asm
+                .branch(non_negative, BranchKind::Conditional(Cond::Ge));
+            self.asm.mov_imm64(reg, 0);
+            self.asm.bind(non_negative);
+        }
+        // First scan: skip `start` characters from the payload.
+        self.asm.ldr_imm(Reg::X4, Reg::X0, 0);
+        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
+        self.asm.mov_reg(Reg::X5, Reg::X1);
+        // chars to take = max(end - start, 0); computed before the
+        // scans clobber x1/x2.
+        self.asm.sub_reg(Reg::X2, Reg::X2, Reg::X1);
+        self.emit_skip_chars();
+        // x0 is free now: keep the slice's first byte there.
+        self.asm.mov_reg(Reg::X0, Reg::X3);
+        let non_negative_take = self.asm.new_label();
+        self.asm.cmp_imm(Reg::X2, 0);
+        self.asm
+            .branch(non_negative_take, BranchKind::Conditional(Cond::Ge));
+        self.asm.mov_imm64(Reg::X2, 0);
+        self.asm.bind(non_negative_take);
+        // Second scan: advance over the characters being taken.
+        self.asm.mov_reg(Reg::X5, Reg::X2);
+        self.emit_skip_chars();
+        // Slice byte length, then allocate and copy.
+        self.asm.sub_reg(Reg::X2, Reg::X3, Reg::X0);
+        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        self.emit_alloc();
+        self.asm.str_imm(Reg::X2, Reg::X5, 0);
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
+        self.emit_copy_bytes(Reg::X2, Reg::X0, Reg::X7, Reg::X3);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
+    /// `toString` of the integer in x0 → fresh string object in x0.
+    fn emit_int_to_str(&mut self) {
+        self.asm.sub_sp_imm(32);
+        self.asm.emit_int_digits(false);
+        self.asm.add_reg_sp_imm(Reg::X2, 32);
+        self.asm.sub_reg(Reg::X2, Reg::X2, Reg::X1);
+        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        self.emit_alloc();
+        self.asm.str_imm(Reg::X2, Reg::X5, 0);
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
+        self.emit_copy_bytes(Reg::X2, Reg::X1, Reg::X7, Reg::X3);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+        self.asm.add_sp_imm(32);
+    }
+
+    /// `toString` of the Bool in x0 → interned "true"/"false" object.
+    fn emit_bool_to_str(&mut self) {
+        let false_label = self.asm.new_label();
+        let end_label = self.asm.new_label();
+        let true_offset = self.asm.intern_string_object("true");
+        let false_offset = self.asm.intern_string_object("false");
+        self.asm
+            .branch(false_label, BranchKind::CompareZero(Reg::X0));
+        self.asm.load_rodata_address(Reg::X0, true_offset);
+        self.asm.branch(end_label, BranchKind::Unconditional);
+        self.asm.bind(false_label);
+        self.asm.load_rodata_address(Reg::X0, false_offset);
+        self.asm.bind(end_label);
+    }
+
     /// println of the string object in x0: one write for the payload,
     /// one for the newline.
     fn emit_println_str(&mut self) {
@@ -873,6 +992,78 @@ impl Emitter {
         }
         self.asm.pop_frame_record();
         self.asm.ret();
+    }
+
+    /// String / display builtins, mirroring the C backend's surface.
+    /// Returns Ok(None) when `name` is not a builtin.
+    fn builtin_call(
+        &mut self,
+        name: &str,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<Option<ValueType>, Diagnostic> {
+        match (name, arguments.len()) {
+            ("length", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "length of a non-string"));
+                }
+                self.emit_str_char_count();
+                Ok(Some(ValueType::Int))
+            }
+            ("isEmptyString", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "isEmptyString of a non-string"));
+                }
+                self.asm.ldr_imm(Reg::X1, Reg::X0, 0);
+                self.asm.cmp_imm(Reg::X1, 0);
+                // Reuse the comparison: x0 = (byte length == 0).
+                self.asm.cset(Reg::X0, Cond::Eq);
+                Ok(Some(ValueType::Bool))
+            }
+            ("toString", 1) => {
+                match self.expression(&arguments[0])? {
+                    ValueType::Int => self.emit_int_to_str(),
+                    ValueType::Bool => self.emit_bool_to_str(),
+                    ValueType::Str => {}
+                    ValueType::Unit => return Err(unsupported(span, "toString of unit")),
+                }
+                Ok(Some(ValueType::Str))
+            }
+            ("substring", 3) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "substring of a non-string"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Int {
+                    return Err(unsupported(span, "substring with a non-Int start"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[2])? != ValueType::Int {
+                    return Err(unsupported(span, "substring with a non-Int end"));
+                }
+                self.asm.mov_reg(Reg::X2, Reg::X0);
+                self.asm.pop(Reg::X1);
+                self.asm.pop(Reg::X0);
+                self.emit_substring();
+                Ok(Some(ValueType::Str))
+            }
+            ("at", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "at of a non-string"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Int {
+                    return Err(unsupported(span, "at with a non-Int index"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.pop(Reg::X0);
+                // at(s, i) = substring(s, i, i + 1)
+                self.asm.add_reg_imm(Reg::X2, Reg::X1, 1);
+                self.emit_substring();
+                Ok(Some(ValueType::Str))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Call a top-level annotated function: arguments are evaluated

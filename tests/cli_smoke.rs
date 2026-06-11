@@ -23033,6 +23033,69 @@ fn build_target_aarch64_apple_darwin_strings_run() {
     );
 }
 
+/// String builtins on the direct aarch64 backend: toString of
+/// Int/Bool/String, char-indexed clamping substring/at (matching the
+/// evaluator and klassic_rt), and isEmptyString — asserted against
+/// the evaluator's output on Apple Silicon.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_string_builtins_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_strb_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_strb_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(toString(42) + \"-\" + toString(0 - 7) + \"-\" + toString(true) + \"-\" + toString(false))\n\
+         println(substring(\"hello world\", 6, 11))\n\
+         println(substring(\"あいうえお\", 1, 3))\n\
+         println(substring(\"あいうえお\", 3, 99))\n\
+         println(substring(\"あいうえお\", 4, 2))\n\
+         println(at(\"abc\", 1))\n\
+         println(at(\"あいう\", 2))\n\
+         println(isEmptyString(\"\"))\n\
+         println(isEmptyString(\"x\"))\n\
+         val n = 12\n\
+         println(\"n = \" + toString(n * n))\n\
+         println(length(substring(\"あいうえお\", 1, 4)))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin string-builtin build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "42--7-true-false\nworld\nいう\nえお\n\nb\nう\ntrue\nfalse\nn = 144\n3\n"
+    );
+}
+
 /// On Apple Silicon a target-less `build` detects the host: programs
 /// inside the direct subset get the toolchain-free Mach-O backend
 /// (no libSystem linkage), and programs outside it silently fall
