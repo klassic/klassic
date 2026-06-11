@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="copper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#b45309"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="13" fill="#16130f"/>
+  <rect x="1.5" y="1.5" width="61" height="61" rx="11.5" fill="none" stroke="#f0a44b" stroke-opacity="0.35" stroke-width="1.5"/>
+  <!-- chisel-cut K -->
+  <path d="M18 12 h9 v18.5 L42.5 12 H53 L36.5 31.5 53 52 H42 L27 33.5 V52 h-9 Z" fill="url(#copper)"/>
+  <path d="M18 12 h9 v4 h-9 Z" fill="#faf3e3" fill-opacity="0.25"/>
+</svg>

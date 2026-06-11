@@ -1,7 +1,7 @@
 [book]
 title = "The Klassic Book"
 authors = ["Klassic contributors"]
-description = "Statically typed object-functional programming language with a Rust workspace toolchain and a Linux x86_64 native compiler with garbage collection."
+description = "Statically typed object-functional programming language that compiles straight to native executables - ELF on Linux, signed Mach-O on Apple Silicon - with no external toolchain."
 language = "en"
 multilingual = false
 src = "src"

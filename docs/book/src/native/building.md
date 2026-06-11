@@ -1,8 +1,8 @@
 # Building Executables
 
-The native compiler emits a Linux x86_64 ELF directly — no `cc`,
-`as`, or `ld` involvement. For a typical script that means a sub-10
-KiB binary with sub-millisecond startup.
+The native compiler emits the executable container itself — no `cc`,
+`as`, `ld`, or `codesign` involvement. For a typical script that means
+a sub-10 KiB binary with sub-millisecond startup.
 
 ## Workflow
 
@@ -11,40 +11,61 @@ klassic build path/to/program.kl -o program
 ./program
 ```
 
-You can make the target explicit with `--target linux-x86_64` or the standard
-triple alias `--target x86_64-unknown-linux-gnu`, or use `--target native` on a
-Linux x86_64 host. Linux x86_64 is currently the only implemented concrete
-target, but keeping the target visible in the command line lets future targets
-reuse the same build surface. Internally the target registry records the backend
-and data layout as well as the OS/ABI/file format, so future backends can plug
-into the same target-selection path instead of being hardcoded into the CLI.
+A target-less `build` compiles for the **detected host**:
+
+| Host | Backend | Output |
+| --- | --- | --- |
+| Linux x86_64 | direct ELF writer (most complete) | ELF64 talking to the kernel via raw syscalls |
+| macOS arm64 | direct Mach-O writer, portable-C fallback | ad-hoc-signed Mach-O arm64 via `svc #0x80` |
+| other hosts | portable C backend | executable linked with the system `cc` |
+
+To pick a target explicitly, pass `--target` with a canonical name or
+triple — `linux-x86_64` / `x86_64-unknown-linux-gnu` and
+`macos-aarch64` / `aarch64-apple-darwin` are the implemented direct
+targets, and `--target native` selects the host's. The Mach-O target
+cross-builds from any host, embedded code signature included.
+`klassic targets` prints the full matrix alongside planned targets.
+
+On Apple Silicon, programs outside the Mach-O backend's growing subset
+fall back transparently to the portable C backend (`--backend c`),
+which links against the bundled `libklassic_runtime.a` — a
+host-default `build` therefore succeeds for strictly more programs
+than either backend alone.
 
 That's the whole flow. The compiler runs the same parse → rewrite →
 type-check → proof-check pipeline as the evaluator, then lowers a
-supported subset to machine code and writes an ELF64 file.
+supported subset to machine code and writes the executable.
 
 ## What gets compiled
 
-The native compiler currently lowers a growing slice of the language:
+On Linux x86_64, the direct backend lowers a wide slice of the
+language:
 
 - Arithmetic, boolean, and string-concatenation expressions.
 - `if` (static and dynamic), `while`, `foreach`.
 - `val` / `mutable` bindings, including reassignment.
 - `def` functions, including recursive ones.
 - Static and runtime collections (lists, maps, sets, records).
+- Monomorphic and shape-tracked generic enums with `match`.
 - `println`, `printlnError`, `assert`, `assertResult`.
 - File I/O, environment variables, command-line args, stdin / stdout.
 - `__gc_*` builtins for the GC heap.
+
+On macOS arm64, the younger direct backend covers Int/Bool/String
+expressions, locals, `if` / `while`, annotated functions with
+recursion, the string builtins, monomorphic enums and `match`, cons
+lists, and records — and the portable C backend catches what it
+cannot.
 
 See [Native Compiler Coverage](../reference/native-coverage.md) for
 the exhaustive matrix.
 
 ## Unsupported constructs
 
-If you hit something the native compiler does not yet handle, the
-build emits a source-located diagnostic and exits non-zero. There is
-no fallback to the evaluator at runtime — production binaries always
-run through native code.
+If you hit something the native compilers do not yet handle, the build
+emits a source-located diagnostic and exits non-zero. There is no
+fallback to the evaluator at runtime — production binaries always run
+through native code.
 
 ```bash
 klassic build unsupported.kl -o out
