@@ -7,6 +7,29 @@ fn klassic_bin() -> &'static str {
     env!("CARGO_BIN_EXE_klassic")
 }
 
+/// Round-2 stdlib completeness (#443-#446, #448): list higher-order
+/// ops, math constants/helpers, time component extraction, and
+/// map/set transforms — all pure Klassic, all order-preserving.
+#[test]
+fn stdlib_completeness_round_two() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.list\nimport std.math\nimport std.time\nimport std.map\nimport std.set\nprintln(flatten([[1, 2], [3, 4]]))\nprintln(takeWhile([1, 2, 3, 1], (x) => x < 3))\nprintln(chunk([1, 2, 3, 4, 5], 2))\nprintln(maxBy([1, 5, 3], (x) => x))\nprintln(lcm(4, 6))\nprintln(factorial(5))\nprintln(isPrime(7))\nprintln(year(0))\nprintln(formatHuman(951868800000))\nprintln(toPairs(%[\"a\": 1, \"b\": 2]))\nprintln(setMap(%(1, 2, 3), (x) => x * 2))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "round-2 stdlib should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[1, 2, 3, 4]\n[1, 2]\n[[1, 2], [3, 4], [5]]\n5\n12\n120\ntrue\n1970\n2000-03-01 00:00:00\n[[a, 1], [b, 2]]\n%(2, 4, 6)\n()\n"
+    );
+}
+
 /// CI guard: the direct Mach-O backend's binaries can only run on
 /// Apple Silicon, so every test that builds *and executes* that
 /// backend's output is `#[cfg(all(target_os = "macos", target_arch =
