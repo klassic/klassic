@@ -41,7 +41,68 @@ extension (this: String) {
   def isInteger() = String#isInt(this)
   // Predicate: true iff the string is a valid floating-point number.
   def isFloat() = String#isDouble(this)
+  // Count non-overlapping occurrences of `sub` in `this`. Empty `sub`
+  // returns 0.
+  def countOccurrences(sub) = countOccurrences(this, sub)
+  // Uppercase the first character; leave the rest unchanged. Empty
+  // string stays "".
+  def capitalized() = capitalize(this)
+  // Indent every line of `this` by `n` spaces.
+  def indented(n) = indent(this, n)
+  // Strip a leading prefix; return `this` unchanged when absent.
+  def withoutPrefix(prefix) = stripPrefix(this, prefix)
+  // Strip a trailing suffix; return `this` unchanged when absent.
+  def withoutSuffix(suffix) = stripSuffix(this, suffix)
 }
+
+// ---------- countOccurrences ------------------------------------------------
+
+// Number of non-overlapping occurrences of `sub` in `s`. Returns 0 for
+// an empty `sub`.
+def countOccurrences(s, sub) = if(isEmptyString(sub)) 0 else size(split(s, sub)) - 1
+
+// ---------- capitalize ------------------------------------------------------
+
+// Uppercase the first character of `s`; leave the rest unchanged.
+// Returns "" when `s` is empty.
+def capitalize(s) =
+  if(isEmptyString(s)) ""
+  else toUpperCase(substring(s, 0, 1)) + substring(s, 1, length(s))
+
+// ---------- unlines ---------------------------------------------------------
+
+// Join a list of strings with newline separators (no trailing newline).
+// Returns "" for an empty list.
+def unlines(xs) =
+  if(isEmpty(xs)) ""
+  else foldLeft(tail(xs))(toString(head(xs)))((acc, x) => acc + "\n" + toString(x))
+
+// ---------- indent ----------------------------------------------------------
+
+// Build a string of `n` space characters.
+def stringSpaces(n) = if((n <= 0)) "" else " " + stringSpaces(n - 1)
+
+// Join a non-empty list of lines with newline separators, prefixing
+// each line with `prefix`.
+def indentJoinLines(ls, prefix) =
+  foldLeft(tail(ls))(prefix + toString(head(ls)))((acc, x) => acc + "\n" + prefix + toString(x))
+
+// Indent every line of `s` by `n` spaces.
+def indent(s, n) = indentJoinLines(split(s, "\n"), stringSpaces(n))
+
+// ---------- stripPrefix / stripSuffix ---------------------------------------
+
+// Return `s` with `prefix` removed from the front, or `s` unchanged when
+// `s` does not start with `prefix`.
+def stripPrefix(s, prefix) =
+  if(startsWith(s, prefix)) substring(s, length(prefix), length(s)) else s
+
+// Return `s` with `suffix` removed from the end, or `s` unchanged when
+// `s` does not end with `suffix`.
+def stripSuffix(s, suffix) =
+  if(endsWith(s, suffix)) substring(s, 0, length(s) - length(suffix)) else s
+
+// ---------- parse helpers ---------------------------------------------------
 
 def parseInt(s) = String#parseInt(s)
 
