@@ -3163,10 +3163,19 @@ impl TypeChecker {
                 "args",
                 Type::Function(vec![], Box::new(Type::List(Box::new(Type::String)))),
             )],
-            "Process" => &[(
-                "exit",
-                Type::Function(vec![Type::Int], Box::new(Type::Unit)),
-            )],
+            "Process" => &[
+                (
+                    "exit",
+                    Type::Function(vec![Type::Int], Box::new(Type::Unit)),
+                ),
+                (
+                    "run",
+                    Type::Function(
+                        vec![Type::String, Type::List(Box::new(Type::String))],
+                        Box::new(process_run_result_type()),
+                    ),
+                ),
+            ],
             "Dir" => &[
                 ("current", Type::Function(vec![], Box::new(Type::String))),
                 ("home", Type::Function(vec![], Box::new(Type::String))),
@@ -4280,6 +4289,20 @@ fn resolve_user_instance_types() -> Vec<InstanceInfo> {
     USER_INSTANCE_INFOS.with(|instances| instances.borrow().clone())
 }
 
+/// Structural record type returned by `Process#run`:
+/// `record { stdout: String; stderr: String; exitCode: Int }`. Built as a
+/// closed row so `.stdout`, `.stderr`, and `.exitCode` type-check.
+fn process_run_result_type() -> Type {
+    let row = Type::RowExtend(
+        "exitCode".to_string(),
+        Box::new(Type::Int),
+        Box::new(Type::RowEmpty),
+    );
+    let row = Type::RowExtend("stderr".to_string(), Box::new(Type::String), Box::new(row));
+    let row = Type::RowExtend("stdout".to_string(), Box::new(Type::String), Box::new(row));
+    Type::StructuralRecord(Box::new(row))
+}
+
 fn builtin_module_type_exports(path: &str) -> Option<ModuleTypeExports> {
     let entries: &[(&str, Type)] = match path {
         "Map" => &[
@@ -4462,10 +4485,19 @@ fn builtin_module_type_exports(path: &str) -> Option<ModuleTypeExports> {
             "args",
             Type::Function(vec![], Box::new(Type::List(Box::new(Type::String)))),
         )],
-        "Process" => &[(
-            "exit",
-            Type::Function(vec![Type::Int], Box::new(Type::Unit)),
-        )],
+        "Process" => &[
+            (
+                "exit",
+                Type::Function(vec![Type::Int], Box::new(Type::Unit)),
+            ),
+            (
+                "run",
+                Type::Function(
+                    vec![Type::String, Type::List(Box::new(Type::String))],
+                    Box::new(process_run_result_type()),
+                ),
+            ),
+        ],
         "Dir" => &[
             ("current", Type::Function(vec![], Box::new(Type::String))),
             ("home", Type::Function(vec![], Box::new(Type::String))),

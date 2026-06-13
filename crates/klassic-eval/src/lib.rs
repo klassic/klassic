@@ -1521,7 +1521,7 @@ fn builtin_module_members(path: &str) -> Option<&'static [&'static str]> {
         "StandardInput" => Some(&["all", "lines"]),
         "Environment" => Some(&["vars", "get", "exists"]),
         "CommandLine" => Some(&["args"]),
-        "Process" => Some(&["exit"]),
+        "Process" => Some(&["exit", "run"]),
         "Dir" => Some(&[
             "current",
             "home",
@@ -3263,6 +3263,34 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             ensure_arity(name, arguments, 1, span)?;
             let code = expect_non_negative_int(&arguments[0], "Process#exit", span)?;
             std::process::exit(code as i32);
+        }
+        "Process#run" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let command = expect_string(&arguments[0], "Process#run", span)?;
+            let arg_values = expect_list(&arguments[1], "Process#run", span)?;
+            let mut args: Vec<String> = Vec::with_capacity(arg_values.len());
+            for arg in arg_values {
+                args.push(expect_string(arg, "Process#run", span)?.to_string());
+            }
+            let process_record = |stdout: String, stderr: String, exit_code: i64| Value::Record {
+                name: String::new(),
+                fields: vec![
+                    ("stdout".to_string(), Value::String(stdout)),
+                    ("stderr".to_string(), Value::String(stderr)),
+                    ("exitCode".to_string(), Value::Int(exit_code)),
+                ],
+            };
+            match std::process::Command::new(command).args(&args).output() {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                    // `code()` is `None` when the process was terminated by a
+                    // signal; report -1 for that just like a spawn failure.
+                    let exit_code = output.status.code().map(i64::from).unwrap_or(-1);
+                    Ok(process_record(stdout, stderr, exit_code))
+                }
+                Err(error) => Ok(process_record(String::new(), error.to_string(), -1)),
+            }
         }
         "Dir#current" => std::env::current_dir()
             .map(|path| Value::String(path.display().to_string()))

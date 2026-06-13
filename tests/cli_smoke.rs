@@ -24888,3 +24888,38 @@ fn string_parse_int_or_parse_double_or_is_int_is_double() {
         "42\n99\n3.14\n1.5\ntrue\nfalse\ntrue\nfalse\n0\n()\n"
     );
 }
+
+#[test]
+fn process_run_captures_stdout_and_exit_codes() {
+    // `echo` exists on every CI environment; this stays hermetic by only
+    // invoking it and the builtin `no_such_cmd_xyz` failure path.
+    let snippet = concat!(
+        // run echo: stdout captured with trailing newline, exit code 0
+        r#"val ok = Process#run("echo", ["hello"])"#,
+        "\n",
+        r#"println(ok.stdout)"#,
+        "\n",
+        r#"println(ok.exitCode)"#,
+        "\n",
+        // spawn failure: exit code -1, no crash, stderr non-empty
+        r#"val bad = Process#run("no_such_cmd_xyz", [])"#,
+        "\n",
+        r#"println(bad.exitCode)"#,
+        "\n",
+        r#"println(bad.stderr != "")"#,
+        "\n",
+    );
+    let output = Command::new(klassic_bin())
+        .args(["-e", snippet])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "Process#run should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "hello\n\n0\n-1\ntrue\n()\n"
+    );
+}

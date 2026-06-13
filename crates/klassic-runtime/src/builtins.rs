@@ -421,6 +421,11 @@ pub const BUILTINS: &[BuiltinDescriptor] = &[
         aliases: &["exit"],
         arity: 1,
     },
+    BuiltinDescriptor {
+        canonical: "Process#run",
+        aliases: &[],
+        arity: 2,
+    },
     // --- Directory ---
     BuiltinDescriptor {
         canonical: "Dir#current",
