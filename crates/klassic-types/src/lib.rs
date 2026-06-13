@@ -2627,6 +2627,11 @@ impl TypeChecker {
             Type::Function(vec![Type::String], Box::new(Type::Int)),
         );
         self.declare_poly(
+            "String#parseDouble".to_string(),
+            false,
+            Type::Function(vec![Type::String], Box::new(Type::Double)),
+        );
+        self.declare_poly(
             "Math#powInt".to_string(),
             false,
             Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int)),
@@ -2681,6 +2686,27 @@ impl TypeChecker {
             false,
             Type::Function(vec![Type::Double], Box::new(Type::Double)),
         );
+        self.declare_poly(
+            "round".to_string(),
+            false,
+            Type::Function(vec![Type::Dynamic], Box::new(Type::Int)),
+        );
+        for name in [
+            "sin", "cos", "tan", "asin", "acos", "atan", "exp", "log", "log10", "log2",
+        ] {
+            self.declare_poly(
+                name.to_string(),
+                false,
+                Type::Function(vec![Type::Dynamic], Box::new(Type::Double)),
+            );
+        }
+        for name in ["pow", "atan2"] {
+            self.declare_poly(
+                name.to_string(),
+                false,
+                Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Double)),
+            );
+        }
         self.declare_poly(
             "abs".to_string(),
             false,

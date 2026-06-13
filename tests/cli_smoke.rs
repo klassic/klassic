@@ -31,6 +31,30 @@ fn macos_ci_must_be_apple_silicon_for_aarch64_execution() {
     );
 }
 
+/// Floating-point math gained the staples it lacked: round, pow,
+/// the transcendentals (sin/cos/log/exp/...), and String parsing
+/// (`parseDouble` / `.toDouble()`). Numeric arguments coerce, so
+/// `sin(0)` and `sin(0.0)` both work.
+#[test]
+fn floating_point_math_builtins() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.string\nprintln(round(3.7))\nprintln(round(3.2))\nprintln(pow(2.0, 10.0))\nprintln(sin(0.0))\nprintln(exp(0.0))\nprintln(log10(1000.0))\nprintln(\"2.5\".toDouble() + 0.5)\nprintln(parseDouble(\"42\") * 2.0)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "math builtins should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "4\n3\n1024.0\n0.0\n1.0\n3.0\n3.0\n84.0\n()\n"
+    );
+}
+
 /// std.list grew the fundamental higher-order operations it lacked —
 /// reverse, flatMap, distinct, indexOf, containsItem — plus method
 /// forms (`.reversed()`, `.fold(init)(f)`, `.reduce(f)`, ...). The

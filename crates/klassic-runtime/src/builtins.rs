@@ -107,6 +107,71 @@ pub const BUILTINS: &[BuiltinDescriptor] = &[
         aliases: &[],
         arity: 1,
     },
+    BuiltinDescriptor {
+        canonical: "round",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "sin",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "cos",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "tan",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "asin",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "acos",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "atan",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "exp",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "log",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "log10",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "log2",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "pow",
+        aliases: &[],
+        arity: 2,
+    },
+    BuiltinDescriptor {
+        canonical: "atan2",
+        aliases: &[],
+        arity: 2,
+    },
     // --- String helpers ---
     BuiltinDescriptor {
         canonical: "toString",
@@ -486,6 +551,11 @@ pub const BUILTINS: &[BuiltinDescriptor] = &[
     },
     BuiltinDescriptor {
         canonical: "String#parseInt",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "String#parseDouble",
         aliases: &[],
         arity: 1,
     },

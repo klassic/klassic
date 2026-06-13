@@ -30,7 +30,7 @@ mod value;
 use builtin_registry::{builtin_arity, builtin_name, value_method_builtin_name};
 use builtin_support::{
     clamp_index, ensure_arity, expect_clamped_index, expect_list, expect_map,
-    expect_non_negative_int, expect_set, expect_string, simple_regex_is_match,
+    expect_non_negative_int, expect_set, expect_string, number_as_f64, simple_regex_is_match,
     simple_regex_replace_all,
 };
 use environment::{AssignmentFailure, Binding, Environment};
@@ -2626,6 +2626,16 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
                 )
             })
         }
+        "String#parseDouble" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let text = expect_string(&arguments[0], "String#parseDouble", span)?;
+            text.trim().parse::<f64>().map(Value::Double).map_err(|_| {
+                Diagnostic::runtime(
+                    span,
+                    format!("String#parseDouble failed to parse {text:?} as a number"),
+                )
+            })
+        }
         "Math#gcd" => {
             ensure_arity(name, arguments, 2, span)?;
             let mut a = match arguments[0] {
@@ -2711,6 +2721,45 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
                 Value::Double(value) => Ok(Value::Double(value.sqrt())),
                 _ => Err(Diagnostic::runtime(span, "sqrt expects a number")),
             }
+        }
+        "round" => {
+            ensure_arity(name, arguments, 1, span)?;
+            match &arguments[0] {
+                Value::Int(value) => Ok(Value::Int(*value)),
+                Value::Long(value) => Ok(Value::Int(*value)),
+                Value::Float(value) => Ok(Value::Int(value.round() as i64)),
+                Value::Double(value) => Ok(Value::Int(value.round() as i64)),
+                _ => Err(Diagnostic::runtime(span, "round expects a number")),
+            }
+        }
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "exp" | "log" | "log10" | "log2" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let x = number_as_f64(&arguments[0], name, span)?;
+            let result = match name {
+                "sin" => x.sin(),
+                "cos" => x.cos(),
+                "tan" => x.tan(),
+                "asin" => x.asin(),
+                "acos" => x.acos(),
+                "atan" => x.atan(),
+                "exp" => x.exp(),
+                "log" => x.ln(),
+                "log10" => x.log10(),
+                _ => x.log2(),
+            };
+            Ok(Value::Double(result))
+        }
+        "pow" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let base = number_as_f64(&arguments[0], name, span)?;
+            let exponent = number_as_f64(&arguments[1], name, span)?;
+            Ok(Value::Double(base.powf(exponent)))
+        }
+        "atan2" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let y = number_as_f64(&arguments[0], name, span)?;
+            let x = number_as_f64(&arguments[1], name, span)?;
+            Ok(Value::Double(y.atan2(x)))
         }
         "toString" => {
             ensure_arity(name, arguments, 1, span)?;

@@ -29,6 +29,11 @@ extension (this: String) {
   // (a Result-returning variant can layer on once parse failures are
   // recoverable in-language).
   def toInt() = String#parseInt(this)
+  // Floating-point parse; a non-numeric string is a runtime error
+  // (same caveat as `toInt`).
+  def toDouble() = String#parseDouble(this)
 }
 
 def parseInt(s) = String#parseInt(s)
+
+def parseDouble(s) = String#parseDouble(s)

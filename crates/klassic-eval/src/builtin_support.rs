@@ -35,6 +35,21 @@ pub(crate) fn expect_string<'a>(
     }
 }
 
+/// Coerce any numeric value to `f64` for the floating-point math
+/// builtins (`sin`, `pow`, ...).
+pub(crate) fn number_as_f64(value: &Value, name: &str, span: Span) -> Result<f64, Diagnostic> {
+    match value {
+        Value::Int(number) => Ok(*number as f64),
+        Value::Long(number) => Ok(*number as f64),
+        Value::Float(number) => Ok(*number as f64),
+        Value::Double(number) => Ok(*number),
+        _ => Err(Diagnostic::runtime(
+            span,
+            format!("{name} expects a number"),
+        )),
+    }
+}
+
 /// An index argument for the clamping string slicers (`substring` /
 /// `at`): negatives clamp to 0, matching `klassic_rt` and both native
 /// backends (issue #434 — the evaluator used to reject them).
