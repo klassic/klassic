@@ -22,6 +22,31 @@ def filterValues(m, p) =
 def merge(m, other) =
   foldLeft(Map#keys(other))(m)((acc, k) => Map#put(acc, k, Map#get(other, k)))
 
+// Reverse a list using only the global `cons` / `foldLeft` builtins
+// (so std.map stays import-free). Used to undo the prepend order of
+// the fold-builders below, keeping insertion order.
+def mapReverse(xs) = foldLeft(xs)([])((acc, x) => cons(x)(acc))
+
+// toPairs — convert a map to a list of [key, value] pairs in
+// insertion order. entries is an alias for toPairs.
+def toPairs(m) =
+  mapReverse(foldLeft(Map#keys(m))([])((acc, k) => cons([k, Map#get(m, k)])(acc)))
+
+def entries(m) = toPairs(m)
+
+// foldMap — fold over all entries of a map.
+// f takes (acc, key, value) as three separate arguments.
+// Also exported as `fold` for ergonomics.
+def foldMap(m, init, f) =
+  foldLeft(Map#keys(m))(init)((acc, k) => f(acc, k, Map#get(m, k)))
+
+def fold(m, init, f) = foldMap(m, init, f)
+
+// mapKeys — apply g to every key, keeping values.
+// If g produces duplicate keys the later key wins (insertion order of keys).
+def mapKeys(m, g) =
+  Map#fromPairs(mapReverse(foldLeft(Map#keys(m))([])((acc, k) => cons([g(k), Map#get(m, k)])(acc))))
+
 extension <k, v>(this: Map<k, v>) {
   def containsKey(key) = Map#containsKey(this, key)
   def containsValue(value) = Map#containsValue(this, value)
@@ -32,4 +57,8 @@ extension <k, v>(this: Map<k, v>) {
   def mapValues(f) = mapValues(this, f)
   def filterValues(p) = filterValues(this, p)
   def merge(other) = merge(this, other)
+  def toPairs() = toPairs(this)
+  def entries() = toPairs(this)
+  def foldMap(init) = (f) => foldLeft(Map#keys(this))(init)((acc, k) => f(acc, k, Map#get(this, k)))
+  def mapKeys(g) = mapKeys(this, g)
 }

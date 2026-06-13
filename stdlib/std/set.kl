@@ -3,8 +3,27 @@ module std.set
 // Set helpers exposed as extension methods on Set<a>. They delegate
 // to the existing `Set#*` builtins.
 
+// Reverse a list with only the global `cons` / `foldLeft` builtins,
+// so the fold-builder below keeps insertion order.
+def setReverse(xs) = foldLeft(xs)([])((acc, x) => cons(x)(acc))
+
+// setMap — apply f to every element and collect results into a new Set.
+def setMap(s, f) =
+  Set#fromList(setReverse(foldLeft(Set#toList(s))([])((acc, x) => cons(f(x))(acc))))
+
+// setFilter — keep only elements that satisfy predicate p.
+def setFilter(s, p) =
+  foldLeft(Set#toList(s))(Set#empty())((acc, x) => if(p(x)) Set#add(acc, x) else acc)
+
+// setFold — fold over all elements of the set.
+// f takes (acc, element) as two separate arguments.
+def setFold(s, init, f) = foldLeft(Set#toList(s))(init)(f)
+
 extension <a>(this: Set<a>) {
   def containsElement(value) = Set#contains(this, value)
   def isEmptySet() = Set#isEmpty(this)
   def sizeOf() = Set#size(this)
+  def setMap(f) = Set#fromList(setReverse(foldLeft(Set#toList(this))([])((acc, x) => cons(f(x))(acc))))
+  def setFilter(p) = foldLeft(Set#toList(this))(Set#empty())((acc, x) => if(p(x)) Set#add(acc, x) else acc)
+  def setFold(init) = (f) => foldLeft(Set#toList(this))(init)(f)
 }
