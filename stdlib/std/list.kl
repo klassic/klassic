@@ -57,6 +57,67 @@ def indexOf(xs, x) = indexOfFrom(xs, x, 0)
 // Drop later duplicates, keeping each element's first occurrence.
 def distinct(xs) = if(isEmpty(xs)) [] else cons(head(xs))(distinct(filter(tail(xs), (y) => y != head(xs))))
 
+// ---------- flatten ---------------------------------------------------------
+
+// Flatten a list of lists into a single list.
+def flatten(xss) = foldLeft(xss)([])((acc, xs) => concat(acc, xs))
+
+// ---------- takeWhile / dropWhile -------------------------------------------
+
+// Take elements from the front while predicate `p` holds.
+def takeWhile(xs, p) =
+  if(isEmpty(xs)) []
+  else if(p(head(xs))) cons(head(xs))(takeWhile(tail(xs), p))
+  else []
+
+// Drop elements from the front while predicate `p` holds.
+def dropWhile(xs, p) =
+  if(isEmpty(xs)) []
+  else if(p(head(xs))) dropWhile(tail(xs), p)
+  else xs
+
+// ---------- zipWithIndex ----------------------------------------------------
+
+// Helper: pair each element with its index starting at `i`.
+// Returns a list of records { item: a; index: Int }.
+def zipWithIndexFrom(xs, i) =
+  if(isEmpty(xs)) []
+  else cons(record { item: head(xs); index: i })(zipWithIndexFrom(tail(xs), i + 1))
+
+// Pair each element with its zero-based index.
+// Returns List<{ item: a; index: Int }>.
+def zipWithIndex(xs) = zipWithIndexFrom(xs, 0)
+
+// ---------- maxBy / minBy ---------------------------------------------------
+
+// Return the element for which `key(x)` is greatest (non-empty list).
+def maxBy(xs, key) =
+  foldLeft(tail(xs))(head(xs))((acc, x) => if(key(x) > key(acc)) x else acc)
+
+// Return the element for which `key(x)` is smallest (non-empty list).
+def minBy(xs, key) =
+  foldLeft(tail(xs))(head(xs))((acc, x) => if(key(x) < key(acc)) x else acc)
+
+// ---------- chunk -----------------------------------------------------------
+
+// Split `xs` into non-overlapping sublists of at most `n` elements.
+def chunk(xs, n) =
+  if(isEmpty(xs)) []
+  else cons(take(xs, n))(chunk(drop(xs, n), n))
+
+// ---------- slice -----------------------------------------------------------
+
+// Return elements at indices [from, to) — drop `from`, then take `to - from`.
+def slice(xs, from, to) = take(drop(xs, from), to - from)
+
+// ---------- scanLeft --------------------------------------------------------
+
+// Like foldLeft but collect every intermediate accumulator value.
+// scanLeft([1,2,3], 0, f) = [0, f(0,1), f(f(0,1),2), f(f(f(0,1),2),3)]
+def scanLeft(xs, init, f) =
+  if(isEmpty(xs)) [init]
+  else cons(init)(scanLeft(tail(xs), f(init, head(xs)), f))
+
 // ---------- sort / sortBy ---------------------------------------------------
 
 // Insertion-sort helper: insert `x` into an already-sorted list.
@@ -155,6 +216,22 @@ extension <a>(this: List<a>) {
   def groupedBy(key) = groupBy(this, key)
   // Join with toString and separator: `xs.mkStringWith("-")`.
   def mkStringWith(sep) = mkString(this, sep)
+  // Take elements while predicate holds: `xs.takeWhileBy(p)`.
+  def takeWhileBy(p) = takeWhile(this, p)
+  // Drop elements while predicate holds: `xs.dropWhileBy(p)`.
+  def dropWhileBy(p) = dropWhile(this, p)
+  // Pair each element with its zero-based index: `xs.withIndex()`.
+  def withIndex() = zipWithIndex(this)
+  // Return the element with the greatest key: `xs.maxByKey(f)`.
+  def maxByKey(key) = maxBy(this, key)
+  // Return the element with the smallest key: `xs.minByKey(f)`.
+  def minByKey(key) = minBy(this, key)
+  // Split into sublists of at most `n` elements: `xs.chunked(n)`.
+  def chunked(n) = chunk(this, n)
+  // Sublist [from, to): `xs.sliced(from, to)`.
+  def sliced(from, to) = slice(this, from, to)
+  // Collect intermediate fold results: `xs.scanned(init, f)`.
+  def scanned(init) = (f) => scanLeft(this, init, f)
 }
 
 extension (this: List<Int>) {
