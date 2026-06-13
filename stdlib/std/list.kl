@@ -57,6 +57,68 @@ def indexOf(xs, x) = indexOfFrom(xs, x, 0)
 // Drop later duplicates, keeping each element's first occurrence.
 def distinct(xs) = if(isEmpty(xs)) [] else cons(head(xs))(distinct(filter(tail(xs), (y) => y != head(xs))))
 
+// ---------- sort / sortBy ---------------------------------------------------
+
+// Insertion-sort helper: insert `x` into an already-sorted list.
+// Works for any ordered type (Int, Double) because it uses `<=`.
+def insertSorted(sorted, x) =
+  if(isEmpty(sorted)) [x]
+  else if(x <= head(sorted)) cons(x)(sorted)
+  else cons(head(sorted))(insertSorted(tail(sorted), x))
+
+// Sort a list of numbers (Int or Double) in ascending order.
+// Uses insertion sort via `foldLeft` — O(n²) but pure and simple.
+def sort(xs) = foldLeft(xs)([])(insertSorted)
+
+// Insertion-sort helper that compares by a key function.
+def insertSortedBy(key, sorted, x) =
+  if(isEmpty(sorted)) [x]
+  else if(key(x) <= key(head(sorted))) cons(x)(sorted)
+  else cons(head(sorted))(insertSortedBy(key, tail(sorted), x))
+
+// Sort `xs` by the numeric value returned by `key(x)`.
+def sortBy(xs, key) = foldLeft(xs)([])((acc, x) => insertSortedBy(key, acc, x))
+
+// ---------- zip -------------------------------------------------------------
+
+// Zip two lists into a list of 2-element lists, stopping at the shorter one.
+def zip(xs, ys) =
+  if(isEmpty(xs)) []
+  else if(isEmpty(ys)) []
+  else cons([head(xs), head(ys)])(zip(tail(xs), tail(ys)))
+
+// ---------- partition -------------------------------------------------------
+
+// Split `xs` into [[trueList], [falseList]] according to predicate `p`.
+def partition(xs, p) =
+  [filter(xs, p), filter(xs, (x) => if(p(x)) false else true)]
+
+// ---------- groupBy ---------------------------------------------------------
+
+// Append `x` into the group keyed by `k`, or create a new group.
+// Each group is a record { key: K; items: List<V> }.
+def addToGroup(groups, k, x) =
+  if(isEmpty(groups))
+    [record { key: k; items: [x] }]
+  else if(head(groups).key == k)
+    cons(record { key: k; items: concat(head(groups).items, [x]) })(tail(groups))
+  else
+    cons(head(groups))(addToGroup(tail(groups), k, x))
+
+// Group elements of `xs` by the value returned by `key(x)`.
+// Returns a list of records { key: K; items: List<V> } in insertion order.
+def groupBy(xs, key) = foldLeft(xs)([])((acc, x) => addToGroup(acc, key(x), x))
+
+// ---------- mkString --------------------------------------------------------
+
+// Render each element with `toString` and join with `sep`.  Returns "" for
+// an empty list.
+def mkString(xs, sep) =
+  if(isEmpty(xs)) ""
+  else foldLeft(tail(xs))(toString(head(xs)))((acc, x) => acc + sep + toString(x))
+
+// ---------- method-style helpers (generic) ----------------------------------
+
 // Method-style helpers for any list. `this.method()` syntax delegates
 // to the equivalent module-level def above; users can pick whichever
 // reads better at the call site.
@@ -83,6 +145,16 @@ extension <a>(this: List<a>) {
   def fold(init) = (f) => foldLeft(this)(init)(f)
   // `reduce` over a non-empty list: fold from the head with no seed.
   def reduce(f) = foldLeft(tail(this))(head(this))(f)
+  // Sort by a numeric key function: `xs.sortedBy((x) => x.field)`.
+  def sortedBy(key) = sortBy(this, key)
+  // Zip with another list: `xs.zipWith(ys)`.
+  def zipWith(ys) = zip(this, ys)
+  // Split into [trueList, falseList]: `xs.partitionBy(p)`.
+  def partitionBy(p) = partition(this, p)
+  // Group by a key function, returning records {key, items}.
+  def groupedBy(key) = groupBy(this, key)
+  // Join with toString and separator: `xs.mkStringWith("-")`.
+  def mkStringWith(sep) = mkString(this, sep)
 }
 
 extension (this: List<Int>) {
@@ -90,8 +162,12 @@ extension (this: List<Int>) {
   def productOf() = product(this)
   def minimum() = foldLeft(tail(this))(head(this))((a, b) => if((a <= b)) a else b)
   def maximum() = foldLeft(tail(this))(head(this))((a, b) => if((a >= b)) a else b)
+  // Sort in ascending order: `xs.sorted()`.
+  def sorted() = sort(this)
 }
 
 extension (this: List<Double>) {
   def totalDouble() = foldLeft(this)(0.0)((a, b) => a + b)
+  // Sort in ascending order: `xs.sorted()`.
+  def sorted() = sort(this)
 }

@@ -24608,3 +24608,70 @@ fn deep_recursion_survives_stack_growth() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "5000\n()\n");
 }
+
+/// std.list gained sort / sortBy / zip / partition / groupBy / mkString
+/// (issue #437). All six free functions and their method aliases are
+/// exercised here through the evaluator.
+#[test]
+fn std_list_sort_zip_partition_group_mkstring() {
+    // Build the Klassic snippet as a single &str so newlines are literal.
+    let snippet = concat!(
+        "import std.list\n",
+        // sort — ascending insertion sort for numbers
+        "println(sort([3, 1, 2]))\n",
+        "println(sort([5, 3, 8, 1, 4]))\n",
+        // sortBy — sort by a key function (reverse order via negation)
+        "println(sortBy([3, 1, 2], (x) => x))\n",
+        "println(sortBy([3, 1, 2], (x) => 0 - x))\n",
+        // zip — same-type lists paired as 2-element sub-lists; stops at shorter
+        "println(zip([1, 2, 3], [4, 5, 6]))\n",
+        "println(zip([1, 2], [10, 20, 30]))\n",
+        // partition — [trueList, falseList]
+        "println(partition([1, 2, 3, 4, 5], (x) => x > 3))\n",
+        // mkString — toString + separator join; empty list yields ""
+        "println(mkString([1, 2, 3], \"-\"))\n",
+        "println(mkString([], \",\"))\n",
+        "println(mkString([\"a\", \"b\", \"c\"], \", \"))\n",
+        // groupBy — returns list of records {key, items} in insertion order
+        "val gs = groupBy([1, 2, 3, 4, 5, 6], (x) => if(x > 3) \"big\" else \"small\")\n",
+        "foreach(g in gs) { println(g.key + \"=\" + mkString(g.items, \":\")) }\n",
+        // method aliases
+        "println([3, 1, 2].sorted())\n",
+        "println([3.5, 1.2, 2.7].sorted())\n",
+        "println([3, 1, 2].sortedBy((x) => x))\n",
+        "println([1, 2].zipWith([10, 20]))\n",
+        "println([1, 2, 3, 4].partitionBy((x) => x > 2))\n",
+        "println([1, 2, 3].mkStringWith(\"-\"))\n",
+    );
+    let output = Command::new(klassic_bin())
+        .args(["-e", snippet])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "std.list sort/zip/partition/groupBy/mkString should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[1, 2, 3]\n\
+         [1, 3, 4, 5, 8]\n\
+         [1, 2, 3]\n\
+         [3, 2, 1]\n\
+         [[1, 4], [2, 5], [3, 6]]\n\
+         [[1, 10], [2, 20]]\n\
+         [[4, 5], [1, 2, 3]]\n\
+         1-2-3\n\
+         \n\
+         a, b, c\n\
+         small=1:2:3\n\
+         big=4:5:6\n\
+         [1, 2, 3]\n\
+         [1.2, 2.7, 3.5]\n\
+         [1, 2, 3]\n\
+         [[1, 10], [2, 20]]\n\
+         [[3, 4], [1, 2]]\n\
+         1-2-3\n\
+         ()\n"
+    );
+}
