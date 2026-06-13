@@ -37,3 +37,40 @@ extension (this: Double) {
   def signOfD() = if((this > 0.0)) 1 else if((this < 0.0)) -1 else 0
   def clampToD(lo, hi) = if((this < lo)) lo else if((this > hi)) hi else this
 }
+
+// Constants (as 0-argument defs since Klassic has no const)
+def pi() = atan2(0.0, -1.0)
+
+def e() = exp(1.0)
+
+// Angle conversions
+def degreesToRadians(d) = d * pi() / 180.0
+
+def radiansToDegrees(r) = r * 180.0 / pi()
+
+// LCM: Least Common Multiple
+def lcm(a, b) = if((a == 0 || b == 0)) 0 else abs(a * b) / Math#gcd(a, b)
+
+// Hypot: sqrt(x^2 + y^2) for computing hypotenuse
+def hypot(x, y) = sqrt(double(x) * double(x) + double(y) * double(y))
+
+// Factorial: recursive definition
+def factorial(n) = if((n <= 1)) 1 else n * factorial(n - 1)
+
+// isPrime: check if a number is prime
+def isPrime(n) =
+  if((n < 2)) false
+  else if((n == 2)) true
+  else if((mod(n, 2) == 0)) false
+  else isPrimeHelper(n, 3)
+
+def isPrimeHelper(n, divisor) =
+  if((divisor * divisor > n)) true
+  else if((mod(n, divisor) == 0)) false
+  else isPrimeHelper(n, divisor + 2)
+
+// Extension methods for practical integration with Double
+extension (this: Double) {
+  def toRadians() = this * pi() / 180.0
+  def toDegrees() = this * 180.0 / pi()
+}
