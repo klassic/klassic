@@ -30,6 +30,30 @@ fn stdlib_completeness_round_two() {
     );
 }
 
+/// std.option / std.result richer API (#447). The collision-suffixed
+/// free names (filterOption/foldOption/orElseResult) coexist with
+/// std.list's filter when all three modules are co-imported — the
+/// case that broke native inlining before the rename.
+#[test]
+fn stdlib_option_result_richer_api() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.option\nimport std.result\nimport std.list\nprintln(filterOption(some(5), (x) => x > 3))\nprintln(toList(some(42)))\nprintln(foldOption(some(2), 0, (x) => x * 10))\nprintln(andThen(ok(3), (x) => ok(x + 1)))\nprintln(mapErr(err(\"boom\"), (e) => e + \"!\"))\nprintln(orElseResult(err(\"x\"), (e) => ok(0)))\nprintln(toOption(ok(7)))\nprintln(filter([1, 2, 3, 4], (x) => x > 2))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "option/result API should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Some(5)\n[42]\n20\nOk(4)\nErr(boom!)\nOk(0)\nSome(7)\n[3, 4]\n()\n"
+    );
+}
+
 /// CI guard: the direct Mach-O backend's binaries can only run on
 /// Apple Silicon, so every test that builds *and executes* that
 /// backend's output is `#[cfg(all(target_os = "macos", target_arch =
