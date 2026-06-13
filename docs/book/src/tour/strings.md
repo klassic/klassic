@@ -56,6 +56,51 @@ val tidy = "  Klassic  ".trim().toUpperCase()
 println(tidy)   // KLASSIC
 ```
 
+## Formatting and padding
+
+`format(template, args)` fills each `{}` placeholder from the `args`
+list in order, rendering every element with `toString`. A literal
+brace is written `{{`. `padStart` / `padEnd` widen a string to a
+target width with a chosen pad string; both have method twins.
+
+```kl
+println(format("Hello, {}! You have {} messages.", ["Klassic", "3"]))
+                              // Hello, Klassic! You have 3 messages.
+println(format("{{not a slot}} {}", ["filled"]))
+                              // {not a slot} filled
+println(padStart("7", 3, "0"))    // 007
+println(padEnd("7", 3, "."))      // 7..
+println("42".padStart(5, " "))    // "   42"
+```
+
+The `args` list is homogeneous like every Klassic list, so format an
+all-`Int` or all-`String` list — mix types by converting to strings
+first.
+
+## Parsing numbers
+
+`String#parseInt` / `String#parseDouble` parse a string or abort on
+bad input. The recoverable variants never crash: `toIntOr(d)` /
+`toDoubleOr(d)` fall back to `d`, and `isInteger()` / `isFloat()`
+report whether a parse would succeed.
+
+```kl
+println(String#parseInt("42"))      // 42
+println(String#parseDouble("3.14")) // 3.14
+
+println("42".toIntOr(0))            // 42
+println("oops".toIntOr(-1))         // -1
+println("3.14".toDoubleOr(0.0))     // 3.14
+println("nope".toDoubleOr(0.0))     // 0.0
+
+println("42".isInteger())           // true
+println("4.2".isFloat())            // true
+println("x".isInteger())            // false
+```
+
+The same operations are available as free functions under
+`import std.string.{parseInt, parseDouble, parseIntOr, parseDoubleOr}`.
+
 ## Heap strings
 
 When you need string values that grow at runtime (concatenating in a

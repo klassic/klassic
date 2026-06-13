@@ -30,6 +30,11 @@ prelude names without the prefix.
 | `any(xs, p)` / `all(xs, p)` / `count(xs, p)` | `any([1, 2, 3], (x) => x > 2)` |
 | `replicate(n, x)` | `replicate(3, "x")` → `["x", "x", "x"]` |
 | `sum(xs)` / `product(xs)` / `last(xs)` | `sum([1, 2, 3])` → `6` |
+| `sort(xs)` / `sortBy(xs, key)` | `sort([3, 1, 2])` → `[1, 2, 3]` |
+| `zip(xs, ys)` | `zip([1, 2], [3, 4])` → `[[1, 3], [2, 4]]` |
+| `partition(xs, p)` | `partition([1, 2, 3], isEven)` → `[[2], [1, 3]]` |
+| `groupBy(xs, key)` | groups into `{key, items}` records |
+| `mkString(xs, sep)` | `mkString([1, 2, 3], "-")` → `"1-2-3"` |
 
 The module also installs extension methods on `List<a>` and
 `List<Int>` so the same operations are reachable via dot syntax:
@@ -45,6 +50,17 @@ println([3, 1, 4, 1, 5, 9].minimum())  // 1   (List<Int>)
 println([3, 1, 4, 1, 5, 9].maximum())  // 9   (List<Int>)
 println([1.5, 2.5, 3.5].totalDouble()) // 7.5 (List<Double>)
 ```
+
+The higher-order helpers have matching method twins:
+
+```klassic
+println([5, 3, 8, 1].sorted())            // [1, 3, 5, 8] (List<Int>/<Double>)
+println([1, 2, 3].zipWith([10, 20, 30]))  // [[1, 10], [2, 20], [3, 30]]
+println([1, 2, 3].mkStringWith(" - "))    // 1 - 2 - 3
+```
+
+`.sortedBy(key)`, `.partitionBy(p)`, and `.groupedBy(key)` round out
+the dot-callable set.
 
 ## std.string
 
@@ -197,6 +213,30 @@ println(tags.sizeOf())                         // 2
 builtin — the underlying `Map#get` returns the raw value (or fails).
 `sizeOf()` and `isEmptyMap()` / `isEmptySet()` avoid name clashes
 with the top-level `size` / `isEmpty` builtins.
+
+`std.map` also adds the immutable transforms `mapValues(f)`,
+`filterValues(p)`, and `merge(other)` (right-hand entries win on a key
+clash). They build on the `Map#put` / `Map#remove` / `Map#fromPairs` /
+`Map#empty` builtins, which return fresh maps rather than mutating:
+
+```klassic
+val prices = %["apple": 100, "pear": 150]
+println(prices.put("kiwi", 80).getOrElse("kiwi", 0))    // 80
+println(prices.mapValues((v) => v - 10).getOrElse("apple", 0)) // 90
+println((%["a": 1]).merge(%["a": 9, "b": 2]).getOrElse("a", 0)) // 9
+```
+
+Sets carry the algebra builtins `Set#union` / `Set#intersect` /
+`Set#subtract` (plus `Set#add` / `Set#remove` / `Set#fromList` /
+`Set#toList` / `Set#empty`), each with a dot-callable twin:
+
+```klassic
+val a = %(1, 2, 3)
+val b = %(3, 4, 5)
+println(a.union(b).toList())       // [1, 2, 3, 4, 5]
+println(a.intersect(b).toList())   // [3]
+println(a.subtract(b).toList())    // [1, 2]
+```
 
 ## std.dir
 
