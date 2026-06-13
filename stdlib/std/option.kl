@@ -43,6 +43,33 @@ def orElse(o, alternative) = o match {
   case None => alternative
 }
 
+// filterOption(o, p): Some(v) if o is Some(v) and p(v), else None
+// (free name suffixed to avoid colliding with std.list.filter when
+// both are imported and inlined into one native type scope.)
+def filterOption(o, p) = o match {
+  case Some(v) => if(p(v)) Some(v) else None
+  case None => None
+}
+
+// toList(o): [v] if o is Some(v), [] if None
+def toList(o) = o match {
+  case Some(v) => [v]
+  case None => []
+}
+
+// foldOption(o, ifNone, f): ifNone if None, f(v) if Some(v)
+// (suffixed; std.map also has a free `fold`.)
+def foldOption(o, ifNone, f) = o match {
+  case Some(v) => f(v)
+  case None => ifNone
+}
+
+// ifPresent(o, f): runs f(v) if Some(v), unit if None
+def ifPresent(o, f) = o match {
+  case Some(v) => {f(v); ()}
+  case None => ()
+}
+
 // Method-style access. `opt.isSome()` and friends delegate to the
 // function-style helpers above; users can pick whichever reads
 // better at the call site.
@@ -70,5 +97,21 @@ extension <a>(this: Option<a>) {
   def orElse(alternative) = this match {
     case Some(v) => Some(v)
     case None => alternative
+  }
+  def filter(p) = this match {
+    case Some(v) => if(p(v)) Some(v) else None
+    case None => None
+  }
+  def toList() = this match {
+    case Some(v) => [v]
+    case None => []
+  }
+  def fold(ifNone, f) = this match {
+    case Some(v) => f(v)
+    case None => ifNone
+  }
+  def ifPresent(f) = this match {
+    case Some(v) => {f(v); ()}
+    case None => ()
   }
 }

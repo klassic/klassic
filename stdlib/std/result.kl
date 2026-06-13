@@ -1,5 +1,7 @@
 module std.result
 
+import std.option.{some, none}
+
 // Result/Either ADT. `Ok(value)` carries a success payload, `Err(message)`
 // carries a failure payload. Inspect via postfix `match` or the
 // extension methods at the bottom of the file.
@@ -33,6 +35,48 @@ def mapResult(r, f) = r match {
   case Err(m) => Err(m)
 }
 
+// flatMap(r, f): Ok(v) -> f(v) (f returns Result), Err(e) -> Err(e)
+def flatMapResult(r, f) = r match {
+  case Ok(v) => f(v)
+  case Err(m) => Err(m)
+}
+
+// andThen: alias for flatMap
+def andThen(r, f) = r match {
+  case Ok(v) => f(v)
+  case Err(m) => Err(m)
+}
+
+// mapErr(r, g): Err(e) -> Err(g(e)), Ok stays
+def mapErr(r, g) = r match {
+  case Ok(v) => Ok(v)
+  case Err(m) => Err(g(m))
+}
+
+// orElse(r, h): Err(e) -> h(e) (h returns Result), Ok stays
+def orElseResult(r, h) = r match {
+  case Ok(v) => Ok(v)
+  case Err(m) => h(m)
+}
+
+// filter(r, p, errVal): Ok(v) and !p(v) -> Err(errVal), else unchanged
+def filterResult(r, p, errVal) = r match {
+  case Ok(v) => if(p(v)) Ok(v) else Err(errVal)
+  case Err(m) => Err(m)
+}
+
+// fold(r, onOk, onErr): applies onOk to Ok value or onErr to Err message
+def foldResult(r, onOk, onErr) = r match {
+  case Ok(v) => onOk(v)
+  case Err(m) => onErr(m)
+}
+
+// toOption(r): Ok(v) -> Some(v), Err -> None
+def toOption(r) = r match {
+  case Ok(v) => some(v)
+  case Err(m) => none()
+}
+
 // Method-style dispatch. Mirrors the function helpers above.
 extension <a, e>(this: Result<a, e>) {
   def isOk() = this match {
@@ -50,5 +94,33 @@ extension <a, e>(this: Result<a, e>) {
   def mapResult(f) = this match {
     case Ok(v) => Ok(f(v))
     case Err(m) => Err(m)
+  }
+  def flatMap(f) = this match {
+    case Ok(v) => f(v)
+    case Err(m) => Err(m)
+  }
+  def andThen(f) = this match {
+    case Ok(v) => f(v)
+    case Err(m) => Err(m)
+  }
+  def mapErr(g) = this match {
+    case Ok(v) => Ok(v)
+    case Err(m) => Err(g(m))
+  }
+  def orElse(h) = this match {
+    case Ok(v) => Ok(v)
+    case Err(m) => h(m)
+  }
+  def filterResult(p, errVal) = this match {
+    case Ok(v) => if(p(v)) Ok(v) else Err(errVal)
+    case Err(m) => Err(m)
+  }
+  def foldResult(onOk, onErr) = this match {
+    case Ok(v) => onOk(v)
+    case Err(m) => onErr(m)
+  }
+  def toOption() = this match {
+    case Ok(v) => some(v)
+    case Err(m) => none()
   }
 }
