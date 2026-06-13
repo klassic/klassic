@@ -39,3 +39,105 @@ def formatIso(millis) = {
 }
 
 def nowIso() = formatIso(nowMillis())
+
+// ---------------------------------------------------------------------------
+// Internal helpers: Hinnant days-to-civil and its inverse
+// ---------------------------------------------------------------------------
+
+// Decompose epoch-days `z0` to a structural civil record {year, month, day}.
+// This is the core of Howard Hinnant's days_to_civil algorithm.
+def timeDaysToCivil(z0) = {
+  val z = z0 + 719468
+  val era = z / 146097
+  val doe = z - era * 146097
+  val yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  val doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  val mp = (5 * doy + 2) / 153
+  val dy = doy - (153 * mp + 2) / 5 + 1
+  val mo = if (mp < 10) mp + 3 else mp - 9
+  val yr = yoe + era * 400 + (if (mo <= 2) 1 else 0)
+  record { year: yr; month: mo; day: dy }
+}
+
+// Hinnant's days_from_civil: convert (year, month, day) to epoch-days.
+def timeDaysFromCivil(year0, month0, day0) = {
+  val yr = if (month0 <= 2) year0 - 1 else year0
+  val mo = if (month0 <= 2) month0 + 9 else month0 - 3
+  val era = if (yr >= 0) yr / 400 else (yr - 399) / 400
+  val yoe = yr - era * 400
+  val doy = (153 * mo + 2) / 5 + day0 - 1
+  val doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+  era * 146097 + doe - 719468
+}
+
+// Decompose epoch milliseconds to a full date-time record
+// { year, month, day, hour, minute, second } (all UTC).
+def timeDecompose(millis) = {
+  val totalSeconds = millis / 1000
+  val days = totalSeconds / 86400
+  val secondOfDay = totalSeconds - days * 86400
+  val hr = secondOfDay / 3600
+  val mn = (secondOfDay - hr * 3600) / 60
+  val sc = secondOfDay - hr * 3600 - mn * 60
+  val civil = timeDaysToCivil(days)
+  record { year: civil.year; month: civil.month; day: civil.day; hour: hr; minute: mn; second: sc }
+}
+
+// ---------------------------------------------------------------------------
+// Component accessors (free-function style)
+// ---------------------------------------------------------------------------
+
+// UTC year from epoch milliseconds.
+def year(millis) = timeDecompose(millis).year
+
+// UTC month (1–12) from epoch milliseconds.
+def month(millis) = timeDecompose(millis).month
+
+// UTC day-of-month (1–31) from epoch milliseconds.
+def day(millis) = timeDecompose(millis).day
+
+// UTC hour (0–23) from epoch milliseconds.
+def hour(millis) = timeDecompose(millis).hour
+
+// UTC minute (0–59) from epoch milliseconds.
+def minute(millis) = timeDecompose(millis).minute
+
+// UTC second (0–59) from epoch milliseconds.
+def second(millis) = timeDecompose(millis).second
+
+// ---------------------------------------------------------------------------
+// Composite helpers
+// ---------------------------------------------------------------------------
+
+// Decompose epoch millis into { year; month; day; hour; minute; second }.
+def toDate(millis) = timeDecompose(millis)
+
+// Format as "YYYY-MM-DD HH:MM:SS" (space separator, no timezone suffix).
+def formatHuman(millis) = {
+  val dt = timeDecompose(millis)
+  "#{dt.year}-" + timePad2(dt.month) + "-" + timePad2(dt.day) + " " +
+  timePad2(dt.hour) + ":" + timePad2(dt.minute) + ":" + timePad2(dt.second)
+}
+
+// Parse "YYYY-MM-DDTHH:MM:SS.mmmZ" back to epoch milliseconds.
+// The trailing Z is required; the millisecond fraction (.mmm) is optional.
+def parseIso(s) = {
+  val tParts = split(s, "T")
+  val datePart = head(tParts)
+  val timePartZ = head(tail(tParts))
+  // strip trailing Z
+  val timePart = substring(timePartZ, 0, length(timePartZ) - 1)
+  val dateParts = split(datePart, "-")
+  val yr = String#parseInt(head(dateParts))
+  val mo = String#parseInt(head(tail(dateParts)))
+  val dy = String#parseInt(head(tail(tail(dateParts))))
+  val colonParts = split(timePart, ":")
+  val hr = String#parseInt(head(colonParts))
+  val mn = String#parseInt(head(tail(colonParts)))
+  val secPart = head(tail(tail(colonParts)))
+  val dotParts = split(secPart, ".")
+  val sc = String#parseInt(head(dotParts))
+  val ms = if (isEmpty(tail(dotParts))) 0 else String#parseInt(head(tail(dotParts)))
+  val days = timeDaysFromCivil(yr, mo, dy)
+  (days * 86400 + hr * 3600 + mn * 60 + sc) * 1000 + ms
+}
