@@ -24798,3 +24798,46 @@ fn set_add_remove_from_list_to_list_empty_union_intersect_subtract() {
          ()\n"
     );
 }
+
+#[test]
+fn string_padstart_padend_format() {
+    let snippet = concat!(
+        // padStart: left-pad with zeros
+        r#"println(padStart("7", 3, "0"))"#,
+        "\n",
+        // padEnd: right-pad with dots
+        r#"println(padEnd("ab", 5, "."))"#,
+        "\n",
+        // padStart as value method on String
+        r#"println("5".padStart(3, " "))"#,
+        "\n",
+        // padEnd as value method on String
+        r#"println("ab".padEnd(5, "."))"#,
+        "\n",
+        // padStart with multibyte chars (char-count, not byte-count)
+        r#"println(padStart("あ", 3, "_"))"#,
+        "\n",
+        // padStart: no-op when input already >= width
+        r#"println(padStart("hello", 3, "0"))"#,
+        "\n",
+        // format: basic placeholder substitution
+        r#"println(format("Hello {}, you are {}", ["world", toString(42)]))"#,
+        "\n",
+        // format: {{ escape produces literal {
+        r#"println(format("price {{}} = {}", ["10"]))"#,
+        "\n",
+    );
+    let output = Command::new(klassic_bin())
+        .args(["-e", snippet])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "padStart/padEnd/format should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "007\nab...\n  5\nab...\n__あ\nhello\nHello world, you are 42\nprice {} = 10\n()\n"
+    );
+}

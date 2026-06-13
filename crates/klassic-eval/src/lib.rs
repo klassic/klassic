@@ -2946,6 +2946,71 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             let input = expect_string(&arguments[0], "reverse", span)?;
             Ok(Value::String(input.chars().rev().collect()))
         }
+        "padStart" => {
+            ensure_arity(name, arguments, 3, span)?;
+            let input = expect_string(&arguments[0], "padStart", span)?;
+            let width = expect_non_negative_int(&arguments[1], "padStart", span)?;
+            let pad = expect_string(&arguments[2], "padStart", span)?;
+            let input_chars: Vec<char> = input.chars().collect();
+            let pad_chars: Vec<char> = pad.chars().collect();
+            if input_chars.len() >= width || pad_chars.is_empty() {
+                Ok(Value::String(input.to_string()))
+            } else {
+                let needed = width - input_chars.len();
+                let padding: String = pad_chars.iter().cycle().take(needed).collect();
+                Ok(Value::String(format!("{padding}{input}")))
+            }
+        }
+        "padEnd" => {
+            ensure_arity(name, arguments, 3, span)?;
+            let input = expect_string(&arguments[0], "padEnd", span)?;
+            let width = expect_non_negative_int(&arguments[1], "padEnd", span)?;
+            let pad = expect_string(&arguments[2], "padEnd", span)?;
+            let input_chars: Vec<char> = input.chars().collect();
+            let pad_chars: Vec<char> = pad.chars().collect();
+            if input_chars.len() >= width || pad_chars.is_empty() {
+                Ok(Value::String(input.to_string()))
+            } else {
+                let needed = width - input_chars.len();
+                let padding: String = pad_chars.iter().cycle().take(needed).collect();
+                Ok(Value::String(format!("{input}{padding}")))
+            }
+        }
+        "format" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let template = expect_string(&arguments[0], "format", span)?;
+            let args = expect_list(&arguments[1], "format", span)?;
+            let mut result = String::new();
+            let mut arg_index = 0usize;
+            let chars: Vec<char> = template.chars().collect();
+            let mut i = 0usize;
+            while i < chars.len() {
+                if chars[i] == '{' {
+                    if chars.get(i + 1) == Some(&'{') {
+                        result.push('{');
+                        i += 2;
+                    } else if chars.get(i + 1) == Some(&'}') {
+                        let replacement = args
+                            .get(arg_index)
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+                        result.push_str(&replacement);
+                        arg_index += 1;
+                        i += 2;
+                    } else {
+                        result.push(chars[i]);
+                        i += 1;
+                    }
+                } else if chars[i] == '}' && chars.get(i + 1) == Some(&'}') {
+                    result.push('}');
+                    i += 2;
+                } else {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+            }
+            Ok(Value::String(result))
+        }
         "head" => {
             ensure_arity(name, arguments, 1, span)?;
             let list = expect_list(&arguments[0], "head", span)?;

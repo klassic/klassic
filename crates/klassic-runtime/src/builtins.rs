@@ -283,6 +283,21 @@ pub const BUILTINS: &[BuiltinDescriptor] = &[
         aliases: &[],
         arity: 1,
     },
+    BuiltinDescriptor {
+        canonical: "padStart",
+        aliases: &[],
+        arity: 3,
+    },
+    BuiltinDescriptor {
+        canonical: "padEnd",
+        aliases: &[],
+        arity: 3,
+    },
+    BuiltinDescriptor {
+        canonical: "format",
+        aliases: &[],
+        arity: 2,
+    },
     // --- List helpers ---
     BuiltinDescriptor {
         canonical: "head",

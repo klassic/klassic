@@ -2837,6 +2837,30 @@ impl TypeChecker {
             false,
             Type::Function(vec![Type::String], Box::new(Type::String)),
         );
+        self.declare_poly(
+            "padStart".to_string(),
+            false,
+            Type::Function(
+                vec![Type::String, Type::Int, Type::String],
+                Box::new(Type::String),
+            ),
+        );
+        self.declare_poly(
+            "padEnd".to_string(),
+            false,
+            Type::Function(
+                vec![Type::String, Type::Int, Type::String],
+                Box::new(Type::String),
+            ),
+        );
+        self.declare_poly(
+            "format".to_string(),
+            false,
+            Type::Function(
+                vec![Type::String, Type::List(Box::new(Type::Dynamic))],
+                Box::new(Type::String),
+            ),
+        );
         let a = self.fresh_var();
         let b = self.fresh_var();
         self.declare_poly(
@@ -4078,6 +4102,10 @@ impl TypeChecker {
                 }
                 "length" => Some(Type::Function(vec![], Box::new(Type::Int))),
                 "repeat" => Some(Type::Function(vec![Type::Int], Box::new(Type::String))),
+                "padStart" | "padEnd" => Some(Type::Function(
+                    vec![Type::Int, Type::String],
+                    Box::new(Type::String),
+                )),
                 _ => None,
             },
             Type::List(inner) => match field {

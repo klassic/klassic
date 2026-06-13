@@ -185,6 +185,8 @@ pub(crate) fn value_method_builtin_name(value: &Value, field: &str) -> Option<&'
             "length" => Some("length"),
             "repeat" => Some("repeat"),
             "reverse" => Some("reverse"),
+            "padStart" => Some("padStart"),
+            "padEnd" => Some("padEnd"),
             _ => None,
         },
         Value::List(_) => match field {
