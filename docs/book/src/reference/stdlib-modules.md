@@ -103,6 +103,28 @@ println(15.clampTo(0, 10))    // 10
 The dispatch key normalises Byte / Short / Int / Long to the same
 `Int` bucket, so the extension methods apply to all four widths.
 
+The module also carries the math constants `pi()` and `e()`, the
+angle conversions `degreesToRadians(d)` / `radiansToDegrees(r)`, and
+the integer helpers `lcm(a, b)`, `hypot(x, y)`, `factorial(n)`, and
+`isPrime(n)`:
+
+```klassic
+import std.math.{pi, degreesToRadians, lcm, hypot, factorial, isPrime}
+
+println(degreesToRadians(180.0))   // 3.141592653589793
+println(lcm(4, 6))                 // 12
+println(hypot(3, 4))               // 5.0
+println(factorial(5))              // 120
+println(isPrime(7))                // true
+```
+
+`Double` receivers gain `.toRadians()` / `.toDegrees()` for the same
+conversions in method form:
+
+```klassic
+println((180.0).toRadians())       // 3.141592653589793
+```
+
 ## std.path
 
 POSIX-style path string helpers. Windows-style paths are not yet
@@ -135,6 +157,25 @@ println(maybe.getOrElse(0))      // 7   (method-style)
 println(none().isNone())         // true
 println(some("hi").isSome())     // true
 println(some(2).mapOption((x) => x * 10).getOrElse(0)) // 20
+```
+
+Beyond `getOrElse` / `mapOption` / `flatMapOption` / `orElse`, the
+module ships `filterOption(o, p)`, `toList(o)`, `foldOption(o, ifNone, f)`,
+and `ifPresent(o, f)`. The function-style names carry an `Option`
+suffix where they would otherwise clash with another module's free
+function, but the **method twins keep the clean names**
+`.filter`, `.toList`, `.fold`, and `.ifPresent`:
+
+```klassic
+import std.option.{some, none, filterOption, foldOption}
+
+println(filterOption(some(7), (x) => x > 3).getOrElse(0)) // 7   (free fn)
+println(foldOption(some(10), 0, (x) => x * 2))            // 20
+
+println(some(7).filter((x) => x > 3).getOrElse(0))        // 7   (method)
+println(some(5).fold(0, (x) => x + 1))                    // 6
+println(some(5).toList())                                 // [5]
+some(99).ifPresent((x) => println("got " + toString(x)))  // got 99
 ```
 
 The underlying ADT lives in the same file:
@@ -171,6 +212,24 @@ println(bad.isErr())                   // true
 println(good.unwrapOr("fallback"))     // "payload"
 println(bad.unwrapOr("fallback"))      // "fallback"
 println(good.mapResult((x) => x + "!").unwrapOr("")) // "payload!"
+```
+
+The chaining surface is `flatMapResult(r, f)` / `andThen(r, f)`,
+`mapErr(r, g)`, `orElseResult(r, h)`, `filterResult(r, p, errVal)`,
+`foldResult(r, onOk, onErr)`, and `toOption(r)`. As with `std.option`,
+the free functions take a type suffix to stay collision-free, while
+the method twins read cleanly as `.flatMap`, `.andThen`, `.mapErr`,
+`.orElse`, `.filterResult`, `.foldResult`, and `.toOption`:
+
+```klassic
+import std.result.{ok, err, andThen, foldResult}
+
+println(andThen(ok(4), (x) => ok(x * 2)).unwrapOr(0))         // 8
+println(foldResult(err("boom"), (x) => "ok", (m) => "err " + m)) // err boom
+
+println(ok(4).flatMap((x) => ok(x + 10)).unwrapOr(0))         // 14
+println(err("e").orElse((m) => ok(7)).unwrapOr(0))            // 7
+println(ok(3).toOption().getOrElse(0))                        // 3
 ```
 
 The underlying ADT:
@@ -236,6 +295,37 @@ val b = %(3, 4, 5)
 println(a.union(b).toList())       // [1, 2, 3, 4, 5]
 println(a.intersect(b).toList())   // [3]
 println(a.subtract(b).toList())    // [1, 2]
+```
+
+For traversal and reshaping, `std.map` adds `toPairs(m)` (alias
+`entries(m)`) to materialise the entries as `[key, value]` lists in
+insertion order, `fold(m, init, f)` (alias `foldMap`) to fold over
+all entries with `f(acc, key, value)`, and `mapKeys(m, g)` to rewrite
+every key. The method twins are `.toPairs()` / `.entries()`,
+`.mapKeys(g)`, and the curried `.foldMap(init)(f)`:
+
+```klassic
+import std.map.{toPairs, fold, mapKeys}
+
+val m = %["a": 1, "b": 2, "c": 3]
+println(toPairs(m))                              // [[a, 1], [b, 2], [c, 3]]
+println(fold(m, 0, (acc, k, v) => acc + v))      // 6
+println(mapKeys(m, (k) => k + "!").keys())       // [a!, b!, c!]
+println(m.foldMap(0)((acc, k, v) => acc + v))    // 6
+```
+
+`std.set` mirrors this with `setMap(s, f)`, `setFilter(s, p)`, and
+`setFold(s, init, f)`, each with a method twin (`.setMap` / `.setFilter`
+and the curried `.setFold(init)(f)`):
+
+```klassic
+import std.set.{setMap, setFilter, setFold}
+
+val s = %(1, 2, 3, 4)
+println(setMap(s, (x) => x * 10).toList())       // [10, 20, 30, 40]
+println(setFilter(s, (x) => x > 2).toList())     // [3, 4]
+println(setFold(s, 0, (acc, x) => acc + x))      // 10
+println(s.setFold(0)((acc, x) => acc + x))       // 10
 ```
 
 ## std.dir
@@ -391,6 +481,26 @@ println(formatIso(0))              // 1970-01-01T00:00:00.000Z
 println(formatIso(1718000000123))  // 2024-06-10T06:13:20.123Z
 println(durationMillis(100, 350))  // 250
 println(nowIso())                  // the current instant
+```
+
+The same civil-date conversion powers the component accessors
+`year` / `month` / `day` / `hour` / `minute` / `second`, the
+`toDate(millis)` record (with `year`, `month`, `day`, `hour`,
+`minute`, `second` fields), the `formatHuman(millis)` renderer
+(`YYYY-MM-DD HH:MM:SS`), and `parseIso(s)` which turns an ISO-8601
+string back into epoch milliseconds:
+
+```klassic
+import std.time.{year, month, day, toDate, formatHuman, parseIso}
+
+val ms = 1718000000123
+println(year(ms))                              // 2024
+println(month(ms))                             // 6
+println(day(ms))                               // 10
+val d = toDate(ms)
+println(toString(d.hour) + ":" + toString(d.minute)) // 6:13
+println(formatHuman(ms))                       // 2024-06-10 06:13:20
+println(parseIso("2024-06-10T06:13:20.123Z"))  // 1718000000123
 ```
 
 ## Native availability

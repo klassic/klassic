@@ -77,6 +77,36 @@ The `args` list is homogeneous like every Klassic list, so format an
 all-`Int` or all-`String` list — mix types by converting to strings
 first.
 
+## Text shaping with std.string
+
+`std.string` adds a few text-shaping helpers on top of the builtins.
+`countOccurrences(s, sub)` counts non-overlapping occurrences;
+`capitalize(s)` upper-cases the first byte; `unlines(xs)` is the
+inverse of splitting on newlines; `indent(s, n)` prefixes every line
+with `n` spaces; `stripPrefix` / `stripSuffix` remove an affix when it
+is present (and leave the string untouched otherwise).
+
+```kl
+import std.string.{countOccurrences, capitalize, unlines, indent, stripPrefix, stripSuffix}
+
+println(countOccurrences("banana", "a"))   // 3
+println(capitalize("hello"))               // Hello
+println(unlines(["a", "b", "c"]))          // a / b / c (newline-joined)
+println(indent("line1\nline2", 2))         //   line1 /   line2
+println(stripPrefix("foobar", "foo"))      // bar
+println(stripSuffix("foobar", "bar"))      // foo
+```
+
+Each has a method twin so you can chain off a `String` value:
+`.countOccurrences(sub)`, `.capitalized()`, `.indented(n)`,
+`.withoutPrefix(p)`, and `.withoutSuffix(s)`.
+
+```kl
+println("banana".countOccurrences("a"))    // 3
+println("hello".capitalized())             // Hello
+println("foobar".withoutPrefix("foo"))     // bar
+```
+
 ## Parsing numbers
 
 `String#parseInt` / `String#parseDouble` parse a string or abort on

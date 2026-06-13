@@ -65,6 +65,50 @@ type (each pair `[x, y]` is itself a list). `sortBy(xs, key)` /
 `.sortedBy(key)` and `partition(xs, p)` / `.partitionBy(p)` round out
 the set.
 
+### Slicing, scanning, indexing
+
+A second wave of `std.list` helpers covers the slicing and scanning
+patterns. `flatten` concatenates a list of lists; `takeWhile` /
+`dropWhile` split on a predicate from the front; `chunk(n)` packs the
+list into fixed-size sublists; `slice(from, to)` is the half-open
+`[from, to)` window; `scanLeft(init, f)` is a fold that keeps every
+intermediate accumulator.
+
+```kl
+import std.list.{flatten, takeWhile, chunk, slice, scanLeft}
+
+println(flatten([[1, 2], [3], [4, 5]]))          // [1, 2, 3, 4, 5]
+println(takeWhile([1, 2, 3, 1], (x) => x < 3))   // [1, 2]
+println(chunk([1, 2, 3, 4, 5], 2))               // [[1, 2], [3, 4], [5]]
+println(slice([10, 20, 30, 40, 50], 1, 4))       // [20, 30, 40]
+println(scanLeft([1, 2, 3], 0, (a, b) => a + b)) // [0, 1, 3, 6]
+```
+
+`maxBy(xs, key)` / `minBy(xs, key)` pick the element with the
+greatest / smallest key, and `zipWithIndex` pairs each element with
+its zero-based index into a list of `{item, index}` records:
+
+```kl
+import std.list.{zipWithIndex, maxBy}
+
+println(maxBy([3, 1, 4, 1, 5], (x) => x))        // 5
+foreach (p in zipWithIndex(["a", "b", "c"])) {
+  println(toString(p.index) + ": " + p.item)     // 0: a / 1: b / 2: c
+}
+```
+
+Each has a dot-callable twin: `.flatten` is implicit through the free
+function, while `.takeWhileBy(p)`, `.dropWhileBy(p)`, `.chunked(n)`,
+`.sliced(from, to)`, `.maxByKey(key)`, `.minByKey(key)`, and
+`.withIndex()` mirror the free functions. `.scanned(init)` is curried,
+so the folding function comes second:
+
+```kl
+println([1, 2, 3, 4, 5].chunked(2))              // [[1, 2], [3, 4], [5]]
+println([10, 20, 30, 40].sliced(1, 3))           // [20, 30]
+println([1, 2, 3].scanned(0)((a, b) => a + b))   // [0, 1, 3, 6]
+```
+
 ## Maps
 
 ```kl
