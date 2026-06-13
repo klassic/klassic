@@ -207,6 +207,8 @@ pub(crate) fn value_method_builtin_name(value: &Value, field: &str) -> Option<&'
             "values" => Some("Map#values"),
             "isEmpty" => Some("Map#isEmpty"),
             "size" => Some("Map#size"),
+            "put" => Some("Map#put"),
+            "remove" => Some("Map#remove"),
             _ => None,
         },
         Value::Set(_) => match field {

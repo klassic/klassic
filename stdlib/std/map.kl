@@ -5,6 +5,23 @@ module std.map
 // delegate to the existing `Map#*` builtins so semantics and
 // native-mode coverage stay aligned.
 
+// Module-level transforms that build new maps on top of the
+// `Map#put` / `Map#get` / `Map#remove` builtins. They are pure: each
+// returns a fresh map and never mutates the input.
+
+// mapValues — apply f to every value, keeping keys and order.
+def mapValues(m, f) =
+  foldLeft(Map#keys(m))(Map#empty())((acc, k) => Map#put(acc, k, f(Map#get(m, k))))
+
+// filterValues — keep only entries whose value satisfies p.
+def filterValues(m, p) =
+  foldLeft(Map#keys(m))(Map#empty())((acc, k) =>
+    if(p(Map#get(m, k))) Map#put(acc, k, Map#get(m, k)) else acc)
+
+// merge — overlay other on top of m; other's entries win on key clash.
+def merge(m, other) =
+  foldLeft(Map#keys(other))(m)((acc, k) => Map#put(acc, k, Map#get(other, k)))
+
 extension <k, v>(this: Map<k, v>) {
   def containsKey(key) = Map#containsKey(this, key)
   def containsValue(value) = Map#containsValue(this, value)
@@ -12,4 +29,7 @@ extension <k, v>(this: Map<k, v>) {
   def isEmptyMap() = Map#isEmpty(this)
   def sizeOf() = Map#size(this)
   def getOrElse(key, fallback) = if(Map#containsKey(this, key)) Map#get(this, key) else fallback
+  def mapValues(f) = mapValues(this, f)
+  def filterValues(p) = filterValues(this, p)
+  def merge(other) = merge(this, other)
 }

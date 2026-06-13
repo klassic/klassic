@@ -514,6 +514,26 @@ pub const BUILTINS: &[BuiltinDescriptor] = &[
         arity: 1,
     },
     BuiltinDescriptor {
+        canonical: "Map#put",
+        aliases: &[],
+        arity: 3,
+    },
+    BuiltinDescriptor {
+        canonical: "Map#remove",
+        aliases: &[],
+        arity: 2,
+    },
+    BuiltinDescriptor {
+        canonical: "Map#fromPairs",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "Map#empty",
+        aliases: &[],
+        arity: 0,
+    },
+    BuiltinDescriptor {
         canonical: "Set#contains",
         aliases: &[],
         arity: 2,

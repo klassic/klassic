@@ -2975,6 +2975,22 @@ impl TypeChecker {
                     "size",
                     Type::Function(vec![Type::Dynamic], Box::new(Type::Int)),
                 ),
+                (
+                    "put",
+                    Type::Function(
+                        vec![Type::Dynamic, Type::Dynamic, Type::Dynamic],
+                        Box::new(Type::Dynamic),
+                    ),
+                ),
+                (
+                    "remove",
+                    Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
+                (
+                    "fromPairs",
+                    Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
+                ("empty", Type::Function(vec![], Box::new(Type::Dynamic))),
             ],
             "Set" => &[
                 (
@@ -4072,6 +4088,14 @@ impl TypeChecker {
                 )),
                 "isEmpty" => Some(Type::Function(vec![], Box::new(Type::Bool))),
                 "size" => Some(Type::Function(vec![], Box::new(Type::Int))),
+                "put" => Some(Type::Function(
+                    vec![(*key).clone(), (*value).clone()],
+                    Box::new(Type::Map(key.clone(), value.clone())),
+                )),
+                "remove" => Some(Type::Function(
+                    vec![(*key).clone()],
+                    Box::new(Type::Map(key.clone(), value.clone())),
+                )),
                 _ => None,
             },
             Type::Set(_) => match field {
@@ -4201,6 +4225,22 @@ fn builtin_module_type_exports(path: &str) -> Option<ModuleTypeExports> {
                 "size",
                 Type::Function(vec![Type::Dynamic], Box::new(Type::Int)),
             ),
+            (
+                "put",
+                Type::Function(
+                    vec![Type::Dynamic, Type::Dynamic, Type::Dynamic],
+                    Box::new(Type::Dynamic),
+                ),
+            ),
+            (
+                "remove",
+                Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+            ),
+            (
+                "fromPairs",
+                Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+            ),
+            ("empty", Type::Function(vec![], Box::new(Type::Dynamic))),
         ],
         "Set" => &[
             (

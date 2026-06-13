@@ -24675,3 +24675,61 @@ fn std_list_sort_zip_partition_group_mkstring() {
          ()\n"
     );
 }
+
+/// Maps became mutable-by-construction (issue #438): the immutable
+/// builtins `Map#put` / `Map#remove` / `Map#fromPairs` / `Map#empty`
+/// each return a fresh map, and `std.map` layers `mapValues` /
+/// `filterValues` / `merge` on top. Exercise all of them through the
+/// evaluator, asserting the original map is never mutated.
+#[test]
+fn map_put_remove_from_pairs_empty_and_std_map_transforms() {
+    let snippet = concat!(
+        "import std.map\n",
+        "val m = %[\"a\": 1, \"b\": 2, \"c\": 3]\n",
+        // Map#put — append a new key, update an existing one, leave m intact.
+        "println(Map#put(m, \"d\", 4))\n",
+        "println(Map#put(m, \"a\", 99))\n",
+        // Map#remove — drop a key.
+        "println(Map#remove(m, \"b\"))\n",
+        // Map#empty / Map#fromPairs (last-wins on duplicate keys).
+        "println(Map#empty())\n",
+        "println(Map#fromPairs([[1, 10], [2, 20], [1, 99]]))\n",
+        // Immutability: m is unchanged after all of the above.
+        "println(m)\n",
+        // std.map transforms (free function + method forms).
+        "println(m.mapValues((v) => v * 10))\n",
+        "println(mapValues(m, (v) => v + 1))\n",
+        "println(m.filterValues((v) => v > 1))\n",
+        "println(m.merge(%[\"b\": 99, \"d\": 4]))\n",
+        "println(merge(m, %[\"e\": 5]))\n",
+        // Value-method dispatch for put / remove.
+        "println(m.put(\"z\", 26))\n",
+        "println(m.remove(\"c\"))\n",
+    );
+    let output = Command::new(klassic_bin())
+        .args(["-e", snippet])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "Map put/remove/fromPairs/empty + std.map transforms should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "%[a: 1, b: 2, c: 3, d: 4]\n\
+         %[a: 99, b: 2, c: 3]\n\
+         %[a: 1, c: 3]\n\
+         %[]\n\
+         %[1: 99, 2: 20]\n\
+         %[a: 1, b: 2, c: 3]\n\
+         %[a: 10, b: 20, c: 30]\n\
+         %[a: 2, b: 3, c: 4]\n\
+         %[b: 2, c: 3]\n\
+         %[a: 1, b: 99, c: 3, d: 4]\n\
+         %[a: 1, b: 2, c: 3, e: 5]\n\
+         %[a: 1, b: 2, c: 3, z: 26]\n\
+         %[a: 1, b: 2]\n\
+         ()\n"
+    );
+}

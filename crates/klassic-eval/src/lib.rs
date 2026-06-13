@@ -1546,6 +1546,10 @@ fn builtin_module_members(path: &str) -> Option<&'static [&'static str]> {
             "values",
             "isEmpty",
             "size",
+            "put",
+            "remove",
+            "fromPairs",
+            "empty",
         ]),
         "Set" => Some(&["contains", "isEmpty", "size"]),
         _ => None,
@@ -3296,6 +3300,66 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             ensure_arity(name, arguments, 1, span)?;
             let entries = expect_map(&arguments[0], "Map#size", span)?;
             Ok(Value::Int(entries.len() as i64))
+        }
+        "Map#put" => {
+            ensure_arity(name, arguments, 3, span)?;
+            let entries = expect_map(&arguments[0], "Map#put", span)?;
+            let key = &arguments[1];
+            let value = &arguments[2];
+            let mut next: Vec<(Value, Value)> = Vec::with_capacity(entries.len() + 1);
+            let mut replaced = false;
+            for (existing_key, existing_value) in entries {
+                if existing_key == key {
+                    next.push((existing_key.clone(), value.clone()));
+                    replaced = true;
+                } else {
+                    next.push((existing_key.clone(), existing_value.clone()));
+                }
+            }
+            if !replaced {
+                next.push((key.clone(), value.clone()));
+            }
+            Ok(Value::Map(next))
+        }
+        "Map#remove" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let entries = expect_map(&arguments[0], "Map#remove", span)?;
+            let key = &arguments[1];
+            let next: Vec<(Value, Value)> = entries
+                .iter()
+                .filter(|(existing_key, _)| existing_key != key)
+                .cloned()
+                .collect();
+            Ok(Value::Map(next))
+        }
+        "Map#fromPairs" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let pairs = expect_list(&arguments[0], "Map#fromPairs", span)?;
+            let mut next: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
+            for pair in pairs {
+                let fields = expect_list(pair, "Map#fromPairs", span)?;
+                if fields.len() != 2 {
+                    return Err(Diagnostic::runtime(
+                        span,
+                        format!(
+                            "Map#fromPairs expects each element to be a 2-element list, got {} elements",
+                            fields.len()
+                        ),
+                    ));
+                }
+                let key = fields[0].clone();
+                let value = fields[1].clone();
+                if let Some(slot) = next.iter_mut().find(|(existing, _)| existing == &key) {
+                    slot.1 = value;
+                } else {
+                    next.push((key, value));
+                }
+            }
+            Ok(Value::Map(next))
+        }
+        "Map#empty" => {
+            ensure_arity(name, arguments, 0, span)?;
+            Ok(Value::Map(Vec::new()))
         }
         "Set#contains" => {
             ensure_arity(name, arguments, 2, span)?;
