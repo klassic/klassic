@@ -187,6 +187,10 @@ pub(crate) fn value_method_builtin_name(value: &Value, field: &str) -> Option<&'
             "reverse" => Some("reverse"),
             "padStart" => Some("padStart"),
             "padEnd" => Some("padEnd"),
+            "parseIntOr" => Some("String#parseIntOr"),
+            "parseDoubleOr" => Some("String#parseDoubleOr"),
+            "isInteger" => Some("String#isInt"),
+            "isDouble" => Some("String#isDouble"),
             _ => None,
         },
         Value::List(_) => match field {

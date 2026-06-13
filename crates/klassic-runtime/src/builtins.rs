@@ -635,6 +635,26 @@ pub const BUILTINS: &[BuiltinDescriptor] = &[
         arity: 1,
     },
     BuiltinDescriptor {
+        canonical: "String#parseIntOr",
+        aliases: &[],
+        arity: 2,
+    },
+    BuiltinDescriptor {
+        canonical: "String#parseDoubleOr",
+        aliases: &[],
+        arity: 2,
+    },
+    BuiltinDescriptor {
+        canonical: "String#isInt",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "String#isDouble",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
         canonical: "Random#seed",
         aliases: &[],
         arity: 1,

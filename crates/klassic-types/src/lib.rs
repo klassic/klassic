@@ -2632,6 +2632,26 @@ impl TypeChecker {
             Type::Function(vec![Type::String], Box::new(Type::Double)),
         );
         self.declare_poly(
+            "String#parseIntOr".to_string(),
+            false,
+            Type::Function(vec![Type::String, Type::Int], Box::new(Type::Int)),
+        );
+        self.declare_poly(
+            "String#parseDoubleOr".to_string(),
+            false,
+            Type::Function(vec![Type::String, Type::Double], Box::new(Type::Double)),
+        );
+        self.declare_poly(
+            "String#isInt".to_string(),
+            false,
+            Type::Function(vec![Type::String], Box::new(Type::Bool)),
+        );
+        self.declare_poly(
+            "String#isDouble".to_string(),
+            false,
+            Type::Function(vec![Type::String], Box::new(Type::Bool)),
+        );
+        self.declare_poly(
             "Math#powInt".to_string(),
             false,
             Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int)),
@@ -4106,6 +4126,9 @@ impl TypeChecker {
                     vec![Type::Int, Type::String],
                     Box::new(Type::String),
                 )),
+                "parseIntOr" => Some(Type::Function(vec![Type::Int], Box::new(Type::Int))),
+                "parseDoubleOr" => Some(Type::Function(vec![Type::Double], Box::new(Type::Double))),
+                "isInteger" | "isDouble" => Some(Type::Function(vec![], Box::new(Type::Bool))),
                 _ => None,
             },
             Type::List(inner) => match field {

@@ -2652,6 +2652,45 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
                 )
             })
         }
+        "String#parseIntOr" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let text = expect_string(&arguments[0], "String#parseIntOr", span)?;
+            let default = match &arguments[1] {
+                Value::Int(v) => *v,
+                _ => {
+                    return Err(Diagnostic::runtime(
+                        span,
+                        "String#parseIntOr: second argument must be an Int",
+                    ));
+                }
+            };
+            Ok(Value::Int(text.trim().parse::<i64>().unwrap_or(default)))
+        }
+        "String#parseDoubleOr" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let text = expect_string(&arguments[0], "String#parseDoubleOr", span)?;
+            let default = match &arguments[1] {
+                Value::Double(v) => *v,
+                Value::Int(v) => *v as f64,
+                _ => {
+                    return Err(Diagnostic::runtime(
+                        span,
+                        "String#parseDoubleOr: second argument must be a Double",
+                    ));
+                }
+            };
+            Ok(Value::Double(text.trim().parse::<f64>().unwrap_or(default)))
+        }
+        "String#isInt" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let text = expect_string(&arguments[0], "String#isInt", span)?;
+            Ok(Value::Bool(text.trim().parse::<i64>().is_ok()))
+        }
+        "String#isDouble" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let text = expect_string(&arguments[0], "String#isDouble", span)?;
+            Ok(Value::Bool(text.trim().parse::<f64>().is_ok()))
+        }
         "Math#gcd" => {
             ensure_arity(name, arguments, 2, span)?;
             let mut a = match arguments[0] {

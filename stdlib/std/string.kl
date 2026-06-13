@@ -32,8 +32,21 @@ extension (this: String) {
   // Floating-point parse; a non-numeric string is a runtime error
   // (same caveat as `toInt`).
   def toDouble() = String#parseDouble(this)
+  // Safe integer parse — returns `d` when the string is not a valid
+  // decimal integer.  Never crashes.
+  def toIntOr(d) = String#parseIntOr(this, d)
+  // Safe floating-point parse — returns `d` on failure.
+  def toDoubleOr(d) = String#parseDoubleOr(this, d)
+  // Predicate: true iff the string is a valid decimal integer.
+  def isInteger() = String#isInt(this)
+  // Predicate: true iff the string is a valid floating-point number.
+  def isFloat() = String#isDouble(this)
 }
 
 def parseInt(s) = String#parseInt(s)
 
 def parseDouble(s) = String#parseDouble(s)
+
+def parseIntOr(s, d) = String#parseIntOr(s, d)
+
+def parseDoubleOr(s, d) = String#parseDoubleOr(s, d)

@@ -24841,3 +24841,50 @@ fn string_padstart_padend_format() {
         "007\nab...\n  5\nab...\n__あ\nhello\nHello world, you are 42\nprice {} = 10\n()\n"
     );
 }
+
+#[test]
+fn string_parse_int_or_parse_double_or_is_int_is_double() {
+    let snippet = concat!(
+        // parseIntOr: valid int
+        r#"println(String#parseIntOr("42", 0))"#,
+        "\n",
+        // parseIntOr: invalid string returns default
+        r#"println(String#parseIntOr("abc", 99))"#,
+        "\n",
+        // parseDoubleOr: valid double
+        r#"println(String#parseDoubleOr("3.14", 0.0))"#,
+        "\n",
+        // parseDoubleOr: invalid string returns default
+        r#"println(String#parseDoubleOr("x", 1.5))"#,
+        "\n",
+        // isInt: true for integer string
+        r#"println(String#isInt("42"))"#,
+        "\n",
+        // isInt: false for decimal string
+        r#"println(String#isInt("4.2"))"#,
+        "\n",
+        // isDouble: true for decimal string
+        r#"println(String#isDouble("3.14"))"#,
+        "\n",
+        // isDouble: false for non-numeric string
+        r#"println(String#isDouble("abc"))"#,
+        "\n",
+        // toIntOr via stdlib extension method
+        "import std.string\n",
+        r#"println("abc".toIntOr(0))"#,
+        "\n",
+    );
+    let output = Command::new(klassic_bin())
+        .args(["-e", snippet])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "parseIntOr/parseDoubleOr/isInt/isDouble should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "42\n99\n3.14\n1.5\ntrue\nfalse\ntrue\nfalse\n0\n()\n"
+    );
+}
