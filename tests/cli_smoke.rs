@@ -24733,3 +24733,68 @@ fn map_put_remove_from_pairs_empty_and_std_map_transforms() {
          ()\n"
     );
 }
+
+/// Sets gained immutable set-algebra builtins (issue #439): `Set#add`,
+/// `Set#remove`, `Set#fromList`, `Set#toList`, `Set#empty`, `Set#union`,
+/// `Set#intersect`, and `Set#subtract` each return a fresh set (insertion
+/// order preserved, duplicates dropped). add / remove / union / intersect /
+/// subtract / toList are also dot-callable value methods. Exercise both the
+/// free-function and value-method forms, asserting the original set is never
+/// mutated.
+#[test]
+fn set_add_remove_from_list_to_list_empty_union_intersect_subtract() {
+    let snippet = concat!(
+        "val s = %(1, 2, 3)\n",
+        // Free-function builtins.
+        "println(Set#add(s, 4))\n",
+        "println(Set#add(s, 2))\n",
+        "println(Set#remove(s, 2))\n",
+        "println(Set#fromList([1, 1, 2, 3, 2]))\n",
+        "println(Set#toList(%(1, 2, 3)))\n",
+        "println(Set#empty())\n",
+        "println(Set#union(%(1, 2, 3), %(3, 4, 5)))\n",
+        "println(Set#intersect(%(1, 2, 3), %(2, 3, 4)))\n",
+        "println(Set#subtract(%(1, 2, 3), %(2)))\n",
+        // Immutability: s is unchanged after all of the above.
+        "println(s)\n",
+        // Value-method dispatch.
+        "println(s.add(4))\n",
+        "println(s.remove(2))\n",
+        "println(s.union(%(3, 4, 5)))\n",
+        "println(s.intersect(%(2, 3, 4)))\n",
+        "println(s.subtract(%(2)))\n",
+        "println(s.toList())\n",
+        // Still immutable.
+        "println(s)\n",
+    );
+    let output = Command::new(klassic_bin())
+        .args(["-e", snippet])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "Set add/remove/fromList/toList/empty/union/intersect/subtract should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "%(1, 2, 3, 4)\n\
+         %(1, 2, 3)\n\
+         %(1, 3)\n\
+         %(1, 2, 3)\n\
+         [1, 2, 3]\n\
+         %()\n\
+         %(1, 2, 3, 4, 5)\n\
+         %(2, 3)\n\
+         %(1, 3)\n\
+         %(1, 2, 3)\n\
+         %(1, 2, 3, 4)\n\
+         %(1, 3)\n\
+         %(1, 2, 3, 4, 5)\n\
+         %(2, 3)\n\
+         %(1, 3)\n\
+         [1, 2, 3]\n\
+         %(1, 2, 3)\n\
+         ()\n"
+    );
+}

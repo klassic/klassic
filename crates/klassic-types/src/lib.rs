@@ -3005,6 +3005,35 @@ impl TypeChecker {
                     "size",
                     Type::Function(vec![Type::Dynamic], Box::new(Type::Int)),
                 ),
+                (
+                    "add",
+                    Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
+                (
+                    "remove",
+                    Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
+                (
+                    "fromList",
+                    Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
+                (
+                    "toList",
+                    Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
+                ("empty", Type::Function(vec![], Box::new(Type::Dynamic))),
+                (
+                    "union",
+                    Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
+                (
+                    "intersect",
+                    Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
+                (
+                    "subtract",
+                    Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                ),
             ],
             "FileInput" => &[
                 (
@@ -4098,10 +4127,23 @@ impl TypeChecker {
                 )),
                 _ => None,
             },
-            Type::Set(_) => match field {
+            Type::Set(inner) => match field {
                 "contains" => Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Bool))),
                 "isEmpty" => Some(Type::Function(vec![], Box::new(Type::Bool))),
                 "size" => Some(Type::Function(vec![], Box::new(Type::Int))),
+                "add" => Some(Type::Function(
+                    vec![(*inner).clone()],
+                    Box::new(Type::Set(inner.clone())),
+                )),
+                "remove" => Some(Type::Function(
+                    vec![(*inner).clone()],
+                    Box::new(Type::Set(inner.clone())),
+                )),
+                "union" | "intersect" | "subtract" => Some(Type::Function(
+                    vec![Type::Set(inner.clone())],
+                    Box::new(Type::Set(inner.clone())),
+                )),
+                "toList" => Some(Type::Function(vec![], Box::new(Type::List(inner.clone())))),
                 _ => None,
             },
             Type::Var(id) => match field {
@@ -4254,6 +4296,35 @@ fn builtin_module_type_exports(path: &str) -> Option<ModuleTypeExports> {
             (
                 "size",
                 Type::Function(vec![Type::Dynamic], Box::new(Type::Int)),
+            ),
+            (
+                "add",
+                Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+            ),
+            (
+                "remove",
+                Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+            ),
+            (
+                "fromList",
+                Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+            ),
+            (
+                "toList",
+                Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+            ),
+            ("empty", Type::Function(vec![], Box::new(Type::Dynamic))),
+            (
+                "union",
+                Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+            ),
+            (
+                "intersect",
+                Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+            ),
+            (
+                "subtract",
+                Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
             ),
         ],
         "FileInput" => &[

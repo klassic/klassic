@@ -1551,7 +1551,19 @@ fn builtin_module_members(path: &str) -> Option<&'static [&'static str]> {
             "fromPairs",
             "empty",
         ]),
-        "Set" => Some(&["contains", "isEmpty", "size"]),
+        "Set" => Some(&[
+            "contains",
+            "isEmpty",
+            "size",
+            "add",
+            "remove",
+            "fromList",
+            "toList",
+            "empty",
+            "union",
+            "intersect",
+            "subtract",
+        ]),
         _ => None,
     }
 }
@@ -3375,6 +3387,81 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             ensure_arity(name, arguments, 1, span)?;
             let values = expect_set(&arguments[0], "Set#size", span)?;
             Ok(Value::Int(values.len() as i64))
+        }
+        "Set#add" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let values = expect_set(&arguments[0], "Set#add", span)?;
+            let element = &arguments[1];
+            let mut next: Vec<Value> = values.to_vec();
+            if !next.contains(element) {
+                next.push(element.clone());
+            }
+            Ok(Value::Set(next))
+        }
+        "Set#remove" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let values = expect_set(&arguments[0], "Set#remove", span)?;
+            let element = &arguments[1];
+            let next: Vec<Value> = values
+                .iter()
+                .filter(|existing| *existing != element)
+                .cloned()
+                .collect();
+            Ok(Value::Set(next))
+        }
+        "Set#fromList" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let items = expect_list(&arguments[0], "Set#fromList", span)?;
+            let mut next: Vec<Value> = Vec::with_capacity(items.len());
+            for item in items {
+                if !next.contains(item) {
+                    next.push(item.clone());
+                }
+            }
+            Ok(Value::Set(next))
+        }
+        "Set#toList" => {
+            ensure_arity(name, arguments, 1, span)?;
+            let values = expect_set(&arguments[0], "Set#toList", span)?;
+            Ok(Value::List(values.to_vec()))
+        }
+        "Set#empty" => {
+            ensure_arity(name, arguments, 0, span)?;
+            Ok(Value::Set(Vec::new()))
+        }
+        "Set#union" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let left = expect_set(&arguments[0], "Set#union", span)?;
+            let right = expect_set(&arguments[1], "Set#union", span)?;
+            let mut next: Vec<Value> = left.to_vec();
+            for value in right {
+                if !next.contains(value) {
+                    next.push(value.clone());
+                }
+            }
+            Ok(Value::Set(next))
+        }
+        "Set#intersect" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let left = expect_set(&arguments[0], "Set#intersect", span)?;
+            let right = expect_set(&arguments[1], "Set#intersect", span)?;
+            let next: Vec<Value> = left
+                .iter()
+                .filter(|value| right.contains(value))
+                .cloned()
+                .collect();
+            Ok(Value::Set(next))
+        }
+        "Set#subtract" => {
+            ensure_arity(name, arguments, 2, span)?;
+            let left = expect_set(&arguments[0], "Set#subtract", span)?;
+            let right = expect_set(&arguments[1], "Set#subtract", span)?;
+            let next: Vec<Value> = left
+                .iter()
+                .filter(|value| !right.contains(value))
+                .cloned()
+                .collect();
+            Ok(Value::Set(next))
         }
         _ => Err(Diagnostic::runtime(
             span,

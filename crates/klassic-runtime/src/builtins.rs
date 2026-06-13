@@ -548,6 +548,46 @@ pub const BUILTINS: &[BuiltinDescriptor] = &[
         aliases: &[],
         arity: 1,
     },
+    BuiltinDescriptor {
+        canonical: "Set#add",
+        aliases: &[],
+        arity: 2,
+    },
+    BuiltinDescriptor {
+        canonical: "Set#remove",
+        aliases: &[],
+        arity: 2,
+    },
+    BuiltinDescriptor {
+        canonical: "Set#fromList",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "Set#toList",
+        aliases: &[],
+        arity: 1,
+    },
+    BuiltinDescriptor {
+        canonical: "Set#empty",
+        aliases: &[],
+        arity: 0,
+    },
+    BuiltinDescriptor {
+        canonical: "Set#union",
+        aliases: &[],
+        arity: 2,
+    },
+    BuiltinDescriptor {
+        canonical: "Set#intersect",
+        aliases: &[],
+        arity: 2,
+    },
+    BuiltinDescriptor {
+        canonical: "Set#subtract",
+        aliases: &[],
+        arity: 2,
+    },
     // --- Time / Math / Random ---
     BuiltinDescriptor {
         canonical: "Time#nowMillis",
