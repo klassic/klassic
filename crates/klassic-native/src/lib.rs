@@ -685,252 +685,6 @@ fn stdlib_module_decls(parsed: Expr) -> Vec<Expr> {
         other => vec![other],
     }
 }
-
-/// Remove the import nodes of inlined modules and rewrite aliased module
-/// access (`M.func` for `import std.x as M`) into a direct reference
-/// (`func`), recursing through the whole tree. Runs before type checking,
-/// so the aliased forms never need their own resolution.
-fn rewrite_inlined(expr: Expr, inlined: &[String], aliases: &HashSet<String>) -> Expr {
-    fn go(e: Expr, inlined: &[String], aliases: &HashSet<String>) -> Expr {
-        rewrite_inlined(e, inlined, aliases)
-    }
-    #[allow(clippy::boxed_local)] // mirrors the `Box<Expr>` AST fields it rewrites
-    fn go_box(e: Box<Expr>, inlined: &[String], aliases: &HashSet<String>) -> Box<Expr> {
-        Box::new(rewrite_inlined(*e, inlined, aliases))
-    }
-    fn go_vec(es: Vec<Expr>, inlined: &[String], aliases: &HashSet<String>) -> Vec<Expr> {
-        es.into_iter().map(|e| go(e, inlined, aliases)).collect()
-    }
-    match expr {
-        Expr::Import { path, span, .. } if inlined.iter().any(|p| p == &path) => Expr::Block {
-            expressions: Vec::new(),
-            span,
-        },
-        // `M.field` where `M` aliases an inlined module collapses to the
-        // bare `field` the spliced declarations define.
-        Expr::FieldAccess {
-            target,
-            field,
-            span,
-        } => {
-            if let Expr::Identifier { name, .. } = target.as_ref()
-                && aliases.contains(name)
-            {
-                return Expr::Identifier { name: field, span };
-            }
-            Expr::FieldAccess {
-                target: go_box(target, inlined, aliases),
-                field,
-                span,
-            }
-        }
-        // `M#field` parses as one identifier; collapse it the same way
-        // so the hash form works in native builds too (the evaluator
-        // accepts both forms).
-        Expr::Identifier { name, span }
-            if name
-                .split_once('#')
-                .is_some_and(|(prefix, _)| aliases.contains(prefix)) =>
-        {
-            let member = name
-                .split_once('#')
-                .expect("guard checked the separator")
-                .1
-                .to_string();
-            Expr::Identifier { name: member, span }
-        }
-        Expr::Block { expressions, span } => Expr::Block {
-            expressions: go_vec(expressions, inlined, aliases),
-            span,
-        },
-        Expr::If {
-            condition,
-            then_branch,
-            else_branch,
-            span,
-        } => Expr::If {
-            condition: go_box(condition, inlined, aliases),
-            then_branch: go_box(then_branch, inlined, aliases),
-            else_branch: else_branch.map(|b| go_box(b, inlined, aliases)),
-            span,
-        },
-        Expr::While {
-            condition,
-            body,
-            span,
-        } => Expr::While {
-            condition: go_box(condition, inlined, aliases),
-            body: go_box(body, inlined, aliases),
-            span,
-        },
-        Expr::Foreach {
-            binding,
-            iterable,
-            body,
-            span,
-        } => Expr::Foreach {
-            binding,
-            iterable: go_box(iterable, inlined, aliases),
-            body: go_box(body, inlined, aliases),
-            span,
-        },
-        Expr::DefDecl {
-            name,
-            type_params,
-            constraints,
-            params,
-            param_annotations,
-            return_annotation,
-            body,
-            span,
-        } => Expr::DefDecl {
-            name,
-            type_params,
-            constraints,
-            params,
-            param_annotations,
-            return_annotation,
-            body: go_box(body, inlined, aliases),
-            span,
-        },
-        Expr::Lambda {
-            params,
-            param_annotations,
-            body,
-            span,
-        } => Expr::Lambda {
-            params,
-            param_annotations,
-            body: go_box(body, inlined, aliases),
-            span,
-        },
-        Expr::Call {
-            callee,
-            arguments,
-            span,
-        } => Expr::Call {
-            callee: go_box(callee, inlined, aliases),
-            arguments: go_vec(arguments, inlined, aliases),
-            span,
-        },
-        Expr::VarDecl {
-            mutable,
-            name,
-            annotation,
-            value,
-            span,
-        } => Expr::VarDecl {
-            mutable,
-            name,
-            annotation,
-            value: go_box(value, inlined, aliases),
-            span,
-        },
-        Expr::Assign { name, value, span } => Expr::Assign {
-            name,
-            value: go_box(value, inlined, aliases),
-            span,
-        },
-        Expr::Cleanup {
-            body,
-            cleanup,
-            span,
-        } => Expr::Cleanup {
-            body: go_box(body, inlined, aliases),
-            cleanup: go_box(cleanup, inlined, aliases),
-            span,
-        },
-        Expr::Unary { op, expr, span } => Expr::Unary {
-            op,
-            expr: go_box(expr, inlined, aliases),
-            span,
-        },
-        Expr::Binary { lhs, op, rhs, span } => Expr::Binary {
-            lhs: go_box(lhs, inlined, aliases),
-            op,
-            rhs: go_box(rhs, inlined, aliases),
-            span,
-        },
-        Expr::ListLiteral { elements, span } => Expr::ListLiteral {
-            elements: go_vec(elements, inlined, aliases),
-            span,
-        },
-        Expr::MapLiteral { entries, span } => Expr::MapLiteral {
-            entries: entries
-                .into_iter()
-                .map(|(k, v)| (go(k, inlined, aliases), go(v, inlined, aliases)))
-                .collect(),
-            span,
-        },
-        Expr::SetLiteral { elements, span } => Expr::SetLiteral {
-            elements: go_vec(elements, inlined, aliases),
-            span,
-        },
-        Expr::RecordConstructor {
-            name,
-            arguments,
-            span,
-        } => Expr::RecordConstructor {
-            name,
-            arguments: go_vec(arguments, inlined, aliases),
-            span,
-        },
-        Expr::RecordLiteral { fields, span } => Expr::RecordLiteral {
-            fields: fields
-                .into_iter()
-                .map(|(name, value)| (name, go(value, inlined, aliases)))
-                .collect(),
-            span,
-        },
-        Expr::Match {
-            scrutinee,
-            arms,
-            span,
-        } => Expr::Match {
-            scrutinee: go_box(scrutinee, inlined, aliases),
-            arms: arms
-                .into_iter()
-                .map(|arm| MatchArm {
-                    pattern: arm.pattern,
-                    guard: arm.guard.map(|g| go(g, inlined, aliases)),
-                    body: go(arm.body, inlined, aliases),
-                    span: arm.span,
-                })
-                .collect(),
-            span,
-        },
-        Expr::ExtensionDeclaration {
-            type_params,
-            this_name,
-            receiver_type,
-            methods,
-            span,
-        } => Expr::ExtensionDeclaration {
-            type_params,
-            this_name,
-            receiver_type,
-            methods: go_vec(methods, inlined, aliases),
-            span,
-        },
-        Expr::InstanceDeclaration {
-            class_name,
-            for_type,
-            for_type_annotation,
-            constraints,
-            methods,
-            span,
-        } => Expr::InstanceDeclaration {
-            class_name,
-            for_type,
-            for_type_annotation,
-            constraints,
-            methods: go_vec(methods, inlined, aliases),
-            span,
-        },
-        other => other,
-    }
-}
-
 /// Sanitize a dotted module path for use in a mangled identifier:
 /// `util.base` -> `util_base`.
 fn sanitize_module_path(path: &str) -> String {
@@ -973,16 +727,16 @@ struct RenameScope {
     /// the main program. Takes priority over `imported` (own defs shadow
     /// imports of the same name).
     own: HashMap<String, String>,
-    /// Bare names the scope imports from another *mangled* (user) module
-    /// -> that name's mangled form, honoring this scope's own
-    /// members/excludes per import.
+    /// Bare names the scope imports from another *mangled* module -> that
+    /// name's mangled form, honoring this scope's own members/excludes per
+    /// import. Every inlined module (stdlib and user) is mangled.
     imported: HashMap<String, String>,
     /// Alias -> mangled module path prefix, for aliases that name a
-    /// mangled (user) module: `M.func` / `M#func` collapse to
-    /// `__mod_<path>_func`.
+    /// mangled module: `M.func` / `M#func` collapse to `__mod_<path>_func`.
     user_aliases: HashMap<String, String>,
-    /// Aliases that name an *unmangled* (stdlib) module: `M.func` /
-    /// `M#func` collapse to a bare `func` (the spliced stdlib decl name).
+    /// Aliases that name a module which is *not* mangled (none today; kept
+    /// as a defensive path so an aliased import of a future non-mangled
+    /// inlinable module still collapses `M.func` to a bare `func`).
     stdlib_aliases: HashSet<String>,
     /// Inlined module paths whose `import` nodes are deleted.
     inlined: Vec<String>,
@@ -992,9 +746,9 @@ struct RenameScope {
 ///
 /// `own_path` is the importing module's path (`None` for the main
 /// program). `imports` are the inlinable imports made by this scope.
-/// `mangled_modules` maps each *mangled* (user) module path to its set of
-/// free def names so an importer can expand a bulk import. `stdlib_paths`
-/// is the set of inlined stdlib module paths (unmangled).
+/// `mangled_modules` maps each mangled module path to its set of free def
+/// names so an importer can expand a bulk import and resolve a selective
+/// one. `inlined` is every spliced module path, used to drop import nodes.
 fn build_rename_scope(
     own_path: Option<&str>,
     own_defs: &[String],
@@ -1359,11 +1113,11 @@ fn rename_scope_expr(expr: Expr, scope: &RenameScope, locals: &HashSet<String>) 
             span,
         } => Expr::ExtensionDeclaration {
             type_params,
-            this_name,
+            this_name: this_name.clone(),
             receiver_type,
             methods: methods
                 .into_iter()
-                .map(|m| rename_scope_expr(m, scope, locals))
+                .map(|m| rename_method(m, scope, locals, &this_name))
                 .collect(),
             span,
         },
@@ -1381,11 +1135,55 @@ fn rename_scope_expr(expr: Expr, scope: &RenameScope, locals: &HashSet<String>) 
             constraints,
             methods: methods
                 .into_iter()
-                .map(|m| rename_scope_expr(m, scope, locals))
+                .map(|m| rename_method(m, scope, locals, ""))
                 .collect(),
             span,
         },
         other => other,
+    }
+}
+
+/// Rewrite an extension- or instance-method `def`'s body while leaving its
+/// name untouched. Method names dispatch by their declared name, not as
+/// free module defs, so they must NOT be mangled even when the module also
+/// declares a free def of the same name. The receiver (`this`) and the
+/// method's params are local to the body.
+fn rename_method(
+    method: Expr,
+    scope: &RenameScope,
+    locals: &HashSet<String>,
+    this_name: &str,
+) -> Expr {
+    match method {
+        Expr::DefDecl {
+            name,
+            type_params,
+            constraints,
+            params,
+            param_annotations,
+            return_annotation,
+            body,
+            span,
+        } => {
+            let mut body_locals = locals.clone();
+            if !this_name.is_empty() {
+                body_locals.insert(this_name.to_string());
+            }
+            for param in &params {
+                body_locals.insert(param.clone());
+            }
+            Expr::DefDecl {
+                name,
+                type_params,
+                constraints,
+                params,
+                param_annotations,
+                return_annotation,
+                body: Box::new(rename_scope_expr(*body, scope, &body_locals)),
+                span,
+            }
+        }
+        other => rename_scope_expr(other, scope, locals),
     }
 }
 
@@ -1474,16 +1272,12 @@ fn inline_module_imports(
     // splice them all even when the main program only imports the top
     // of the graph.
     let mut paths: Vec<String> = Vec::new();
-    let mut aliases: HashSet<String> = HashSet::new();
     let all_imports = main_imports.iter().chain(module_imports.values().flatten());
     for import in all_imports {
         if !paths.contains(&import.path)
             && !user_modules.iter().any(|module| module.path == import.path)
         {
             paths.push(import.path.clone());
-        }
-        if let Some(alias) = &import.alias {
-            aliases.insert(alias.clone());
         }
     }
     for module in user_modules {
@@ -1492,59 +1286,58 @@ fn inline_module_imports(
         }
     }
 
-    // User modules are mangled into a private namespace; stdlib modules
-    // are left bare (their refs from main stay bare too). `mangled_modules`
-    // records each mangled module's free def names so an importer can
-    // expand a bulk import.
-    let mut mangled_modules: HashMap<String, Vec<String>> = HashMap::new();
+    // Every inlined module — stdlib and user alike — is mangled into its
+    // own private namespace so that two modules defining the same free def
+    // name with different types can no longer collide. Parse each stdlib
+    // module now (user modules are already parsed) so we can record its
+    // free def names and its own imports of other inlined modules.
+    let mut parsed_by_path: HashMap<String, Expr> = HashMap::new();
     for (path, parsed) in &user_parsed {
+        parsed_by_path.insert(path.clone(), parsed.clone());
+    }
+    for path in &paths {
+        if parsed_by_path.contains_key(path) {
+            continue;
+        }
+        let source = stdlib_module_source(path).expect("inlinable module has a source");
+        let file = SourceFile::new(path, source.to_string());
+        let parsed = rewrite_expression(parse_source(&file)?);
+        let mut own = Vec::new();
+        collect_inlinable_imports(&parsed, user_modules, &mut own);
+        module_imports.insert(path.clone(), own);
+        parsed_by_path.insert(path.clone(), parsed);
+    }
+
+    // `mangled_modules` records each module's free def names so an importer
+    // can expand a bulk import and resolve a selective one.
+    let mut mangled_modules: HashMap<String, Vec<String>> = HashMap::new();
+    for (path, parsed) in &parsed_by_path {
         mangled_modules.insert(path.clone(), module_free_def_names(parsed));
     }
 
     let mut module_decls = Vec::new();
     for path in &paths {
-        // User modules are already parsed; stdlib modules parse here.
-        let parsed = if let Some((_, parsed)) = user_parsed
-            .iter()
-            .find(|(module_path, _)| module_path == path)
-        {
-            parsed.clone()
-        } else {
-            let source = stdlib_module_source(path).expect("inlinable module has a source");
-            let file = SourceFile::new(path, source.to_string());
-            rewrite_expression(parse_source(&file)?)
-        };
-        let is_user_module = mangled_modules.contains_key(path);
-        if is_user_module {
-            // Mangle this module's free defs and rewrite its internal
-            // references through its own selectors. `stdlib_module_decls`
-            // only strips the `module` header here.
-            let own_defs = mangled_modules.get(path).cloned().unwrap_or_default();
-            let imports = module_imports.get(path).cloned().unwrap_or_default();
-            let scope =
-                build_rename_scope(Some(path), &own_defs, &imports, &mangled_modules, &paths);
-            let locals = HashSet::new();
-            for decl in stdlib_module_decls(parsed) {
-                module_decls.push(rename_scope_expr(decl, &scope, &locals));
-            }
-        } else {
-            // Stdlib module: keep the existing bare splice (no mangling).
-            for decl in stdlib_module_decls(parsed) {
-                if let Expr::Import { path: inner, .. } = &decl
-                    && (paths.iter().any(|existing| existing == inner)
-                        || stdlib_module_is_inlinable(inner))
-                {
-                    continue;
-                }
-                module_decls.push(rewrite_inlined(decl, &paths, &aliases));
-            }
+        let parsed = parsed_by_path
+            .get(path)
+            .cloned()
+            .expect("every spliced path is parsed");
+        // Mangle this module's free defs and rewrite its internal
+        // references through its own selectors. `stdlib_module_decls`
+        // only strips the `module` header here; `rename_scope_expr`
+        // deletes the module's own inlined `import` nodes.
+        let own_defs = mangled_modules.get(path).cloned().unwrap_or_default();
+        let imports = module_imports.get(path).cloned().unwrap_or_default();
+        let scope = build_rename_scope(Some(path), &own_defs, &imports, &mangled_modules, &paths);
+        let locals = HashSet::new();
+        for decl in stdlib_module_decls(parsed) {
+            module_decls.push(rename_scope_expr(decl, &scope, &locals));
         }
     }
 
     let span = expr.span();
-    // The main program: rewrite references to names it imports from a
-    // mangled (user) module, and collapse stdlib-aliased access to bare.
-    // Main's own top-level defs are locals so they never get mangled.
+    // The main program: rewrite references to names it imports from any
+    // inlined module to that module's mangled name. Main's own top-level
+    // defs are locals so they never get mangled.
     let main_defs = module_free_def_names(&expr);
     let main_scope = build_rename_scope(None, &[], &main_imports, &mangled_modules, &paths);
     let main_locals: HashSet<String> = main_defs.into_iter().collect();
