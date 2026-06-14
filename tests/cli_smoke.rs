@@ -23311,6 +23311,50 @@ fn build_target_aarch64_apple_darwin_emits_macho() {
     );
 }
 
+/// Regression guard that runs on any host (including the fast Linux CI
+/// job): the aarch64 cross-build must accept monomorphic enum
+/// construction and match. The shared enum-lowering pass wraps
+/// constructions in shape-marker calls (`__enum_shape_named`) for the
+/// x86_64 display/dispatch paths; if those leak unhandled into the
+/// aarch64 backend, every enum build fails — a class of regression
+/// previously caught only by the macOS-gated run test.
+#[test]
+fn build_target_aarch64_apple_darwin_enum_cross_build() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_enum_xbuild_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_enum_xbuild_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         def total(t: Tree): Int = t match { case Leaf(v) => v; case Branch(l, r) => total(l) + total(r) }\n\
+         val t = Branch(Leaf(7), Leaf(2))\n\
+         println(total(t))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        build_output.status.success(),
+        "darwin enum cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
 /// On an Apple Silicon mac the generated Mach-O actually runs — this
 /// is the acceptance test for the M1 slice of the direct aarch64
 /// backend (it executes on macOS CI's arm64 runners).
