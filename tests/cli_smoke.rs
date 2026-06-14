@@ -22503,6 +22503,48 @@ fn native_integer_overflow_is_a_clean_error() {
     );
 }
 
+/// An unannotated parameter the body uses as a String (here passed to
+/// the String-only `length`) now compiles natively: its native type is
+/// inferred from body usage as a heap string instead of defaulting to
+/// Int, so a String argument no longer mismatches the parameter. (The
+/// `- 1` arithmetic is what previously forced the non-inline Int path.)
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_infers_unannotated_string_parameter() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_strparam_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_strparam_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def f(s) = length(s) - 1\nprintln(f(\"hello\"))\n",
+    )
+    .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "unannotated String-param helper should build natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "4\n");
+}
+
 /// Allocating enum values in a loop long enough to exhaust the initial
 /// 1 MiB GC heap exercises collection and free-list reuse. A reused
 /// first-fit block used to keep stale payload bytes (and `__gc_record`'s
