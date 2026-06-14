@@ -10,6 +10,15 @@ def nowMillis() = Time#nowMillis()
 
 def durationMillis(startMillis, endMillis) = endMillis - startMillis
 
+// Floor division (b > 0): rounds toward negative infinity, unlike Klassic's
+// truncating `/` which rounds toward zero. For non-negative `a` this is
+// identical to `/`; for negative `a` we subtract 1 whenever there is a
+// non-zero remainder, matching Python's `//` semantics.
+def timeFloorDiv(a, b) = {
+  val q = a / b
+  if (a - q * b != 0 && a < 0) q - 1 else q
+}
+
 def timePad2(n) = if (n < 10) "0#{n}" else "#{n}"
 
 def timePad3(n) = if (n < 10) "00#{n}" else if (n < 100) "0#{n}" else "#{n}"
@@ -28,12 +37,12 @@ def timeRenderCivil(z0, hour, minute, second, ms) = {
 }
 
 def formatIso(millis) = {
-  val totalSeconds = millis / 1000
+  val totalSeconds = timeFloorDiv(millis, 1000)
   val ms = millis - totalSeconds * 1000
-  val days = totalSeconds / 86400
+  val days = timeFloorDiv(totalSeconds, 86400)
   val secondOfDay = totalSeconds - days * 86400
-  val hour = secondOfDay / 3600
-  val minute = (secondOfDay - hour * 3600) / 60
+  val hour = timeFloorDiv(secondOfDay, 3600)
+  val minute = timeFloorDiv(secondOfDay - hour * 3600, 60)
   val second = secondOfDay - hour * 3600 - minute * 60
   timeRenderCivil(days, hour, minute, second, ms)
 }
@@ -73,11 +82,11 @@ def timeDaysFromCivil(year0, month0, day0) = {
 // Decompose epoch milliseconds to a full date-time record
 // { year, month, day, hour, minute, second } (all UTC).
 def timeDecompose(millis) = {
-  val totalSeconds = millis / 1000
-  val days = totalSeconds / 86400
+  val totalSeconds = timeFloorDiv(millis, 1000)
+  val days = timeFloorDiv(totalSeconds, 86400)
   val secondOfDay = totalSeconds - days * 86400
-  val hr = secondOfDay / 3600
-  val mn = (secondOfDay - hr * 3600) / 60
+  val hr = timeFloorDiv(secondOfDay, 3600)
+  val mn = timeFloorDiv(secondOfDay - hr * 3600, 60)
   val sc = secondOfDay - hr * 3600 - mn * 60
   val civil = timeDaysToCivil(days)
   record { year: civil.year; month: civil.month; day: civil.day; hour: hr; minute: mn; second: sc }

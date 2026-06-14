@@ -14,7 +14,7 @@ def clamp(n, lo, hi) = if((n < lo)) lo else if((n > hi)) hi else n
 
 def isEven(n) = mod(n, 2) == 0
 
-def isOdd(n) = mod(n, 2) == 1
+def isOdd(n) = mod(n, 2) != 0
 
 def sign(n) = if((n > 0)) 1 else if((n < 0)) -1 else 0
 
@@ -23,7 +23,7 @@ def sign(n) = if((n > 0)) 1 else if((n < 0)) -1 else 0
 // reach these extensions.
 extension (this: Int) {
   def isEvenN() = mod(this, 2) == 0
-  def isOddN() = mod(this, 2) == 1
+  def isOddN() = mod(this, 2) != 0
   def absValue() = if((this < 0)) -this else this
   def signOf() = if((this > 0)) 1 else if((this < 0)) -1 else 0
   def clampTo(lo, hi) = clamp(this, lo, hi)

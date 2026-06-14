@@ -102,7 +102,8 @@ def minBy(xs, key) =
 
 // Split `xs` into non-overlapping sublists of at most `n` elements.
 def chunk(xs, n) =
-  if(isEmpty(xs)) []
+  if(n <= 0) []
+  else if(isEmpty(xs)) []
   else cons(take(xs, n))(chunk(drop(xs, n), n))
 
 // ---------- slice -----------------------------------------------------------
