@@ -3785,10 +3785,6 @@ struct NativeCodeGenerator {
     /// Slot id -> concrete enum shape, so a `match` on an identifier can
     /// recover the per-instantiation field reprs of its scrutinee.
     enum_shapes: HashMap<usize, ConcreteEnumShape>,
-    /// Slot ids whose recorded shape came from a monomorphic enum (so a
-    /// later display of the bound name knows it can format the value). A
-    /// parallel marker to `enum_shapes`, kept tiny on purpose.
-    mono_enum_shape_slots: HashSet<usize>,
     /// Shapes referenced by synthesized `__enum_shape_hint(value, id)`
     /// calls: a pattern binding of an enum-typed payload wraps its field
     /// read in a hint so the binding's slot records the payload's shape
@@ -3797,12 +3793,6 @@ struct NativeCodeGenerator {
     /// Shape of the generic enum value just constructed, awaiting binding
     /// to a slot (picked up by the next `allocate_slot`/`bind_constant`).
     pending_enum_shape: Option<ConcreteEnumShape>,
-    /// Whether `pending_enum_shape` originated from a monomorphic enum
-    /// construction (the `__enum_shape_named` marker) rather than the
-    /// generic-enum construction path. Display sites format a value only
-    /// for shapes whose every variant they can render; this flag lets the
-    /// monomorphic display land independently of the generic one.
-    pending_enum_shape_is_mono: bool,
     /// Fresh-name counter for synthesized generic-enum lowering trees.
     generic_enum_counter: usize,
     /// Nesting depth of compile-time function/lambda body evaluation
@@ -3982,10 +3972,8 @@ impl NativeCodeGenerator {
             mono_enum_shapes: HashMap::new(),
             mono_enum_variants: HashMap::new(),
             enum_shapes: HashMap::new(),
-            mono_enum_shape_slots: HashSet::new(),
             enum_shape_hints: Vec::new(),
             pending_enum_shape: None,
-            pending_enum_shape_is_mono: false,
             generic_enum_counter: 0,
             static_eval_call_depth: 0,
             static_eval_fuel: 0,
@@ -4445,7 +4433,6 @@ impl NativeCodeGenerator {
         let value = self.compile_expr(value_expr)?;
         if let Some(shape) = self.mono_enum_shapes.get(name).cloned() {
             self.pending_enum_shape = Some(shape);
-            self.pending_enum_shape_is_mono = true;
         }
         Ok(value)
     }
@@ -5284,7 +5271,6 @@ impl NativeCodeGenerator {
         // that immediately follows its construction; clear any leftover so
         // it never attaches to an unrelated value.
         self.pending_enum_shape = None;
-        self.pending_enum_shape_is_mono = false;
         match expr {
             Expr::Int { value, .. } => {
                 self.asm.mov_imm64(Reg::Rax, *value as u64);
@@ -5479,7 +5465,6 @@ impl NativeCodeGenerator {
                 // per-instance payload reprs to the next slot.
                 if let Some(shape) = self.enum_shapes.get(&slot.id).cloned() {
                     self.pending_enum_shape = Some(shape);
-                    self.pending_enum_shape_is_mono = self.mono_enum_shape_slots.contains(&slot.id);
                 }
                 Ok(slot.value)
             }
@@ -10515,7 +10500,6 @@ impl NativeCodeGenerator {
                 }
                 let value = self.compile_expr(&arguments[0])?;
                 if value == NativeValue::HeapPointer
-                    && self.pending_enum_shape_is_mono
                     && let Some(shape) = self.pending_enum_shape.take()
                 {
                     return self.emit_enum_display_runtime_string(&shape, span);
@@ -32519,7 +32503,6 @@ impl NativeCodeGenerator {
 
         let value = self.compile_expr(expr)?;
         if value == NativeValue::HeapPointer
-            && self.pending_enum_shape_is_mono
             && let Some(shape) = self.pending_enum_shape.take()
         {
             let formatted = self.emit_enum_display_runtime_string(&shape, span)?;
@@ -32790,12 +32773,11 @@ impl NativeCodeGenerator {
                     continue;
                 }
                 let fragment = self.compile_expr(&parsed)?;
-                let enum_shape =
-                    if fragment == NativeValue::HeapPointer && self.pending_enum_shape_is_mono {
-                        self.pending_enum_shape.take()
-                    } else {
-                        None
-                    };
+                let enum_shape = if fragment == NativeValue::HeapPointer {
+                    self.pending_enum_shape.take()
+                } else {
+                    None
+                };
                 if let Some(shape) = enum_shape {
                     let formatted = self.emit_enum_display_runtime_string(&shape, span)?;
                     if let Some(formatted) = self.native_string_ref(formatted) {
@@ -38108,11 +38090,7 @@ impl NativeCodeGenerator {
             && let Some(shape) = self.pending_enum_shape.take()
         {
             self.enum_shapes.insert(slot.id, shape);
-            if self.pending_enum_shape_is_mono {
-                self.mono_enum_shape_slots.insert(slot.id);
-            }
         }
-        self.pending_enum_shape_is_mono = false;
         self.scopes
             .last_mut()
             .expect("native compiler always has a scope")
