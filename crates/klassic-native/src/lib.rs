@@ -6208,12 +6208,19 @@ impl NativeCodeGenerator {
         }
         self.pop_temp_reg(Reg::Rcx);
         match op {
-            BinaryOp::Add => self.asm.add_reg_reg(Reg::Rax, Reg::Rcx),
+            BinaryOp::Add => {
+                self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
+                self.emit_integer_overflow_check(span);
+            }
             BinaryOp::Subtract => {
                 self.asm.sub_reg_reg(Reg::Rcx, Reg::Rax);
                 self.asm.mov_reg_reg(Reg::Rax, Reg::Rcx);
+                self.emit_integer_overflow_check(span);
             }
-            BinaryOp::Multiply => self.asm.imul_reg_reg(Reg::Rax, Reg::Rcx),
+            BinaryOp::Multiply => {
+                self.asm.imul_reg_reg(Reg::Rax, Reg::Rcx);
+                self.emit_integer_overflow_check(span);
+            }
             BinaryOp::Divide => {
                 self.asm.mov_reg_reg(Reg::Rbx, Reg::Rax);
                 self.asm.mov_reg_reg(Reg::Rax, Reg::Rcx);
@@ -36756,6 +36763,17 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(ok);
     }
 
+    /// Trap on signed overflow (the OF flag set by the preceding add / sub
+    /// / imul) so native integer arithmetic matches the evaluator's checked
+    /// semantics — the evaluator reports `integer overflow` where native
+    /// would otherwise silently wrap two's complement.
+    fn emit_integer_overflow_check(&mut self, span: Span) {
+        let ok = self.asm.create_text_label();
+        self.asm.jcc_label(Condition::NoOverflow, ok);
+        self.emit_runtime_error(span, "integer overflow");
+        self.asm.bind_text_label(ok);
+    }
+
     fn emit_non_negative_builtin_int_check(&mut self, span: Span, name: &str) {
         self.emit_runtime_error_if_rax_negative(
             span,
@@ -40258,6 +40276,7 @@ enum Condition {
     LessEqual,
     Greater,
     GreaterEqual,
+    NoOverflow,
 }
 
 impl Condition {
@@ -40272,6 +40291,7 @@ impl Condition {
             Self::LessEqual => 0x9e,
             Self::Greater => 0x9f,
             Self::GreaterEqual => 0x9d,
+            Self::NoOverflow => 0x91,
         }
     }
 
@@ -40286,6 +40306,7 @@ impl Condition {
             Self::LessEqual => 0x8e,
             Self::Greater => 0x8f,
             Self::GreaterEqual => 0x8d,
+            Self::NoOverflow => 0x81,
         }
     }
 }

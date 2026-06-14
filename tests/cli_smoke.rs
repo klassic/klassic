@@ -22461,6 +22461,46 @@ fn native_division_by_zero_is_a_clean_error() {
     );
 }
 
+/// Native integer arithmetic traps on signed overflow with a clean
+/// `integer overflow` runtime error — matching the evaluator's checked
+/// arithmetic — instead of silently wrapping two's complement. The
+/// add/sub/imul are followed by an overflow-flag check.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_integer_overflow_is_a_clean_error() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_overflow_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_overflow_{stamp}.bin"));
+    fs::write(&source_path, "println(9223372036854775807 + 1)\n").expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "overflow program should build\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path).output().expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(!run.status.success());
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("integer overflow"),
+        "expected `integer overflow` on stderr, got:\nstdout:{}\nstderr:{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 /// Allocating enum values in a loop long enough to exhaust the initial
 /// 1 MiB GC heap exercises collection and free-list reuse. A reused
 /// first-fit block used to keep stale payload bytes (and `__gc_record`'s
