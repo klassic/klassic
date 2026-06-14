@@ -1926,8 +1926,13 @@ impl Emitter {
             return Err(Diagnostic::compile(
                 span,
                 format!(
-                    "{name} expects {} arguments but got {}",
+                    "{name} expects {} {} but got {}",
                     params.len(),
+                    if params.len() == 1 {
+                        "argument"
+                    } else {
+                        "arguments"
+                    },
                     arguments.len()
                 ),
             ));

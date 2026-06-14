@@ -1979,8 +1979,13 @@ impl TypeChecker {
                     return Err(type_error(
                         span,
                         format!(
-                            "function expects {} arguments but got {}",
+                            "function expects {} {} but got {}",
                             params.len(),
+                            if params.len() == 1 {
+                                "argument"
+                            } else {
+                                "arguments"
+                            },
                             arguments.len()
                         ),
                     ));
@@ -2118,8 +2123,13 @@ impl TypeChecker {
                     return Err(type_error(
                         span,
                         format!(
-                            "function expects {} arguments but got {}",
+                            "function expects {} {} but got {}",
                             params.len(),
+                            if params.len() == 1 {
+                                "argument"
+                            } else {
+                                "arguments"
+                            },
                             arguments.len()
                         ),
                     ));
@@ -3372,9 +3382,14 @@ impl TypeChecker {
                 return Err(type_error(
                     constraint.span,
                     format!(
-                        "typeclass `{}` expects {} type arguments but got {}",
+                        "typeclass `{}` expects {} type {} but got {}",
                         constraint.class_name,
                         info.type_params.len(),
+                        if info.type_params.len() == 1 {
+                            "argument"
+                        } else {
+                            "arguments"
+                        },
                         constraint.arguments.len()
                     ),
                 ));

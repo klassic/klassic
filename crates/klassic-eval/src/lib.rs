@@ -1264,8 +1264,13 @@ fn eval_expr_inner(
                 return Err(Diagnostic::runtime(
                     *span,
                     format!(
-                        "record `{name}` expects {} arguments but got {}",
+                        "record `{name}` expects {} {} but got {}",
                         fields.fields.len(),
+                        if fields.fields.len() == 1 {
+                            "argument"
+                        } else {
+                            "arguments"
+                        },
                         arguments.len()
                     ),
                 ));

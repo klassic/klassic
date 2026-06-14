@@ -14,7 +14,12 @@ pub(crate) fn ensure_arity(
         Err(Diagnostic::runtime(
             span,
             format!(
-                "{name} expects {expected} arguments but got {}",
+                "{name} expects {expected} {} but got {}",
+                if expected == 1 {
+                    "argument"
+                } else {
+                    "arguments"
+                },
                 arguments.len()
             ),
         ))
