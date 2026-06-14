@@ -3278,7 +3278,13 @@ impl TypeChecker {
         }
 
         let exports = resolve_user_module_types(path).ok_or_else(|| {
-            let message = if path.starts_with("std.") {
+            let message = if path.ends_with("._") {
+                let module = path.trim_end_matches("._");
+                format!(
+                    "wildcard imports are not supported; list the members explicitly, \
+                     e.g. `import {module}.{{a, b}}`"
+                )
+            } else if path.starts_with("std.") {
                 format!(
                     "module `{path}` is part of the standard library but is not yet \
                      available in native builds. Run the program with the evaluator \

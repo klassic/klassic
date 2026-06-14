@@ -216,6 +216,7 @@ fn helpful_syntax_diagnostics() {
             "record { name = \"Alice\" }",
             "record literals use `field: value`",
         ),
+        ("import std.list._", "wildcard imports are not supported"),
     ];
     for (src, expected) in cases {
         let output = Command::new(klassic_bin())
