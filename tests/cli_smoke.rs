@@ -30,16 +30,18 @@ fn stdlib_completeness_round_two() {
     );
 }
 
-/// std.option / std.result richer API (#447). The collision-suffixed
-/// free names (filterOption/foldOption/orElseResult) coexist with
-/// std.list's filter when all three modules are co-imported — the
-/// case that broke native inlining before the rename.
+/// std.option / std.result richer API via method-style dispatch. The
+/// clean names are restored now that native module namespacing (#449)
+/// makes the free names safe and receiver-type dispatch picks the right
+/// `filter`/`fold`/`flatMap`/`orElse` per type — so Option and Result
+/// expose `.filter`/`.fold`/`.flatMap`/`.orElse`/... that coexist with
+/// std.list when all three are co-imported.
 #[test]
 fn stdlib_option_result_richer_api() {
     let output = Command::new(klassic_bin())
         .args([
             "-e",
-            "import std.option\nimport std.result\nimport std.list\nprintln(filterOption(some(5), (x) => x > 3))\nprintln(toList(some(42)))\nprintln(foldOption(some(2), 0, (x) => x * 10))\nprintln(andThen(ok(3), (x) => ok(x + 1)))\nprintln(mapErr(err(\"boom\"), (e) => e + \"!\"))\nprintln(orElseResult(err(\"x\"), (e) => ok(0)))\nprintln(toOption(ok(7)))\nprintln(filter([1, 2, 3, 4], (x) => x > 2))",
+            "import std.option\nimport std.result\nimport std.list\nprintln(some(5).filter((x) => x > 3))\nprintln(some(2).fold(0, (x) => x * 10))\nprintln(some(3).flatMap((x) => some(x + 1)))\nprintln(ok(3).andThen((x) => ok(x + 1)))\nprintln(err(\"boom\").mapErr((e) => e + \"!\"))\nprintln(err(\"x\").orElse((e) => ok(0)))\nprintln(ok(7).toOption())\nprintln([1, 2, 3, 4].filterBy((x) => x > 2))",
         ])
         .output()
         .expect("binary should run");
@@ -50,7 +52,7 @@ fn stdlib_option_result_richer_api() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "Some(5)\n[42]\n20\nOk(4)\nErr(boom!)\nOk(0)\nSome(7)\n[3, 4]\n()\n"
+        "Some(5)\n20\nSome(4)\nOk(4)\nErr(boom!)\nOk(0)\nSome(7)\n[3, 4]\n()\n"
     );
 }
 
@@ -21695,7 +21697,7 @@ fn native_build_inlines_adt_stdlib_modules() {
 
 /// A generic-enum value freshly built on each arm of a `match` (so its
 /// shape is produced inside control flow) now carries a merged shape past
-/// the join (M6), so `mapOption` / `flatMapOption` / `orElse` / `mapResult`
+/// the join (M6), so `mapOption` / `flatMap` / `orElse` / `mapResult`
 /// results can be matched downstream. The merge prefers a resolved field
 /// over a defaulted one, so a string-payload `mapOption` reads back as a
 /// string, not the `None` arm's defaulted scalar.
@@ -21710,12 +21712,12 @@ fn native_build_propagates_generic_enum_shape_through_match() {
     let output_path = std::env::temp_dir().join(format!("klassic_native_generic_join_{stamp}.bin"));
     fs::write(
         &source_path,
-        "import std.option.{some, none, getOrElse, mapOption, flatMapOption, orElse}\n\
+        "import std.option.{some, none, getOrElse, mapOption, flatMap, orElse}\n\
          import std.result.{ok, err, unwrapOr, mapResult}\n\
          println(getOrElse(mapOption(some(10), (x) => x + 1), 0))\n\
          println(getOrElse(mapOption(none(), (x) => x + 1), -1))\n\
          println(getOrElse(mapOption(some(5), (x) => \"v=#{x}\"), \"none\"))\n\
-         println(getOrElse(flatMapOption(some(10), (x) => some(x * 2)), 0))\n\
+         println(getOrElse(flatMap(some(10), (x) => some(x * 2)), 0))\n\
          println(getOrElse(orElse(none(), some(77)), 0))\n\
          println(getOrElse(mapOption(mapOption(some(3), (x) => x + 1), (y) => y * 10), 0))\n\
          println(unwrapOr(mapResult(ok(5), (x) => x + 100), 0))\n\

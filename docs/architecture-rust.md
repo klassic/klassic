@@ -723,7 +723,7 @@ cargo run -- -e "1 + 2"
   their constructors (`some` / `ok`), consumers (`getOrElse` / `unwrapOr`
   / `isSome` / `isErr`) and method-style extensions compile to native.
   Helpers that *return* a freshly constructed generic enum through a
-  `match` (`mapOption` / `flatMapOption` / `orElse` / `mapResult`) work too:
+  `match` (`mapOption` / `flatMap` / `orElse` / `mapResult`) work too:
   a generic-enum shape produced inside a branch is captured per branch and
   the `if` lowering publishes the merged shape of its two branches, so the
   joined value carries it to its binding. The merge prefers a resolved

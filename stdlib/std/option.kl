@@ -33,7 +33,7 @@ def mapOption(o, f) = o match {
   case None => None
 }
 
-def flatMapOption(o, f) = o match {
+def flatMap(o, f) = o match {
   case Some(v) => f(v)
   case None => None
 }
@@ -43,10 +43,10 @@ def orElse(o, alternative) = o match {
   case None => alternative
 }
 
-// filterOption(o, p): Some(v) if o is Some(v) and p(v), else None
+// filter(o, p): Some(v) if o is Some(v) and p(v), else None
 // (free name suffixed to avoid colliding with std.list.filter when
 // both are imported and inlined into one native type scope.)
-def filterOption(o, p) = o match {
+def filter(o, p) = o match {
   case Some(v) => if(p(v)) Some(v) else None
   case None => None
 }
@@ -57,9 +57,9 @@ def toList(o) = o match {
   case None => []
 }
 
-// foldOption(o, ifNone, f): ifNone if None, f(v) if Some(v)
+// fold(o, ifNone, f): ifNone if None, f(v) if Some(v)
 // (suffixed; std.map also has a free `fold`.)
-def foldOption(o, ifNone, f) = o match {
+def fold(o, ifNone, f) = o match {
   case Some(v) => f(v)
   case None => ifNone
 }
@@ -90,7 +90,7 @@ extension <a>(this: Option<a>) {
     case Some(v) => Some(f(v))
     case None => None
   }
-  def flatMapOption(f) = this match {
+  def flatMap(f) = this match {
     case Some(v) => f(v)
     case None => None
   }

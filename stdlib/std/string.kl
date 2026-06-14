@@ -43,7 +43,7 @@ extension (this: String) {
   def isFloat() = String#isDouble(this)
   // Count non-overlapping occurrences of `sub` in `this`. Empty `sub`
   // returns 0.
-  def countOccurrences(sub) = countOccurrences(this, sub)
+  def count(sub) = count(this, sub)
   // Uppercase the first character; leave the rest unchanged. Empty
   // string stays "".
   def capitalized() = capitalize(this)
@@ -55,11 +55,11 @@ extension (this: String) {
   def withoutSuffix(suffix) = stripSuffix(this, suffix)
 }
 
-// ---------- countOccurrences ------------------------------------------------
+// ---------- count ------------------------------------------------
 
 // Number of non-overlapping occurrences of `sub` in `s`. Returns 0 for
 // an empty `sub`.
-def countOccurrences(s, sub) = if(isEmptyString(sub)) 0 else size(split(s, sub)) - 1
+def count(s, sub) = if(isEmptyString(sub)) 0 else size(split(s, sub)) - 1
 
 // ---------- capitalize ------------------------------------------------------
 

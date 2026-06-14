@@ -159,22 +159,24 @@ println(some("hi").isSome())     // true
 println(some(2).mapOption((x) => x * 10).getOrElse(0)) // 20
 ```
 
-Beyond `getOrElse` / `mapOption` / `flatMapOption` / `orElse`, the
-module ships `filterOption(o, p)`, `toList(o)`, `foldOption(o, ifNone, f)`,
-and `ifPresent(o, f)`. The function-style names carry an `Option`
-suffix where they would otherwise clash with another module's free
-function, but the **method twins keep the clean names**
-`.filter`, `.toList`, `.fold`, and `.ifPresent`:
+Beyond `getOrElse` / `mapOption` / `flatMap` / `orElse`, the module
+ships `filter(o, p)`, `toList(o)`, `fold(o, ifNone, f)`, and
+`ifPresent(o, f)` as free functions, each with a matching method twin
+`.filter`, `.toList`, `.fold`, and `.ifPresent`. (`mapOption` keeps its
+suffix because the bare `map` is a builtin name.) The same clean
+`filter` / `fold` / `flatMap` names live on `std.result` and `std.list`
+too; co-import them and reach for the **method form**, which dispatches
+by receiver type, or qualify the free function with an alias:
 
 ```klassic
-import std.option.{some, none, filterOption, foldOption}
+import std.option.{some, none, filter, fold}
 
-println(filterOption(some(7), (x) => x > 3).getOrElse(0)) // 7   (free fn)
-println(foldOption(some(10), 0, (x) => x * 2))            // 20
+println(filter(some(7), (x) => x > 3).getOrElse(0)) // 7   (free fn)
+println(fold(some(10), 0, (x) => x * 2))            // 20
 
-println(some(7).filter((x) => x > 3).getOrElse(0))        // 7   (method)
-println(some(5).fold(0, (x) => x + 1))                    // 6
-println(some(5).toList())                                 // [5]
+println(some(7).filter((x) => x > 3).getOrElse(0))  // 7   (method)
+println(some(5).fold(0, (x) => x + 1))              // 6
+println(some(5).toList())                           // [5]
 some(99).ifPresent((x) => println("got " + toString(x)))  // got 99
 ```
 
@@ -214,22 +216,24 @@ println(bad.unwrapOr("fallback"))      // "fallback"
 println(good.mapResult((x) => x + "!").unwrapOr("")) // "payload!"
 ```
 
-The chaining surface is `flatMapResult(r, f)` / `andThen(r, f)`,
-`mapErr(r, g)`, `orElseResult(r, h)`, `filterResult(r, p, errVal)`,
-`foldResult(r, onOk, onErr)`, and `toOption(r)`. As with `std.option`,
-the free functions take a type suffix to stay collision-free, while
-the method twins read cleanly as `.flatMap`, `.andThen`, `.mapErr`,
-`.orElse`, `.filterResult`, `.foldResult`, and `.toOption`:
+The chaining surface is `flatMap(r, f)` / `andThen(r, f)`,
+`mapErr(r, g)`, `orElse(r, h)`, `filter(r, p, errVal)`,
+`fold(r, onOk, onErr)`, and `toOption(r)`, with method twins
+`.flatMap`, `.andThen`, `.mapErr`, `.orElse`, `.filter`, `.fold`, and
+`.toOption`. (`mapResult` keeps its suffix because the bare `map` is a
+builtin name.) `filter` / `fold` / `flatMap` / `orElse` are the same
+clean names `std.option` and `std.list` use; under co-import prefer the
+method form, which dispatches by receiver type:
 
 ```klassic
-import std.result.{ok, err, andThen, foldResult}
+import std.result.{ok, err, andThen, fold}
 
-println(andThen(ok(4), (x) => ok(x * 2)).unwrapOr(0))         // 8
-println(foldResult(err("boom"), (x) => "ok", (m) => "err " + m)) // err boom
+println(andThen(ok(4), (x) => ok(x * 2)).unwrapOr(0))     // 8
+println(fold(err("boom"), (x) => "ok", (m) => "err " + m)) // err boom
 
-println(ok(4).flatMap((x) => ok(x + 10)).unwrapOr(0))         // 14
-println(err("e").orElse((m) => ok(7)).unwrapOr(0))            // 7
-println(ok(3).toOption().getOrElse(0))                        // 3
+println(ok(4).flatMap((x) => ok(x + 10)).unwrapOr(0))     // 14
+println(err("e").orElse((m) => ok(7)).unwrapOr(0))        // 7
+println(ok(3).toOption().getOrElse(0))                    // 3
 ```
 
 The underlying ADT:

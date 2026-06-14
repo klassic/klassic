@@ -36,7 +36,7 @@ def mapResult(r, f) = r match {
 }
 
 // flatMap(r, f): Ok(v) -> f(v) (f returns Result), Err(e) -> Err(e)
-def flatMapResult(r, f) = r match {
+def flatMap(r, f) = r match {
   case Ok(v) => f(v)
   case Err(m) => Err(m)
 }
@@ -54,19 +54,19 @@ def mapErr(r, g) = r match {
 }
 
 // orElse(r, h): Err(e) -> h(e) (h returns Result), Ok stays
-def orElseResult(r, h) = r match {
+def orElse(r, h) = r match {
   case Ok(v) => Ok(v)
   case Err(m) => h(m)
 }
 
 // filter(r, p, errVal): Ok(v) and !p(v) -> Err(errVal), else unchanged
-def filterResult(r, p, errVal) = r match {
+def filter(r, p, errVal) = r match {
   case Ok(v) => if(p(v)) Ok(v) else Err(errVal)
   case Err(m) => Err(m)
 }
 
 // fold(r, onOk, onErr): applies onOk to Ok value or onErr to Err message
-def foldResult(r, onOk, onErr) = r match {
+def fold(r, onOk, onErr) = r match {
   case Ok(v) => onOk(v)
   case Err(m) => onErr(m)
 }
@@ -111,11 +111,11 @@ extension <a, e>(this: Result<a, e>) {
     case Ok(v) => Ok(v)
     case Err(m) => h(m)
   }
-  def filterResult(p, errVal) = this match {
+  def filter(p, errVal) = this match {
     case Ok(v) => if(p(v)) Ok(v) else Err(errVal)
     case Err(m) => Err(m)
   }
-  def foldResult(onOk, onErr) = this match {
+  def fold(onOk, onErr) = this match {
     case Ok(v) => onOk(v)
     case Err(m) => onErr(m)
   }
