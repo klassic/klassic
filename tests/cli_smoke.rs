@@ -111,6 +111,30 @@ fn arity_diagnostic_pluralizes() {
     );
 }
 
+/// Consistency helpers added across the ADT/collection stdlib:
+/// `Result.getOrElse` (the Option name, aliasing unwrapOr), `contains` /
+/// `exists` predicates on both Option and Result (dispatching by
+/// receiver when co-imported), and `List.atIndex` / `sumBy` / `foldRight`.
+#[test]
+fn stdlib_consistency_helpers() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.option\nimport std.result\nimport std.list\nprintln(ok(5).getOrElse(0))\nprintln(err(\"e\").getOrElse(-1))\nprintln(ok(5).exists((x) => x > 3))\nprintln(err(\"e\").contains(9))\nprintln(some(5).contains(5))\nprintln(some(5).exists((x) => x > 3))\nprintln([10, 20, 30].atIndex(1))\nprintln([1, 2, 3, 4].sumBy((x) => x * x))\nprintln([1, 2, 3].foldRight(0)((x, acc) => x + acc))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "stdlib consistency helpers should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "5\n-1\ntrue\nfalse\ntrue\ntrue\n20\n30\n6\n()\n"
+    );
+}
+
 /// `none` is a polymorphic `Option` value, not a function: it takes no
 /// parentheses and unifies at any element type, so `getOrElse(none, 0)`
 /// and `getOrElse(none, "fallback")` both type-check against the single
