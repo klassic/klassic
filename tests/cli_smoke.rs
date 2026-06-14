@@ -54,6 +54,61 @@ fn stdlib_option_result_richer_api() {
     );
 }
 
+/// Correctness fixes at the negative / boundary edges of the round-2
+/// stdlib: `std.math.isOdd` used `mod(n, 2) == 1`, but Klassic's `mod`
+/// is truncated so `mod(-3, 2) == -1` — a negative odd integer was
+/// classified as neither odd nor even. `std.list.chunk` looped forever
+/// on a non-positive size (`drop(xs, 0) == xs`). `std.time.formatIso`
+/// emitted garbage (`00:00:0-1`) for pre-1970 (negative) epoch millis
+/// because the time-of-day split used truncated instead of floor
+/// division. All three now behave, and positive inputs are unchanged.
+#[test]
+fn stdlib_negative_and_boundary_fixes() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.math\nimport std.list\nimport std.time\nprintln(isOdd(-3))\nprintln(isEven(-3))\nprintln(isOdd(-4))\nprintln(chunk([1, 2, 3], 0))\nprintln(chunk([1, 2, 3, 4, 5], 2))\nprintln(formatIso(-1000))\nprintln(parseIso(formatIso(-1000)))\nprintln(formatIso(1700000000000))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "stdlib boundary fixes should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "true\nfalse\nfalse\n[]\n[[1, 2], [3, 4], [5]]\n1969-12-31T23:59:59.000Z\n-1000\n2023-11-14T22:13:20.000Z\n()\n"
+    );
+}
+
+/// Arity-mismatch diagnostics pluralize the noun: exactly one expected
+/// argument reads "1 argument", any other count reads "N arguments".
+#[test]
+fn arity_diagnostic_pluralizes() {
+    let singular = Command::new(klassic_bin())
+        .args(["-e", "def f(x) = x\nf()"])
+        .output()
+        .expect("binary should run");
+    assert!(!singular.status.success());
+    assert!(
+        String::from_utf8_lossy(&singular.stderr).contains("expects 1 argument but got 0"),
+        "expected singular 'argument', got:\n{}",
+        String::from_utf8_lossy(&singular.stderr)
+    );
+
+    let plural = Command::new(klassic_bin())
+        .args(["-e", "def g(x, y) = x\ng(1)"])
+        .output()
+        .expect("binary should run");
+    assert!(!plural.status.success());
+    assert!(
+        String::from_utf8_lossy(&plural.stderr).contains("expects 2 arguments but got 1"),
+        "expected plural 'arguments', got:\n{}",
+        String::from_utf8_lossy(&plural.stderr)
+    );
+}
+
 /// CI guard: the direct Mach-O backend's binaries can only run on
 /// Apple Silicon, so every test that builds *and executes* that
 /// backend's output is `#[cfg(all(target_os = "macos", target_arch =
