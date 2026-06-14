@@ -627,17 +627,45 @@ fn stdlib_module_source(path: &str) -> Option<&'static str> {
         .map(|module| module.source)
 }
 
+/// One import of an inlinable module, with the selector information the
+/// namespacing rewrite needs. `members = Some(..)` selects only those
+/// names (`import a.{x, y}`); `excludes` hides names from a bulk import
+/// (`import a.{x => _}`); `alias = Some("M")` names the module so
+/// `M.func` / `M#func` access can be resolved.
+#[derive(Clone, Debug)]
+struct InlineImport {
+    path: String,
+    alias: Option<String>,
+    // The selector fields are threaded through M1 so the namespacing
+    // rewrite can honor `import a.{x, y}` / `import a.{x => _}`; the
+    // rewrite that reads them lands in a later milestone.
+    #[allow(dead_code)]
+    members: Option<Vec<String>>,
+    #[allow(dead_code)]
+    excludes: Vec<String>,
+}
+
 fn collect_inlinable_imports(
     expr: &Expr,
     user_modules: &[UserModuleSource],
-    out: &mut Vec<(String, Option<String>)>,
+    out: &mut Vec<InlineImport>,
 ) {
     match expr {
-        Expr::Import { path, alias, .. }
-            if stdlib_module_is_inlinable(path)
-                || user_modules.iter().any(|module| module.path == *path) =>
+        Expr::Import {
+            path,
+            alias,
+            members,
+            excludes,
+            ..
+        } if stdlib_module_is_inlinable(path)
+            || user_modules.iter().any(|module| module.path == *path) =>
         {
-            out.push((path.clone(), alias.clone()));
+            out.push(InlineImport {
+                path: path.clone(),
+                alias: alias.clone(),
+                members: members.clone(),
+                excludes: excludes.clone(),
+            });
         }
         Expr::Block { expressions, .. } => {
             for sub in expressions {
@@ -932,20 +960,19 @@ fn inline_module_imports(
 ) -> Result<Expr, Diagnostic> {
     let mut imports = Vec::new();
     collect_inlinable_imports(&expr, user_modules, &mut imports);
-    // A std module imported only from inside a user module still needs
-    // splicing; the module sources are plain text here, so scan them
-    // the same way the CLI discovers user modules.
+    // Parse every user module once up front. Their parsed ASTs feed both
+    // import discovery (a std or user module imported only from inside a
+    // user module still needs splicing) and the splice loop below, so
+    // selective `import a.{x, y}` members survive instead of being lost
+    // to a line scan.
+    let mut user_parsed: Vec<(String, Expr)> = Vec::with_capacity(user_modules.len());
     for module in user_modules {
-        for line in module.source.lines() {
-            let Some(rest) = line.trim_start().strip_prefix("import ") else {
-                continue;
-            };
-            let token = rest.split_whitespace().next().unwrap_or("");
-            let token = token.split(".{").next().unwrap_or(token);
-            if stdlib_module_is_inlinable(token) {
-                imports.push((token.to_string(), None));
-            }
-        }
+        let file = SourceFile::new(&module.path, module.source.clone());
+        let parsed = rewrite_expression(parse_source(&file)?);
+        // Capture imports the module itself makes of other inlinable
+        // modules, keeping their members/excludes/alias.
+        collect_inlinable_imports(&parsed, user_modules, &mut imports);
+        user_parsed.push((module.path.clone(), parsed));
     }
     if imports.is_empty() {
         return Ok(expr);
@@ -959,13 +986,13 @@ fn inline_module_imports(
     // of the graph.
     let mut paths: Vec<String> = Vec::new();
     let mut aliases: HashSet<String> = HashSet::new();
-    for (path, alias) in &imports {
-        if !paths.iter().any(|existing| existing == path)
-            && !user_modules.iter().any(|module| module.path == *path)
+    for import in &imports {
+        if !paths.contains(&import.path)
+            && !user_modules.iter().any(|module| module.path == import.path)
         {
-            paths.push(path.clone());
+            paths.push(import.path.clone());
         }
-        if let Some(alias) = alias {
+        if let Some(alias) = &import.alias {
             aliases.insert(alias.clone());
         }
     }
@@ -977,15 +1004,17 @@ fn inline_module_imports(
 
     let mut module_decls = Vec::new();
     for path in &paths {
-        let user_source = user_modules
+        // User modules are already parsed; stdlib modules parse here.
+        let parsed = if let Some((_, parsed)) = user_parsed
             .iter()
-            .find(|module| module.path == *path)
-            .map(|module| module.source.as_str());
-        let source = user_source
-            .or_else(|| stdlib_module_source(path))
-            .expect("inlinable module has a source");
-        let file = SourceFile::new(path, source.to_string());
-        let parsed = rewrite_expression(parse_source(&file)?);
+            .find(|(module_path, _)| module_path == path)
+        {
+            parsed.clone()
+        } else {
+            let source = stdlib_module_source(path).expect("inlinable module has a source");
+            let file = SourceFile::new(path, source.to_string());
+            rewrite_expression(parse_source(&file)?)
+        };
         // A module's own imports of other spliced modules are satisfied
         // by the splice order — drop those nodes (anything else keeps
         // its diagnostic).
