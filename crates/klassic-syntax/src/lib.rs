@@ -1093,6 +1093,12 @@ impl Parser {
                 TokenKind::Colon => {
                     self.bump();
                 }
+                TokenKind::Assign => {
+                    return Err(Diagnostic::parse(
+                        self.peek().span,
+                        "record literals use `field: value`, not `field = value`",
+                    ));
+                }
                 _ => {
                     return Err(Diagnostic::parse(
                         self.peek().span,
@@ -1980,7 +1986,9 @@ impl Parser {
 
     fn parse_if_expression(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.bump().span;
-        self.expect_lparen()?;
+        self.expect_lparen_hinted(
+            "expected `(`: Klassic wraps an `if` condition in parentheses — `if(cond) { ... }`",
+        )?;
         let condition = self.parse_expression()?;
         self.expect_rparen()?;
         let then_branch = self.parse_branch_expression()?;
@@ -2022,7 +2030,9 @@ impl Parser {
 
     fn parse_while_expression(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.bump().span;
-        self.expect_lparen()?;
+        self.expect_lparen_hinted(
+            "expected `(`: Klassic wraps a `while` condition in parentheses — `while(cond) { ... }`",
+        )?;
         let condition = self.parse_expression()?;
         self.expect_rparen()?;
         let body = self.parse_branch_expression()?;
@@ -2035,7 +2045,9 @@ impl Parser {
 
     fn parse_foreach_expression(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.bump().span;
-        self.expect_lparen()?;
+        self.expect_lparen_hinted(
+            "expected `(`: Klassic wraps a `foreach` binding in parentheses — `foreach(x in xs) { ... }`",
+        )?;
         let (binding, binding_span) = self.expect_identifier()?;
         match self.peek().kind {
             TokenKind::In => {
@@ -3662,6 +3674,20 @@ impl Parser {
                 Ok(())
             }
             _ => Err(Diagnostic::parse(self.peek().span, "expected `(`")),
+        }
+    }
+
+    /// Like `expect_lparen` but, when the `(` is missing, emits a
+    /// keyword-specific hint — Klassic requires parentheses around an
+    /// `if` / `while` condition and a `foreach` binding, which trips up
+    /// users coming from Kotlin / Scala / Rust.
+    fn expect_lparen_hinted(&mut self, hint: &str) -> Result<(), Diagnostic> {
+        match self.peek().kind {
+            TokenKind::LParen => {
+                self.bump();
+                Ok(())
+            }
+            _ => Err(Diagnostic::parse(self.peek().span, hint)),
         }
     }
 

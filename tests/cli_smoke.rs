@@ -202,6 +202,35 @@ fn field_access_error_names_the_member() {
     );
 }
 
+/// Syntax errors for the parenthesization Klassic requires (and the
+/// `field: value` record syntax) carry a keyword-specific hint instead
+/// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
+/// the fix.
+#[test]
+fn helpful_syntax_diagnostics() {
+    let cases = [
+        ("if x > 0 { 1 } else { 2 }", "`if(cond) { ... }`"),
+        ("while x < 10 { x }", "`while(cond) { ... }`"),
+        ("foreach x in xs { x }", "`foreach(x in xs) { ... }`"),
+        (
+            "record { name = \"Alice\" }",
+            "record literals use `field: value`",
+        ),
+    ];
+    for (src, expected) in cases {
+        let output = Command::new(klassic_bin())
+            .args(["-e", src])
+            .output()
+            .expect("binary should run");
+        assert!(!output.status.success(), "`{src}` should fail to parse");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "for `{src}` expected hint containing {expected:?}, got:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// CI guard: the direct Mach-O backend's binaries can only run on
 /// Apple Silicon, so every test that builds *and executes* that
 /// backend's output is `#[cfg(all(target_os = "macos", target_arch =
