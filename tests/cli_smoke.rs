@@ -111,6 +111,31 @@ fn arity_diagnostic_pluralizes() {
     );
 }
 
+/// `none` is a polymorphic `Option` value, not a function: it takes no
+/// parentheses and unifies at any element type, so `getOrElse(none, 0)`
+/// and `getOrElse(none, "fallback")` both type-check against the single
+/// `val none = None` binding. Klassic's HM inference generalizes the
+/// nullary `None` constructor, so no special casing is needed.
+#[test]
+fn none_is_a_polymorphic_value() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.option\nprintln(getOrElse(none, 0))\nprintln(getOrElse(none, \"fallback\"))\nprintln(none.orElse(some(7)).getOrElse(-1))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "polymorphic none should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "0\nfallback\n7\n()\n"
+    );
+}
+
 /// CI guard: the direct Mach-O backend's binaries can only run on
 /// Apple Silicon, so every test that builds *and executes* that
 /// backend's output is `#[cfg(all(target_os = "macos", target_arch =
@@ -21647,7 +21672,7 @@ fn native_build_inlines_adt_stdlib_modules() {
         "import std.option.{some, none, getOrElse, isSome}\n\
          import std.result.{ok, err, unwrapOr, isErr}\n\
          println(getOrElse(some(7), 0))\n\
-         println(getOrElse(none(), 42))\n\
+         println(getOrElse(none, 42))\n\
          println(isSome(some(5)))\n\
          println(unwrapOr(ok(9), 0))\n\
          println(unwrapOr(err(\"boom\"), 99))\n\
@@ -21715,10 +21740,10 @@ fn native_build_propagates_generic_enum_shape_through_match() {
         "import std.option\n\
          import std.result\n\
          println(some(10).map((x) => x + 1).getOrElse(0))\n\
-         println(none().map((x) => x + 1).getOrElse(-1))\n\
+         println(none.map((x) => x + 1).getOrElse(-1))\n\
          println(some(5).map((x) => \"v=#{x}\").getOrElse(\"none\"))\n\
          println(some(10).flatMap((x) => some(x * 2)).getOrElse(0))\n\
-         println(none().orElse(some(77)).getOrElse(0))\n\
+         println(none.orElse(some(77)).getOrElse(0))\n\
          println(some(3).map((x) => x + 1).map((y) => y * 10).getOrElse(0))\n\
          println(ok(5).map((x) => x + 100).unwrapOr(0))\n\
          println(err(\"boom\").map((x) => x + 100).unwrapOr(-1))\n",
@@ -22214,7 +22239,7 @@ fn native_displays_enum_values() {
          println(toString(B(5)))\n\
          println(\"box=#{w}\")\n\
          println(some(5))\n\
-         println(none())\n\
+         println(none)\n\
          println(some(some(9)))\n",
     )
     .expect("source should write");
@@ -22247,7 +22272,7 @@ fn native_displays_enum_values() {
 /// Receiver-type-aware method dispatch: when an extension-method name is
 /// declared on multiple enum types (here `orElse` on both `Option` and
 /// `Result`, co-imported), native dispatches by the receiver's actual
-/// enum instead of failing — `none().orElse(..)` resolves to Option's,
+/// enum instead of failing — `none.orElse(..)` resolves to Option's,
 /// `err(..).orElse(..)` to Result's. Matches the evaluator.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
@@ -22262,7 +22287,7 @@ fn native_dispatches_shared_enum_method_by_receiver() {
         &source_path,
         "import std.option\n\
          import std.result\n\
-         println(none().orElse(some(7)))\n\
+         println(none.orElse(some(7)))\n\
          println(some(3).orElse(some(9)))\n\
          println(err(\"e\").orElse((m) => ok(0)))\n\
          println(ok(5).orElse((m) => ok(0)))\n",
@@ -24495,7 +24520,7 @@ fn evaluator_imports_std_option_and_result() {
             "-e",
             "import std.option.{some, none, getOrElse}\n\
              println(getOrElse(some(\"hi\"), \"fallback\"))\n\
-             println(getOrElse(none(), \"fallback\"))",
+             println(getOrElse(none, \"fallback\"))",
         ])
         .output()
         .expect("binary should run");

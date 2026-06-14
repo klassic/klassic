@@ -17536,7 +17536,7 @@ impl NativeCodeGenerator {
     ///
     ///   * a variant constructor call (`some(..)` desugars to `Some(..)`)
     ///   * a call to a function whose body provably returns a known enum
-    ///     (`none()`, `ok(..)`, ...)
+    ///     (`ok(..)`, `err(..)`, ...)
     ///   * an identifier bound to a slot carrying a generic-enum shape
     ///   * a chained enum extension-method call (`opt.filter(p)` returns the
     ///     same enum the method is declared on)
@@ -17596,7 +17596,7 @@ impl NativeCodeGenerator {
 
     /// The enum named by the tail value of `expr`, when it is provably a
     /// known enum constructor (used to resolve a helper function's return
-    /// enum, e.g. the `None` in `def none() = None`). Only descends through
+    /// enum, e.g. the `Ok` in `def ok(v) = Ok(v)`). Only descends through
     /// pure tail positions (blocks, `if`, `match` arms) so it never claims
     /// an enum the function might not actually return.
     fn static_expr_enum_name(&self, expr: &Expr) -> Option<String> {

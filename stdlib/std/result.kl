@@ -74,7 +74,7 @@ def fold(r, onOk, onErr) = r match {
 // toOption(r): Ok(v) -> Some(v), Err -> None
 def toOption(r) = r match {
   case Ok(v) => some(v)
-  case Err(m) => none()
+  case Err(m) => none
 }
 
 // Method-style dispatch. Mirrors the function helpers above.
@@ -121,6 +121,6 @@ extension <a, e>(this: Result<a, e>) {
   }
   def toOption() = this match {
     case Ok(v) => some(v)
-    case Err(m) => none()
+    case Err(m) => none
   }
 }

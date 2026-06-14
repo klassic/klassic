@@ -154,10 +154,16 @@ val maybe = some(7)
 println(getOrElse(maybe, 0))     // 7   (function-style)
 println(maybe.getOrElse(0))      // 7   (method-style)
 
-println(none().isNone())         // true
+println(none.isNone())         // true
 println(some("hi").isSome())     // true
 println(some(2).map((x) => x * 10).getOrElse(0)) // 20
 ```
+
+`none` is a polymorphic value (`Option<a>` for any `a`), so it takes no
+parentheses — write `none`, not `none()`. `some(v)` stays a function
+because it carries a payload. (Klassic's inference generalizes a nullary
+constructor like `None` to a polymorphic value, so `val none = None`
+just works.)
 
 Beyond `getOrElse` / `map` / `flatMap` / `orElse`, the module ships
 `filter(o, p)`, `toList(o)`, `fold(o, ifNone, f)`, and `ifPresent(o, f)`

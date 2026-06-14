@@ -11,7 +11,12 @@ enum Option<a> {
 
 def some(value) = Some(value)
 
-def none() = None
+// `none` is a value, not a function: the nullary `None` constructor
+// generalizes to a polymorphic `Option<a>`, so callers write `none`
+// (no parentheses) and it unifies at whatever element type the use
+// site needs. `some(value)` stays a function because it carries a
+// payload.
+val none = None
 
 def isSome(o) = o match {
   case Some(v) => true
