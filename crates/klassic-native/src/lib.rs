@@ -561,7 +561,27 @@ fn compile_internal(
     typecheck_program(&expr).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
+    // Map every enum variant name to its owning enum — captured before
+    // `desugar_enums` erases the monomorphic declarations — so codegen can
+    // name the enum behind a receiver's tracked shape when dispatching an
+    // ambiguous extension method (covers both generic and mono enums).
+    let mut variant_owner_enum: HashMap<String, String> = HashMap::new();
+    {
+        let mut enum_decls = Vec::new();
+        collect_enum_decls(&expr, &mut enum_decls);
+        for (enum_name, _type_params, variants) in &enum_decls {
+            for variant in variants {
+                variant_owner_enum.insert(variant.name.clone(), enum_name.clone());
+            }
+        }
+    }
     let (expr, lowered_enum_names, mono_enum_shapes, mono_enum_variants) = desugar_enums(expr);
+    // Capture the extension-method registry before the desugar erases the
+    // `ExtensionDeclaration`s, so codegen can resolve method names that the
+    // desugar left ambiguous (declared on more than one type) by the
+    // receiver's runtime enum shape.
+    let mut ext_registry: HashMap<String, Vec<String>> = HashMap::new();
+    collect_extension_methods(&expr, &mut ext_registry);
     let expr = desugar_extensions(expr);
     analyze_proofs(
         &expr,
@@ -582,6 +602,8 @@ fn compile_internal(
             generator.lowered_enum_names = lowered_enum_names;
             generator.mono_enum_shapes = mono_enum_shapes;
             generator.mono_enum_variants = mono_enum_variants;
+            generator.ext_method_enum_types = ext_registry;
+            generator.variant_owner_enum = variant_owner_enum;
             let object = generator.compile(&expr).map_err(|diagnostic| {
                 NativeCompileError::with_view(source, user_view, diagnostic)
             })?;
@@ -3774,6 +3796,21 @@ struct NativeCodeGenerator {
     generic_enums: HashMap<String, GenericEnumInfo>,
     /// Variant name -> owning generic enum name.
     variant_to_generic_enum: HashMap<String, String>,
+    /// Extension-method name -> the list of enum type keys that declare
+    /// it. Built from the program's `ExtensionDeclaration`s before the
+    /// extension desugar erases them. When a method name appears on more
+    /// than one enum (e.g. `orElse` on both `Option` and `Result`), the
+    /// pre-codegen desugar cannot pick a unique `__ext_<Type>_<method>`
+    /// rewrite, so it leaves a `FieldAccess` callee; codegen then
+    /// dispatches by the receiver value's tracked enum shape using this
+    /// table. Names declared on exactly one enum are already rewritten by
+    /// the desugar and never consult this map.
+    ext_method_enum_types: HashMap<String, Vec<String>>,
+    /// Variant name -> owning enum name, for every enum (generic and the
+    /// monomorphic ones erased by the lowering). Lets codegen name the enum
+    /// behind a receiver's tracked `ConcreteEnumShape` when dispatching an
+    /// ambiguous extension method.
+    variant_owner_enum: HashMap<String, String>,
     /// Variant name -> the (fully concrete) shape of the monomorphic enum
     /// that owns it. Built from the preserved declarations of every enum
     /// the lowering erased, so a `println`/`toString`/interpolation site
@@ -3971,6 +4008,8 @@ impl NativeCodeGenerator {
             lowered_enum_names: HashSet::new(),
             generic_enums: HashMap::new(),
             variant_to_generic_enum: HashMap::new(),
+            ext_method_enum_types: HashMap::new(),
+            variant_owner_enum: HashMap::new(),
             mono_enum_shapes: HashMap::new(),
             mono_enum_variants: HashMap::new(),
             enum_shapes: HashMap::new(),
@@ -17327,6 +17366,19 @@ impl NativeCodeGenerator {
             let callee = Expr::Identifier { name, span };
             return self.compile_call(&callee, arguments, span);
         }
+        // Receiver-type-aware dispatch for an extension method whose name
+        // is ambiguous (declared on more than one type, so the pre-codegen
+        // desugar could not pick a unique `__ext_<Type>_<method>`). When
+        // the receiver compiles to an enum value whose tracked shape names
+        // an enum among the method's declaring types, route to that enum's
+        // mangled extension function. Runs before the hard-coded builtin
+        // fallback below so e.g. `option.map(..)` is not mis-routed to the
+        // list `map` builtin.
+        if let Some(value) =
+            self.try_compile_enum_extension_method(target, field, arguments, span)?
+        {
+            return Ok(value);
+        }
         let helper_name = match field {
             "map" => return self.compile_static_map(std::slice::from_ref(target), arguments, span),
             "foldLeft" => {
@@ -17412,6 +17464,163 @@ impl NativeCodeGenerator {
             span,
         };
         self.compile_call(&callee, &lowered, span)
+    }
+
+    /// The enum name behind a tracked `ConcreteEnumShape`: look any of its
+    /// variant names up in the (generic + erased-mono) variant->enum table.
+    /// Variant names are globally unique across the enums that reach native
+    /// codegen, so any variant identifies the whole enum.
+    fn enum_name_of_shape(&self, shape: &ConcreteEnumShape) -> Option<String> {
+        shape
+            .variants
+            .keys()
+            .find_map(|variant| self.variant_owner_enum.get(variant).cloned())
+            .or_else(|| {
+                shape
+                    .variants
+                    .keys()
+                    .find_map(|variant| self.variant_to_generic_enum.get(variant).cloned())
+            })
+    }
+
+    /// Statically determine the enum a receiver expression yields, without
+    /// emitting code, for the cases the ambiguous-method dispatch needs:
+    ///
+    ///   * a variant constructor call (`some(..)` desugars to `Some(..)`)
+    ///   * a call to a function whose body provably returns a known enum
+    ///     (`none()`, `ok(..)`, ...)
+    ///   * an identifier bound to a slot carrying a generic-enum shape
+    ///   * a chained enum extension-method call (`opt.filter(p)` returns the
+    ///     same enum the method is declared on)
+    ///
+    /// Returns `None` when the enum cannot be named statically, so the
+    /// caller falls back to the existing (clean-diagnostic) path.
+    fn static_receiver_enum_name(&self, target: &Expr) -> Option<String> {
+        match target {
+            Expr::Identifier { name, .. } => {
+                if let Some(enum_name) = self.variant_owner_enum.get(name) {
+                    // A nullary variant referenced by bare name (`None`).
+                    return Some(enum_name.clone());
+                }
+                let slot = self.lookup_var(name)?;
+                let shape = self.enum_shapes.get(&slot.id)?;
+                self.enum_name_of_shape(shape)
+            }
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::Identifier { name, .. } => {
+                    if let Some(enum_name) = self.variant_owner_enum.get(name) {
+                        return Some(enum_name.clone());
+                    }
+                    let function = self.functions.get(name)?;
+                    self.static_expr_enum_name(&function.body)
+                }
+                Expr::FieldAccess {
+                    target: inner,
+                    field,
+                    ..
+                } => {
+                    // A chained enum extension method returns the same enum
+                    // it is declared on (Option's map/filter/orElse/... all
+                    // yield Option). Resolve the inner receiver's enum, then
+                    // confirm `field` is an extension method on that enum.
+                    let inner_enum = self.static_receiver_enum_name(inner)?;
+                    let declared_on = self.ext_method_enum_types.get(field)?;
+                    declared_on
+                        .iter()
+                        .any(|ty| ty == &inner_enum)
+                        .then_some(inner_enum)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The enum named by the tail value of `expr`, when it is provably a
+    /// known enum constructor (used to resolve a helper function's return
+    /// enum, e.g. the `None` in `def none() = None`). Only descends through
+    /// pure tail positions (blocks, `if`, `match` arms) so it never claims
+    /// an enum the function might not actually return.
+    fn static_expr_enum_name(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier { name, .. } => self.variant_owner_enum.get(name).cloned(),
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::Identifier { name, .. } => self.variant_owner_enum.get(name).cloned(),
+                _ => None,
+            },
+            Expr::Block { expressions, .. } => expressions
+                .last()
+                .and_then(|e| self.static_expr_enum_name(e)),
+            Expr::Cleanup { body, .. } => self.static_expr_enum_name(body),
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let then_enum = self.static_expr_enum_name(then_branch)?;
+                let else_enum = else_branch
+                    .as_deref()
+                    .and_then(|branch| self.static_expr_enum_name(branch))?;
+                (then_enum == else_enum).then_some(then_enum)
+            }
+            Expr::Match { arms, .. } => {
+                let mut result: Option<String> = None;
+                for arm in arms {
+                    let arm_enum = self.static_expr_enum_name(&arm.body)?;
+                    match &result {
+                        Some(existing) if existing != &arm_enum => return None,
+                        _ => result = Some(arm_enum),
+                    }
+                }
+                result
+            }
+            _ => None,
+        }
+    }
+
+    /// Receiver-type-aware dispatch for an extension method whose name is
+    /// declared on more than one enum (so the pre-codegen desugar could not
+    /// pick a unique `__ext_<Type>_<method>`). Returns `Ok(Some(value))`
+    /// when the receiver's enum is named statically and owns the method —
+    /// the call is routed to that enum's mangled extension function exactly
+    /// as the single-type desugar would have. Returns `Ok(None)` when this
+    /// path does not apply, leaving the caller's existing handling intact.
+    fn try_compile_enum_extension_method(
+        &mut self,
+        target: &Expr,
+        field: &str,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<Option<NativeValue>, Diagnostic> {
+        // Only act on method names declared on at least one *enum* type.
+        let Some(declared_on) = self.ext_method_enum_types.get(field) else {
+            return Ok(None);
+        };
+        let is_enum_method = declared_on
+            .iter()
+            .any(|ty| self.generic_enums.contains_key(ty) || self.lowered_enum_names.contains(ty));
+        if !is_enum_method {
+            return Ok(None);
+        }
+        let declared_on: Vec<String> = declared_on.clone();
+        let Some(enum_name) = self.static_receiver_enum_name(target) else {
+            return Ok(None);
+        };
+        if !declared_on.iter().any(|ty| ty == &enum_name) {
+            return Ok(None);
+        }
+        // Mirror the single-type desugar: `__ext_<Enum>_<field>(target, args)`.
+        // `compile_call` compiles the receiver once and propagates its enum
+        // shape into the extension function's `this` parameter.
+        let mangled = format!("__ext_{enum_name}_{field}");
+        let callee = Expr::Identifier {
+            name: mangled,
+            span,
+        };
+        let mut lowered = Vec::with_capacity(arguments.len() + 1);
+        lowered.push(target.clone());
+        lowered.extend(arguments.iter().cloned());
+        Ok(Some(self.compile_call(&callee, &lowered, span)?))
     }
 
     fn compile_static_lambda_method_call(
