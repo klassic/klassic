@@ -582,6 +582,13 @@ cargo run -- -e "1 + 2"
   integer/string literal and variable/wildcard patterns, and guards;
   literal/variable `match` over non-enum scrutinees lowers the same way,
   and a fully non-matching scrutinee aborts through `__match_fail()`.
+  Enum **values** also display like the evaluator: `println` / `toString`
+  / string interpolation of an enum format it as `Variant(field, ...)`
+  (strings unquoted, nullary variants bare, nested enums recursing) by
+  emitting a shape-driven formatting routine — monomorphic shapes are
+  carried from the lowering pass and generic shapes from the
+  `ConcreteEnumShape` side-table — rather than printing the raw heap
+  pointer.
   Enums are real nominal types in `klassic-types` now: a declaration
   registers an `EnumSchema` (type parameters + per-variant field types)
   and declares each constructor as a polymorphic function into

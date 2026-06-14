@@ -22185,6 +22185,63 @@ fn native_isolates_same_named_module_defs() {
     assert_eq!(String::from_utf8_lossy(&std_run.stdout), "7\n");
 }
 
+/// Native ENUM VALUE display: `println` / `toString` / interpolation of
+/// an enum value formats it the way the evaluator does — `Variant(...)`,
+/// strings unquoted, nullary variants bare, nested enums recursing —
+/// instead of emitting the raw heap pointer it used to. Covers
+/// monomorphic enums and generic enums (`Option`), including nesting.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_displays_enum_values() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_enum_display_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_enum_display_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "import std.option\n\
+         enum Box { case B(v: Int); case Tag(s: String); case Nil }\n\
+         enum Nest { case Wrap(inner: Box) }\n\
+         val w = Wrap(B(7))\n\
+         println(B(5))\n\
+         println(Tag(\"hi\"))\n\
+         println(Nil)\n\
+         println(w)\n\
+         println(toString(B(5)))\n\
+         println(\"box=#{w}\")\n\
+         println(some(5))\n\
+         println(none())\n\
+         println(some(some(9)))\n",
+    )
+    .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "native build of enum display should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "B(5)\nTag(hi)\nNil\nWrap(B(7))\nB(5)\nbox=Wrap(B(7))\nSome(5)\nNone\nSome(Some(9))\n"
+    );
+}
+
 /// Allocating enum values in a loop long enough to exhaust the initial
 /// 1 MiB GC heap exercises collection and free-list reuse. A reused
 /// first-fit block used to keep stale payload bytes (and `__gc_record`'s
