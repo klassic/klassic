@@ -22242,6 +22242,56 @@ fn native_displays_enum_values() {
     );
 }
 
+/// Receiver-type-aware method dispatch: when an extension-method name is
+/// declared on multiple enum types (here `orElse` on both `Option` and
+/// `Result`, co-imported), native dispatches by the receiver's actual
+/// enum instead of failing — `none().orElse(..)` resolves to Option's,
+/// `err(..).orElse(..)` to Result's. Matches the evaluator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_dispatches_shared_enum_method_by_receiver() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_recv_dispatch_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_recv_dispatch_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "import std.option\n\
+         import std.result\n\
+         println(none().orElse(some(7)))\n\
+         println(some(3).orElse(some(9)))\n\
+         println(err(\"e\").orElse((m) => ok(0)))\n\
+         println(ok(5).orElse((m) => ok(0)))\n",
+    )
+    .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "native build of co-imported shared method should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "Some(7)\nSome(3)\nOk(0)\nOk(5)\n"
+    );
+}
+
 /// Allocating enum values in a loop long enough to exhaust the initial
 /// 1 MiB GC heap exercises collection and free-list reuse. A reused
 /// first-fit block used to keep stale payload bytes (and `__gc_record`'s
