@@ -146,7 +146,9 @@ def parseIso(s) = {
   val secPart = head(tail(tail(colonParts)))
   val dotParts = split(secPart, ".")
   val sc = String#parseInt(head(dotParts))
-  val ms = if (isEmpty(tail(dotParts))) 0 else String#parseInt(head(tail(dotParts)))
+  // Scale the fractional part positionally: ".5" is 500ms, ".05" is
+  // 50ms, ".123" is 123ms. Pad to (and truncate at) three digits.
+  val ms = if (isEmpty(tail(dotParts))) 0 else String#parseInt(substring(head(tail(dotParts)) + "000", 0, 3))
   val days = timeDaysFromCivil(yr, mo, dy)
   (days * 86400 + hr * 3600 + mn * 60 + sc) * 1000 + ms
 }

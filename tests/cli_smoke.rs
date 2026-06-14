@@ -135,6 +135,31 @@ fn stdlib_consistency_helpers() {
     );
 }
 
+/// Boundary fixes: `std.time.parseIso` scales a sub-3-digit fractional
+/// second positionally (`.5` -> 500ms, `.05` -> 50ms) instead of reading
+/// the bare digits, and `std.list.slice` clamps negative bounds to 0 so
+/// `slice(xs, -1, 3)` returns at most `to - from` elements rather than
+/// over-returning, and `to < from` yields `[]`.
+#[test]
+fn stdlib_time_slice_boundary_fixes() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.time\nimport std.list\nprintln(parseIso(\"1970-01-01T00:00:00.5Z\"))\nprintln(parseIso(\"1970-01-01T00:00:00.05Z\"))\nprintln(slice([1, 2, 3, 4, 5], -1, 3))\nprintln(slice([1, 2, 3], 2, 1))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "time/slice fixes should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "500\n50\n[1, 2, 3]\n[]\n()\n"
+    );
+}
+
 /// `none` is a polymorphic `Option` value, not a function: it takes no
 /// parentheses and unifies at any element type, so `getOrElse(none, 0)`
 /// and `getOrElse(none, "fallback")` both type-check against the single

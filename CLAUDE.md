@@ -129,7 +129,7 @@ When adding syntax or semantics:
 - String interpolation: `"Hello #{name}"`.
 - `cleanup { ... }` clauses run after the associated expression.
 - `module foo.bar { ... }` plus selective / aliased imports.
-- Structural records (`record { x = 1; y = 2 }`) and nominal record declarations (`record Point { x: Int; y: Int }`).
+- Structural records (`record { x: 1; y: 2 }`) and nominal record declarations (`record Point { x: Int; y: Int }`), constructed positionally as `#Point(1, 2)`.
 - Algebraic data types: `enum Option<a> { case Some(value: a); case None }` and Scala-style postfix pattern matching (`o match { case Some(v) => v; case None => 0 }`). Enums are real nominal types in the checker (match exhaustiveness and unreachable arms are diagnosed), and native builds compile monomorphic and shape-tracked generic enums — including recursion — through a per-frame by-pointer ABI; remaining native gaps (e.g. list-of-enum payloads) fail with source-located diagnostics.
 - Extension methods: `extension <a>(this: List<a>) { def headOr(d) = ... }` adds dot-callable methods to existing types. Stdlib leans on this for `std.string`, `std.list`, `std.math`, `std.option`, `std.result`, `std.map`, `std.set`, `std.time`, `std.json`, `std.path`, `std.cli`, `std.dir`, `std.env`, `std.file`, `std.process`, `std.test`.
 - Type classes with constraints, including higher-kinded examples.

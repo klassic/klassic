@@ -112,7 +112,12 @@ def chunk(xs, n) =
 // ---------- slice -----------------------------------------------------------
 
 // Return elements at indices [from, to) — drop `from`, then take `to - from`.
-def slice(xs, from, to) = take(drop(xs, from), to - from)
+// Negative bounds clamp to 0 so the half-open range never over-returns.
+def slice(xs, from, to) = {
+  val f = if(from < 0) 0 else from
+  val t = if(to < 0) 0 else to
+  take(drop(xs, f), t - f)
+}
 
 // ---------- at --------------------------------------------------------------
 
