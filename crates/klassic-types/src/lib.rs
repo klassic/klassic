@@ -1864,11 +1864,7 @@ impl TypeChecker {
                     }
                     other => Err(type_error(
                         *span,
-                        format!(
-                            "no method or field `{}` on {}",
-                            field,
-                            display_type(&other)
-                        ),
+                        format!("no method or field `{}` on {}", field, display_type(&other)),
                     )),
                 }
             }

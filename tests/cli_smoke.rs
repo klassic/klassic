@@ -147,8 +147,7 @@ fn field_access_error_names_the_member() {
         .expect("binary should run");
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("no method or field `toUpper` on String"),
+        String::from_utf8_lossy(&output.stderr).contains("no method or field `toUpper` on String"),
         "expected the member name in the error, got:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -22419,7 +22418,9 @@ fn native_division_by_zero_is_a_clean_error() {
         "div-by-zero program should still build\nstderr:\n{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    let run = Command::new(&output_path).output().expect("binary should run");
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
     let _ = fs::remove_file(&source_path);
     let _ = fs::remove_file(&output_path);
     // A signal-killed process (SIGFPE) reports `code() == None` on Unix;
