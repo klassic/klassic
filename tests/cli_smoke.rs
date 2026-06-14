@@ -22489,7 +22489,9 @@ fn native_integer_overflow_is_a_clean_error() {
         "overflow program should build\nstderr:\n{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    let run = Command::new(&output_path).output().expect("binary should run");
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
     let _ = fs::remove_file(&source_path);
     let _ = fs::remove_file(&output_path);
     assert!(!run.status.success());
