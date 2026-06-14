@@ -32,6 +32,9 @@ def last(xs) = if(isEmpty(tail(xs))) head(xs) else last(tail(xs))
 
 def sum(xs) = foldLeft(xs)(0)((acc, x) => acc + x)
 
+// Sum f(x) over every element. sumBy([1,2,3], (x) => x*x) = 14.
+def sumBy(xs, f) = foldLeft(xs)(0)((acc, x) => acc + f(x))
+
 def product(xs) = foldLeft(xs)(1)((acc, x) => acc * x)
 
 // Reverse a list. (`reverse` itself is a string builtin, hence the
@@ -111,6 +114,12 @@ def chunk(xs, n) =
 // Return elements at indices [from, to) — drop `from`, then take `to - from`.
 def slice(xs, from, to) = take(drop(xs, from), to - from)
 
+// ---------- at --------------------------------------------------------------
+
+// Indexed access: the element at index `i` (zero-based). An out-of-range
+// index raises the existing head-on-empty error.
+def at(xs, i) = head(drop(xs, i))
+
 // ---------- scanLeft --------------------------------------------------------
 
 // Like foldLeft but collect every intermediate accumulator value.
@@ -118,6 +127,13 @@ def slice(xs, from, to) = take(drop(xs, from), to - from)
 def scanLeft(xs, init, f) =
   if(isEmpty(xs)) [init]
   else cons(init)(scanLeft(tail(xs), f(init, head(xs)), f))
+
+// ---------- foldRight -------------------------------------------------------
+
+// Right fold: f is applied as f(x, acc) from the right.
+// foldRight([1,2,3], 0, (x, acc) => x + acc) = 6. Implemented by
+// reversing then folding left, so it stays tail-recursive.
+def foldRight(xs, init, f) = foldLeft(reverse(xs))(init)((acc, x) => f(x, acc))
 
 // ---------- sort / sortBy ---------------------------------------------------
 
@@ -233,6 +249,14 @@ extension <a>(this: List<a>) {
   def sliced(from, to) = slice(this, from, to)
   // Collect intermediate fold results: `xs.scanned(init, f)`.
   def scanned(init) = (f) => scanLeft(this, init, f)
+  // Indexed access (zero-based): `xs.atIndex(i)`.
+  def atIndex(i) = at(this, i)
+  // Sum f(x) over the list: `xs.sumBy(f)`.
+  def sumBy(f) = sumBy(this, f)
+  // Curried right fold: `xs.foldRight(init)(f)`. Inlines the
+  // reverse-then-foldLeft definition rather than calling the free
+  // `foldRight`, since the same-named extension method would shadow it.
+  def foldRight(init) = (f) => foldLeft(reverse(this))(init)((acc, x) => f(x, acc))
 }
 
 extension (this: List<Int>) {

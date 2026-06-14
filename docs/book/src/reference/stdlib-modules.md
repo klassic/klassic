@@ -30,6 +30,9 @@ prelude names without the prefix.
 | `any(xs, p)` / `all(xs, p)` / `count(xs, p)` | `any([1, 2, 3], (x) => x > 2)` |
 | `replicate(n, x)` | `replicate(3, "x")` → `["x", "x", "x"]` |
 | `sum(xs)` / `product(xs)` / `last(xs)` | `sum([1, 2, 3])` → `6` |
+| `sumBy(xs, f)` | `sumBy([1, 2, 3, 4], (x) => x * x)` → `30` |
+| `at(xs, i)` | `at([10, 20, 30], 1)` → `20` (out-of-range raises the head-on-empty error) |
+| `foldRight(xs, init, f)` | `foldRight([1, 2, 3], 0, (x, acc) => x + acc)` → `6` |
 | `sort(xs)` / `sortBy(xs, key)` | `sort([3, 1, 2])` → `[1, 2, 3]` |
 | `zip(xs, ys)` | `zip([1, 2], [3, 4])` → `[[1, 3], [2, 4]]` |
 | `partition(xs, p)` | `partition([1, 2, 3], isEven)` → `[[2], [1, 3]]` |
@@ -60,7 +63,14 @@ println([1, 2, 3].mkStringWith(" - "))    // 1 - 2 - 3
 ```
 
 `.sortedBy(key)`, `.partitionBy(p)`, and `.groupedBy(key)` round out
-the dot-callable set.
+the dot-callable set. The newer helpers add `.atIndex(i)`, `.sumBy(f)`,
+and the curried `.foldRight(init)(f)`:
+
+```klassic
+println([10, 20, 30].atIndex(1))                 // 20
+println([1, 2, 3, 4].sumBy((x) => x * x))        // 30
+println([1, 2, 3].foldRight(0)((x, acc) => x + acc)) // 6
+```
 
 ## std.string
 
@@ -168,7 +178,21 @@ just works.)
 Beyond `getOrElse` / `map` / `flatMap` / `orElse`, the module ships
 `filter(o, p)`, `toList(o)`, `fold(o, ifNone, f)`, and `ifPresent(o, f)`
 as free functions, each with a matching method twin `.filter`,
-`.toList`, `.fold`, and `.ifPresent`. The same clean `map` / `filter` /
+`.toList`, `.fold`, and `.ifPresent`. Two predicate helpers round out
+the set — `contains(o, x)` tests value equality and `exists(o, p)`
+tests a predicate (both `false` on `None`), each with a method twin:
+
+```klassic
+import std.option.{some, none}
+
+println(some(5).contains(5))           // true
+println(some(5).contains(9))           // false
+println(none.contains(5))              // false
+println(some(5).exists((x) => x > 3))  // true
+println(none.exists((x) => x > 3))     // false
+```
+
+The same clean `map` / `filter` /
 `fold` / `flatMap` names live on `std.result` and `std.list` too;
 co-import them and reach for the **method form**, which dispatches by
 receiver type, or qualify the free function with an alias:
@@ -220,6 +244,24 @@ println(good.unwrapOr("fallback"))     // "payload"
 println(bad.unwrapOr("fallback"))      // "fallback"
 println(good.map((x) => x + "!").unwrapOr("")) // "payload!"
 ```
+
+`unwrapOr` also answers to `getOrElse(r, fallback)` (an alias), and the
+module adds the predicate helpers `exists(r, p)` and `contains(r, x)`
+(both `false` on `Err`), each with a method twin:
+
+```klassic
+import std.option.{some, none}
+import std.result.{ok, err}
+
+println(ok(5).getOrElse(0))            // 5
+println(err("e").getOrElse(0))         // 0
+println(ok(5).exists((x) => x > 3))    // true
+println(ok(5).contains(5))             // true
+println(err("e").contains(5))          // false
+```
+
+(`std.result` imports `std.option`, so a native build of result code
+needs `std.option` co-imported alongside it.)
 
 The chaining surface is `map(r, f)` / `flatMap(r, f)` / `andThen(r, f)`,
 `mapErr(r, g)`, `orElse(r, h)`, `filter(r, p, errVal)`,
@@ -282,16 +324,26 @@ builtin — the underlying `Map#get` returns the raw value (or fails).
 with the top-level `size` / `isEmpty` builtins.
 
 `std.map` also adds the immutable transforms `mapValues(f)`,
-`filterValues(p)`, and `merge(other)` (right-hand entries win on a key
-clash). They build on the `Map#put` / `Map#remove` / `Map#fromPairs` /
-`Map#empty` builtins, which return fresh maps rather than mutating:
+`filterValues(p)`, `filterKeys(p)`, and `merge(other)` (right-hand
+entries win on a key clash). They build on the `Map#put` /
+`Map#remove` / `Map#fromPairs` / `Map#empty` builtins, which return
+fresh maps rather than mutating:
 
 ```klassic
 val prices = %["apple": 100, "pear": 150]
 println(prices.put("kiwi", 80).getOrElse("kiwi", 0))    // 80
 println(prices.mapValues((v) => v - 10).getOrElse("apple", 0)) // 90
 println((%["a": 1]).merge(%["a": 9, "b": 2]).getOrElse("a", 0)) // 9
+
+val m = %["a": 1, "b": 2, "c": 3]
+println(m.filterKeys((k) => k != "b").containsKey("b")) // false
+println(m.filterKeys((k) => k != "b").containsKey("a")) // true
 ```
+
+These `Map#put`-based transforms (`mapValues` / `filterValues` /
+`filterKeys` / `merge` / `mapKeys`) run under the evaluator; native
+builds reject them with a source-located diagnostic until the native
+map-transform path lands.
 
 Sets carry the algebra builtins `Set#union` / `Set#intersect` /
 `Set#subtract` (plus `Set#add` / `Set#remove` / `Set#fromList` /

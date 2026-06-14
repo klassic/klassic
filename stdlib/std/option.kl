@@ -75,6 +75,18 @@ def ifPresent(o, f) = o match {
   case None => ()
 }
 
+// contains(o, x): Some(v) -> v == x, None -> false.
+def contains(o, x) = o match {
+  case Some(v) => v == x
+  case None => false
+}
+
+// exists(o, p): Some(v) -> p(v), None -> false.
+def exists(o, p) = o match {
+  case Some(v) => p(v)
+  case None => false
+}
+
 // Method-style access. `opt.isSome()` and friends delegate to the
 // function-style helpers above; users can pick whichever reads
 // better at the call site.
@@ -118,5 +130,13 @@ extension <a>(this: Option<a>) {
   def ifPresent(f) = this match {
     case Some(v) => {f(v); ()}
     case None => ()
+  }
+  def contains(x) = this match {
+    case Some(v) => v == x
+    case None => false
+  }
+  def exists(p) = this match {
+    case Some(v) => p(v)
+    case None => false
   }
 }

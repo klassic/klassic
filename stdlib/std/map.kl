@@ -18,6 +18,11 @@ def filterValues(m, p) =
   foldLeft(Map#keys(m))(Map#empty())((acc, k) =>
     if(p(Map#get(m, k))) Map#put(acc, k, Map#get(m, k)) else acc)
 
+// filterKeys — keep only entries whose key satisfies p.
+def filterKeys(m, p) =
+  foldLeft(Map#keys(m))(Map#empty())((acc, k) =>
+    if(p(k)) Map#put(acc, k, Map#get(m, k)) else acc)
+
 // merge — overlay other on top of m; other's entries win on key clash.
 def merge(m, other) =
   foldLeft(Map#keys(other))(m)((acc, k) => Map#put(acc, k, Map#get(other, k)))
@@ -56,6 +61,7 @@ extension <k, v>(this: Map<k, v>) {
   def getOrElse(key, fallback) = if(Map#containsKey(this, key)) Map#get(this, key) else fallback
   def mapValues(f) = mapValues(this, f)
   def filterValues(p) = filterValues(this, p)
+  def filterKeys(p) = filterKeys(this, p)
   def merge(other) = merge(this, other)
   def toPairs() = toPairs(this)
   def entries() = toPairs(this)

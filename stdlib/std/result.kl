@@ -30,6 +30,21 @@ def unwrapOr(r, fallback) = r match {
   case Err(m) => fallback
 }
 
+// getOrElse: alias of unwrapOr — Ok(v) -> v, Err -> fallback.
+def getOrElse(r, fallback) = unwrapOr(r, fallback)
+
+// exists(r, p): Ok(v) -> p(v), Err -> false.
+def exists(r, p) = r match {
+  case Ok(v) => p(v)
+  case Err(m) => false
+}
+
+// contains(r, x): Ok(v) -> v == x, Err -> false.
+def contains(r, x) = r match {
+  case Ok(v) => v == x
+  case Err(m) => false
+}
+
 def map(r, f) = r match {
   case Ok(v) => Ok(f(v))
   case Err(m) => Err(m)
@@ -90,6 +105,18 @@ extension <a, e>(this: Result<a, e>) {
   def unwrapOr(fallback) = this match {
     case Ok(v) => v
     case Err(m) => fallback
+  }
+  def getOrElse(fallback) = this match {
+    case Ok(v) => v
+    case Err(m) => fallback
+  }
+  def exists(p) = this match {
+    case Ok(v) => p(v)
+    case Err(m) => false
+  }
+  def contains(x) = this match {
+    case Ok(v) => v == x
+    case Err(m) => false
   }
   def map(f) = this match {
     case Ok(v) => Ok(f(v))
