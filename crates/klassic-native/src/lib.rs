@@ -4677,7 +4677,7 @@ impl NativeCodeGenerator {
                     let mut param_values = Vec::new();
                     let mut param_unannotated = Vec::new();
                     let mut param_enum_shapes = Vec::new();
-                    for annotation in param_annotations {
+                    for (index, annotation) in param_annotations.iter().enumerate() {
                         let shape = annotation.as_ref().and_then(|annotation| {
                             self.generic_enum_annotation_shape(&annotation.text)
                         });
@@ -4691,7 +4691,23 @@ impl NativeCodeGenerator {
                         param_enum_shapes.push(shape);
                         param_unannotated.push(annotation.is_none());
                         flexible_params.push(value.is_none() && annotation.is_some());
-                        param_values.push(value.unwrap_or(NativeValue::Int));
+                        // An unannotated parameter that the body uses only
+                        // as a String gets the same by-pointer `HeapString`
+                        // ABI as an explicit `s: String` annotation, instead
+                        // of silently defaulting to `Int` (which made the
+                        // string call site fail with an unsupported-arg
+                        // diagnostic). It is NOT flagged flexible: the param
+                        // type is now known, so the function is emitted once.
+                        let inferred = if annotation.is_none()
+                            && params
+                                .get(index)
+                                .is_some_and(|param| param_used_as_string(body, param))
+                        {
+                            Some(NativeValue::HeapString)
+                        } else {
+                            value
+                        };
+                        param_values.push(inferred.unwrap_or(NativeValue::Int));
                     }
                     let return_enum_shape = return_annotation.as_ref().and_then(|annotation| {
                         self.generic_enum_annotation_shape(&annotation.text)
@@ -4763,13 +4779,25 @@ impl NativeCodeGenerator {
                         let mut flexible_params = Vec::new();
                         let mut param_values = Vec::new();
                         let mut param_unannotated = Vec::new();
-                        for annotation in param_annotations {
+                        for (index, annotation) in param_annotations.iter().enumerate() {
                             let value = annotation.as_ref().and_then(|annotation| {
                                 self.native_function_param_value(annotation)
                             });
                             param_unannotated.push(annotation.is_none());
                             flexible_params.push(value.is_none() && annotation.is_some());
-                            param_values.push(value.unwrap_or(NativeValue::Int));
+                            // Mirror the top-level `def` site: an unannotated
+                            // lambda parameter used only as a String gets the
+                            // `HeapString` by-pointer ABI rather than `Int`.
+                            let inferred = if annotation.is_none()
+                                && params
+                                    .get(index)
+                                    .is_some_and(|param| param_used_as_string(body, param))
+                            {
+                                Some(NativeValue::HeapString)
+                            } else {
+                                value
+                            };
+                            param_values.push(inferred.unwrap_or(NativeValue::Int));
                         }
                         let contains_thread_call = expr_contains_thread_call(body, &thread_aliases);
                         let param_count = params.len();
@@ -38910,6 +38938,200 @@ fn expr_references_any_name_with_shadowing(
     }
 }
 
+/// Free-function builtins whose FIRST argument is unambiguously a
+/// `String` in both the evaluator and native backends. An unannotated
+/// parameter that flows into the receiver slot of one of these proves it
+/// is a String, so native codegen can pin the param to the by-pointer
+/// `HeapString` ABI instead of defaulting it to `Int`.
+///
+/// Only the receiver (first) argument is consulted: several of these take
+/// a numeric tail (`substring(s, start, end)`, `repeat(s, n)`), so a param
+/// in a later slot does NOT prove String. Builtins that also accept lists
+/// (`size`, `reverse`, `contains`, `head`, `tail`, `isEmpty`, `map`,
+/// `at`, `indexOf`) are deliberately excluded: misreading a list param as
+/// a String would miscompile, and a remaining diagnostic is preferable.
+fn is_string_only_receiver_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "length"
+            | "substring"
+            | "split"
+            | "trim"
+            | "trimLeft"
+            | "trimRight"
+            | "toLowerCase"
+            | "toUpperCase"
+            | "startsWith"
+            | "endsWith"
+            | "isEmptyString"
+            | "replace"
+            | "replaceAll"
+            | "repeat"
+    )
+}
+
+/// Decide whether the unannotated parameter `name` is used by `body` in a
+/// position that unambiguously requires a `String`, so native codegen can
+/// give it the `HeapString` by-pointer ABI (matching an explicit
+/// `s: String` annotation) instead of defaulting to `Int`. Conservative by
+/// construction: only unambiguous String-only operations count, and any
+/// inner rebinding of `name` shadows the parameter for the rest of that
+/// scope so a same-named local cannot trigger a false positive.
+fn param_used_as_string(body: &Expr, name: &str) -> bool {
+    let shadowed = HashSet::new();
+    param_used_as_string_with_shadowing(body, name, &shadowed)
+}
+
+fn param_used_as_string_with_shadowing(
+    expr: &Expr,
+    name: &str,
+    shadowed: &HashSet<String>,
+) -> bool {
+    let names_param = |candidate: &Expr| -> bool {
+        matches!(candidate, Expr::Identifier { name: id, .. }
+            if id == name && !shadowed.contains(name))
+    };
+    match expr {
+        Expr::Call {
+            callee, arguments, ..
+        } => {
+            // A string-only builtin applied with the parameter as its
+            // receiver (first argument) proves the parameter is a String.
+            if let Expr::Identifier {
+                name: callee_name, ..
+            } = callee.as_ref()
+                && is_string_only_receiver_builtin(callee_name)
+                && arguments.first().is_some_and(&names_param)
+            {
+                return true;
+            }
+            param_used_as_string_with_shadowing(callee, name, shadowed)
+                || arguments
+                    .iter()
+                    .any(|argument| param_used_as_string_with_shadowing(argument, name, shadowed))
+        }
+        Expr::Binary {
+            lhs,
+            op: BinaryOp::Add,
+            rhs,
+            ..
+        } => {
+            // String concatenation `param + <known String>` (or the
+            // mirror) proves the parameter is a String. `binary_add_*`
+            // already treats a string literal anywhere in a `+` chain as
+            // making the whole expression a String, so reuse that notion
+            // of a "known String" operand.
+            if (names_param(lhs) && binary_add_contains_string_literal(rhs))
+                || (names_param(rhs) && binary_add_contains_string_literal(lhs))
+            {
+                return true;
+            }
+            param_used_as_string_with_shadowing(lhs, name, shadowed)
+                || param_used_as_string_with_shadowing(rhs, name, shadowed)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            param_used_as_string_with_shadowing(lhs, name, shadowed)
+                || param_used_as_string_with_shadowing(rhs, name, shadowed)
+        }
+        Expr::Unary { expr, .. } | Expr::FieldAccess { target: expr, .. } => {
+            param_used_as_string_with_shadowing(expr, name, shadowed)
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            param_used_as_string_with_shadowing(condition, name, shadowed)
+                || param_used_as_string_with_shadowing(then_branch, name, shadowed)
+                || else_branch.as_deref().is_some_and(|branch| {
+                    param_used_as_string_with_shadowing(branch, name, shadowed)
+                })
+        }
+        Expr::Block { expressions, .. } => {
+            let mut shadowed = shadowed.clone();
+            expressions.iter().any(|expression| {
+                let used = param_used_as_string_with_shadowing(expression, name, &shadowed);
+                if let Expr::VarDecl {
+                    name: bound_name, ..
+                } = expression
+                    && bound_name == name
+                {
+                    shadowed.insert(name.to_string());
+                }
+                used
+            })
+        }
+        Expr::VarDecl { value, .. } => param_used_as_string_with_shadowing(value, name, shadowed),
+        Expr::Assign { value, .. } => param_used_as_string_with_shadowing(value, name, shadowed),
+        Expr::Cleanup { body, cleanup, .. } => {
+            param_used_as_string_with_shadowing(body, name, shadowed)
+                || param_used_as_string_with_shadowing(cleanup, name, shadowed)
+        }
+        Expr::While {
+            condition, body, ..
+        } => {
+            param_used_as_string_with_shadowing(condition, name, shadowed)
+                || param_used_as_string_with_shadowing(body, name, shadowed)
+        }
+        Expr::Foreach {
+            binding,
+            iterable,
+            body,
+            ..
+        } => {
+            if param_used_as_string_with_shadowing(iterable, name, shadowed) {
+                return true;
+            }
+            if binding == name {
+                return false;
+            }
+            param_used_as_string_with_shadowing(body, name, shadowed)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            if param_used_as_string_with_shadowing(scrutinee, name, shadowed) {
+                return true;
+            }
+            arms.iter().any(|arm| {
+                let mut nested = shadowed.clone();
+                collect_pattern_binding_names(&arm.pattern, &mut nested);
+                arm.guard
+                    .as_ref()
+                    .is_some_and(|guard| param_used_as_string_with_shadowing(guard, name, &nested))
+                    || param_used_as_string_with_shadowing(&arm.body, name, &nested)
+            })
+        }
+        // Nested `def`/lambda introduce their own params; if one shadows
+        // `name`, references inside no longer refer to our parameter.
+        Expr::DefDecl { params, body, .. } | Expr::Lambda { params, body, .. } => {
+            if params.iter().any(|param| param == name) {
+                return false;
+            }
+            param_used_as_string_with_shadowing(body, name, shadowed)
+        }
+        Expr::ListLiteral {
+            elements: arguments,
+            ..
+        }
+        | Expr::RecordConstructor { arguments, .. } => arguments
+            .iter()
+            .any(|argument| param_used_as_string_with_shadowing(argument, name, shadowed)),
+        Expr::RecordLiteral { fields, .. } => fields
+            .iter()
+            .any(|(_, value)| param_used_as_string_with_shadowing(value, name, shadowed)),
+        Expr::MapLiteral { entries, .. } => entries.iter().any(|(key, value)| {
+            param_used_as_string_with_shadowing(key, name, shadowed)
+                || param_used_as_string_with_shadowing(value, name, shadowed)
+        }),
+        Expr::SetLiteral { elements, .. } => elements
+            .iter()
+            .any(|element| param_used_as_string_with_shadowing(element, name, shadowed)),
+        _ => false,
+    }
+}
+
 /// Collect the variable names a pattern binds (recursing through
 /// constructor arguments), for shadowing-aware expression walks.
 fn collect_pattern_binding_names(pattern: &Pattern, names: &mut HashSet<String>) {
@@ -40871,11 +41093,105 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        NativeAbi, NativeArchitecture, NativeBackend, NativeCompilerConfig, NativeEndianness,
+        Expr, NativeAbi, NativeArchitecture, NativeBackend, NativeCompilerConfig, NativeEndianness,
         NativeExecutableFormat, NativeOperatingSystem, NativeTarget, NativeTargetContext,
         PLATFORM_CONSTANTS_BY_TARGET, PlatformSyscall, TargetPlatform, compile_source_for_target,
-        compile_source_to_elf,
+        compile_source_to_elf, param_used_as_string,
     };
+
+    /// Parse a single top-level `def`, returning `(param_name, body)` of
+    /// its first parameter so the String-usage inference can be exercised
+    /// directly.
+    fn first_def_param_and_body(source: &str) -> (String, Expr) {
+        let program =
+            super::parse_inline_expression("<test>", source).expect("source should parse");
+        let expressions = match &program {
+            Expr::Block { expressions, .. } => expressions.clone(),
+            other => vec![other.clone()],
+        };
+        for expression in expressions {
+            if let Expr::DefDecl { params, body, .. } = expression {
+                return (
+                    params.first().expect("def needs a parameter").clone(),
+                    body.as_ref().clone(),
+                );
+            }
+        }
+        panic!("source had no top-level def");
+    }
+
+    fn def_first_param_used_as_string(source: &str) -> bool {
+        let (param, body) = first_def_param_and_body(source);
+        param_used_as_string(&body, &param)
+    }
+
+    #[test]
+    fn infers_string_param_from_length_call() {
+        assert!(def_first_param_used_as_string("def f(s) = length(s) - 1"));
+    }
+
+    #[test]
+    fn infers_string_param_from_nested_to_upper_case() {
+        assert!(def_first_param_used_as_string(
+            "def f(s) = length(toUpperCase(s)) + 1"
+        ));
+    }
+
+    #[test]
+    fn infers_string_param_from_split_receiver() {
+        assert!(def_first_param_used_as_string(
+            "def f(s, sub) = size(split(s, sub)) - 1"
+        ));
+    }
+
+    #[test]
+    fn infers_string_param_from_concatenation_with_literal() {
+        assert!(def_first_param_used_as_string("def f(s) = s + \"!\""));
+    }
+
+    #[test]
+    fn int_recursive_param_is_not_inferred_as_string() {
+        // The fib regression guard: an unannotated Int parameter must stay
+        // on the Int path, so the helper must report it is NOT a String.
+        assert!(!def_first_param_used_as_string(
+            "def fib(n) = if(n < 2) n else fib(n - 1) + fib(n - 2)"
+        ));
+    }
+
+    #[test]
+    fn ambiguous_list_builtins_do_not_infer_string() {
+        // `size`, `reverse`, `contains`, `head`, `map` all accept lists, so
+        // a param flowing into them is NOT provably a String.
+        assert!(!def_first_param_used_as_string("def f(xs) = size(xs) + 1"));
+        assert!(!def_first_param_used_as_string(
+            "def f(xs) = head(reverse(xs))"
+        ));
+        assert!(!def_first_param_used_as_string(
+            "def f(xs) = if(contains(xs, 1)) 1 else 0"
+        ));
+    }
+
+    #[test]
+    fn numeric_tail_argument_does_not_infer_string() {
+        // `repeat(s, n)` / `substring(s, a, b)` take an Int tail: the count
+        // / index param must not be mistaken for a String just because it
+        // sits beside a string-only builtin.
+        assert!(!def_first_param_used_as_string(
+            "def f(n) = repeat(\"ab\", n)"
+        ));
+        assert!(!def_first_param_used_as_string(
+            "def f(a) = substring(\"hello\", a, 3)"
+        ));
+    }
+
+    #[test]
+    fn shadowed_param_does_not_infer_string() {
+        // A same-named local that shadows the parameter and is used as a
+        // String must not back-propagate to the (unrelated) parameter.
+        assert!(!def_first_param_used_as_string(
+            "def f(s) = { val s = [1 2 3]; length(s) }"
+        ));
+    }
 
     #[test]
     fn emits_elf_header_for_println_int_program() {
