@@ -6217,6 +6217,14 @@ impl NativeCodeGenerator {
             BinaryOp::Divide => {
                 self.asm.mov_reg_reg(Reg::Rbx, Reg::Rax);
                 self.asm.mov_reg_reg(Reg::Rax, Reg::Rcx);
+                // A bare `idiv` by zero raises SIGFPE; the evaluator instead
+                // reports a clean `division by zero` runtime error. Guard the
+                // divisor (now in Rbx) so native matches that behaviour.
+                let nonzero = self.asm.create_text_label();
+                self.asm.cmp_reg_imm8(Reg::Rbx, 0);
+                self.asm.jcc_label(Condition::NotEqual, nonzero);
+                self.emit_runtime_error(span, "division by zero");
+                self.asm.bind_text_label(nonzero);
                 self.asm.cqo();
                 self.asm.idiv_reg(Reg::Rbx);
             }

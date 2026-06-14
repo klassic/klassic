@@ -136,6 +136,24 @@ fn none_is_a_polymorphic_value() {
     );
 }
 
+/// A method/field-access error on a type that has no such member names
+/// the member (`no method or field \`x\` on T`) instead of the opaque
+/// "T does not support field access".
+#[test]
+fn field_access_error_names_the_member() {
+    let output = Command::new(klassic_bin())
+        .args(["-e", "\"hello\".toUpper()"])
+        .output()
+        .expect("binary should run");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("no method or field `toUpper` on String"),
+        "expected the member name in the error, got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// CI guard: the direct Mach-O backend's binaries can only run on
 /// Apple Silicon, so every test that builds *and executes* that
 /// backend's output is `#[cfg(all(target_os = "macos", target_arch =
@@ -22370,6 +22388,51 @@ fn native_map_family_coexists_with_builtins() {
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
         "Some(10)\nOk(4)\n[10, 20, 30]\n[3, 2, 1]\ntrue\n"
+    );
+}
+
+/// Native integer division by zero reports a clean `division by zero`
+/// runtime error and exits non-zero — matching the evaluator — instead
+/// of crashing the process with SIGFPE. The `idiv` is guarded with a
+/// divisor zero-check.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_division_by_zero_is_a_clean_error() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_div0_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_div0_{stamp}.bin"));
+    fs::write(&source_path, "println(10 / 0)\n").expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "div-by-zero program should still build\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path).output().expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    // A signal-killed process (SIGFPE) reports `code() == None` on Unix;
+    // a clean runtime error exits with a non-zero code.
+    assert!(
+        run.status.code().is_some(),
+        "process was killed by a signal (SIGFPE) instead of exiting cleanly"
+    );
+    assert!(!run.status.success());
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("division by zero"),
+        "expected `division by zero` on stderr, got:\n{}",
+        String::from_utf8_lossy(&run.stderr)
     );
 }
 

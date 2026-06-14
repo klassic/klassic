@@ -1864,7 +1864,11 @@ impl TypeChecker {
                     }
                     other => Err(type_error(
                         *span,
-                        format!("{} does not support field access", display_type(&other)),
+                        format!(
+                            "no method or field `{}` on {}",
+                            field,
+                            display_type(&other)
+                        ),
                     )),
                 }
             }
