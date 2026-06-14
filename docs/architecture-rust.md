@@ -61,11 +61,11 @@ cargo run -- -e "1 + 2"
 - REPL/session state
 
 ### `klassic-native`
-- Batch native compilation through `klassic build [--target linux-x86_64|x86_64-unknown-linux-gnu|native] <file.kl> -o <output>`
+- Batch native compilation through `klassic build [--target linux-x86_64|x86_64-unknown-linux-gnu|macos-aarch64|aarch64-apple-darwin|native] <file.kl> -o <output>`
 - Reuses the Rust parser, rewrite pass, typechecker, and proof/trust analysis
-- Emits Linux x86_64 machine code directly
-- Carries an explicit `NativeTarget`; the only implemented target is currently
-  `LinuxX86_64`
+- Emits target-native machine code directly; both `LinuxX86_64` and `MacOsAArch64` are implemented
+- Also emits ad-hoc-signed Mach-O arm64 executables for `aarch64-apple-darwin` (direct backend, growing subset)
+- Carries an explicit `NativeTarget`; the implemented targets are `LinuxX86_64` and `MacOsAArch64`
 - Keeps supported targets in a metadata registry containing the compact name,
   standard triple, architecture, direct-codegen backend, data layout,
   operating system, ABI, and executable format
@@ -76,8 +76,7 @@ cargo run -- -e "1 + 2"
 - Keeps target-specific syscall numbers and OS constants such as fds, open
   modes, errno values, stat masks, clocks, mmap flags, and sendfile limits in a
   target-keyed platform constants registry
-- Writes ELF64 executables directly without invoking `cc`, `as`, `ld`, Java, Scala,
-  or the JVM
+- Writes ELF64 executables (Linux x86_64) and ad-hoc-signed Mach-O arm64 executables (Apple Silicon) directly without invoking `cc`, `as`, `ld`, Java, Scala, or the JVM
 - Current native codegen covers the first vertical slice: integer and boolean
   expressions, string literal printing, `println` / `printlnError`, `assert`,
   curried `assertResult`, `if`, `while`, mutable integer/boolean locals,

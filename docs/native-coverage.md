@@ -510,12 +510,13 @@ Rules:
 - Tier 0 must keep working at every commit. No PR can land if the
   `x86_64-unknown-linux-gnu` direct ELF path stops producing a runnable
   executable.
-- Tier 1 targets stay on the direct-syscall family of backends so that
-  Klassic's "no external `cc` / `as` / `ld`" property is preserved on
-  Linux.
+- Tier 1 targets stay on the direct backend family so that Klassic's
+  "no external `cc` / `as` / `ld`" property is preserved. arm64 macOS
+  (`aarch64-apple-darwin`) is tier 1 and uses a direct Mach-O arm64 backend
+  (svc #0x80), not the portable C backend.
 - Tier 2 targets reach the matrix through the portable runtime call
-  path / C backend. macOS and Windows do not get a direct syscall
-  backend.
+  path / C backend. x86_64 macOS and Windows reach the matrix through the
+  portable C backend.
 - An unsupported target must produce a `TargetSpec`-style diagnostic,
   not a panic.
 

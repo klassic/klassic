@@ -157,7 +157,8 @@ selected native target with no external toolchain. Linux x86_64
 language surface; Apple Silicon macOS (`macos-aarch64` /
 `aarch64-apple-darwin`) emits ad-hoc-signed Mach-O arm64 for a growing subset
 (Int/Bool/String expressions, locals, control flow, functions with recursion,
-string builtins, monomorphic enums and match). Linux x86_64 highlights:
+string builtins, monomorphic enums and match, cons lists, records, sets with
+method dispatch). Linux x86_64 highlights:
 
 - Core integer / boolean / string / list expressions, control flow, and
   recursive `def`s (including annotated `String` and `List<String>` parameters).

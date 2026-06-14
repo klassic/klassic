@@ -1,6 +1,6 @@
-# Standard Library Modules (v0.2)
+# Standard Library Modules (v0.3)
 
-The v0.2 standard library splits the historic `stdlib*` prelude
+The v0.3 standard library splits the historic `stdlib*` prelude
 helpers into module-qualified namespaces. Modules ship as embedded
 Klassic sources (see
 [`stdlib/std/`](https://github.com/klassic/klassic/tree/main/stdlib/std)),

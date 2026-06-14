@@ -24,7 +24,7 @@ cargo run -- -e "1 + 2"                              # evaluate an expression
 cargo run -- path/to/program.kl                      # evaluate a file
 cargo run -- -f path/to/program.kl                   # equivalent to above
 cargo run                                            # REPL (`:history`, `:exit`)
-cargo run -- build path/to/program.kl -o program     # native build (Linux x86_64)
+cargo run -- build path/to/program.kl -o program     # native build (host-detected target)
 cargo run -- targets                                  # list known native targets
 cargo run -- --backend c build program.kl -o program.c  # portable C backend (subset)
 cargo run -- --target x86_64-unknown-linux-gnu build path/to/program.kl -o program
@@ -42,7 +42,7 @@ cargo run -- --deny-trust path/to/program.kl         # reject trusted proofs
 4. `klassic-rewrite`: placeholder desugaring and syntax normalization
 5. `klassic-types`: HM inference, record typing, typeclass constraints, proof checks
 6. `klassic-eval`: evaluator, runtime builtins, modules, REPL/session state
-7. `klassic-native`: Linux x86_64 native compiler — emits machine code and ELF64 directly (no `cc`/`as`/`ld`)
+7. `klassic-native`: native compiler — emits ELF64 for Linux x86_64 AND ad-hoc-signed Mach-O arm64 for Apple Silicon, both without `cc`/`as`/`ld`
 8. Root `src/`: CLI argument handling and diagnostic presentation
 
 The evaluator (`klassic-eval`) is the reference implementation. The native
@@ -58,7 +58,7 @@ source-located diagnostic — there is no fallback to the evaluator.
 - `crates/klassic-rewrite` — rewrite passes
 - `crates/klassic-types` — static checking
 - `crates/klassic-eval` — evaluator + builtins + REPL state
-- `crates/klassic-native` — native code generator + ELF writer
+- `crates/klassic-native` — native code generator + ELF writer, and Mach-O arm64 writer (Apple Silicon)
 - `crates/klassic-runtime` — shared runtime crate scaffold
 - `crates/klassic-macro-peg` — standalone macro PEG parser/evaluator
 
@@ -70,7 +70,7 @@ source-located diagnostic — there is no fallback to the evaluator.
   - `tests/sample_programs.rs` — runs every program in `test-programs/` through both the evaluator and the native compiler when on Linux x86_64.
   - `tests/language_regressions.rs` — language-level regression suite.
 - Klassic sample programs live under `test-programs/` (and `examples/`).
-- `klassic-native` integration tests are gated with `#[cfg(all(target_os = "linux", target_arch = "x86_64"))]`.
+- `klassic-native` integration tests are gated: the ELF path uses `#[cfg(all(target_os = "linux", target_arch = "x86_64"))]` and the Mach-O path uses `#[cfg(all(target_os = "macos", target_arch = "aarch64"))]`.
 
 ### Roadmap
 
@@ -95,7 +95,7 @@ integration test in `tests/cli_smoke.rs` and a one-paragraph addendum to
 5. Run `cargo fmt --check` and `cargo test`.
 
 `crates/klassic-native/src/lib.rs` is intentionally a single very large file
-(~27k lines). Stay consistent with that organization rather than splitting it.
+(~40k lines). Stay consistent with that organization rather than splitting it.
 Prefer `unsupported(span, "<feature>")` returning a `Diagnostic` for paths that
 remain unimplemented.
 
@@ -131,6 +131,6 @@ When adding syntax or semantics:
 - `module foo.bar { ... }` plus selective / aliased imports.
 - Structural records (`record { x = 1; y = 2 }`) and nominal record declarations (`record Point { x: Int; y: Int }`).
 - Algebraic data types: `enum Option<a> { case Some(value: a); case None }` and Scala-style postfix pattern matching (`o match { case Some(v) => v; case None => 0 }`). Enums are real nominal types in the checker (match exhaustiveness and unreachable arms are diagnosed), and native builds compile monomorphic and shape-tracked generic enums — including recursion — through a per-frame by-pointer ABI; remaining native gaps (e.g. list-of-enum payloads) fail with source-located diagnostics.
-- Extension methods: `extension <a>(this: List<a>) { def headOr(d) = ... }` adds dot-callable methods to existing types. Stdlib leans on this for `std.string`, `std.list`, `std.math`, `std.option`, `std.result`, `std.map`, `std.set`.
+- Extension methods: `extension <a>(this: List<a>) { def headOr(d) = ... }` adds dot-callable methods to existing types. Stdlib leans on this for `std.string`, `std.list`, `std.math`, `std.option`, `std.result`, `std.map`, `std.set`, `std.time`, `std.json`, `std.path`, `std.cli`, `std.dir`, `std.env`, `std.file`, `std.process`, `std.test`.
 - Type classes with constraints, including higher-kinded examples.
 - Proof surface: `axiom`, `theorem`, with `--warn-trust` / `--deny-trust` flags.
