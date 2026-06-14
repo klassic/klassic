@@ -723,13 +723,13 @@ cargo run -- -e "1 + 2"
   their constructors (`some` / `ok`), consumers (`getOrElse` / `unwrapOr`
   / `isSome` / `isErr`) and method-style extensions compile to native.
   Helpers that *return* a freshly constructed generic enum through a
-  `match` (`mapOption` / `flatMap` / `orElse` / `mapResult`) work too:
+  `match` (`map` / `flatMap` / `orElse`) work too:
   a generic-enum shape produced inside a branch is captured per branch and
   the `if` lowering publishes the merged shape of its two branches, so the
   joined value carries it to its binding. The merge prefers a resolved
   field repr over a defaulted one (a defaulted field is only ever read in a
   tag-guarded dead arm, so trusting the resolved branch is sound), letting
-  a string-payload `mapOption` read back as a string rather than the
+  a string-payload `map` read back as a string rather than the
   `None` arm's defaulted scalar.
 
   A portable C backend (roadmap PR 9 / PR 10) lives behind

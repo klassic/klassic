@@ -28,7 +28,7 @@ def getOrElse(o, fallback) = o match {
   case None => fallback
 }
 
-def mapOption(o, f) = o match {
+def map(o, f) = o match {
   case Some(v) => Some(f(v))
   case None => None
 }
@@ -86,7 +86,7 @@ extension <a>(this: Option<a>) {
     case Some(v) => v
     case None => fallback
   }
-  def mapOption(f) = this match {
+  def map(f) = this match {
     case Some(v) => Some(f(v))
     case None => None
   }

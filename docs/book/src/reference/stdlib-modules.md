@@ -156,17 +156,16 @@ println(maybe.getOrElse(0))      // 7   (method-style)
 
 println(none().isNone())         // true
 println(some("hi").isSome())     // true
-println(some(2).mapOption((x) => x * 10).getOrElse(0)) // 20
+println(some(2).map((x) => x * 10).getOrElse(0)) // 20
 ```
 
-Beyond `getOrElse` / `mapOption` / `flatMap` / `orElse`, the module
-ships `filter(o, p)`, `toList(o)`, `fold(o, ifNone, f)`, and
-`ifPresent(o, f)` as free functions, each with a matching method twin
-`.filter`, `.toList`, `.fold`, and `.ifPresent`. (`mapOption` keeps its
-suffix because the bare `map` is a builtin name.) The same clean
-`filter` / `fold` / `flatMap` names live on `std.result` and `std.list`
-too; co-import them and reach for the **method form**, which dispatches
-by receiver type, or qualify the free function with an alias:
+Beyond `getOrElse` / `map` / `flatMap` / `orElse`, the module ships
+`filter(o, p)`, `toList(o)`, `fold(o, ifNone, f)`, and `ifPresent(o, f)`
+as free functions, each with a matching method twin `.filter`,
+`.toList`, `.fold`, and `.ifPresent`. The same clean `map` / `filter` /
+`fold` / `flatMap` names live on `std.result` and `std.list` too;
+co-import them and reach for the **method form**, which dispatches by
+receiver type, or qualify the free function with an alias:
 
 ```klassic
 import std.option.{some, none, filter, fold}
@@ -213,17 +212,16 @@ println(good.isOk())                   // true
 println(bad.isErr())                   // true
 println(good.unwrapOr("fallback"))     // "payload"
 println(bad.unwrapOr("fallback"))      // "fallback"
-println(good.mapResult((x) => x + "!").unwrapOr("")) // "payload!"
+println(good.map((x) => x + "!").unwrapOr("")) // "payload!"
 ```
 
-The chaining surface is `flatMap(r, f)` / `andThen(r, f)`,
+The chaining surface is `map(r, f)` / `flatMap(r, f)` / `andThen(r, f)`,
 `mapErr(r, g)`, `orElse(r, h)`, `filter(r, p, errVal)`,
-`fold(r, onOk, onErr)`, and `toOption(r)`, with method twins
+`fold(r, onOk, onErr)`, and `toOption(r)`, with method twins `.map`,
 `.flatMap`, `.andThen`, `.mapErr`, `.orElse`, `.filter`, `.fold`, and
-`.toOption`. (`mapResult` keeps its suffix because the bare `map` is a
-builtin name.) `filter` / `fold` / `flatMap` / `orElse` are the same
-clean names `std.option` and `std.list` use; under co-import prefer the
-method form, which dispatches by receiver type:
+`.toOption`. `map` / `filter` / `fold` / `flatMap` / `orElse` are the
+same clean names `std.option` and `std.list` use; under co-import
+prefer the method form, which dispatches by receiver type:
 
 ```klassic
 import std.result.{ok, err, andThen, fold}

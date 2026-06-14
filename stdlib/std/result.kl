@@ -30,7 +30,7 @@ def unwrapOr(r, fallback) = r match {
   case Err(m) => fallback
 }
 
-def mapResult(r, f) = r match {
+def map(r, f) = r match {
   case Ok(v) => Ok(f(v))
   case Err(m) => Err(m)
 }
@@ -91,7 +91,7 @@ extension <a, e>(this: Result<a, e>) {
     case Ok(v) => v
     case Err(m) => fallback
   }
-  def mapResult(f) = this match {
+  def map(f) = this match {
     case Ok(v) => Ok(f(v))
     case Err(m) => Err(m)
   }

@@ -36,18 +36,18 @@ def product(xs) = foldLeft(xs)(1)((acc, x) => acc * x)
 
 // Reverse a list. (`reverse` itself is a string builtin, hence the
 // distinct name; the extension method below reads as `.reversed()`.)
-def reverseList(xs) = foldLeft(xs)([])((acc, x) => cons(x)(acc))
+def reverse(xs) = foldLeft(xs)([])((acc, x) => cons(x)(acc))
 
 // Transform every element. (`map` exists as a value-method builtin;
 // this is the free-function form.)
-def mapList(xs, f) = if(isEmpty(xs)) [] else cons(f(head(xs)))(mapList(tail(xs), f))
+def map(xs, f) = if(isEmpty(xs)) [] else cons(f(head(xs)))(map(tail(xs), f))
 
 // Map each element to a list and flatten the results.
 def flatMap(xs, f) = if(isEmpty(xs)) [] else concat(f(head(xs)), flatMap(tail(xs), f))
 
 // Whether the list contains a value, by `==`. (`contains` is a string
 // builtin; this is the list form.)
-def containsItem(xs, x) = any(xs, (y) => y == x)
+def contains(xs, x) = any(xs, (y) => y == x)
 
 def indexOfFrom(xs, x, i) = if(isEmpty(xs)) (0 - 1) else if(head(xs) == x) i else indexOfFrom(tail(xs), x, i + 1)
 
@@ -199,7 +199,7 @@ extension <a>(this: List<a>) {
   // `.map`, `.contains`, `.join` are builtin value methods already,
   // and `.foldLeft(init, f)` takes both args at once; these fill the
   // remaining gaps.
-  def reversed() = reverseList(this)
+  def reversed() = reverse(this)
   def flatMapBy(f) = flatMap(this, f)
   def indexOfItem(x) = indexOf(this, x)
   def distinctItems() = distinct(this)

@@ -2875,6 +2875,53 @@ fn collect_extension_methods(expr: &Expr, registry: &mut HashMap<String, Vec<Str
     }
 }
 
+/// Method names the native backend dispatches as builtin value methods
+/// on lists / strings / maps / sets (see `compile_static_method_call`'s
+/// helper table). An extension method that reuses one of these names
+/// (e.g. `Option.map`) must NOT be statically rewritten to
+/// `__ext_<Type>_<name>` by the desugar, because the receiver at a given
+/// call site might instead be a list/string that needs the builtin. Such
+/// calls are left for codegen, where `try_compile_enum_extension_method`
+/// dispatches an enum receiver to its extension and every other receiver
+/// falls through to the builtin.
+fn is_native_builtin_method_name(name: &str) -> bool {
+    matches!(
+        name,
+        "map"
+            | "foldLeft"
+            | "bind"
+            | "toString"
+            | "substring"
+            | "at"
+            | "matches"
+            | "split"
+            | "join"
+            | "trim"
+            | "trimLeft"
+            | "trimRight"
+            | "replace"
+            | "replaceAll"
+            | "toLowerCase"
+            | "toUpperCase"
+            | "startsWith"
+            | "endsWith"
+            | "contains"
+            | "containsKey"
+            | "containsValue"
+            | "get"
+            | "head"
+            | "tail"
+            | "size"
+            | "isEmpty"
+            | "isEmptyString"
+            | "indexOf"
+            | "lastIndexOf"
+            | "length"
+            | "repeat"
+            | "reverse"
+    )
+}
+
 fn desugar_extensions_with(expr: Expr, registry: &HashMap<String, Vec<String>>) -> Expr {
     match expr {
         Expr::ExtensionDeclaration {
@@ -2988,6 +3035,7 @@ fn desugar_extensions_with(expr: Expr, registry: &HashMap<String, Vec<String>>) 
             {
                 if let Some(types) = registry.get(&field)
                     && types.len() == 1
+                    && !is_native_builtin_method_name(&field)
                 {
                     let type_key = &types[0];
                     let mangled = format!("__ext_{type_key}_{field}");

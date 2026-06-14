@@ -160,16 +160,16 @@ fn floating_point_math_builtins() {
 }
 
 /// std.list grew the fundamental higher-order operations it lacked —
-/// reverse, flatMap, distinct, indexOf, containsItem — plus method
-/// forms (`.reversed()`, `.fold(init)(f)`, `.reduce(f)`, ...). The
-/// curried `xs.fold(init)(f)` reads Scala-style; the builtin
+/// reverse, flatMap, distinct, indexOf, contains — plus method forms
+/// (`.reversed()`, `.fold(init)(f)`, `.reduce(f)`, ...). The curried
+/// `xs.fold(init)(f)` reads Scala-style; the builtin
 /// `xs.foldLeft(init, f)` still takes both args at once.
 #[test]
 fn std_list_higher_order_helpers() {
     let output = Command::new(klassic_bin())
         .args([
             "-e",
-            "import std.list\nprintln(reverseList([1, 2, 3]))\nprintln(flatMap([1, 2], (x) => [x, x]))\nprintln(distinct([1, 2, 2, 3, 1]))\nprintln(indexOf([\"a\", \"b\", \"c\"], \"c\"))\nprintln([1, 2, 3, 4].fold(0)((a, b) => a + b))\nprintln([5, 3, 8].reduce((a, b) => if (a < b) a else b))\nprintln([1, 2, 3].reversed())\nprintln([1, 2, 3, 4].foldLeft(0, (a, b) => a + b))",
+            "import std.list\nprintln(reverse([1, 2, 3]))\nprintln(flatMap([1, 2], (x) => [x, x]))\nprintln(distinct([1, 2, 2, 3, 1]))\nprintln(indexOf([\"a\", \"b\", \"c\"], \"c\"))\nprintln([1, 2, 3, 4].fold(0)((a, b) => a + b))\nprintln([5, 3, 8].reduce((a, b) => if (a < b) a else b))\nprintln([1, 2, 3].reversed())\nprintln([1, 2, 3, 4].foldLeft(0, (a, b) => a + b))",
         ])
         .output()
         .expect("binary should run");
@@ -21631,7 +21631,7 @@ fn native_build_inlines_aliased_stdlib_import() {
 /// constructors (`some` / `ok`), consumers (`getOrElse` / `unwrapOr` /
 /// `isSome` / `isErr`) and the method-style extensions. (Helpers that
 /// *return* a freshly constructed generic enum through a match —
-/// `mapOption` / `mapResult` / `orElse` — are covered separately by
+/// `map` / `flatMap` / `orElse` — are covered separately by
 /// `native_build_propagates_generic_enum_shape_through_match`.)
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
@@ -21697,10 +21697,10 @@ fn native_build_inlines_adt_stdlib_modules() {
 
 /// A generic-enum value freshly built on each arm of a `match` (so its
 /// shape is produced inside control flow) now carries a merged shape past
-/// the join (M6), so `mapOption` / `flatMap` / `orElse` / `mapResult`
-/// results can be matched downstream. The merge prefers a resolved field
-/// over a defaulted one, so a string-payload `mapOption` reads back as a
-/// string, not the `None` arm's defaulted scalar.
+/// the join (M6), so `map` / `flatMap` / `orElse` results can be matched
+/// downstream. The merge prefers a resolved field over a defaulted one,
+/// so a string-payload `map` reads back as a string, not the `None`
+/// arm's defaulted scalar.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_propagates_generic_enum_shape_through_match() {
@@ -21712,16 +21712,16 @@ fn native_build_propagates_generic_enum_shape_through_match() {
     let output_path = std::env::temp_dir().join(format!("klassic_native_generic_join_{stamp}.bin"));
     fs::write(
         &source_path,
-        "import std.option.{some, none, getOrElse, mapOption, flatMap, orElse}\n\
-         import std.result.{ok, err, unwrapOr, mapResult}\n\
-         println(getOrElse(mapOption(some(10), (x) => x + 1), 0))\n\
-         println(getOrElse(mapOption(none(), (x) => x + 1), -1))\n\
-         println(getOrElse(mapOption(some(5), (x) => \"v=#{x}\"), \"none\"))\n\
-         println(getOrElse(flatMap(some(10), (x) => some(x * 2)), 0))\n\
-         println(getOrElse(orElse(none(), some(77)), 0))\n\
-         println(getOrElse(mapOption(mapOption(some(3), (x) => x + 1), (y) => y * 10), 0))\n\
-         println(unwrapOr(mapResult(ok(5), (x) => x + 100), 0))\n\
-         println(unwrapOr(mapResult(err(\"boom\"), (x) => x + 100), -1))\n",
+        "import std.option\n\
+         import std.result\n\
+         println(some(10).map((x) => x + 1).getOrElse(0))\n\
+         println(none().map((x) => x + 1).getOrElse(-1))\n\
+         println(some(5).map((x) => \"v=#{x}\").getOrElse(\"none\"))\n\
+         println(some(10).flatMap((x) => some(x * 2)).getOrElse(0))\n\
+         println(none().orElse(some(77)).getOrElse(0))\n\
+         println(some(3).map((x) => x + 1).map((y) => y * 10).getOrElse(0))\n\
+         println(ok(5).map((x) => x + 100).unwrapOr(0))\n\
+         println(err(\"boom\").map((x) => x + 100).unwrapOr(-1))\n",
     )
     .expect("temp source file should write");
 
@@ -22291,6 +22291,60 @@ fn native_dispatches_shared_enum_method_by_receiver() {
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
         "Some(7)\nSome(3)\nOk(0)\nOk(5)\n"
+    );
+}
+
+/// Builtin-name method coexistence: after the clean rename, `Option` /
+/// `Result` expose `.map`, and std.list keeps `reverse` / `contains` as
+/// free functions — all names that are *also* native builtins. The
+/// desugar must not statically bind `.map` to the enum extension (a list
+/// receiver still needs the builtin `map`), so co-importing all three
+/// and using `.map` on each receiver type, plus the free `reverse` /
+/// `contains`, must dispatch correctly. Matches the evaluator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_map_family_coexists_with_builtins() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_map_family_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_map_family_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "import std.option\n\
+         import std.result\n\
+         import std.list\n\
+         println(some(5).map((x) => x * 2))\n\
+         println(ok(3).map((x) => x + 1))\n\
+         println([1, 2, 3].map((x) => x * 10))\n\
+         println(reverse([1, 2, 3]))\n\
+         println(contains([1, 2, 3], 2))\n",
+    )
+    .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "native build of builtin-name method coexistence should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "Some(10)\nOk(4)\n[10, 20, 30]\n[3, 2, 1]\ntrue\n"
     );
 }
 
