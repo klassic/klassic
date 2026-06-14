@@ -2448,9 +2448,11 @@ fn en_box_scalar(counter: &mut usize, value: Expr, span: Span) -> Expr {
 /// The dispatch is an index if-chain whose final `else` is the
 /// highest-indexed variant (the tag is always one of the variants, so the
 /// last arm needs no guard).
-/// Whether enum display recurses into nested-enum payloads. Off for the
-/// flat monomorphic/generic display; flipped on once nested display lands.
-const ENUM_DISPLAY_NESTED_ENABLED: bool = false;
+/// Whether enum display recurses into nested-enum payloads. With this on,
+/// an `EnumField` whose shape is tracked formats by recursing into the
+/// same builder, so `Wrap(B(7))` and `Some(Some(5))` render in full
+/// instead of a `<enum>` placeholder.
+const ENUM_DISPLAY_NESTED_ENABLED: bool = true;
 
 fn en_build_enum_display(
     counter: &mut usize,
