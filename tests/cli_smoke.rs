@@ -22086,6 +22086,105 @@ fn user_module_imports_resolve_from_neighboring_files() {
     );
 }
 
+/// Two modules that each define a free `def` of the same name but a
+/// different type — `alpha.filter`/`alpha.count` (list-typed, recursive)
+/// vs `beta.filter`/`beta.count` (string-typed) — used to collide in
+/// native's flat translation unit (#449). Per-module name mangling
+/// (`__mod_<path>_<name>`) namespaces them: `main`'s `filter` resolves
+/// to beta's while `alpha`'s internal `filter` stays alpha's. A standalone
+/// stdlib free-name overlap (`std.option.getOrElse` Option-typed vs
+/// `std.env.getOrElse` String-typed) is covered too. Evaluator and native
+/// build agree.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_isolates_same_named_module_defs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("klassic_ns449_{stamp}"));
+    fs::create_dir_all(&dir).expect("temp module dir should create");
+    fs::write(
+        dir.join("alpha.kl"),
+        "module alpha\ndef filter(xs, keep) = if(isEmpty(xs)) [] else if(keep) cons(head(xs))(filter(tail(xs), keep)) else filter(tail(xs), keep)\ndef count(xs) = size(xs)\ndef useAlpha(xs) = count(filter(xs, true))\n",
+    )
+    .expect("module should write");
+    fs::write(
+        dir.join("beta.kl"),
+        "module beta\ndef filter(s) = toUpperCase(s)\ndef count(s, c) = length(s) + c\ndef useBeta(s) = filter(s)\n",
+    )
+    .expect("module should write");
+    let main_path = dir.join("main.kl");
+    fs::write(
+        &main_path,
+        "import alpha.{useAlpha}\nimport beta.{useBeta, filter}\nprintln(useAlpha([1, 2, 3]))\nprintln(useBeta(\"hi\"))\nprintln(filter(\"yo\"))\n",
+    )
+    .expect("main should write");
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(main_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    assert!(
+        eval_output.status.success(),
+        "evaluator should namespace colliding module defs\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&eval_output.stdout), "3\nHI\nYO\n");
+
+    let output_path = dir.join("main.bin");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            main_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should namespace colliding module defs\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    assert!(run_output.status.success());
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "3\nHI\nYO\n");
+
+    // A stdlib free-name overlap that collided before #449:
+    // std.env.getOrElse is (String, String)-typed, std.option.getOrElse
+    // is (Option<a>, a)-typed. Importing both must not cross-wire.
+    let std_path = dir.join("stdcoll.kl");
+    fs::write(
+        &std_path,
+        "import std.option as O\nimport std.env as E\nprintln(O.getOrElse(O.some(7), 0))\n",
+    )
+    .expect("stdcoll should write");
+    let std_bin = dir.join("stdcoll.bin");
+    let std_build = Command::new(klassic_bin())
+        .args([
+            "build",
+            std_path.to_str().expect("path should be utf-8"),
+            "-o",
+            std_bin.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        std_build.status.success(),
+        "stdlib getOrElse overlap should namespace\nstderr:\n{}",
+        String::from_utf8_lossy(&std_build.stderr)
+    );
+    let std_run = Command::new(&std_bin)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(std_run.status.success());
+    assert_eq!(String::from_utf8_lossy(&std_run.stdout), "7\n");
+}
+
 /// Allocating enum values in a loop long enough to exhaust the initial
 /// 1 MiB GC heap exercises collection and free-list reuse. A reused
 /// first-fit block used to keep stale payload bytes (and `__gc_record`'s

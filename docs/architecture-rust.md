@@ -703,9 +703,15 @@ cargo run -- -e "1 + 2"
   bundled prelude and the user program (native name resolution is
   order-sensitive, and the modules call prelude helpers), the import node
   is dropped, and lazy codegen only emits the functions actually called.
-  Selective and bulk imports resolve directly; aliased imports
-  (`import std.x as M`) additionally have their `M.func` access rewritten
-  to a bare `func`. The ADT-backed modules (`std.option` / `std.result`)
+  Because every module's declarations share one flat translation unit,
+  each inlined module's free `def`s are name-mangled to
+  `__mod_<path>_<name>` and references are rewritten scope-aware (local
+  bindings shadow, so they are never mangled), so same-named but
+  differently-typed free functions across modules — user or `std.*` —
+  no longer collide (#449). Selective and bulk imports resolve to the
+  mangled name; aliased imports (`import std.x as M`) collapse their
+  `M.func` access to the target module's mangled name. The ADT-backed
+  modules (`std.option` / `std.result`)
   now inline as well, on top of the generic-enum specialization above:
   their constructors (`some` / `ok`), consumers (`getOrElse` / `unwrapOr`
   / `isSome` / `isErr`) and method-style extensions compile to native.
