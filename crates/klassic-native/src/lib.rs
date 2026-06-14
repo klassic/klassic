@@ -561,7 +561,7 @@ fn compile_internal(
     typecheck_program(&expr).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
-    let (expr, lowered_enum_names) = desugar_enums(expr);
+    let (expr, lowered_enum_names, mono_enum_shapes, mono_enum_variants) = desugar_enums(expr);
     let expr = desugar_extensions(expr);
     analyze_proofs(
         &expr,
@@ -580,6 +580,8 @@ fn compile_internal(
             let mut generator =
                 NativeCodeGenerator::new(source.clone(), user_view.clone(), target.platform);
             generator.lowered_enum_names = lowered_enum_names;
+            generator.mono_enum_shapes = mono_enum_shapes;
+            generator.mono_enum_variants = mono_enum_variants;
             let object = generator.compile(&expr).map_err(|diagnostic| {
                 NativeCompileError::with_view(source, user_view, diagnostic)
             })?;
@@ -1658,7 +1660,14 @@ fn collect_enum_decls(expr: &Expr, out: &mut Vec<(String, Vec<String>, Vec<EnumV
     }
 }
 
-fn desugar_enums(expr: Expr) -> (Expr, HashSet<String>) {
+fn desugar_enums(
+    expr: Expr,
+) -> (
+    Expr,
+    HashSet<String>,
+    HashMap<String, ConcreteEnumShape>,
+    HashMap<String, EnumVariantInfo>,
+) {
     let mut decls = Vec::new();
     collect_enum_decls(&expr, &mut decls);
 
@@ -1736,13 +1745,75 @@ fn desugar_enums(expr: Expr) -> (Expr, HashSet<String>) {
         }
     }
 
+    // Per-enum concrete shapes (variant names + field reprs), so a
+    // `println`/`toString`/interpolation site can format an erased
+    // monomorphic enum value. Built in two passes: flat shapes first, then
+    // nested-enum fields linked to their owning enum's shape so display
+    // recurses. Keyed at the end by every variant name (each variant of an
+    // enum maps to that whole enum's shape).
+    let mut enum_shapes: HashMap<String, ConcreteEnumShape> = HashMap::new();
+    let mut nested_links: Vec<(String, String, usize, String)> = Vec::new();
+    for name in &supported {
+        let mut shaped_variants = HashMap::new();
+        for (index, variant) in mono[name].iter().enumerate() {
+            let mut fields = Vec::with_capacity(variant.params.len());
+            for (field_index, (_, annotation)) in variant.params.iter().enumerate() {
+                let repr = classify_enum_field(&annotation.text, &supported)
+                    .expect("supported enum field classified");
+                if repr == EnumFieldRepr::EnumField {
+                    nested_links.push((
+                        name.clone(),
+                        variant.name.clone(),
+                        field_index,
+                        annotation.text.trim().to_string(),
+                    ));
+                }
+                fields.push(ShapedField {
+                    repr,
+                    nested: None,
+                    resolved: true,
+                });
+            }
+            shaped_variants.insert(
+                variant.name.clone(),
+                ShapedVariant {
+                    index: index as i64,
+                    fields,
+                },
+            );
+        }
+        enum_shapes.insert(
+            name.clone(),
+            ConcreteEnumShape {
+                variants: shaped_variants,
+            },
+        );
+    }
+    for (enum_name, variant_name, field_index, nested_enum) in nested_links {
+        let nested = enum_shapes.get(&nested_enum).cloned();
+        if let (Some(nested), Some(shape)) = (nested, enum_shapes.get_mut(&enum_name))
+            && let Some(variant) = shape.variants.get_mut(&variant_name)
+            && let Some(field) = variant.fields.get_mut(field_index)
+        {
+            field.nested = Some(Box::new(nested));
+        }
+    }
+    let mut mono_enum_shapes: HashMap<String, ConcreteEnumShape> = HashMap::new();
+    for shape in enum_shapes.values() {
+        for variant_name in shape.variants.keys() {
+            mono_enum_shapes
+                .entry(variant_name.clone())
+                .or_insert_with(|| shape.clone());
+        }
+    }
+
     let mut lowering = EnumLowering {
-        variants,
+        variants: variants.clone(),
         lowered_enums: supported,
         counter: 0,
     };
     let lowered = lowering.lower(expr);
-    (lowered, lowering.lowered_enums)
+    (lowered, lowering.lowered_enums, mono_enum_shapes, variants)
 }
 
 /// Fresh synthetic-name generator shared by the enum lowering and the
@@ -2038,7 +2109,8 @@ impl EnumLowering {
                     && info.fields.is_empty()
                 {
                     let info = info.clone();
-                    en_build_construct(&mut self.counter, &info, Vec::new(), span)
+                    let construct = en_build_construct(&mut self.counter, &info, Vec::new(), span);
+                    en_shape_named(construct, &name, span)
                 } else {
                     Expr::Identifier { name, span }
                 }
@@ -2054,8 +2126,10 @@ impl EnumLowering {
                     && let Some(info) = self.variants.get(name)
                     && info.fields.len() == arguments.len()
                 {
+                    let variant_name = name.clone();
                     let info = info.clone();
-                    return en_build_construct(&mut self.counter, &info, arguments, span);
+                    let construct = en_build_construct(&mut self.counter, &info, arguments, span);
+                    return en_shape_named(construct, &variant_name, span);
                 }
                 Expr::Call {
                     callee: Box::new(self.lower(*callee)),
@@ -2074,7 +2148,8 @@ impl EnumLowering {
                     && info.fields.len() == arguments.len()
                 {
                     let info = info.clone();
-                    return en_build_construct(&mut self.counter, &info, arguments, span);
+                    let construct = en_build_construct(&mut self.counter, &info, arguments, span);
+                    return en_shape_named(construct, &name, span);
                 }
                 Expr::RecordConstructor {
                     name,
@@ -2276,6 +2351,21 @@ impl EnumLowering {
     }
 }
 
+/// Wrap a lowered monomorphic-enum construction in a marker call that
+/// publishes the value's variant name to codegen. The codegen handler
+/// (`compile_enum_shape_named`) looks the name up in `mono_enum_shapes`
+/// and sets `pending_enum_shape`, so a later `println`/`toString`/
+/// interpolation (or a slot binding) can recover the shape needed to
+/// format the value. The marker is value-transparent: it compiles its
+/// inner construction and returns its pointer unchanged.
+fn en_shape_named(value: Expr, variant_name: &str, span: Span) -> Expr {
+    en_call(
+        "__enum_shape_named",
+        vec![value, en_string(variant_name, span)],
+        span,
+    )
+}
+
 fn en_build_construct(
     counter: &mut usize,
     info: &EnumVariantInfo,
@@ -2346,6 +2436,152 @@ fn en_box_scalar(counter: &mut usize, value: Expr, span: Span) -> Expr {
         ],
         span,
     )
+}
+
+/// Build an `Expr` that formats an enum value (`value`, yielding the
+/// `__gc_record` heap pointer) into a heap string matching the
+/// evaluator's `Display`: a nullary variant renders as just its name, a
+/// variant with fields as `Name(f0, f1, ...)` with `, ` between fields.
+/// Field formatting is by repr — Int via `__gc_int_to_string`, Bool as
+/// `true`/`false`, String as the raw heap string (unquoted), nested enum
+/// by recursing into this same builder with the field's tracked shape.
+/// The dispatch is an index if-chain whose final `else` is the
+/// highest-indexed variant (the tag is always one of the variants, so the
+/// last arm needs no guard).
+/// Whether enum display recurses into nested-enum payloads. Off for the
+/// flat monomorphic/generic display; flipped on once nested display lands.
+const ENUM_DISPLAY_NESTED_ENABLED: bool = false;
+
+fn en_build_enum_display(
+    counter: &mut usize,
+    shape: &ConcreteEnumShape,
+    value: Expr,
+    nested_enabled: bool,
+    span: Span,
+) -> Expr {
+    let obj = en_fresh(counter, "disp");
+    let idx = en_fresh(counter, "tag");
+
+    // Variants ordered by tag index so the if-chain is deterministic and
+    // the last (no-guard) arm corresponds to the highest index.
+    let mut ordered: Vec<(&String, &ShapedVariant)> = shape.variants.iter().collect();
+    ordered.sort_by_key(|(_, variant)| variant.index);
+
+    let read_tag = en_call(
+        "__gc_read",
+        vec![
+            en_call(
+                "__gc_read_ptr",
+                vec![en_ident(&obj, span), en_int(0, span)],
+                span,
+            ),
+            en_int(0, span),
+        ],
+        span,
+    );
+
+    let mut chain: Option<Expr> = None;
+    for (name, variant) in ordered.iter().rev() {
+        let body = en_build_variant_display(counter, name, variant, &obj, nested_enabled, span);
+        chain = Some(match chain.take() {
+            None => body,
+            Some(rest) => en_if(
+                en_binary(
+                    en_ident(&idx, span),
+                    BinaryOp::Equal,
+                    en_int(variant.index, span),
+                    span,
+                ),
+                body,
+                rest,
+                span,
+            ),
+        });
+    }
+    let body = chain.unwrap_or_else(|| en_call("__gc_string", vec![en_string("", span)], span));
+
+    en_block(
+        vec![
+            en_vardecl(&obj, value, span),
+            en_vardecl(&idx, read_tag, span),
+            body,
+        ],
+        span,
+    )
+}
+
+/// Build the heap-string fragment for one variant (`Name` or
+/// `Name(f0, ...)`), reading each field from `obj` by its slot repr.
+fn en_build_variant_display(
+    counter: &mut usize,
+    name: &str,
+    variant: &ShapedVariant,
+    obj: &str,
+    nested_enabled: bool,
+    span: Span,
+) -> Expr {
+    if variant.fields.is_empty() {
+        return en_call("__gc_string", vec![en_string(name, span)], span);
+    }
+    let mut acc = en_string(&format!("{name}("), span);
+    for (i, field) in variant.fields.iter().enumerate() {
+        if i > 0 {
+            acc = en_str_concat(acc, en_string(", ", span), span);
+        }
+        let offset = en_int(8 * (i as i64 + 1), span);
+        let field_text = match field.repr {
+            EnumFieldRepr::Scalar => en_call(
+                "__gc_int_to_string",
+                vec![en_call(
+                    "__gc_read",
+                    vec![
+                        en_call("__gc_read_ptr", vec![en_ident(obj, span), offset], span),
+                        en_int(0, span),
+                    ],
+                    span,
+                )],
+                span,
+            ),
+            EnumFieldRepr::BoolField => {
+                let read = en_call(
+                    "__gc_read",
+                    vec![
+                        en_call("__gc_read_ptr", vec![en_ident(obj, span), offset], span),
+                        en_int(0, span),
+                    ],
+                    span,
+                );
+                en_if(
+                    en_binary(read, BinaryOp::Equal, en_int(1, span), span),
+                    en_string("true", span),
+                    en_string("false", span),
+                    span,
+                )
+            }
+            EnumFieldRepr::StringField => {
+                en_call("__gc_read_string", vec![en_ident(obj, span), offset], span)
+            }
+            EnumFieldRepr::EnumField => match (nested_enabled, &field.nested) {
+                (true, Some(nested)) => en_build_enum_display(
+                    counter,
+                    nested,
+                    en_call("__gc_read_ptr", vec![en_ident(obj, span), offset], span),
+                    nested_enabled,
+                    span,
+                ),
+                // Nested display not enabled (or no tracked nested shape):
+                // render a placeholder rather than a raw pointer.
+                _ => en_string("<enum>", span),
+            },
+        };
+        acc = en_str_concat(acc, field_text, span);
+    }
+    en_str_concat(acc, en_string(")", span), span)
+}
+
+/// `__gc_string_concat(a, b)` over two display fragments.
+fn en_str_concat(a: Expr, b: Expr, span: Span) -> Expr {
+    en_call("__gc_string_concat", vec![a, b], span)
 }
 
 fn en_build_match(
@@ -3536,9 +3772,23 @@ struct NativeCodeGenerator {
     generic_enums: HashMap<String, GenericEnumInfo>,
     /// Variant name -> owning generic enum name.
     variant_to_generic_enum: HashMap<String, String>,
+    /// Variant name -> the (fully concrete) shape of the monomorphic enum
+    /// that owns it. Built from the preserved declarations of every enum
+    /// the lowering erased, so a `println`/`toString`/interpolation site
+    /// can recover the variant names + field reprs to format the value.
+    mono_enum_shapes: HashMap<String, ConcreteEnumShape>,
+    /// Variant name -> monomorphic variant info (tag + field reprs). Lets a
+    /// freshly-parsed interpolation sub-expression — which bypasses the
+    /// pre-codegen enum lowering — be lowered on the fly so an enum
+    /// constructor inside `"#{...}"` reaches codegen as a `__gc_record`.
+    mono_enum_variants: HashMap<String, EnumVariantInfo>,
     /// Slot id -> concrete enum shape, so a `match` on an identifier can
     /// recover the per-instantiation field reprs of its scrutinee.
     enum_shapes: HashMap<usize, ConcreteEnumShape>,
+    /// Slot ids whose recorded shape came from a monomorphic enum (so a
+    /// later display of the bound name knows it can format the value). A
+    /// parallel marker to `enum_shapes`, kept tiny on purpose.
+    mono_enum_shape_slots: HashSet<usize>,
     /// Shapes referenced by synthesized `__enum_shape_hint(value, id)`
     /// calls: a pattern binding of an enum-typed payload wraps its field
     /// read in a hint so the binding's slot records the payload's shape
@@ -3547,6 +3797,12 @@ struct NativeCodeGenerator {
     /// Shape of the generic enum value just constructed, awaiting binding
     /// to a slot (picked up by the next `allocate_slot`/`bind_constant`).
     pending_enum_shape: Option<ConcreteEnumShape>,
+    /// Whether `pending_enum_shape` originated from a monomorphic enum
+    /// construction (the `__enum_shape_named` marker) rather than the
+    /// generic-enum construction path. Display sites format a value only
+    /// for shapes whose every variant they can render; this flag lets the
+    /// monomorphic display land independently of the generic one.
+    pending_enum_shape_is_mono: bool,
     /// Fresh-name counter for synthesized generic-enum lowering trees.
     generic_enum_counter: usize,
     /// Nesting depth of compile-time function/lambda body evaluation
@@ -3723,9 +3979,13 @@ impl NativeCodeGenerator {
             lowered_enum_names: HashSet::new(),
             generic_enums: HashMap::new(),
             variant_to_generic_enum: HashMap::new(),
+            mono_enum_shapes: HashMap::new(),
+            mono_enum_variants: HashMap::new(),
             enum_shapes: HashMap::new(),
+            mono_enum_shape_slots: HashSet::new(),
             enum_shape_hints: Vec::new(),
             pending_enum_shape: None,
+            pending_enum_shape_is_mono: false,
             generic_enum_counter: 0,
             static_eval_call_depth: 0,
             static_eval_fuel: 0,
@@ -3816,6 +4076,13 @@ impl NativeCodeGenerator {
         }
     }
 
+    /// Build a `ConcreteEnumShape` for every monomorphic enum the lowering
+    /// erased, keyed by each of its variant names, so a display site can
+    /// recover the variant names + field reprs from the value's pending
+    /// shape. Monomorphic enums are fully concrete (no type parameters), so
+    /// each variant maps to the same whole-enum shape. Nested-enum fields
+    /// carry the nested enum's own shape (resolved in a second pass once
+    /// every enum's flat shape is known) so display recurses correctly.
     /// Build the concrete shape of `enum_name` given the reprs resolved for
     /// each type parameter at a construction site. A variant whose type
     /// parameter is still unresolved is omitted (a later match on it emits
@@ -4154,6 +4421,61 @@ impl NativeCodeGenerator {
             .ok_or_else(|| Diagnostic::compile(span, "unknown enum shape hint".to_string()))?;
         self.pending_enum_shape = Some(shape);
         Ok(value)
+    }
+
+    /// `__enum_shape_named(value, "Variant")` — synthesized by the
+    /// monomorphic-enum lowering around each construction. Compiles
+    /// `value` (the lowered `__gc_record` block) and publishes the owning
+    /// enum's concrete shape as the pending shape, so a later display site
+    /// or slot binding can recover the variant names + field reprs. The
+    /// value is returned unchanged; an unknown name simply leaves the
+    /// pending shape clear (the value still prints, falling back to the
+    /// pointer path for an enum whose shape was not registered).
+    fn compile_enum_shape_named(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let [value_expr, Expr::String { value: name, .. }] = arguments else {
+            return Err(Diagnostic::compile(
+                span,
+                "__enum_shape_named expects a value and a literal variant name".to_string(),
+            ));
+        };
+        let value = self.compile_expr(value_expr)?;
+        if let Some(shape) = self.mono_enum_shapes.get(name).cloned() {
+            self.pending_enum_shape = Some(shape);
+            self.pending_enum_shape_is_mono = true;
+        }
+        Ok(value)
+    }
+
+    /// Format an already-compiled enum value (its `__gc_record` pointer in
+    /// rax) into a heap string using `shape`. Binds the pointer to a fresh
+    /// rooted temp so the display tree (which allocates intermediate
+    /// strings) can read each field without recompiling the source and
+    /// without the pointer being collected. Returns the resulting
+    /// `HeapString`.
+    fn emit_enum_display_runtime_string(
+        &mut self,
+        shape: &ConcreteEnumShape,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.push_scope();
+        self.generic_enum_counter += 1;
+        let temp = format!("__enum_disp{}", self.generic_enum_counter);
+        let slot = self.allocate_slot(temp.clone(), NativeValue::HeapPointer);
+        self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+        let tree = en_build_enum_display(
+            &mut self.generic_enum_counter,
+            shape,
+            en_ident(&temp, span),
+            ENUM_DISPLAY_NESTED_ENABLED,
+            span,
+        );
+        let result = self.compile_expr(&tree)?;
+        self.pop_scope();
+        Ok(result)
     }
 
     /// Whether `name` resolves to a registered generic-enum variant.
@@ -4962,6 +5284,7 @@ impl NativeCodeGenerator {
         // that immediately follows its construction; clear any leftover so
         // it never attaches to an unrelated value.
         self.pending_enum_shape = None;
+        self.pending_enum_shape_is_mono = false;
         match expr {
             Expr::Int { value, .. } => {
                 self.asm.mov_imm64(Reg::Rax, *value as u64);
@@ -5154,8 +5477,9 @@ impl NativeCodeGenerator {
                 // Propagate a generic enum value's shape so passing it on
                 // (e.g. as a function argument or rebinding it) carries the
                 // per-instance payload reprs to the next slot.
-                if let Some(shape) = self.enum_shapes.get(&slot.id) {
-                    self.pending_enum_shape = Some(shape.clone());
+                if let Some(shape) = self.enum_shapes.get(&slot.id).cloned() {
+                    self.pending_enum_shape = Some(shape);
+                    self.pending_enum_shape_is_mono = self.mono_enum_shape_slots.contains(&slot.id);
                 }
                 Ok(slot.value)
             }
@@ -6336,6 +6660,7 @@ impl NativeCodeGenerator {
             "__gc_read_string" => self.compile_gc_read_string(arguments, span),
             "__gc_write" => self.compile_gc_write(arguments, span),
             "__enum_shape_hint" => self.compile_enum_shape_hint(arguments, span),
+            "__enum_shape_named" => self.compile_enum_shape_named(arguments, span),
             "__match_fail" => self.compile_match_fail(span),
             "assert" => {
                 if arguments.len() != 1 {
@@ -7359,6 +7684,7 @@ impl NativeCodeGenerator {
             "__gc_read_string" => self.compile_gc_read_string(arguments, span).map(Some),
             "__gc_write" => self.compile_gc_write(arguments, span).map(Some),
             "__enum_shape_hint" => self.compile_enum_shape_hint(arguments, span).map(Some),
+            "__enum_shape_named" => self.compile_enum_shape_named(arguments, span).map(Some),
             "__match_fail" => self.compile_match_fail(span).map(Some),
             "head" => self.compile_static_head(arguments, span).map(Some),
             "FileOutput#write" => self
@@ -10188,6 +10514,12 @@ impl NativeCodeGenerator {
                     return Ok(self.emit_static_string(self.static_value_display_string(&value)));
                 }
                 let value = self.compile_expr(&arguments[0])?;
+                if value == NativeValue::HeapPointer
+                    && self.pending_enum_shape_is_mono
+                    && let Some(shape) = self.pending_enum_shape.take()
+                {
+                    return self.emit_enum_display_runtime_string(&shape, span);
+                }
                 self.emit_runtime_to_string_value(value, span)
             }
             "substring" => {
@@ -32186,6 +32518,14 @@ impl NativeCodeGenerator {
         }
 
         let value = self.compile_expr(expr)?;
+        if value == NativeValue::HeapPointer
+            && self.pending_enum_shape_is_mono
+            && let Some(shape) = self.pending_enum_shape.take()
+        {
+            let formatted = self.emit_enum_display_runtime_string(&shape, span)?;
+            self.emit_print_value_fragment(fd, formatted);
+            return Ok(());
+        }
         self.emit_print_value_fragment(fd, value);
         Ok(())
     }
@@ -32246,6 +32586,34 @@ impl NativeCodeGenerator {
         let name = self.file_input_open_callback_name(body, param)?;
         matches!(name.as_str(), "FileInput#lines" | "FileInput#readLines")
             .then_some((&arguments[0], name))
+    }
+
+    /// Apply the monomorphic-enum lowering to a freshly-parsed
+    /// interpolation sub-expression. The interpolation path re-parses the
+    /// `#{...}` body after the program-wide `desugar_enums` pass already
+    /// ran, so an enum constructor inside it would otherwise reach codegen
+    /// un-lowered. Re-running the lowering with the recorded variant table
+    /// rewrites it to the `__gc_record` form (and re-attaches the shape
+    /// marker), matching how the same expression is handled outside a
+    /// string.
+    fn lower_interpolation_enums(&self, expr: Expr) -> Expr {
+        if self.mono_enum_variants.is_empty() {
+            return expr;
+        }
+        let mut lowering = EnumLowering {
+            variants: self.mono_enum_variants.clone(),
+            lowered_enums: self.lowered_enum_names.clone(),
+            counter: self.interpolation_enum_counter_base(),
+        };
+        lowering.lower(expr)
+    }
+
+    /// A large base offset for the interpolation lowering's fresh-name
+    /// counter so its synthesized `__enum_*` names never collide with the
+    /// program-wide lowering's names (which started at 0). Interpolation
+    /// trees are compiled in isolation, so a fixed high base is sufficient.
+    fn interpolation_enum_counter_base(&self) -> usize {
+        1_000_000_000
     }
 
     fn emit_print_interpolated_string(
@@ -32312,7 +32680,7 @@ impl NativeCodeGenerator {
                     parse_inline_expression("<interpolation>", &normalized).map_err(|_| {
                         Diagnostic::compile(span, "failed to parse interpolation expression")
                     })?;
-                let parsed = rewrite_expression(parsed);
+                let parsed = self.lower_interpolation_enums(rewrite_expression(parsed));
                 self.emit_print_expr_fragment(fd, &parsed, span)?;
             } else {
                 literal.push(chars[index]);
@@ -32403,7 +32771,7 @@ impl NativeCodeGenerator {
                     parse_inline_expression("<interpolation>", &normalized).map_err(|_| {
                         Diagnostic::compile(span, "failed to parse interpolation expression")
                     })?;
-                let parsed = rewrite_expression(parsed);
+                let parsed = self.lower_interpolation_enums(rewrite_expression(parsed));
                 if let Some(fragment) = self.compile_collection_literal_display_runtime_string(
                     &parsed,
                     span,
@@ -32422,7 +32790,31 @@ impl NativeCodeGenerator {
                     continue;
                 }
                 let fragment = self.compile_expr(&parsed)?;
-                if let Some(fragment) = self.native_string_ref(fragment) {
+                let enum_shape =
+                    if fragment == NativeValue::HeapPointer && self.pending_enum_shape_is_mono {
+                        self.pending_enum_shape.take()
+                    } else {
+                        None
+                    };
+                if let Some(shape) = enum_shape {
+                    let formatted = self.emit_enum_display_runtime_string(&shape, span)?;
+                    if let Some(formatted) = self.native_string_ref(formatted) {
+                        self.emit_append_native_string_to_runtime_buffer_offset_label(
+                            data,
+                            offset,
+                            formatted,
+                            span,
+                            "string interpolation result exceeds 65536 bytes",
+                        );
+                    } else {
+                        self.emit_append_heap_string_to_runtime_buffer_offset_label(
+                            data,
+                            offset,
+                            span,
+                            "string interpolation result exceeds 65536 bytes",
+                        );
+                    }
+                } else if let Some(fragment) = self.native_string_ref(fragment) {
                     self.emit_append_native_string_to_runtime_buffer_offset_label(
                         data,
                         offset,
@@ -37716,7 +38108,11 @@ impl NativeCodeGenerator {
             && let Some(shape) = self.pending_enum_shape.take()
         {
             self.enum_shapes.insert(slot.id, shape);
+            if self.pending_enum_shape_is_mono {
+                self.mono_enum_shape_slots.insert(slot.id);
+            }
         }
+        self.pending_enum_shape_is_mono = false;
         self.scopes
             .last_mut()
             .expect("native compiler always has a scope")
