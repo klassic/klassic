@@ -636,12 +636,9 @@ fn stdlib_module_source(path: &str) -> Option<&'static str> {
 struct InlineImport {
     path: String,
     alias: Option<String>,
-    // The selector fields are threaded through M1 so the namespacing
-    // rewrite can honor `import a.{x, y}` / `import a.{x => _}`; the
-    // rewrite that reads them lands in a later milestone.
-    #[allow(dead_code)]
+    // The selector fields let the namespacing rewrite honor
+    // `import a.{x, y}` / `import a.{x => _}` when resolving a reference.
     members: Option<Vec<String>>,
-    #[allow(dead_code)]
     excludes: Vec<String>,
 }
 
@@ -934,6 +931,495 @@ fn rewrite_inlined(expr: Expr, inlined: &[String], aliases: &HashSet<String>) ->
     }
 }
 
+/// Sanitize a dotted module path for use in a mangled identifier:
+/// `util.base` -> `util_base`.
+fn sanitize_module_path(path: &str) -> String {
+    path.replace('.', "_")
+}
+
+/// The mangled name a module's free top-level `def` `name` takes once it
+/// is spliced into the single native translation unit.
+fn mangled_def_name(path: &str, name: &str) -> String {
+    format!("__mod_{}_{}", sanitize_module_path(path), name)
+}
+
+/// The free top-level `def` names a parsed module declares. Used both to
+/// build the self-mangle map for the module and to resolve what an
+/// importer of that module sees. Only bare `def`s count — extension
+/// methods desugar to `__ext_*` separately, and enum / record
+/// declarations introduce constructors rather than free defs.
+fn module_free_def_names(parsed: &Expr) -> Vec<String> {
+    fn collect(expr: &Expr, out: &mut Vec<String>) {
+        match expr {
+            Expr::DefDecl { name, .. } => out.push(name.clone()),
+            Expr::Block { expressions, .. } => {
+                for sub in expressions {
+                    collect(sub, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    collect(parsed, &mut out);
+    out
+}
+
+/// What a name resolves to inside one rewrite scope (one user module, or
+/// the main program). Built once per scope and consulted as the
+/// scope-aware walker descends.
+struct RenameScope {
+    /// The module's own free `def` names -> their mangled form. Empty for
+    /// the main program. Takes priority over `imported` (own defs shadow
+    /// imports of the same name).
+    own: HashMap<String, String>,
+    /// Bare names the scope imports from another *mangled* (user) module
+    /// -> that name's mangled form, honoring this scope's own
+    /// members/excludes per import.
+    imported: HashMap<String, String>,
+    /// Alias -> mangled module path prefix, for aliases that name a
+    /// mangled (user) module: `M.func` / `M#func` collapse to
+    /// `__mod_<path>_func`.
+    user_aliases: HashMap<String, String>,
+    /// Aliases that name an *unmangled* (stdlib) module: `M.func` /
+    /// `M#func` collapse to a bare `func` (the spliced stdlib decl name).
+    stdlib_aliases: HashSet<String>,
+    /// Inlined module paths whose `import` nodes are deleted.
+    inlined: Vec<String>,
+}
+
+/// Build the per-scope rename map from the importing scope's own imports.
+///
+/// `own_path` is the importing module's path (`None` for the main
+/// program). `imports` are the inlinable imports made by this scope.
+/// `mangled_modules` maps each *mangled* (user) module path to its set of
+/// free def names so an importer can expand a bulk import. `stdlib_paths`
+/// is the set of inlined stdlib module paths (unmangled).
+fn build_rename_scope(
+    own_path: Option<&str>,
+    own_defs: &[String],
+    imports: &[InlineImport],
+    mangled_modules: &HashMap<String, Vec<String>>,
+    inlined: &[String],
+) -> RenameScope {
+    let own = own_path
+        .map(|path| {
+            own_defs
+                .iter()
+                .map(|name| (name.clone(), mangled_def_name(path, name)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut imported: HashMap<String, String> = HashMap::new();
+    let mut user_aliases: HashMap<String, String> = HashMap::new();
+    let mut stdlib_aliases: HashSet<String> = HashSet::new();
+    for import in imports {
+        let Some(defs) = mangled_modules.get(&import.path) else {
+            // Importing an unmangled (stdlib) module: an alias collapses
+            // to bare names, selective/bulk forms already resolve bare.
+            if let Some(alias) = &import.alias {
+                stdlib_aliases.insert(alias.clone());
+            }
+            continue;
+        };
+        if let Some(alias) = &import.alias {
+            user_aliases.insert(alias.clone(), import.path.clone());
+        }
+        // Selected names: explicit members, or every free def minus
+        // excludes for a bulk import. Aliased imports do not bind bare
+        // names (only `alias.name` access), matching the evaluator.
+        if import.alias.is_some() {
+            continue;
+        }
+        let selected: Vec<&String> = match &import.members {
+            Some(members) => defs.iter().filter(|name| members.contains(name)).collect(),
+            None => defs
+                .iter()
+                .filter(|name| !import.excludes.contains(name))
+                .collect(),
+        };
+        for name in selected {
+            imported.insert(name.clone(), mangled_def_name(&import.path, name));
+        }
+    }
+
+    RenameScope {
+        own,
+        imported,
+        user_aliases,
+        stdlib_aliases,
+        inlined: inlined.to_vec(),
+    }
+}
+
+/// Resolve a bare identifier reference under `scope`, given the set of
+/// names locally bound at this point. Locals shadow everything; then the
+/// scope's own free defs; then names imported from a mangled module.
+/// Anything else (prelude helpers, builtins, stdlib names, constructors)
+/// is left unchanged.
+fn resolve_bare_name(scope: &RenameScope, locals: &HashSet<String>, name: &str) -> Option<String> {
+    if locals.contains(name) {
+        return None;
+    }
+    if let Some(mangled) = scope.own.get(name) {
+        return Some(mangled.clone());
+    }
+    if let Some(mangled) = scope.imported.get(name) {
+        return Some(mangled.clone());
+    }
+    None
+}
+
+/// Scope-aware rename pass. Mangles the scope's own free top-level `def`
+/// declarations, rewrites identifier references to mangled module names,
+/// collapses aliased module access to the right (mangled or bare) target,
+/// and deletes inlined `import` nodes. Threads the set of locally bound
+/// names so a local never shadows into a mangled rewrite.
+fn rename_scope_expr(expr: Expr, scope: &RenameScope, locals: &HashSet<String>) -> Expr {
+    match expr {
+        // Inlined imports vanish (they were spliced as decls already).
+        Expr::Import { path, span, .. } if scope.inlined.contains(&path) => Expr::Block {
+            expressions: Vec::new(),
+            span,
+        },
+        // A bare identifier. The `#` form (`M#func`) is one identifier;
+        // resolve it against the scope's aliases first.
+        Expr::Identifier { name, span } => {
+            if let Some((prefix, member)) = name.split_once('#') {
+                if let Some(target) = scope.user_aliases.get(prefix) {
+                    return Expr::Identifier {
+                        name: mangled_def_name(target, member),
+                        span,
+                    };
+                }
+                if scope.stdlib_aliases.contains(prefix) {
+                    return Expr::Identifier {
+                        name: member.to_string(),
+                        span,
+                    };
+                }
+                return Expr::Identifier { name, span };
+            }
+            match resolve_bare_name(scope, locals, &name) {
+                Some(mangled) => Expr::Identifier {
+                    name: mangled,
+                    span,
+                },
+                None => Expr::Identifier { name, span },
+            }
+        }
+        // `M.field`: collapse aliased module access to the spliced decl.
+        Expr::FieldAccess {
+            target,
+            field,
+            span,
+        } => {
+            if let Expr::Identifier { name, .. } = target.as_ref()
+                && !locals.contains(name)
+            {
+                if let Some(path) = scope.user_aliases.get(name) {
+                    return Expr::Identifier {
+                        name: mangled_def_name(path, &field),
+                        span,
+                    };
+                }
+                if scope.stdlib_aliases.contains(name) {
+                    return Expr::Identifier { name: field, span };
+                }
+            }
+            Expr::FieldAccess {
+                target: Box::new(rename_scope_expr(*target, scope, locals)),
+                field,
+                span,
+            }
+        }
+        Expr::Block { expressions, span } => {
+            // A `val`/`mutable`/`def` binds its name for the expressions
+            // that follow it in the block.
+            let mut locals = locals.clone();
+            let mut out = Vec::with_capacity(expressions.len());
+            for sub in expressions {
+                let binds = block_binding_name(&sub);
+                let rewritten = rename_scope_expr(sub, scope, &locals);
+                if let Some(name) = binds {
+                    locals.insert(name);
+                }
+                out.push(rewritten);
+            }
+            Expr::Block {
+                expressions: out,
+                span,
+            }
+        }
+        Expr::DefDecl {
+            name,
+            type_params,
+            constraints,
+            params,
+            param_annotations,
+            return_annotation,
+            body,
+            span,
+        } => {
+            // The def's own name is mangled (it is a free module def);
+            // its params are local to the body. The body still sees the
+            // def's own name unmangled-as-recursion via `scope.own`, so we
+            // must NOT add `name` to locals (recursion must mangle).
+            let mangled = scope.own.get(&name).cloned().unwrap_or(name);
+            let mut body_locals = locals.clone();
+            for param in &params {
+                body_locals.insert(param.clone());
+            }
+            Expr::DefDecl {
+                name: mangled,
+                type_params,
+                constraints,
+                params,
+                param_annotations,
+                return_annotation,
+                body: Box::new(rename_scope_expr(*body, scope, &body_locals)),
+                span,
+            }
+        }
+        Expr::Lambda {
+            params,
+            param_annotations,
+            body,
+            span,
+        } => {
+            let mut body_locals = locals.clone();
+            for param in &params {
+                body_locals.insert(param.clone());
+            }
+            Expr::Lambda {
+                params,
+                param_annotations,
+                body: Box::new(rename_scope_expr(*body, scope, &body_locals)),
+                span,
+            }
+        }
+        Expr::Foreach {
+            binding,
+            iterable,
+            body,
+            span,
+        } => {
+            let iterable = Box::new(rename_scope_expr(*iterable, scope, locals));
+            let mut body_locals = locals.clone();
+            body_locals.insert(binding.clone());
+            Expr::Foreach {
+                binding,
+                iterable,
+                body: Box::new(rename_scope_expr(*body, scope, &body_locals)),
+                span,
+            }
+        }
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => Expr::Match {
+            scrutinee: Box::new(rename_scope_expr(*scrutinee, scope, locals)),
+            arms: arms
+                .into_iter()
+                .map(|arm| {
+                    let mut arm_locals = locals.clone();
+                    collect_pattern_bindings(&arm.pattern, &mut arm_locals);
+                    MatchArm {
+                        pattern: arm.pattern,
+                        guard: arm.guard.map(|g| rename_scope_expr(g, scope, &arm_locals)),
+                        body: rename_scope_expr(arm.body, scope, &arm_locals),
+                        span: arm.span,
+                    }
+                })
+                .collect(),
+            span,
+        },
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+            span,
+        } => Expr::If {
+            condition: Box::new(rename_scope_expr(*condition, scope, locals)),
+            then_branch: Box::new(rename_scope_expr(*then_branch, scope, locals)),
+            else_branch: else_branch.map(|b| Box::new(rename_scope_expr(*b, scope, locals))),
+            span,
+        },
+        Expr::While {
+            condition,
+            body,
+            span,
+        } => Expr::While {
+            condition: Box::new(rename_scope_expr(*condition, scope, locals)),
+            body: Box::new(rename_scope_expr(*body, scope, locals)),
+            span,
+        },
+        Expr::Call {
+            callee,
+            arguments,
+            span,
+        } => Expr::Call {
+            callee: Box::new(rename_scope_expr(*callee, scope, locals)),
+            arguments: arguments
+                .into_iter()
+                .map(|a| rename_scope_expr(a, scope, locals))
+                .collect(),
+            span,
+        },
+        Expr::VarDecl {
+            mutable,
+            name,
+            annotation,
+            value,
+            span,
+        } => Expr::VarDecl {
+            mutable,
+            name,
+            annotation,
+            value: Box::new(rename_scope_expr(*value, scope, locals)),
+            span,
+        },
+        Expr::Assign { name, value, span } => Expr::Assign {
+            name,
+            value: Box::new(rename_scope_expr(*value, scope, locals)),
+            span,
+        },
+        Expr::Cleanup {
+            body,
+            cleanup,
+            span,
+        } => Expr::Cleanup {
+            body: Box::new(rename_scope_expr(*body, scope, locals)),
+            cleanup: Box::new(rename_scope_expr(*cleanup, scope, locals)),
+            span,
+        },
+        Expr::Unary { op, expr, span } => Expr::Unary {
+            op,
+            expr: Box::new(rename_scope_expr(*expr, scope, locals)),
+            span,
+        },
+        Expr::Binary { lhs, op, rhs, span } => Expr::Binary {
+            lhs: Box::new(rename_scope_expr(*lhs, scope, locals)),
+            op,
+            rhs: Box::new(rename_scope_expr(*rhs, scope, locals)),
+            span,
+        },
+        Expr::ListLiteral { elements, span } => Expr::ListLiteral {
+            elements: elements
+                .into_iter()
+                .map(|e| rename_scope_expr(e, scope, locals))
+                .collect(),
+            span,
+        },
+        Expr::MapLiteral { entries, span } => Expr::MapLiteral {
+            entries: entries
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        rename_scope_expr(k, scope, locals),
+                        rename_scope_expr(v, scope, locals),
+                    )
+                })
+                .collect(),
+            span,
+        },
+        Expr::SetLiteral { elements, span } => Expr::SetLiteral {
+            elements: elements
+                .into_iter()
+                .map(|e| rename_scope_expr(e, scope, locals))
+                .collect(),
+            span,
+        },
+        Expr::RecordConstructor {
+            name,
+            arguments,
+            span,
+        } => Expr::RecordConstructor {
+            name,
+            arguments: arguments
+                .into_iter()
+                .map(|a| rename_scope_expr(a, scope, locals))
+                .collect(),
+            span,
+        },
+        Expr::RecordLiteral { fields, span } => Expr::RecordLiteral {
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| (name, rename_scope_expr(value, scope, locals)))
+                .collect(),
+            span,
+        },
+        Expr::ExtensionDeclaration {
+            type_params,
+            this_name,
+            receiver_type,
+            methods,
+            span,
+        } => Expr::ExtensionDeclaration {
+            type_params,
+            this_name,
+            receiver_type,
+            methods: methods
+                .into_iter()
+                .map(|m| rename_scope_expr(m, scope, locals))
+                .collect(),
+            span,
+        },
+        Expr::InstanceDeclaration {
+            class_name,
+            for_type,
+            for_type_annotation,
+            constraints,
+            methods,
+            span,
+        } => Expr::InstanceDeclaration {
+            class_name,
+            for_type,
+            for_type_annotation,
+            constraints,
+            methods: methods
+                .into_iter()
+                .map(|m| rename_scope_expr(m, scope, locals))
+                .collect(),
+            span,
+        },
+        other => other,
+    }
+}
+
+/// The name a top-level block element binds for the elements that follow
+/// it (a `val`/`mutable` or a non-mangled local `def`). `def`s whose name
+/// is in `scope.own` are handled by the mangle path, not as locals, so
+/// this returns the binding name unconditionally; the caller only adds it
+/// to the local set after rewriting the binder, which keeps recursion and
+/// own-def references resolving through `scope.own`.
+fn block_binding_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::VarDecl { name, .. } => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Collect the variable bindings a match pattern introduces.
+fn collect_pattern_bindings(pattern: &Pattern, out: &mut HashSet<String>) {
+    match pattern {
+        Pattern::Variable { name, .. } => {
+            out.insert(name.clone());
+        }
+        Pattern::Constructor { args, .. } => {
+            for argument in args {
+                collect_pattern_bindings(argument, out);
+            }
+        }
+        Pattern::Wildcard { .. }
+        | Pattern::LiteralInt { .. }
+        | Pattern::LiteralString { .. }
+        | Pattern::LiteralBool { .. } => {}
+    }
+}
+
 /// Inline non-generic `std.*` module imports before type checking.
 ///
 /// Native builds compile a single translation unit, so unlike the
@@ -958,23 +1444,26 @@ fn inline_module_imports(
     prelude_offset: usize,
     user_modules: &[UserModuleSource],
 ) -> Result<Expr, Diagnostic> {
-    let mut imports = Vec::new();
-    collect_inlinable_imports(&expr, user_modules, &mut imports);
+    let mut main_imports = Vec::new();
+    collect_inlinable_imports(&expr, user_modules, &mut main_imports);
     // Parse every user module once up front. Their parsed ASTs feed both
     // import discovery (a std or user module imported only from inside a
     // user module still needs splicing) and the splice loop below, so
     // selective `import a.{x, y}` members survive instead of being lost
-    // to a line scan.
+    // to a line scan. Each module's own imports are kept separately so the
+    // namespacing rewrite resolves a reference against the importing
+    // module's selectors, not a flattened union.
     let mut user_parsed: Vec<(String, Expr)> = Vec::with_capacity(user_modules.len());
+    let mut module_imports: HashMap<String, Vec<InlineImport>> = HashMap::new();
     for module in user_modules {
         let file = SourceFile::new(&module.path, module.source.clone());
         let parsed = rewrite_expression(parse_source(&file)?);
-        // Capture imports the module itself makes of other inlinable
-        // modules, keeping their members/excludes/alias.
-        collect_inlinable_imports(&parsed, user_modules, &mut imports);
+        let mut own = Vec::new();
+        collect_inlinable_imports(&parsed, user_modules, &mut own);
+        module_imports.insert(module.path.clone(), own);
         user_parsed.push((module.path.clone(), parsed));
     }
-    if imports.is_empty() {
+    if main_imports.is_empty() && module_imports.values().all(|imports| imports.is_empty()) {
         return Ok(expr);
     }
 
@@ -986,7 +1475,8 @@ fn inline_module_imports(
     // of the graph.
     let mut paths: Vec<String> = Vec::new();
     let mut aliases: HashSet<String> = HashSet::new();
-    for import in &imports {
+    let all_imports = main_imports.iter().chain(module_imports.values().flatten());
+    for import in all_imports {
         if !paths.contains(&import.path)
             && !user_modules.iter().any(|module| module.path == import.path)
         {
@@ -1002,6 +1492,15 @@ fn inline_module_imports(
         }
     }
 
+    // User modules are mangled into a private namespace; stdlib modules
+    // are left bare (their refs from main stay bare too). `mangled_modules`
+    // records each mangled module's free def names so an importer can
+    // expand a bulk import.
+    let mut mangled_modules: HashMap<String, Vec<String>> = HashMap::new();
+    for (path, parsed) in &user_parsed {
+        mangled_modules.insert(path.clone(), module_free_def_names(parsed));
+    }
+
     let mut module_decls = Vec::new();
     for path in &paths {
         // User modules are already parsed; stdlib modules parse here.
@@ -1015,22 +1514,41 @@ fn inline_module_imports(
             let file = SourceFile::new(path, source.to_string());
             rewrite_expression(parse_source(&file)?)
         };
-        // A module's own imports of other spliced modules are satisfied
-        // by the splice order — drop those nodes (anything else keeps
-        // its diagnostic).
-        for decl in stdlib_module_decls(parsed) {
-            if let Expr::Import { path: inner, .. } = &decl
-                && (paths.iter().any(|existing| existing == inner)
-                    || stdlib_module_is_inlinable(inner))
-            {
-                continue;
+        let is_user_module = mangled_modules.contains_key(path);
+        if is_user_module {
+            // Mangle this module's free defs and rewrite its internal
+            // references through its own selectors. `stdlib_module_decls`
+            // only strips the `module` header here.
+            let own_defs = mangled_modules.get(path).cloned().unwrap_or_default();
+            let imports = module_imports.get(path).cloned().unwrap_or_default();
+            let scope =
+                build_rename_scope(Some(path), &own_defs, &imports, &mangled_modules, &paths);
+            let locals = HashSet::new();
+            for decl in stdlib_module_decls(parsed) {
+                module_decls.push(rename_scope_expr(decl, &scope, &locals));
             }
-            module_decls.push(decl);
+        } else {
+            // Stdlib module: keep the existing bare splice (no mangling).
+            for decl in stdlib_module_decls(parsed) {
+                if let Expr::Import { path: inner, .. } = &decl
+                    && (paths.iter().any(|existing| existing == inner)
+                        || stdlib_module_is_inlinable(inner))
+                {
+                    continue;
+                }
+                module_decls.push(rewrite_inlined(decl, &paths, &aliases));
+            }
         }
     }
 
     let span = expr.span();
-    let expr = rewrite_inlined(expr, &paths, &aliases);
+    // The main program: rewrite references to names it imports from a
+    // mangled (user) module, and collapse stdlib-aliased access to bare.
+    // Main's own top-level defs are locals so they never get mangled.
+    let main_defs = module_free_def_names(&expr);
+    let main_scope = build_rename_scope(None, &[], &main_imports, &mangled_modules, &paths);
+    let main_locals: HashSet<String> = main_defs.into_iter().collect();
+    let expr = rename_scope_expr(expr, &main_scope, &main_locals);
     let Expr::Block { expressions, .. } = expr else {
         // No top-level block to splice into (single-expression program):
         // the modules can only be prelude-dependent, so place them first.
