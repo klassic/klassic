@@ -923,6 +923,17 @@ impl Emitter {
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return Err(unsupported(*span, "calling a non-identifier"));
                 };
+                // `__enum_shape_named(value, "Variant")` and
+                // `__enum_shape_hint(value, id)` are shape aids the shared
+                // enum-lowering pass wraps around values for the x86_64
+                // display/dispatch paths. The aarch64 backend has no use
+                // for the shape, so it compiles the wrapped value
+                // transparently and drops the marker.
+                if (name == "__enum_shape_named" || name == "__enum_shape_hint")
+                    && let Some(value) = arguments.first()
+                {
+                    return self.expression(value);
+                }
                 // Builtins first, mirroring the C backend's dispatch.
                 if let Some(ty) = self.builtin_call(name, arguments, *span)? {
                     return Ok(ty);
