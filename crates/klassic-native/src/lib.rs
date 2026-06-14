@@ -17506,8 +17506,18 @@ impl NativeCodeGenerator {
                 let shape = self.enum_shapes.get(&slot.id)?;
                 self.enum_name_of_shape(shape)
             }
-            Expr::Call { callee, .. } => match callee.as_ref() {
+            Expr::Call {
+                callee, arguments, ..
+            } => match callee.as_ref() {
                 Expr::Identifier { name, .. } => {
+                    // A monomorphic enum construction the lowering wrapped as
+                    // `__enum_shape_named(<construct>, "Variant")`; the second
+                    // argument literally names the variant.
+                    if name == "__enum_shape_named"
+                        && let Some(Expr::String { value, .. }) = arguments.get(1)
+                    {
+                        return self.variant_owner_enum.get(value).cloned();
+                    }
                     if let Some(enum_name) = self.variant_owner_enum.get(name) {
                         return Some(enum_name.clone());
                     }
@@ -17544,8 +17554,17 @@ impl NativeCodeGenerator {
     fn static_expr_enum_name(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::Identifier { name, .. } => self.variant_owner_enum.get(name).cloned(),
-            Expr::Call { callee, .. } => match callee.as_ref() {
-                Expr::Identifier { name, .. } => self.variant_owner_enum.get(name).cloned(),
+            Expr::Call {
+                callee, arguments, ..
+            } => match callee.as_ref() {
+                Expr::Identifier { name, .. } => {
+                    if name == "__enum_shape_named"
+                        && let Some(Expr::String { value, .. }) = arguments.get(1)
+                    {
+                        return self.variant_owner_enum.get(value).cloned();
+                    }
+                    self.variant_owner_enum.get(name).cloned()
+                }
                 _ => None,
             },
             Expr::Block { expressions, .. } => expressions
