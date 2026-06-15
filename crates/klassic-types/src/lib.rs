@@ -155,6 +155,11 @@ struct TypeChecker {
     current_module: Option<String>,
     next_var: u32,
     substitutions: HashMap<GenericVar, Type>,
+    /// Constraints inferred from arithmetic operators on still-unresolved
+    /// type variables (built-in `Num` / `Plus` classes). They are drained
+    /// into a `def`'s generalized signature, or defaulted to `Int` for
+    /// vars that never become generalizable.
+    inferred_constraints: Vec<Constraint>,
 }
 
 #[derive(Clone, Debug)]
@@ -1250,17 +1255,78 @@ impl TypeChecker {
 
     fn infer_program(&mut self, expr: &Expr) -> Result<Type, Diagnostic> {
         match expr {
-            Expr::Block { expressions, .. } => {
+            Expr::Block { expressions, span } => {
                 self.predeclare_proofs(expressions);
                 self.predeclare_defs(expressions);
                 let mut last = Type::Unit;
                 for expression in expressions {
                     last = self.infer_expr(expression)?;
                 }
+                self.settle_inferred_constraints(*span)?;
                 Ok(last)
             }
-            other => self.infer_expr(other),
+            other => {
+                let ty = self.infer_expr(other)?;
+                self.settle_inferred_constraints(other.span())?;
+                Ok(ty)
+            }
         }
+    }
+
+    /// Resolve the operator constraints that never reached a `def`
+    /// signature (e.g. a top-level lambda, or arithmetic on a variable
+    /// that was only ever used by `+`/`-`/...). A constraint whose
+    /// variable became concrete must satisfy its class; an unresolved
+    /// variable is ambiguous and defaults to `Int`.
+    fn settle_inferred_constraints(&mut self, span: Span) -> Result<(), Diagnostic> {
+        let pending = std::mem::take(&mut self.inferred_constraints);
+        for constraint in pending {
+            let resolved = self.resolve_constraint(&constraint);
+            let vars = free_vars_in_constraints(std::slice::from_ref(&resolved));
+            if vars.is_empty() {
+                self.ensure_constraints_satisfied(std::slice::from_ref(&resolved), span)?;
+            } else {
+                for var in vars {
+                    if let GenericVar::Type(id) = var {
+                        self.bind_var(GenericVar::Type(id), Type::Int);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold operator constraints inferred since `since` into a generalized
+    /// binding: constraints over the signature's own quantifiable variables
+    /// join `constraints`, concrete ones are checked immediately, and a
+    /// constraint over a variable that is not quantifiable here is pushed
+    /// back to settle in an enclosing scope. Returns the (re-resolved)
+    /// signature, its generalized variables, and the final constraint set.
+    fn generalize_with_operator_constraints(
+        &mut self,
+        since: usize,
+        final_type: &Type,
+        mut constraints: Vec<Constraint>,
+        span: Span,
+    ) -> Result<(Type, Vec<GenericVar>, Vec<Constraint>), Diagnostic> {
+        let inferred = self.inferred_constraints.split_off(since);
+        let candidate = self.generalize_signature(final_type, &constraints);
+        for constraint in inferred {
+            let resolved = self.resolve_constraint(&constraint);
+            let vars = free_vars_in_constraints(std::slice::from_ref(&resolved));
+            if vars.is_empty() {
+                self.ensure_constraints_satisfied(std::slice::from_ref(&resolved), span)?;
+            } else if vars.iter().all(|var| candidate.contains(var)) {
+                if !constraints.contains(&resolved) {
+                    constraints.push(resolved);
+                }
+            } else {
+                self.inferred_constraints.push(resolved);
+            }
+        }
+        let resolved_final = self.resolve(final_type);
+        let generalized = self.generalize_signature(&resolved_final, &constraints);
+        Ok((resolved_final, generalized, constraints))
     }
 
     /// Declare every `def` in the block before checking any statement,
@@ -1332,7 +1398,32 @@ impl TypeChecker {
             Expr::Unit { .. } => Ok(Type::Unit),
             Expr::Identifier { name, span } => {
                 if let Some(binding) = self.lookup(name).cloned() {
-                    Ok(self.instantiate(&binding))
+                    if binding
+                        .constraints
+                        .iter()
+                        .any(|c| matches!(c.class_name.as_str(), "Num" | "Plus"))
+                    {
+                        // Referencing an operator-constrained binding
+                        // indirectly (a val, a higher-order argument, ...)
+                        // must carry its Num/Plus constraints, or a bad
+                        // instantiation would type-check and crash at run
+                        // time. Instantiate type + constraints with shared
+                        // fresh variables and record the operator ones so the
+                        // enclosing generalization (or the program-end settle)
+                        // checks them. User constraints keep their existing
+                        // direct-call-only behaviour.
+                        let (ty, constraints) = self.instantiate_binding_signature(&binding);
+                        for constraint in constraints {
+                            if matches!(constraint.class_name.as_str(), "Num" | "Plus")
+                                && !self.inferred_constraints.contains(&constraint)
+                            {
+                                self.inferred_constraints.push(constraint);
+                            }
+                        }
+                        Ok(ty)
+                    } else {
+                        Ok(self.instantiate(&binding))
+                    }
                 } else if let Some(stored) = resolve_module_selector_type(name) {
                     let adopted = self.adopt_stored_type(&stored);
                     Ok(self.instantiate_stored_type(&adopted))
@@ -1548,6 +1639,7 @@ impl TypeChecker {
                 value,
                 span,
             } => {
+                let constraints_before = self.inferred_constraints.len();
                 let value_type = self.infer_expr(value)?;
                 let final_type = if let Some(annotation) = annotation {
                     let mut named = HashMap::new();
@@ -1557,17 +1649,24 @@ impl TypeChecker {
                     value_type
                 };
                 let final_type = self.resolve(&final_type);
-                let generalized_vars = if *mutable {
-                    Vec::new()
+                let (final_type, generalized_vars, constraints) = if *mutable {
+                    // Mutable bindings don't generalize; any operator
+                    // constraints they introduced settle at program end.
+                    (final_type, Vec::new(), Vec::new())
                 } else {
-                    self.generalize_signature(&final_type, &[])
+                    self.generalize_with_operator_constraints(
+                        constraints_before,
+                        &final_type,
+                        Vec::new(),
+                        *span,
+                    )?
                 };
                 self.declare(
                     name.clone(),
                     *mutable,
                     final_type,
                     generalized_vars,
-                    Vec::new(),
+                    constraints,
                 );
                 Ok(Type::Unit)
             }
@@ -1628,6 +1727,7 @@ impl TypeChecker {
                     self.declare(param.clone(), false, ty.clone(), Vec::new(), Vec::new());
                 }
                 self.declare_constraint_methods(&resolved_constraints, *span)?;
+                let constraints_before = self.inferred_constraints.len();
                 let body_type = self.infer_expr(body)?;
                 self.pop_scope();
 
@@ -1645,8 +1745,15 @@ impl TypeChecker {
                 if was_predeclared {
                     self.remove_binding(name);
                 }
-                let generalized_vars =
-                    self.generalize_signature(&final_type, &resolved_constraints);
+                // Fold operator constraints inferred from this body into the
+                // generalized signature (`forall a: Plus. (a, a) -> a`).
+                let (final_type, generalized_vars, resolved_constraints) = self
+                    .generalize_with_operator_constraints(
+                        constraints_before,
+                        &final_type,
+                        resolved_constraints,
+                        *span,
+                    )?;
                 self.declare(
                     name.clone(),
                     false,
@@ -1715,11 +1822,19 @@ impl TypeChecker {
                         Ok(Type::Bool)
                     }
                     klassic_syntax::UnaryOp::Plus | klassic_syntax::UnaryOp::Minus => {
-                        let resolved = self.default_unresolved_type(inner, Type::Int);
-                        if resolved.is_numeric() || resolved.is_dynamic_like() {
-                            Ok(resolved)
-                        } else {
-                            Err(type_error(*span, "unary numeric operator expects a number"))
+                        match self.resolve(&inner) {
+                            Type::Var(id) => {
+                                let constraint = Constraint {
+                                    class_name: "Num".to_string(),
+                                    arguments: vec![Type::Var(id)],
+                                };
+                                if !self.inferred_constraints.contains(&constraint) {
+                                    self.inferred_constraints.push(constraint);
+                                }
+                                Ok(Type::Var(id))
+                            }
+                            other if other.is_numeric() || other.is_dynamic_like() => Ok(other),
+                            _ => Err(type_error(*span, "unary numeric operator expects a number")),
                         }
                     }
                 }
@@ -1752,11 +1867,28 @@ impl TypeChecker {
                             ));
                         }
                         let unified = self.unify(left.clone(), right.clone(), *span)?;
-                        let resolved = self.default_unresolved_type(unified, Type::Int);
-                        if resolved.is_numeric() || resolved.is_dynamic_like() {
-                            Ok(resolved)
-                        } else {
-                            Err(type_error(*span, "arithmetic operator expects numbers"))
+                        match self.resolve(&unified) {
+                            // Operands stay an unresolved variable: instead of
+                            // eagerly defaulting to Int, record an operator
+                            // constraint so the enclosing `def` generalizes over
+                            // a `Num` / `Plus` type. `+` also accepts strings.
+                            Type::Var(id) => {
+                                let class_name = if matches!(op, BinaryOp::Add) {
+                                    "Plus"
+                                } else {
+                                    "Num"
+                                };
+                                let constraint = Constraint {
+                                    class_name: class_name.to_string(),
+                                    arguments: vec![Type::Var(id)],
+                                };
+                                if !self.inferred_constraints.contains(&constraint) {
+                                    self.inferred_constraints.push(constraint);
+                                }
+                                Ok(Type::Var(id))
+                            }
+                            other if other.is_numeric() || other.is_dynamic_like() => Ok(other),
+                            _ => Err(type_error(*span, "arithmetic operator expects numbers")),
                         }
                     }
                     BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
@@ -3543,6 +3675,17 @@ impl TypeChecker {
             .any(|argument| matches!(argument, Type::Dynamic | Type::Var(_) | Type::RowVar(_)))
         {
             return true;
+        }
+        // Built-in operator classes are resolved structurally (they have no
+        // user `instance` declarations): `Num` for `-`/`*`/`/`, `Plus` for
+        // `+` (numbers and string concatenation).
+        if let Some(argument) = required.arguments.first() {
+            let resolved = self.resolve(argument);
+            match required.class_name.as_str() {
+                "Num" => return resolved.is_numeric(),
+                "Plus" => return resolved.is_numeric() || matches!(resolved, Type::String),
+                _ => {}
+            }
         }
         if stack.contains(required) {
             return true;

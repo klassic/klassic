@@ -202,6 +202,100 @@ fn field_access_error_names_the_member() {
     );
 }
 
+/// Arithmetic operators introduce built-in type-class constraints
+/// (`Plus` for `+`, `Num` for `-` / `*` / `/` and unary minus), so an
+/// unannotated `def add(x, y) = x + y` generalizes polymorphically and
+/// works at Int, Double, and String — and the constraint is carried
+/// through a `val` binding too.
+#[test]
+fn arithmetic_operators_are_typeclass_polymorphic() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "def add(x, y) = x + y\ndef diff(x, y) = x - y\ndef neg(x) = -x\nval plus = add\nprintln(add(1, 2))\nprintln(add(1.0, 2.0))\nprintln(add(\"a\", \"b\"))\nprintln(diff(5.0, 2.0))\nprintln(neg(7.0))\nprintln(plus(10, 20))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "generic arithmetic should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "3\n3.0\nab\n3.0\n-7.0\n30\n()\n"
+    );
+}
+
+/// The operator type-classes reject non-numeric / non-string operands at
+/// compile time: `Plus` excludes Bool, `Num` excludes String, and the
+/// rejection survives an indirect `val` reference (the constraint is not
+/// silently dropped).
+#[test]
+fn arithmetic_typeclass_rejects_bad_operands() {
+    let cases = [
+        ("def add(x, y) = x + y\nadd(true, false)", "Plus<Boolean>"),
+        ("def diff(x, y) = x - y\ndiff(\"a\", \"b\")", "Num<String>"),
+        ("def neg(x) = -x\nneg(\"a\")", "Num<String>"),
+        (
+            "def add(x, y) = x + y\nval f = add\nf(true, false)",
+            "Plus<Boolean>",
+        ),
+    ];
+    for (src, expected) in cases {
+        let output = Command::new(klassic_bin())
+            .args(["-e", src])
+            .output()
+            .expect("binary should run");
+        assert!(!output.status.success(), "`{src}` should be a type error");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "for `{src}` expected {expected:?}, got:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Native build of a generic arithmetic helper monomorphizes per call
+/// site, so one `def add(x, y) = x + y` runs at Int, Double, and String
+/// in a single program — matching the evaluator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_generic_arithmetic_monomorphizes() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_genarith_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_genarith_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def add(x, y) = x + y\nprintln(add(3, 4))\nprintln(add(3.0, 4.0))\nprintln(add(\"a\", \"b\"))\n",
+    )
+    .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "generic arithmetic should build natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "7\n7.0\nab\n");
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
