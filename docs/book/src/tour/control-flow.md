@@ -67,6 +67,16 @@ they are used.
 
 ## Match-on-shape
 
-Klassic does not yet have an algebraic `match` expression. Use chained
-`if` / `else` for pattern-style dispatch, or method-style calls on
-records.
+Klassic has an algebraic `match` expression for pattern dispatch over
+[enums](../reference/enums.md):
+
+```kl
+enum Color { case Red; case Green }
+val c = Red
+println(c match { case Red => "r"; case Green => "g" })   // r
+```
+
+`match` also binds constructor payloads, matches literals, and supports
+`if` guards; see the [Enums](../reference/enums.md) reference for the
+full surface. Chained `if` / `else` still works for plain boolean
+dispatch.

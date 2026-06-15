@@ -62,18 +62,11 @@ receiver.
 
 ## Native compilation
 
-Native build (`klassic build file.kl`) does not yet support
-extension method dispatch. The compiler rejects an
-`extension { ... }` block with:
-
-```
-error: extension methods are not yet supported in native builds; see
-       docs/roadmap-targets-stdlib.md
-```
-
-Until the native-side dispatcher catches up, scripts that rely on
-extension methods should run through the evaluator (`klassic
-file.kl` or `klassic run file.kl`).
+Native build (`klassic build file.kl`) supports extension methods. Each
+method desugars into an ordinary function whose first parameter is the
+receiver, so `"hi".shout()` compiles to the same code as `shout("hi")`
+and produces identical output under the evaluator and a native
+executable.
 
 ## Stdlib usage
 
