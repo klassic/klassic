@@ -4345,7 +4345,20 @@ impl TypeChecker {
                 "isEmpty" => Some(Type::Function(vec![], Box::new(Type::Bool))),
                 "contains" => Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Bool))),
                 "join" => Some(Type::Function(vec![Type::String], Box::new(Type::String))),
-                "map" => Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic))),
+                // `xs.map(f)` over a `List<a>` is element-aware: `f` must
+                // accept the element type `a` and the result is `List<b>` for
+                // whatever `f` returns. This rejects, e.g., a `(b: Bool) => _`
+                // mapper applied to a `List<Int>` instead of silently typing
+                // the call as `Dynamic`.
+                "map" => {
+                    let result = self.fresh_var();
+                    let mapper =
+                        Type::Function(vec![inner.as_ref().clone()], Box::new(result.clone()));
+                    Some(Type::Function(
+                        vec![mapper],
+                        Box::new(Type::List(Box::new(result))),
+                    ))
+                }
                 // Accepts both `xs.foldLeft(init, f)` (two args at
                 // once) and `xs.foldLeft(init)(f)` (curried) — the
                 // latter partial-applies this type, and the runtime
