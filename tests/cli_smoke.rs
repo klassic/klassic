@@ -769,6 +769,39 @@ fn helpful_syntax_diagnostics() {
     }
 }
 
+/// A block that reaches end-of-input without its closing `}` reports the
+/// missing brace, instead of the misleading "expected a newline or `;`
+/// between expressions" — while a genuine missing separator still does.
+#[test]
+fn unclosed_block_reports_missing_brace() {
+    let unclosed = Command::new(klassic_bin())
+        .args(["-e", "val x = { 1 + 2"])
+        .output()
+        .expect("binary should run");
+    assert!(!unclosed.status.success(), "unclosed block should fail");
+    assert!(
+        String::from_utf8_lossy(&unclosed.stderr).contains("expected `}` to close the block"),
+        "expected a missing-brace hint, got:\n{}",
+        String::from_utf8_lossy(&unclosed.stderr)
+    );
+
+    // A real missing separator between two expressions keeps its own hint.
+    let no_separator = Command::new(klassic_bin())
+        .args(["-e", "{ 1 2 }"])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !no_separator.status.success(),
+        "missing separator should fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&no_separator.stderr)
+            .contains("expected a newline or `;` between expressions"),
+        "expected a separator hint, got:\n{}",
+        String::from_utf8_lossy(&no_separator.stderr)
+    );
+}
+
 /// CI guard: the direct Mach-O backend's binaries can only run on
 /// Apple Silicon, so every test that builds *and executes* that
 /// backend's output is `#[cfg(all(target_os = "macos", target_arch =

@@ -1052,6 +1052,15 @@ impl Parser {
             if self.consume_separators() {
                 continue;
             }
+            // Reaching end-of-input here means a block's closing `}` is
+            // missing — the top-level caller ends on `Eof` and never gets
+            // here, so an `Eof` always implies an unclosed block.
+            if matches!(self.peek().kind, TokenKind::Eof) {
+                return Err(
+                    Diagnostic::parse(self.peek().span, "expected `}` to close the block")
+                        .with_incomplete_input(),
+                );
+            }
             return Err(Diagnostic::parse(
                 self.peek().span,
                 "expected a newline or `;` between expressions",
