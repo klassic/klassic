@@ -2127,7 +2127,24 @@ impl TypeChecker {
                 }
                 Ok(self.resolve(&result))
             }
-            Type::Dynamic | Type::Null | Type::Var(_) => Ok(Type::Dynamic),
+            Type::Var(id) => {
+                // The callee is an unresolved type variable — typically a
+                // function-typed parameter like `f` in `def apply(f, x) =
+                // f(x)`. Unify it with a function type built from the
+                // argument types so the parameter's signature is recovered
+                // and the arguments are type-checked, instead of erasing the
+                // whole call to `Dynamic` (which silently accepts a
+                // wrongly-typed argument and crashes at run time).
+                let arg_types = arguments
+                    .iter()
+                    .map(|argument| self.infer_expr(argument))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = self.fresh_var();
+                let function = Type::Function(arg_types, Box::new(result.clone()));
+                self.unify(Type::Var(id), function, span)?;
+                Ok(self.resolve(&result))
+            }
+            Type::Dynamic | Type::Null => Ok(Type::Dynamic),
             other => Err(type_error(
                 span,
                 format!("{} is not callable", display_type(&other)),
@@ -2271,7 +2288,24 @@ impl TypeChecker {
                 }
                 Ok(self.resolve(&result))
             }
-            Type::Dynamic | Type::Null | Type::Var(_) => Ok(Type::Dynamic),
+            Type::Var(id) => {
+                // The callee is an unresolved type variable — typically a
+                // function-typed parameter like `f` in `def apply(f, x) =
+                // f(x)`. Unify it with a function type built from the
+                // argument types so the parameter's signature is recovered
+                // and the arguments are type-checked, instead of erasing the
+                // whole call to `Dynamic` (which silently accepts a
+                // wrongly-typed argument and crashes at run time).
+                let arg_types = arguments
+                    .iter()
+                    .map(|argument| self.infer_expr(argument))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = self.fresh_var();
+                let function = Type::Function(arg_types, Box::new(result.clone()));
+                self.unify(Type::Var(id), function, span)?;
+                Ok(self.resolve(&result))
+            }
+            Type::Dynamic | Type::Null => Ok(Type::Dynamic),
             other => Err(type_error(
                 span,
                 format!("{} is not callable", display_type(&other)),

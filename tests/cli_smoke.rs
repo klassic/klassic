@@ -296,6 +296,45 @@ fn native_generic_arithmetic_monomorphizes() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "7\n7.0\nab\n");
 }
 
+/// Calling a function-typed parameter recovers its signature: `def
+/// apply(f, x) = f(x)` infers `((a) -> b, a) -> b`, so valid calls work
+/// and a wrongly-typed argument (`apply(g, true)` with `g: (Int) -> Int`)
+/// is a compile-time type error — instead of the call erasing to Dynamic
+/// and crashing at run time.
+#[test]
+fn higher_order_param_application_is_typed() {
+    let good = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "def apply(f, x) = f(x)\ndef g(n: Int): Int = n * 2\nprintln(apply(g, 5))\nprintln(apply((n) => n + 1, 10))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good.status.success(),
+        "valid higher-order application should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&good.stdout), "10\n11\n()\n");
+
+    let bad = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "def apply(f, x) = f(x)\ndef g(n: Int): Int = n\napply(g, true)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !bad.status.success(),
+        "apply(g, true) should be a type error"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("Int is not compatible with Boolean"),
+        "expected an argument type error, got:\n{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
