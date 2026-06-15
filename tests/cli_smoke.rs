@@ -566,6 +566,57 @@ fn match_arm_mismatch_points_at_body() {
     );
 }
 
+/// A match arm whose constructor an earlier unguarded, irrefutably-bound
+/// arm already matches is reported as unreachable — but a refutable
+/// earlier payload (`case S(1)`) does not close the variant, and guards
+/// keep later arms live, so neither is a false positive.
+#[test]
+fn duplicate_match_constructor_is_unreachable() {
+    let unreachable = [
+        // Repeated nullary constructor.
+        "enum C { case R; case G }\nval c = R\nc match { case R => 1; case R => 2; case G => 3 }",
+        // Repeated constructor with irrefutable payloads.
+        "enum O { case S(v: Int); case N }\nval o = S(1)\no match { case S(x) => x; case S(y) => y; case N => 0 }",
+    ];
+    for src in unreachable {
+        let out = Command::new(klassic_bin())
+            .args(["-e", src])
+            .output()
+            .expect("binary should run");
+        assert!(!out.status.success(), "`{src}` should be unreachable");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unreachable match arm"),
+            "`{src}` expected an unreachable-arm error, got:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Not duplicates: a refutable `case S(1)` leaves `case S(x)` live, and
+    // a guard keeps a second same-constructor arm reachable.
+    let valid = [
+        (
+            "enum O { case S(v: Int); case N }\nval o = S(1)\nprintln(o match { case S(1) => 100; case S(x) => x; case N => 0 })",
+            "100\n()\n",
+        ),
+        (
+            "enum O { case S(v: Int); case N }\nval o = S(7)\nprintln(o match { case S(x) if x > 0 => 1; case S(y) => 2; case N => 0 })",
+            "1\n()\n",
+        ),
+    ];
+    for (src, expected) in valid {
+        let out = Command::new(klassic_bin())
+            .args(["-e", src])
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "`{src}` should be a valid match\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    }
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
