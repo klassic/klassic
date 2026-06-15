@@ -122,8 +122,10 @@ def slice(xs, from, to) = {
 // ---------- at --------------------------------------------------------------
 
 // Indexed access: the element at index `i` (zero-based). An out-of-range
-// index raises the existing head-on-empty error.
-def at(xs, i) = head(drop(xs, i))
+// index raises the existing head-on-empty error. A negative index is
+// out of range too (without the guard `drop` treats it as 0 and returns
+// the head).
+def at(xs, i) = if(i < 0) head([]) else head(drop(xs, i))
 
 // ---------- scanLeft --------------------------------------------------------
 

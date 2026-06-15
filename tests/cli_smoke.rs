@@ -561,6 +561,40 @@ fn stdlib_correctness_regressions() {
     }
 }
 
+/// `std.list.at` treats a negative index as out of range — raising the
+/// same head-on-empty error as a too-large index — instead of silently
+/// returning the head element (`drop` treats a negative count as 0).
+#[test]
+fn list_at_rejects_negative_index() {
+    let good = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.list.{at}\nprintln(at([10 20 30], 0))\nprintln(at([10 20 30], 2))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good.status.success(),
+        "in-range access should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&good.stdout), "10\n30\n()\n");
+
+    let negative = Command::new(klassic_bin())
+        .args(["-e", "import std.list.{at}\nprintln(at([10 20 30], -1))"])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !negative.status.success(),
+        "a negative index should be out of range"
+    );
+    assert!(
+        String::from_utf8_lossy(&negative.stderr).contains("head expects a non-empty list"),
+        "expected an out-of-range error, got:\n{}",
+        String::from_utf8_lossy(&negative.stderr)
+    );
+}
+
 /// A `->` (thin arrow) in a type annotation is accepted as an alias for
 /// `=>`, so `(Int) -> Int` parses as a function type (in `val` and
 /// parameter annotations, and curried) instead of an opaque Named type
