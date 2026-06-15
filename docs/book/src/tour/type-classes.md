@@ -94,6 +94,39 @@ typeclass Functor<'f> where {
 You can use `instance Functor<List>` to declare how `fmap` lifts a
 function over a list.
 
+## Built-in operator classes
+
+The arithmetic operators are themselves type-class-constrained, so you
+get the same overloading for free — no `instance` declarations needed.
+`+` requires `Plus` (the numeric types and `String`), while `-`, `*`,
+`/`, and unary minus require `Num` (numbers only). An unannotated helper
+therefore infers a *polymorphic* signature instead of being pinned to
+`Int`:
+
+```kl
+def add(x, y) = x + y     // (a, a) -> a  where Plus<a>
+println(add(1, 2))        // 3
+println(add(1.0, 2.0))    // 3.0
+println(add("a", "b"))    // ab
+
+def diff(x, y) = x - y    // Num<a> — numbers only
+println(diff(10, 3))      // 7
+```
+
+An operand the class doesn't cover is a compile-time error, exactly like
+a missing user instance:
+
+```kl
+def add(x, y) = x + y
+add(true, false)          // missing instance for Plus<Boolean>
+
+def diff(x, y) = x - y
+diff("a", "b")            // missing instance for Num<String>
+```
+
+A still-unconstrained operator variable — plain `1 + 2`, say — defaults
+to `Int`, so existing integer code is unaffected.
+
 ## When to reach for type classes
 
 - You want one name (`show`, `fmap`, `eq`) to resolve differently
