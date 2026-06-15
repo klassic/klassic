@@ -1592,7 +1592,9 @@ impl TypeChecker {
                     }
                     let body_type = self.infer_expr(&arm.body)?;
                     self.pop_scope();
-                    arm_type = self.unify(arm_type, body_type, arm.span)?;
+                    // Point a cross-arm type mismatch at the conflicting body
+                    // expression, not at the start of the arm's pattern.
+                    arm_type = self.unify(arm_type, body_type, arm.body.span())?;
                 }
                 self.check_match_coverage(&scrutinee_type, arms, *span)?;
                 Ok(self.resolve(&arm_type))
