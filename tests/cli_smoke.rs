@@ -523,6 +523,27 @@ fn stdlib_correctness_regressions() {
     }
 }
 
+/// A `->` (thin arrow) in a type annotation is accepted as an alias for
+/// `=>`, so `(Int) -> Int` parses as a function type (in `val` and
+/// parameter annotations, and curried) instead of an opaque Named type
+/// that yields a misleading "not callable" / "not compatible" error.
+#[test]
+fn thin_arrow_type_annotation() {
+    let out = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "val f: (Int) -> Int = (x) => x + 1\ndef apply(g: (Int) -> Int, x: Int): Int = g(x)\nval c: (Int) -> (Int) -> Int = (a) => (b) => a + b\nprintln(f(10))\nprintln(apply((n) => n * 2, 5))\nprintln(c(3)(4))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        out.status.success(),
+        "`->` annotations should type-check\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "11\n10\n7\n()\n");
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see

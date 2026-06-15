@@ -5124,6 +5124,15 @@ fn split_function_type(text: &str) -> Option<(String, String)> {
                 let right = text[chars[index + 1].0 + 1..].trim().to_string();
                 return Some((left, right));
             }
+            // Accept the thin arrow `->` as an alias for `=>` in type
+            // annotations, so `(Int) -> Int` parses as a function type
+            // instead of an opaque Named type (`-` never appears in an
+            // annotation except as part of `->`).
+            '-' if paren == 0 && angle == 0 && chars[index + 1].1 == '>' => {
+                let left = text[..chars[index].0].trim().to_string();
+                let right = text[chars[index + 1].0 + 1..].trim().to_string();
+                return Some((left, right));
+            }
             _ => {}
         }
         index += 1;
