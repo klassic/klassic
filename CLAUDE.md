@@ -133,4 +133,9 @@ When adding syntax or semantics:
 - Algebraic data types: `enum Option<a> { case Some(value: a); case None }` and Scala-style postfix pattern matching (`o match { case Some(v) => v; case None => 0 }`). Enums are real nominal types in the checker (match exhaustiveness and unreachable arms are diagnosed), and native builds compile monomorphic and shape-tracked generic enums — including recursion — through a per-frame by-pointer ABI; remaining native gaps (e.g. list-of-enum payloads) fail with source-located diagnostics.
 - Extension methods: `extension <a>(this: List<a>) { def headOr(d) = ... }` adds dot-callable methods to existing types. Stdlib leans on this for `std.string`, `std.list`, `std.math`, `std.option`, `std.result`, `std.map`, `std.set`, `std.time`, `std.json`, `std.path`, `std.cli`, `std.dir`, `std.env`, `std.file`, `std.process`, `std.test`.
 - Type classes with constraints, including higher-kinded examples.
+- Arithmetic operators are type-class-constrained, so unannotated generic
+  arithmetic infers a polymorphic signature: `def add(x, y) = x + y` is
+  `(a, a) -> a where Plus<a>` (works at Int / Double / String), and
+  `def diff(x, y) = x - y` is `Num<a>` (numbers only). `add(true, false)`
+  is a compile error (`missing instance for Plus<Boolean>`).
 - Proof surface: `axiom`, `theorem`, with `--warn-trust` / `--deny-trust` flags.
