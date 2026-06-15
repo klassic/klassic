@@ -425,6 +425,62 @@ fn collection_contains_is_element_typed() {
     );
 }
 
+/// `m.containsKey(k)` / `m.containsValue(v)` / `m.get(k)` are typed against
+/// the map's declared key/value type instead of `Dynamic`, so a same-type
+/// lookup still works while a wrong-typed one is a type error rather than a
+/// silently-accepted always-false / always-null lookup. Mirrors the
+/// already-element-typed `getOrElse`/`put`/`remove`.
+#[test]
+fn map_key_value_methods_are_typed() {
+    let good = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "val m = %[\"a\": 1 \"b\": 2]\nprintln(m.containsKey(\"a\"))\nprintln(m.containsValue(2))\nprintln(m.get(\"b\"))\nprintln(m.containsKey(\"z\"))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good.status.success(),
+        "typed map lookups should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&good.stdout),
+        "true\ntrue\n2\nfalse\n()\n"
+    );
+
+    // Each wrong-typed lookup over a Map<String, Int> is a type error.
+    let cases = [
+        (
+            "println(%[\"a\": 1].containsKey(42))",
+            "String is not compatible with Int",
+        ),
+        (
+            "println(%[\"a\": 1].containsValue(true))",
+            "Int is not compatible with Boolean",
+        ),
+        (
+            "println(%[\"a\": 1].get(99))",
+            "String is not compatible with Int",
+        ),
+    ];
+    for (src, expected) in cases {
+        let bad = Command::new(klassic_bin())
+            .args(["-e", src])
+            .output()
+            .expect("binary should run");
+        assert!(
+            !bad.status.success(),
+            "`{src}` should be a key/value type error"
+        );
+        assert!(
+            String::from_utf8_lossy(&bad.stderr).contains(expected),
+            "`{src}` expected `{expected}`, got:\n{}",
+            String::from_utf8_lossy(&bad.stderr)
+        );
+    }
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see

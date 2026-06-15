@@ -4377,10 +4377,20 @@ impl TypeChecker {
                 _ => None,
             },
             Type::Map(key, value) => match field {
-                "containsKey" | "containsValue" => {
-                    Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Bool)))
+                // `m.containsKey(k)` / `m.containsValue(v)` / `m.get(k)` take the
+                // map's declared key/value type rather than `Dynamic`, matching
+                // `getOrElse`/`put`/`remove` below: a wrong-typed lookup such as
+                // `%["a": 1].get(99)` is a type error instead of being silently
+                // accepted. `get` keeps a `Dynamic` result because it returns
+                // null for an absent key.
+                "containsKey" => Some(Type::Function(vec![(*key).clone()], Box::new(Type::Bool))),
+                "containsValue" => {
+                    Some(Type::Function(vec![(*value).clone()], Box::new(Type::Bool)))
                 }
-                "get" => Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic))),
+                "get" => Some(Type::Function(
+                    vec![(*key).clone()],
+                    Box::new(Type::Dynamic),
+                )),
                 "getOrElse" => Some(Type::Function(
                     vec![(*key).clone(), (*value).clone()],
                     Box::new((*value).clone()),
