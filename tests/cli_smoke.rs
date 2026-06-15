@@ -335,6 +335,44 @@ fn higher_order_param_application_is_typed() {
     );
 }
 
+/// `xs.map(f)` is typed against the receiver's element type instead of
+/// `Dynamic`: a mapper that wants a different element type is rejected,
+/// and the call's result is a properly typed `List<b>` (so it chains and
+/// flows into typed contexts) rather than `Dynamic`.
+#[test]
+fn list_map_is_element_typed() {
+    let good = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println([1 2 3].map((x) => x * 2))\nprintln([1 2 3].map((x) => \"n#{x}\"))\nprintln([1 2 3].map((x) => x + 1).map((y) => y * 10))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good.status.success(),
+        "element-typed map should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&good.stdout),
+        "[2, 4, 6]\n[n1, n2, n3]\n[20, 30, 40]\n()\n"
+    );
+
+    let bad = Command::new(klassic_bin())
+        .args(["-e", "println([1 2 3].map((b: Bool) => b))"])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !bad.status.success(),
+        "a Bool mapper over a List<Int> should be a type error"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("Int is not compatible with Boolean"),
+        "expected an element type error, got:\n{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
