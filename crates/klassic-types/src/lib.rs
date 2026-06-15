@@ -4343,7 +4343,14 @@ impl TypeChecker {
                 "tail" => Some(Type::Function(vec![], Box::new(Type::List(inner.clone())))),
                 "size" => Some(Type::Function(vec![], Box::new(Type::Int))),
                 "isEmpty" => Some(Type::Function(vec![], Box::new(Type::Bool))),
-                "contains" => Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Bool))),
+                // `xs.contains(x)` over a `List<a>` requires `x` to be the
+                // element type `a` rather than `Dynamic`, so e.g.
+                // `[1 2 3].contains("s")` on a `List<Int>` is a type error
+                // instead of a silently-accepted always-false membership test.
+                "contains" => Some(Type::Function(
+                    vec![inner.as_ref().clone()],
+                    Box::new(Type::Bool),
+                )),
                 "join" => Some(Type::Function(vec![Type::String], Box::new(Type::String))),
                 // `xs.map(f)` over a `List<a>` is element-aware: `f` must
                 // accept the element type `a` and the result is `List<b>` for
@@ -4399,7 +4406,10 @@ impl TypeChecker {
                 _ => None,
             },
             Type::Set(inner) => match field {
-                "contains" => Some(Type::Function(vec![Type::Dynamic], Box::new(Type::Bool))),
+                // `s.contains(x)` requires `x` to be the element type, matching
+                // `add`/`remove` below: a cross-type membership test such as
+                // `%(1 2 3).contains("s")` is rejected instead of typed `Dynamic`.
+                "contains" => Some(Type::Function(vec![(*inner).clone()], Box::new(Type::Bool))),
                 "isEmpty" => Some(Type::Function(vec![], Box::new(Type::Bool))),
                 "size" => Some(Type::Function(vec![], Box::new(Type::Int))),
                 "add" => Some(Type::Function(

@@ -373,6 +373,58 @@ fn list_map_is_element_typed() {
     );
 }
 
+/// `xs.contains(x)` on a `List<a>` / `Set<a>` is typed against the
+/// element type `a` instead of `Dynamic`, so a same-type membership test
+/// still works but a cross-type one (`[1 2 3].contains("s")`) is a type
+/// error rather than a silently-accepted always-false test.
+#[test]
+fn collection_contains_is_element_typed() {
+    let good = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println([1 2 3].contains(2))\nprintln([\"a\" \"b\"].contains(\"b\"))\nprintln(%(1 2 3).contains(9))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good.status.success(),
+        "element-typed contains should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&good.stdout),
+        "true\ntrue\nfalse\n()\n"
+    );
+
+    let bad_list = Command::new(klassic_bin())
+        .args(["-e", "println([1 2 3].contains(\"foo\"))"])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !bad_list.status.success(),
+        "a String argument to List<Int>.contains should be a type error"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad_list.stderr).contains("Int is not compatible with String"),
+        "expected an element type error, got:\n{}",
+        String::from_utf8_lossy(&bad_list.stderr)
+    );
+
+    let bad_set = Command::new(klassic_bin())
+        .args(["-e", "println(%(1 2 3).contains(\"foo\"))"])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !bad_set.status.success(),
+        "a String argument to Set<Int>.contains should be a type error"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad_set.stderr).contains("Int is not compatible with String"),
+        "expected an element type error, got:\n{}",
+        String::from_utf8_lossy(&bad_set.stderr)
+    );
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
@@ -13829,7 +13881,7 @@ fn builds_native_executable_for_runtime_line_to_string() {
         std::env::temp_dir().join(format!("klassic-native-runtime-line-to-string-{unique}"));
     fs::write(
         &source_path,
-        "val probe = head(args())\nval lines = tail(args())\nval trailing = (probe + \",\").split(\",\")\nval empty = split(\"\", \",\")\nprintln(toString(lines))\nprintln(\"lines=\" + lines)\nprintln(toString(trailing))\nprintln(\"empty=\" + empty)\nprintln(lines.contains(\"beta\"))\nprintln(contains(lines)(\"gamma\"))\nprintln(lines.contains(probe))\nprintln(lines.contains(length(probe)))\nassertResult(\"[beta, gamma]\")(toString(lines))\nassertResult(\"lines=[beta, gamma]\")(\"lines=\" + lines)\nassertResult(\"[alpha, ]\")(toString(trailing))\nassertResult(\"empty=[]\")(\"empty=\" + empty)\nassert(lines.contains(\"beta\"))\nassert(contains(lines)(\"gamma\"))\nassert(!lines.contains(probe))\nassert(!lines.contains(length(probe)))\n",
+        "val probe = head(args())\nval lines = tail(args())\nval trailing = (probe + \",\").split(\",\")\nval empty = split(\"\", \",\")\nprintln(toString(lines))\nprintln(\"lines=\" + lines)\nprintln(toString(trailing))\nprintln(\"empty=\" + empty)\nprintln(lines.contains(\"beta\"))\nprintln(contains(lines)(\"gamma\"))\nprintln(lines.contains(probe))\nassertResult(\"[beta, gamma]\")(toString(lines))\nassertResult(\"lines=[beta, gamma]\")(\"lines=\" + lines)\nassertResult(\"[alpha, ]\")(toString(trailing))\nassertResult(\"empty=[]\")(\"empty=\" + empty)\nassert(lines.contains(\"beta\"))\nassert(contains(lines)(\"gamma\"))\nassert(!lines.contains(probe))\n",
     )
     .expect("source should write");
 
@@ -13870,7 +13922,7 @@ fn builds_native_executable_for_runtime_line_to_string() {
     );
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
-        "[beta, gamma]\nlines=[beta, gamma]\n[alpha, ]\nempty=[]\ntrue\ntrue\nfalse\nfalse\n"
+        "[beta, gamma]\nlines=[beta, gamma]\n[alpha, ]\nempty=[]\ntrue\ntrue\nfalse\n"
     );
     assert!(run.stderr.is_empty());
 }
