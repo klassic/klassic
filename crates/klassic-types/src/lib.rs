@@ -4108,12 +4108,33 @@ impl TypeChecker {
         span: Span,
     ) -> Result<(), Diagnostic> {
         let mut closed = false;
+        let mut closed_variants: HashSet<String> = HashSet::new();
         for arm in arms {
             if closed {
                 return Err(type_error(
                     arm.span,
                     "unreachable match arm: a preceding pattern already matches every value",
                 ));
+            }
+            // A later unguarded arm for a constructor that an earlier
+            // unguarded arm already matches with irrefutable payloads is
+            // dead (e.g. a second `case None` or `case Some(_)`). An arm
+            // with a refutable payload such as `case Some(1)` does not
+            // close the variant, so `case Some(x)` after it stays live.
+            if arm.guard.is_none()
+                && let klassic_syntax::Pattern::Constructor { name, args, .. } = &arm.pattern
+            {
+                if closed_variants.contains(name) {
+                    return Err(type_error(
+                        arm.span,
+                        format!(
+                            "unreachable match arm: `{name}` is already matched by a preceding arm"
+                        ),
+                    ));
+                }
+                if args.iter().all(pattern_is_irrefutable) {
+                    closed_variants.insert(name.clone());
+                }
             }
             if arm.guard.is_none() && pattern_is_irrefutable(&arm.pattern) {
                 closed = true;
