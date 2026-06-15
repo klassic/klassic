@@ -21,8 +21,8 @@ instance Show<Int> where {
   def show(x: Int): String = "Int: " + x
 }
 
-instance Show<Bool> where {
-  def show(b: Bool): String = if (b) "yes" else "no"
+instance Show<Boolean> where {
+  def show(b: Boolean): String = if (b) "yes" else "no"
 }
 ```
 
