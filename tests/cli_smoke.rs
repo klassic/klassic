@@ -481,6 +481,44 @@ fn map_key_value_methods_are_typed() {
     }
 }
 
+/// `xs.foldLeft(init, f)` over a `List<a>` ties the folder to the element
+/// type — `init` and the result share an accumulator type and `f` is
+/// `(acc, a) -> acc` — so a valid numeric/string fold works but a folder
+/// that treats the `Int` element as a `String` is a type error.
+#[test]
+fn list_foldleft_is_element_typed() {
+    let good = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println([1 2 3].foldLeft(0, (acc, x) => acc + x))\nprintln([\"a\" \"b\"].foldLeft(\"\", (acc, x) => acc + x))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good.status.success(),
+        "valid folds should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&good.stdout), "6\nab\n()\n");
+
+    let bad = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println([1 2 3].foldLeft(0, (acc, x) => acc + length(x)))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !bad.status.success(),
+        "treating an Int element as a String should be a type error"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("String is not compatible with Int"),
+        "expected an element type error, got:\n{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
 /// Regressions for three stdlib correctness bugs: `stdlibIsOdd` returned
 /// false for negative odd numbers, `sortBy`/`sort` reversed the relative
 /// order of equal-key elements (unstable sort), and `indent("")` produced

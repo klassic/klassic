@@ -4404,10 +4404,19 @@ impl TypeChecker {
                 // once) and `xs.foldLeft(init)(f)` (curried) — the
                 // latter partial-applies this type, and the runtime
                 // goes through apply_callable so the partial completes.
-                "foldLeft" => Some(Type::Function(
-                    vec![Type::Dynamic, Type::Dynamic],
-                    Box::new(Type::Dynamic),
-                )),
+                // `xs.foldLeft(init, f)` over a `List<a>` ties the folder to
+                // the element type: `init` and the result share an
+                // accumulator type `b`, and `f` is `(b, a) -> b`. This
+                // rejects, e.g., a folder that treats the `Int` element as a
+                // `String`, instead of typing every position as `Dynamic`.
+                "foldLeft" => {
+                    let acc = self.fresh_var();
+                    let folder = Type::Function(
+                        vec![acc.clone(), inner.as_ref().clone()],
+                        Box::new(acc.clone()),
+                    );
+                    Some(Type::Function(vec![acc.clone(), folder], Box::new(acc)))
+                }
                 _ => None,
             },
             Type::Map(key, value) => match field {
