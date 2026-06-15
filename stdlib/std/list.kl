@@ -143,20 +143,22 @@ def foldRight(xs, init, f) = foldLeft(reverse(xs))(init)((acc, x) => f(x, acc))
 // ---------- sort / sortBy ---------------------------------------------------
 
 // Insertion-sort helper: insert `x` into an already-sorted list.
-// Works for any ordered type (Int, Double) because it uses `<=`.
+// Uses `<` (not `<=`) so the sort is stable: `x` is placed after any
+// earlier elements that compare equal, preserving their input order.
 def insertSorted(sorted, x) =
   if(isEmpty(sorted)) [x]
-  else if(x <= head(sorted)) cons(x)(sorted)
+  else if(x < head(sorted)) cons(x)(sorted)
   else cons(head(sorted))(insertSorted(tail(sorted), x))
 
 // Sort a list of numbers (Int or Double) in ascending order.
 // Uses insertion sort via `foldLeft` — O(n²) but pure and simple.
 def sort(xs) = foldLeft(xs)([])(insertSorted)
 
-// Insertion-sort helper that compares by a key function.
+// Insertion-sort helper that compares by a key function. Uses `<`
+// (not `<=`) so equal-key elements keep their input order (stable sort).
 def insertSortedBy(key, sorted, x) =
   if(isEmpty(sorted)) [x]
-  else if(key(x) <= key(head(sorted))) cons(x)(sorted)
+  else if(key(x) < key(head(sorted))) cons(x)(sorted)
   else cons(head(sorted))(insertSortedBy(key, tail(sorted), x))
 
 // Sort `xs` by the numeric value returned by `key(x)`.

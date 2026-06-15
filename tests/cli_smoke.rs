@@ -481,6 +481,48 @@ fn map_key_value_methods_are_typed() {
     }
 }
 
+/// Regressions for three stdlib correctness bugs: `stdlibIsOdd` returned
+/// false for negative odd numbers, `sortBy`/`sort` reversed the relative
+/// order of equal-key elements (unstable sort), and `indent("")` produced
+/// bare indentation spaces instead of an empty string.
+#[test]
+fn stdlib_correctness_regressions() {
+    let cases = [
+        ("println(stdlibIsOdd(-3))", "true\n()\n"),
+        ("println(stdlibIsOdd(-4))", "false\n()\n"),
+        // Equal keys keep their input order (stable sort).
+        (
+            "import std.list.{sortBy}\nprintln(sortBy([[1 100] [1 200] [1 300]], (p) => head(p)))",
+            "[[1, 100], [1, 200], [1, 300]]\n()\n",
+        ),
+        (
+            "import std.list.{sortBy}\nprintln(sortBy([[2 1] [1 1] [2 2] [1 2]], (p) => head(p)))",
+            "[[1, 1], [1, 2], [2, 1], [2, 2]]\n()\n",
+        ),
+        // Indenting the empty string yields the empty string, not spaces.
+        (
+            "import std.string.{indent}\nprintln(\"[\" + indent(\"\", 2) + \"]\")",
+            "[]\n()\n",
+        ),
+    ];
+    for (src, expected) in cases {
+        let out = Command::new(klassic_bin())
+            .args(["-e", src])
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "`{src}` should evaluate\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "wrong output for `{src}`"
+        );
+    }
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
