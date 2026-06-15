@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 
 use klassic_span::{Diagnostic, DiagnosticKind, Severity, Span};
 use klassic_syntax::{
-    Expr, FloatLiteralKind, IntLiteralKind, RecordField, TypeAnnotation, TypeClassConstraint,
-    TypeClassMethod,
+    Expr, FloatLiteralKind, IntLiteralKind, RecordField, StringPart, TypeAnnotation,
+    TypeClassConstraint, TypeClassMethod,
 };
 
 pub mod proof;
@@ -1394,6 +1394,17 @@ impl TypeChecker {
             }),
             Expr::Bool { .. } => Ok(Type::Bool),
             Expr::String { .. } => Ok(Type::String),
+            Expr::StringInterpolation { parts, .. } => {
+                // Type-check every hole so a type error inside `#{ ... }` is
+                // reported; any value is displayable, so the whole literal
+                // is a `String`.
+                for part in parts {
+                    if let StringPart::Interpolation(hole) = part {
+                        self.infer_expr(hole)?;
+                    }
+                }
+                Ok(Type::String)
+            }
             Expr::Null { .. } => Ok(Type::Null),
             Expr::Unit { .. } => Ok(Type::Unit),
             Expr::Identifier { name, span } => {
@@ -5810,6 +5821,18 @@ fn substitute_expr_identifiers(expr: &Expr, substitutions: &HashMap<String, Expr
         | Expr::EnumDeclaration { .. }
         | Expr::Match { .. }
         | Expr::PegRuleBlock { .. } => expr.clone(),
+        Expr::StringInterpolation { parts, span } => Expr::StringInterpolation {
+            parts: parts
+                .iter()
+                .map(|part| match part {
+                    StringPart::Literal(text) => StringPart::Literal(text.clone()),
+                    StringPart::Interpolation(hole) => StringPart::Interpolation(Box::new(
+                        substitute_expr_identifiers(hole, substitutions),
+                    )),
+                })
+                .collect(),
+            span: *span,
+        },
         Expr::Identifier { name, .. } => substitutions
             .get(name)
             .cloned()

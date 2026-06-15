@@ -151,6 +151,10 @@ pub enum Expr {
         value: String,
         span: Span,
     },
+    StringInterpolation {
+        parts: Vec<StringPart>,
+        span: Span,
+    },
     Null {
         span: Span,
     },
@@ -345,6 +349,14 @@ pub enum Expr {
     },
 }
 
+/// One piece of an interpolated string: either literal text or an
+/// expression hole (`#{ ... }`) parsed with the full grammar.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StringPart {
+    Literal(String),
+    Interpolation(Box<Expr>),
+}
+
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
@@ -352,6 +364,7 @@ impl Expr {
             | Self::Double { span, .. }
             | Self::Bool { span, .. }
             | Self::String { span, .. }
+            | Self::StringInterpolation { span, .. }
             | Self::Null { span }
             | Self::Unit { span }
             | Self::Identifier { span, .. }
@@ -399,6 +412,12 @@ enum TokenKind {
     Int(i64, IntLiteralKind),
     Double(f64, FloatLiteralKind),
     String(String),
+    // Interpolated string template pieces. A string with `#{...}` holes
+    // lexes as `StringStart(text)` ‹hole tokens› (`StringMid(text)` ‹hole›)*
+    // `StringEnd(text)`; the hole tokens are ordinary expression tokens.
+    StringStart(String),
+    StringMid(String),
+    StringEnd(String),
     Identifier(String),
     True,
     False,
@@ -475,9 +494,22 @@ pub fn parse_inline_expression(name: &str, text: &str) -> Result<Expr, Diagnosti
     parse_source(&source)
 }
 
+/// How a string segment ended while scanning literal content.
+enum SegmentEnd {
+    /// The closing `"` of the string literal.
+    Quote,
+    /// A `#{` opening an interpolation hole.
+    Interpolation,
+}
+
 struct Lexer<'a> {
     input: &'a str,
     position: usize,
+    /// Brace nesting depth for each currently-open `#{ ... }` hole. While
+    /// this is non-empty the lexer is inside an interpolation: `{`/`}`
+    /// adjust the top depth, and a `}` at depth 0 closes the hole and
+    /// resumes lexing the enclosing string literal.
+    interp_braces: Vec<usize>,
 }
 
 impl<'a> Lexer<'a> {
@@ -485,6 +517,7 @@ impl<'a> Lexer<'a> {
         Self {
             input: source.text(),
             position: 0,
+            interp_braces: Vec::new(),
         }
     }
 
@@ -544,10 +577,23 @@ impl<'a> Lexer<'a> {
             }
             Some('{') => {
                 self.bump_char();
+                if let Some(depth) = self.interp_braces.last_mut() {
+                    *depth += 1;
+                }
                 TokenKind::LBrace
             }
             Some('}') => {
+                if self.interp_braces.last() == Some(&0) {
+                    // Closes the innermost interpolation hole; resume the
+                    // enclosing string literal where the hole opened.
+                    self.bump_char();
+                    self.interp_braces.pop();
+                    return self.lex_string_resume(start);
+                }
                 self.bump_char();
+                if let Some(depth) = self.interp_braces.last_mut() {
+                    *depth -= 1;
+                }
                 TokenKind::RBrace
             }
             Some('+') => {
@@ -644,7 +690,7 @@ impl<'a> Lexer<'a> {
                 self.bump_char();
                 TokenKind::Caret
             }
-            Some('"') => return self.lex_string(),
+            Some('"') => return self.lex_string_open(),
             Some(ch) if ch.is_ascii_digit() => return self.lex_number(),
             Some(ch) if Self::is_identifier_start(ch) => return self.lex_identifier(),
             Some(ch) => {
@@ -772,11 +818,51 @@ impl<'a> Lexer<'a> {
         })
     }
 
-    fn lex_string(&mut self) -> Result<Token, Diagnostic> {
+    /// Lex a string literal beginning at the opening `"`. Produces a plain
+    /// `String` token, or — when the literal contains a `#{` hole —
+    /// `StringStart(text)`, pushing a fresh interpolation context whose
+    /// hole tokens are then lexed by the normal `next_token` loop.
+    fn lex_string_open(&mut self) -> Result<Token, Diagnostic> {
         let start = self.position;
-        self.bump_char();
-        let mut value = String::new();
+        self.bump_char(); // opening '"'
+        let (text, end) = self.read_string_segment(start)?;
+        let kind = match end {
+            SegmentEnd::Quote => TokenKind::String(text),
+            SegmentEnd::Interpolation => {
+                self.interp_braces.push(0);
+                TokenKind::StringStart(text)
+            }
+        };
+        Ok(Token {
+            kind,
+            span: Span::new(start, self.position),
+        })
+    }
 
+    /// Resume the enclosing string literal after a hole's closing `}` was
+    /// consumed. Produces `StringMid(text)` (another hole follows) or
+    /// `StringEnd(text)` (the literal closes). `start` is the position of
+    /// the `}` that closed the preceding hole.
+    fn lex_string_resume(&mut self, start: usize) -> Result<Token, Diagnostic> {
+        let (text, end) = self.read_string_segment(start)?;
+        let kind = match end {
+            SegmentEnd::Quote => TokenKind::StringEnd(text),
+            SegmentEnd::Interpolation => {
+                self.interp_braces.push(0);
+                TokenKind::StringMid(text)
+            }
+        };
+        Ok(Token {
+            kind,
+            span: Span::new(start, self.position),
+        })
+    }
+
+    /// Read string content (decoding escapes) up to and consuming either a
+    /// closing `"` or a `#{` hole opener. The opening `"` (or the prior
+    /// hole's `}`) must already have been consumed.
+    fn read_string_segment(&mut self, start: usize) -> Result<(String, SegmentEnd), Diagnostic> {
+        let mut value = String::new();
         loop {
             match self.peek_char() {
                 None => {
@@ -788,7 +874,12 @@ impl<'a> Lexer<'a> {
                 }
                 Some('"') => {
                     self.bump_char();
-                    break;
+                    return Ok((value, SegmentEnd::Quote));
+                }
+                Some('#') if self.peek_nth_char(1) == Some('{') => {
+                    self.bump_char(); // '#'
+                    self.bump_char(); // '{'
+                    return Ok((value, SegmentEnd::Interpolation));
                 }
                 Some('\\') => {
                     self.bump_char();
@@ -823,11 +914,6 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-
-        Ok(Token {
-            kind: TokenKind::String(value),
-            span: Span::new(start, self.position),
-        })
     }
 
     fn skip_trivia(&mut self) -> Result<(), Diagnostic> {
@@ -2542,6 +2628,44 @@ impl Parser {
         Ok(rewrap_span(lambda, start.merge(end)))
     }
 
+    /// Parse an interpolated string literal. The lexer has already split
+    /// it into `StringStart(text)` ‹hole tokens› (`StringMid(text)` ‹hole›)*
+    /// `StringEnd(text)`, so each hole is parsed with the full expression
+    /// grammar between the template tokens.
+    fn parse_string_interpolation(&mut self) -> Result<Expr, Diagnostic> {
+        let start = self.peek().span;
+        let TokenKind::StringStart(leading) = self.peek().kind.clone() else {
+            return Err(Diagnostic::parse(start, "expected a string interpolation"));
+        };
+        self.bump();
+        let mut parts = vec![StringPart::Literal(leading)];
+        loop {
+            let hole = self.parse_expression()?;
+            parts.push(StringPart::Interpolation(Box::new(hole)));
+            self.consume_separators();
+            match self.peek().kind.clone() {
+                TokenKind::StringMid(text) => {
+                    self.bump();
+                    parts.push(StringPart::Literal(text));
+                }
+                TokenKind::StringEnd(text) => {
+                    let end = self.bump().span;
+                    parts.push(StringPart::Literal(text));
+                    return Ok(Expr::StringInterpolation {
+                        parts,
+                        span: start.merge(end),
+                    });
+                }
+                _ => {
+                    return Err(Diagnostic::parse(
+                        self.peek().span,
+                        "expected `}` to close the string interpolation",
+                    ));
+                }
+            }
+        }
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, Diagnostic> {
         match self.peek().kind.clone() {
             TokenKind::Int(value, kind) => {
@@ -2564,6 +2688,7 @@ impl Parser {
                 let token = self.bump().span;
                 Ok(Expr::String { value, span: token })
             }
+            TokenKind::StringStart(_) => self.parse_string_interpolation(),
             TokenKind::True => {
                 let token = self.bump().span;
                 Ok(Expr::Bool {
@@ -3311,6 +3436,10 @@ impl Parser {
                         | TokenKind::RParen
                         | TokenKind::RBracket
                         | TokenKind::RBrace
+                        // A cast that ends a `#{ ... }` hole is terminated by
+                        // the interpolation template token, e.g. `#{x :> *}`.
+                        | TokenKind::StringMid(_)
+                        | TokenKind::StringEnd(_)
                 ) && paren_depth == 0
                     && bracket_depth == 0
                     && brace_depth == 0
@@ -3800,6 +3929,9 @@ impl TokenMarker {
 
 fn token_text(kind: &TokenKind) -> String {
     match kind {
+        TokenKind::StringStart(value) => format!("\"{value}#{{"),
+        TokenKind::StringMid(value) => format!("}}{value}#{{"),
+        TokenKind::StringEnd(value) => format!("}}{value}\""),
         TokenKind::Int(value, kind) => match kind {
             IntLiteralKind::Byte => format!("{value}BY"),
             IntLiteralKind::Short => format!("{value}S"),
@@ -3918,6 +4050,7 @@ fn needs_spacing_between(previous: Option<&TokenKind>, next: Option<&TokenKind>)
 
 fn rewrap_span(expr: Expr, span: Span) -> Expr {
     match expr {
+        Expr::StringInterpolation { parts, .. } => Expr::StringInterpolation { parts, span },
         Expr::Int { value, kind, .. } => Expr::Int { value, kind, span },
         Expr::Double { value, kind, .. } => Expr::Double { value, kind, span },
         Expr::Bool { value, .. } => Expr::Bool { value, span },

@@ -22,7 +22,14 @@ println(greeting)   // Hello, Klassic!
 ```
 
 `#{...}` evaluates an arbitrary expression and splices its rendering
-into the surrounding string.
+into the surrounding string. A hole is parsed with the full expression
+grammar, so it may contain blocks, `match`, and even nested interpolated
+strings to any depth:
+
+```kl
+val x = 9
+println("outer #{ "inner #{x}" }")   // outer inner 9
+```
 
 ## Concatenation
 

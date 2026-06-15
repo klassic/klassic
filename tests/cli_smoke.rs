@@ -637,6 +637,108 @@ fn record_literal_immediate_dot_access() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n5\n()\n");
 }
 
+/// The interpolation lexer is stateful, so `#{ ... }` holes are parsed
+/// with the full grammar: blocks, `match`, records, `:> *` casts, and
+/// nested interpolated strings (`#{ "inner #{x}" }`) work to arbitrary
+/// depth. (The evaluator previously mis-scanned any `}` inside a hole.)
+#[test]
+fn string_interpolation_arbitrary_nesting() {
+    let cases = [
+        // Nested braces in an `if` — the evaluator's old scanner broke here.
+        (
+            "val c = true\nprintln(\"r=#{if(c) { 10 } else { 20 }}\")",
+            "r=10\n()\n",
+        ),
+        // A `match` (with a nested string in an arm) inside a hole.
+        (
+            "enum E { case A; case B }\nval x = A\nprintln(\"m=#{x match { case A => \"ay\"; case B => \"bee\" }}\")",
+            "m=ay\n()\n",
+        ),
+        // A nested interpolated string inside a hole.
+        (
+            "val x = 9\nprintln(\"o #{ \"in #{x}\" } e\")",
+            "o in 9 e\n()\n",
+        ),
+        // A `:> *` dynamic cast inside a hole.
+        ("val x = 5\nprintln(\"c=#{x :> *}\")", "c=5\n()\n"),
+        // Record-literal dot access inside a hole.
+        ("println(\"#{record { v: 7 }.v}\")", "7\n()\n"),
+        // Adjacent holes with an empty literal between them.
+        ("val a = 1\nval b = 2\nprintln(\"#{a}#{b}\")", "12\n()\n"),
+    ];
+    for (src, expected) in cases {
+        let out = Command::new(klassic_bin())
+            .args(["-e", src])
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "`{src}` should evaluate\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "wrong output for `{src}`"
+        );
+    }
+}
+
+/// eval and native agree on interpolation with nested braces and a nested
+/// interpolated string — cases the old per-backend scanners handled
+/// inconsistently (the evaluator could not nest braces at all).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_string_interpolation_nesting_matches_eval() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-interp-nesting-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-interp-nesting-{unique}"));
+    let program =
+        "val c = true\nval x = 9\nprintln(\"r=#{if(c) { 10 } else { 20 }} n=#{ \"in #{x}\" }\")\n";
+    fs::write(&source_path, program).expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(
+        eval.status.success(),
+        "eval failed:\n{}",
+        String::from_utf8_lossy(&eval.stderr)
+    );
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "r=10 n=in 9\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native output must match eval"
+    );
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
@@ -17407,13 +17509,13 @@ fn builds_native_executable_for_runtime_literal_display_fragments() {
 val runtime = FileInput#all(path)
 mutable hits = 0
 val listText = toString([{{ hits += 1; runtime }}, {{ hits += 1; "tail" }}])
-val listInterpolated = "list=#{{[{{ hits += 1; runtime }}, {{ hits += 1; \"tail\" }}]}}"
+val listInterpolated = "list=#{{[{{ hits += 1; runtime }}, {{ hits += 1; "tail" }}]}}"
 val listConcat = "list=" + [{{ hits += 1; runtime }}, {{ hits += 1; "tail" }}]
 val mapText = toString(%[{{ hits += 1; runtime }}: {{ hits += 1; "value" }}])
-val mapInterpolated = "map=#{{%[{{ hits += 1; runtime }}: {{ hits += 1; \"value\" }}]}}"
+val mapInterpolated = "map=#{{%[{{ hits += 1; runtime }}: {{ hits += 1; "value" }}]}}"
 val mapConcat = "map=" + %[{{ hits += 1; runtime }}: {{ hits += 1; "value" }}]
 val setText = toString(%({{ hits += 1; runtime }}, {{ hits += 1; "tail" }}, {{ hits += 1; runtime }}))
-val setInterpolated = "set=#{{%({{ hits += 1; runtime }}, {{ hits += 1; \"tail\" }}, {{ hits += 1; runtime }})}}"
+val setInterpolated = "set=#{{%({{ hits += 1; runtime }}, {{ hits += 1; "tail" }}, {{ hits += 1; runtime }})}}"
 val setConcat = "set=" + %({{ hits += 1; runtime }}, {{ hits += 1; "tail" }}, {{ hits += 1; runtime }})
 println(listText)
 println(listInterpolated)
