@@ -544,6 +544,28 @@ fn thin_arrow_type_annotation() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "11\n10\n7\n()\n");
 }
 
+/// A type mismatch between match arms points at the conflicting body
+/// expression, not at the start of the arm's pattern, so the caret lands
+/// on the value that actually has the wrong type.
+#[test]
+fn match_arm_mismatch_points_at_body() {
+    let bad = Command::new(klassic_bin())
+        .args(["-e", "val x = 0\nx match { case 0 => 1; case _ => \"s\" }"])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !bad.status.success(),
+        "mismatched arm body types should be a type error"
+    );
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    // The body `"s"` is at line 2, column 34; the arm's pattern is earlier,
+    // so a `2:34` span proves the caret moved onto the body expression.
+    assert!(
+        stderr.contains("2:34") && stderr.contains("Int is not compatible with String"),
+        "expected the error to point at the body `\"s\"` (2:34), got:\n{stderr}"
+    );
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
