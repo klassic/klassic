@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use klassic_span::{Diagnostic, Span};
-use klassic_syntax::Expr;
+use klassic_syntax::{Expr, StringPart};
 
 #[derive(Clone, Debug)]
 pub struct ProofDefinition {
@@ -260,6 +260,13 @@ fn collect_referenced_proof_names(
         | Expr::String { .. }
         | Expr::Null { .. }
         | Expr::Unit { .. } => {}
+        Expr::StringInterpolation { parts, .. } => {
+            for part in parts {
+                if let StringPart::Interpolation(hole) = part {
+                    collect_referenced_proof_names(hole, names, dependencies);
+                }
+            }
+        }
         Expr::InstanceDeclaration { methods, .. }
         | Expr::ExtensionDeclaration { methods, .. }
         | Expr::Block {

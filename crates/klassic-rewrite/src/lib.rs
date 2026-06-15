@@ -1,4 +1,4 @@
-use klassic_syntax::Expr;
+use klassic_syntax::{Expr, StringPart};
 
 pub fn rewrite_expression(expr: Expr) -> Expr {
     finalize(expr)
@@ -271,6 +271,21 @@ fn rewrite(expr: Expr) -> Expr {
             expressions: expressions.into_iter().map(finalize).collect(),
             span,
         },
+        Expr::StringInterpolation { parts, span } => wrap_placeholders(
+            Expr::StringInterpolation {
+                parts: parts
+                    .into_iter()
+                    .map(|part| match part {
+                        StringPart::Literal(text) => StringPart::Literal(text),
+                        StringPart::Interpolation(hole) => {
+                            StringPart::Interpolation(Box::new(rewrite(*hole)))
+                        }
+                    })
+                    .collect(),
+                span,
+            },
+            span,
+        ),
         other => other,
     }
 }
@@ -502,6 +517,18 @@ fn replace_placeholders(expr: Expr, counter: &mut usize) -> Expr {
             expressions: expressions
                 .into_iter()
                 .map(|expression| replace_placeholders(expression, counter))
+                .collect(),
+            span,
+        },
+        Expr::StringInterpolation { parts, span } => Expr::StringInterpolation {
+            parts: parts
+                .into_iter()
+                .map(|part| match part {
+                    StringPart::Literal(text) => StringPart::Literal(text),
+                    StringPart::Interpolation(hole) => {
+                        StringPart::Interpolation(Box::new(replace_placeholders(*hole, counter)))
+                    }
+                })
                 .collect(),
             span,
         },

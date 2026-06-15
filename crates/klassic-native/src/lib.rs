@@ -7,7 +7,7 @@ use klassic_runtime::STDLIB_MODULES;
 use klassic_span::{Diagnostic, SourceFile, Span};
 use klassic_syntax::{
     BinaryOp, EnumVariant, Expr, FloatLiteralKind, IntLiteralKind, MatchArm, Pattern, RecordField,
-    TypeAnnotation, TypeClassConstraint, UnaryOp, parse_inline_expression, parse_source,
+    StringPart, TypeAnnotation, TypeClassConstraint, UnaryOp, parse_source,
 };
 use klassic_types::proof::{ProofConfig, analyze_proofs};
 use klassic_types::typecheck_program;
@@ -5406,20 +5406,20 @@ impl NativeCodeGenerator {
                 Ok(NativeValue::Bool)
             }
             Expr::Null { .. } => Ok(NativeValue::Null),
-            Expr::String { value, span } => {
-                if value.contains("#{") {
-                    let Some(value) =
-                        self.static_interpolated_string_value_preserving_effects(value, *span)
-                    else {
-                        return self.emit_runtime_interpolated_string(value, *span);
-                    };
-                    return Ok(self.emit_static_string(value));
-                }
+            Expr::String { value, .. } => {
                 let label = self.asm.data_label_with_bytes(value.as_bytes());
                 Ok(NativeValue::StaticString {
                     label,
                     len: value.len(),
                 })
+            }
+            Expr::StringInterpolation { parts, span } => {
+                let Some(value) =
+                    self.static_interpolated_string_value_preserving_effects(parts, *span)
+                else {
+                    return self.emit_runtime_interpolated_string(parts, *span);
+                };
+                Ok(self.emit_static_string(value))
             }
             Expr::ListLiteral { elements, span } => {
                 if let Some(values) = elements
@@ -25482,11 +25482,14 @@ impl NativeCodeGenerator {
             Expr::Null { .. } => Some(StaticValue::Null),
             Expr::Unit { .. } => Some(StaticValue::Unit),
             Expr::String { value, .. } => {
-                let value = if value.contains("#{") {
-                    self.static_interpolated_string_value(value)?
-                } else {
-                    value.clone()
-                };
+                let label = self.asm.data_label_with_bytes(value.as_bytes());
+                Some(StaticValue::StaticString {
+                    label,
+                    len: value.len(),
+                })
+            }
+            Expr::StringInterpolation { parts, .. } => {
+                let value = self.static_interpolated_string_value(parts)?;
                 let label = self.asm.data_label_with_bytes(value.as_bytes());
                 Some(StaticValue::StaticString {
                     label,
@@ -26882,8 +26885,8 @@ impl NativeCodeGenerator {
         bindings: &[(&str, StaticValue)],
     ) -> Option<StaticValue> {
         match expr {
-            Expr::String { value, .. } if value.contains("#{") => self
-                .static_interpolated_string_value_with_bindings(value, bindings)
+            Expr::StringInterpolation { parts, .. } => self
+                .static_interpolated_string_value_with_bindings(parts, bindings)
                 .map(|value| self.static_string_value(value)),
             Expr::Identifier { name, .. } => bindings
                 .iter()
@@ -31229,7 +31232,7 @@ impl NativeCodeGenerator {
             return self.static_string_from_value(&value);
         }
         match expr {
-            Expr::String { value, .. } if !value.contains("#{") => Some(value.clone()),
+            Expr::String { value, .. } => Some(value.clone()),
             Expr::Binary {
                 lhs,
                 op: BinaryOp::Add,
@@ -31264,7 +31267,7 @@ impl NativeCodeGenerator {
             return true;
         }
         match expr {
-            Expr::String { value, .. } if value.contains("#{") => true,
+            Expr::StringInterpolation { .. } => true,
             Expr::Identifier { name, .. } => matches!(
                 self.lookup_var(name).map(|slot| slot.value),
                 Some(NativeValue::RuntimeString { .. })
@@ -31485,108 +31488,63 @@ impl NativeCodeGenerator {
             .is_some_and(|value| self.static_string_list_content_from_value(&value).is_some())
     }
 
-    fn static_interpolated_string_value(&mut self, value: &str) -> Option<String> {
-        self.static_interpolated_string_value_inner(value, &[], None, false)
+    fn static_interpolated_string_value(&mut self, parts: &[StringPart]) -> Option<String> {
+        self.static_interpolated_string_parts(parts, &[], None, false)
     }
 
     fn static_interpolated_string_value_preserving_effects(
         &mut self,
-        value: &str,
+        parts: &[StringPart],
         span: Span,
     ) -> Option<String> {
-        self.static_interpolated_string_value_inner(value, &[], None, true)?;
-        self.static_interpolated_string_value_inner(value, &[], Some(span), false)
+        self.static_interpolated_string_parts(parts, &[], None, true)?;
+        self.static_interpolated_string_parts(parts, &[], Some(span), false)
     }
 
     fn static_interpolated_string_value_with_bindings(
         &mut self,
-        value: &str,
+        parts: &[StringPart],
         bindings: &[(&str, StaticValue)],
     ) -> Option<String> {
-        self.static_interpolated_string_value_inner(value, bindings, None, false)
+        self.static_interpolated_string_parts(parts, bindings, None, false)
     }
 
-    fn static_interpolated_string_value_inner(
+    /// Resolve an interpolated string at compile time from its structured
+    /// parts, returning `None` when any hole is not statically known.
+    fn static_interpolated_string_parts(
         &mut self,
-        value: &str,
+        parts: &[StringPart],
         bindings: &[(&str, StaticValue)],
         preserve_effects_span: Option<Span>,
         preview_effects: bool,
     ) -> Option<String> {
         let mut result = String::new();
-        let chars = value.chars().collect::<Vec<_>>();
-        let mut index = 0usize;
-        while index < chars.len() {
-            if chars[index] == '#' && chars.get(index + 1) == Some(&'{') {
-                index += 2;
-                let mut expr = String::new();
-                let mut brace_depth = 0usize;
-                let mut paren_depth = 0usize;
-                let mut bracket_depth = 0usize;
-                while index < chars.len() {
-                    let ch = chars[index];
-                    match ch {
-                        '{' => {
-                            brace_depth += 1;
-                            expr.push(ch);
-                        }
-                        '}' if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 => {
-                            break;
-                        }
-                        '}' => {
-                            brace_depth = brace_depth.saturating_sub(1);
-                            expr.push(ch);
-                        }
-                        '(' => {
-                            paren_depth += 1;
-                            expr.push(ch);
-                        }
-                        ')' => {
-                            paren_depth = paren_depth.saturating_sub(1);
-                            expr.push(ch);
-                        }
-                        '[' => {
-                            bracket_depth += 1;
-                            expr.push(ch);
-                        }
-                        ']' => {
-                            bracket_depth = bracket_depth.saturating_sub(1);
-                            expr.push(ch);
-                        }
-                        _ => expr.push(ch),
+        for part in parts {
+            match part {
+                StringPart::Literal(text) => result.push_str(text),
+                StringPart::Interpolation(hole) => {
+                    let hole = self.lower_interpolation_enums(rewrite_expression((**hole).clone()));
+                    let value = if preview_effects && bindings.is_empty() {
+                        self.preview_static_value_after_effectful_eval(&hole)?
+                    } else if let Some(span) = preserve_effects_span
+                        && bindings.is_empty()
+                    {
+                        self.static_value_from_argument_preserving_effects(
+                            &hole,
+                            span,
+                            "native string interpolation",
+                        )
+                        .ok()?
+                    } else if bindings.is_empty() {
+                        self.static_value_from_expr(&hole)?
+                    } else {
+                        self.static_value_from_expr_with_bindings(&hole, bindings)?
+                    };
+                    if self.static_value_has_conditional_builtin_display(&value) {
+                        return None;
                     }
-                    index += 1;
+                    result.push_str(&self.static_value_display_string(&value));
                 }
-                if index >= chars.len() || chars[index] != '}' {
-                    return None;
-                }
-                index += 1;
-                let normalized = strip_dynamic_cast(expr.trim());
-                let parsed = parse_inline_expression("<interpolation>", &normalized).ok()?;
-                let parsed = rewrite_expression(parsed);
-                let value = if preview_effects && bindings.is_empty() {
-                    self.preview_static_value_after_effectful_eval(&parsed)?
-                } else if let Some(span) = preserve_effects_span
-                    && bindings.is_empty()
-                {
-                    self.static_value_from_argument_preserving_effects(
-                        &parsed,
-                        span,
-                        "native string interpolation",
-                    )
-                    .ok()?
-                } else if bindings.is_empty() {
-                    self.static_value_from_expr(&parsed)?
-                } else {
-                    self.static_value_from_expr_with_bindings(&parsed, bindings)?
-                };
-                if self.static_value_has_conditional_builtin_display(&value) {
-                    return None;
-                }
-                result.push_str(&self.static_value_display_string(&value));
-            } else {
-                result.push(chars[index]);
-                index += 1;
             }
         }
         Some(result)
@@ -32742,13 +32700,12 @@ impl NativeCodeGenerator {
         expr: &Expr,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        if let Expr::String {
-            value,
+        if let Expr::StringInterpolation {
+            parts,
             span: string_span,
         } = expr
-            && value.contains("#{")
         {
-            return self.emit_print_interpolated_string(fd, value, *string_span);
+            return self.emit_print_interpolated_string(fd, parts, *string_span);
         }
 
         if let Expr::Binary {
@@ -32923,159 +32880,59 @@ impl NativeCodeGenerator {
     fn emit_print_interpolated_string(
         &mut self,
         fd: u64,
-        value: &str,
+        parts: &[StringPart],
         span: Span,
     ) -> Result<(), Diagnostic> {
-        let chars = value.chars().collect::<Vec<_>>();
-        let mut literal = String::new();
-        let mut index = 0usize;
-        while index < chars.len() {
-            if chars[index] == '#' && chars.get(index + 1) == Some(&'{') {
-                if !literal.is_empty() {
-                    let label = self.asm.data_label_with_bytes(literal.as_bytes());
-                    self.emit_write_data(fd, label, literal.len());
-                    literal.clear();
-                }
-                index += 2;
-                let mut expr = String::new();
-                let mut brace_depth = 0usize;
-                let mut paren_depth = 0usize;
-                let mut bracket_depth = 0usize;
-                while index < chars.len() {
-                    let ch = chars[index];
-                    match ch {
-                        '{' => {
-                            brace_depth += 1;
-                            expr.push(ch);
-                        }
-                        '}' if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 => {
-                            break;
-                        }
-                        '}' => {
-                            brace_depth = brace_depth.saturating_sub(1);
-                            expr.push(ch);
-                        }
-                        '(' => {
-                            paren_depth += 1;
-                            expr.push(ch);
-                        }
-                        ')' => {
-                            paren_depth = paren_depth.saturating_sub(1);
-                            expr.push(ch);
-                        }
-                        '[' => {
-                            bracket_depth += 1;
-                            expr.push(ch);
-                        }
-                        ']' => {
-                            bracket_depth = bracket_depth.saturating_sub(1);
-                            expr.push(ch);
-                        }
-                        _ => expr.push(ch),
+        for part in parts {
+            match part {
+                StringPart::Literal(text) => {
+                    if !text.is_empty() {
+                        let label = self.asm.data_label_with_bytes(text.as_bytes());
+                        self.emit_write_data(fd, label, text.len());
                     }
-                    index += 1;
                 }
-                if index >= chars.len() || chars[index] != '}' {
-                    return Err(Diagnostic::compile(span, "unterminated interpolation"));
+                StringPart::Interpolation(hole) => {
+                    let parsed =
+                        self.lower_interpolation_enums(rewrite_expression((**hole).clone()));
+                    self.emit_print_expr_fragment(fd, &parsed, span)?;
                 }
-                index += 1;
-                let normalized = strip_dynamic_cast(expr.trim());
-                let parsed =
-                    parse_inline_expression("<interpolation>", &normalized).map_err(|_| {
-                        Diagnostic::compile(span, "failed to parse interpolation expression")
-                    })?;
-                let parsed = self.lower_interpolation_enums(rewrite_expression(parsed));
-                self.emit_print_expr_fragment(fd, &parsed, span)?;
-            } else {
-                literal.push(chars[index]);
-                index += 1;
             }
-        }
-        if !literal.is_empty() {
-            let label = self.asm.data_label_with_bytes(literal.as_bytes());
-            self.emit_write_data(fd, label, literal.len());
         }
         Ok(())
     }
 
     fn emit_runtime_interpolated_string(
         &mut self,
-        value: &str,
+        parts: &[StringPart],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         const RUNTIME_STRING_CAP: usize = 65_536;
         let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
         let len = self.asm.data_label_with_i64s(&[0]);
         let offset = self.asm.data_label_with_i64s(&[0]);
-        let chars = value.chars().collect::<Vec<_>>();
-        let mut literal = String::new();
-        let mut index = 0usize;
-        while index < chars.len() {
-            if chars[index] == '#' && chars.get(index + 1) == Some(&'{') {
-                if !literal.is_empty() {
-                    let label = self.asm.data_label_with_bytes(literal.as_bytes());
-                    let input = NativeStringRef {
-                        data: label,
-                        len: NativeStringLen::Immediate(literal.len()),
-                    };
-                    self.emit_append_native_string_to_runtime_buffer_offset_label(
-                        data,
-                        offset,
-                        input,
-                        span,
-                        "string interpolation result exceeds 65536 bytes",
-                    );
-                    literal.clear();
-                }
-                index += 2;
-                let mut expr = String::new();
-                let mut brace_depth = 0usize;
-                let mut paren_depth = 0usize;
-                let mut bracket_depth = 0usize;
-                while index < chars.len() {
-                    let ch = chars[index];
-                    match ch {
-                        '{' => {
-                            brace_depth += 1;
-                            expr.push(ch);
-                        }
-                        '}' if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 => {
-                            break;
-                        }
-                        '}' => {
-                            brace_depth = brace_depth.saturating_sub(1);
-                            expr.push(ch);
-                        }
-                        '(' => {
-                            paren_depth += 1;
-                            expr.push(ch);
-                        }
-                        ')' => {
-                            paren_depth = paren_depth.saturating_sub(1);
-                            expr.push(ch);
-                        }
-                        '[' => {
-                            bracket_depth += 1;
-                            expr.push(ch);
-                        }
-                        ']' => {
-                            bracket_depth = bracket_depth.saturating_sub(1);
-                            expr.push(ch);
-                        }
-                        _ => expr.push(ch),
+        for part in parts {
+            let hole = match part {
+                StringPart::Literal(text) => {
+                    if !text.is_empty() {
+                        let label = self.asm.data_label_with_bytes(text.as_bytes());
+                        let input = NativeStringRef {
+                            data: label,
+                            len: NativeStringLen::Immediate(text.len()),
+                        };
+                        self.emit_append_native_string_to_runtime_buffer_offset_label(
+                            data,
+                            offset,
+                            input,
+                            span,
+                            "string interpolation result exceeds 65536 bytes",
+                        );
                     }
-                    index += 1;
+                    continue;
                 }
-                if index >= chars.len() || chars[index] != '}' {
-                    return Err(Diagnostic::compile(span, "unterminated interpolation"));
-                }
-                index += 1;
-                let normalized = strip_dynamic_cast(expr.trim());
-                let parsed =
-                    parse_inline_expression("<interpolation>", &normalized).map_err(|_| {
-                        Diagnostic::compile(span, "failed to parse interpolation expression")
-                    })?;
-                let parsed = self.lower_interpolation_enums(rewrite_expression(parsed));
+                StringPart::Interpolation(hole) => hole,
+            };
+            {
+                let parsed = self.lower_interpolation_enums(rewrite_expression((**hole).clone()));
                 if let Some(fragment) = self.compile_collection_literal_display_runtime_string(
                     &parsed,
                     span,
@@ -33196,24 +33053,7 @@ impl NativeCodeGenerator {
                 } else {
                     return Err(unsupported(span, "native string interpolation"));
                 }
-            } else {
-                literal.push(chars[index]);
-                index += 1;
             }
-        }
-        if !literal.is_empty() {
-            let label = self.asm.data_label_with_bytes(literal.as_bytes());
-            let input = NativeStringRef {
-                data: label,
-                len: NativeStringLen::Immediate(literal.len()),
-            };
-            self.emit_append_native_string_to_runtime_buffer_offset_label(
-                data,
-                offset,
-                input,
-                span,
-                "string interpolation result exceeds 65536 bytes",
-            );
         }
         self.emit_store_runtime_string_len_from_offset(len, offset);
         Ok(NativeValue::RuntimeString { data, len })
@@ -38802,6 +38642,10 @@ fn expr_references_any_name_with_shadowing(
     shadowed: &HashSet<String>,
 ) -> bool {
     match expr {
+        Expr::StringInterpolation { parts, .. } => parts.iter().any(|part| {
+            matches!(part, StringPart::Interpolation(hole)
+                if expr_references_any_name_with_shadowing(hole, names, shadowed))
+        }),
         Expr::Identifier { name, .. } => names.contains(name) && !shadowed.contains(name),
         Expr::VarDecl { name, value, .. } => {
             if expr_references_any_name_with_shadowing(value, names, shadowed) {
@@ -39153,6 +38997,13 @@ fn collect_pattern_binding_names(pattern: &Pattern, names: &mut HashSet<String>)
 
 fn collect_assigned_names(expr: &Expr, names: &mut HashSet<String>) {
     match expr {
+        Expr::StringInterpolation { parts, .. } => {
+            for part in parts {
+                if let StringPart::Interpolation(hole) = part {
+                    collect_assigned_names(hole, names);
+                }
+            }
+        }
         Expr::Assign { name, value, .. } => {
             names.insert(name.clone());
             collect_assigned_names(value, names);
@@ -39273,6 +39124,10 @@ fn collect_assigned_names(expr: &Expr, names: &mut HashSet<String>) {
 
 fn static_expr_is_pure(expr: &Expr) -> bool {
     match expr {
+        Expr::StringInterpolation { parts, .. } => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Interpolation(hole) => static_expr_is_pure(hole),
+        }),
         Expr::Assign { .. } | Expr::While { .. } | Expr::Foreach { .. } | Expr::Cleanup { .. } => {
             false
         }
@@ -39454,6 +39309,10 @@ fn lookup_var_slot_in_scopes(scopes: &[HashMap<String, VarSlot>], name: &str) ->
 
 fn expr_contains_thread_call(expr: &Expr, thread_aliases: &HashSet<String>) -> bool {
     match expr {
+        Expr::StringInterpolation { parts, .. } => parts.iter().any(|part| {
+            matches!(part, StringPart::Interpolation(hole)
+                if expr_contains_thread_call(hole, thread_aliases))
+        }),
         Expr::Call {
             callee, arguments, ..
         } => {
@@ -40254,17 +40113,6 @@ fn format_static_double(bits: u64) -> String {
         format!("{value:.1}")
     } else {
         value.to_string()
-    }
-}
-
-fn strip_dynamic_cast(expression: &str) -> String {
-    let trimmed = expression.trim();
-    if let Some(prefix) = trimmed.strip_suffix(":> *") {
-        prefix.trim_end().to_string()
-    } else if let Some(prefix) = trimmed.strip_suffix(":>*") {
-        prefix.trim_end().to_string()
-    } else {
-        trimmed.to_string()
     }
 }
 
@@ -41104,7 +40952,7 @@ mod tests {
     /// directly.
     fn first_def_param_and_body(source: &str) -> (String, Expr) {
         let program =
-            super::parse_inline_expression("<test>", source).expect("source should parse");
+            klassic_syntax::parse_inline_expression("<test>", source).expect("source should parse");
         let expressions = match &program {
             Expr::Block { expressions, .. } => expressions.clone(),
             other => vec![other.clone()],

@@ -12,8 +12,7 @@ use std::time::{Duration, Instant};
 use klassic_rewrite::rewrite_expression;
 use klassic_span::{Diagnostic, DiagnosticKind, Severity, SourceFile, Span};
 use klassic_syntax::{
-    BinaryOp, Expr, RecordField, TypeAnnotation, TypeClassConstraint, parse_inline_expression,
-    parse_source,
+    BinaryOp, Expr, RecordField, StringPart, TypeAnnotation, TypeClassConstraint, parse_source,
 };
 use klassic_types::proof::{ProofConfig, analyze_proofs};
 use klassic_types::{
@@ -1038,7 +1037,20 @@ fn eval_expr_inner(
             klassic_syntax::FloatLiteralKind::Double => Value::Double(*value),
         }),
         Expr::Bool { value, .. } => Ok(Value::Bool(*value)),
-        Expr::String { value, span } => interpolate_string(value, *span, environment),
+        Expr::String { value, .. } => Ok(Value::String(value.clone())),
+        Expr::StringInterpolation { parts, .. } => {
+            let mut result = String::new();
+            for part in parts {
+                match part {
+                    StringPart::Literal(text) => result.push_str(text),
+                    StringPart::Interpolation(hole) => {
+                        let value = eval_expr(hole, environment, state)?;
+                        result.push_str(&value.to_string());
+                    }
+                }
+            }
+            Ok(Value::String(result))
+        }
         Expr::Null { .. } => Ok(Value::Null),
         Expr::Unit { .. } => Ok(Value::Unit),
         Expr::Identifier { name, span } => resolve_identifier(name, *span, environment),
@@ -3618,80 +3630,6 @@ fn prefer_instance_dispatch(name: &str, argument_values: &[Value]) -> bool {
             ],
         )
     )
-}
-
-fn interpolate_string(
-    value: &str,
-    span: Span,
-    environment: &mut Environment,
-) -> Result<Value, Diagnostic> {
-    if !value.contains("#{") {
-        return Ok(Value::String(value.to_string()));
-    }
-
-    let mut result = String::new();
-    let chars = value.chars().collect::<Vec<_>>();
-    let mut index = 0usize;
-    while index < chars.len() {
-        if chars[index] == '#' && chars.get(index + 1) == Some(&'{') {
-            index += 2;
-            let mut expr = String::new();
-            let mut paren_depth = 0usize;
-            let mut bracket_depth = 0usize;
-            while index < chars.len() {
-                let ch = chars[index];
-                match ch {
-                    '{' => expr.push(ch),
-                    '(' => {
-                        paren_depth += 1;
-                        expr.push(ch);
-                    }
-                    ')' => {
-                        paren_depth = paren_depth.saturating_sub(1);
-                        expr.push(ch);
-                    }
-                    '[' => {
-                        bracket_depth += 1;
-                        expr.push(ch);
-                    }
-                    ']' => {
-                        bracket_depth = bracket_depth.saturating_sub(1);
-                        expr.push(ch);
-                    }
-                    '}' if paren_depth == 0 && bracket_depth == 0 => break,
-                    _ => expr.push(ch),
-                }
-                index += 1;
-            }
-            if index >= chars.len() || chars[index] != '}' {
-                return Err(Diagnostic::runtime(span, "unterminated interpolation"));
-            }
-            index += 1;
-            let normalized = strip_dynamic_cast(expr.trim());
-            let parsed = parse_inline_expression("<interpolation>", &normalized).map_err(|_| {
-                Diagnostic::runtime(span, "failed to parse interpolation expression")
-            })?;
-            let mut state = EvaluationState::default();
-            let interpolated = eval_expr(&parsed, environment, &mut state)?;
-            result.push_str(&interpolated.to_string());
-        } else {
-            result.push(chars[index]);
-            index += 1;
-        }
-    }
-
-    Ok(Value::String(result))
-}
-
-fn strip_dynamic_cast(expression: &str) -> String {
-    let trimmed = expression.trim();
-    if let Some(prefix) = trimmed.strip_suffix(":> *") {
-        prefix.trim_end().to_string()
-    } else if let Some(prefix) = trimmed.strip_suffix(":>*") {
-        prefix.trim_end().to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 #[cfg(test)]
