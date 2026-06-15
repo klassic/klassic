@@ -46,7 +46,7 @@ def stdlibMod(n, m) = n - (n / m) * m
 
 def stdlibIsEven(n) = stdlibMod(n, 2) == 0
 
-def stdlibIsOdd(n) = stdlibMod(n, 2) == 1
+def stdlibIsOdd(n) = stdlibMod(n, 2) != 0
 
 def stdlibReverse(xs) = foldLeft(xs)([])((acc, x) => cons(x)(acc))
 

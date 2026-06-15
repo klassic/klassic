@@ -88,7 +88,7 @@ def indentJoinLines(ls, prefix) =
   foldLeft(tail(ls))(prefix + toString(head(ls)))((acc, x) => acc + "\n" + prefix + toString(x))
 
 // Indent every line of `s` by `n` spaces.
-def indent(s, n) = indentJoinLines(split(s, "\n"), stringSpaces(n))
+def indent(s, n) = if(s == "") "" else indentJoinLines(split(s, "\n"), stringSpaces(n))
 
 // ---------- stripPrefix / stripSuffix ---------------------------------------
 
