@@ -980,15 +980,16 @@ impl Parser {
         let expr = match self.peek().kind {
             TokenKind::Module => self.parse_module_header(),
             TokenKind::Import => self.parse_import_expression(),
-            TokenKind::Record => {
-                if matches!(
+            // Only intercept record *declarations* here. A record *literal*
+            // (`record { ... }`) falls through to `parse_assignment` so the
+            // postfix loop can apply to it, e.g. `record { x: 1 }.x`.
+            TokenKind::Record
+                if !matches!(
                     self.tokens.get(self.index + 1).map(|token| &token.kind),
                     Some(TokenKind::LBrace)
-                ) {
-                    self.parse_record_literal()
-                } else {
-                    self.parse_record_declaration()
-                }
+                ) =>
+            {
+                self.parse_record_declaration()
             }
             TokenKind::TypeClass => self.parse_typeclass_declaration(),
             TokenKind::Instance => self.parse_instance_declaration(),

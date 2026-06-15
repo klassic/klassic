@@ -617,6 +617,26 @@ fn duplicate_match_constructor_is_unreachable() {
     }
 }
 
+/// A structural record literal can be dot-accessed immediately
+/// (`record { x: 1 }.x`), including chained access, instead of requiring
+/// a `val` binding first.
+#[test]
+fn record_literal_immediate_dot_access() {
+    let out = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println(record { x: 1; y: 2 }.x)\nprintln(record { a: record { b: 5 } }.a.b)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        out.status.success(),
+        "record literal dot-access should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n5\n()\n");
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
