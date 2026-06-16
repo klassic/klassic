@@ -1662,7 +1662,9 @@ impl TypeChecker {
                 let final_type = if let Some(annotation) = annotation {
                     let mut named = HashMap::new();
                     let declared = self.parse_annotation_with_named_vars(annotation, &mut named);
-                    self.enforce_assignable(declared, value_type, *span)?
+                    // Point a declared-vs-value mismatch at the value, not at
+                    // the start of the `val`/`mutable` keyword.
+                    self.enforce_assignable(declared, value_type, value.span())?
                 } else {
                     value_type
                 };
@@ -1749,7 +1751,10 @@ impl TypeChecker {
                 let body_type = self.infer_expr(body)?;
                 self.pop_scope();
 
-                let resolved_return = self.enforce_assignable(return_type, body_type, *span)?;
+                // Point a return-type mismatch at the body expression, not at
+                // the start of the `def` keyword.
+                let resolved_return =
+                    self.enforce_assignable(return_type, body_type, body.span())?;
                 let resolved_params = param_types
                     .into_iter()
                     .map(|param| self.resolve(&param))
