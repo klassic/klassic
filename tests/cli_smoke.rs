@@ -595,6 +595,47 @@ fn list_at_rejects_negative_index() {
     );
 }
 
+/// `std.string.lines()` does not emit a phantom empty line for a trailing
+/// newline (or for the empty string), matching Python/Rust/Haskell.
+#[test]
+fn string_lines_drops_trailing_newline() {
+    let cases = [
+        // Empty string has zero lines.
+        ("import std.string\nprintln(size(\"\".lines()))", "0\n()\n"),
+        // A trailing newline does not add an empty line.
+        (
+            "import std.string\nprintln(\"a\\nb\\n\".lines())",
+            "[a, b]\n()\n",
+        ),
+        // No trailing newline: same result.
+        (
+            "import std.string\nprintln(\"a\\nb\".lines())",
+            "[a, b]\n()\n",
+        ),
+        // An interior blank line is preserved.
+        (
+            "import std.string\nprintln(size(\"a\\n\\nb\".lines()))",
+            "3\n()\n",
+        ),
+    ];
+    for (src, expected) in cases {
+        let out = Command::new(klassic_bin())
+            .args(["-e", src])
+            .output()
+            .expect("binary should run");
+        assert!(
+            out.status.success(),
+            "`{src}` should evaluate\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "wrong output for `{src}`"
+        );
+    }
+}
+
 /// A `->` (thin arrow) in a type annotation is accepted as an alias for
 /// `=>`, so `(Int) -> Int` parses as a function type (in `val` and
 /// parameter annotations, and curried) instead of an opaque Named type

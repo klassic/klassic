@@ -8,7 +8,10 @@ module std.string
 extension (this: String) {
   def isEmpty() = isEmptyString(this)
   def nonEmpty() = if(isEmptyString(this)) false else true
-  def lines() = split(this, "\n")
+  def lines() = {
+    val parts = split(this, "\n")
+    if(isEmptyString(stdlibLast(parts))) stdlibTake(parts, size(parts) - 1) else parts
+  }
   def words() = stdlibFilter(split(this, " "), (w) => if(isEmptyString(w)) false else true)
   def lengthChars() = length(this)
   def reverseChars() = reverse(this)
