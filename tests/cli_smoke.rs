@@ -3431,6 +3431,71 @@ fn builds_native_executable_for_top_level_lambda_bindings() {
     assert!(run.stderr.is_empty());
 }
 
+/// A returned inner closure that captures an enclosing lambda parameter must
+/// see the parameter, not an outer `val` of the same name it shadows. Native
+/// used to capture the shadowed parameter through a frame-relative runtime
+/// slot that lost out to the outer val's value, so `f(3)(4)` printed `14`
+/// (outer `x = 10`) instead of the evaluator's `7`. Mutable captures, which
+/// genuinely need the live runtime slot, must keep working.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_shadowed_param_in_returned_closure() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-shadow-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-shadow-{unique}"));
+    fs::write(
+        &source_path,
+        // 1: param `x` shadows outer val `x`; 2: same plus a real captured
+        // val `k`; 3: distinct shadow values; 4: control with no collision;
+        // 5: escaping mutable closure still reads the live value.
+        "val x = 10\n\
+         val f = (x: Int) => (y: Int) => x + y\n\
+         println(f(3)(4))\n\
+         val k = 1000\n\
+         val g = (x: Int) => (y: Int) => k + x + y\n\
+         println(g(3)(4))\n\
+         val h = (x: Int) => (y: Int) => x + y\n\
+         println(h(100)(1))\n\
+         val z = 5\n\
+         val noClash = (x: Int) => (y: Int) => x + y\n\
+         println(noClash(3)(4))\n\
+         mutable c = 0\n\
+         val read = () => c\n\
+         c = 9\n\
+         println(read())\n",
+    )
+    .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "7\n1007\n101\n7\n9\n");
+    assert!(run.stderr.is_empty());
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_functions_capturing_top_level_bindings() {

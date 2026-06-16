@@ -369,6 +369,13 @@ cargo run -- -e "1 + 2"
   be bound and called when captures and arguments are statically recoverable;
   unannotated functions that return runtime-capturing lambdas are inlined at the
   call site so their captured local slots stay alive after the function returns.
+  When an enclosing lambda parameter is bound to a static constant during such
+  inline lowering, an inner returned closure captures it by that static value
+  rather than a frame-relative runtime slot: the parameter is immutable, and a
+  runtime capture would both fail to survive the closure escaping its frame and
+  shadow the correct value, so a parameter shadowing an outer `val` of the same
+  name no longer makes the closure read the outer binding. Mutable captures keep
+  their live runtime slot.
   Static `if` values, static binary folds, and
   static call folds use the same purity gate before native folding, and
   dynamic-control assignments invalidate static facts for runtime integer/boolean
