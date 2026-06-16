@@ -1124,6 +1124,7 @@ fn helpful_syntax_diagnostics() {
             "record literals use `field: value`",
         ),
         ("import std.list._", "wildcard imports are not supported"),
+        ("import std.list.*", "wildcard imports are not supported"),
     ];
     for (src, expected) in cases {
         let output = Command::new(klassic_bin())
@@ -1137,6 +1138,37 @@ fn helpful_syntax_diagnostics() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// A `;` between enum variant fields (where a `,` is required) is a clean
+/// parse error rather than being swallowed into a garbled type name like
+/// `Int;y:Int`. Comma-separated and multi-line variants still parse.
+#[test]
+fn enum_variant_semicolon_is_a_clean_error() {
+    let bad = Command::new(klassic_bin())
+        .args(["-e", "enum P { case Pt(x: Int; y: Int) }\nPt(1, 2)"])
+        .output()
+        .expect("binary should run");
+    assert!(!bad.status.success(), "a `;` field separator should fail");
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        stderr.contains("expected `)`") && !stderr.contains("Int;y"),
+        "expected a clean parse error, not a garbled type, got:\n{stderr}"
+    );
+
+    let good = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum P {\n  case Pt(x: Int, y: Int)\n}\nprintln(Pt(1, 2))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good.status.success(),
+        "comma-separated variant fields should parse\nstderr:\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&good.stdout), "Pt(1, 2)\n()\n");
 }
 
 /// A block that reaches end-of-input without its closing `}` reports the
