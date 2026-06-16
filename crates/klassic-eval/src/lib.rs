@@ -1253,7 +1253,12 @@ fn eval_expr_inner(
                         Ok(value)
                     }
                 }
-                _ => Err(Diagnostic::runtime(*span, "field access expects a record")),
+                _ => Err(Diagnostic::runtime(
+                    *span,
+                    format!(
+                        "no field `{field}` here; if `{field}` is a method, call it as `{field}()`"
+                    ),
+                )),
             }
         }
         Expr::Cleanup { body, cleanup, .. } => {

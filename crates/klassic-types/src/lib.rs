@@ -551,8 +551,13 @@ impl TypeChecker {
                     return Err(type_error(
                         *span,
                         format!(
-                            "variant `{name}` expects {} fields but got {}",
+                            "variant `{name}` expects {} {} but got {}",
                             field_types.len(),
+                            if field_types.len() == 1 {
+                                "field"
+                            } else {
+                                "fields"
+                            },
                             args.len()
                         ),
                     ));
@@ -1901,7 +1906,13 @@ impl TypeChecker {
                                 Ok(Type::Var(id))
                             }
                             other if other.is_numeric() || other.is_dynamic_like() => Ok(other),
-                            _ => Err(type_error(*span, "arithmetic operator expects numbers")),
+                            other => Err(type_error(
+                                *span,
+                                format!(
+                                    "arithmetic operator requires a numeric type, but got {}",
+                                    display_type(&other)
+                                ),
+                            )),
                         }
                     }
                     BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
@@ -3777,8 +3788,13 @@ impl TypeChecker {
                 return Err(type_error(
                     span,
                     format!(
-                        "record `{name}` expects {} fields but got {}",
+                        "record `{name}` expects {} {} but got {}",
                         schema.fields.len(),
+                        if schema.fields.len() == 1 {
+                            "field"
+                        } else {
+                            "fields"
+                        },
                         arguments.len()
                     ),
                 ));

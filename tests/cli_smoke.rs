@@ -702,6 +702,37 @@ fn type_errors_use_readable_type_var_names() {
     );
 }
 
+/// Several diagnostics name the offending value/type instead of being
+/// opaque: arity messages use the singular "field", non-numeric
+/// arithmetic names the type, and a field access on a non-record names
+/// the field and hints at the method call.
+#[test]
+fn clearer_diagnostic_messages() {
+    let cases = [
+        (
+            "enum Box { case Box(v: Int) }\nval b = Box(1)\nb match { case Box(a, c) => a }",
+            "expects 1 field but got 2",
+        ),
+        ("true + false", "requires a numeric type, but got Boolean"),
+        (
+            "import std.string\n\"hello\".toUpperCase",
+            "if `toUpperCase` is a method, call it as `toUpperCase()`",
+        ),
+    ];
+    for (src, expected) in cases {
+        let out = Command::new(klassic_bin())
+            .args(["-e", src])
+            .output()
+            .expect("binary should run");
+        assert!(!out.status.success(), "`{src}` should fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expected),
+            "`{src}` expected message containing {expected:?}, got:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// A match arm whose constructor an earlier unguarded, irrefutably-bound
 /// arm already matches is reported as unreachable — but a refutable
 /// earlier payload (`case S(1)`) does not close the variant, and guards
