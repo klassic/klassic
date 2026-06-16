@@ -99,6 +99,7 @@ dependencies = [
 name = "klassic-types"
 version = "0.1.0"
 dependencies = [
+ "klassic-runtime",
  "klassic-span",
  "klassic-syntax",
 ]
