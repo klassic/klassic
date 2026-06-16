@@ -174,6 +174,7 @@ type ModuleTypeExports = HashMap<String, StoredType>;
 thread_local! {
     static USER_MODULE_TYPES: RefCell<HashMap<String, ModuleTypeExports>> = RefCell::new(HashMap::new());
     static USER_RECORD_SCHEMAS: RefCell<HashMap<String, RecordSchema>> = RefCell::new(HashMap::new());
+    static USER_ENUM_SCHEMAS: RefCell<HashMap<String, EnumSchema>> = RefCell::new(HashMap::new());
     static USER_BINDING_TYPES: RefCell<HashMap<String, StoredType>> = RefCell::new(HashMap::new());
     static USER_TYPECLASS_INFOS: RefCell<HashMap<String, TypeClassInfo>> = RefCell::new(HashMap::new());
     static USER_INSTANCE_INFOS: RefCell<Vec<InstanceInfo>> = const { RefCell::new(Vec::new()) };
@@ -261,6 +262,7 @@ where
     checker.push_scope();
     checker.install_builtins();
     checker.record_schemas.extend(resolve_user_record_schemas());
+    checker.enum_schemas.extend(resolve_user_enum_schemas());
     checker.typeclasses.extend(resolve_user_typeclass_infos());
     checker.instances.extend(resolve_user_instance_types());
     for (name, stored) in resolve_user_binding_types() {
@@ -284,6 +286,7 @@ where
         .map(|ty| display_type(&checker.resolve(&ty)));
     if result.is_ok() {
         export_user_record_schemas(checker.user_record_schemas());
+        export_user_enum_schemas(checker.user_enum_schemas());
         export_user_typeclass_infos(checker.user_typeclass_infos());
         export_user_instance_types(checker.user_instance_types());
         // Module-scoped translation units export their root bindings
@@ -321,6 +324,10 @@ pub fn clear_user_module_types() {
 
 pub fn clear_user_record_schemas() {
     USER_RECORD_SCHEMAS.with(|schemas| schemas.borrow_mut().clear());
+}
+
+pub fn clear_user_enum_schemas() {
+    USER_ENUM_SCHEMAS.with(|schemas| schemas.borrow_mut().clear());
 }
 
 pub fn clear_user_binding_types() {
@@ -490,6 +497,10 @@ impl TypeChecker {
             .filter(|(name, _)| name.as_str() != "Point")
             .map(|(name, schema)| (name.clone(), schema.clone()))
             .collect()
+    }
+
+    fn user_enum_schemas(&self) -> HashMap<String, EnumSchema> {
+        self.enum_schemas.clone()
     }
 
     fn user_typeclass_infos(&self) -> HashMap<String, TypeClassInfo> {
@@ -4563,6 +4574,13 @@ fn export_user_record_schemas(schemas: HashMap<String, RecordSchema>) {
     });
 }
 
+fn export_user_enum_schemas(schemas: HashMap<String, EnumSchema>) {
+    USER_ENUM_SCHEMAS.with(|known| {
+        let mut known = known.borrow_mut();
+        known.extend(schemas);
+    });
+}
+
 fn export_user_binding_types(bindings: HashMap<String, StoredType>) {
     USER_BINDING_TYPES.with(|known| {
         let mut known = known.borrow_mut();
@@ -4586,6 +4604,10 @@ fn export_user_instance_types(instances: Vec<InstanceInfo>) {
 
 fn resolve_user_record_schemas() -> HashMap<String, RecordSchema> {
     USER_RECORD_SCHEMAS.with(|schemas| schemas.borrow().clone())
+}
+
+fn resolve_user_enum_schemas() -> HashMap<String, EnumSchema> {
+    USER_ENUM_SCHEMAS.with(|schemas| schemas.borrow().clone())
 }
 
 fn resolve_user_binding_types() -> HashMap<String, StoredType> {

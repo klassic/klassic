@@ -1802,6 +1802,7 @@ fn clear_user_modules() {
 fn clear_user_records() {
     USER_RECORDS.with(|records| records.borrow_mut().clear());
     klassic_types::clear_user_record_schemas();
+    klassic_types::clear_user_enum_schemas();
 }
 
 #[cfg(test)]
