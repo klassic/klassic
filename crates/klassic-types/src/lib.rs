@@ -3515,7 +3515,12 @@ impl TypeChecker {
                     "wildcard imports are not supported; list the members explicitly, \
                      e.g. `import {module}.{{a, b}}`"
                 )
-            } else if path.starts_with("std.") {
+            } else if klassic_runtime::STDLIB_MODULES
+                .iter()
+                .any(|module| module.path == path)
+            {
+                // A real stdlib module that resolved here only because it is
+                // not inlined by the current backend (e.g. `std.json` natively).
                 format!(
                     "module `{path}` is part of the standard library but is not yet \
                      available in native builds. Run the program with the evaluator \

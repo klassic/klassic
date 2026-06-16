@@ -914,6 +914,29 @@ fn unknown_match_constructor_is_rejected() {
     assert_eq!(String::from_utf8_lossy(&good.stdout), "1\n()\n");
 }
 
+/// Importing a `std.*` module that does not exist reports "unknown module"
+/// rather than the "part of the standard library / not yet available in
+/// native builds" message reserved for real but not-yet-inlined modules.
+#[test]
+fn nonexistent_std_module_says_unknown() {
+    for path in ["std.nonexistent", "std.collections"] {
+        let out = Command::new(klassic_bin())
+            .args(["-e", &format!("import {path}.{{foo}}\n1")])
+            .output()
+            .expect("binary should run");
+        assert!(!out.status.success(), "`{path}` should fail to import");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("unknown module `{path}`")),
+            "expected `unknown module` for `{path}`, got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("part of the standard library"),
+            "should not claim a nonexistent module is part of the stdlib:\n{stderr}"
+        );
+    }
+}
+
 /// A structural record literal can be dot-accessed immediately
 /// (`record { x: 1 }.x`), including chained access, instead of requiring
 /// a `val` binding first.
