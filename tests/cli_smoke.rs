@@ -22983,6 +22983,80 @@ fn native_build_inlines_adt_stdlib_modules() {
     );
 }
 
+/// A selective import of a name a module does not export is rejected by the
+/// native build with the same `module `p` has no member `m`` diagnostic the
+/// evaluator gives, instead of silently dropping the unknown member and
+/// accepting a program eval refuses. The exported set mirrors the
+/// evaluator's value bindings (free defs, top-level vals, enum
+/// constructors), so a real member still builds.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_rejects_nonexistent_selective_import_member() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let bad_path = std::env::temp_dir().join(format!("klassic_native_badimport_{stamp}.kl"));
+    let good_path = std::env::temp_dir().join(format!("klassic_native_goodimport_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_import_{stamp}.bin"));
+
+    // `abs` is not a free def in std.math (only the `absValue` extension
+    // method exists), so eval rejects it; native must too.
+    fs::write(&bad_path, "import std.math.{abs}\nprintln(5)\n").expect("temp source should write");
+    let bad_build = Command::new(klassic_bin())
+        .args([
+            "build",
+            bad_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !bad_build.status.success(),
+        "native build must reject an import of a non-member"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad_build.stderr)
+            .contains("module `std.math` has no member `abs`"),
+        "expected the evaluator's member diagnostic, got:\n{}",
+        String::from_utf8_lossy(&bad_build.stderr)
+    );
+
+    // A val (`none`), an enum constructor (`Some`), and a free def
+    // (`getOrElse`) are all real members and still build + run.
+    fs::write(
+        &good_path,
+        "import std.option.{Some, none, getOrElse}\n\
+         println(getOrElse(Some(7), 0))\n\
+         println(getOrElse(none, 42))\n",
+    )
+    .expect("temp source should write");
+    let good_build = Command::new(klassic_bin())
+        .args([
+            "build",
+            good_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good_build.status.success(),
+        "real members (val / constructor / def) must build\nstderr:\n{}",
+        String::from_utf8_lossy(&good_build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&bad_path);
+    let _ = fs::remove_file(&good_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "7\n42\n");
+}
+
 /// A generic-enum value freshly built on each arm of a `match` (so its
 /// shape is produced inside control flow) now carries a merged shape past
 /// the join (M6), so `map` / `flatMap` / `orElse` results can be matched

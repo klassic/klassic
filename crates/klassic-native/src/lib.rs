@@ -664,6 +664,9 @@ struct InlineImport {
     // `import a.{x, y}` / `import a.{x => _}` when resolving a reference.
     members: Option<Vec<String>>,
     excludes: Vec<String>,
+    // Source span of the `import`, so a selective import of a name the
+    // module does not export can be rejected where the evaluator does.
+    span: Span,
 }
 
 fn collect_inlinable_imports(
@@ -677,6 +680,7 @@ fn collect_inlinable_imports(
             alias,
             members,
             excludes,
+            span,
             ..
         } if stdlib_module_is_inlinable(path)
             || user_modules.iter().any(|module| module.path == *path) =>
@@ -686,6 +690,7 @@ fn collect_inlinable_imports(
                 alias: alias.clone(),
                 members: members.clone(),
                 excludes: excludes.clone(),
+                span: *span,
             });
         }
         Expr::Block { expressions, .. } => {
@@ -730,6 +735,33 @@ fn module_free_def_names(parsed: &Expr) -> Vec<String> {
     fn collect(expr: &Expr, out: &mut Vec<String>) {
         match expr {
             Expr::DefDecl { name, .. } => out.push(name.clone()),
+            Expr::Block { expressions, .. } => {
+                for sub in expressions {
+                    collect(sub, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    collect(parsed, &mut out);
+    out
+}
+
+/// Every bare name a module exports for a selective `import`, matching the
+/// evaluator's root value bindings: free `def`s, top-level `val` / `mutable`
+/// bindings, and enum constructors. Type names and extension methods are not
+/// value bindings, so they are not importable. Used only to validate
+/// `import a.{x}` members — mangling still keys off free defs alone.
+fn module_member_names(parsed: &Expr) -> Vec<String> {
+    fn collect(expr: &Expr, out: &mut Vec<String>) {
+        match expr {
+            Expr::DefDecl { name, .. } | Expr::VarDecl { name, .. } => out.push(name.clone()),
+            Expr::EnumDeclaration { variants, .. } => {
+                for variant in variants {
+                    out.push(variant.name.clone());
+                }
+            }
             Expr::Block { expressions, .. } => {
                 for sub in expressions {
                     collect(sub, out);
@@ -1337,6 +1369,35 @@ fn inline_module_imports(
     let mut mangled_modules: HashMap<String, Vec<String>> = HashMap::new();
     for (path, parsed) in &parsed_by_path {
         mangled_modules.insert(path.clone(), module_free_def_names(parsed));
+    }
+
+    // Reject a selective import of a name the target module does not export.
+    // Without this the rename scope silently drops the unknown member, so
+    // native accepted programs the evaluator rejects with `module `p` has no
+    // member `m``. The export set mirrors the evaluator's root value bindings
+    // (free defs, top-level vals, enum constructors), not just the free defs
+    // mangling keys off. Only inlined modules are checked.
+    let module_members: HashMap<&str, Vec<String>> = parsed_by_path
+        .iter()
+        .map(|(path, parsed)| (path.as_str(), module_member_names(parsed)))
+        .collect();
+    for import in main_imports.iter().chain(module_imports.values().flatten()) {
+        let (Some(members), Some(exports)) =
+            (&import.members, module_members.get(import.path.as_str()))
+        else {
+            continue;
+        };
+        for member in members {
+            if import.excludes.contains(member) {
+                continue;
+            }
+            if !exports.contains(member) {
+                return Err(Diagnostic::compile(
+                    import.span,
+                    format!("module `{}` has no member `{}`", import.path, member),
+                ));
+            }
+        }
     }
 
     let mut module_decls = Vec::new();
