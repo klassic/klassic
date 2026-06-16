@@ -553,6 +553,15 @@ impl TypeChecker {
                 // keep the legacy Dynamic bindings.
                 let Some((enum_name, type_params, field_types)) = self.enum_variant_schema(name)
                 else {
+                    // An unknown constructor matched against a concrete enum
+                    // scrutinee is a mistake (e.g. a typo). Only fall back to
+                    // Dynamic bindings when the scrutinee's enum isn't known.
+                    if let Type::Enum(scrutinee_enum, _) = self.resolve(scrutinee_type) {
+                        return Err(type_error(
+                            *span,
+                            format!("`{name}` is not a constructor of `{scrutinee_enum}`"),
+                        ));
+                    }
                     for arg in args {
                         self.declare_pattern_bindings(arg, &Type::Dynamic)?;
                     }
