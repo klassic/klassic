@@ -1079,6 +1079,63 @@ fn native_string_interpolation_nesting_matches_eval() {
     );
 }
 
+/// A runtime string interpolation (a hole that is not statically foldable,
+/// e.g. an enum payload bound in a match arm) used to accumulate previous
+/// calls' output in native because the shared buffer offset was never
+/// reset per call. Each call now returns only its own interpolation.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_runtime_interpolation_does_not_accumulate_across_calls() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-interp-accum-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-interp-accum-{unique}"));
+    fs::write(
+        &source_path,
+        "enum E { case EA(n: Int) }\ndef greet(e: E): String = e match { case EA(n) => \"val: #{n}\" }\nprintln(greet(EA(10)))\nprintln(greet(EA(20)))\nprintln(greet(EA(30)))\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        "val: 10\nval: 20\nval: 30\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native interpolation must not accumulate across calls"
+    );
+}
+
 /// Native equality of enum values used to silently compare heap identity
 /// (so `Red == Red` returned `false`); it is now refused with a clean
 /// diagnostic rather than miscompiled. The evaluator compares structurally

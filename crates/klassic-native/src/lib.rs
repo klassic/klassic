@@ -32921,6 +32921,10 @@ impl NativeCodeGenerator {
         let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
         let len = self.asm.data_label_with_i64s(&[0]);
         let offset = self.asm.data_label_with_i64s(&[0]);
+        // The offset cell is a static data slot: reset it to 0 on every
+        // call, otherwise a second invocation appends after the first
+        // call's content (the sibling runtime-string helpers all do this).
+        self.emit_reset_runtime_buffer_offset_label(offset);
         for part in parts {
             let hole = match part {
                 StringPart::Literal(text) => {
