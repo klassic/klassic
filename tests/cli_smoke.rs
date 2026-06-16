@@ -914,6 +914,26 @@ fn unknown_match_constructor_is_rejected() {
     assert_eq!(String::from_utf8_lossy(&good.stdout), "1\n()\n");
 }
 
+/// `enumValue.toString()` works in the evaluator (it returns the variant
+/// rendering, matching `toString(enumValue)` and the native backend),
+/// rather than type-checking and then failing at run time.
+#[test]
+fn enum_tostring_method_works() {
+    let out = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum O { case Red; case S(v: Int) }\nprintln(Red.toString())\nprintln(S(7).toString())\nval s: String = Red.toString()\nprintln(s)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        out.status.success(),
+        "enum .toString() should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Red\nS(7)\nRed\n()\n");
+}
+
 /// Importing a `std.*` module that does not exist reports "unknown module"
 /// rather than the "part of the standard library / not yet available in
 /// native builds" message reserved for real but not-yet-inlined modules.
