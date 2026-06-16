@@ -1618,6 +1618,10 @@ impl Parser {
                     self.bump();
                 }
                 TokenKind::Comma if paren_depth == 0 && angle_depth == 0 => break,
+                // A `;` does not separate variant fields (use `,`); stop here
+                // so it surfaces as a clean parse error instead of being
+                // swallowed into a garbled type name like `Int;y:Int`.
+                TokenKind::Semicolon if paren_depth == 0 && angle_depth == 0 => break,
                 TokenKind::Less => {
                     angle_depth += 1;
                     self.bump();
@@ -1980,6 +1984,25 @@ impl Parser {
         } else {
             None
         };
+        // `import foo.*` is a wildcard attempt — `*` is not an identifier, so
+        // without this it would leave a stray `*` and report "expected a
+        // newline". Give the same hint as the `import foo._` form.
+        if matches!(self.peek().kind, TokenKind::Dot)
+            && matches!(
+                self.tokens.get(self.index + 1).map(|token| &token.kind),
+                Some(TokenKind::Star)
+            )
+        {
+            self.bump();
+            let star = self.bump().span;
+            return Err(Diagnostic::parse(
+                star,
+                format!(
+                    "wildcard imports are not supported; list the members explicitly, \
+                     e.g. `import {path}.{{a, b}}`"
+                ),
+            ));
+        }
         let (members, excludes) = if matches!(self.peek().kind, TokenKind::Dot)
             && matches!(
                 self.tokens.get(self.index + 1).map(|token| &token.kind),
