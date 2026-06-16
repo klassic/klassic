@@ -24556,7 +24556,7 @@ impl NativeCodeGenerator {
         entries: &[(Expr, Expr)],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        let mut static_entries = Vec::with_capacity(entries.len());
+        let mut static_entries: Vec<(StaticValue, StaticValue)> = Vec::with_capacity(entries.len());
         for (key, value) in entries {
             let key = self.static_value_from_argument_preserving_effects(
                 key,
@@ -24568,7 +24568,16 @@ impl NativeCodeGenerator {
                 span,
                 "native map value with non-static value",
             )?;
-            static_entries.push((key, value));
+            // A duplicate key keeps a single entry with the last value
+            // (last-wins), matching the evaluator and the set literal.
+            if let Some(slot) = static_entries
+                .iter_mut()
+                .find(|(existing, _)| self.static_value_equal_user(existing, &key))
+            {
+                slot.1 = value;
+            } else {
+                static_entries.push((key, value));
+            }
         }
         let label = self.intern_static_map(static_entries);
         Ok(NativeValue::StaticMap { label })
