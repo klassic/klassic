@@ -2382,6 +2382,10 @@ impl Parser {
                         if matches!(self.peek().kind, TokenKind::Comma) {
                             self.bump();
                             self.consume_separators();
+                            // Allow a trailing comma, like collection literals.
+                            if matches!(self.peek().kind, TokenKind::RParen) {
+                                break;
+                            }
                             continue;
                         }
                         break;
@@ -2969,6 +2973,10 @@ impl Parser {
                 if matches!(self.peek().kind, TokenKind::Comma) {
                     self.bump();
                     self.consume_separators();
+                    // Allow a trailing comma in the parameter list.
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        break;
+                    }
                     continue;
                 }
                 break;
@@ -3003,6 +3011,10 @@ impl Parser {
                 if matches!(self.peek().kind, TokenKind::Comma) {
                     self.bump();
                     self.consume_separators();
+                    // Allow a trailing comma in the parameter list.
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        break;
+                    }
                     continue;
                 }
                 break;
@@ -3068,6 +3080,17 @@ impl Parser {
             match self.tokens.get(index).map(|token| &token.kind) {
                 Some(TokenKind::Comma) => {
                     index += 1;
+                    // A trailing comma before `)` still looks like a lambda.
+                    if matches!(
+                        self.tokens.get(index).map(|token| &token.kind),
+                        Some(TokenKind::RParen)
+                    ) {
+                        index += 1;
+                        return matches!(
+                            self.tokens.get(index).map(|token| &token.kind),
+                            Some(TokenKind::FatArrow)
+                        );
+                    }
                 }
                 Some(TokenKind::RParen) => {
                     index += 1;

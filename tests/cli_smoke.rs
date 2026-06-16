@@ -874,6 +874,35 @@ fn unclosed_block_reports_missing_brace() {
     );
 }
 
+/// A trailing comma is accepted in function calls, parameter lists, and
+/// lambda parameters, matching the collection literals that already
+/// allow it — while an empty `(,)` is still a syntax error.
+#[test]
+fn trailing_comma_in_calls_params_and_lambdas() {
+    let good = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "def f(x, y,) = x + y\nval g = (a,) => a * 2\nprintln(f(1, 2,))\nprintln(g(5))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good.status.success(),
+        "trailing commas should parse\nstderr:\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&good.stdout), "3\n10\n()\n");
+
+    // An empty argument list with only a comma is still rejected.
+    for src in ["def f(x) = x\nf(,)", "val g = (,) => 1"] {
+        let bad = Command::new(klassic_bin())
+            .args(["-e", src])
+            .output()
+            .expect("binary should run");
+        assert!(!bad.status.success(), "`{src}` should be a syntax error");
+    }
+}
+
 /// CI guard: the direct Mach-O backend's binaries can only run on
 /// Apple Silicon, so every test that builds *and executes* that
 /// backend's output is `#[cfg(all(target_os = "macos", target_arch =
