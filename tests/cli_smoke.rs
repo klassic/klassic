@@ -638,6 +638,29 @@ fn match_arm_mismatch_points_at_body() {
     );
 }
 
+/// Type errors render unresolved type variables as readable names (`'a`,
+/// `'b`, ...) — shared variables keep the same name — instead of leaking
+/// raw internal ids like `'t33` / `'r34`.
+#[test]
+fn type_errors_use_readable_type_var_names() {
+    let out = Command::new(klassic_bin())
+        .args(["-e", "def getXY(r) = r.x + r.y; getXY(\"hello\")"])
+        .output()
+        .expect("binary should run");
+    assert!(!out.status.success(), "the mismatch should be a type error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // `x` and `y` are the same variable, so both render as `'a`.
+    assert!(
+        stderr.contains("record { x: 'a; y: 'a"),
+        "expected readable, consistent var names, got:\n{stderr}"
+    );
+    // No raw internal `'t<id>` / `'r<id>` leaks (only `'a`..`'z` are used).
+    assert!(
+        !stderr.contains("'t") && !stderr.contains("'r"),
+        "internal type-var ids leaked:\n{stderr}"
+    );
+}
+
 /// A match arm whose constructor an earlier unguarded, irrefutably-bound
 /// arm already matches is reported as unreachable — but a refutable
 /// earlier payload (`case S(1)`) does not close the variant, and guards
