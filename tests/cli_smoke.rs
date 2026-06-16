@@ -793,6 +793,41 @@ fn binding_annotation_mismatch_points_at_value() {
     );
 }
 
+/// Type annotations that name a stdlib enum (`Option<T>`, `Result<T, E>`)
+/// resolve to the same nominal type the constructors produce, so a `val`,
+/// parameter, or return annotation type-checks — while a genuine element
+/// mismatch is still reported.
+#[test]
+fn stdlib_enum_type_annotations_resolve() {
+    let good = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.option.{some, getOrElse}\nval o: Option<Int> = some(5)\ndef unwrap(p: Option<Int>): Int = getOrElse(p, 0)\nprintln(unwrap(o))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good.status.success(),
+        "stdlib enum annotations should type-check\nstderr:\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&good.stdout), "5\n()\n");
+
+    let bad = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.option.{some}\nval o: Option<Int> = some(\"x\")",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(!bad.status.success(), "an element mismatch should fail");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("Int is not compatible with String"),
+        "expected an element type error, got:\n{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
 /// A match arm whose constructor an earlier unguarded, irrefutably-bound
 /// arm already matches is reported as unreachable — but a refutable
 /// earlier payload (`case S(1)`) does not close the variant, and guards
