@@ -764,6 +764,35 @@ fn constructor_arity_error_says_constructor() {
     );
 }
 
+/// A type-annotation mismatch in a `val`/`def` binding points at the
+/// offending value or body expression, not at the start of the keyword.
+#[test]
+fn binding_annotation_mismatch_points_at_value() {
+    let val = Command::new(klassic_bin())
+        .args(["-e", "val x: String = 42"])
+        .output()
+        .expect("binary should run");
+    assert!(!val.status.success(), "the val mismatch should fail");
+    // `42` is at column 17; the `val` keyword is at column 1.
+    assert!(
+        String::from_utf8_lossy(&val.stderr).contains(":1:17:"),
+        "expected the span at the value, got:\n{}",
+        String::from_utf8_lossy(&val.stderr)
+    );
+
+    let def = Command::new(klassic_bin())
+        .args(["-e", "def f(x: String): Int = x"])
+        .output()
+        .expect("binary should run");
+    assert!(!def.status.success(), "the def mismatch should fail");
+    // The body `x` is at column 25; the `def` keyword is at column 1.
+    assert!(
+        String::from_utf8_lossy(&def.stderr).contains(":1:25:"),
+        "expected the span at the body, got:\n{}",
+        String::from_utf8_lossy(&def.stderr)
+    );
+}
+
 /// A match arm whose constructor an earlier unguarded, irrefutably-bound
 /// arm already matches is reported as unreachable — but a refutable
 /// earlier payload (`case S(1)`) does not close the variant, and guards
