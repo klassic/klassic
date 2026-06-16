@@ -733,6 +733,37 @@ fn clearer_diagnostic_messages() {
     }
 }
 
+/// An arity mismatch when applying an enum constructor says "constructor"
+/// rather than the generic "function", while a real function still says
+/// "function".
+#[test]
+fn constructor_arity_error_says_constructor() {
+    let ctor = Command::new(klassic_bin())
+        .args(["-e", "enum Shape { case Circle(r: Int) }\nCircle(1, 2)"])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !ctor.status.success(),
+        "wrong constructor arity should fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&ctor.stderr).contains("constructor expects 1 argument but got 2"),
+        "expected a constructor message, got:\n{}",
+        String::from_utf8_lossy(&ctor.stderr)
+    );
+
+    let func = Command::new(klassic_bin())
+        .args(["-e", "def f(x, y) = x + y\nf(1)"])
+        .output()
+        .expect("binary should run");
+    assert!(!func.status.success(), "wrong function arity should fail");
+    assert!(
+        String::from_utf8_lossy(&func.stderr).contains("function expects 2 arguments but got 1"),
+        "expected a function message, got:\n{}",
+        String::from_utf8_lossy(&func.stderr)
+    );
+}
+
 /// A match arm whose constructor an earlier unguarded, irrefutably-bound
 /// arm already matches is reported as unreachable — but a refutable
 /// earlier payload (`case S(1)`) does not close the variant, and guards

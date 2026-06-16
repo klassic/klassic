@@ -1945,17 +1945,19 @@ impl TypeChecker {
                 arguments,
                 span,
             } => {
+                let noun = self.call_target_noun(callee);
                 if let Expr::Identifier { name, .. } = callee.as_ref()
                     && let Some(binding) = self.lookup(name).cloned()
                     && !binding.constraints.is_empty()
                 {
                     let (callee_type, constraints) = self.instantiate_binding_signature(&binding);
-                    let result = self.infer_constrained_call(callee_type, arguments, *span)?;
+                    let result =
+                        self.infer_constrained_call(callee_type, arguments, *span, noun)?;
                     self.ensure_constraints_satisfied(&constraints, *span)?;
                     return Ok(result);
                 }
                 let callee_type = self.infer_expr(callee)?;
-                self.infer_call(callee_type, arguments, *span)
+                self.infer_call(callee_type, arguments, *span, noun)
             }
             Expr::FieldAccess {
                 target,
@@ -2123,11 +2125,24 @@ impl TypeChecker {
         }
     }
 
+    /// Whether a call target is an enum constructor, so arity diagnostics
+    /// can say "constructor" instead of the generic "function".
+    fn call_target_noun(&self, callee: &Expr) -> &'static str {
+        if let Expr::Identifier { name, .. } = callee
+            && self.enum_variant_schema(name).is_some()
+        {
+            "constructor"
+        } else {
+            "function"
+        }
+    }
+
     fn infer_call(
         &mut self,
         callee_type: Type,
         arguments: &[Expr],
         span: Span,
+        noun: &str,
     ) -> Result<Type, Diagnostic> {
         match self.resolve(&callee_type) {
             Type::Function(params, result) => {
@@ -2135,7 +2150,7 @@ impl TypeChecker {
                     return Err(type_error(
                         span,
                         format!(
-                            "function expects {} {} but got {}",
+                            "{noun} expects {} {} but got {}",
                             params.len(),
                             if params.len() == 1 {
                                 "argument"
@@ -2289,6 +2304,7 @@ impl TypeChecker {
         callee_type: Type,
         arguments: &[Expr],
         span: Span,
+        noun: &str,
     ) -> Result<Type, Diagnostic> {
         match self.resolve(&callee_type) {
             Type::Function(params, result) => {
@@ -2296,7 +2312,7 @@ impl TypeChecker {
                     return Err(type_error(
                         span,
                         format!(
-                            "function expects {} {} but got {}",
+                            "{noun} expects {} {} but got {}",
                             params.len(),
                             if params.len() == 1 {
                                 "argument"
