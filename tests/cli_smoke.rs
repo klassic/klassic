@@ -481,6 +481,27 @@ fn map_key_value_methods_are_typed() {
     }
 }
 
+/// A map literal with a duplicate key keeps one entry with the last value
+/// (last-wins), so `size`/`get` stay consistent — matching how the set
+/// literal collapses duplicate elements.
+#[test]
+fn map_literal_duplicate_key_is_last_wins() {
+    let out = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "val m = %[\"a\": 1 \"a\": 2 \"b\": 3]\nprintln(Map#size(m))\nprintln(m.get(\"a\"))\nprintln(m.get(\"b\"))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        out.status.success(),
+        "the map literal should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Two distinct keys; `a` keeps the last value `2`.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n2\n3\n()\n");
+}
+
 /// `xs.foldLeft(init, f)` over a `List<a>` ties the folder to the element
 /// type — `init` and the result share an accumulator type and `f` is
 /// `(acc, a) -> acc` — so a valid numeric/string fold works but a folder

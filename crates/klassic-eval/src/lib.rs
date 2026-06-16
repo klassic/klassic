@@ -1312,17 +1312,22 @@ fn eval_expr_inner(
                 .map(|element| eval_expr(element, environment, state))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        Expr::MapLiteral { entries, .. } => Ok(Value::Map(
-            entries
-                .iter()
-                .map(|(key, value)| {
-                    Ok((
-                        eval_expr(key, environment, state)?,
-                        eval_expr(value, environment, state)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, Diagnostic>>()?,
-        )),
+        Expr::MapLiteral { entries, .. } => {
+            // A duplicate key keeps a single entry with the last value
+            // written (last-wins), so `size`/`get` stay consistent — the
+            // same way the set literal collapses duplicate elements.
+            let mut pairs: Vec<(Value, Value)> = Vec::new();
+            for (key, value) in entries {
+                let key = eval_expr(key, environment, state)?;
+                let value = eval_expr(value, environment, state)?;
+                if let Some(slot) = pairs.iter_mut().find(|(existing, _)| *existing == key) {
+                    slot.1 = value;
+                } else {
+                    pairs.push((key, value));
+                }
+            }
+            Ok(Value::Map(pairs))
+        }
         Expr::SetLiteral { elements, .. } => {
             let mut values = Vec::new();
             for element in elements {
