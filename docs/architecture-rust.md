@@ -721,7 +721,12 @@ cargo run -- -e "1 + 2"
   differently-typed free functions across modules — user or `std.*` —
   no longer collide (#449). Selective and bulk imports resolve to the
   mangled name; aliased imports (`import std.x as M`) collapse their
-  `M.func` access to the target module's mangled name. The ADT-backed
+  `M.func` access to the target module's mangled name. A selective
+  `import a.{x}` of a name the module does not export is rejected before
+  splicing with the same `module `a` has no member `x`` diagnostic the
+  evaluator gives — the export set mirrors the evaluator's root value
+  bindings (free defs, top-level `val`s, enum constructors), so the unknown
+  member is no longer silently dropped into an accepted build. The ADT-backed
   modules (`std.option` / `std.result`)
   now inline as well, on top of the generic-enum specialization above:
   their constructors (`some` / `ok`), consumers (`getOrElse` / `unwrapOr`
