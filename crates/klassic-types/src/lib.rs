@@ -5747,7 +5747,54 @@ fn push_unique(vars: &mut Vec<GenericVar>, var: GenericVar) {
     }
 }
 
+/// Assigns short, readable names (`'a`, `'b`, ...) to the unresolved type
+/// and row variables encountered while rendering a single type, so error
+/// messages never leak raw internal ids like `'t33` / `'r34`.
+#[derive(Default)]
+struct TypeVarNamer {
+    type_vars: HashMap<u32, String>,
+    row_vars: HashMap<u32, String>,
+    next: usize,
+}
+
+impl TypeVarNamer {
+    fn letter(n: usize) -> String {
+        let letter = (b'a' + (n % 26) as u8) as char;
+        let suffix = n / 26;
+        if suffix == 0 {
+            format!("'{letter}")
+        } else {
+            format!("'{letter}{suffix}")
+        }
+    }
+
+    fn type_name(&mut self, id: u32) -> String {
+        if let Some(name) = self.type_vars.get(&id) {
+            return name.clone();
+        }
+        let name = Self::letter(self.next);
+        self.next += 1;
+        self.type_vars.insert(id, name.clone());
+        name
+    }
+
+    fn row_name(&mut self, id: u32) -> String {
+        if let Some(name) = self.row_vars.get(&id) {
+            return name.clone();
+        }
+        let name = Self::letter(self.next);
+        self.next += 1;
+        self.row_vars.insert(id, name.clone());
+        name
+    }
+}
+
 fn display_type(ty: &Type) -> String {
+    let mut namer = TypeVarNamer::default();
+    display_type_named(ty, &mut namer)
+}
+
+fn display_type_named(ty: &Type, namer: &mut TypeVarNamer) -> String {
     match ty {
         Type::Byte => "Byte".to_string(),
         Type::Short => "Short".to_string(),
@@ -5761,58 +5808,71 @@ fn display_type(ty: &Type) -> String {
         Type::Unit => "Unit".to_string(),
         Type::Dynamic => "*".to_string(),
         Type::Null => "null".to_string(),
-        Type::List(inner) => format!("List<{}>", display_type(inner)),
-        Type::Map(key, value) => format!("Map<{}, {}>", display_type(key), display_type(value)),
-        Type::Set(inner) => format!("Set<{}>", display_type(inner)),
+        Type::List(inner) => format!("List<{}>", display_type_named(inner, namer)),
+        Type::Map(key, value) => format!(
+            "Map<{}, {}>",
+            display_type_named(key, namer),
+            display_type_named(value, namer)
+        ),
+        Type::Set(inner) => format!("Set<{}>", display_type_named(inner, namer)),
         Type::Function(params, result) => format!(
             "({}) => {}",
             params
                 .iter()
-                .map(display_type)
+                .map(|t| display_type_named(t, namer))
                 .collect::<Vec<_>>()
                 .join(", "),
-            display_type(result)
+            display_type_named(result, namer)
         ),
         Type::Applied(head, args) => format!(
             "{}<{}>",
-            display_type(head),
-            args.iter().map(display_type).collect::<Vec<_>>().join(", ")
+            display_type_named(head, namer),
+            args.iter()
+                .map(|t| display_type_named(t, namer))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Type::Record(name, args) if args.is_empty() => format!("#{name}"),
         Type::Record(name, args) => format!(
             "#{}<{}>",
             name,
-            args.iter().map(display_type).collect::<Vec<_>>().join(", ")
+            args.iter()
+                .map(|t| display_type_named(t, namer))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Type::Enum(name, args) if args.is_empty() => name.clone(),
         Type::Enum(name, args) => format!(
             "{}<{}>",
             name,
-            args.iter().map(display_type).collect::<Vec<_>>().join(", ")
+            args.iter()
+                .map(|t| display_type_named(t, namer))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
-        Type::StructuralRecord(row) => format!("record {{ {} }}", display_row(row)),
+        Type::StructuralRecord(row) => format!("record {{ {} }}", display_row_named(row, namer)),
         Type::RowEmpty => String::new(),
-        Type::RowExtend(_, _, _) => display_row(ty),
+        Type::RowExtend(_, _, _) => display_row_named(ty, namer),
         Type::Generic(name) => name.clone(),
         Type::Named(name) => name.clone(),
-        Type::Var(id) => format!("'t{id}"),
-        Type::RowVar(id) => format!("'r{id}"),
+        Type::Var(id) => namer.type_name(*id),
+        Type::RowVar(id) => namer.row_name(*id),
     }
 }
 
-fn display_row(ty: &Type) -> String {
+fn display_row_named(ty: &Type, namer: &mut TypeVarNamer) -> String {
     match ty {
         Type::RowEmpty => String::new(),
-        Type::RowVar(id) => format!("... 'r{id}"),
+        Type::RowVar(id) => format!("... {}", namer.row_name(*id)),
         Type::RowExtend(label, field, rest) => {
-            let mut parts = vec![format!("{label}: {}", display_type(field))];
-            let rest = display_row(rest);
+            let mut parts = vec![format!("{label}: {}", display_type_named(field, namer))];
+            let rest = display_row_named(rest, namer);
             if !rest.is_empty() {
                 parts.push(rest);
             }
             parts.join("; ")
         }
-        other => display_type(other),
+        other => display_type_named(other, namer),
     }
 }
 
