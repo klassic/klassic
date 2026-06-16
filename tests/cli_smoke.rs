@@ -1059,6 +1059,56 @@ fn native_string_interpolation_nesting_matches_eval() {
     );
 }
 
+/// Native equality of enum values used to silently compare heap identity
+/// (so `Red == Red` returned `false`); it is now refused with a clean
+/// diagnostic rather than miscompiled. The evaluator compares structurally
+/// (the oracle answer is `true`).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_enum_equality_is_refused_not_miscompiled() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-enum-eq-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-enum-eq-{unique}"));
+    fs::write(
+        &source_path,
+        "enum Color { case Red; case Green }\nprintln(Red == Red)\n",
+    )
+    .expect("source should write");
+
+    // The evaluator (oracle) compares structurally: Red == Red is true.
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "true\n");
+
+    // The native build refuses rather than silently returning false.
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        !build.status.success(),
+        "native enum equality should be refused, not miscompiled"
+    );
+    assert!(
+        String::from_utf8_lossy(&build.stderr).contains("equality of heap values such as enums"),
+        "expected a clean unsupported diagnostic, got:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see

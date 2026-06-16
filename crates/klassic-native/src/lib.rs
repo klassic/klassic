@@ -6226,6 +6226,17 @@ impl NativeCodeGenerator {
                 .mov_imm64(Reg::Rax, u64::from(equal == (op == BinaryOp::Equal)));
             return Ok(NativeValue::Bool);
         }
+        // A heap value (e.g. an enum constructor) reaching this fallthrough
+        // for `==`/`!=` would be compared by heap identity — two freshly
+        // built copies of the same value have different addresses, so the
+        // result is wrong. Refuse it cleanly instead of silently
+        // miscompiling; structural enum equality is a future feature
+        // (the evaluator already compares them structurally).
+        if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+            && matches!(lhs_value, NativeValue::HeapPointer)
+        {
+            return Err(unsupported(span, "equality of heap values such as enums"));
+        }
         if !matches!(lhs_value, NativeValue::Int | NativeValue::HeapPointer) {
             return Err(unsupported(span, "native binary operation for non-Int lhs"));
         }
