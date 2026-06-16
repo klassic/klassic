@@ -879,6 +879,41 @@ fn duplicate_match_constructor_is_unreachable() {
     }
 }
 
+/// A match arm naming a constructor that does not belong to the scrutinee's
+/// enum (a typo) is a compile-time error instead of being silently accepted.
+#[test]
+fn unknown_match_constructor_is_rejected() {
+    let bad = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Color { case Red; case Blue }\nRed match { case Nonexistent => 0; case Red => 1; case Blue => 2 }",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(!bad.status.success(), "an unknown constructor should fail");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr)
+            .contains("`Nonexistent` is not a constructor of `Color`"),
+        "expected an unknown-constructor error, got:\n{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    // Real constructors, variables, and wildcards still type-check.
+    let good = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Color { case Red; case Blue }\nprintln(Red match { case Red => 1; case _ => 2 })",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        good.status.success(),
+        "a valid match should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&good.stdout), "1\n()\n");
+}
+
 /// A structural record literal can be dot-accessed immediately
 /// (`record { x: 1 }.x`), including chained access, instead of requiring
 /// a `val` binding first.
