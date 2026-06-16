@@ -3870,6 +3870,13 @@ struct NativeCodeGenerator {
     scope_gc_root_counts: Vec<usize>,
     scopes: Vec<HashMap<String, VarSlot>>,
     static_scopes: Vec<HashMap<String, StaticValue>>,
+    /// Names of enclosing-lambda parameters currently bound to a static
+    /// constant during inline-call lowering. Such a param is immutable and
+    /// its static value is authoritative, so an inner lambda must NOT capture
+    /// it via a (frame-relative, escape-unsafe) runtime slot that would
+    /// shadow the static value — that made a returned closure read an outer
+    /// `val` shadowed by the param. Saved/restored around each inline body.
+    inline_static_params: Vec<String>,
     scope_base_offsets: Vec<i32>,
     next_stack_offset: i32,
     next_var_slot_id: usize,
@@ -4088,6 +4095,7 @@ impl NativeCodeGenerator {
             scope_gc_root_counts: vec![0],
             scopes: vec![HashMap::new()],
             static_scopes: vec![HashMap::new()],
+            inline_static_params: Vec::new(),
             scope_base_offsets: vec![0],
             next_stack_offset: 0,
             next_var_slot_id: 0,
@@ -5607,7 +5615,7 @@ impl NativeCodeGenerator {
                     params.clone(),
                     body.as_ref().clone(),
                     self.current_static_captures(),
-                    self.current_runtime_captures(),
+                    self.closure_runtime_captures(),
                     None,
                     expr_contains_thread_call(body, &thread_aliases),
                 );
@@ -8534,6 +8542,7 @@ impl NativeCodeGenerator {
             ));
         }
         self.push_scope();
+        let saved_inline_params = self.inline_static_params.len();
         let result = (|| {
             for (param, argument) in params.iter().zip(arguments) {
                 let static_argument = self.static_value_from_pure_expr(argument);
@@ -8547,6 +8556,7 @@ impl NativeCodeGenerator {
                         self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                         if let Some(value) = static_argument {
                             self.bind_static_value(param.clone(), value);
+                            self.inline_static_params.push(param.clone());
                         }
                     }
                     NativeValue::Null
@@ -8572,6 +8582,7 @@ impl NativeCodeGenerator {
             }
             self.compile_expr(body)
         })();
+        self.inline_static_params.truncate(saved_inline_params);
         match result {
             Ok(value) => {
                 if self.native_value_captures_current_scope(value)
@@ -26184,6 +26195,7 @@ impl NativeCodeGenerator {
             ));
         }
         self.push_scope();
+        let saved_inline_params = self.inline_static_params.len();
         let result = (|| {
             let assigned_captures = assigned_names_in_expr(&lambda.body);
             self.bind_static_lambda_runtime_captures(&lambda);
@@ -26207,6 +26219,7 @@ impl NativeCodeGenerator {
                         self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                         if let Some(value) = static_argument {
                             self.bind_static_value(param.clone(), value);
+                            self.inline_static_params.push(param.clone());
                         }
                     }
                     NativeValue::Null
@@ -26232,6 +26245,7 @@ impl NativeCodeGenerator {
             }
             self.compile_expr(&lambda.body)
         })();
+        self.inline_static_params.truncate(saved_inline_params);
         match result {
             Ok(value) => {
                 if self.native_value_captures_current_scope(value)
@@ -26986,12 +27000,23 @@ impl NativeCodeGenerator {
                 for (name, value) in bindings {
                     captures.insert((*name).to_string(), value.clone());
                 }
+                // A statically-substituted binding (an enclosing lambda's
+                // parameter) is authoritative for that name. If an outer
+                // `val` of the same name was materialized into a runtime slot
+                // (e.g. while binding the enclosing lambda's captures), that
+                // slot must NOT be captured here — at call time a runtime
+                // capture shadows the static one, so the inner closure would
+                // read the outer val instead of the shadowing parameter.
+                let mut runtime_captures = self.current_runtime_captures();
+                for (name, _) in bindings {
+                    runtime_captures.remove(*name);
+                }
                 let thread_aliases = self.current_thread_aliases_with_static_bindings(bindings);
                 let label = self.intern_static_lambda(
                     params.clone(),
                     body.as_ref().clone(),
                     captures,
-                    self.current_runtime_captures(),
+                    runtime_captures,
                     None,
                     expr_contains_thread_call(body, &thread_aliases),
                 );
@@ -28497,6 +28522,20 @@ impl NativeCodeGenerator {
             for (name, slot) in scope {
                 captures.insert(name.clone(), *slot);
             }
+        }
+        captures
+    }
+
+    /// Runtime captures for a lambda being interned, with statically-bound
+    /// enclosing-lambda parameters removed. Those params are immutable and
+    /// carry an authoritative static-constant value; a runtime slot for them
+    /// is a frame-relative stack offset that does not survive the closure
+    /// escaping its defining frame, and (being present in `runtime_captures`)
+    /// would shadow the correct static value at call time.
+    fn closure_runtime_captures(&self) -> HashMap<String, VarSlot> {
+        let mut captures = self.current_runtime_captures();
+        for name in &self.inline_static_params {
+            captures.remove(name);
         }
         captures
     }
