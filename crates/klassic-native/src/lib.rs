@@ -32725,6 +32725,17 @@ impl NativeCodeGenerator {
             span: string_span,
         } = expr
         {
+            // A hole that performs its own console output must run before the
+            // surrounding string is printed, so materialize the whole value
+            // first instead of streaming each fragment to the fd in order.
+            if parts.iter().any(|part| {
+                matches!(part, StringPart::Interpolation(hole)
+                    if self.expr_writes_console_output(hole))
+            }) {
+                let value = self.emit_runtime_interpolated_string(parts, *string_span)?;
+                self.emit_print_value_fragment(fd, value);
+                return Ok(());
+            }
             return self.emit_print_interpolated_string(fd, parts, *string_span);
         }
 
@@ -32735,6 +32746,12 @@ impl NativeCodeGenerator {
             ..
         } = expr
             && self.is_print_concat_expr(expr)
+            // The split path emits each operand straight to the fd in source
+            // order. That only matches the evaluator when no operand performs
+            // its own console output: a nested `println` must run before the
+            // surrounding text (its value is the Unit result), so a concat
+            // that writes to the console is materialized first instead.
+            && !self.expr_writes_console_output(expr)
         {
             self.emit_print_expr_fragment(fd, lhs, span)?;
             self.emit_print_expr_fragment(fd, rhs, span)?;
@@ -32919,6 +32936,142 @@ impl NativeCodeGenerator {
             }
         }
         Ok(())
+    }
+
+    /// True when evaluating `expr` can itself write to stdout/stderr (it
+    /// reaches a `println`/`printlnError` call, including transitively
+    /// through user functions it calls). The print-concat and
+    /// print-interpolation fast paths emit each fragment straight to the fd
+    /// in source order; that only matches the evaluator when no fragment
+    /// performs its own console output, since a nested `println`'s text must
+    /// land *before* the surrounding string (its value is the Unit result).
+    fn expr_writes_console_output(&self, expr: &Expr) -> bool {
+        let mut visiting = HashSet::new();
+        self.expr_writes_console_output_visiting(expr, &mut visiting)
+    }
+
+    fn expr_writes_console_output_visiting(
+        &self,
+        expr: &Expr,
+        visiting: &mut HashSet<String>,
+    ) -> bool {
+        let recur = |s: &Self, e: &Expr, v: &mut HashSet<String>| {
+            s.expr_writes_console_output_visiting(e, v)
+        };
+        match expr {
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                if let Expr::Identifier { name, .. } = callee.as_ref() {
+                    let resolved = self.builtin_name_for_identifier(name);
+                    if matches!(resolved.as_str(), "println" | "printlnError") {
+                        return true;
+                    }
+                    // Follow a call into a user-defined function body once,
+                    // so a hole like `#{emit()}` whose `emit` prints is also
+                    // recognised. The visiting set breaks recursion cycles.
+                    if let Some(function) = self.functions.get(name.as_str())
+                        && !visiting.contains(name)
+                    {
+                        visiting.insert(name.clone());
+                        let writes = recur(self, &function.body, visiting);
+                        visiting.remove(name);
+                        if writes {
+                            return true;
+                        }
+                    }
+                }
+                recur(self, callee, visiting)
+                    || arguments
+                        .iter()
+                        .any(|argument| recur(self, argument, visiting))
+            }
+            Expr::StringInterpolation { parts, .. } => parts.iter().any(|part| {
+                matches!(part, StringPart::Interpolation(hole)
+                    if recur(self, hole, visiting))
+            }),
+            Expr::Unary { expr, .. } | Expr::FieldAccess { target: expr, .. } => {
+                recur(self, expr, visiting)
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                recur(self, lhs, visiting) || recur(self, rhs, visiting)
+            }
+            Expr::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                recur(self, condition, visiting)
+                    || recur(self, then_branch, visiting)
+                    || else_branch
+                        .as_deref()
+                        .is_some_and(|branch| recur(self, branch, visiting))
+            }
+            Expr::While {
+                condition, body, ..
+            } => recur(self, condition, visiting) || recur(self, body, visiting),
+            Expr::Foreach { iterable, body, .. } => {
+                recur(self, iterable, visiting) || recur(self, body, visiting)
+            }
+            Expr::Block { expressions, .. } => expressions
+                .iter()
+                .any(|expression| recur(self, expression, visiting)),
+            Expr::Cleanup { body, cleanup, .. } => {
+                recur(self, body, visiting) || recur(self, cleanup, visiting)
+            }
+            Expr::Lambda { body, .. }
+            | Expr::DefDecl { body, .. }
+            | Expr::TheoremDeclaration { body, .. } => recur(self, body, visiting),
+            Expr::InstanceDeclaration { methods, .. } => {
+                methods.iter().any(|method| recur(self, method, visiting))
+            }
+            Expr::RecordConstructor { arguments, .. }
+            | Expr::ListLiteral {
+                elements: arguments,
+                ..
+            } => arguments
+                .iter()
+                .any(|argument| recur(self, argument, visiting)),
+            Expr::RecordLiteral { fields, .. } => {
+                fields.iter().any(|(_, value)| recur(self, value, visiting))
+            }
+            Expr::MapLiteral { entries, .. } => entries
+                .iter()
+                .any(|(key, value)| recur(self, key, visiting) || recur(self, value, visiting)),
+            Expr::SetLiteral { elements, .. } => elements
+                .iter()
+                .any(|element| recur(self, element, visiting)),
+            Expr::VarDecl { value, .. } | Expr::Assign { value, .. } => {
+                recur(self, value, visiting)
+            }
+            Expr::AxiomDeclaration { proposition, .. } => recur(self, proposition, visiting),
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                recur(self, scrutinee, visiting)
+                    || arms.iter().any(|arm| {
+                        arm.guard
+                            .as_ref()
+                            .is_some_and(|guard| recur(self, guard, visiting))
+                            || recur(self, &arm.body, visiting)
+                    })
+            }
+            Expr::Int { .. }
+            | Expr::Double { .. }
+            | Expr::Bool { .. }
+            | Expr::String { .. }
+            | Expr::Null { .. }
+            | Expr::Unit { .. }
+            | Expr::Identifier { .. }
+            | Expr::ModuleHeader { .. }
+            | Expr::Import { .. }
+            | Expr::RecordDeclaration { .. }
+            | Expr::TypeClassDeclaration { .. }
+            | Expr::ExtensionDeclaration { .. }
+            | Expr::EnumDeclaration { .. }
+            | Expr::PegRuleBlock { .. } => false,
+        }
     }
 
     fn emit_runtime_interpolated_string(

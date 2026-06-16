@@ -126,7 +126,11 @@ cargo run -- -e "1 + 2"
   threads, whose stacks live at unrelated addresses.
   `println` / `printlnError` stream simple
   string-concatenation and interpolation expressions directly until a heap string
-  runtime is added. Interpolated strings can also be folded into static native
+  runtime is added. That streaming fast path is skipped when a fragment performs
+  its own console output (a `println` reached directly or transitively through a
+  called function): such concats / interpolations are materialized first so the
+  nested output lands before the surrounding text, matching the evaluator instead
+  of interleaving it. Interpolated strings can also be folded into static native
   values when all fragments resolve through immutable static bindings, including
   fragments with mutable block prefixes when their final values remain
   recoverable. Interpolation fragments that resolve to native runtime strings,

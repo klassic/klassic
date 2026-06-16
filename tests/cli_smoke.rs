@@ -1157,6 +1157,74 @@ fn native_runtime_interpolation_does_not_accumulate_across_calls() {
     );
 }
 
+/// A `println` nested inside a string concatenation or interpolation hole
+/// must run before the surrounding text is printed (its value is the Unit
+/// result). The native print-concat / print-interpolation fast paths used to
+/// stream each fragment straight to the fd, interleaving the inner output;
+/// they now materialize the value first when a fragment writes to the
+/// console, matching the evaluator. The check follows a call into a user
+/// function so transitive output (`emit()`) is recognised too.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_print_with_nested_console_output_matches_eval() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-print-nested-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-print-nested-{unique}"));
+    let program = concat!(
+        "def emit(): Int = { println(\"side\"); 9 }\n",
+        "println(\"A\" + println(\"B\") + \"C\")\n",
+        "println(\"a#{println(\"b\")}c\")\n",
+        "println(\"n=#{emit()}!\")\n",
+        "val x = 7\n",
+        "println(\"keep=#{x} fast\")\n",
+    );
+    fs::write(&source_path, program).expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(
+        eval.status.success(),
+        "eval failed:\n{}",
+        String::from_utf8_lossy(&eval.stderr)
+    );
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        "B\nA()C\nb\na()c\nside\nn=9!\nkeep=7 fast\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native print must not interleave nested console output"
+    );
+}
+
 /// Native equality of enum values used to silently compare heap identity
 /// (so `Red == Red` returned `false`); it is now refused with a clean
 /// diagnostic rather than miscompiled. The evaluator compares structurally
