@@ -159,6 +159,7 @@ pub(crate) fn value_method_builtin_name(value: &Value, field: &str) -> Option<&'
         | Value::Double(_)
         | Value::Bool(_)
         | Value::Unit
+        | Value::Enum { .. }
         | Value::Record { .. } => match field {
             "toString" => Some("toString"),
             _ => None,
