@@ -31789,6 +31789,13 @@ impl NativeCodeGenerator {
                 StringPart::Literal(text) => result.push_str(text),
                 StringPart::Interpolation(hole) => {
                     let hole = self.lower_interpolation_enums(rewrite_expression((**hole).clone()));
+                    // A hole that mutates a variable it also displays is
+                    // mistimed by the compile-time fold (it shows the value
+                    // before the mutation). Decline the static fold so the
+                    // runtime interpolation path evaluates it in order.
+                    if expr_contains_assignment(&hole) {
+                        return None;
+                    }
                     let value = if preview_effects && bindings.is_empty() {
                         self.preview_static_value_after_effectful_eval(&hole)?
                     } else if let Some(span) = preserve_effects_span
@@ -39823,6 +39830,60 @@ fn interpolation_hole_may_reenter(expr: &Expr) -> bool {
         }
         Expr::Unary { expr, .. } => interpolation_hole_may_reenter(expr),
         _ => true,
+    }
+}
+
+/// Whether an expression performs an assignment (mutation). The
+/// compile-time interpolation fold mistimes the displayed value of a hole
+/// that mutates a variable it also reads (it shows the value before the
+/// mutation); such a hole must run at runtime instead. A false negative
+/// only leaves that hole on the existing fold path, so unhandled shapes
+/// stay conservative.
+fn expr_contains_assignment(expr: &Expr) -> bool {
+    match expr {
+        Expr::Assign { .. } => true,
+        Expr::Block { expressions, .. } => expressions.iter().any(expr_contains_assignment),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_contains_assignment(lhs) || expr_contains_assignment(rhs)
+        }
+        Expr::Unary { expr, .. } => expr_contains_assignment(expr),
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_contains_assignment(condition)
+                || expr_contains_assignment(then_branch)
+                || else_branch.as_deref().is_some_and(expr_contains_assignment)
+        }
+        Expr::Call {
+            callee, arguments, ..
+        } => expr_contains_assignment(callee) || arguments.iter().any(expr_contains_assignment),
+        Expr::FieldAccess { target, .. } => expr_contains_assignment(target),
+        Expr::Cleanup { body, cleanup, .. } => {
+            expr_contains_assignment(body) || expr_contains_assignment(cleanup)
+        }
+        Expr::VarDecl { value, .. } => expr_contains_assignment(value),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            expr_contains_assignment(scrutinee)
+                || arms.iter().any(|arm| {
+                    arm.guard.as_ref().is_some_and(expr_contains_assignment)
+                        || expr_contains_assignment(&arm.body)
+                })
+        }
+        Expr::While {
+            condition, body, ..
+        } => expr_contains_assignment(condition) || expr_contains_assignment(body),
+        Expr::Foreach { iterable, body, .. } => {
+            expr_contains_assignment(iterable) || expr_contains_assignment(body)
+        }
+        Expr::StringInterpolation { parts, .. } => parts.iter().any(|part| {
+            matches!(part, StringPart::Interpolation(hole) if expr_contains_assignment(hole))
+        }),
+        _ => false,
     }
 }
 

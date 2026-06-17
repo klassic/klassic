@@ -4001,6 +4001,67 @@ fn builds_native_executable_for_recursive_interpolation() {
     );
 }
 
+/// An interpolation hole that mutates a variable it also displays was
+/// folded at compile time and showed the value *before* the mutation
+/// (`h=0` / `h=1` instead of `h=1` / `h=2`). Such a hole now declines the
+/// fold and runs at runtime, so the display order matches the evaluator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_side_effecting_interpolation_hole() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-sideinterp-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-sideinterp-{unique}"));
+    fs::write(
+        &source_path,
+        "mutable c = 0\n\
+         def tick(): String = \"before=#{c} now=#{ { c = c + 1; c } }\"\n\
+         println(tick())\n\
+         println(tick())\n\
+         println(tick())\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        "before=0 now=1\nbefore=1 now=2\nbefore=2 now=3\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native must match eval for an interpolation hole that mutates as it displays"
+    );
+}
+
 /// closure's `base` (the outermost parameter) used to alias the middle
 /// layer's `x`, silently computing `x + x + y = 21`.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

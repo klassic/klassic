@@ -133,7 +133,10 @@ cargo run -- -e "1 + 2"
   of interleaving it. Interpolated strings can also be folded into static native
   values when all fragments resolve through immutable static bindings, including
   fragments with mutable block prefixes when their final values remain
-  recoverable. Interpolation fragments that resolve to native runtime strings,
+  recoverable. A hole that assigns to a variable it also displays declines the
+  fold (which would show the pre-mutation value) and runs through the runtime
+  path so the displayed value reflects the mutation in order. Interpolation
+  fragments that resolve to native runtime strings,
   or to dynamic native `Int` / `Boolean` values, produce fixed-buffer
   `RuntimeString` values. Because that fixed buffer and its offset cell are a
   single static slot per interpolation site, a hole that can re-enter the site
