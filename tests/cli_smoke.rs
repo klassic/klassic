@@ -1157,6 +1157,65 @@ fn native_runtime_interpolation_does_not_accumulate_across_calls() {
     );
 }
 
+/// Converting a Boolean to a string via `+` concatenation (e.g. an enum
+/// payload `"" + b`) used to reuse a static runtime buffer whose offset was
+/// never reset per call, so a second call appended after the first's content
+/// (`true`, then `truefalse`). The Int sibling already reset its offset; now
+/// the Boolean path does too, matching the evaluator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_bool_concat_does_not_accumulate_across_calls() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-bool-accum-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-bool-accum-{unique}"));
+    fs::write(
+        &source_path,
+        "enum W { case B(b: Boolean) }\n\
+         def show(w: W): String = w match { case B(b) => \"\" + b }\n\
+         println(show(B(true)))\n\
+         println(show(B(false)))\n\
+         println(show(B(true)))\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "true\nfalse\ntrue\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native bool concatenation must not accumulate across calls"
+    );
+}
+
 /// A `println` nested inside a string concatenation or interpolation hole
 /// must run before the surrounding text is printed (its value is the Unit
 /// result). The native print-concat / print-interpolation fast paths used to
