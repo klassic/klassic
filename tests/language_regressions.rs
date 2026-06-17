@@ -224,6 +224,27 @@ fn typechecker_specs_are_covered_more_directly() {
             .to_string()
             .contains("function expects 2 arguments but got 1")
     );
+
+    // A bare lowercase `def` type parameter (`def id<a>(x: a): a`) is a type
+    // variable, consistent with enums/records/extensions. It used to be
+    // treated as a concrete type, so even `id(5)` failed to unify; only the
+    // `'a` form worked.
+    assert_eq!(
+        evaluate_text("<expr>", "def id<a>(x: a): a = x\nid(5)").unwrap(),
+        Value::Int(5)
+    );
+    assert_eq!(
+        evaluate_text("<expr>", "def id<a>(x: a): a = x\nid(id(5))").unwrap(),
+        Value::Int(5)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "def const<a, b>(x: a, y: b): a = x\nconst(1, \"ignored\")",
+        )
+        .unwrap(),
+        Value::Int(1)
+    );
 }
 
 #[test]
