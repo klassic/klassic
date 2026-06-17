@@ -2304,8 +2304,22 @@ impl TypeChecker {
                     ));
                 }
                 let arity = params.len();
-                for (expected, argument) in params.into_iter().zip(arguments.iter()) {
-                    self.check_call_argument(expected, argument)?;
+                // Check non-lambda arguments before lambda arguments: a
+                // lambda whose body dispatches on its parameter (e.g.
+                // `(lst) => lst.size()`) would otherwise commit that
+                // parameter's still-free type variable to a structural-record
+                // shape before a sibling argument pins it to the real type, so
+                // `hof((lst) => lst.size(), [1,2,3])` would spuriously fail.
+                let pairs: Vec<(Type, &Expr)> = params.into_iter().zip(arguments.iter()).collect();
+                for (expected, argument) in &pairs {
+                    if !matches!(argument, Expr::Lambda { .. }) {
+                        self.check_call_argument(expected.clone(), argument)?;
+                    }
+                }
+                for (expected, argument) in &pairs {
+                    if matches!(argument, Expr::Lambda { .. }) {
+                        self.check_call_argument(expected.clone(), argument)?;
+                    }
                 }
                 let result = self.resolve(&result);
                 if arguments.len() > arity {
@@ -2490,8 +2504,22 @@ impl TypeChecker {
                     ));
                 }
                 let arity = params.len();
-                for (expected, argument) in params.into_iter().zip(arguments.iter()) {
-                    self.check_call_argument(expected, argument)?;
+                // Check non-lambda arguments before lambda arguments: a
+                // lambda whose body dispatches on its parameter (e.g.
+                // `(lst) => lst.size()`) would otherwise commit that
+                // parameter's still-free type variable to a structural-record
+                // shape before a sibling argument pins it to the real type, so
+                // `hof((lst) => lst.size(), [1,2,3])` would spuriously fail.
+                let pairs: Vec<(Type, &Expr)> = params.into_iter().zip(arguments.iter()).collect();
+                for (expected, argument) in &pairs {
+                    if !matches!(argument, Expr::Lambda { .. }) {
+                        self.check_call_argument(expected.clone(), argument)?;
+                    }
+                }
+                for (expected, argument) in &pairs {
+                    if matches!(argument, Expr::Lambda { .. }) {
+                        self.check_call_argument(expected.clone(), argument)?;
+                    }
                 }
                 let result = self.resolve(&result);
                 if arguments.len() > arity {
