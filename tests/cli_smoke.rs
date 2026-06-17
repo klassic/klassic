@@ -1306,34 +1306,50 @@ fn native_print_with_nested_console_output_matches_eval() {
     );
 }
 
-/// Native equality of enum values used to silently compare heap identity
-/// (so `Red == Red` returned `false`); it is now refused with a clean
-/// diagnostic rather than miscompiled. The evaluator compares structurally
-/// (the oracle answer is `true`).
+/// Native equality of enum values compares them structurally through
+/// `gc_deep_equal`, matching the evaluator. Earlier the native backend
+/// compared heap identity (so two freshly built copies looked unequal),
+/// then refused the construct outright; now it walks the GC structure of
+/// both operands. Covers nullary variants, a scalar payload, a string
+/// payload, a nested enum, distinct variants, and `!=`, against the
+/// evaluator oracle.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn native_enum_equality_is_refused_not_miscompiled() {
+fn native_enum_equality_matches_evaluator() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time should be monotonic")
         .as_nanos();
     let source_path = std::env::temp_dir().join(format!("klassic-enum-eq-{unique}.kl"));
     let output_path = std::env::temp_dir().join(format!("klassic-enum-eq-{unique}"));
-    fs::write(
-        &source_path,
-        "enum Color { case Red; case Green }\nprintln(Red == Red)\n",
-    )
-    .expect("source should write");
+    let program = "enum Color { case Red; case Green }\n\
+         enum Box { case S(v: Int); case T(v: Int) }\n\
+         enum Named { case N(s: String); case Z }\n\
+         enum Opt { case Som(v: Int); case Non }\n\
+         enum Wrap { case W(o: Opt); case E }\n\
+         println(Red == Red)\n\
+         println(Red == Green)\n\
+         println(S(5) == S(5))\n\
+         println(S(5) == S(6))\n\
+         println(S(5) == T(5))\n\
+         println(N(\"hi\") == N(\"hi\"))\n\
+         println(N(\"hi\") == N(\"ho\"))\n\
+         println(W(Som(3)) == W(Som(3)))\n\
+         println(W(Som(3)) == W(Non))\n\
+         println(S(5) != S(6))\n\
+         println(S(5) != S(5))\n";
+    fs::write(&source_path, program).expect("source should write");
 
-    // The evaluator (oracle) compares structurally: Red == Red is true.
+    // Expected structural-equality answers (the evaluator is the oracle).
+    let expected = "true\nfalse\ntrue\nfalse\nfalse\ntrue\nfalse\ntrue\nfalse\ntrue\nfalse\n";
+
     let eval = Command::new(klassic_bin())
         .arg(&source_path)
         .output()
         .expect("evaluator should run");
     assert!(eval.status.success());
-    assert_eq!(String::from_utf8_lossy(&eval.stdout), "true\n");
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), expected);
 
-    // The native build refuses rather than silently returning false.
     let build = Command::new(klassic_bin())
         .args([
             "build",
@@ -1343,16 +1359,79 @@ fn native_enum_equality_is_refused_not_miscompiled() {
         ])
         .output()
         .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build should compile enum equality, got:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("native binary should run");
     let _ = fs::remove_file(&source_path);
     let _ = fs::remove_file(&output_path);
-    assert!(
-        !build.status.success(),
-        "native enum equality should be refused, not miscompiled"
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected,
+        "native enum equality must match the evaluator"
     );
+}
+
+/// Enum equality stays correct under collection pressure: the allocator
+/// can hand a value a larger free block without splitting it, so two
+/// equal enums may sit in different-sized blocks. `gc_deep_equal`
+/// compares the shared content prefix, not the block size, so churning
+/// many enum allocations through a structural comparison still reports
+/// every identical pair as equal.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_enum_equality_survives_allocation_churn() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-enum-eq-churn-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-enum-eq-churn-{unique}"));
+    fs::write(
+        &source_path,
+        "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         def same(a: Tree, b: Tree): Boolean = a == b\n\
+         mutable i = 0\n\
+         mutable hits = 0\n\
+         while (i < 50000) {\n\
+         \u{20}\u{20}val t1 = Branch(Leaf(i), Branch(Leaf(1), Leaf(2)))\n\
+         \u{20}\u{20}val t2 = Branch(Leaf(i), Branch(Leaf(1), Leaf(2)))\n\
+         \u{20}\u{20}if (same(t1, t2)) { hits = hits + 1 }\n\
+         \u{20}\u{20}i = i + 1\n\
+         }\n\
+         println(hits)\n",
+    )
+    .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
     assert!(
-        String::from_utf8_lossy(&build.stderr).contains("equality of heap values such as enums"),
-        "expected a clean unsupported diagnostic, got:\n{}",
+        build.status.success(),
+        "native build should compile, got:\n{}",
         String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("native binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "50000\n",
+        "every identical tree pair must compare equal under churn"
     );
 }
 

@@ -3921,6 +3921,7 @@ struct NativeCodeGenerator {
     gc_pin: TextLabel,
     gc_unpin: TextLabel,
     gc_mark_visit: TextLabel,
+    gc_deep_equal: TextLabel,
     gc_grow_heap: TextLabel,
     gc_bounds_error: TextLabel,
     gc_oom_text: DataLabel,
@@ -4095,6 +4096,7 @@ impl NativeCodeGenerator {
         let gc_pin = asm.create_text_label();
         let gc_unpin = asm.create_text_label();
         let gc_mark_visit = asm.create_text_label();
+        let gc_deep_equal = asm.create_text_label();
         let gc_grow_heap = asm.create_text_label();
         let gc_bounds_error = asm.create_text_label();
         let gc_oom_text = asm.data_label_with_bytes(b"klassic gc: out of memory\n");
@@ -4164,6 +4166,7 @@ impl NativeCodeGenerator {
             gc_pin,
             gc_unpin,
             gc_mark_visit,
+            gc_deep_equal,
             gc_grow_heap,
             gc_bounds_error,
             gc_oom_text,
@@ -4744,6 +4747,7 @@ impl NativeCodeGenerator {
         self.emit_stack_overflow_abort_runtime();
         self.emit_print_i64_runtime();
         self.emit_gc_mark_visit_runtime();
+        self.emit_gc_deep_equal_runtime();
         self.emit_gc_alloc_runtime();
         self.emit_gc_collect_runtime();
         self.emit_gc_pin_runtime();
@@ -6394,15 +6398,33 @@ impl NativeCodeGenerator {
             return Ok(NativeValue::Bool);
         }
         // A heap value (e.g. an enum constructor) reaching this fallthrough
-        // for `==`/`!=` would be compared by heap identity — two freshly
-        // built copies of the same value have different addresses, so the
-        // result is wrong. Refuse it cleanly instead of silently
-        // miscompiling; structural enum equality is a future feature
-        // (the evaluator already compares them structurally).
+        // for `==`/`!=` must be compared structurally — two freshly built
+        // copies of the same value have different addresses, so a bare
+        // pointer comparison would be wrong. `gc_deep_equal` walks the GC
+        // headers of both operands; the type checker has already proved
+        // they share a type, so the structural walk matches the
+        // evaluator's `Value` equality.
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && matches!(lhs_value, NativeValue::HeapPointer)
         {
-            return Err(unsupported(span, "equality of heap values such as enums"));
+            self.push_temp_reg(Reg::Rax);
+            let rhs_value = self.compile_expr(rhs)?;
+            if !matches!(rhs_value, NativeValue::HeapPointer) {
+                return Err(unsupported(
+                    span,
+                    "native equality for a heap value and this value type",
+                ));
+            }
+            // rax = rhs pointer; restore lhs pointer into rdi.
+            self.pop_temp_reg(Reg::Rdi);
+            self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
+            self.asm.call_label(self.gc_deep_equal);
+            if op == BinaryOp::NotEqual {
+                self.asm.cmp_reg_imm8(Reg::Rax, 0);
+                self.asm.setcc_al(Condition::Equal);
+                self.asm.movzx_rax_al();
+            }
+            return Ok(NativeValue::Bool);
         }
         if !matches!(lhs_value, NativeValue::Int | NativeValue::HeapPointer) {
             return Err(unsupported(span, "native binary operation for non-Int lhs"));
@@ -38742,6 +38764,150 @@ impl NativeCodeGenerator {
             b"klassic gc: mark worklist overflow\n".len(),
         );
         self.emit_exit_code(1);
+    }
+
+    /// `gc_deep_equal(a, b)` (rdi = a, rsi = b) compares two heap values
+    /// structurally, returning rax = 1 when they are equal and rax = 0
+    /// otherwise. It is the native counterpart of the evaluator's
+    /// structural equality on enums (and any other heap value reachable
+    /// from one): the `==` / `!=` site calls it instead of comparing the
+    /// two pointers by identity, which would report two freshly built
+    /// copies of the same value as unequal.
+    ///
+    /// Every heap object carries the 16-byte `[size|mark][type_tag]`
+    /// header. The two operands share a type (the checker proved it), so
+    /// their tags match and their meaningful content occupies the same
+    /// leading slots/bytes — but their *block* sizes can differ, because
+    /// the allocator may hand a value a larger free block without
+    /// splitting it. The surplus is always zero-filled padding, and the
+    /// meaningful content (a record's real fields, a string's
+    /// length-prefixed bytes, a list's length-prefixed elements, a boxed
+    /// scalar's 8 bytes) is always a prefix no longer than either block.
+    /// So comparing only the shorter payload is exact: any real
+    /// difference lies within that prefix, and the tail of the larger
+    /// block is padding that does not affect equality. `GC_TYPE_RAW_BYTES`
+    /// payloads are compared qword by qword; `GC_TYPE_POINTER_*` payloads
+    /// are compared slot by slot by recursing, with the pointer-list tag
+    /// first checking the two leading integer lengths and skipping that
+    /// word. An enum's variant tag is itself slot 0 (a boxed integer), so
+    /// distinct variants fall out at the first slot. The recursion depth
+    /// tracks the nesting depth of the compared values, not the heap size.
+    fn emit_gc_deep_equal_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_deep_equal);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        // Locals: [rbp-8] = cursor_a, [rbp-16] = end_a, [rbp-24] = cursor_b.
+        self.asm.sub_reg_imm8(Reg::Rsp, 32);
+
+        let equal = self.asm.create_text_label();
+        let not_equal = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        let raw_bytes = self.asm.create_text_label();
+        let raw_loop = self.asm.create_text_label();
+        let ptr_setup = self.asm.create_text_label();
+        let slot_loop = self.asm.create_text_label();
+        let raw_have_min = self.asm.create_text_label();
+        let ptr_have_min = self.asm.create_text_label();
+
+        // Identical pointers (including both null) are trivially equal.
+        self.asm.cmp_reg_reg(Reg::Rdi, Reg::Rsi);
+        self.asm.jcc_label(Condition::Equal, equal);
+        // A null on exactly one side has no header to dereference.
+        self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
+        self.asm.jcc_label(Condition::Equal, not_equal);
+        self.asm.test_reg_reg(Reg::Rsi, Reg::Rsi);
+        self.asm.jcc_label(Condition::Equal, not_equal);
+        // Type tags must match: type_a = [rdi-8], type_b = [rsi-8].
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdi, -8);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rsi, -8);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::NotEqual, not_equal);
+        // payload_a = ([rdi-16] & ~mark) - 16 in r8, payload_b in r9.
+        self.asm.load_ptr_disp32(Reg::R8, Reg::Rdi, -16);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::Rsi, -16);
+        self.asm.mov_imm64(Reg::R11, !(1_u64 << 63));
+        self.asm.and_reg_reg(Reg::R8, Reg::R11);
+        self.asm.and_reg_reg(Reg::R9, Reg::R11);
+        self.asm.sub_reg_imm8(Reg::R8, 16);
+        self.asm.sub_reg_imm8(Reg::R9, 16);
+        // rax still holds the shared type tag.
+        self.asm
+            .cmp_reg_imm8(Reg::Rax, Self::GC_TYPE_RAW_BYTES as i8);
+        self.asm.jcc_label(Condition::Equal, raw_bytes);
+        self.asm
+            .cmp_reg_imm8(Reg::Rax, Self::GC_TYPE_POINTER_RECORD as i8);
+        self.asm.jcc_label(Condition::Below, not_equal);
+        // Pointer record / array / list: a packed run of heap-pointer
+        // slots, optionally led by an integer length for the list tag.
+        self.asm
+            .cmp_reg_imm8(Reg::Rax, Self::GC_TYPE_POINTER_LIST as i8);
+        self.asm.jcc_label(Condition::NotEqual, ptr_setup);
+        // List: the two lengths must match, then skip past the length word.
+        self.asm.load_ptr_disp32(Reg::R10, Reg::Rdi, 0);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::Rsi, 0);
+        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
+        self.asm.jcc_label(Condition::NotEqual, not_equal);
+        self.asm.add_reg_imm32(Reg::Rdi, 8);
+        self.asm.add_reg_imm32(Reg::Rsi, 8);
+        self.asm.sub_reg_imm8(Reg::R8, 8);
+        self.asm.sub_reg_imm8(Reg::R9, 8);
+        self.asm.bind_text_label(ptr_setup);
+        // r8 = min(payload_a, payload_b): compare only the shared prefix.
+        self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
+        self.asm.jcc_label(Condition::Below, ptr_have_min);
+        self.asm.mov_reg_reg(Reg::R8, Reg::R9);
+        self.asm.bind_text_label(ptr_have_min);
+        // cursor_a = rdi, end_a = rdi + min, cursor_b = rsi.
+        self.asm.mov_reg_reg(Reg::R10, Reg::Rdi);
+        self.asm.add_reg_reg(Reg::R10, Reg::R8);
+        self.asm.store_rbp_slot(8, Reg::Rdi);
+        self.asm.store_rbp_slot(16, Reg::R10);
+        self.asm.store_rbp_slot(24, Reg::Rsi);
+        self.asm.bind_text_label(slot_loop);
+        self.asm.load_rbp_slot(Reg::R10, 8);
+        self.asm.load_rbp_slot(Reg::R11, 16);
+        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
+        self.asm.jcc_label(Condition::AboveOrEqual, equal);
+        self.asm.load_rbp_slot(Reg::R11, 24);
+        // rdi = a_slot = [cursor_a], rsi = b_slot = [cursor_b], recurse.
+        self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
+        self.asm.load_ptr_disp32(Reg::Rsi, Reg::R11, 0);
+        self.asm.call_label(self.gc_deep_equal);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, not_equal);
+        // Advance both cursors one slot and continue.
+        self.asm.load_rbp_slot(Reg::R10, 8);
+        self.asm.add_reg_imm32(Reg::R10, 8);
+        self.asm.store_rbp_slot(8, Reg::R10);
+        self.asm.load_rbp_slot(Reg::R10, 24);
+        self.asm.add_reg_imm32(Reg::R10, 8);
+        self.asm.store_rbp_slot(24, Reg::R10);
+        self.asm.jmp_label(slot_loop);
+        // Raw bytes: compare the shared-prefix payload qword by qword.
+        self.asm.bind_text_label(raw_bytes);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
+        self.asm.jcc_label(Condition::Below, raw_have_min);
+        self.asm.mov_reg_reg(Reg::R8, Reg::R9);
+        self.asm.bind_text_label(raw_have_min);
+        self.asm.bind_text_label(raw_loop);
+        self.asm.test_reg_reg(Reg::R8, Reg::R8);
+        self.asm.jcc_label(Condition::Equal, equal);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::Rdi, 0);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::Rsi, 0);
+        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
+        self.asm.jcc_label(Condition::NotEqual, not_equal);
+        self.asm.add_reg_imm32(Reg::Rdi, 8);
+        self.asm.add_reg_imm32(Reg::Rsi, 8);
+        self.asm.sub_reg_imm8(Reg::R8, 8);
+        self.asm.jmp_label(raw_loop);
+        self.asm.bind_text_label(equal);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(not_equal);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.bind_text_label(done);
+        self.asm.leave();
+        self.asm.ret();
     }
 
     /// `gc_pin(addr)` (rdi = addr): registers `addr` in the static root
