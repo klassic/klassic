@@ -381,6 +381,13 @@ Static string-key maps, static string-valued maps, string sets, and scalar
 list / set / map entries answer `containsKey` / `containsValue` /
 `contains` queries from runtime strings, ints, and booleans.
 
+The two-argument `m.getOrElse(k, d)` lowers to a temp-bound
+`containsKey` / `get` / `if`, evaluating `m` and `k` once and falling back
+to `d` on a miss. `m.keys()` / `m.values()` return the key or value list of
+a map — a runtime map reuses the key/value list builders, while a static map
+literal projects its compile-time entries. `s.toList()` projects a static
+set's elements into a list.
+
 Builtin module aliases, selective imports, and aliased helper values, such
 as `import Map as M`, `import Map.{size}`, and `val readAll = FI#readAll`,
 resolve to the same native helper implementations. Static record fields may
