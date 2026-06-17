@@ -619,6 +619,33 @@ fn typeclass_simple_specs_are_covered() {
 }
 
 #[test]
+fn typeclass_bare_type_param_specs_are_covered() {
+    // A bare lowercase class type parameter (`typeclass Show<a>`) is a type
+    // variable, consistent with enums/records/defs/extensions. It used to be
+    // treated as a concrete type, so the method signature `(a) => String` did
+    // not match the `Int` instance and `show(42)` failed.
+    let program = r#"
+        typeclass Show<a> where {
+          show: (a) => String
+        }
+
+        instance Show<Int> where {
+          def show(x: Int): String = "I" + x
+        }
+
+        instance Show<Boolean> where {
+          def show(b: Boolean): String = if(b) "Y" else "N"
+        }
+
+        show(42) + ", " + show(true)
+    "#;
+    assert_eq!(
+        evaluate_text("<expr>", program).unwrap(),
+        Value::String("I42, Y".to_string())
+    );
+}
+
+#[test]
 fn higher_kinded_typeclass_specs_are_covered() {
     let program = r#"
         typeclass Functor<'f: * => *> where {
