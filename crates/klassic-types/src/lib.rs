@@ -3627,7 +3627,14 @@ impl TypeChecker {
                 .iter()
                 .map(|method| TypeClassMethodInfo {
                     name: method.name.clone(),
-                    ty: parse_schema_type_annotation(&method.annotation.text, type_params),
+                    // Mirror the enum/record path: a bare class type
+                    // parameter (`typeclass Show<a> where { show: (a) => ... }`)
+                    // parses to `Named("a")`, so generify it to a type
+                    // variable like the `'a` form already is.
+                    ty: generify_named_params(
+                        parse_schema_type_annotation(&method.annotation.text, type_params),
+                        type_params,
+                    ),
                 })
                 .collect(),
         }
