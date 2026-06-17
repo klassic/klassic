@@ -1523,10 +1523,57 @@ impl TypeChecker {
                 class_name,
                 for_type_annotation,
                 constraints,
+                methods,
                 span,
                 ..
             } => {
                 self.register_instance(class_name, for_type_annotation, constraints, *span)?;
+                // Type-check each instance method body against its declared
+                // return type, so a body that disagrees with its signature
+                // (`def compute(x: Boolean): Int = "not an int"`) is rejected
+                // at compile time instead of crashing at runtime. The method
+                // name itself is deliberately NOT declared in the scratch
+                // scope: a class method called inside the body (e.g.
+                // `show(p.name)`) must dispatch through the polymorphic class
+                // method, not recurse into this instance's own monomorphic
+                // definition.
+                for method in methods {
+                    let Expr::DefDecl {
+                        params,
+                        param_annotations,
+                        return_annotation,
+                        body,
+                        ..
+                    } = method
+                    else {
+                        continue;
+                    };
+                    self.push_scope();
+                    let result = (|| {
+                        let mut named = HashMap::new();
+                        for (index, param) in params.iter().enumerate() {
+                            let ty = param_annotations
+                                .get(index)
+                                .and_then(|annotation| annotation.as_ref())
+                                .map(|annotation| {
+                                    self.parse_annotation_with_named_vars(annotation, &mut named)
+                                })
+                                .unwrap_or_else(|| self.fresh_var());
+                            self.declare(param.clone(), false, ty, Vec::new(), Vec::new());
+                        }
+                        let return_type = return_annotation
+                            .as_ref()
+                            .map(|annotation| {
+                                self.parse_annotation_with_named_vars(annotation, &mut named)
+                            })
+                            .unwrap_or_else(|| self.fresh_var());
+                        let body_type = self.infer_expr(body)?;
+                        self.enforce_assignable(return_type, body_type, body.span())?;
+                        Ok(())
+                    })();
+                    self.pop_scope();
+                    result?;
+                }
                 Ok(Type::Unit)
             }
             Expr::TheoremDeclaration {

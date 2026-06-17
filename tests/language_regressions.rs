@@ -672,6 +672,39 @@ fn typeclass_bare_type_param_specs_are_covered() {
 }
 
 #[test]
+fn instance_method_body_is_checked_against_its_return_type() {
+    // An instance method whose body disagrees with its declared return type is
+    // rejected at compile time instead of crashing at runtime. The body used
+    // to be unchecked entirely.
+    let wrong_return = evaluate_text(
+        "<expr>",
+        "typeclass Compute<'a> where { compute: ('a) => Int }\n\
+         instance Compute<Boolean> where { def compute(x: Boolean): Int = \"not an int\" }\n\
+         compute(true)",
+    )
+    .expect_err("an instance body that returns the wrong type should fail");
+    assert!(
+        wrong_return.to_string().contains("type mismatch"),
+        "expected a type-mismatch error, got: {wrong_return}"
+    );
+
+    // A class method called inside an instance body dispatches through the
+    // polymorphic class method (here `show` on a `String` field), so a
+    // correct instance that references other instances still type-checks.
+    let valid = evaluate_text(
+        "<expr>",
+        "typeclass Show<'a> where { show: ('a) => String }\n\
+         instance Show<Int> where { def show(x: Int): String = \"i\" + x }\n\
+         instance Show<String> where { def show(x: String): String = x }\n\
+         record Person { name: String; age: Int }\n\
+         instance Show<Person> where { def show(p: Person): String = show(p.name) + \"/\" + show(p.age) }\n\
+         show(#Person(\"a\", 7))",
+    )
+    .unwrap();
+    assert_eq!(valid, Value::String("a/i7".to_string()));
+}
+
+#[test]
 fn two_constraints_on_same_class_use_distinct_type_variables() {
     // `def pair<Show 'a, Show 'b>` has two constraints on the same class with
     // different type variables. The class method `show` must be usable at both
