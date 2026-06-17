@@ -484,6 +484,23 @@ fn record_specs_are_covered_more_directly() {
             .to_string()
             .contains("is not available on this record")
     );
+
+    // A bare lowercase record type parameter (`record Box<a>`) is a type
+    // variable, consistent with enums (`enum Option<a>`). It used to be
+    // treated as a concrete type, so `#Box(5)` failed to unify; only the
+    // `'a` form worked.
+    assert_eq!(
+        evaluate_text("<expr>", "record Box<a> {\n  v: a\n}\nval b = #Box(5)\nb.v",).unwrap(),
+        Value::Int(5)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "record Pair<a, b> {\n  fst: a\n  snd: b\n}\nval p = #Pair(1, \"two\")\np.snd",
+        )
+        .unwrap(),
+        Value::String("two".to_string())
+    );
 }
 
 #[test]
