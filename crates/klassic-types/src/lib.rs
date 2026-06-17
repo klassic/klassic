@@ -3714,10 +3714,24 @@ impl TypeChecker {
                 .zip(constraint.arguments.iter().cloned())
                 .collect();
             for method in &info.methods {
-                self.declare_mono(
+                // Declare the class method polymorphically over the
+                // constraint's type variables with the constraint attached,
+                // rather than monomorphically tied to one constraint's
+                // argument. Each use then instantiates fresh and records the
+                // constraint at its concrete type. This lets two constraints
+                // on the same class with different type variables
+                // (`def pair<Show 'a, Show 'b>`) both reach `show` without
+                // unifying `'a` and `'b` — the old `declare_mono` overwrote
+                // the method with the last constraint's type, forcing the two
+                // variables equal and spuriously rejecting mixed-type calls.
+                let ty = substitute_generics(&method.ty, &substitutions);
+                let generalized = free_vars(&ty);
+                self.declare(
                     method.name.clone(),
                     false,
-                    substitute_generics(&method.ty, &substitutions),
+                    ty,
+                    generalized,
+                    vec![constraint.clone()],
                 );
             }
         }
