@@ -84,6 +84,28 @@ fn stdlib_negative_and_boundary_fixes() {
     );
 }
 
+/// Strings compare lexicographically by code point, so the ordering
+/// operators and `std.list.sort` work on text — not just numbers.
+#[test]
+fn strings_compare_lexicographically() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.list\nprintln(\"apple\" < \"banana\")\nprintln(\"b\" > \"a\")\nprintln(\"a\" <= \"a\")\nprintln(\"zebra\" >= \"apple\")\nprintln(sort([\"banana\", \"apple\", \"cherry\"]))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "string comparison should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "true\ntrue\ntrue\ntrue\n[apple, banana, cherry]\n()\n"
+    );
+}
+
 /// Arity-mismatch diagnostics pluralize the noun: exactly one expected
 /// argument reads "1 argument", any other count reads "N arguments".
 #[test]
@@ -3234,6 +3256,68 @@ fn builds_native_executable_for_set_combine() {
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&eval.stdout),
         "native Set#union / intersect / subtract must match eval"
+    );
+}
+
+/// Ordering of compile-time-known strings folds to a constant in native
+/// builds, matching the evaluator. (Runtime string ordering stays a clean
+/// diagnostic; it is not lowered yet.)
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_static_string_comparison() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-strcmp-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-strcmp-{unique}"));
+    fs::write(
+        &source_path,
+        "println(\"apple\" < \"banana\")\n\
+         println(\"b\" > \"a\")\n\
+         println(\"a\" <= \"a\")\n\
+         println(\"zebra\" >= \"apple\")\n\
+         val x = \"mango\"\n\
+         val y = \"melon\"\n\
+         println(x < y)\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native static string comparison must match eval"
     );
 }
 

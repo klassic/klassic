@@ -278,12 +278,29 @@ fn eval_divide(lhs: Value, rhs: Value, span: Span) -> Result<Value, Diagnostic> 
 }
 
 fn eval_comparison(op: BinaryOp, lhs: Value, rhs: Value, span: Span) -> Result<Value, Diagnostic> {
+    // Two strings compare lexicographically by code point (UTF-8 byte order
+    // preserves code-point order), so sorting and range checks work on text.
+    if let (Value::String(lhs), Value::String(rhs)) = (&lhs, &rhs) {
+        let result = match op {
+            BinaryOp::Less => lhs < rhs,
+            BinaryOp::LessEqual => lhs <= rhs,
+            BinaryOp::Greater => lhs > rhs,
+            BinaryOp::GreaterEqual => lhs >= rhs,
+            _ => unreachable!("comparison operator expected"),
+        };
+        return Ok(Value::Bool(result));
+    }
     let (lhs, rhs) = match (numeric_value(&lhs), numeric_value(&rhs)) {
         (Some(lhs), Some(rhs)) => {
             let (lhs, rhs, _) = promote_numeric_pair(lhs, rhs);
             (lhs.as_f64(), rhs.as_f64())
         }
-        _ => return Err(Diagnostic::runtime(span, "comparison expects numbers")),
+        _ => {
+            return Err(Diagnostic::runtime(
+                span,
+                "comparison expects two numbers or two strings",
+            ));
+        }
     };
     let result = match op {
         BinaryOp::Less => lhs < rhs,
