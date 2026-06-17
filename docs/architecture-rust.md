@@ -135,7 +135,14 @@ cargo run -- -e "1 + 2"
   fragments with mutable block prefixes when their final values remain
   recoverable. Interpolation fragments that resolve to native runtime strings,
   or to dynamic native `Int` / `Boolean` values, produce fixed-buffer
-  `RuntimeString` values.
+  `RuntimeString` values. Because that fixed buffer and its offset cell are a
+  single static slot per interpolation site, a hole that can re-enter the site
+  (a call into a function that itself interpolates, including direct or mutual
+  recursion) snapshots the in-progress prefix into a GC heap string, evaluates
+  the hole, then restores the prefix and offset before appending the fragment;
+  without that snapshot the inner build resets the offset to 0 and the outer
+  resumed appending at the wrong position. Collection-literal holes keep their
+  in-place short-circuit and never reach the snapshot path.
   Static string and integer list values can be bound with `val`; static string
   helpers, including `split` and `join`, are folded at compile time for native
   codegen, and static string concatenation can produce immutable static values

@@ -3750,6 +3750,70 @@ fn builds_native_executable_for_shadowed_param_in_returned_closure() {
 /// A variable captured transitively through an intermediate closure layer is
 /// read by value, not through a stale frame slot. `makeAdder(100)` then
 /// `f(10)` then `g(1)` must compute `base + x + y = 111`; the innermost
+/// A recursive function whose body interpolates a recursive call used to
+/// corrupt its result: the interpolation buffer + offset cell are a single
+/// static slot per site, so the inner invocation reset the offset and the
+/// outer resumed appending at the wrong position (`show(Wrap(Wrap(Base)))`
+/// gave `[X][X]]` instead of `[[X]]`). The fix snapshots the in-progress
+/// prefix around a re-entrant hole and restores it after. The argument
+/// comes from `CommandLine#args().size()` so the recursion is genuinely
+/// runtime (a literal argument would be constant-folded and never hit the
+/// runtime buffer).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_recursive_interpolation() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-recurinterp-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-recurinterp-{unique}"));
+    fs::write(
+        &source_path,
+        "enum E { case Wrap(inner: E); case Base }\n\
+         def show(e: E): String = e match { case Wrap(inner) => \"[#{show(inner)}]\"; case Base => \"X\" }\n\
+         val z = CommandLine#args().size()\n\
+         def tag(n: Int): String = if (n <= 0) \"X\" else \"A#{tag(n - 1)}B\"\n\
+         println(show(Wrap(Wrap(Base))))\n\
+         println(tag(z + 2))\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "[[X]]\nAAXBB\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native must match eval for a recursive function that interpolates a recursive call"
+    );
+}
+
 /// closure's `base` (the outermost parameter) used to alias the middle
 /// layer's `x`, silently computing `x + x + y = 21`.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
