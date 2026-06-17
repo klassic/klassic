@@ -2990,6 +2990,67 @@ fn builds_native_executable_for_map_get_or_else() {
     );
 }
 
+/// `m.keys()` / `m.values()` over a static map project its compile-time
+/// entries into a list, matching the evaluator for direct printing,
+/// `foreach`, and chained list methods.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_map_keys_and_values() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-mapkeys-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-mapkeys-{unique}"));
+    fs::write(
+        &source_path,
+        "val m = %[\"a\": 1, \"b\": 2, \"c\": 3]\n\
+         println(m.keys())\n\
+         println(m.values())\n\
+         println(m.keys().size())\n\
+         foreach (k in m.keys()) { println(k) }\n\
+         foreach (v in m.values()) { println(v) }\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        "[a, b, c]\n[1, 2, 3]\n3\na\nb\nc\n1\n2\n3\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native Map#keys / Map#values must match eval"
+    );
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_runtime_return_map_function_values() {
