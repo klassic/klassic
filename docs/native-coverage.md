@@ -344,6 +344,19 @@ over applied types such as `List<Int>` are supported. A constraint with
 no matching instance is rejected ahead of codegen with a `missing
 instance` diagnostic, in native builds exactly as in the evaluator.
 
+## Proof Surface
+
+`axiom` and `theorem` declarations are a static, type-check-time
+surface — Klassic does not run a proof checker on theorem bodies, and
+the declarations are erased before codegen, so a native build compiles
+and runs the ordinary runtime portion of a program that uses them. The
+`--warn-trust` and `--deny-trust` gates apply to native builds exactly
+as they do to the evaluator: `--warn-trust` reports every theorem whose
+proof transitively depends on a trusted (`axiom` or `trust`-marked)
+declaration, and `--deny-trust` rejects the build when any reachable
+theorem does. Calling a zero-argument axiom in proof position is a
+shared type-check limitation, diagnosed identically by both paths.
+
 ## Runtime List Literals And Selectors
 
 Direct `head` over list literals can return runtime native values, including
