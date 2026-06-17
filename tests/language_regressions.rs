@@ -446,6 +446,34 @@ fn map_specs_are_covered() {
 }
 
 #[test]
+fn match_resolves_constructors_against_the_scrutinee_enum() {
+    // A user enum may reuse a prelude constructor name (`Ok`/`Err`,
+    // `Some`/`None`). A match arm's constructor must resolve against the
+    // scrutinee's own enum, not whichever enum the schema map happens to
+    // iterate first — that made the same program compile or fail at random.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "enum Outcome<a, b> { case Ok(value: a); case Err(msg: b) }\n\
+             def unwrap(r: Outcome<Int, String>): Int = r match { case Ok(v) => v; case Err(e) => 0 }\n\
+             unwrap(Ok(42))",
+        )
+        .unwrap(),
+        Value::Int(42)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "enum Maybe<a> { case Some(v: a); case None }\n\
+             def f(m: Maybe<Int>): Int = m match { case Some(v) => v; case None => 0 }\n\
+             f(Some(7))",
+        )
+        .unwrap(),
+        Value::Int(7)
+    );
+}
+
+#[test]
 fn record_specs_are_covered_more_directly() {
     assert_eq!(
         evaluate_text(
