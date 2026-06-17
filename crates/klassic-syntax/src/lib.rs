@@ -706,16 +706,87 @@ impl<'a> Lexer<'a> {
         })
     }
 
+    /// A digit, or a `_` digit separator that sits between two digits
+    /// (`1_000`). A trailing `_` is left for the next token, so `1_` still
+    /// lexes the integer `1`.
+    fn peek_is_digit_or_separator(&self) -> bool {
+        match self.peek_char() {
+            Some(ch) if ch.is_ascii_digit() => true,
+            Some('_') => matches!(self.peek_nth_char(1), Some(ch) if ch.is_ascii_digit()),
+            _ => false,
+        }
+    }
+
     fn lex_number(&mut self) -> Result<Token, Diagnostic> {
         let start = self.position;
-        while matches!(self.peek_char(), Some(ch) if ch.is_ascii_digit()) {
+        // Hex literal `0x..` / `0X..` (with `_` separators and an optional
+        // integer-width suffix), parsed in radix 16.
+        if self.peek_char() == Some('0')
+            && matches!(self.peek_nth_char(1), Some('x' | 'X'))
+            && matches!(self.peek_nth_char(2), Some(ch) if ch.is_ascii_hexdigit())
+        {
+            self.bump_char();
+            self.bump_char();
+            let digits_start = self.position;
+            while matches!(self.peek_char(), Some(ch) if ch.is_ascii_hexdigit())
+                || (self.peek_char() == Some('_')
+                    && matches!(self.peek_nth_char(1), Some(ch) if ch.is_ascii_hexdigit()))
+            {
+                self.bump_char();
+            }
+            let digits_end = self.position;
+            let kind = if self.input[self.position..].starts_with("BY") {
+                self.position += 2;
+                IntLiteralKind::Byte
+            } else if matches!(self.peek_char(), Some('S')) {
+                self.bump_char();
+                IntLiteralKind::Short
+            } else if matches!(self.peek_char(), Some('L')) {
+                self.bump_char();
+                IntLiteralKind::Long
+            } else {
+                IntLiteralKind::Int
+            };
+            let text = self.input[digits_start..digits_end].replace('_', "");
+            let value = i64::from_str_radix(&text, 16).map_err(|_| {
+                Diagnostic::parse(
+                    Span::new(start, digits_end),
+                    "integer literal is out of range",
+                )
+            })?;
+            return Ok(Token {
+                kind: TokenKind::Int(value, kind),
+                span: Span::new(start, self.position),
+            });
+        }
+        while self.peek_is_digit_or_separator() {
             self.bump_char();
         }
 
-        let is_double = if self.peek_char() == Some('.')
+        let has_fraction = if self.peek_char() == Some('.')
             && matches!(self.peek_nth_char(1), Some(ch) if ch.is_ascii_digit())
         {
             self.bump_char();
+            while self.peek_is_digit_or_separator() {
+                self.bump_char();
+            }
+            true
+        } else {
+            false
+        };
+
+        // Scientific notation `e` / `E` with an optional sign, e.g. `1e9`,
+        // `1.5e-3`. Its presence makes the literal a floating-point value
+        // even without a fractional part.
+        let has_exponent = if matches!(self.peek_char(), Some('e' | 'E'))
+            && (matches!(self.peek_nth_char(1), Some(ch) if ch.is_ascii_digit())
+                || (matches!(self.peek_nth_char(1), Some('+' | '-'))
+                    && matches!(self.peek_nth_char(2), Some(ch) if ch.is_ascii_digit())))
+        {
+            self.bump_char();
+            if matches!(self.peek_char(), Some('+' | '-')) {
+                self.bump_char();
+            }
             while matches!(self.peek_char(), Some(ch) if ch.is_ascii_digit()) {
                 self.bump_char();
             }
@@ -723,6 +794,8 @@ impl<'a> Lexer<'a> {
         } else {
             false
         };
+
+        let is_double = has_fraction || has_exponent;
 
         if is_double {
             let (text_end, kind) = if matches!(self.peek_char(), Some('F')) {
@@ -732,7 +805,7 @@ impl<'a> Lexer<'a> {
             } else {
                 (self.position, FloatLiteralKind::Double)
             };
-            let text = &self.input[start..text_end];
+            let text = self.input[start..text_end].replace('_', "");
             let value = text.parse::<f64>().map_err(|_| {
                 Diagnostic::parse(Span::new(start, text_end), "invalid floating point literal")
             })?;
@@ -761,7 +834,7 @@ impl<'a> Lexer<'a> {
             IntLiteralKind::Int => self.position,
         };
 
-        let text = &self.input[start..text_end];
+        let text = self.input[start..text_end].replace('_', "");
         let value = text.parse::<i64>().map_err(|_| {
             Diagnostic::parse(
                 Span::new(start, text_end),
@@ -4359,6 +4432,65 @@ mod tests {
                 op: BinaryOp::Add, ..
             } => {}
             other => panic!("unexpected expression: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn underscore_separators_in_number_literals() {
+        let file = SourceFile::new("test.kl", "1_000_000");
+        match parse_source(&file).expect("integer should parse") {
+            Expr::Int { value, .. } => assert_eq!(value, 1_000_000),
+            other => panic!("unexpected expression: {other:?}"),
+        }
+
+        let file = SourceFile::new("test.kl", "3_000.5");
+        match parse_source(&file).expect("double should parse") {
+            Expr::Double { value, .. } => assert_eq!(value, 3_000.5),
+            other => panic!("unexpected expression: {other:?}"),
+        }
+
+        // A trailing `_` is not part of the number: `1_` lexes the integer
+        // `1` and leaves `_` as a separate token, so the two adjacent
+        // expressions fail to parse rather than the `_` being swallowed.
+        let file = SourceFile::new("test.kl", "1_");
+        assert!(
+            parse_source(&file).is_err(),
+            "`1_` should not lex as a single number"
+        );
+    }
+
+    #[test]
+    fn hex_integer_literals() {
+        for (source, expected) in [
+            ("0xff", 255),
+            ("0x1F", 31),
+            ("0XFF", 255),
+            ("0xff_ff", 65535),
+        ] {
+            let file = SourceFile::new("test.kl", source);
+            match parse_source(&file).expect("hex integer should parse") {
+                Expr::Int { value, .. } => assert_eq!(value, expected, "for {source}"),
+                other => panic!("unexpected expression for {source}: {other:?}"),
+            }
+        }
+        // `0x` with no hex digit is not a hex literal: `0` then identifier `x`.
+        let file = SourceFile::new("test.kl", "0x");
+        assert!(parse_source(&file).is_err(), "`0x` is not a hex literal");
+    }
+
+    #[test]
+    fn scientific_notation_literals() {
+        for (source, expected) in [
+            ("1e3", 1000.0),
+            ("1.0e9", 1.0e9),
+            ("1.5e-3", 1.5e-3),
+            ("2E2", 200.0),
+        ] {
+            let file = SourceFile::new("test.kl", source);
+            match parse_source(&file).expect("scientific literal should parse") {
+                Expr::Double { value, .. } => assert_eq!(value, expected, "for {source}"),
+                other => panic!("unexpected expression for {source}: {other:?}"),
+            }
         }
     }
 
