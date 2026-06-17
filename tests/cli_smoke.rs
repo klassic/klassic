@@ -3747,6 +3747,66 @@ fn builds_native_executable_for_shadowed_param_in_returned_closure() {
     assert!(run.stderr.is_empty());
 }
 
+/// A variable captured transitively through an intermediate closure layer is
+/// read by value, not through a stale frame slot. `makeAdder(100)` then
+/// `f(10)` then `g(1)` must compute `base + x + y = 111`; the innermost
+/// closure's `base` (the outermost parameter) used to alias the middle
+/// layer's `x`, silently computing `x + x + y = 21`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_transitively_captured_outer_variable() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-transcap-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-transcap-{unique}"));
+    fs::write(
+        &source_path,
+        "def makeAdder(base) = (x) => (y) => base + x + y\n\
+         val f = makeAdder(100)\n\
+         val g = f(10)\n\
+         println(g(1))\n\
+         val g2 = f(20)\n\
+         println(g2(2))\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "111\n122\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native must match eval for a transitively-captured outer variable"
+    );
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_functions_capturing_top_level_bindings() {
