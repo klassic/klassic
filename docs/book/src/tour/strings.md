@@ -42,9 +42,9 @@ val mixed = "count = " + 42
 
 | Function | Behaviour |
 |---|---|
-| `length(s)` | Byte length |
-| `substring(s, i, j)` | Bytes `[i, j)` |
-| `at(s, i)` | One-byte string at index |
+| `length(s)` | Character (code point) count |
+| `substring(s, i, j)` | Characters `[i, j)` |
+| `at(s, i)` | One-character string at index |
 | `trim(s)`, `trimLeft(s)`, `trimRight(s)` | Strip ASCII whitespace |
 | `toLowerCase(s)`, `toUpperCase(s)` | ASCII case shift |
 | `replace(s, from, to)` | Replace first occurrence |
