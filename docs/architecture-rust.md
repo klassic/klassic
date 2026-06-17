@@ -227,7 +227,8 @@ cargo run -- -e "1 + 2"
   (`if(...) %(1, 2) else %(3, 4, 5)`) also merge through a runtime-list
   buffer that holds each branch's elements, with `size` / `Set#size` /
   `isEmpty` / `Set#isEmpty` / `contains` answering from the per-branch
-  dynamic length and slot contents.
+  dynamic length and slot contents. `s.toList()` projects a static set's
+  element vector into a fresh static list.
   Divergent static-map branches (any entry count, including
   `if(...) %["x": 1] else %["y": 2, "z": 3]`) also merge through a
   runtime-list buffer where keys and values alternate, with the buffer
