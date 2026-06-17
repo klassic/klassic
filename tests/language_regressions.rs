@@ -705,6 +705,48 @@ fn instance_method_body_is_checked_against_its_return_type() {
 }
 
 #[test]
+fn instance_method_signature_is_checked_against_the_class() {
+    // An instance method whose parameter type does not match the class
+    // method instantiated at the instance type is rejected. `Compute<String>`
+    // requires `compute: (String) => Int`, so a `(Int) => Int` method is a
+    // type error instead of crashing at runtime when the String is used.
+    let wrong_param = evaluate_text(
+        "<expr>",
+        "typeclass Compute<'a> where { compute: ('a) => Int }\n\
+         instance Compute<String> where { def compute(x: Int): Int = x - 1 }\n\
+         compute(\"hello\")",
+    )
+    .expect_err("an instance method with the wrong parameter type should fail");
+    assert!(
+        wrong_param.to_string().contains("type mismatch"),
+        "expected a type-mismatch error, got: {wrong_param}"
+    );
+
+    // A multi-argument class method is checked position by position.
+    let wrong_second = evaluate_text(
+        "<expr>",
+        "typeclass Eq<'a> where { equals: ('a, 'a) => Boolean }\n\
+         instance Eq<Int> where { def equals(x: Int, y: String): Boolean = true }\n\
+         equals(1, 2)",
+    )
+    .expect_err("a mismatched second parameter should fail");
+    assert!(wrong_second.to_string().contains("type mismatch"));
+
+    // A correct generic instance still type-checks.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "typeclass Show<'a> where { show: ('a) => String }\n\
+             instance Show<Int> where { def show(x: Int): String = \"i\" }\n\
+             instance Show<List<'a>> where Show<'a> { def show(xs: List<'a>): String = \"L\" }\n\
+             show([1 2 3])",
+        )
+        .unwrap(),
+        Value::String("L".to_string())
+    );
+}
+
+#[test]
 fn two_constraints_on_same_class_use_distinct_type_variables() {
     // `def pair<Show 'a, Show 'b>` has two constraints on the same class with
     // different type variables. The class method `show` must be usable at both
