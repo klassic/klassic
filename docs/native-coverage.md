@@ -318,6 +318,19 @@ rather than miscompiling: comparing enum values with `==` / `!=` (the
 evaluator compares them structurally), and aggregate payload fields such
 as `List<SomeEnum>`.
 
+## Extension Methods
+
+`extension` declarations lower to ordinary native functions, and a
+`receiver.method(...)` call on a value of the extended type dispatches
+to the matching one. This covers extensions on built-in types such as
+`Int` and `String`, generic extensions like `extension <a>(this:
+List<a>)`, receiver use inside the body, and method chaining.
+Standard-library extension methods (for example `.reversed()` from
+`std.list` or `.capitalized()` from `std.string`) compile the same way
+once their module is imported; the evaluator auto-loads the standard
+library, so it additionally accepts those calls without an explicit
+import.
+
 ## Runtime List Literals And Selectors
 
 Direct `head` over list literals can return runtime native values, including
