@@ -1162,7 +1162,14 @@ impl TypeChecker {
                 let row = self.enforce_assignable(*left, *right, span)?;
                 Ok(Type::StructuralRecord(Box::new(row)))
             }
-            (Type::RowEmpty, Type::RowEmpty) => Ok(Type::RowEmpty),
+            // Width subtyping (assignability only): once the expected row has
+            // no more required fields, the actual record may still carry extra
+            // fields (or an open tail). A wider record is assignable to the
+            // narrower expected type, so the extras are ignored — the
+            // documented row-polymorphic behavior where a function "looks for
+            // the fields it mentions and ignores the rest". This is sound only
+            // for the directional assignability check, not for `unify`.
+            (Type::RowEmpty, actual) if is_row_type(&actual) => Ok(actual),
             (Type::RowExtend(label, field, rest), row) if is_row_type(&row) => {
                 let (other_field, other_rest) = self.rewrite_row(row, &label, span)?;
                 let unified_field = self.enforce_assignable(*field, other_field, span)?;

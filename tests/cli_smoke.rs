@@ -3266,6 +3266,68 @@ fn builds_native_executable_for_annotated_nominal_record() {
     );
 }
 
+/// Structural-record width subtyping: a function whose parameter type
+/// mentions a subset of fields accepts a richer record, ignoring the extra
+/// fields (the documented row-polymorphic behavior). The explicit annotation
+/// `{ x: Int }` used to be treated as a closed row, so passing a record with
+/// extra fields was rejected. Native must match the evaluator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_record_width_subtyping() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-rowwidth-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-rowwidth-{unique}"));
+    fs::write(
+        &source_path,
+        "def name_of(o: { name: String }): String = o.name\n\
+         def add(r: { a: Int; b: Int }): Int = r.a + r.b\n\
+         println(name_of(record { name: \"Klassic\"; age: 7 }))\n\
+         println(add(record { a: 1; b: 2; c: 3; d: 4 }))\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(
+        eval.status.success(),
+        "eval failed:\n{}",
+        String::from_utf8_lossy(&eval.stderr)
+    );
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "Klassic\n3\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native output must match eval for record width subtyping"
+    );
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_static_folded_recursive_list_function() {
