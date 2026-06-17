@@ -17689,6 +17689,9 @@ impl NativeCodeGenerator {
             "toList" if arguments.is_empty() => {
                 return self.compile_set_to_list(target, span);
             }
+            "put" if arguments.len() == 2 => {
+                return self.compile_map_put(target, &arguments[0], &arguments[1], span);
+            }
             "toString" => "toString",
             "substring" => "substring",
             "at" => "at",
@@ -17852,6 +17855,40 @@ impl NativeCodeGenerator {
         let elements = self.static_sets[label.0].elements.clone();
         let list_label = self.intern_static_list(elements);
         Ok(self.emit_static_value(&StaticValue::StaticList { label: list_label }))
+    }
+
+    /// `m.put(k, v)` — a fresh static map with `k -> v` set. An existing key
+    /// is updated in place (its position is preserved), a new key is appended,
+    /// matching the evaluator. `m`, `k`, and `v` are evaluated once, in order;
+    /// a runtime map or non-static key/value stays a clean diagnostic.
+    fn compile_map_put(
+        &mut self,
+        target: &Expr,
+        key: &Expr,
+        value: &Expr,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let mut entries = self.static_map_entries_from_expr(target, span)?;
+        let key_value =
+            self.static_value_from_argument_preserving_effects(key, span, "native Map#put key")?;
+        let new_value = self.static_value_from_argument_preserving_effects(
+            value,
+            span,
+            "native Map#put value",
+        )?;
+        let mut updated = false;
+        for entry in &mut entries {
+            if self.static_value_equal_user(&entry.0, &key_value) {
+                entry.1 = new_value.clone();
+                updated = true;
+                break;
+            }
+        }
+        if !updated {
+            entries.push((key_value, new_value));
+        }
+        let label = self.intern_static_map(entries);
+        Ok(self.emit_static_value(&StaticValue::StaticMap { label }))
     }
 
     /// The enum name behind a tracked `ConcreteEnumShape`: look any of its
