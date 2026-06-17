@@ -646,6 +646,40 @@ fn typeclass_bare_type_param_specs_are_covered() {
 }
 
 #[test]
+fn two_constraints_on_same_class_use_distinct_type_variables() {
+    // `def pair<Show 'a, Show 'b>` has two constraints on the same class with
+    // different type variables. The class method `show` must be usable at both
+    // `'a` and `'b` without forcing them equal, so a mixed-type call is
+    // accepted. The method declaration used to be overwritten by the last
+    // constraint, unifying `'a` and `'b` and spuriously rejecting `pair(1, "x")`.
+    let program = r#"
+        typeclass Show<'a> where { show: ('a) => String }
+        instance Show<Int> where { def show(x: Int): String = "i" }
+        instance Show<String> where { def show(x: String): String = "s" }
+        def pair<Show 'a, Show 'b>(x: 'a, y: 'b): String = show(x) + show(y)
+        pair(1, "two")
+    "#;
+    assert_eq!(
+        evaluate_text("<expr>", program).unwrap(),
+        Value::String("is".to_string())
+    );
+
+    // A missing instance for either type variable is still rejected.
+    let missing = evaluate_text(
+        "<expr>",
+        "typeclass Show<'a> where { show: ('a) => String }\n\
+         instance Show<Int> where { def show(x: Int): String = \"i\" }\n\
+         def pair<Show 'a, Show 'b>(x: 'a, y: 'b): String = show(x) + show(y)\n\
+         pair(1, true)",
+    )
+    .expect_err("a missing instance for one constraint should fail");
+    assert!(
+        missing.to_string().contains("missing instance for Show"),
+        "expected a missing-instance error, got: {missing}"
+    );
+}
+
+#[test]
 fn constrained_binding_indirect_reference_carries_constraint() {
     // Assigning a class-constrained generic function to a concrete function
     // type discharges its constraint at that type: `display` needs `Show`, so
