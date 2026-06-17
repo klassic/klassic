@@ -331,6 +331,19 @@ once their module is imported; the evaluator auto-loads the standard
 library, so it additionally accepts those calls without an explicit
 import.
 
+## Type Classes
+
+`typeclass` declarations, their `instance` implementations, and
+constrained generic functions (`def f<'a>(x: 'a): R where Show<'a> =
+...`) lower natively. Both direct instance-method calls (`show(42)`) and
+dispatch through one or more constraints — including transitive
+constraints, where one constrained function calls another — resolve to
+the concrete instance at the call site and compile to ordinary native
+calls. Instances over concrete types such as `Int` and `String` and
+over applied types such as `List<Int>` are supported. A constraint with
+no matching instance is rejected ahead of codegen with a `missing
+instance` diagnostic, in native builds exactly as in the evaluator.
+
 ## Runtime List Literals And Selectors
 
 Direct `head` over list literals can return runtime native values, including
