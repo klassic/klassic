@@ -1733,7 +1733,7 @@ impl TypeChecker {
             }
             Expr::DefDecl {
                 name,
-                type_params: _,
+                type_params,
                 constraints,
                 params,
                 param_annotations,
@@ -1742,6 +1742,16 @@ impl TypeChecker {
                 span,
             } => {
                 let mut named = HashMap::new();
+                // Seed the annotation parser with the explicit type
+                // parameters so a bare `<a>` name is a type variable, like
+                // enums/records/extensions. Without this only the `'a` form
+                // became a variable and `def id<a>(x: a): a` treated `a` as a
+                // concrete type, so `id(5)` failed to unify.
+                for type_param in type_params {
+                    named
+                        .entry(type_param.clone())
+                        .or_insert_with(|| self.fresh_var());
+                }
                 // Reuse the block-level predeclaration's variables when
                 // one exists, so forward calls already checked against
                 // them constrain this definition.
