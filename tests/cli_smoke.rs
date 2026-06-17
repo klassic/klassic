@@ -2924,6 +2924,72 @@ assertResult(["a", "b", "c"])(head(cons(lineFn)(lineFns))(lines, 2))
     assert!(run.stderr.is_empty());
 }
 
+/// `m.getOrElse(k, d)` is lowered to a temp-bound `containsKey`/`get`/`if`,
+/// so the present and absent cases match the evaluator and the key is
+/// evaluated exactly once (the side-effecting key bumps the counter a single
+/// time).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_map_get_or_else() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-getorelse-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-getorelse-{unique}"));
+    fs::write(
+        &source_path,
+        "val m = %[\"a\": 1, \"b\": 2]\n\
+         val s = %[\"x\": \"hi\"]\n\
+         mutable hits = 0\n\
+         def key(): String = { hits = hits + 1; \"a\" }\n\
+         println(m.getOrElse(\"a\", 0))\n\
+         println(m.getOrElse(\"z\", -1))\n\
+         println(s.getOrElse(\"x\", \"none\"))\n\
+         println(s.getOrElse(\"q\", \"none\"))\n\
+         println(m.getOrElse(key(), 99))\n\
+         println(hits)\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        "1\n-1\nhi\nnone\n1\n1\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native Map#getOrElse must match eval, evaluating the key once"
+    );
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_runtime_return_map_function_values() {

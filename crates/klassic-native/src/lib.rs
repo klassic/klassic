@@ -17600,6 +17600,12 @@ impl NativeCodeGenerator {
                 )?;
                 return Ok(self.emit_static_value(&value));
             }
+            // `m.getOrElse(k, d)` — the two-argument map form. (Option's
+            // one-argument `getOrElse` is an extension method already routed
+            // by `try_compile_enum_extension_method` above.)
+            "getOrElse" if arguments.len() == 2 => {
+                return self.compile_map_get_or_else(target, &arguments[0], &arguments[1], span);
+            }
             "toString" => "toString",
             "substring" => "substring",
             "at" => "at",
@@ -17645,6 +17651,81 @@ impl NativeCodeGenerator {
             span,
         };
         self.compile_call(&callee, &lowered, span)
+    }
+
+    /// Lower `m.getOrElse(k, d)` to a temp-bound conditional that reuses the
+    /// supported `containsKey` / `get` / `if` codegen:
+    ///
+    /// ```text
+    /// { val m' = m; val k' = k; if (m'.containsKey(k')) m'.get(k') else d }
+    /// ```
+    ///
+    /// Binding `m` and `k` to fresh vals first evaluates each exactly once,
+    /// matching the evaluator even when they carry side effects. The fresh
+    /// names are keyed on the call-site span so distinct call sites never
+    /// collide; nested calls shadow lexically through the block scope.
+    fn compile_map_get_or_else(
+        &mut self,
+        target: &Expr,
+        key: &Expr,
+        default: &Expr,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let map_name = format!("__getOrElse_map_{}", span.start);
+        let key_name = format!("__getOrElse_key_{}", span.start);
+        let map_id = Expr::Identifier {
+            name: map_name.clone(),
+            span,
+        };
+        let key_id = Expr::Identifier {
+            name: key_name.clone(),
+            span,
+        };
+        let contains = Expr::Call {
+            callee: Box::new(Expr::FieldAccess {
+                target: Box::new(map_id.clone()),
+                field: "containsKey".to_string(),
+                span,
+            }),
+            arguments: vec![key_id.clone()],
+            span,
+        };
+        let get = Expr::Call {
+            callee: Box::new(Expr::FieldAccess {
+                target: Box::new(map_id),
+                field: "get".to_string(),
+                span,
+            }),
+            arguments: vec![key_id],
+            span,
+        };
+        let conditional = Expr::If {
+            condition: Box::new(contains),
+            then_branch: Box::new(get),
+            else_branch: Some(Box::new(default.clone())),
+            span,
+        };
+        let block = Expr::Block {
+            expressions: vec![
+                Expr::VarDecl {
+                    mutable: false,
+                    name: map_name,
+                    annotation: None,
+                    value: Box::new(target.clone()),
+                    span,
+                },
+                Expr::VarDecl {
+                    mutable: false,
+                    name: key_name,
+                    annotation: None,
+                    value: Box::new(key.clone()),
+                    span,
+                },
+                conditional,
+            ],
+            span,
+        };
+        self.compile_expr(&block)
     }
 
     /// The enum name behind a tracked `ConcreteEnumShape`: look any of its
