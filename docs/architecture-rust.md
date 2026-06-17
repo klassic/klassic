@@ -246,7 +246,10 @@ cargo run -- -e "1 + 2"
   reuse. The two-argument method `m.getOrElse(k, d)` lowers to a
   temp-bound `{ val m' = m; val k' = k; if (m'.containsKey(k')) m'.get(k')
   else d }`, reusing the supported `containsKey` / `get` / `if` codegen
-  while evaluating `m` and `k` exactly once. The kind tag also drives display: `println` and string
+  while evaluating `m` and `k` exactly once. `m.keys()` / `m.values()`
+  reuse the `__gc_smap_keys`/`__gc_smap_values` list builders for a runtime
+  map and project a static map literal's compile-time entries into a fresh
+  static list. The kind tag also drives display: `println` and string
   interpolation emit `%(v1, v2, ...)` for runtime sets and
   `%[k: v, ...]` for runtime maps, matching the static-collection display
   rather than falling back to the bracketed list form.

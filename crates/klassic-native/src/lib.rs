@@ -17606,6 +17606,12 @@ impl NativeCodeGenerator {
             "getOrElse" if arguments.len() == 2 => {
                 return self.compile_map_get_or_else(target, &arguments[0], &arguments[1], span);
             }
+            "keys" if arguments.is_empty() => {
+                return self.compile_map_keys_or_values(target, span, false);
+            }
+            "values" if arguments.is_empty() => {
+                return self.compile_map_keys_or_values(target, span, true);
+            }
             "toString" => "toString",
             "substring" => "substring",
             "at" => "at",
@@ -17726,6 +17732,32 @@ impl NativeCodeGenerator {
             span,
         };
         self.compile_expr(&block)
+    }
+
+    /// `m.keys()` / `m.values()` — return the key (or value) list of a map.
+    /// A runtime map reuses the existing `__gc_smap_keys`/`__gc_smap_values`
+    /// codegen; a static map literal projects its compile-time entries into a
+    /// fresh static list.
+    fn compile_map_keys_or_values(
+        &mut self,
+        target: &Expr,
+        span: Span,
+        is_values: bool,
+    ) -> Result<NativeValue, Diagnostic> {
+        if self.expr_yields_runtime_map(target) {
+            return self.compile_gc_smap_keys_or_values(
+                std::slice::from_ref(target),
+                span,
+                is_values,
+            );
+        }
+        let entries = self.static_map_entries_from_expr(target, span)?;
+        let elements = entries
+            .into_iter()
+            .map(|(key, value)| if is_values { value } else { key })
+            .collect();
+        let label = self.intern_static_list(elements);
+        Ok(self.emit_static_value(&StaticValue::StaticList { label }))
     }
 
     /// The enum name behind a tracked `ConcreteEnumShape`: look any of its
