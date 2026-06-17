@@ -3901,6 +3901,11 @@ struct NativeCodeGenerator {
     virtual_dirs: HashSet<String>,
     unknown_virtual_paths: HashSet<String>,
     queued_threads: Vec<QueuedThread>,
+    /// Names of top-level `mutable` bindings. An out-of-line (self-recursive)
+    /// function cannot address the top-level frame's slot for one of these,
+    /// so capturing a mutable global there is refused rather than silently
+    /// snapshotting a stale copy into the callee frame.
+    top_level_mutable_names: HashSet<String>,
     dynamic_control_depth: usize,
     mergeable_dynamic_branch_depth: usize,
     /// Monomorphic enums lowered to `__gc_record` shape by
@@ -4120,6 +4125,7 @@ impl NativeCodeGenerator {
             virtual_dirs: HashSet::new(),
             unknown_virtual_paths: HashSet::new(),
             queued_threads: Vec::new(),
+            top_level_mutable_names: HashSet::new(),
             dynamic_control_depth: 0,
             mergeable_dynamic_branch_depth: 0,
             lowered_enum_names: HashSet::new(),
@@ -4730,6 +4736,7 @@ impl NativeCodeGenerator {
         };
         let thread_aliases = top_level_thread_aliases(expressions);
         let top_level_value_names = top_level_value_names(expressions);
+        self.top_level_mutable_names = top_level_mutable_names(expressions);
         for expression in expressions {
             match expression {
                 Expr::DefDecl {
@@ -37328,6 +37335,19 @@ impl NativeCodeGenerator {
             if self.lookup_var(name).is_some() {
                 continue;
             }
+            // A top-level `mutable` global lives in the top-level frame's
+            // stack slot, which this out-of-line function cannot address.
+            // Snapshotting it into a callee-frame local would read a stale
+            // value and discard any write when the frame dies (a silent
+            // miscompile), so refuse instead. Non-recursive functions that
+            // touch a mutable global are inlined at the call site and reach
+            // the real slot, so this only affects self-recursive ones.
+            if self.top_level_mutable_names.contains(name) {
+                return Err(unsupported(
+                    function.body.span(),
+                    "native recursive function capturing a mutable top-level binding",
+                ));
+            }
             if let Some(value) = lookup_static_value_in_scopes(&saved_static_scopes, name) {
                 self.bind_static_runtime_value(name.clone(), value);
                 continue;
@@ -39556,6 +39576,20 @@ fn top_level_value_names(expressions: &[Expr]) -> HashSet<String> {
         .iter()
         .filter_map(|expression| match expression {
             Expr::VarDecl { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn top_level_mutable_names(expressions: &[Expr]) -> HashSet<String> {
+    expressions
+        .iter()
+        .filter_map(|expression| match expression {
+            Expr::VarDecl {
+                name,
+                mutable: true,
+                ..
+            } => Some(name.clone()),
             _ => None,
         })
         .collect()

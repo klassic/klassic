@@ -356,7 +356,12 @@ cargo run -- -e "1 + 2"
   are call-site inlined; recursive `def` declarations can still capture immutable
   static top-level values, builtin aliases, static lambda values, and immutable
   runtime string / line-list / selected-length runtime-list / runtime-record
-  bindings by rebinding them inside the emitted function frame. Direct calls and value aliases for
+  bindings by rebinding them inside the emitted function frame. Capturing a
+  top-level `mutable` binding from a recursive (out-of-line) function is refused
+  with a clean diagnostic rather than compiled: such a global lives in the
+  top-level frame's slot, which the callee frame cannot address, so rebinding it
+  would snapshot a stale value and discard writes. The non-recursive case is
+  inlined and reaches the real slot, so it keeps working. Direct calls and value aliases for
   user-defined functions shadow same-named native builtins.
   Immutable aliases to curried helpers such as `assertResult`, `cons`, `map`,
   and `foldLeft` resolve through the same native special-call paths as direct
