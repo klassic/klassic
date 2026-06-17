@@ -1293,6 +1293,49 @@ fn collect_pattern_bindings(pattern: &Pattern, out: &mut HashSet<String>) {
 /// can only call earlier `def`s), and stdlib modules call prelude helpers,
 /// so the spliced declarations are inserted *after* the prelude and
 /// *before* the user program — i.e. `[prelude][modules][user]`.
+/// Order inlined module paths so that every module's own inlinable imports
+/// precede it. A module references the mangled defs and bare vals of what it
+/// imports, and native splices them into a single ordered translation unit
+/// where a `val` is not visible before its declaration — so a dependency
+/// must be spliced first (`std.result` imports `std.option`'s `val none`).
+fn topo_order_module_paths(
+    paths: &[String],
+    module_imports: &HashMap<String, Vec<InlineImport>>,
+) -> Vec<String> {
+    let mut ordered = Vec::with_capacity(paths.len());
+    // 0 = unseen, 1 = on the current DFS path, 2 = emitted.
+    let mut state: HashMap<String, u8> = HashMap::new();
+    for root in paths {
+        let mut stack: Vec<(String, bool)> = vec![(root.clone(), false)];
+        while let Some((path, processed)) = stack.pop() {
+            if processed {
+                if state.get(&path) != Some(&2) {
+                    state.insert(path.clone(), 2);
+                    ordered.push(path);
+                }
+                continue;
+            }
+            match state.get(&path).copied().unwrap_or(0) {
+                2 => continue,
+                1 => continue, // already on the path: break the cycle.
+                _ => {}
+            }
+            state.insert(path.clone(), 1);
+            stack.push((path.clone(), true));
+            if let Some(imports) = module_imports.get(&path) {
+                for import in imports {
+                    if paths.contains(&import.path)
+                        && state.get(&import.path).copied().unwrap_or(0) == 0
+                    {
+                        stack.push((import.path.clone(), false));
+                    }
+                }
+            }
+        }
+    }
+    ordered
+}
+
 fn inline_module_imports(
     expr: Expr,
     prelude_offset: usize,
@@ -1351,18 +1394,39 @@ fn inline_module_imports(
     for (path, parsed) in &user_parsed {
         parsed_by_path.insert(path.clone(), parsed.clone());
     }
-    for path in &paths {
-        if parsed_by_path.contains_key(path) {
+    // Worklist over `paths`: parsing a stdlib module can reveal further
+    // stdlib imports (e.g. `std.result` imports `std.option`), so append any
+    // newly-discovered inlinable module and keep going until the transitive
+    // closure is spliced. Without this a transitively-imported module is
+    // recorded in `module_imports` but never added to `paths`, so its decls
+    // are never spliced and references to it fail to resolve.
+    let mut index = 0;
+    while index < paths.len() {
+        let path = paths[index].clone();
+        index += 1;
+        if parsed_by_path.contains_key(&path) {
             continue;
         }
-        let source = stdlib_module_source(path).expect("inlinable module has a source");
-        let file = SourceFile::new(path, source.to_string());
+        let source = stdlib_module_source(&path).expect("inlinable module has a source");
+        let file = SourceFile::new(&path, source.to_string());
         let parsed = rewrite_expression(parse_source(&file)?);
         let mut own = Vec::new();
         collect_inlinable_imports(&parsed, user_modules, &mut own);
+        for import in &own {
+            if !paths.contains(&import.path)
+                && !user_modules.iter().any(|module| module.path == import.path)
+            {
+                paths.push(import.path.clone());
+            }
+        }
         module_imports.insert(path.clone(), own);
         parsed_by_path.insert(path.clone(), parsed);
     }
+
+    // Splice dependencies before dependents so a module's bare `val` imports
+    // (e.g. `std.option`'s `none`) are declared before `std.result` references
+    // them; native resolves a `val` only after its declaration.
+    let paths = topo_order_module_paths(&paths, &module_imports);
 
     // `mangled_modules` records each module's free def names so an importer
     // can expand a bulk import and resolve a selective one.

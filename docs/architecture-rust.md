@@ -768,7 +768,12 @@ cargo run -- -e "1 + 2"
   field repr over a defaulted one (a defaulted field is only ever read in a
   tag-guarded dead arm, so trusting the resolved branch is sound), letting
   a string-payload `map` read back as a string rather than the
-  `None` arm's defaulted scalar.
+  `None` arm's defaulted scalar. Import discovery is transitive: a module
+  imported only from inside another inlined module (`std.result` imports
+  `std.option`) is found by a worklist over the parsed modules and spliced
+  too, and the spliced modules are ordered so each module's imports precede
+  it — a dependency's bare `val` (such as `std.option`'s `none`) must be
+  declared before the dependent references it.
 
   A portable C backend (roadmap PR 9 / PR 10) lives behind
   `--backend c`: `klassic --backend c build program.kl -o program.c`

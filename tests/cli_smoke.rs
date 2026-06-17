@@ -3051,6 +3051,64 @@ fn builds_native_executable_for_map_keys_and_values() {
     );
 }
 
+/// `std.result` imports `std.option` internally, so importing only
+/// `std.result` must transitively splice `std.option` — including its bare
+/// `val none` — and order it first, since native resolves a `val` only after
+/// its declaration. Previously this failed native build with "std.option not
+/// available" and then "undefined variable `none`".
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_transitive_stdlib_import() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-transdep-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-transdep-{unique}"));
+    fs::write(
+        &source_path,
+        "import std.result.{ok, err, getOrElse, isOk}\n\
+         println(getOrElse(ok(5), 0))\n\
+         println(getOrElse(err(\"boom\"), 99))\n\
+         println(isOk(ok(1)))\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "5\n99\ntrue\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native must match eval when importing only std.result (transitive std.option)"
+    );
+}
+
 /// `s.toList()` projects a static set's elements into a list, matching the
 /// evaluator for printing, `foreach`, chained list methods, and deduped
 /// literals.
