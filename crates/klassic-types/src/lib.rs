@@ -1455,25 +1455,23 @@ impl TypeChecker {
             Expr::Unit { .. } => Ok(Type::Unit),
             Expr::Identifier { name, span } => {
                 if let Some(binding) = self.lookup(name).cloned() {
-                    if binding
-                        .constraints
-                        .iter()
-                        .any(|c| matches!(c.class_name.as_str(), "Num" | "Plus"))
-                    {
-                        // Referencing an operator-constrained binding
-                        // indirectly (a val, a higher-order argument, ...)
-                        // must carry its Num/Plus constraints, or a bad
-                        // instantiation would type-check and crash at run
-                        // time. Instantiate type + constraints with shared
-                        // fresh variables and record the operator ones so the
+                    if !binding.constraints.is_empty() {
+                        // Referencing a constrained binding indirectly (a val,
+                        // a higher-order argument, ...) must carry its
+                        // constraints, or a bad instantiation would type-check
+                        // and crash at run time. Instantiate type + constraints
+                        // with shared fresh variables and record them so the
                         // enclosing generalization (or the program-end settle)
-                        // checks them. User constraints keep their existing
-                        // direct-call-only behaviour.
+                        // checks them — e.g. `val f: (Boolean) => String =
+                        // display` (where `display` needs `Show`) now reports
+                        // the missing `Show<Boolean>` instance instead of
+                        // dropping the constraint and failing at runtime. A
+                        // still-free constraint variable is generalized rather
+                        // than rejected, so storing a polymorphic constrained
+                        // function in a `val` and calling it later still works.
                         let (ty, constraints) = self.instantiate_binding_signature(&binding);
                         for constraint in constraints {
-                            if matches!(constraint.class_name.as_str(), "Num" | "Plus")
-                                && !self.inferred_constraints.contains(&constraint)
-                            {
+                            if !self.inferred_constraints.contains(&constraint) {
                                 self.inferred_constraints.push(constraint);
                             }
                         }

@@ -646,6 +646,58 @@ fn typeclass_bare_type_param_specs_are_covered() {
 }
 
 #[test]
+fn constrained_binding_indirect_reference_carries_constraint() {
+    // Assigning a class-constrained generic function to a concrete function
+    // type discharges its constraint at that type: `display` needs `Show`, so
+    // binding it at `(Boolean) => String` reports the missing `Show<Boolean>`
+    // instance instead of dropping the constraint and crashing at runtime.
+    let no_instance = evaluate_text(
+        "<expr>",
+        "typeclass Show<'a> where { show: ('a) => String }\n\
+         instance Show<Int> where { def show(x: Int): String = \"n:\" + x }\n\
+         def display<Show 'a>(x: 'a): String = show(x)\n\
+         val f: (Boolean) => String = display\n\
+         f(true)",
+    )
+    .expect_err("a constrained binding bound at a type without an instance should fail");
+    assert!(
+        no_instance
+            .to_string()
+            .contains("missing instance for Show"),
+        "expected a missing-instance error, got: {no_instance}"
+    );
+
+    // Binding it at a type that does have an instance still works.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "typeclass Show<'a> where { show: ('a) => String }\n\
+             instance Show<Int> where { def show(x: Int): String = \"n:\" + x }\n\
+             def display<Show 'a>(x: 'a): String = show(x)\n\
+             val f: (Int) => String = display\n\
+             f(5)",
+        )
+        .unwrap(),
+        Value::String("n:5".to_string())
+    );
+
+    // Storing the polymorphic constrained function in a `val` and calling it
+    // later at a concrete type still works (the free constraint generalizes).
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "typeclass Show<'a> where { show: ('a) => String }\n\
+             instance Show<Int> where { def show(x: Int): String = \"i\" + x }\n\
+             def display<Show 'a>(x: 'a): String = show(x)\n\
+             val g = display\n\
+             g(5)",
+        )
+        .unwrap(),
+        Value::String("i5".to_string())
+    );
+}
+
+#[test]
 fn higher_kinded_typeclass_specs_are_covered() {
     let program = r#"
         typeclass Functor<'f: * => *> where {
