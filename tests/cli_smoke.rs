@@ -1435,6 +1435,84 @@ fn native_enum_equality_survives_allocation_churn() {
     );
 }
 
+/// `assertResult` over enum values compares structurally through
+/// `gc_deep_equal`, matching the evaluator. It used to compare heap
+/// identity, so an assertion of two equal enums failed (and printed raw
+/// pointer addresses). Equal operands now pass; unequal operands abort
+/// with a non-zero exit.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_assert_result_compares_enums_structurally() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let pass_src = std::env::temp_dir().join(format!("klassic-ar-pass-{unique}.kl"));
+    let pass_bin = std::env::temp_dir().join(format!("klassic-ar-pass-{unique}"));
+    fs::write(
+        &pass_src,
+        "enum E { case A(v: Int); case B }\n\
+         assertResult(A(5))(A(5))\n\
+         assertResult(B)(B)\n\
+         println(\"ok\")\n",
+    )
+    .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            pass_src.to_string_lossy().as_ref(),
+            "-o",
+            pass_bin.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build should compile, got:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&pass_bin).output().expect("binary should run");
+    assert!(
+        run.status.success(),
+        "assertResult of equal enums must pass"
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "ok\n");
+    let _ = fs::remove_file(&pass_src);
+    let _ = fs::remove_file(&pass_bin);
+
+    // Unequal operands must abort before the following statement runs.
+    let fail_src = std::env::temp_dir().join(format!("klassic-ar-fail-{unique}.kl"));
+    let fail_bin = std::env::temp_dir().join(format!("klassic-ar-fail-{unique}"));
+    fs::write(
+        &fail_src,
+        "enum E { case A(v: Int); case B }\n\
+         assertResult(A(5))(A(6))\n\
+         println(\"unreachable\")\n",
+    )
+    .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            fail_src.to_string_lossy().as_ref(),
+            "-o",
+            fail_bin.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(build.status.success());
+    let run = Command::new(&fail_bin).output().expect("binary should run");
+    let _ = fs::remove_file(&fail_src);
+    let _ = fs::remove_file(&fail_bin);
+    assert!(
+        !run.status.success(),
+        "assertResult of unequal enums must abort"
+    );
+    assert!(
+        !String::from_utf8_lossy(&run.stdout).contains("unreachable"),
+        "the program must abort before the next statement"
+    );
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
