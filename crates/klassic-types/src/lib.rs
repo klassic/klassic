@@ -2034,7 +2034,9 @@ impl TypeChecker {
                 if let Some(method_type) = self.builtin_value_method_type(&target_type, field) {
                     return Ok(method_type);
                 }
-                if let Some(method_type) = self.user_extension_method_type(&target_type, field) {
+                if let Some(method_type) =
+                    self.user_extension_method_type(&target_type, field, *span)
+                {
                     return Ok(method_type);
                 }
                 match self.resolve(&target_type) {
@@ -4413,18 +4415,29 @@ impl TypeChecker {
         Ok(Type::Unit)
     }
 
-    fn user_extension_method_type(&mut self, target: &Type, field: &str) -> Option<Type> {
+    fn user_extension_method_type(
+        &mut self,
+        target: &Type,
+        field: &str,
+        span: Span,
+    ) -> Option<Type> {
         let resolved = self.resolve(target);
         let key = dispatch_key_for_type(&resolved)?;
         let stored = resolve_user_extension_method_type(&key, field)?;
         let adopted = self.adopt_stored_type(&stored);
         let instantiated = self.instantiate_stored_type(&adopted);
         match instantiated {
-            // Drop the leading `this` parameter — dispatch already
-            // supplies the receiver, so the user-visible method type
-            // only carries any extra arguments.
             Type::Function(mut params, ret) if !params.is_empty() => {
-                params.remove(0);
+                // Unify the receiver against the declared `this` type before
+                // dropping it, so the receiver's concrete type arguments flow
+                // into the method's type variables (and a concrete receiver
+                // mismatch is rejected). `dispatch_key_for_type` keys only on
+                // the type constructor, so without this an
+                // `extension (this: List<Int>)` applied to a `List<String>`
+                // kept `Int` and silently accepted ill-typed arguments, and a
+                // generic `extension <a>(this: Box<a>)` left `a` free.
+                let this_param = params.remove(0);
+                self.unify(this_param, resolved, span).ok()?;
                 Some(Type::Function(params, ret))
             }
             other => Some(other),

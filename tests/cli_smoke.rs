@@ -22343,6 +22343,78 @@ fn extension_methods_dispatch_on_list_int() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "15\n()\n");
 }
 
+/// Extension-method dispatch unifies the receiver against the declared
+/// `this` type, so the receiver's concrete type arguments are honoured.
+/// A concrete `extension (this: List<Int>)` no longer applies to a
+/// `List<String>`, and a generic `extension <a>(this: Box<a>)` binds `a`
+/// to the receiver's element type — so an ill-typed argument is rejected
+/// instead of being silently accepted (the result used to be typed at the
+/// wrong argument, e.g. `Option<Int>.getOrElse("x")` returning a String).
+#[test]
+fn extension_method_dispatch_checks_receiver_type_arguments() {
+    // A concrete `List<Int>` extension does not apply to a `List<String>`.
+    let wrong_element = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "extension (this: List<Int>) { def headInt(): Int = head(this) }\n\
+             val strs: List<String> = [\"hello\"]\n\
+             val n: Int = strs.headInt()\n\
+             println(n + 100)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !wrong_element.status.success(),
+        "a List<Int> extension must not apply to a List<String>"
+    );
+    assert!(
+        String::from_utf8_lossy(&wrong_element.stderr).contains("headInt"),
+        "expected a no-such-method diagnostic, got:\n{}",
+        String::from_utf8_lossy(&wrong_element.stderr)
+    );
+
+    // A generic extension binds `a` to the receiver's element type, so a
+    // wrong-typed argument is a type error.
+    let wrong_arg = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Box<a> { case Full(v: a); case Empty }\n\
+             extension <a>(this: Box<a>) { def getOr(v: a): a = this match { case Full(x) => x; case Empty => v } }\n\
+             val b: Box<Int> = Empty\n\
+             println(b.getOr(\"STR\"))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        !wrong_arg.status.success(),
+        "Box<Int>.getOr must reject a String argument"
+    );
+    assert!(
+        String::from_utf8_lossy(&wrong_arg.stderr).contains("not compatible"),
+        "expected a type-mismatch diagnostic, got:\n{}",
+        String::from_utf8_lossy(&wrong_arg.stderr)
+    );
+
+    // Correct usage still compiles and runs: the matching concrete receiver
+    // and the generic extension at its real element type both work.
+    let correct = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Box<a> { case Full(v: a); case Empty }\n\
+             extension <a>(this: Box<a>) { def getOr(v: a): a = this match { case Full(x) => x; case Empty => v } }\n\
+             val b: Box<Int> = Full(7)\n\
+             println(b.getOr(0))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        correct.status.success(),
+        "correct extension usage must still work\nstderr:\n{}",
+        String::from_utf8_lossy(&correct.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&correct.stdout), "7\n()\n");
+}
+
 /// Native build now supports extension methods on built-in types by
 /// desugaring `extension (this: T) { def m() = ... }` into a
 /// mangled top-level def `__ext_T_m(this) = ...` and rewriting
