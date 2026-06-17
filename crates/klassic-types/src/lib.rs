@@ -551,8 +551,23 @@ impl TypeChecker {
                 // fresh type arguments) and types each sub-pattern at
                 // the instantiated field type; unknown constructors
                 // keep the legacy Dynamic bindings.
-                let Some((enum_name, type_params, field_types)) = self.enum_variant_schema(name)
-                else {
+                //
+                // Resolve the constructor against the scrutinee's own enum
+                // first when it has a variant of this name. A user enum may
+                // reuse a prelude constructor name (`Ok`/`Err`/`Some`/`None`),
+                // and a blind `enum_variant_schema` lookup returns whichever
+                // enum the schema map happens to iterate first — a
+                // per-process-random order that made the same `case Ok(...)`
+                // on a user `Outcome` compile or fail nondeterministically.
+                let scrutinee_enum = match self.resolve(scrutinee_type) {
+                    Type::Enum(enum_name, _) => Some(enum_name),
+                    _ => None,
+                };
+                let resolved_schema = scrutinee_enum
+                    .as_deref()
+                    .and_then(|enum_name| self.enum_variant_schema_in(enum_name, name))
+                    .or_else(|| self.enum_variant_schema(name));
+                let Some((enum_name, type_params, field_types)) = resolved_schema else {
                     // An unknown constructor matched against a concrete enum
                     // scrutinee is a mistake (e.g. a typo). Only fall back to
                     // Dynamic bindings when the scrutinee's enum isn't known.
@@ -4476,6 +4491,23 @@ impl TypeChecker {
     /// Look up the enum owning `variant`, returning the enum name, its
     /// type parameters, and the variant's field types (over
     /// `Type::Generic` parameters).
+    /// Resolve a constructor name against a specific enum, used to
+    /// disambiguate a constructor shared by several enums in favour of the
+    /// match scrutinee's own enum.
+    fn enum_variant_schema_in(
+        &self,
+        enum_name: &str,
+        variant: &str,
+    ) -> Option<(String, Vec<String>, Vec<Type>)> {
+        let schema = self.enum_schemas.get(enum_name)?;
+        let (_, fields) = schema.variants.iter().find(|(name, _)| name == variant)?;
+        Some((
+            enum_name.to_string(),
+            schema.type_params.clone(),
+            fields.clone(),
+        ))
+    }
+
     fn enum_variant_schema(&self, variant: &str) -> Option<(String, Vec<String>, Vec<Type>)> {
         for (enum_name, schema) in &self.enum_schemas {
             if let Some((_, fields)) = schema.variants.iter().find(|(name, _)| name == variant) {
