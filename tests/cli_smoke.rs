@@ -3136,6 +3136,70 @@ fn builds_native_executable_for_recursive_function_static_top_level_capture() {
     assert!(run.stderr.is_empty());
 }
 
+/// A self-recursive function is compiled out of line, so it cannot address
+/// the top-level frame's slot for a `mutable` global it captures. Native used
+/// to snapshot the global's value into a callee-frame local, reading a stale
+/// value and discarding writes when the frame dies — a silent miscompile
+/// (`mutable c = 0; def f(n){ c = 1; ... }; f(0); println(c)` printed `0`
+/// instead of the evaluator's `1`). It is now refused with a clean diagnostic
+/// rather than miscompiled. A self-recursive capture of an *immutable* val is
+/// still snapshotted correctly (see the test above), and a non-recursive
+/// function mutating a global is inlined and reaches the real slot.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_refuses_recursive_capture_of_mutable_global() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-recmut-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-recmut-{unique}"));
+    fs::write(
+        &source_path,
+        "mutable c = 0\n\
+         def f(n: Int): Int = {\n\
+         \x20 c = 1\n\
+         \x20 if(n <= 0) 0 else f(n - 1)\n\
+         }\n\
+         val r = f(0)\n\
+         println(c)\n",
+    )
+    .expect("source should write");
+
+    // The evaluator (oracle) accepts it and prints 1.
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "1\n");
+
+    // Native refuses rather than silently printing 0.
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !build.status.success(),
+        "native must refuse a recursive capture of a mutable global, not miscompile it"
+    );
+    assert!(
+        String::from_utf8_lossy(&build.stderr)
+            .contains("recursive function capturing a mutable top-level binding"),
+        "expected a clean unsupported diagnostic, got:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_static_folded_recursive_list_function() {
