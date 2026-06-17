@@ -33220,6 +33220,9 @@ impl NativeCodeGenerator {
             };
             {
                 let parsed = self.lower_interpolation_enums(rewrite_expression((**hole).clone()));
+                // Collection-literal holes are formatted in place by this
+                // short-circuit; it owns its own evaluation and never falls
+                // through to the recursion-prone general path below.
                 if let Some(fragment) = self.compile_collection_literal_display_runtime_string(
                     &parsed,
                     span,
@@ -33237,12 +33240,47 @@ impl NativeCodeGenerator {
                     );
                     continue;
                 }
+                // A hole that can re-enter this interpolation site — a call
+                // into a function that itself interpolates, including direct
+                // or mutual recursion — would otherwise clobber the shared
+                // static buffer and offset cell mid-build (the inner build
+                // resets the offset to 0 and overwrites bytes). Snapshot the
+                // in-progress prefix to a GC heap string, evaluate the hole,
+                // then restore the prefix and offset before appending the
+                // fragment.
+                let reentrant = interpolation_hole_may_reenter(&parsed);
+                let snapshot_slot = if reentrant {
+                    self.push_scope();
+                    self.emit_runtime_string_to_heap_string(data, offset);
+                    let slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+                    self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                    Some(slot)
+                } else {
+                    None
+                };
                 let fragment = self.compile_expr(&parsed)?;
                 let enum_shape = if fragment == NativeValue::HeapPointer {
                     self.pending_enum_shape.take()
                 } else {
                     None
                 };
+                if let Some(snapshot_slot) = snapshot_slot {
+                    // Spill the fragment's payload register, restore the
+                    // prefix the hole evaluation clobbered, then reload it.
+                    // The restore emits no allocation, so the unrooted spill
+                    // cannot be freed before the reload.
+                    let frag_slot = self.allocate_anonymous_slot(NativeValue::Int);
+                    self.asm.store_rbp_slot(frag_slot.offset, Reg::Rax);
+                    self.emit_reset_runtime_buffer_offset_label(offset);
+                    self.asm.load_rbp_slot(Reg::Rax, snapshot_slot.offset);
+                    self.emit_append_heap_string_to_runtime_buffer_offset_label(
+                        data,
+                        offset,
+                        span,
+                        "string interpolation result exceeds 65536 bytes",
+                    );
+                    self.asm.load_rbp_slot(Reg::Rax, frag_slot.offset);
+                }
                 if let Some(shape) = enum_shape {
                     let formatted = self.emit_enum_display_runtime_string(&shape, span)?;
                     if let Some(formatted) = self.native_string_ref(formatted) {
@@ -33339,6 +33377,9 @@ impl NativeCodeGenerator {
                     }
                 } else {
                     return Err(unsupported(span, "native string interpolation"));
+                }
+                if reentrant {
+                    self.pop_scope();
                 }
             }
         }
@@ -39624,6 +39665,30 @@ fn lookup_var_slot_in_scopes(scopes: &[HashMap<String, VarSlot>], name: &str) ->
         .iter()
         .rev()
         .find_map(|scope| scope.get(name).copied())
+}
+
+/// Whether evaluating an interpolation hole could re-enter an
+/// interpolation buffer — i.e. it may invoke a user function (which can
+/// recurse back into the same interpolation site). Only provably
+/// call-free holes (literals, identifiers, and arithmetic over them) are
+/// safe; every other shape is treated conservatively, since a false
+/// negative is a silent miscompile while a false positive only costs a
+/// prefix snapshot.
+fn interpolation_hole_may_reenter(expr: &Expr) -> bool {
+    match expr {
+        Expr::Int { .. }
+        | Expr::Double { .. }
+        | Expr::Bool { .. }
+        | Expr::String { .. }
+        | Expr::Null { .. }
+        | Expr::Unit { .. }
+        | Expr::Identifier { .. } => false,
+        Expr::Binary { lhs, rhs, .. } => {
+            interpolation_hole_may_reenter(lhs) || interpolation_hole_may_reenter(rhs)
+        }
+        Expr::Unary { expr, .. } => interpolation_hole_may_reenter(expr),
+        _ => true,
+    }
 }
 
 fn expr_contains_thread_call(expr: &Expr, thread_aliases: &HashSet<String>) -> bool {
