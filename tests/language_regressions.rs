@@ -271,6 +271,19 @@ fn typechecker_specs_are_covered_more_directly() {
             .to_string()
             .contains("expects 2 arguments but got 1")
     );
+
+    // Non-lambda arguments are checked before lambda arguments, so a lambda
+    // whose body dispatches a method on its parameter (`(lst) => lst.size()`)
+    // sees the parameter's type pinned by the sibling argument. This used to
+    // commit the parameter to a structural-record shape and reject the call.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "def hof(f: ('a) => 'b, x: 'a): 'b = f(x)\nhof((lst) => lst.size(), [1, 2, 3])",
+        )
+        .unwrap(),
+        Value::Int(3)
+    );
 }
 
 #[test]
