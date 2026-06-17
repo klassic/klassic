@@ -253,7 +253,9 @@ cargo run -- -e "1 + 2"
   while evaluating `m` and `k` exactly once. `m.keys()` / `m.values()`
   reuse the `__gc_smap_keys`/`__gc_smap_values` list builders for a runtime
   map and project a static map literal's compile-time entries into a fresh
-  static list. The kind tag also drives display: `println` and string
+  static list. `m.put(k, v)` builds a fresh static map from a static map's
+  entries — updating an existing key in place or appending a new one — so
+  the original map is untouched. The kind tag also drives display: `println` and string
   interpolation emit `%(v1, v2, ...)` for runtime sets and
   `%[k: v, ...]` for runtime maps, matching the static-collection display
   rather than falling back to the bracketed list form.

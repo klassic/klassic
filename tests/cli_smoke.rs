@@ -3051,6 +3051,67 @@ fn builds_native_executable_for_map_keys_and_values() {
     );
 }
 
+/// `m.put(k, v)` returns a fresh static map: an existing key is updated in
+/// place (position preserved), a new key is appended, and the original map
+/// is untouched — matching the evaluator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_map_put() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-mapput-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-mapput-{unique}"));
+    fs::write(
+        &source_path,
+        "val m = %[\"a\": 1, \"b\": 2]\n\
+         println(m.put(\"c\", 3))\n\
+         println(m.put(\"a\", 9))\n\
+         println(m.put(\"a\", 9).keys())\n\
+         println(m.put(\"c\", 3).getOrElse(\"c\", 0))\n\
+         println(m.size())\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        "%[a: 1, b: 2, c: 3]\n%[a: 9, b: 2]\n[a, b]\n3\n2\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native Map#put must match eval"
+    );
+}
+
 /// `std.result` imports `std.option` internally, so importing only
 /// `std.result` must transitively splice `std.option` — including its bare
 /// `val none` — and order it first, since native resolves a `val` only after
