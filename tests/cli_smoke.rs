@@ -3051,6 +3051,66 @@ fn builds_native_executable_for_map_keys_and_values() {
     );
 }
 
+/// `s.toList()` projects a static set's elements into a list, matching the
+/// evaluator for printing, `foreach`, chained list methods, and deduped
+/// literals.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_set_to_list() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-settolist-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-settolist-{unique}"));
+    fs::write(
+        &source_path,
+        "val nums = %(3, 1, 2, 1)\n\
+         val words = %(\"a\", \"b\")\n\
+         println(nums.toList())\n\
+         println(nums.toList().size())\n\
+         foreach (w in words.toList()) { println(w) }\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        "[3, 1, 2]\n3\na\nb\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native Set#toList must match eval"
+    );
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_runtime_return_map_function_values() {

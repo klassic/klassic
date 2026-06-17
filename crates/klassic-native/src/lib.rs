@@ -17612,6 +17612,11 @@ impl NativeCodeGenerator {
             "values" if arguments.is_empty() => {
                 return self.compile_map_keys_or_values(target, span, true);
             }
+            // `s.toList()` — the set form. (Option/Result `toList` is an
+            // extension method already routed by the enum dispatch above.)
+            "toList" if arguments.is_empty() => {
+                return self.compile_set_to_list(target, span);
+            }
             "toString" => "toString",
             "substring" => "substring",
             "at" => "at",
@@ -17758,6 +17763,23 @@ impl NativeCodeGenerator {
             .collect();
         let label = self.intern_static_list(elements);
         Ok(self.emit_static_value(&StaticValue::StaticList { label }))
+    }
+
+    /// `s.toList()` — the elements of a static set as a list, in insertion
+    /// order. A runtime set has no static element vector, so it stays a clean
+    /// diagnostic.
+    fn compile_set_to_list(
+        &mut self,
+        target: &Expr,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let value = self.compile_expr(target)?;
+        let NativeValue::StaticSet { label } = value else {
+            return Err(unsupported(span, "native Set#toList for non-static set"));
+        };
+        let elements = self.static_sets[label.0].elements.clone();
+        let list_label = self.intern_static_list(elements);
+        Ok(self.emit_static_value(&StaticValue::StaticList { label: list_label }))
     }
 
     /// The enum name behind a tracked `ConcreteEnumShape`: look any of its
