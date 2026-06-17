@@ -1528,21 +1528,27 @@ impl TypeChecker {
                 ..
             } => {
                 self.register_instance(class_name, for_type_annotation, constraints, *span)?;
-                // Type-check each instance method body against its declared
-                // return type, so a body that disagrees with its signature
-                // (`def compute(x: Boolean): Int = "not an int"`) is rejected
-                // at compile time instead of crashing at runtime. The method
-                // name itself is deliberately NOT declared in the scratch
-                // scope: a class method called inside the body (e.g.
-                // `show(p.name)`) must dispatch through the polymorphic class
-                // method, not recurse into this instance's own monomorphic
-                // definition.
+                // Type-check each instance method against the class. Two checks:
+                // (1) its body must match its declared return type, and (2) its
+                // declared signature must match the class method signature
+                // instantiated at the instance type — so an instance whose
+                // method returns the wrong type
+                // (`def compute(x: Boolean): Int = "not an int"`) or takes the
+                // wrong type (`instance Compute<String> { def compute(x: Int) }`)
+                // is rejected at compile time instead of crashing at runtime.
+                // The method name itself is deliberately NOT declared in the
+                // scratch scope: a class method called inside the body
+                // (`show(p.name)`) must dispatch through the polymorphic class
+                // method, not recurse into this instance's monomorphic one.
+                let class_info = self.typeclasses.get(class_name).cloned();
                 for method in methods {
                     let Expr::DefDecl {
+                        name: method_name,
                         params,
                         param_annotations,
                         return_annotation,
                         body,
+                        span: method_span,
                         ..
                     } = method
                     else {
@@ -1551,6 +1557,7 @@ impl TypeChecker {
                     self.push_scope();
                     let result = (|| {
                         let mut named = HashMap::new();
+                        let mut param_types = Vec::with_capacity(params.len());
                         for (index, param) in params.iter().enumerate() {
                             let ty = param_annotations
                                 .get(index)
@@ -1559,7 +1566,8 @@ impl TypeChecker {
                                     self.parse_annotation_with_named_vars(annotation, &mut named)
                                 })
                                 .unwrap_or_else(|| self.fresh_var());
-                            self.declare(param.clone(), false, ty, Vec::new(), Vec::new());
+                            self.declare(param.clone(), false, ty.clone(), Vec::new(), Vec::new());
+                            param_types.push(ty);
                         }
                         let return_type = return_annotation
                             .as_ref()
@@ -1567,6 +1575,37 @@ impl TypeChecker {
                                 self.parse_annotation_with_named_vars(annotation, &mut named)
                             })
                             .unwrap_or_else(|| self.fresh_var());
+
+                        // (2) signature vs class method instantiated at the
+                        // instance type. Single-parameter classes only; the
+                        // shared `named` map keeps a generic instance's type
+                        // variable (`Show<List<'a>>`) consistent between the
+                        // instance type and the method signature.
+                        if let Some(info) = &class_info
+                            && info.type_params.len() == 1
+                            && let Some(class_method) =
+                                info.methods.iter().find(|m| &m.name == method_name)
+                        {
+                            let instance_type = self
+                                .parse_annotation_with_named_vars(for_type_annotation, &mut named);
+                            let instance_type = self.normalize_constraint_type(instance_type);
+                            let substitutions: HashMap<String, Type> =
+                                std::iter::once((info.type_params[0].clone(), instance_type))
+                                    .collect();
+                            let expected = substitute_generics(&class_method.ty, &substitutions);
+                            // Only compare when the class declares the member
+                            // as a function; a non-function member type is a
+                            // loose placeholder, not a signature to match.
+                            if matches!(self.resolve(&expected), Type::Function(_, _)) {
+                                let actual = Type::Function(
+                                    param_types.clone(),
+                                    Box::new(return_type.clone()),
+                                );
+                                self.unify(expected, actual, *method_span)?;
+                            }
+                        }
+
+                        // (1) body vs declared return type.
                         let body_type = self.infer_expr(body)?;
                         self.enforce_assignable(return_type, body_type, body.span())?;
                         Ok(())
