@@ -3112,6 +3112,69 @@ fn builds_native_executable_for_map_put() {
     );
 }
 
+/// `m.remove(k)`, `s.add(x)`, and `s.remove(x)` build a fresh static map or
+/// set, preserving order, deduping a set add, and leaving the original
+/// untouched — matching the evaluator, including when chained.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_map_set_remove_and_add() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-removeadd-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-removeadd-{unique}"));
+    fs::write(
+        &source_path,
+        "val m = %[\"a\": 1, \"b\": 2, \"c\": 3]\n\
+         println(m.remove(\"b\"))\n\
+         println(m.size())\n\
+         val s = %(1, 2, 3)\n\
+         println(s.add(4))\n\
+         println(s.add(2))\n\
+         println(s.remove(2))\n\
+         println(s.add(4).remove(2).toList())\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        "%[a: 1, c: 3]\n3\n%(1, 2, 3, 4)\n%(1, 2, 3)\n%(1, 3)\n[1, 3, 4]\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native Map#remove / Set#add / Set#remove must match eval"
+    );
+}
+
 /// `std.result` imports `std.option` internally, so importing only
 /// `std.result` must transitively splice `std.option` — including its bare
 /// `val none` — and order it first, since native resolves a `val` only after

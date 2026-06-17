@@ -255,7 +255,9 @@ cargo run -- -e "1 + 2"
   map and project a static map literal's compile-time entries into a fresh
   static list. `m.put(k, v)` builds a fresh static map from a static map's
   entries — updating an existing key in place or appending a new one — so
-  the original map is untouched. The kind tag also drives display: `println` and string
+  the original map is untouched. `m.remove(k)`, `s.add(x)`, and `s.remove(x)`
+  build a fresh static map/set the same way (a set add dedups), interning the
+  filtered or extended entries. The kind tag also drives display: `println` and string
   interpolation emit `%(v1, v2, ...)` for runtime sets and
   `%[k: v, ...]` for runtime maps, matching the static-collection display
   rather than falling back to the bracketed list form.
