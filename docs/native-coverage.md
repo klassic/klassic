@@ -357,6 +357,16 @@ declaration, and `--deny-trust` rejects the build when any reachable
 theorem does. Calling a zero-argument axiom in proof position is a
 shared type-check limitation, diagnosed identically by both paths.
 
+## Cleanup Clauses
+
+A `cleanup { ... }` clause runs after its associated expression on the
+normal completion path. Native builds do not unwind cleanup clauses when
+that expression aborts at runtime (for example on division by zero): the
+evaluator runs the clause before propagating the error, while a native
+build reports the error without running it. A program that aborts
+therefore differs only in the cleanup side effect, not in the final
+exit; restoring abort-time unwinding is a known gap.
+
 ## Runtime List Literals And Selectors
 
 Direct `head` over list literals can return runtime native values, including
