@@ -3200,6 +3200,72 @@ fn native_refuses_recursive_capture_of_mutable_global() {
     );
 }
 
+/// A nominal record type annotation (`p: Point`) accepts the corresponding
+/// `#Point(...)` constructor. The annotation used to stay a `Named` type
+/// while the constructor produced a `Record` type, so they failed to unify
+/// (`Point is not compatible with #Point`), making annotated record params
+/// and returns unusable. Native must match the evaluator on the now-accepted
+/// program.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_annotated_nominal_record() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-recordann-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-recordann-{unique}"));
+    fs::write(
+        &source_path,
+        "record Point { x: Int; y: Int }\n\
+         def sum(p: Point): Int = p.x + p.y\n\
+         def mk(a: Int): Point = #Point(a, a + 1)\n\
+         val q: Point = #Point(10, 20)\n\
+         println(sum(#Point(3, 4)))\n\
+         println(sum(mk(5)))\n\
+         println(q.y)\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(
+        eval.status.success(),
+        "eval failed:\n{}",
+        String::from_utf8_lossy(&eval.stderr)
+    );
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "7\n11\n20\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native output must match eval for annotated nominal records"
+    );
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_static_folded_recursive_list_function() {

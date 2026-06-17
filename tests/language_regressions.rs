@@ -423,6 +423,36 @@ fn record_specs_are_covered_more_directly() {
     )
     .expect_err("record field mismatch should fail");
     assert!(field_error.to_string().contains("type mismatch"));
+
+    // A nominal record type annotation accepts the corresponding `#Name(...)`
+    // constructor: the annotation `p: Point` and the constructed value
+    // `#Point(...)` must unify. Both used to be different type
+    // representations (`Named` vs `Record`), so the annotation was rejected
+    // with `Point is not compatible with #Point`.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "record Point {\n  x: Int\n  y: Int\n}\ndef sum(p: Point): Int = p.x + p.y\nsum(#Point(3, 4))",
+        )
+        .unwrap(),
+        Value::Int(7)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "record Point {\n  x: Int\n  y: Int\n}\nval q: Point = #Point(1, 2)\nq.y",
+        )
+        .unwrap(),
+        Value::Int(2)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "record Point {\n  x: Int\n  y: Int\n}\ndef mk(a: Int): Point = #Point(a, a + 1)\nmk(5).y",
+        )
+        .unwrap(),
+        Value::Int(6)
+    );
 }
 
 #[test]
