@@ -453,6 +453,37 @@ fn record_specs_are_covered_more_directly() {
         .unwrap(),
         Value::Int(6)
     );
+
+    // Structural-record width subtyping: a function whose parameter mentions
+    // a subset of fields accepts a richer record (the documented
+    // "looks for the fields it mentions and ignores the rest" behavior).
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "def name_of(o: { name: String }): String = o.name\nname_of(record { name: \"Klassic\"; age: 7 })",
+        )
+        .unwrap(),
+        Value::String("Klassic".to_string())
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "def add(r: { a: Int; b: Int }): Int = r.a + r.b\nadd(record { a: 1; b: 2; c: 3; d: 4 })",
+        )
+        .unwrap(),
+        Value::Int(3)
+    );
+    // A missing required field is still rejected (narrowing is not allowed).
+    let missing = evaluate_text(
+        "<expr>",
+        "def need_x(r: { x: Int }): Int = r.x\nneed_x(record { y: 2 })",
+    )
+    .expect_err("a record missing a required field should be rejected");
+    assert!(
+        missing
+            .to_string()
+            .contains("is not available on this record")
+    );
 }
 
 #[test]
