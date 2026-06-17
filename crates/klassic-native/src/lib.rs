@@ -8164,7 +8164,7 @@ impl NativeCodeGenerator {
                 self.asm.bind_text_label(ok);
                 Ok(NativeValue::Unit)
             }
-            NativeValue::Int | NativeValue::Bool | NativeValue::HeapPointer => {
+            NativeValue::Int | NativeValue::Bool => {
                 self.push_temp_reg(Reg::Rax);
                 let actual = self.compile_expr(&actual_arguments[0])?;
                 if actual != expected {
@@ -8178,6 +8178,33 @@ impl NativeCodeGenerator {
                 self.asm.cmp_reg_reg(Reg::Rcx, Reg::Rax);
                 self.asm.jcc_label(Condition::Equal, ok);
                 self.emit_assert_result_failed_runtime(span, expected);
+                self.asm.bind_text_label(ok);
+                Ok(NativeValue::Unit)
+            }
+            NativeValue::HeapPointer => {
+                // A heap value (enum, cons cell, ...) must compare
+                // structurally, not by heap identity — two freshly built
+                // copies of the same value have different addresses.
+                // `gc_deep_equal` walks both operands' GC structure, the
+                // same routine the `==` operator uses. The failure path
+                // reports a plain message rather than the raw pointers a
+                // value formatter would print for a heap value without a
+                // tracked shape.
+                self.push_temp_reg(Reg::Rax);
+                let actual = self.compile_expr(&actual_arguments[0])?;
+                if !matches!(actual, NativeValue::HeapPointer) {
+                    return Err(unsupported(
+                        span,
+                        "native assertResult for values with different types",
+                    ));
+                }
+                self.pop_temp_reg(Reg::Rdi);
+                self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
+                self.asm.call_label(self.gc_deep_equal);
+                let ok = self.asm.create_text_label();
+                self.asm.cmp_reg_imm8(Reg::Rax, 0);
+                self.asm.jcc_label(Condition::NotEqual, ok);
+                self.emit_runtime_error(span, "assertResult failed");
                 self.asm.bind_text_label(ok);
                 Ok(NativeValue::Unit)
             }
