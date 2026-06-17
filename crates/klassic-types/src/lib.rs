@@ -2202,7 +2202,7 @@ impl TypeChecker {
     ) -> Result<Type, Diagnostic> {
         match self.resolve(&callee_type) {
             Type::Function(params, result) => {
-                if arguments.len() != params.len() {
+                if arguments.len() < params.len() {
                     return Err(type_error(
                         span,
                         format!(
@@ -2217,10 +2217,34 @@ impl TypeChecker {
                         ),
                     ));
                 }
+                let arity = params.len();
                 for (expected, argument) in params.into_iter().zip(arguments.iter()) {
                     self.check_call_argument(expected, argument)?;
                 }
-                Ok(self.resolve(&result))
+                let result = self.resolve(&result);
+                if arguments.len() > arity {
+                    // Over-application: a curried function applied to more
+                    // arguments than its first arity. Feed the remaining
+                    // arguments to the returned function, matching the runtime
+                    // (which curries via `apply_callable`), so e.g.
+                    // `map(xs, f)` type-checks like `map(xs)(f)`. Only when the
+                    // result is itself a function — otherwise this is a genuine
+                    // too-many-arguments error (e.g. a constructor or a
+                    // scalar-returning function), reported as such.
+                    if matches!(result, Type::Function(_, _)) {
+                        return self.infer_call(result, &arguments[arity..], span, noun);
+                    }
+                    return Err(type_error(
+                        span,
+                        format!(
+                            "{noun} expects {} {} but got {}",
+                            arity,
+                            if arity == 1 { "argument" } else { "arguments" },
+                            arguments.len()
+                        ),
+                    ));
+                }
+                Ok(result)
             }
             Type::Var(id) => {
                 // The callee is an unresolved type variable — typically a
@@ -2364,7 +2388,7 @@ impl TypeChecker {
     ) -> Result<Type, Diagnostic> {
         match self.resolve(&callee_type) {
             Type::Function(params, result) => {
-                if arguments.len() != params.len() {
+                if arguments.len() < params.len() {
                     return Err(type_error(
                         span,
                         format!(
@@ -2379,10 +2403,34 @@ impl TypeChecker {
                         ),
                     ));
                 }
+                let arity = params.len();
                 for (expected, argument) in params.into_iter().zip(arguments.iter()) {
                     self.check_call_argument(expected, argument)?;
                 }
-                Ok(self.resolve(&result))
+                let result = self.resolve(&result);
+                if arguments.len() > arity {
+                    // Over-application: a curried function applied to more
+                    // arguments than its first arity. Feed the remaining
+                    // arguments to the returned function, matching the runtime
+                    // (which curries via `apply_callable`), so e.g.
+                    // `map(xs, f)` type-checks like `map(xs)(f)`. Only when the
+                    // result is itself a function — otherwise this is a genuine
+                    // too-many-arguments error (e.g. a constructor or a
+                    // scalar-returning function), reported as such.
+                    if matches!(result, Type::Function(_, _)) {
+                        return self.infer_call(result, &arguments[arity..], span, noun);
+                    }
+                    return Err(type_error(
+                        span,
+                        format!(
+                            "{noun} expects {} {} but got {}",
+                            arity,
+                            if arity == 1 { "argument" } else { "arguments" },
+                            arguments.len()
+                        ),
+                    ));
+                }
+                Ok(result)
             }
             Type::Var(id) => {
                 // The callee is an unresolved type variable — typically a

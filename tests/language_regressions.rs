@@ -245,6 +245,32 @@ fn typechecker_specs_are_covered_more_directly() {
         .unwrap(),
         Value::Int(1)
     );
+
+    // Over-application: a curried function applied to more arguments than its
+    // first arity feeds the rest to the returned function, like the runtime.
+    // `map(xs, f)` used to be rejected ("expects 1 argument but got 2") even
+    // though it ran; it now type-checks like `map(xs)(f)`.
+    assert_eq!(
+        evaluate_text("<expr>", "map([1 2 3], (x) => x + 1)").unwrap(),
+        Value::List(vec![Value::Int(2), Value::Int(3), Value::Int(4)])
+    );
+    // A genuine too-many-arguments error (a non-function result) is still
+    // reported as an arity error, not silently over-applied.
+    let too_many = evaluate_text("<expr>", "def f(x: Int): Int = x\nf(1, 2)")
+        .expect_err("calling a scalar-returning function with extra args should fail");
+    assert!(
+        too_many
+            .to_string()
+            .contains("expects 1 argument but got 2")
+    );
+    // Partial application (too few arguments) is still rejected.
+    let too_few = evaluate_text("<expr>", "def g(x, y) = x + y\ng(1)")
+        .expect_err("partial application should fail");
+    assert!(
+        too_few
+            .to_string()
+            .contains("expects 2 arguments but got 1")
+    );
 }
 
 #[test]
