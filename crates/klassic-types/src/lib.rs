@@ -4065,7 +4065,16 @@ impl TypeChecker {
                         .annotation
                         .as_ref()
                         .map(|annotation| {
-                            parse_schema_type_annotation(&annotation.text, type_params)
+                            // Mirror the enum path: a bare type-parameter name
+                            // (`record Box<a> { v: a }`) parses to `Named("a")`,
+                            // so generify it to `Generic("a")` like enums do.
+                            // Without this only the `'a` form became a type
+                            // variable and `<a>` was treated as a concrete type,
+                            // so `#Box(5)` failed to unify.
+                            generify_named_params(
+                                parse_schema_type_annotation(&annotation.text, type_params),
+                                type_params,
+                            )
                         })
                         .unwrap_or(Type::Dynamic);
                     (field.name.clone(), ty)
