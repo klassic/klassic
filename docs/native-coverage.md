@@ -294,6 +294,30 @@ storage across normal and recursive native calls. Runtime line-list
 `foldLeft` can use the same storage for record accumulators, including
 empty `List<String>` fields.
 
+## Enums And Match
+
+Monomorphic enums lower to GC records with short-circuit tag dispatch:
+each variant is a heap cell whose first slot is the boxed tag and whose
+remaining slots box the payload. Supported payloads are integer (`Int` /
+`Long` / `Short` / `Byte`), `Boolean`, `String`, and nested
+monomorphic-enum fields, with distinct variant names. Generic enums
+(`Option<a>`, `Result<a, b>`, self-referential shapes) compile per
+instantiation, with payload shapes tracked through `val` bindings,
+control-flow joins, and fully-applied annotated function boundaries — so
+recursive functions over `Option<Int>`- or `Tree`-style annotations
+lower natively. Enum values format through `toString`, interpolation,
+and string concatenation.
+
+`match` lowers to a tag-test if-chain over constructor patterns,
+including nested constructor patterns, integer / string literal
+patterns, variable bindings, wildcards, and arm guards. The checker
+diagnoses match exhaustiveness and unreachable arms ahead of codegen.
+
+Remaining gaps fail at build time with a source-located diagnostic
+rather than miscompiling: comparing enum values with `==` / `!=` (the
+evaluator compares them structurally), and aggregate payload fields such
+as `List<SomeEnum>`.
+
 ## Runtime List Literals And Selectors
 
 Direct `head` over list literals can return runtime native values, including
