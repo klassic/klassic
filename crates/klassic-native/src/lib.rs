@@ -6124,6 +6124,17 @@ impl NativeCodeGenerator {
                 .mov_imm64(Reg::Rax, u64::from(equal == (op == BinaryOp::Equal)));
             return Ok(NativeValue::Bool);
         }
+        // Ordering of two compile-time-known strings folds to a constant.
+        // Runtime string ordering (sorting variables) is not lowered yet and
+        // falls through to a clean diagnostic.
+        if matches!(
+            op,
+            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual
+        ) && let Some(result) = self.static_string_ordering_from_exprs(lhs, rhs, op)
+        {
+            self.asm.mov_imm64(Reg::Rax, u64::from(result));
+            return Ok(NativeValue::Bool);
+        }
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && let Some(value) = self.compile_map_get_null_equality(lhs, rhs, op, span)?
         {
@@ -30473,6 +30484,32 @@ impl NativeCodeGenerator {
         let lhs = self.static_value_from_expr(lhs)?;
         let rhs = self.static_value_from_expr(rhs)?;
         Some(self.static_value_equal_user(&lhs, &rhs))
+    }
+
+    /// Compare two compile-time-known strings lexicographically (UTF-8 byte
+    /// order preserves code-point order), matching the evaluator. Returns
+    /// `None` when either side is not a static string, so non-string or
+    /// runtime operands fall through.
+    fn static_string_ordering_from_exprs(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        op: BinaryOp,
+    ) -> Option<bool> {
+        if !static_expr_is_pure(lhs) || !static_expr_is_pure(rhs) {
+            return None;
+        }
+        let lhs = self.static_value_from_expr(lhs)?;
+        let rhs = self.static_value_from_expr(rhs)?;
+        let lhs = self.static_string_from_value(&lhs)?;
+        let rhs = self.static_string_from_value(&rhs)?;
+        Some(match op {
+            BinaryOp::Less => lhs < rhs,
+            BinaryOp::LessEqual => lhs <= rhs,
+            BinaryOp::Greater => lhs > rhs,
+            BinaryOp::GreaterEqual => lhs >= rhs,
+            _ => return None,
+        })
     }
 
     fn static_equality_from_exprs_preserving_effects(

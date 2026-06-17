@@ -63,6 +63,14 @@ val tidy = "  Klassic  ".trim().toUpperCase()
 println(tidy)   // KLASSIC
 ```
 
+Strings also order lexicographically by code point, so `<`, `<=`, `>`,
+and `>=` work on text and `std.list.sort` can sort it:
+
+```kl
+println("apple" < "banana")   // true
+println(sort(["banana", "apple"]))   // [apple, banana]
+```
+
 ## Formatting and padding
 
 `format(template, args)` fills each `{}` placeholder from the `args`
