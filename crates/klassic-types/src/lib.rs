@@ -3452,13 +3452,22 @@ impl TypeChecker {
                         Box::new(Type::Dynamic),
                     ),
                 ),
+                // Element-typed over fresh generalized variables (declared
+                // `declare_poly`, so each use instantiates fresh): the key /
+                // value type flows out instead of `Dynamic`.
                 (
                     "keys",
-                    Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+                    Type::Function(
+                        vec![Type::Map(Box::new(Type::Var(0)), Box::new(Type::Var(1)))],
+                        Box::new(Type::List(Box::new(Type::Var(0)))),
+                    ),
                 ),
                 (
                     "values",
-                    Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+                    Type::Function(
+                        vec![Type::Map(Box::new(Type::Var(0)), Box::new(Type::Var(1)))],
+                        Box::new(Type::List(Box::new(Type::Var(1)))),
+                    ),
                 ),
                 (
                     "isEmpty",
@@ -3515,17 +3524,37 @@ impl TypeChecker {
                     Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
                 ),
                 ("empty", Type::Function(vec![], Box::new(Type::Dynamic))),
+                // Two sets of the same element type in, a set of that type
+                // out, over a fresh generalized variable.
                 (
                     "union",
-                    Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                    Type::Function(
+                        vec![
+                            Type::Set(Box::new(Type::Var(0))),
+                            Type::Set(Box::new(Type::Var(0))),
+                        ],
+                        Box::new(Type::Set(Box::new(Type::Var(0)))),
+                    ),
                 ),
                 (
                     "intersect",
-                    Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                    Type::Function(
+                        vec![
+                            Type::Set(Box::new(Type::Var(0))),
+                            Type::Set(Box::new(Type::Var(0))),
+                        ],
+                        Box::new(Type::Set(Box::new(Type::Var(0)))),
+                    ),
                 ),
                 (
                     "subtract",
-                    Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                    Type::Function(
+                        vec![
+                            Type::Set(Box::new(Type::Var(0))),
+                            Type::Set(Box::new(Type::Var(0))),
+                        ],
+                        Box::new(Type::Set(Box::new(Type::Var(0)))),
+                    ),
                 ),
             ],
             "FileInput" => &[
@@ -5046,13 +5075,25 @@ fn builtin_module_type_exports(path: &str) -> Option<ModuleTypeExports> {
                     Box::new(Type::Dynamic),
                 ),
             ),
+            // `Map#keys(m)` / `Map#values(m)` are element-typed over fresh
+            // generalized variables (the `Type::Var`s are generalized by
+            // `free_vars` and instantiated per use), so a key/value flows out
+            // as its real type rather than `Dynamic` — e.g.
+            // `foldLeft(Map#keys(%["a": 1]))(0)((acc, k) => acc + k)` is now a
+            // type error instead of silently folding a String as an Int.
             (
                 "keys",
-                Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+                Type::Function(
+                    vec![Type::Map(Box::new(Type::Var(0)), Box::new(Type::Var(1)))],
+                    Box::new(Type::List(Box::new(Type::Var(0)))),
+                ),
             ),
             (
                 "values",
-                Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
+                Type::Function(
+                    vec![Type::Map(Box::new(Type::Var(0)), Box::new(Type::Var(1)))],
+                    Box::new(Type::List(Box::new(Type::Var(1)))),
+                ),
             ),
             (
                 "isEmpty",
@@ -5109,17 +5150,39 @@ fn builtin_module_type_exports(path: &str) -> Option<ModuleTypeExports> {
                 Type::Function(vec![Type::Dynamic], Box::new(Type::Dynamic)),
             ),
             ("empty", Type::Function(vec![], Box::new(Type::Dynamic))),
+            // `Set#union` / `intersect` / `subtract` take two sets of the same
+            // element type and return a set of that type, over a fresh
+            // generalized variable, so mixing element types is a type error
+            // instead of producing a `Dynamic`-typed set.
             (
                 "union",
-                Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                Type::Function(
+                    vec![
+                        Type::Set(Box::new(Type::Var(0))),
+                        Type::Set(Box::new(Type::Var(0))),
+                    ],
+                    Box::new(Type::Set(Box::new(Type::Var(0)))),
+                ),
             ),
             (
                 "intersect",
-                Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                Type::Function(
+                    vec![
+                        Type::Set(Box::new(Type::Var(0))),
+                        Type::Set(Box::new(Type::Var(0))),
+                    ],
+                    Box::new(Type::Set(Box::new(Type::Var(0)))),
+                ),
             ),
             (
                 "subtract",
-                Type::Function(vec![Type::Dynamic, Type::Dynamic], Box::new(Type::Dynamic)),
+                Type::Function(
+                    vec![
+                        Type::Set(Box::new(Type::Var(0))),
+                        Type::Set(Box::new(Type::Var(0))),
+                    ],
+                    Box::new(Type::Set(Box::new(Type::Var(0)))),
+                ),
             ),
         ],
         "FileInput" => &[

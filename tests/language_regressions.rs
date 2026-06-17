@@ -515,6 +515,41 @@ fn exhaustiveness_checks_refutable_payload_subpatterns() {
 }
 
 #[test]
+fn free_map_and_set_builtins_are_element_typed() {
+    // `Map#keys` / `Map#values` / `Set#union` carry the collection's element
+    // type instead of `Dynamic`, so a wrong-typed use is a type error rather
+    // than a silent Dynamic escape.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "val vs: List<Int> = Map#values(%[\"a\": 1 \"b\": 2])\nfoldLeft(vs)(0)((acc, v) => acc + v)",
+        )
+        .unwrap(),
+        Value::Int(3)
+    );
+    let keys_wrong = evaluate_text(
+        "<expr>",
+        "val ks: List<Int> = Map#keys(%[\"a\": 1 \"b\": 2])\nks",
+    )
+    .expect_err("String keys assigned to List<Int> should fail");
+    assert!(keys_wrong.to_string().contains("type mismatch"));
+
+    let union_mixed = evaluate_text("<expr>", "Set#union(%(1 2 3), %(\"a\" \"b\"))")
+        .expect_err("union of differently-typed sets should fail");
+    assert!(union_mixed.to_string().contains("type mismatch"));
+
+    // Correct usage still type-checks.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "val s: Set<Int> = Set#union(%(1 2), %(2 3))\nSet#toList(s).size()",
+        )
+        .unwrap(),
+        Value::Int(3)
+    );
+}
+
+#[test]
 fn match_resolves_constructors_against_the_scrutinee_enum() {
     // A user enum may reuse a prelude constructor name (`Ok`/`Err`,
     // `Some`/`None`). A match arm's constructor must resolve against the
