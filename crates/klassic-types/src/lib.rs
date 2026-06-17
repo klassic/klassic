@@ -651,12 +651,26 @@ impl TypeChecker {
                     Type::Enum(name, head_args) if head_args.is_empty() => {
                         return Type::Enum(name.clone(), args);
                     }
+                    Type::Named(name) if self.record_schemas.contains_key(name) => {
+                        return Type::Record(name.clone(), args);
+                    }
+                    Type::Record(name, head_args) if head_args.is_empty() => {
+                        return Type::Record(name.clone(), args);
+                    }
                     _ => {}
                 }
                 Type::Applied(Box::new(head), args)
             }
             Type::Named(name) if self.enum_schemas.contains_key(name) => {
                 Type::Enum(name.clone(), Vec::new())
+            }
+            // Annotations parse a nominal record name as `Named`; normalize
+            // it to the nominal record type so a `p: Point` annotation
+            // unifies with a `#Point(...)` constructor (which is already a
+            // `Type::Record`). Without this the annotation stayed `Named` and
+            // failed to unify (`Point is not compatible with #Point`).
+            Type::Named(name) if self.record_schemas.contains_key(name) => {
+                Type::Record(name.clone(), Vec::new())
             }
             Type::Record(name, args) => Type::Record(
                 name.clone(),
