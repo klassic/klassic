@@ -17692,6 +17692,12 @@ impl NativeCodeGenerator {
             "put" if arguments.len() == 2 => {
                 return self.compile_map_put(target, &arguments[0], &arguments[1], span);
             }
+            "remove" if arguments.len() == 1 => {
+                return self.compile_collection_remove(target, &arguments[0], span);
+            }
+            "add" if arguments.len() == 1 => {
+                return self.compile_set_add(target, &arguments[0], span);
+            }
             "toString" => "toString",
             "substring" => "substring",
             "at" => "at",
@@ -17889,6 +17895,74 @@ impl NativeCodeGenerator {
         }
         let label = self.intern_static_map(entries);
         Ok(self.emit_static_value(&StaticValue::StaticMap { label }))
+    }
+
+    /// `m.remove(k)` / `s.remove(x)` — a fresh static map or set without the
+    /// given key/element, preserving the order of the rest. The receiver and
+    /// argument are evaluated once; a runtime collection or non-static
+    /// argument stays a clean diagnostic.
+    fn compile_collection_remove(
+        &mut self,
+        target: &Expr,
+        arg: &Expr,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let value = self.compile_expr(target)?;
+        let arg_value = self.static_value_from_argument_preserving_effects(
+            arg,
+            span,
+            "native remove argument",
+        )?;
+        match value {
+            NativeValue::StaticMap { label } => {
+                let entries = self.static_maps[label.0].entries.clone();
+                let kept: Vec<_> = entries
+                    .into_iter()
+                    .filter(|(key, _)| !self.static_value_equal_user(key, &arg_value))
+                    .collect();
+                let label = self.intern_static_map(kept);
+                Ok(self.emit_static_value(&StaticValue::StaticMap { label }))
+            }
+            NativeValue::StaticSet { label } => {
+                let elements = self.static_sets[label.0].elements.clone();
+                let kept: Vec<_> = elements
+                    .into_iter()
+                    .filter(|element| !self.static_value_equal_user(element, &arg_value))
+                    .collect();
+                let label = self.intern_static_set(kept);
+                Ok(self.emit_static_value(&StaticValue::StaticSet { label }))
+            }
+            _ => Err(unsupported(span, "native remove for non-static map or set")),
+        }
+    }
+
+    /// `s.add(x)` — a fresh static set with `x` appended, deduped (a member
+    /// already present is a no-op). The receiver and argument are evaluated
+    /// once; a runtime set or non-static argument stays a clean diagnostic.
+    fn compile_set_add(
+        &mut self,
+        target: &Expr,
+        arg: &Expr,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let value = self.compile_expr(target)?;
+        let NativeValue::StaticSet { label } = value else {
+            return Err(unsupported(span, "native Set#add for non-static set"));
+        };
+        let arg_value = self.static_value_from_argument_preserving_effects(
+            arg,
+            span,
+            "native Set#add element",
+        )?;
+        let mut elements = self.static_sets[label.0].elements.clone();
+        if !elements
+            .iter()
+            .any(|element| self.static_value_equal_user(element, &arg_value))
+        {
+            elements.push(arg_value);
+        }
+        let label = self.intern_static_set(elements);
+        Ok(self.emit_static_value(&StaticValue::StaticSet { label }))
     }
 
     /// The enum name behind a tracked `ConcreteEnumShape`: look any of its
