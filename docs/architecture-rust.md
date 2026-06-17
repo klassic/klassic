@@ -773,7 +773,13 @@ cargo run -- -e "1 + 2"
   `std.option`) is found by a worklist over the parsed modules and spliced
   too, and the spliced modules are ordered so each module's imports precede
   it — a dependency's bare `val` (such as `std.option`'s `none`) must be
-  declared before the dependent references it.
+  declared before the dependent references it. A chained enum extension
+  method that converts to a different enum (`Result.toOption` yields an
+  `Option`) is dispatched against its own return enum rather than the
+  receiver's: the extension function's body is read for the enum it
+  produces, resolving constructor-alias helpers (`some` / `none` / `ok` /
+  `err`) through a one-pass `def` / `val` -> enum map, so a following
+  `getOrElse` routes to the right type.
 
   A portable C backend (roadmap PR 9 / PR 10) lives behind
   `--backend c`: `klassic --backend c build program.kl -o program.c`
