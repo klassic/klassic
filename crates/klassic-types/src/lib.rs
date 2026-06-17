@@ -4454,26 +4454,65 @@ impl TypeChecker {
         if closed {
             return Ok(());
         }
-        let Type::Enum(enum_name, _) = self.resolve(scrutinee_type) else {
+        let Type::Enum(enum_name, enum_args) = self.resolve(scrutinee_type) else {
             return Ok(());
         };
-        let Some(schema) = self.enum_schemas.get(&enum_name) else {
+        let Some(schema) = self.enum_schemas.get(&enum_name).cloned() else {
             return Ok(());
         };
-        let mut covered = HashSet::new();
-        for arm in arms {
-            if arm.guard.is_some() {
-                continue;
-            }
-            if let klassic_syntax::Pattern::Constructor { name, .. } = &arm.pattern {
-                covered.insert(name.clone());
-            }
-        }
+        let patterns: Vec<&klassic_syntax::Pattern> = arms
+            .iter()
+            .filter(|arm| arm.guard.is_none())
+            .map(|arm| &arm.pattern)
+            .collect();
+        let substitutions: HashMap<String, Type> = schema
+            .type_params
+            .iter()
+            .cloned()
+            .zip(enum_args.iter().cloned())
+            .collect();
+        // A variant is covered when it is matched and — for a single-field
+        // variant — its payload sub-patterns are themselves exhaustive, so a
+        // refutable payload (`case Wrap(1)`) or a nested constructor
+        // (`case Full(Full(x))`) that leaves part of the variant unhandled is
+        // reported as missing. Multi-field variants keep the lenient
+        // presence-covers behavior (full matrix coverage is future work).
         let missing: Vec<&str> = schema
             .variants
             .iter()
+            .filter(|(variant, field_types)| {
+                let variant_args: Vec<&[klassic_syntax::Pattern]> = patterns
+                    .iter()
+                    .filter_map(|pattern| match pattern {
+                        klassic_syntax::Pattern::Constructor { name, args, .. }
+                            if name == variant =>
+                        {
+                            Some(args.as_slice())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if variant_args.is_empty() {
+                    return true; // variant never matched
+                }
+                if field_types.is_empty() {
+                    return false; // nullary variant: presence covers it
+                }
+                if variant_args
+                    .iter()
+                    .any(|args| args.iter().all(pattern_is_irrefutable))
+                {
+                    return false; // an irrefutable-payload arm fully covers it
+                }
+                if field_types.len() == 1 {
+                    let field_type = substitute_generics(&field_types[0], &substitutions);
+                    let field_patterns: Vec<&klassic_syntax::Pattern> =
+                        variant_args.iter().map(|args| &args[0]).collect();
+                    return !self.patterns_cover(&field_patterns, &field_type);
+                }
+                false // multi-field: leniently considered covered
+            })
             .map(|(variant, _)| variant.as_str())
-            .filter(|variant| !covered.contains(*variant))
             .collect();
         if missing.is_empty() {
             Ok(())
@@ -4485,6 +4524,75 @@ impl TypeChecker {
                     missing.join(", ")
                 ),
             ))
+        }
+    }
+
+    /// Whether `patterns` exhaustively cover every value of `ty`, used to
+    /// check a constructor variant's payload sub-patterns recursively. A
+    /// wildcard or variable covers everything; a `Bool` needs both `true` and
+    /// `false`; an enum needs every variant covered (recursing into
+    /// single-field payloads); any other type (`Int`, `String`, ...) is only
+    /// covered by a wildcard/variable.
+    fn patterns_cover(&self, patterns: &[&klassic_syntax::Pattern], ty: &Type) -> bool {
+        use klassic_syntax::Pattern;
+        if patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Wildcard { .. } | Pattern::Variable { .. }))
+        {
+            return true;
+        }
+        match self.resolve(ty) {
+            Type::Bool => {
+                let has_true = patterns
+                    .iter()
+                    .any(|p| matches!(p, Pattern::LiteralBool { value: true, .. }));
+                let has_false = patterns
+                    .iter()
+                    .any(|p| matches!(p, Pattern::LiteralBool { value: false, .. }));
+                has_true && has_false
+            }
+            Type::Enum(enum_name, enum_args) => {
+                let Some(schema) = self.enum_schemas.get(&enum_name).cloned() else {
+                    return false;
+                };
+                let substitutions: HashMap<String, Type> = schema
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(enum_args.iter().cloned())
+                    .collect();
+                schema.variants.iter().all(|(variant, field_types)| {
+                    let variant_args: Vec<&[Pattern]> = patterns
+                        .iter()
+                        .filter_map(|pattern| match pattern {
+                            Pattern::Constructor { name, args, .. } if name == variant => {
+                                Some(args.as_slice())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if variant_args.is_empty() {
+                        return false;
+                    }
+                    if field_types.is_empty() {
+                        return true;
+                    }
+                    if variant_args
+                        .iter()
+                        .any(|args| args.iter().all(pattern_is_irrefutable))
+                    {
+                        return true;
+                    }
+                    if field_types.len() == 1 {
+                        let field_type = substitute_generics(&field_types[0], &substitutions);
+                        let field_patterns: Vec<&Pattern> =
+                            variant_args.iter().map(|args| &args[0]).collect();
+                        return self.patterns_cover(&field_patterns, &field_type);
+                    }
+                    true
+                })
+            }
+            _ => false,
         }
     }
 

@@ -446,6 +446,75 @@ fn map_specs_are_covered() {
 }
 
 #[test]
+fn exhaustiveness_checks_refutable_payload_subpatterns() {
+    // A constructor arm with a refutable payload does not cover its whole
+    // variant, so the match is non-exhaustive and rejected (it used to be
+    // accepted and crash at runtime with `no match arm matched value`).
+    let literal_payload = evaluate_text(
+        "<expr>",
+        "enum W { case Wrap(n: Int); case End }\n\
+         def f(w: W): Int = w match { case Wrap(1) => 11; case End => 99 }\n\
+         f(Wrap(42))",
+    )
+    .expect_err("a refutable literal payload should not cover the variant");
+    assert!(literal_payload.to_string().contains("not exhaustive"));
+
+    let nested_payload = evaluate_text(
+        "<expr>",
+        "enum Box { case Full(c: Box); case Empty }\n\
+         def f(b: Box): Int = b match { case Full(Full(x)) => 1; case Empty => 2 }\n\
+         f(Full(Empty))",
+    )
+    .expect_err("a nested constructor payload should not cover the variant");
+    assert!(nested_payload.to_string().contains("not exhaustive"));
+
+    // Valid coverage still type-checks: multiple arms jointly covering a
+    // variant's payload, a sole-variant nested payload, a refutable arm
+    // followed by a catch-all, and a Boolean payload matched on both values.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "enum O<a> { case Some(v: a); case None }\n\
+             def f(o: O<O<Int>>): Int = o match { case Some(Some(v)) => v; case Some(None) => 0; case None => -1 }\n\
+             f(Some(Some(7)))",
+        )
+        .unwrap(),
+        Value::Int(7)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "enum Step { case St(a: Int) }\n\
+             enum R<e> { case Good(s: Step); case Bad(m: e) }\n\
+             def f(r: R<String>): Int = r match { case Good(St(a)) => a; case Bad(m) => 0 }\n\
+             f(Good(St(9)))",
+        )
+        .unwrap(),
+        Value::Int(9)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "enum W { case Wrap(n: Int); case End }\n\
+             def f(w: W): Int = w match { case Wrap(1) => 11; case Wrap(x) => x; case End => 99 }\n\
+             f(Wrap(42))",
+        )
+        .unwrap(),
+        Value::Int(42)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "enum B { case Wrap(b: Boolean) }\n\
+             def f(x: B): Int = x match { case Wrap(true) => 1; case Wrap(false) => 0 }\n\
+             f(Wrap(true))",
+        )
+        .unwrap(),
+        Value::Int(1)
+    );
+}
+
+#[test]
 fn match_resolves_constructors_against_the_scrutinee_enum() {
     // A user enum may reuse a prelude constructor name (`Ok`/`Err`,
     // `Some`/`None`). A match arm's constructor must resolve against the
