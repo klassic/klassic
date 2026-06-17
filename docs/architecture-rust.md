@@ -243,7 +243,10 @@ cargo run -- -e "1 + 2"
   `Map#get(...) == null` / `!= null` reuse the same unrolled search and
   cache the lookup needle in a fresh data slot so the comparison loop can
   reload the needle between iterations without losing it to register
-  reuse. The kind tag also drives display: `println` and string
+  reuse. The two-argument method `m.getOrElse(k, d)` lowers to a
+  temp-bound `{ val m' = m; val k' = k; if (m'.containsKey(k')) m'.get(k')
+  else d }`, reusing the supported `containsKey` / `get` / `if` codegen
+  while evaluating `m` and `k` exactly once. The kind tag also drives display: `println` and string
   interpolation emit `%(v1, v2, ...)` for runtime sets and
   `%[k: v, ...]` for runtime maps, matching the static-collection display
   rather than falling back to the bracketed list form.
