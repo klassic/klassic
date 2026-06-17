@@ -36595,6 +36595,11 @@ impl NativeCodeGenerator {
         let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
         let len = self.asm.data_label_with_i64s(&[0]);
         let offset = self.asm.data_label_with_i64s(&[0]);
+        // Reset the static offset cell per call, like the Int sibling
+        // (emit_i64_rax_to_runtime_string_ref): without this a second
+        // bool->string conversion appends after the first call's content,
+        // so `"" + b` over two calls produced "true" then "truefalse".
+        self.emit_reset_runtime_buffer_offset_label(offset);
         self.emit_append_bool_rax_to_runtime_buffer_offset_label(
             data,
             offset,
