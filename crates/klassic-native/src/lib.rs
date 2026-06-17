@@ -27007,16 +27007,19 @@ impl NativeCodeGenerator {
                 for (name, value) in bindings {
                     captures.insert((*name).to_string(), value.clone());
                 }
-                // A statically-substituted binding (an enclosing lambda's
-                // parameter) is authoritative for that name. If an outer
-                // `val` of the same name was materialized into a runtime slot
-                // (e.g. while binding the enclosing lambda's captures), that
-                // slot must NOT be captured here — at call time a runtime
-                // capture shadows the static one, so the inner closure would
-                // read the outer val instead of the shadowing parameter.
+                // A name with a known static-constant capture is captured by
+                // that value, which is frame-independent and authoritative. It
+                // must NOT also be captured by a runtime slot: such a slot is a
+                // frame-relative offset that does not survive the enclosing
+                // frame, and at call time a runtime capture shadows the static
+                // one — so a transitively-captured outer parameter
+                // (`base` in `(x) => (y) => base + x + y`) would read whatever
+                // now sits at that stale offset (the middle layer's `x`)
+                // instead of its real value. This subsumes the
+                // binding-parameter removal that fixed the shadowing case.
                 let mut runtime_captures = self.current_runtime_captures();
-                for (name, _) in bindings {
-                    runtime_captures.remove(*name);
+                for name in captures.keys() {
+                    runtime_captures.remove(name);
                 }
                 let thread_aliases = self.current_thread_aliases_with_static_bindings(bindings);
                 let label = self.intern_static_lambda(
