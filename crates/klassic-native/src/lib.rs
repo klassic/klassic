@@ -1520,6 +1520,14 @@ fn inline_module_imports(
     })
 }
 
+/// Which binary set operation `compile_set_combine` performs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetCombineOp {
+    Union,
+    Intersect,
+    Subtract,
+}
+
 /// Storage strategy for one monomorphic enum variant payload slot.
 ///
 /// Every slot of the backing `__gc_record` must hold a heap pointer so
@@ -17698,6 +17706,25 @@ impl NativeCodeGenerator {
             "add" if arguments.len() == 1 => {
                 return self.compile_set_add(target, &arguments[0], span);
             }
+            "union" if arguments.len() == 1 => {
+                return self.compile_set_combine(target, &arguments[0], span, SetCombineOp::Union);
+            }
+            "intersect" if arguments.len() == 1 => {
+                return self.compile_set_combine(
+                    target,
+                    &arguments[0],
+                    span,
+                    SetCombineOp::Intersect,
+                );
+            }
+            "subtract" if arguments.len() == 1 => {
+                return self.compile_set_combine(
+                    target,
+                    &arguments[0],
+                    span,
+                    SetCombineOp::Subtract,
+                );
+            }
             "toString" => "toString",
             "substring" => "substring",
             "at" => "at",
@@ -17962,6 +17989,60 @@ impl NativeCodeGenerator {
             elements.push(arg_value);
         }
         let label = self.intern_static_set(elements);
+        Ok(self.emit_static_value(&StaticValue::StaticSet { label }))
+    }
+
+    /// `a.union(b)` / `a.intersect(b)` / `a.subtract(b)` — combine two static
+    /// sets into a fresh one, taking the receiver's element order as the base.
+    /// Both sets are evaluated once; a runtime set stays a clean diagnostic.
+    fn compile_set_combine(
+        &mut self,
+        target: &Expr,
+        arg: &Expr,
+        span: Span,
+        op: SetCombineOp,
+    ) -> Result<NativeValue, Diagnostic> {
+        let lhs = self.compile_expr(target)?;
+        let NativeValue::StaticSet { label: lhs_label } = lhs else {
+            return Err(unsupported(span, "native set combine for non-static set"));
+        };
+        let rhs = self.compile_expr(arg)?;
+        let NativeValue::StaticSet { label: rhs_label } = rhs else {
+            return Err(unsupported(span, "native set combine for non-static set"));
+        };
+        let lhs_elements = self.static_sets[lhs_label.0].elements.clone();
+        let rhs_elements = self.static_sets[rhs_label.0].elements.clone();
+        let result: Vec<StaticValue> = match op {
+            SetCombineOp::Union => {
+                let mut combined = lhs_elements;
+                for element in rhs_elements {
+                    if !combined
+                        .iter()
+                        .any(|existing| self.static_value_equal_user(existing, &element))
+                    {
+                        combined.push(element);
+                    }
+                }
+                combined
+            }
+            SetCombineOp::Intersect => lhs_elements
+                .into_iter()
+                .filter(|element| {
+                    rhs_elements
+                        .iter()
+                        .any(|other| self.static_value_equal_user(other, element))
+                })
+                .collect(),
+            SetCombineOp::Subtract => lhs_elements
+                .into_iter()
+                .filter(|element| {
+                    !rhs_elements
+                        .iter()
+                        .any(|other| self.static_value_equal_user(other, element))
+                })
+                .collect(),
+        };
+        let label = self.intern_static_set(result);
         Ok(self.emit_static_value(&StaticValue::StaticSet { label }))
     }
 

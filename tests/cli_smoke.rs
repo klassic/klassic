@@ -3175,6 +3175,68 @@ fn builds_native_executable_for_map_set_remove_and_add() {
     );
 }
 
+/// `a.union(b)` / `a.intersect(b)` / `a.subtract(b)` combine two static sets
+/// into a fresh one, taking the receiver's element order as the base and
+/// leaving both operands untouched — matching the evaluator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_set_combine() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-setcombine-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-setcombine-{unique}"));
+    fs::write(
+        &source_path,
+        "val a = %(1, 2, 3)\n\
+         val b = %(2, 3, 4)\n\
+         println(a.union(b))\n\
+         println(a.intersect(b))\n\
+         println(a.subtract(b))\n\
+         println(a.union(b).size())\n\
+         println(a.size())\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        "%(1, 2, 3, 4)\n%(2, 3)\n%(1)\n4\n3\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native Set#union / intersect / subtract must match eval"
+    );
+}
+
 /// `std.result` imports `std.option` internally, so importing only
 /// `std.result` must transitively splice `std.option` — including its bare
 /// `val none` — and order it first, since native resolves a `val` only after
