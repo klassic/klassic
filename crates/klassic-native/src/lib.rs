@@ -3991,6 +3991,12 @@ struct NativeCodeGenerator {
     /// table. Names declared on exactly one enum are already rewritten by
     /// the desugar and never consult this map.
     ext_method_enum_types: HashMap<String, Vec<String>>,
+    /// Top-level `def` / `val` name -> the enum it provably produces, for
+    /// constructor aliases like `def some(v) = Some(v)` and `val none = None`.
+    /// Lets `static_expr_enum_name` resolve a helper's enum so a chained
+    /// extension method that returns a *different* enum than its receiver
+    /// (`Result.toOption` yields `Option`) dispatches against the right type.
+    enum_value_aliases: HashMap<String, String>,
     /// Variant name -> owning enum name, for every enum (generic and the
     /// monomorphic ones erased by the lowering). Lets codegen name the enum
     /// behind a receiver's tracked `ConcreteEnumShape` when dispatching an
@@ -4196,6 +4202,7 @@ impl NativeCodeGenerator {
             generic_enums: HashMap::new(),
             variant_to_generic_enum: HashMap::new(),
             ext_method_enum_types: HashMap::new(),
+            enum_value_aliases: HashMap::new(),
             variant_owner_enum: HashMap::new(),
             mono_enum_shapes: HashMap::new(),
             mono_enum_variants: HashMap::new(),
@@ -4716,6 +4723,7 @@ impl NativeCodeGenerator {
         self.predeclare_record_schemas(expr);
         self.register_generic_enums(expr);
         self.predeclare_top_level_functions(expr);
+        self.register_enum_value_aliases(expr);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
         self.emit_store_command_line_state();
@@ -17909,20 +17917,64 @@ impl NativeCodeGenerator {
                     field,
                     ..
                 } => {
-                    // A chained enum extension method returns the same enum
-                    // it is declared on (Option's map/filter/orElse/... all
-                    // yield Option). Resolve the inner receiver's enum, then
-                    // confirm `field` is an extension method on that enum.
+                    // A chained enum extension method usually returns the same
+                    // enum it is declared on (Option's map/filter/orElse/...
+                    // all yield Option). Resolve the inner receiver's enum and
+                    // confirm `field` is an extension method on it; then read
+                    // the method's own return enum, since some methods convert
+                    // (`Result.toOption` yields Option). Fall back to the
+                    // receiver enum when the return enum is not statically
+                    // known.
                     let inner_enum = self.static_receiver_enum_name(inner)?;
                     let declared_on = self.ext_method_enum_types.get(field)?;
-                    declared_on
-                        .iter()
-                        .any(|ty| ty == &inner_enum)
-                        .then_some(inner_enum)
+                    if !declared_on.iter().any(|ty| ty == &inner_enum) {
+                        return None;
+                    }
+                    let ext_fn = format!("__ext_{inner_enum}_{field}");
+                    if let Some(body) = self.functions.get(&ext_fn).map(|f| f.body.clone())
+                        && let Some(return_enum) = self.static_expr_enum_name(&body)
+                    {
+                        return Some(return_enum);
+                    }
+                    Some(inner_enum)
                 }
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// Record top-level `def` / `val` bindings whose body provably produces a
+    /// known enum (`def some(v) = Some(v)`, `val none = None`), so that
+    /// `static_expr_enum_name` can resolve a helper's enum. Constructor bodies
+    /// resolve directly through `variant_owner_enum`, so a single pass over the
+    /// already-spliced program suffices — no transitive closure is needed for
+    /// the std constructor aliases this targets.
+    fn register_enum_value_aliases(&mut self, expr: &Expr) {
+        fn collect(expr: &Expr, generator: &NativeCodeGenerator, out: &mut Vec<(String, String)>) {
+            match expr {
+                Expr::DefDecl { name, body, .. } => {
+                    if let Some(enum_name) = generator.static_expr_enum_name(body) {
+                        out.push((name.clone(), enum_name));
+                    }
+                }
+                Expr::VarDecl { name, value, .. } => {
+                    if let Some(enum_name) = generator.static_expr_enum_name(value) {
+                        out.push((name.clone(), enum_name));
+                    }
+                }
+                Expr::Block { expressions, .. } => {
+                    for sub in expressions {
+                        collect(sub, generator, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut aliases = Vec::new();
+        collect(expr, self, &mut aliases);
+        for (name, enum_name) in aliases {
+            self.enum_value_aliases.entry(name).or_insert(enum_name);
         }
     }
 
@@ -17933,7 +17985,11 @@ impl NativeCodeGenerator {
     /// an enum the function might not actually return.
     fn static_expr_enum_name(&self, expr: &Expr) -> Option<String> {
         match expr {
-            Expr::Identifier { name, .. } => self.variant_owner_enum.get(name).cloned(),
+            Expr::Identifier { name, .. } => self
+                .variant_owner_enum
+                .get(name)
+                .or_else(|| self.enum_value_aliases.get(name))
+                .cloned(),
             Expr::Call {
                 callee, arguments, ..
             } => match callee.as_ref() {
@@ -17943,7 +17999,10 @@ impl NativeCodeGenerator {
                     {
                         return self.variant_owner_enum.get(value).cloned();
                     }
-                    self.variant_owner_enum.get(name).cloned()
+                    self.variant_owner_enum
+                        .get(name)
+                        .or_else(|| self.enum_value_aliases.get(name))
+                        .cloned()
                 }
                 _ => None,
             },

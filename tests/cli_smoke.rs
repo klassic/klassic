@@ -3109,6 +3109,64 @@ fn builds_native_executable_for_transitive_stdlib_import() {
     );
 }
 
+/// A chained enum extension method that converts to a *different* enum
+/// (`Result.toOption` yields an `Option`) must dispatch the next method
+/// against the returned enum, not the receiver's. Previously
+/// `ok(x).toOption().getOrElse(d)` failed native build because `getOrElse`
+/// was routed as a `Result` method onto an `Option` value.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_cross_enum_method_chain() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-crossenum-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-crossenum-{unique}"));
+    fs::write(
+        &source_path,
+        "import std.result.{ok, err}\n\
+         println(ok(42).toOption().getOrElse(0))\n\
+         println(err(\"boom\").toOption().getOrElse(-1))\n\
+         println(ok(5).toOption().map((x) => x * 10).getOrElse(0))\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "42\n-1\n50\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native must match eval for a cross-enum extension-method chain"
+    );
+}
+
 /// `s.toList()` projects a static set's elements into a list, matching the
 /// evaluator for printing, `foreach`, chained list methods, and deduped
 /// literals.
