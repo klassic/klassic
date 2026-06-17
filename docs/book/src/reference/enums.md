@@ -69,7 +69,7 @@ per instantiation, with payload shapes tracked through bindings,
 control-flow joins, and annotated function boundaries — so recursive
 functions over `Option<Int>`-style annotations work, and the checker
 also diagnoses match exhaustiveness and unreachable arms ahead of
-codegen. The remaining native gaps — comparing two enum values with
-`==` / `!=` (the evaluator compares them structurally), and payloads
-such as a `List<SomeEnum>` field — fail at build time with a
-source-located diagnostic, never with wrong code.
+codegen. Enum values compare structurally with `==` / `!=`, matching the
+evaluator. The remaining native gaps — such as a `List<SomeEnum>`
+payload field — fail at build time with a source-located diagnostic,
+never with wrong code.

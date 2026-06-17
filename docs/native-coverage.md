@@ -306,7 +306,9 @@ instantiation, with payload shapes tracked through `val` bindings,
 control-flow joins, and fully-applied annotated function boundaries — so
 recursive functions over `Option<Int>`- or `Tree`-style annotations
 lower natively. Enum values format through `toString`, interpolation,
-and string concatenation.
+and string concatenation, and compare with `==` / `!=` through a
+structural deep-equal that matches the evaluator (rather than the heap
+identity a bare pointer comparison would give).
 
 `match` lowers to a tag-test if-chain over constructor patterns,
 including nested constructor patterns, integer / string literal
@@ -314,9 +316,8 @@ patterns, variable bindings, wildcards, and arm guards. The checker
 diagnoses match exhaustiveness and unreachable arms ahead of codegen.
 
 Remaining gaps fail at build time with a source-located diagnostic
-rather than miscompiling: comparing enum values with `==` / `!=` (the
-evaluator compares them structurally), and aggregate payload fields such
-as `List<SomeEnum>`.
+rather than miscompiling: aggregate payload fields such as
+`List<SomeEnum>`.
 
 ## Extension Methods
 
