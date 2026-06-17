@@ -257,7 +257,9 @@ cargo run -- -e "1 + 2"
   entries — updating an existing key in place or appending a new one — so
   the original map is untouched. `m.remove(k)`, `s.add(x)`, and `s.remove(x)`
   build a fresh static map/set the same way (a set add dedups), interning the
-  filtered or extended entries. The kind tag also drives display: `println` and string
+  filtered or extended entries, and `a.union(b)` / `a.intersect(b)` /
+  `a.subtract(b)` combine two static sets — taking the receiver's element
+  order as the base — into a fresh interned set. The kind tag also drives display: `println` and string
   interpolation emit `%(v1, v2, ...)` for runtime sets and
   `%[k: v, ...]` for runtime maps, matching the static-collection display
   rather than falling back to the bracketed list form.
