@@ -27022,6 +27022,81 @@ fn build_backend_c_strings_match_the_evaluator() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), expected);
 }
 
+/// The C backend renders `Double` values exactly like the evaluator: a
+/// whole-number value keeps a single trailing decimal (`4.0`), not the
+/// bare integer Rust's default `f64` formatting would emit. The earlier
+/// runtime shim used `f64::to_string`, so a whole-number Double printed
+/// as `4` while the evaluator (and the direct native backend) printed
+/// `4.0`.
+#[test]
+fn build_backend_c_formats_doubles_like_evaluator() {
+    let cc_available = Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|probe| probe.status.success());
+    if !cc_available {
+        return;
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_cdoubles_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_cdoubles_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(4.0)\n\
+         println(2.0 * 3.0)\n\
+         println(0.0)\n\
+         println(100.0)\n\
+         println(10.0 / 2.0)\n\
+         println(3.14)\n\
+         println(1.5 + 2.25)\n",
+    )
+    .expect("temp source file should write");
+    let expected = "4.0\n6.0\n0.0\n100.0\n5.0\n3.14\n3.75\n";
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    assert!(eval_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&eval_output.stdout),
+        expected,
+        "evaluator oracle"
+    );
+
+    let link_output = Command::new(klassic_bin())
+        .args([
+            "--backend",
+            "c",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        link_output.status.success(),
+        "C backend should compile doubles\nstderr:\n{}",
+        String::from_utf8_lossy(&link_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("compiled C binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(run_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        expected,
+        "C backend double formatting must match the evaluator"
+    );
+}
+
 /// The portable C backend (GitHub issue #425, roadmap PR 9) emits a
 /// single C99 translation unit for the Int/Bool/String/println/if/
 /// while/def subset behind `--backend c`. The generated source depends
