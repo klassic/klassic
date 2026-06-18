@@ -195,6 +195,7 @@ pub(crate) fn value_method_builtin_name(value: &Value, field: &str) -> Option<&'
             _ => None,
         },
         Value::List(_) => match field {
+            "toString" => Some("toString"),
             "head" => Some("head"),
             "tail" => Some("tail"),
             "size" => Some("size"),
@@ -206,6 +207,7 @@ pub(crate) fn value_method_builtin_name(value: &Value, field: &str) -> Option<&'
             _ => None,
         },
         Value::Map(_) => match field {
+            "toString" => Some("toString"),
             "containsKey" => Some("Map#containsKey"),
             "containsValue" => Some("Map#containsValue"),
             "get" => Some("Map#get"),
@@ -219,6 +221,7 @@ pub(crate) fn value_method_builtin_name(value: &Value, field: &str) -> Option<&'
             _ => None,
         },
         Value::Set(_) => match field {
+            "toString" => Some("toString"),
             "contains" => Some("Set#contains"),
             "isEmpty" => Some("Set#isEmpty"),
             "size" => Some("Set#size"),

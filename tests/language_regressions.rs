@@ -617,6 +617,34 @@ fn tostring_method_works_on_every_numeric_type() {
 }
 
 #[test]
+fn tostring_method_works_on_collections() {
+    // `.toString()` rendered scalars, records, and enums but not `List` /
+    // `Map` / `Set`, even though the free `toString(...)` does. They now
+    // match the free function (and the direct native backend renders them
+    // identically through its existing method dispatch).
+    assert_eq!(
+        evaluate_text("<expr>", "[1 2 3].toString()").unwrap(),
+        Value::String("[1, 2, 3]".to_string())
+    );
+    assert_eq!(
+        evaluate_text("<expr>", "%[\"a\":1 \"b\":2].toString()").unwrap(),
+        Value::String("%[a: 1, b: 2]".to_string())
+    );
+    assert_eq!(
+        evaluate_text("<expr>", "%(1 2 3).toString()").unwrap(),
+        Value::String("%(1, 2, 3)".to_string())
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "def render(xs: List<Int>): String = xs.toString()\nrender([5 6 7])",
+        )
+        .unwrap(),
+        Value::String("[5, 6, 7]".to_string())
+    );
+}
+
+#[test]
 fn repeated_literal_match_arm_is_unreachable() {
     // A repeated unguarded literal arm can never run — the constructor check
     // already rejected a duplicate `case A`, but a duplicate `case true`,
