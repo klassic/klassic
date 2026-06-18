@@ -4885,6 +4885,7 @@ impl TypeChecker {
                 _ => None,
             },
             Type::List(inner) => match field {
+                "toString" => Some(Type::Function(vec![], Box::new(Type::String))),
                 "head" => Some(Type::Function(vec![], inner.clone())),
                 "tail" => Some(Type::Function(vec![], Box::new(Type::List(inner.clone())))),
                 "size" => Some(Type::Function(vec![], Box::new(Type::Int))),
@@ -4932,6 +4933,7 @@ impl TypeChecker {
                 _ => None,
             },
             Type::Map(key, value) => match field {
+                "toString" => Some(Type::Function(vec![], Box::new(Type::String))),
                 // `m.containsKey(k)` / `m.containsValue(v)` / `m.get(k)` take the
                 // map's declared key/value type rather than `Dynamic`, matching
                 // `getOrElse`/`put`/`remove` below: a wrong-typed lookup such as
@@ -4971,6 +4973,7 @@ impl TypeChecker {
                 _ => None,
             },
             Type::Set(inner) => match field {
+                "toString" => Some(Type::Function(vec![], Box::new(Type::String))),
                 // `s.contains(x)` requires `x` to be the element type, matching
                 // `add`/`remove` below: a cross-type membership test such as
                 // `%(1 2 3).contains("s")` is rejected instead of typed `Dynamic`.
