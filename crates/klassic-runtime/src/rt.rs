@@ -95,10 +95,23 @@ pub extern "C" fn klassic_rt_println_bool(value: i64) {
     println!("{}", if value != 0 { "true" } else { "false" });
 }
 
+/// Render an `f64` exactly like the evaluator's `Value::Double` display:
+/// a whole-number value keeps a single trailing decimal (`4.0`), while a
+/// fractional value uses the default formatting (`3.14`). Rust's default
+/// `f64` formatting drops the `.0`, which would print a `Double` as if it
+/// were an `Int`.
+fn format_double_like_evaluator(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn klassic_rt_println_f64(value: f64) {
     // Match the evaluator's Double display.
-    println!("{value}");
+    println!("{}", format_double_like_evaluator(value));
 }
 
 #[unsafe(no_mangle)]
@@ -146,7 +159,7 @@ pub extern "C" fn klassic_rt_i64_to_str(value: i64) -> KStr {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn klassic_rt_f64_to_str(value: f64) -> KStr {
-    kstr_from_owned(value.to_string())
+    kstr_from_owned(format_double_like_evaluator(value))
 }
 
 #[unsafe(no_mangle)]
