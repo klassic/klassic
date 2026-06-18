@@ -617,6 +617,48 @@ fn tostring_method_works_on_every_numeric_type() {
 }
 
 #[test]
+fn space_separated_list_accepts_record_constructors() {
+    // A space-separated collection literal of record constructors used to
+    // fail: the second `#P(...)` was swallowed by the infix-`#` operator
+    // (`a #f b` == `f(a, b)`), so `[#P(1, 2) #P(3, 4)]` parsed as
+    // `P(#P(1, 2), ...)` and errored. Comma / newline separators worked.
+    // Enum constructors and plain calls in space-separated lists always
+    // worked; record constructors now match.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "record P { x: Int; y: Int }\n[#P(1, 2) #P(3, 4)].size()",
+        )
+        .unwrap(),
+        Value::Int(2)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "record P { x: Int; y: Int }\nval xs = [#P(1, 2) #P(3, 4)]\nhead(xs).x + head(xs).y",
+        )
+        .unwrap(),
+        Value::Int(3)
+    );
+    // Single-field record constructors too (the trickier case, where the
+    // infix interpretation was syntactically valid).
+    assert_eq!(
+        evaluate_text("<expr>", "record Q { v: Int }\n[#Q(1) #Q(2) #Q(3)].size()",).unwrap(),
+        Value::Int(3)
+    );
+
+    // The infix-`#` operator on functions is unchanged.
+    assert_eq!(
+        evaluate_text("<expr>", "def add(a: Int, b: Int): Int = a + b\n3 #add 4",).unwrap(),
+        Value::Int(7)
+    );
+    assert_eq!(
+        evaluate_text("<expr>", "def add(a: Int, b: Int): Int = a + b\n3 #add(4)",).unwrap(),
+        Value::Int(7)
+    );
+}
+
+#[test]
 fn tostring_method_works_on_collections() {
     // `.toString()` rendered scalars, records, and enums but not `List` /
     // `Map` / `Set`, even though the free `toString(...)` does. They now

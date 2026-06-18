@@ -1083,11 +1083,22 @@ impl<'a> Lexer<'a> {
 struct Parser {
     tokens: Vec<Token>,
     index: usize,
+    /// Names of records declared so far. A `#Name` that resolves to a
+    /// declared record is a record constructor, never the infix-`#`
+    /// operator (`a #f b` == `f(a, b)`), so `[#P(1, 2) #P(3, 4)]` parses as
+    /// two space-separated elements instead of `P(#P(1, 2), ...)`. Records
+    /// must be declared before use (forward references already fail), so
+    /// the set is complete by the time a `#Name` is reached.
+    record_names: std::collections::HashSet<String>,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, index: 0 }
+        Self {
+            tokens,
+            index: 0,
+            record_names: std::collections::HashSet::new(),
+        }
     }
 
     fn parse_program(mut self) -> Result<Expr, Diagnostic> {
@@ -1181,6 +1192,7 @@ impl Parser {
     fn parse_record_declaration(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.bump().span;
         let (name, name_span) = self.expect_identifier()?;
+        self.record_names.insert(name.clone());
         let (type_params, inline_constraints) = self.parse_optional_generic_param_names()?;
         if let Some(c) = inline_constraints.first() {
             return Err(Diagnostic::parse(
@@ -2537,10 +2549,9 @@ impl Parser {
             }
 
             if matches!(self.peek().kind, TokenKind::Hash)
-                && matches!(
-                    self.tokens.get(self.index + 1).map(|token| &token.kind),
-                    Some(TokenKind::Identifier(_))
-                )
+                && let Some(TokenKind::Identifier(infix_name)) =
+                    self.tokens.get(self.index + 1).map(|token| &token.kind)
+                && !self.record_names.contains(infix_name)
             {
                 let hash_span = self.bump().span;
                 let (name, name_span) = self.expect_identifier()?;
