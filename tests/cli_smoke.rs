@@ -1513,6 +1513,67 @@ fn native_assert_result_compares_enums_structurally() {
     );
 }
 
+/// A `match` payload binding and a `foreach` variable that reuse the name
+/// of an outer `val` must shadow it. The outer `val` is tracked as a
+/// static constant; the inner runtime binding used to leak that constant
+/// into folded uses (`x + 1` read the outer value while bare `x` read the
+/// binding), so `case A(x) => x + 1` and `foreach (x in …)` miscompiled.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_inner_binding_shadows_outer_static_value() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-shadow-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-shadow-{unique}"));
+    let program = "enum E { case A(v: Int) }\n\
+         val x = 100\n\
+         println(A(7) match { case A(x) => x + 1 })\n\
+         println(A(7) match { case A(x) => x * 2 })\n\
+         mutable s = 0\n\
+         foreach (x in [10 20 30]) { s = s + x }\n\
+         println(s)\n\
+         println(x)\n";
+    fs::write(&source_path, program).expect("source should write");
+    // The evaluator is the oracle: matched `x` is 7, the foreach `x` is the
+    // element, and the outer `x` is still 100 after the loop.
+    let expected = "8\n14\n60\n100\n";
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), expected);
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("build should run");
+    assert!(
+        build.status.success(),
+        "native build should compile, got:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("native binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected,
+        "an inner binding must shadow the outer static value"
+    );
+}
+
 /// Syntax errors for the parenthesization Klassic requires (and the
 /// `field: value` record syntax) carry a keyword-specific hint instead
 /// of the bare `expected (`, so users coming from Kotlin/Scala/Rust see
