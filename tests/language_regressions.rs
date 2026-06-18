@@ -585,6 +585,54 @@ fn bool_scrutinee_match_must_be_exhaustive() {
 }
 
 #[test]
+fn repeated_literal_match_arm_is_unreachable() {
+    // A repeated unguarded literal arm can never run — the constructor check
+    // already rejected a duplicate `case A`, but a duplicate `case true`,
+    // `case 1`, or `case "a"` used to be silently accepted as dead code.
+    for (program, needle) in [
+        (
+            "def f(b: Boolean): Int = b match { case true => 1; case true => 2; case false => 0 }\nf(true)",
+            "`true` is already matched",
+        ),
+        (
+            "def f(n: Int): Int = n match { case 1 => 10; case 1 => 20; case _ => 0 }\nf(1)",
+            "`1` is already matched",
+        ),
+        (
+            "def f(s: String): Int = s match { case \"a\" => 1; case \"a\" => 2; case _ => 0 }\nf(\"a\")",
+            "`\"a\"` is already matched",
+        ),
+    ] {
+        let err = evaluate_text("<expr>", program)
+            .expect_err("a repeated literal arm should be rejected as unreachable");
+        assert!(
+            err.to_string().contains("unreachable match arm") && err.to_string().contains(needle),
+            "got: {err}"
+        );
+    }
+
+    // Distinct literals, a guarded duplicate (the guard keeps the later arm
+    // live), and the same literal across different scrutinee types all stay
+    // accepted.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "def f(n: Int): Int = n match { case 1 => 10; case 2 => 20; case _ => 0 }\nf(2)",
+        )
+        .unwrap(),
+        Value::Int(20)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "def f(n: Int): Int = n match { case 1 if false => 10; case 1 => 20; case _ => 0 }\nf(1)",
+        )
+        .unwrap(),
+        Value::Int(20)
+    );
+}
+
+#[test]
 fn free_map_and_set_builtins_are_element_typed() {
     // `Map#keys` / `Map#values` / `Set#union` carry the collection's element
     // type instead of `Dynamic`, so a wrong-typed use is a type error rather
