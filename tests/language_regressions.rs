@@ -515,6 +515,76 @@ fn exhaustiveness_checks_refutable_payload_subpatterns() {
 }
 
 #[test]
+fn bool_scrutinee_match_must_be_exhaustive() {
+    // A `Boolean` has a finite domain, so a top-level match missing `true`
+    // or `false` (and without a wildcard) is non-exhaustive and rejected at
+    // type-check time — it used to be accepted and crash at runtime with
+    // `no match arm matched value`, unlike the enum check.
+    let missing_false = evaluate_text(
+        "<expr>",
+        "def f(b: Boolean): Int = b match { case true => 1 }\nf(false)",
+    )
+    .expect_err("a Boolean match missing `false` should be rejected");
+    assert!(
+        missing_false
+            .to_string()
+            .contains("not exhaustive: missing false"),
+        "got: {missing_false}"
+    );
+
+    let missing_true = evaluate_text(
+        "<expr>",
+        "def f(b: Boolean): Int = b match { case false => 0 }\nf(true)",
+    )
+    .expect_err("a Boolean match missing `true` should be rejected");
+    assert!(
+        missing_true
+            .to_string()
+            .contains("not exhaustive: missing true"),
+        "got: {missing_true}"
+    );
+
+    // A guard does not unconditionally cover its value, so a guarded `true`
+    // arm leaves `true` uncovered.
+    let guarded = evaluate_text(
+        "<expr>",
+        "def f(b: Boolean): Int = b match { case true if b => 1; case false => 0 }\nf(true)",
+    )
+    .expect_err("a guarded `true` arm does not cover `true`");
+    assert!(
+        guarded.to_string().contains("not exhaustive"),
+        "got: {guarded}"
+    );
+
+    // Exhaustive forms still type-check (no false rejection): both literals,
+    // either order, a wildcard, or a bare variable.
+    for (program, expected) in [
+        (
+            "def f(b: Boolean): Int = b match { case true => 1; case false => 0 }\nf(true)",
+            1,
+        ),
+        (
+            "def f(b: Boolean): Int = b match { case false => 0; case true => 1 }\nf(true)",
+            1,
+        ),
+        (
+            "def f(b: Boolean): Int = b match { case true => 1; case _ => 0 }\nf(false)",
+            0,
+        ),
+        (
+            "def f(b: Boolean): Int = b match { case x => 99 }\nf(true)",
+            99,
+        ),
+    ] {
+        assert_eq!(
+            evaluate_text("<expr>", program).unwrap(),
+            Value::Int(expected),
+            "exhaustive Boolean match should type-check: {program}"
+        );
+    }
+}
+
+#[test]
 fn free_map_and_set_builtins_are_element_typed() {
     // `Map#keys` / `Map#values` / `Set#union` carry the collection's element
     // type instead of `Dynamic`, so a wrong-typed use is a type error rather

@@ -4483,6 +4483,35 @@ impl TypeChecker {
         if closed {
             return Ok(());
         }
+        // A `Boolean` scrutinee has a finite domain, so an unguarded match
+        // without a wildcard (which would have set `closed` above) is
+        // exhaustive only when both `true` and `false` appear — mirroring
+        // the enum check below and the nested `patterns_cover` rule.
+        if let Type::Bool = self.resolve(scrutinee_type) {
+            let unguarded: Vec<&klassic_syntax::Pattern> = arms
+                .iter()
+                .filter(|arm| arm.guard.is_none())
+                .map(|arm| &arm.pattern)
+                .collect();
+            if self.patterns_cover(&unguarded, &Type::Bool) {
+                return Ok(());
+            }
+            let has_true = unguarded
+                .iter()
+                .any(|p| matches!(p, klassic_syntax::Pattern::LiteralBool { value: true, .. }));
+            let has_false = unguarded
+                .iter()
+                .any(|p| matches!(p, klassic_syntax::Pattern::LiteralBool { value: false, .. }));
+            let missing = match (has_true, has_false) {
+                (true, false) => "false",
+                (false, true) => "true",
+                _ => "true, false",
+            };
+            return Err(type_error(
+                span,
+                format!("match on `Boolean` is not exhaustive: missing {missing}"),
+            ));
+        }
         let Type::Enum(enum_name, enum_args) = self.resolve(scrutinee_type) else {
             return Ok(());
         };
