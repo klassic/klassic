@@ -4449,6 +4449,7 @@ impl TypeChecker {
     ) -> Result<(), Diagnostic> {
         let mut closed = false;
         let mut closed_variants: HashSet<String> = HashSet::new();
+        let mut closed_literals: HashSet<String> = HashSet::new();
         for arm in arms {
             if closed {
                 return Err(type_error(
@@ -4475,6 +4476,19 @@ impl TypeChecker {
                 if args.iter().all(pattern_is_irrefutable) {
                     closed_variants.insert(name.clone());
                 }
+            }
+            // The same is true for a repeated literal pattern: a second
+            // unguarded `case true` or `case 1` can never run because the
+            // first already matches that value. A guarded literal arm does
+            // not close the value, so a later arm for it stays live.
+            if arm.guard.is_none()
+                && let Some(key) = literal_pattern_key(&arm.pattern)
+                && !closed_literals.insert(key.clone())
+            {
+                return Err(type_error(
+                    arm.span,
+                    format!("unreachable match arm: {key} is already matched by a preceding arm"),
+                ));
             }
             if arm.guard.is_none() && pattern_is_irrefutable(&arm.pattern) {
                 closed = true;
@@ -6249,6 +6263,21 @@ fn pattern_is_irrefutable(pattern: &klassic_syntax::Pattern) -> bool {
         pattern,
         klassic_syntax::Pattern::Wildcard { .. } | klassic_syntax::Pattern::Variable { .. }
     )
+}
+
+/// A user-facing, type-distinct key for a literal pattern, used to detect a
+/// repeated `case` that can never run. The rendering doubles as both the
+/// uniqueness key and the diagnostic text, and never collides across types
+/// (`` `1` `` for an `Int`, `` `"1"` `` for a `String`). Non-literal
+/// patterns return `None`.
+fn literal_pattern_key(pattern: &klassic_syntax::Pattern) -> Option<String> {
+    use klassic_syntax::Pattern;
+    match pattern {
+        Pattern::LiteralBool { value, .. } => Some(format!("`{value}`")),
+        Pattern::LiteralInt { value, .. } => Some(format!("`{value}`")),
+        Pattern::LiteralString { value, .. } => Some(format!("`{value:?}`")),
+        _ => None,
+    }
 }
 
 fn occurs_in(var: GenericVar, ty: &Type) -> bool {
