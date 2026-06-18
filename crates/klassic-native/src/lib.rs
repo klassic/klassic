@@ -39471,10 +39471,25 @@ impl NativeCodeGenerator {
     }
 
     fn lookup_static_value(&self, name: &str) -> Option<StaticValue> {
-        self.static_scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name).cloned())
+        // The innermost binding wins. A runtime slot allocated for `name` in
+        // an inner scope (a `match` payload binding, a `foreach` variable, an
+        // inner-block `val`) shadows any outer static value, so stop at that
+        // scope and let the caller read the runtime slot instead of folding
+        // the outer constant. `scopes` and `static_scopes` are pushed and
+        // popped together, so they share indices.
+        for index in (0..self.static_scopes.len()).rev() {
+            if let Some(value) = self.static_scopes[index].get(name) {
+                return Some(value.clone());
+            }
+            if self
+                .scopes
+                .get(index)
+                .is_some_and(|scope| scope.contains_key(name))
+            {
+                return None;
+            }
+        }
+        None
     }
 
     fn lookup_var(&self, name: &str) -> Option<VarSlot> {
