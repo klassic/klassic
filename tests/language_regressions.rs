@@ -585,6 +585,38 @@ fn bool_scrutinee_match_must_be_exhaustive() {
 }
 
 #[test]
+fn tostring_method_works_on_every_numeric_type() {
+    // The `.toString()` value method was accepted on `Int` and `Double` but
+    // not on `Long`, `Short`, `Byte`, or `Float`, even though the free
+    // `toString(...)` function renders all of them — the method form failed
+    // to type-check. They now match `Int`/`Double`.
+    assert_eq!(
+        evaluate_text("<expr>", "5L.toString()").unwrap(),
+        Value::String("5".to_string())
+    );
+    assert_eq!(
+        evaluate_text("<expr>", "2.5F.toString()").unwrap(),
+        Value::String("2.5".to_string())
+    );
+    assert_eq!(
+        evaluate_text("<expr>", "42.toString()").unwrap(),
+        Value::String("42".to_string())
+    );
+    assert_eq!(
+        evaluate_text("<expr>", "3.5.toString()").unwrap(),
+        Value::String("3.5".to_string())
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "def render(n: Long): String = n.toString()\nrender(42L)",
+        )
+        .unwrap(),
+        Value::String("42".to_string())
+    );
+}
+
+#[test]
 fn repeated_literal_match_arm_is_unreachable() {
     // A repeated unguarded literal arm can never run — the constructor check
     // already rejected a duplicate `case A`, but a duplicate `case true`,

@@ -4834,6 +4834,10 @@ impl TypeChecker {
         let resolved = self.resolve(target);
         match resolved {
             Type::Int
+            | Type::Long
+            | Type::Short
+            | Type::Byte
+            | Type::Float
             | Type::Double
             | Type::Bool
             | Type::Unit
