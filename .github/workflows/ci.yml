@@ -56,3 +56,24 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  # Windows x86_64 job. This is the execution runner for the direct
+  # x86_64-pc-windows-msvc PE64 backend: the build-and-run tests
+  # are cfg-gated to Windows, so the generated machine code is
+  # crash-checked here on every push.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build runtime staticlib
+        # cargo test alone doesn't produce libklassic_runtime.a, which
+        # the C-backend link tests resolve next to the klassic binary.
+        run: cargo build -p klassic-runtime
+
+      - name: Test
+        run: cargo test
