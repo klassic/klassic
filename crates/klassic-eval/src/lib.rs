@@ -3962,6 +3962,13 @@ mod tests {
         );
     }
 
+    /// Renders a host path as the body of a Klassic string literal.
+    /// Windows separators must be doubled or `C:\Users\...` lexes as
+    /// an unsupported `\U` escape sequence.
+    fn kl_path(path: &std::path::Path) -> String {
+        path.display().to_string().replace('\\', "\\\\")
+    }
+
     #[test]
     fn evaluates_file_and_dir_modules() {
         let unique = SystemTime::now()
@@ -3977,14 +3984,14 @@ mod tests {
             "<expr>",
             &format!(
                 "Dir#mkdir(\"{}\")\nFileOutput#write(\"{}\", \"hello\")",
-                dir.display(),
-                file.display()
+                kl_path(&dir),
+                kl_path(&file)
             ),
         )
         .unwrap();
 
         assert_eq!(
-            evaluate_text("<expr>", &format!("FileInput#all(\"{}\")", file.display())).unwrap(),
+            evaluate_text("<expr>", &format!("FileInput#all(\"{}\")", kl_path(&file))).unwrap(),
             Value::String("hello".to_string())
         );
         assert_eq!(
@@ -3992,18 +3999,18 @@ mod tests {
                 "<expr>",
                 &format!(
                     "\"{}\" FileInput#open {{ stream => FileInput#readAll(stream) }}",
-                    file.display()
+                    kl_path(&file)
                 ),
             )
             .unwrap(),
             Value::String("hello".to_string())
         );
         assert_eq!(
-            evaluate_text("<expr>", &format!("Dir#isFile(\"{}\")", file.display())).unwrap(),
+            evaluate_text("<expr>", &format!("Dir#isFile(\"{}\")", kl_path(&file))).unwrap(),
             Value::Bool(true)
         );
         let listed =
-            evaluate_text("<expr>", &format!("Dir#listFull(\"{}\")", dir.display())).unwrap();
+            evaluate_text("<expr>", &format!("Dir#listFull(\"{}\")", kl_path(&dir))).unwrap();
         let Value::List(listed) = listed else {
             panic!("Dir#listFull should return a list");
         };
@@ -4015,7 +4022,7 @@ mod tests {
         assert_eq!(
             evaluate_text(
                 "<expr>",
-                &format!("Dir#copy(\"{}\", \"{}\")", file.display(), moved.display())
+                &format!("Dir#copy(\"{}\", \"{}\")", kl_path(&file), kl_path(&moved))
             )
             .unwrap(),
             Value::Unit
@@ -4023,7 +4030,7 @@ mod tests {
         assert_eq!(
             evaluate_text(
                 "<expr>",
-                &format!("FileOutput#exists(\"{}\")", moved.display())
+                &format!("FileOutput#exists(\"{}\")", kl_path(&moved))
             )
             .unwrap(),
             Value::Bool(true)
@@ -4032,12 +4039,12 @@ mod tests {
         assert_eq!(
             evaluate_text(
                 "<expr>",
-                &format!("Dir#delete(\"{}\")", empty_child.display())
+                &format!("Dir#delete(\"{}\")", kl_path(&empty_child))
             )
             .unwrap(),
             Value::Unit
         );
-        assert!(evaluate_text("<expr>", &format!("Dir#delete(\"{}\")", dir.display())).is_err());
+        assert!(evaluate_text("<expr>", &format!("Dir#delete(\"{}\")", kl_path(&dir))).is_err());
 
         let _ = fs::remove_file(&file);
         let _ = fs::remove_file(&moved);
@@ -4056,8 +4063,8 @@ mod tests {
             "<expr>",
             &format!(
                 "FileOutput#write(\"{}\", \"Line 1\")\nFileOutput#append(\"{}\", \"\\nLine 2\")",
-                file.display(),
-                file.display()
+                kl_path(&file),
+                kl_path(&file)
             ),
         )
         .unwrap();
@@ -4065,13 +4072,13 @@ mod tests {
         assert_eq!(
             evaluate_text(
                 "<expr>",
-                &format!("FileOutput#exists(\"{}\")", file.display())
+                &format!("FileOutput#exists(\"{}\")", kl_path(&file))
             )
             .unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
-            evaluate_text("<expr>", &format!("FileInput#all(\"{}\")", file.display())).unwrap(),
+            evaluate_text("<expr>", &format!("FileInput#all(\"{}\")", kl_path(&file))).unwrap(),
             Value::String("Line 1\nLine 2".to_string())
         );
 
@@ -4092,7 +4099,7 @@ mod tests {
                 "<expr>",
                 &format!(
                     "\"{}\" FileInput#open {{ stream => FileInput#readAll(stream) }}",
-                    file.display()
+                    kl_path(&file)
                 ),
             )
             .unwrap(),
@@ -4103,7 +4110,7 @@ mod tests {
                 "<expr>",
                 &format!(
                     "\"{}\" FileInput#open {{ stream => FileInput#readLines(stream) }}",
-                    file.display()
+                    kl_path(&file)
                 ),
             )
             .unwrap(),
