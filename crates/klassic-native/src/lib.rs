@@ -239,6 +239,8 @@ impl NativeTarget {
             Some(Self::LinuxX86_64)
         } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             Some(Self::MacosAarch64)
+        } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            Some(Self::WindowsX86_64)
         } else {
             None
         }

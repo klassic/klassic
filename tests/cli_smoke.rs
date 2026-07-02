@@ -27016,6 +27016,7 @@ fn build_without_target_produces_runnable_host_binary() {
 /// char-indexed substring/at, concat, equality, toString. The test
 /// compiles and links through the automatic cc path and compares
 /// against the evaluator's output.
+#[cfg(unix)]
 #[test]
 fn build_backend_c_strings_match_the_evaluator() {
     let cc_available = Command::new("cc")
@@ -27089,6 +27090,7 @@ fn build_backend_c_strings_match_the_evaluator() {
 /// runtime shim used `f64::to_string`, so a whole-number Double printed
 /// as `4` while the evaluator (and the direct native backend) printed
 /// `4.0`.
+#[cfg(unix)]
 #[test]
 fn build_backend_c_formats_doubles_like_evaluator() {
     let cc_available = Command::new("cc")
@@ -27164,6 +27166,7 @@ fn build_backend_c_formats_doubles_like_evaluator() {
 /// only on stdio/stdint; when a `cc` is available the test compiles
 /// and runs it and asserts evaluator-identical output. Unsupported
 /// constructs get source-located diagnostics.
+#[cfg(unix)]
 #[test]
 fn build_backend_c_emits_compilable_c() {
     let stamp = SystemTime::now()

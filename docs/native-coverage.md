@@ -1,8 +1,12 @@
 # Native Compiler Coverage
 
 This document enumerates the language constructs the native compiler currently
-lowers to direct ELF for Linux x86_64, selectable as `linux-x86_64`,
-`x86_64-unknown-linux-gnu`, or `native` on a matching host. Anything not listed
+lowers to direct ELF for Linux x86_64 (selectable as `linux-x86_64`,
+`x86_64-unknown-linux-gnu`), PE64 for Windows x86_64 (selectable as
+`windows-x86_64`, `x86_64-pc-windows-msvc`), and direct Mach-O arm64 for macOS
+(selectable as `macos-aarch64`, `aarch64-apple-darwin`). On matching hosts, a
+target-less bare `klassic build` defaults to the host platform (i.e., `native`);
+Windows x86_64 hosts now use the direct PE64 backend. Anything not listed
 here fails at build time rather than falling back to the evaluator.
 
 ## Core Surface
