@@ -890,6 +890,15 @@ cargo run -- -e "1 + 2"
   hand-maintained match arm, so adding a new imported function is a
   three-line change (a variant, an `ALL` entry, a `name()` arm) that
   never touches `pe.rs`. Verified end-to-end under WSL2 binfmt
+  built generically over the full `ImportSymbol::ALL` list (originally
+  just `GetStdHandle`/`WriteFile`/`ExitProcess`/`VirtualAlloc`, now
+  also the directory-family imports described below) from a single
+  `kernel32.dll` descriptor, with a fixed `ImageBase` and no `.reloc`
+  section (mirrors the "no external toolchain" property of the ELF
+  and Mach-O writers); adding a new import is purely mechanical (one
+  enum variant, one `ALL` entry, one `name()` arm — `iat_index` is
+  derived from position in `ALL`, and `pe.rs` needs no changes).
+  Verified end-to-end under WSL2 binfmt
   interop (`./program.exe` launches the real Windows loader from
   Linux) against hello-world, recursive `def`s, string/enum/record/list
   operations, closures, and a GC-churn stress program, all matching
@@ -919,6 +928,56 @@ cargo run -- -e "1 + 2"
   the same save-every-register/self-aligning-`rsp` pattern as the
   original four Win64 shims. `Environment#*` and `CommandLine#args`
   don't reach a raw syscall at
+  `syscall_number` tripwire on Windows is now gated at its own
+  `compile_*` entry point (`if self.is_windows { return Err(...) }`,
+  before any codegen for that builtin runs): `sleep`, `stopwatch`,
+  `Time#nowMillis`, `StandardInput#all`/`#lines`, the whole
+  `FileOutput#`/`FileInput#` family, `Dir#home`/`#list`/`#listFull`,
+  `Environment#vars`/`#get`/`#exists`, and `CommandLine#args` each
+  raise a `` `Feature` is not yet supported when targeting
+  x86_64-pc-windows-msvc `` diagnostic instead of panicking.
+
+  The rest of the `Dir#` family (`#mkdir`/`#mkdirs`/`#delete`/`#move`/
+  `#copy`/`#current`/`#exists`/`#isDirectory`/`#isFile`/`#temp`) is
+  un-gated and backed by seven new Win64 shims built on the same
+  save-registers/align-stack/epilogue scaffold as `__win_write`:
+  `__win_mkdir`/`__win_rmdir`/`__win_move`/`__win_copy_file` wrap
+  `CreateDirectoryA`/`RemoveDirectoryA`/`MoveFileExA`/`CopyFileA`
+  (the last replacing the Linux open/`sendfile`-loop/close sequence
+  with one call) and share a `GetLastError()`-translating BOOL-result
+  normalizer that maps `ERROR_FILE_NOT_FOUND`/`ERROR_PATH_NOT_FOUND`
+  to `-errno_no_entry()` and `ERROR_ALREADY_EXISTS`/`ERROR_FILE_EXISTS`
+  to `-errno_exists()` (both now real Windows sentinels, `-2`/`-17`,
+  rather than the placeholder `0` every other
+  `WINDOWS_X86_64_PLATFORM_CONSTANTS` field carries) so the reused
+  Linux `emit_runtime_error_if_rax_negative[_except_errno]` call sites
+  need no changes; `__win_getcwd` wraps `GetCurrentDirectoryA` and
+  absorbs its "length excludes NUL" ABI delta with a `+1` so
+  `Dir#current`'s existing `dec_reg(Rax)` stays untouched;
+  `__win_get_temp_path` wraps `GetTempPathA` and strips the one
+  trailing `\` it always appends, for parity with the no-trailing-
+  separator `Dir#temp`/`"/tmp"` convention; and `__win_get_file_attributes`
+  wraps `GetFileAttributesA`, explicitly detecting the
+  `INVALID_FILE_ATTRIBUTES` (`0xFFFFFFFF`) sentinel via a 64-bit
+  register compare rather than a sign-extending immediate compare
+  (the zero-extended DWORD would otherwise read as a large *positive*
+  value and silently defeat every `cmp rax,0;jge ok`-style caller),
+  backing `Dir#exists`/`#isDirectory`/`#isFile`'s shared
+  `emit_runtime_path_exists_label`/`emit_runtime_path_type_check_label`
+  helpers. Two related, non-codegen fixes shipped alongside these
+  shims: `emit_dir_mkdirs_label`'s runtime path-prefix scanner gained a
+  parallel `\`-handling block (Windows paths may use either separator)
+  that restores the original separator byte rather than hardcoding
+  `/`; and `compile_dir_exists`/`_is_directory`/`_is_file` now force
+  the runtime (non-folded) path check whenever `self.is_windows`,
+  since their existing compile-time constant fold for a
+  statically-known path argument queries the *compiling host's*
+  filesystem — correct for a same-target build, silently wrong for a
+  Windows cross-build. Every path in this family reuses the existing
+  ANSI (`A`-suffixed) kernel32 functions, so non-ASCII paths remain
+  best-effort/undefined until a UTF-8-to-UTF-16LE `W`-function pass is
+  added.
+  `Environment#*` and `CommandLine#args` don't reach a raw syscall at
   all — they walk the `environment_base`/`command_line_argc`/
   `command_line_argv1_base` slots `emit_store_command_line_state`
   leaves zeroed on Windows — so without a gate they would silently

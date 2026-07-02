@@ -3782,8 +3782,16 @@ const WINDOWS_X86_64_PLATFORM_CONSTANTS: PlatformConstants = PlatformConstants {
     default_file_mode: 0,
     default_dir_mode: 0,
     at_fdcwd: 0,
-    errno_no_entry: 0,
-    errno_exists: 0,
+    // Unlike every other field in this placeholder table, these two
+    // *are* read on Windows: the directory-family Win64 shims
+    // (`win_mkdir`, `win_rmdir`, `win_move`, `win_copy_file`,
+    // `win_get_file_attributes`) translate `GetLastError()` into
+    // these same Linux-style negative sentinels so the reused
+    // `emit_runtime_error_if_rax_negative_except_errno` call sites
+    // (written against the Linux convention) keep working unmodified
+    // on both targets.
+    errno_no_entry: -2,
+    errno_exists: -17,
     stat_file_type_mask: 0,
     stat_directory_type: 0,
     stat_regular_file_type: 0,
@@ -4019,6 +4027,74 @@ struct WindowsRuntime {
     /// threads), and each shim call fully reads the value back into
     /// rax before the next shim call can overwrite it.
     perf_counter_scratch: DataLabel,
+    // Slice 2 (directory operations) shims below.
+    /// `mkdir(path, mode)`-shaped shim wrapping `CreateDirectoryA`.
+    /// Input: rdi=path (rsi=mode ignored, `CreateDirectoryA` has no
+    /// mode concept). Output: rax=0 on success, or a translated
+    /// `-errno` (see `emit_win_normalize_bool_result`) on failure.
+    win_mkdir: TextLabel,
+    /// `rmdir(path)`-shaped shim wrapping `RemoveDirectoryA`. Input:
+    /// rdi=path. Output: same convention as `win_mkdir`.
+    win_rmdir: TextLabel,
+    /// `rename(src, dst)`-shaped shim wrapping `MoveFileExA` with
+    /// `MOVEFILE_REPLACE_EXISTING`. Input: rdi=src, rsi=dst. Output:
+    /// same convention as `win_mkdir`.
+    win_move: TextLabel,
+    /// Whole-file-copy shim wrapping `CopyFileA` (`bFailIfExists` =
+    /// FALSE), replacing the Linux open/sendfile-loop/close sequence
+    /// entirely. Input: rdi=src, rsi=dst. Output: same convention as
+    /// `win_mkdir`.
+    win_copy_file: TextLabel,
+    /// `getcwd(buf, cap)`-shaped shim wrapping `GetCurrentDirectoryA`.
+    /// Input: rdi=buf, rsi=cap (same "capacity incl. NUL room"
+    /// convention the reused Linux `Getcwd`-syscall call site
+    /// already passes). Output: rax = length **incl.** NUL on
+    /// success (this shim does `+1` on `GetCurrentDirectoryA`'s
+    /// excl.-NUL result to match the Linux `Getcwd` syscall's own
+    /// convention, so `emit_dir_current`'s existing `dec_reg(Rax)`
+    /// needs zero changes), or -1 on failure.
+    win_getcwd: TextLabel,
+    /// `GetTempPathA`-shaped shim: rdi=buf, rsi=cap. Output: rax =
+    /// length **excl.** NUL with exactly one trailing `\` already
+    /// stripped (for parity with the Linux `Dir#temp`/`"/tmp"`
+    /// no-trailing-separator convention), or -1 on failure.
+    win_get_temp_path: TextLabel,
+    /// `GetFileAttributesA`-shaped shim: rdi=path. Output: rax = the
+    /// DWORD attributes bitmask (bit `0x10` =
+    /// `FILE_ATTRIBUTE_DIRECTORY`) on success -- always
+    /// non-negative, since defined attribute flags never set the
+    /// 64-bit sign bit once zero-extended -- or a translated
+    /// `-errno` (same `GetLastError()` translation as
+    /// `emit_win_normalize_bool_result`, `-errno_no_entry()` for
+    /// `ERROR_FILE_NOT_FOUND`/`ERROR_PATH_NOT_FOUND`, else -1) on
+    /// failure. Callers must not compare the raw `GetFileAttributesA`
+    /// return value against `INVALID_FILE_ATTRIBUTES` themselves --
+    /// `0xFFFFFFFF` zero-extends to a *positive* 64-bit value, which
+    /// is exactly what this shim exists to translate away.
+    win_get_file_attributes: TextLabel,
+    /// Cached `GetStdHandle(STD_INPUT_HANDLE)` result, populated by
+    /// `win_init`. Slice 3 addition.
+    stdin_handle: DataLabel,
+    /// Scratch `DWORD` (zero-initialized qword) for `ReadFile`'s
+    /// required `lpNumberOfBytesRead` out-parameter. Slice 3 addition.
+    stdin_bytes_read_scratch: DataLabel,
+    /// `read(fd, buf, cap)`-shaped shim wrapping `ReadFile`, restricted
+    /// to the cached stdin handle (see `emit_win_read_stdin_runtime`).
+    /// Slice 3 addition.
+    win_read_stdin: TextLabel,
+    /// `FindFirstFileA(lpFileName, lpFindFileData)`-shaped shim: rdi=
+    /// pattern pointer, rsi=`WIN32_FIND_DATAA*` in, rax=handle or a
+    /// normalized negative error out. Slice 3 addition.
+    win_find_first_file: TextLabel,
+    /// `FindNextFileA(hFindFile, lpFindFileData)`-shaped shim: rdi=
+    /// handle, rsi=`WIN32_FIND_DATAA*` in, rax=BOOL out (0/nonzero,
+    /// zero-extended straight from `FindNextFileA`'s own return).
+    /// Slice 3 addition.
+    win_find_next_file: TextLabel,
+    /// `FindClose(hFindFile)`-shaped shim: rdi=handle in, return value
+    /// ignored (mirrors the Linux path's unchecked `close` on the
+    /// directory fd). Slice 3 addition.
+    win_find_close: TextLabel,
 }
 
 struct NativeCodeGenerator {
@@ -4281,6 +4357,19 @@ impl NativeCodeGenerator {
                 write_bytes_scratch: asm.data_label_with_i64s(&[0]),
                 filetime_scratch: asm.data_label_with_i64s(&[0]),
                 perf_counter_scratch: asm.data_label_with_i64s(&[0]),
+                win_mkdir: asm.create_text_label(),
+                win_rmdir: asm.create_text_label(),
+                win_move: asm.create_text_label(),
+                win_copy_file: asm.create_text_label(),
+                win_getcwd: asm.create_text_label(),
+                win_get_temp_path: asm.create_text_label(),
+                win_get_file_attributes: asm.create_text_label(),
+                stdin_handle: asm.data_label_with_i64s(&[0]),
+                stdin_bytes_read_scratch: asm.data_label_with_i64s(&[0]),
+                win_read_stdin: asm.create_text_label(),
+                win_find_first_file: asm.create_text_label(),
+                win_find_next_file: asm.create_text_label(),
+                win_find_close: asm.create_text_label(),
             })
         } else {
             None
@@ -4952,6 +5041,18 @@ impl NativeCodeGenerator {
             self.emit_win_time_now_millis_runtime();
             self.emit_win_qpc_runtime();
             self.emit_win_qpf_runtime();
+            self.emit_win_mkdir_runtime();
+            self.emit_win_rmdir_runtime();
+            self.emit_win_move_runtime();
+            self.emit_win_copy_file_runtime();
+            self.emit_win_getcwd_runtime();
+            self.emit_win_get_temp_path_runtime();
+            self.emit_win_get_file_attributes_runtime();
+            // Slice 3 additions (directory listing / stdin).
+            self.emit_win_read_stdin_runtime();
+            self.emit_win_find_first_file_runtime();
+            self.emit_win_find_next_file_runtime();
+            self.emit_win_find_close_runtime();
         }
         Ok(self.asm.finish())
     }
@@ -23435,9 +23536,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "StandardInput#all"));
-        }
         self.expect_static_arity("StandardInput#all", arguments, 0, span)?;
         Ok(self.emit_standard_input_to_runtime_string(span, "StandardInput#all"))
     }
@@ -23447,9 +23545,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "StandardInput#lines"));
-        }
         self.expect_static_arity("StandardInput#lines", arguments, 0, span)?;
         let NativeValue::RuntimeString { data, len } =
             self.emit_standard_input_to_runtime_string(span, "StandardInput#lines")
@@ -23465,11 +23560,17 @@ impl NativeCodeGenerator {
         let overflow = self.asm.data_label_with_bytes(&[0]);
         let len = self.asm.data_label_with_i64s(&[0]);
 
-        self.emit_syscall_number(PlatformSyscall::Read);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Read);
+        }
         self.asm.mov_imm64(Reg::Rdi, self.platform.stdin_fd());
         self.asm.mov_data_addr(Reg::Rsi, data);
         self.asm.mov_imm64(Reg::Rdx, RUNTIME_STRING_CAP as u64);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_read_stdin);
+        } else {
+            self.asm.syscall();
+        }
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to read stdin"));
         self.asm.mov_data_addr(Reg::Rcx, len);
         self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
@@ -23477,11 +23578,17 @@ impl NativeCodeGenerator {
         self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
         let done = self.asm.create_text_label();
         self.asm.jcc_label(Condition::NotEqual, done);
-        self.emit_syscall_number(PlatformSyscall::Read);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Read);
+        }
         self.asm.mov_imm64(Reg::Rdi, self.platform.stdin_fd());
         self.asm.mov_data_addr(Reg::Rsi, overflow);
         self.asm.mov_imm64(Reg::Rdx, 1);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_read_stdin);
+        } else {
+            self.asm.syscall();
+        }
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to read stdin"));
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Equal, done);
@@ -24365,6 +24472,21 @@ impl NativeCodeGenerator {
     }
 
     fn emit_runtime_path_exists_label(&mut self, path_label: DataLabel) {
+        if self.is_windows {
+            // GetFileAttributesA-based existence check: the shim
+            // already normalizes INVALID_FILE_ATTRIBUTES's
+            // zero-extension trap away, so success is simply "rax >=
+            // 0" here, mirroring the Linux `Access`-syscall check
+            // below (which tests "rax == 0", Access's own success
+            // convention) one line down.
+            self.asm.mov_data_addr(Reg::Rdi, path_label);
+            self.asm
+                .call_label(self.windows_runtime().win_get_file_attributes);
+            self.asm.cmp_reg_imm8(Reg::Rax, 0);
+            self.asm.setcc_al(Condition::GreaterEqual);
+            self.asm.movzx_rax_al();
+            return;
+        }
         self.emit_syscall_number(PlatformSyscall::Access);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.mov_imm64(Reg::Rsi, 0);
@@ -24392,6 +24514,46 @@ impl NativeCodeGenerator {
         span: Span,
         name: &str,
     ) {
+        if self.is_windows {
+            // GetFileAttributesA-based type check: the shim already
+            // returns the same "-errno_no_entry()/-1 on failure, >=0
+            // DWORD attributes on success" convention as the Linux
+            // `Newfstatat`-syscall path below, so the existing
+            // except_errno-tolerant hard-error check and not-found
+            // branch below are reused verbatim -- only the "extract
+            // the type bit" step differs (a single
+            // FILE_ATTRIBUTE_DIRECTORY bit test instead of a stat
+            // s_mode mask-and-compare, since Windows has no separate
+            // "regular file" bit the way POSIX has S_IFREG; anything
+            // that isn't a directory is treated as a file).
+            const FILE_ATTRIBUTE_DIRECTORY: i32 = 0x10;
+            let not_found = self.asm.create_text_label();
+            let done = self.asm.create_text_label();
+            self.asm.mov_data_addr(Reg::Rdi, path_label);
+            self.asm
+                .call_label(self.windows_runtime().win_get_file_attributes);
+            self.emit_runtime_error_if_rax_negative_except_errno(
+                span,
+                self.platform.errno_no_entry(),
+                &format!("{name} failed to stat path"),
+            );
+            self.asm
+                .cmp_reg_imm8(Reg::Rax, self.platform.errno_no_entry());
+            self.asm.jcc_label(Condition::Equal, not_found);
+            self.asm.and_reg_imm32(Reg::Rax, FILE_ATTRIBUTE_DIRECTORY);
+            self.asm.cmp_reg_imm8(Reg::Rax, 0);
+            self.asm.setcc_al(if directory {
+                Condition::NotEqual
+            } else {
+                Condition::Equal
+            });
+            self.asm.movzx_rax_al();
+            self.asm.jmp_label(done);
+            self.asm.bind_text_label(not_found);
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.bind_text_label(done);
+            return;
+        }
         let stat_buffer = self.asm.data_label_with_bytes(&[0; 144]);
         let not_found = self.asm.create_text_label();
         let done = self.asm.create_text_label();
@@ -24445,6 +24607,15 @@ impl NativeCodeGenerator {
         span: Span,
         name: &str,
     ) {
+        if self.is_windows {
+            // CopyFileA replaces the entire open/sendfile-loop/close
+            // sequence below with a single WinAPI call.
+            self.asm.mov_data_addr(Reg::Rdi, source_label);
+            self.asm.mov_data_addr(Reg::Rsi, target_label);
+            self.asm.call_label(self.windows_runtime().win_copy_file);
+            self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to copy file"));
+            return;
+        }
         self.emit_syscall_number(PlatformSyscall::Open);
         self.asm.mov_data_addr(Reg::Rdi, source_label);
         self.asm
@@ -24611,9 +24782,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "Dir#current"));
-        }
         self.expect_static_arity("Dir#current", arguments, 0, span)?;
         Ok(self.emit_dir_current(span))
     }
@@ -24625,11 +24793,17 @@ impl NativeCodeGenerator {
             .data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP + 1]);
         let len = self.asm.data_label_with_i64s(&[0]);
 
-        self.emit_syscall_number(PlatformSyscall::Getcwd);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Getcwd);
+        }
         self.asm.mov_data_addr(Reg::Rdi, data);
         self.asm
             .mov_imm64(Reg::Rsi, (RUNTIME_STRING_CAP + 1) as u64);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_getcwd);
+        } else {
+            self.asm.syscall();
+        }
         self.emit_runtime_error_if_rax_negative(span, "Dir#current failed");
         self.asm.dec_reg(Reg::Rax);
         self.asm.mov_data_addr(Reg::R10, len);
@@ -24659,11 +24833,38 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "Dir#temp"));
-        }
         self.expect_static_arity("Dir#temp", arguments, 0, span)?;
+        if self.is_windows {
+            return Ok(self.emit_win_dir_temp(span));
+        }
         Ok(self.emit_environment_get_static_key_or_default("TMPDIR", "/tmp", span))
+    }
+
+    /// `Dir#temp` on Windows: `GetTempPathA` implements the real
+    /// TMP -> TEMP -> USERPROFILE -> Windows-directory search order,
+    /// so (unlike `Dir#home`, which reuses the generic
+    /// `emit_environment_get_static_key` env-lookup machinery once
+    /// Part A's emulated `environment_base` exists) this bypasses
+    /// that machinery entirely in favor of a dedicated shim.
+    fn emit_win_dir_temp(&mut self, span: Span) -> NativeValue {
+        // Ample headroom over MAX_PATH (260) for the ANSI
+        // GetTempPathA result; this is a stack-free `.data` buffer
+        // per call site, matching `emit_dir_current`'s own local
+        // buffer pattern rather than a shared `WindowsRuntime`
+        // scratch slot.
+        const RUNTIME_STRING_CAP: usize = 512;
+        let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
+        let len = self.asm.data_label_with_i64s(&[0]);
+
+        self.asm.mov_data_addr(Reg::Rdi, data);
+        self.asm.mov_imm64(Reg::Rsi, RUNTIME_STRING_CAP as u64);
+        self.asm
+            .call_label(self.windows_runtime().win_get_temp_path);
+        self.emit_runtime_error_if_rax_negative(span, "Dir#temp failed");
+        self.asm.mov_data_addr(Reg::R10, len);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        NativeValue::RuntimeString { data, len }
     }
 
     fn compile_dir_exists(
@@ -24671,9 +24872,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "Dir#exists"));
-        }
         self.expect_static_arity("Dir#exists", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -24683,7 +24881,14 @@ impl NativeCodeGenerator {
         }
         let path =
             self.static_string_from_argument_preserving_effects(&arguments[0], span, "Dir#exists")?;
-        if self.unknown_virtual_paths.contains(&path) {
+        // Risk 3: a statically-known path argument's existence would
+        // otherwise be constant-folded against the *compiling host's*
+        // filesystem (`native_path_exists`) -- correct for a
+        // same-target build but silently wrong for any cross-build,
+        // and unobservable before this un-gate since Windows always
+        // hit the target-unsupported error first. Force the runtime
+        // (non-folded) check whenever `self.is_windows`.
+        if self.is_windows || self.unknown_virtual_paths.contains(&path) {
             self.emit_runtime_path_exists(&path);
         } else {
             self.asm
@@ -24697,9 +24902,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "Dir#isDirectory"));
-        }
         self.expect_static_arity("Dir#isDirectory", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -24712,7 +24914,9 @@ impl NativeCodeGenerator {
             span,
             "Dir#isDirectory",
         )?;
-        if self.unknown_virtual_paths.contains(&path) {
+        // Risk 3 (see `compile_dir_exists`): bypass the host-filesystem
+        // constant fold on Windows.
+        if self.is_windows || self.unknown_virtual_paths.contains(&path) {
             self.emit_runtime_path_type_check(&path, true, span, "Dir#isDirectory");
         } else {
             self.asm
@@ -24726,9 +24930,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "Dir#isFile"));
-        }
         self.expect_static_arity("Dir#isFile", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -24738,7 +24939,9 @@ impl NativeCodeGenerator {
         }
         let path =
             self.static_string_from_argument_preserving_effects(&arguments[0], span, "Dir#isFile")?;
-        if self.unknown_virtual_paths.contains(&path) {
+        // Risk 3 (see `compile_dir_exists`): bypass the host-filesystem
+        // constant fold on Windows.
+        if self.is_windows || self.unknown_virtual_paths.contains(&path) {
             self.emit_runtime_path_type_check(&path, false, span, "Dir#isFile");
         } else {
             self.asm
@@ -24754,9 +24957,6 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         let name = if recursive { "Dir#mkdirs" } else { "Dir#mkdir" };
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, name));
-        }
         self.expect_static_arity(name, arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label = self.compile_runtime_path_argument(&arguments[0], span, name)?;
@@ -24789,9 +24989,6 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         let name = if full { "Dir#listFull" } else { "Dir#list" };
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, name));
-        }
         self.expect_static_arity(name, arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let (path_label, path) =
@@ -24800,7 +24997,14 @@ impl NativeCodeGenerator {
         }
         let path =
             self.static_string_from_argument_preserving_effects(&arguments[0], span, name)?;
-        if self.virtual_dir_state_unknown(&path) {
+        // Risk 3 (host-vs-target filesystem conflation): on Windows,
+        // never fall through to the `std::path::Path::new(&path).exists()`
+        // constant-fold below, even when the virtual-dir state is fully
+        // known -- that fold queries the *build host's* filesystem, which
+        // is a different machine from the eventual Windows target. Always
+        // take the runtime-emission path instead, exactly as if the
+        // virtual-dir state were unknown.
+        if self.is_windows || self.virtual_dir_state_unknown(&path) {
             let path_label = self.nul_terminated_data_label(&path);
             let path_data = self.asm.data_label_with_bytes(path.as_bytes());
             return Ok(self.emit_dir_list_path_label(
@@ -24853,9 +25057,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "Dir#delete"));
-        }
         self.expect_static_arity("Dir#delete", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -24876,9 +25077,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "Dir#copy"));
-        }
         self.expect_static_arity("Dir#copy", arguments, 2, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0])
             || self.expr_may_yield_runtime_string(&arguments[1])
@@ -24915,9 +25113,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "Dir#move"));
-        }
         self.expect_static_arity("Dir#move", arguments, 2, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0])
             || self.expr_may_yield_runtime_string(&arguments[1])
@@ -25031,6 +25226,14 @@ impl NativeCodeGenerator {
         span: Span,
         name: &str,
     ) -> NativeValue {
+        if self.is_windows {
+            // The Windows loop stages its own `path\*` search pattern
+            // from `path` directly (see
+            // `emit_win_dir_search_pattern_buffer`); it has no use for
+            // the plain `path\0` buffer the Linux `openat` path needed
+            // `path_label` for.
+            return self.emit_dir_list_path_label_windows(path, full, span, name);
+        }
         const DIR_BUFFER_CAP: usize = 8192;
         const RUNTIME_LIST_CAP: usize = 65_536;
 
@@ -25148,6 +25351,195 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R10, fd_slot);
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
         self.asm.syscall();
+        self.emit_sort_runtime_lines(
+            output,
+            output_offset,
+            sorted_output,
+            sorted_output_offset,
+            span,
+            &format!("{name} sorted result exceeds 65536 bytes"),
+        );
+        self.asm.mov_data_addr(Reg::R10, sorted_output_offset);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+        self.asm.mov_data_addr(Reg::R10, len);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
+
+        NativeValue::RuntimeLinesList {
+            data: sorted_output,
+            len,
+        }
+    }
+
+    /// Windows-only: builds a `path\*` NUL-terminated ANSI search
+    /// pattern for `FindFirstFileA` out of `input`. Deliberately not a
+    /// variant of `emit_nul_terminated_path_buffer` -- that helper's
+    /// output buffer has exactly enough room for the path plus one NUL
+    /// (`RUNTIME_PATH_CAP + 1` bytes), with no headroom for the two
+    /// extra suffix bytes (`\`, `*`) this needs, so appending onto its
+    /// result in place would risk overrunning that allocation for a
+    /// path at or near the 65536-byte cap. This allocates its own
+    /// buffer with 3 bytes of headroom (`\`, `*`, NUL) beyond the same
+    /// cap instead; the existing `emit_runtime_buffer_capacity_check`
+    /// call still guards against a pathologically long *input* path.
+    fn emit_win_dir_search_pattern_buffer(
+        &mut self,
+        input: NativeStringRef,
+        span: Span,
+        name: &str,
+    ) -> DataLabel {
+        const RUNTIME_PATH_CAP: usize = 65_536;
+        let output = self
+            .asm
+            .data_label_with_bytes(&vec![0; RUNTIME_PATH_CAP + 3]);
+        self.asm.mov_data_addr(Reg::Rbx, output);
+        self.asm.mov_data_addr(Reg::Rsi, input.data);
+        self.emit_load_native_string_len(Reg::Rdx, input.len);
+        self.emit_runtime_buffer_capacity_check(
+            Reg::Rdx,
+            RUNTIME_PATH_CAP + 1,
+            span,
+            &format!("{name} runtime path exceeds 65536 bytes"),
+        );
+
+        self.asm.mov_imm64(Reg::R8, 0);
+        let loop_label = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.bind_text_label(loop_label);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::Rdx);
+        self.asm.jcc_label(Condition::Equal, done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R8);
+        self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::R8, Reg8::Al);
+        self.asm.inc_reg(Reg::R8);
+        self.asm.jmp_label(loop_label);
+        self.asm.bind_text_label(done);
+
+        // output[len] = '\\', output[len+1] = '*', output[len+2] = NUL.
+        self.asm.mov_imm64(Reg::Rax, b'\\' as u64);
+        self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::Rdx, Reg8::Al);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rdx);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.mov_imm64(Reg::Rax, b'*' as u64);
+        self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::R9, Reg8::Al);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::R9, Reg8::Al);
+
+        output
+    }
+
+    /// Windows-only `Dir#list`/`Dir#listFull` loop: `FindFirstFileA`/
+    /// `FindNextFileA`/`FindClose` in place of the Linux `openat` +
+    /// `getdents64` loop. Reuses the same output contract as the Linux
+    /// path exactly: entries are newline-separated (via
+    /// `emit_append_newline_separator_to_runtime_buffer_offset_label`),
+    /// `"."`/`".."` are skipped, `full` prefixes each entry with the
+    /// queried path (via `emit_append_dir_list_full_prefix`), and the
+    /// whole flat buffer is sorted at the end via the shared
+    /// `emit_sort_runtime_lines` pass -- so `Dir#list`/`Dir#listFull`'s
+    /// result is byte-for-byte comparable to Linux's for the same
+    /// directory contents.
+    fn emit_dir_list_path_label_windows(
+        &mut self,
+        path: NativeStringRef,
+        full: bool,
+        span: Span,
+        name: &str,
+    ) -> NativeValue {
+        const RUNTIME_LIST_CAP: usize = 65_536;
+        // WIN32_FIND_DATAA layout (320 bytes total):
+        //   dwFileAttributes: DWORD          @0   (4 bytes)
+        //   ftCreationTime/LastAccess/Write   @4   (3 * 8 = 24 bytes)
+        //   nFileSizeHigh, nFileSizeLow       @28  (8 bytes)
+        //   dwReserved0, dwReserved1          @36  (8 bytes)
+        //   cFileName[MAX_PATH=260]           @44  (260 bytes)
+        //   cAlternateFileName[14]            @304 (14 bytes, padded to 320)
+        const FIND_DATA_SIZE: usize = 320;
+        const FIND_DATA_FILENAME_OFFSET: i32 = 44;
+
+        let find_data = self.asm.data_label_with_bytes(&vec![0; FIND_DATA_SIZE]);
+        let output = self.asm.data_label_with_bytes(&vec![0; RUNTIME_LIST_CAP]);
+        let sorted_output = self.asm.data_label_with_bytes(&vec![0; RUNTIME_LIST_CAP]);
+        let len = self.asm.data_label_with_i64s(&[0]);
+        let handle_slot = self.asm.data_label_with_i64s(&[0]);
+        let output_offset = self.asm.data_label_with_i64s(&[0]);
+        let sorted_output_offset = self.asm.data_label_with_i64s(&[0]);
+
+        self.asm.mov_data_addr(Reg::Rax, output_offset);
+        self.asm.mov_imm64(Reg::R8, 0);
+        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::R8);
+
+        let pattern = self.emit_win_dir_search_pattern_buffer(path, span, name);
+
+        self.asm.mov_data_addr(Reg::Rdi, pattern);
+        self.asm.mov_data_addr(Reg::Rsi, find_data);
+        self.asm
+            .call_label(self.windows_runtime().win_find_first_file);
+        self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open directory"));
+        self.asm.mov_data_addr(Reg::R10, handle_slot);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        let entry_loop = self.asm.create_text_label();
+        let append_entry = self.asm.create_text_label();
+        let next_entry = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+
+        self.asm.bind_text_label(entry_loop);
+        // "." / ".." skip check against `find_data`'s `cFileName`,
+        // mirroring the Linux path's `d_name`-offset check exactly
+        // (just against a different struct layout).
+        self.asm.mov_data_addr(Reg::Rsi, find_data);
+        self.asm.add_reg_imm32(Reg::Rsi, FIND_DATA_FILENAME_OFFSET);
+        self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rsi, 0);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'.' as i8);
+        self.asm.jcc_label(Condition::NotEqual, append_entry);
+        self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rsi, 1);
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, next_entry);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'.' as i8);
+        self.asm.jcc_label(Condition::NotEqual, append_entry);
+        self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rsi, 2);
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, next_entry);
+
+        self.asm.bind_text_label(append_entry);
+        self.emit_append_newline_separator_to_runtime_buffer_offset_label(
+            output,
+            output_offset,
+            span,
+            &format!("{name} result exceeds 65536 bytes"),
+        );
+        if full {
+            self.emit_append_dir_list_full_prefix(
+                output,
+                output_offset,
+                path,
+                span,
+                &format!("{name} result exceeds 65536 bytes"),
+            );
+        }
+        self.asm.mov_data_addr(Reg::Rsi, find_data);
+        self.asm.add_reg_imm32(Reg::Rsi, FIND_DATA_FILENAME_OFFSET);
+        self.emit_append_c_string_pointer_to_runtime_buffer_offset_label(
+            output,
+            output_offset,
+            span,
+            &format!("{name} result exceeds 65536 bytes"),
+        );
+
+        self.asm.bind_text_label(next_entry);
+        self.asm.mov_data_addr(Reg::R10, handle_slot);
+        self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
+        self.asm.mov_data_addr(Reg::Rsi, find_data);
+        self.asm
+            .call_label(self.windows_runtime().win_find_next_file);
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::NotEqual, entry_loop);
+
+        self.asm.bind_text_label(done);
+        self.asm.mov_data_addr(Reg::R10, handle_slot);
+        self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
+        self.asm.call_label(self.windows_runtime().win_find_close);
+
         self.emit_sort_runtime_lines(
             output,
             output_offset,
@@ -25466,11 +25858,17 @@ impl NativeCodeGenerator {
         span: Span,
         name: &str,
     ) {
-        self.emit_syscall_number(PlatformSyscall::Mkdir);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Mkdir);
+        }
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm
             .mov_imm64(Reg::Rsi, self.platform.default_dir_mode());
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_mkdir);
+        } else {
+            self.asm.syscall();
+        }
         if recursive {
             self.emit_runtime_error_if_rax_negative_except_errno(
                 span,
@@ -25491,6 +25889,16 @@ impl NativeCodeGenerator {
         let scan = self.asm.create_text_label();
         let mkdir_prefix = self.asm.create_text_label();
         let mkdir_final = self.asm.create_text_label();
+        // Risk 4: on Windows, treat '\' as an intermediate-directory
+        // separator too (alongside '/'), via a fully separate
+        // prefix-handling block below so every existing Linux
+        // instruction here -- including the '/' block's exact bytes
+        // -- is completely untouched.
+        let mkdir_prefix_backslash = if self.is_windows {
+            Some(self.asm.create_text_label())
+        } else {
+            None
+        };
 
         self.asm.bind_text_label(scan);
         self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rbx, Reg::R8);
@@ -25498,6 +25906,10 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::Equal, mkdir_final);
         self.asm.cmp_reg_imm8(Reg::Rax, b'/' as i8);
         self.asm.jcc_label(Condition::Equal, mkdir_prefix);
+        if let Some(mkdir_prefix_backslash) = mkdir_prefix_backslash {
+            self.asm.cmp_reg_imm8(Reg::Rax, b'\\' as i8);
+            self.asm.jcc_label(Condition::Equal, mkdir_prefix_backslash);
+        }
         self.asm.inc_reg(Reg::R8);
         self.asm.jmp_label(scan);
 
@@ -25510,6 +25922,17 @@ impl NativeCodeGenerator {
         self.asm.inc_reg(Reg::R8);
         self.asm.jmp_label(scan);
 
+        if let Some(mkdir_prefix_backslash) = mkdir_prefix_backslash {
+            self.asm.bind_text_label(mkdir_prefix_backslash);
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::R8, Reg8::Al);
+            self.emit_dir_mkdir_label(path_label, true, span, name);
+            self.asm.mov_imm64(Reg::Rax, b'\\' as u64);
+            self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::R8, Reg8::Al);
+            self.asm.inc_reg(Reg::R8);
+            self.asm.jmp_label(scan);
+        }
+
         self.asm.bind_text_label(mkdir_final);
         self.emit_dir_mkdir_label(path_label, true, span, name);
     }
@@ -25520,9 +25943,15 @@ impl NativeCodeGenerator {
     }
 
     fn emit_dir_delete_label(&mut self, path_label: DataLabel, span: Span, name: &str) {
-        self.emit_syscall_number(PlatformSyscall::Rmdir);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Rmdir);
+        }
         self.asm.mov_data_addr(Reg::Rdi, path_label);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_rmdir);
+        } else {
+            self.asm.syscall();
+        }
         self.emit_runtime_error_if_rax_negative(
             span,
             &format!("{name} failed to delete directory"),
@@ -25542,10 +25971,16 @@ impl NativeCodeGenerator {
         span: Span,
         name: &str,
     ) {
-        self.emit_syscall_number(PlatformSyscall::Rename);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Rename);
+        }
         self.asm.mov_data_addr(Reg::Rdi, source_label);
         self.asm.mov_data_addr(Reg::Rsi, target_label);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_move);
+        } else {
+            self.asm.syscall();
+        }
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to move path"));
     }
 
@@ -38784,6 +39219,7 @@ impl NativeCodeGenerator {
     /// never has to call `GetStdHandle` itself. Called once, before
     /// any code that could print or allocate.
     fn emit_win_init_runtime(&mut self) {
+        const STD_INPUT_HANDLE: u64 = (-10i64) as u64;
         const STD_OUTPUT_HANDLE: u64 = (-11i64) as u64;
         const STD_ERROR_HANDLE: u64 = (-12i64) as u64;
         let windows = self.windows_runtime();
@@ -38801,6 +39237,13 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rcx, STD_ERROR_HANDLE);
         self.asm.call_import(ImportSymbol::GetStdHandle);
         self.asm.mov_data_addr(Reg::R10, windows.stderr_handle);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        // Slice 3 addition: cache stdin too, so `win_read_stdin` never
+        // has to call `GetStdHandle` itself.
+        self.asm.mov_imm64(Reg::Rcx, STD_INPUT_HANDLE);
+        self.asm.call_import(ImportSymbol::GetStdHandle);
+        self.asm.mov_data_addr(Reg::R10, windows.stdin_handle);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
 
         self.emit_win_shim_epilogue();
@@ -38935,6 +39378,61 @@ impl NativeCodeGenerator {
         self.emit_win_shim_epilogue();
     }
 
+    // ---- Slice 3 additions (directory listing / stdin) below ----
+
+    /// `read(fd, buf, cap)`-shaped shim wrapping `ReadFile`, restricted
+    /// to stdin: the only Windows-safe raw-file-read caller in this
+    /// slice is `StandardInput#all`/`#lines` (regular file reads
+    /// belong to a different slice's `CreateFileA`-backed shim).
+    /// Input: rsi=buf, rdx=cap (rdi is ignored -- every call site here
+    /// passes `self.platform.stdin_fd()`, but this shim always reads
+    /// from the handle `win_init` cached via
+    /// `GetStdHandle(STD_INPUT_HANDLE)`). Output: rax=bytes read, 0 on
+    /// EOF -- `ReadFile` returns a nonzero BOOL with
+    /// `lpNumberOfBytesRead == 0` at EOF on a pipe/console, which this
+    /// shim surfaces as plain `rax == 0`, exactly mirroring Linux
+    /// `read()`'s 0-on-EOF convention so
+    /// `emit_standard_input_to_runtime_string`'s existing
+    /// `cmp rax, 0`-based overflow-loop-continuation logic needs zero
+    /// changes -- or -1 when `ReadFile` itself reports failure (BOOL
+    /// return 0).
+    fn emit_win_read_stdin_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_read_stdin);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+
+        self.asm.mov_data_addr(Reg::R10, windows.stdin_handle);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
+        // r8 = cap (original rdx) captured before rdx is overwritten
+        // with the buffer pointer below, mirroring `emit_win_write_runtime`.
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rdx);
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rsi);
+        self.asm
+            .mov_data_addr(Reg::R9, windows.stdin_bytes_read_scratch);
+        self.asm.xor_reg_reg(Reg::R10, Reg::R10);
+        // Shadow space (32) + 1 stack arg (lpOverlapped, 8 bytes),
+        // rounded up to 48 to stay a multiple of 16.
+        self.emit_win_shim_align_stack(0x30);
+        self.asm.store_ptr_disp32(Reg::Rsp, 0x20, Reg::R10); // lpOverlapped = NULL
+        self.asm.call_import(ImportSymbol::ReadFile);
+
+        let ok = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::NotEqual, ok);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(ok);
+        self.asm
+            .mov_data_addr(Reg::R10, windows.stdin_bytes_read_scratch);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.bind_text_label(done);
+
+        self.emit_win_shim_epilogue();
+    }
+
     /// Wall-clock shim wrapping `GetSystemTimeAsFileTime`, converting
     /// its FILETIME (100ns ticks since 1601-01-01 UTC) output to the
     /// same "milliseconds since the UNIX epoch" value both the
@@ -39025,6 +39523,337 @@ impl NativeCodeGenerator {
         self.asm
             .mov_data_addr(Reg::Rax, windows.perf_counter_scratch);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+
+        self.emit_win_shim_epilogue();
+    }
+
+    // ---- Slice 2 (directory operations) shims ----
+
+    /// Shared BOOL-result normalizer for the Win32 "BOOL WINAPI
+    /// Foo(...)"-shaped imports used by the directory shims
+    /// (`CreateDirectoryA`, `RemoveDirectoryA`, `MoveFileExA`,
+    /// `CopyFileA`): translates a 0-on-failure/nonzero-on-success
+    /// `rax` (as left by the immediately preceding `call_import`)
+    /// into this backend's Linux "-errno on failure, >=0 on success"
+    /// convention, so every existing
+    /// `emit_runtime_error_if_rax_negative[_except_errno]` call site
+    /// keeps working unmodified on both targets. On failure, calls
+    /// `GetLastError()` (reusing the caller's already-reserved 0x20
+    /// shadow space -- every one of this slice's WinAPI calls has
+    /// <=4 register arguments, so `emit_win_shim_align_stack(0x20)`
+    /// always leaves enough room) and maps `ERROR_FILE_NOT_FOUND`(2)/
+    /// `ERROR_PATH_NOT_FOUND`(3) to `-errno_no_entry()`,
+    /// `ERROR_ALREADY_EXISTS`(183)/`ERROR_FILE_EXISTS`(80) to
+    /// `-errno_exists()`, and anything else to -1. Must run with
+    /// `rsp` still at the position `emit_win_shim_align_stack` left
+    /// it (i.e. immediately after the primal `call_import`, before
+    /// `emit_win_shim_epilogue`).
+    fn emit_win_normalize_bool_result(&mut self) {
+        const ERROR_FILE_NOT_FOUND: i32 = 2;
+        const ERROR_PATH_NOT_FOUND: i32 = 3;
+        const ERROR_ALREADY_EXISTS: i32 = 183;
+        const ERROR_FILE_EXISTS: i32 = 80;
+        let ok = self.asm.create_text_label();
+        let no_entry = self.asm.create_text_label();
+        let exists = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::NotEqual, ok);
+        self.asm.call_import(ImportSymbol::GetLastError);
+        self.asm.cmp_reg_imm32(Reg::Rax, ERROR_FILE_NOT_FOUND);
+        self.asm.jcc_label(Condition::Equal, no_entry);
+        self.asm.cmp_reg_imm32(Reg::Rax, ERROR_PATH_NOT_FOUND);
+        self.asm.jcc_label(Condition::Equal, no_entry);
+        self.asm.cmp_reg_imm32(Reg::Rax, ERROR_ALREADY_EXISTS);
+        self.asm.jcc_label(Condition::Equal, exists);
+        self.asm.cmp_reg_imm32(Reg::Rax, ERROR_FILE_EXISTS);
+        self.asm.jcc_label(Condition::Equal, exists);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(no_entry);
+        self.asm
+            .mov_imm64(Reg::Rax, self.platform.errno_no_entry() as i64 as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(exists);
+        self.asm
+            .mov_imm64(Reg::Rax, self.platform.errno_exists() as i64 as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(ok);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.bind_text_label(done);
+    }
+
+    /// `mkdir(path, mode)`-shaped shim wrapping
+    /// `CreateDirectoryA(path, NULL)`. See `WindowsRuntime::win_mkdir`
+    /// for the register contract.
+    fn emit_win_mkdir_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_mkdir);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi); // lpPathName
+        self.asm.mov_imm64(Reg::Rdx, 0); // lpSecurityAttributes = NULL
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::CreateDirectoryA);
+        self.emit_win_normalize_bool_result();
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `rmdir(path)`-shaped shim wrapping `RemoveDirectoryA`. See
+    /// `WindowsRuntime::win_rmdir` for the register contract.
+    fn emit_win_rmdir_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_rmdir);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi); // lpPathName
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::RemoveDirectoryA);
+        self.emit_win_normalize_bool_result();
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `rename(src, dst)`-shaped shim wrapping `MoveFileExA` with
+    /// `MOVEFILE_REPLACE_EXISTING` (matching the Linux `rename(2)`
+    /// syscall's own overwrite-destination semantics that
+    /// `emit_dir_move_labels`'s callers already assume). See
+    /// `WindowsRuntime::win_move` for the register contract.
+    fn emit_win_move_runtime(&mut self) {
+        const MOVEFILE_REPLACE_EXISTING: u64 = 0x1;
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_move);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi); // lpExistingFileName
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rsi); // lpNewFileName
+        self.asm.mov_imm64(Reg::R8, MOVEFILE_REPLACE_EXISTING);
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::MoveFileExA);
+        self.emit_win_normalize_bool_result();
+        self.emit_win_shim_epilogue();
+    }
+
+    /// Whole-file-copy shim wrapping `CopyFileA(src, dst,
+    /// bFailIfExists=FALSE)`, replacing the entire Linux
+    /// open/sendfile-loop/close sequence
+    /// `emit_file_copy_path_labels` otherwise uses. See
+    /// `WindowsRuntime::win_copy_file` for the register contract.
+    fn emit_win_copy_file_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_copy_file);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi); // lpExistingFileName
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rsi); // lpNewFileName
+        self.asm.mov_imm64(Reg::R8, 0); // bFailIfExists = FALSE
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::CopyFileA);
+        self.emit_win_normalize_bool_result();
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `getcwd(buf, cap)`-shaped shim wrapping
+    /// `GetCurrentDirectoryA`. See `WindowsRuntime::win_getcwd` for
+    /// the register contract and the len-incl-NUL ABI-absorption
+    /// rationale.
+    fn emit_win_getcwd_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_getcwd);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        // rdi=lpBuffer, rsi=nBufferLength (both Win64 non-volatile,
+        // so still valid read directly after `call_import` too, but
+        // staged into the WinAPI argument registers up front here).
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rsi); // nBufferLength
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rdi); // lpBuffer
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::GetCurrentDirectoryA);
+
+        let fail = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, fail);
+        // GetCurrentDirectoryA returns length **excl.** NUL;
+        // absorb the delta from the reused Linux `Getcwd` syscall's
+        // "len incl. NUL" convention here so `emit_dir_current`'s
+        // existing `dec_reg(Rax)` call site needs zero changes.
+        self.asm.inc_reg(Reg::Rax);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(fail);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.bind_text_label(done);
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `GetTempPathA`-shaped shim. See
+    /// `WindowsRuntime::win_get_temp_path` for the register contract
+    /// and the trailing-backslash-stripping rationale (design doc
+    /// Risk 5: parity with the Linux `Dir#temp`/`"/tmp"`
+    /// no-trailing-separator convention).
+    fn emit_win_get_temp_path_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_get_temp_path);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        // rdi=lpBuffer, rsi=nBufferLength.
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rdi); // lpBuffer
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rsi); // nBufferLength
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::GetTempPathA);
+
+        let fail = self.asm.create_text_label();
+        let not_backslash = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, fail);
+        // rdi is Win64 non-volatile, so it's still the original
+        // lpBuffer pointer here. rax = length excl. NUL; check
+        // buffer[rax-1] for the trailing '\' GetTempPathA always
+        // appends on success and drop it from the returned length if
+        // present.
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
+        self.asm.dec_reg(Reg::R8);
+        self.asm.movzx_byte_indexed(Reg::R9, Reg::Rdi, Reg::R8);
+        self.asm.cmp_reg_imm8(Reg::R9, b'\\' as i8);
+        self.asm.jcc_label(Condition::NotEqual, not_backslash);
+        self.asm.dec_reg(Reg::Rax);
+        self.asm.bind_text_label(not_backslash);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(fail);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.bind_text_label(done);
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `GetFileAttributesA`-shaped shim. See
+    /// `WindowsRuntime::win_get_file_attributes` for the full
+    /// register contract, including the `INVALID_FILE_ATTRIBUTES`
+    /// zero-extension trap this shim exists to absorb.
+    fn emit_win_get_file_attributes_runtime(&mut self) {
+        const ERROR_FILE_NOT_FOUND: i32 = 2;
+        const ERROR_PATH_NOT_FOUND: i32 = 3;
+        const INVALID_FILE_ATTRIBUTES: u64 = 0xFFFF_FFFF;
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_get_file_attributes);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi); // lpFileName
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::GetFileAttributesA);
+
+        // rax = zero-extended DWORD result. Compare against a
+        // register holding the zero-extended sentinel (not a
+        // sign-extending `cmp_reg_imm32`, which would compare against
+        // 0xFFFFFFFF_FFFFFFFF and never match).
+        let invalid = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.mov_imm64(Reg::R10, INVALID_FILE_ATTRIBUTES);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::R10);
+        self.asm.jcc_label(Condition::Equal, invalid);
+        self.asm.jmp_label(done);
+
+        self.asm.bind_text_label(invalid);
+        self.asm.call_import(ImportSymbol::GetLastError);
+        let no_entry = self.asm.create_text_label();
+        self.asm.cmp_reg_imm32(Reg::Rax, ERROR_FILE_NOT_FOUND);
+        self.asm.jcc_label(Condition::Equal, no_entry);
+        self.asm.cmp_reg_imm32(Reg::Rax, ERROR_PATH_NOT_FOUND);
+        self.asm.jcc_label(Condition::Equal, no_entry);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(no_entry);
+        self.asm
+            .mov_imm64(Reg::Rax, self.platform.errno_no_entry() as i64 as u64);
+        self.asm.bind_text_label(done);
+
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `FindFirstFileA(lpFileName, lpFindFileData)`-shaped shim. Input:
+    /// rdi=pointer to a NUL-terminated ANSI search pattern (a path with
+    /// `\*` appended, staged by `emit_win_dir_search_pattern_buffer`),
+    /// rsi=pointer to a `WIN32_FIND_DATAA` scratch buffer that receives
+    /// the first matching entry as a side effect. Output: rax=handle on
+    /// success. On failure (`INVALID_HANDLE_VALUE`, all-ones), this
+    /// shim calls `GetLastError` and normalizes to the Linux `-errno`
+    /// convention so the existing `emit_runtime_error_if_rax_negative`
+    /// call site at the `Dir#list`/`Dir#listFull` call site needs no
+    /// changes: `ERROR_FILE_NOT_FOUND`(2)/`ERROR_PATH_NOT_FOUND`(3) ->
+    /// -2 (matches Linux `ENOENT`), anything else -> -1.
+    fn emit_win_find_first_file_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_find_first_file);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rsi);
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::FindFirstFileA);
+
+        let done = self.asm.create_text_label();
+        let no_entry = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, -1);
+        self.asm.jcc_label(Condition::NotEqual, done);
+        self.asm.call_import(ImportSymbol::GetLastError);
+        self.asm.cmp_reg_imm32(Reg::Rax, 2); // ERROR_FILE_NOT_FOUND
+        self.asm.jcc_label(Condition::Equal, no_entry);
+        self.asm.cmp_reg_imm32(Reg::Rax, 3); // ERROR_PATH_NOT_FOUND
+        self.asm.jcc_label(Condition::Equal, no_entry);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(no_entry);
+        self.asm.mov_imm64(Reg::Rax, (-2i64) as u64);
+        self.asm.bind_text_label(done);
+
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `FindNextFileA(hFindFile, lpFindFileData)`-shaped shim. Input:
+    /// rdi=handle, rsi=`WIN32_FIND_DATAA*` (overwritten with the next
+    /// matching entry as a side effect). Output: rax=BOOL, straight
+    /// from `FindNextFileA`'s own zero-extended 32-bit return -- 0
+    /// means enumeration is finished (whether because there are no
+    /// more files or because of a genuine I/O error; this shim does
+    /// not distinguish the two, matching the "loop until 0" contract
+    /// the Linux `getdents64` loop also follows), nonzero means
+    /// `lpFindFileData` holds a fresh entry.
+    fn emit_win_find_next_file_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_find_next_file);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rsi);
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::FindNextFileA);
+
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `FindClose(hFindFile)`-shaped shim. Input: rdi=handle. Return
+    /// value ignored, mirroring the Linux path's unchecked `close` on
+    /// the directory fd at the end of `Dir#list`/`Dir#listFull`.
+    fn emit_win_find_close_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_find_close);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::FindClose);
 
         self.emit_win_shim_epilogue();
     }
@@ -42271,10 +43100,22 @@ enum ImportSymbol {
     Sleep,
     QueryPerformanceCounter,
     QueryPerformanceFrequency,
+    CreateDirectoryA,
+    RemoveDirectoryA,
+    MoveFileExA,
+    CopyFileA,
+    GetCurrentDirectoryA,
+    GetTempPathA,
+    GetFileAttributesA,
+    GetLastError,
+    ReadFile,
+    FindFirstFileA,
+    FindNextFileA,
+    FindClose,
 }
 
 impl ImportSymbol {
-    const ALL: [ImportSymbol; 8] = [
+    const ALL: [ImportSymbol; 20] = [
         ImportSymbol::GetStdHandle,
         ImportSymbol::WriteFile,
         ImportSymbol::ExitProcess,
@@ -42283,6 +43124,18 @@ impl ImportSymbol {
         ImportSymbol::Sleep,
         ImportSymbol::QueryPerformanceCounter,
         ImportSymbol::QueryPerformanceFrequency,
+        ImportSymbol::CreateDirectoryA,
+        ImportSymbol::RemoveDirectoryA,
+        ImportSymbol::MoveFileExA,
+        ImportSymbol::CopyFileA,
+        ImportSymbol::GetCurrentDirectoryA,
+        ImportSymbol::GetTempPathA,
+        ImportSymbol::GetFileAttributesA,
+        ImportSymbol::GetLastError,
+        ImportSymbol::ReadFile,
+        ImportSymbol::FindFirstFileA,
+        ImportSymbol::FindNextFileA,
+        ImportSymbol::FindClose,
     ];
 
     /// Exact, case-sensitive export name from `kernel32.dll`.
@@ -42296,6 +43149,18 @@ impl ImportSymbol {
             ImportSymbol::Sleep => "Sleep",
             ImportSymbol::QueryPerformanceCounter => "QueryPerformanceCounter",
             ImportSymbol::QueryPerformanceFrequency => "QueryPerformanceFrequency",
+            ImportSymbol::CreateDirectoryA => "CreateDirectoryA",
+            ImportSymbol::RemoveDirectoryA => "RemoveDirectoryA",
+            ImportSymbol::MoveFileExA => "MoveFileExA",
+            ImportSymbol::CopyFileA => "CopyFileA",
+            ImportSymbol::GetCurrentDirectoryA => "GetCurrentDirectoryA",
+            ImportSymbol::GetTempPathA => "GetTempPathA",
+            ImportSymbol::GetFileAttributesA => "GetFileAttributesA",
+            ImportSymbol::GetLastError => "GetLastError",
+            ImportSymbol::ReadFile => "ReadFile",
+            ImportSymbol::FindFirstFileA => "FindFirstFileA",
+            ImportSymbol::FindNextFileA => "FindNextFileA",
+            ImportSymbol::FindClose => "FindClose",
         }
     }
 
@@ -43328,10 +44193,13 @@ mod tests {
 
     #[test]
     fn windows_target_stdio_fds_match_linux() {
-        // Only the OS-independent fd numbers are meaningful on
-        // Windows (the Win64 shims interpret them to pick a cached
-        // GetStdHandle result) -- everything else in
-        // WINDOWS_X86_64_PLATFORM_CONSTANTS is an unread placeholder.
+        // The OS-independent fd numbers are meaningful on Windows
+        // (the Win64 shims interpret them to pick a cached
+        // GetStdHandle result), as are `errno_no_entry`/
+        // `errno_exists` (read by the directory-family shims' Windows
+        // `GetLastError()` translation) -- every other field in
+        // WINDOWS_X86_64_PLATFORM_CONSTANTS remains an unread
+        // placeholder.
         let platform = TargetPlatform::for_target(NativeTarget::WindowsX86_64);
         assert_eq!(platform.stdin_fd(), 0);
         assert_eq!(platform.stdout_fd(), 1);
