@@ -32,8 +32,8 @@ sleep(500)   // milliseconds
 ```
 
 Both literal integer arguments and runtime integer values work. The
-native code lowers to `nanosleep`. Negative arguments emit a
-source-located diagnostic and exit non-zero.
+native code lowers to `nanosleep` (Windows target: `Sleep`). Negative
+arguments emit a source-located diagnostic and exit non-zero.
 
 ## Stopwatch
 
@@ -46,7 +46,8 @@ println("took #{elapsed} ms")
 
 `stopwatch` accepts a literal `() => ...` lambda or a saved lambda
 value, runs the body, and returns the elapsed milliseconds as an
-`Int`. The native code lowers to `clock_gettime(CLOCK_MONOTONIC)`.
+`Int`. The native code lowers to `clock_gettime(CLOCK_MONOTONIC)`
+(Windows target: `QueryPerformanceCounter` / `QueryPerformanceFrequency`).
 
 ## Wall-clock time
 
@@ -57,9 +58,11 @@ println("epoch ms: #{nowMs}")
 
 `Time#nowMillis()` returns wall-clock milliseconds since the UNIX
 epoch. Same surface in eval and native — the native code lowers to
-`clock_gettime(CLOCK_REALTIME)`. Use `stopwatch` for "how long did
-this take", and `Time#nowMillis` for "what time is it right now"
-(timestamps, log lines, deadlines).
+`clock_gettime(CLOCK_REALTIME)` (Windows target:
+`GetSystemTimeAsFileTime`, converted from its 100ns-tick FILETIME
+epoch to unix millis). Use `stopwatch` for "how long did this take",
+and `Time#nowMillis` for "what time is it right now" (timestamps, log
+lines, deadlines).
 
 ## Integer exponentiation
 

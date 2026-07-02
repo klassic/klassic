@@ -1,7 +1,13 @@
 # File and Directory I/O
 
-Native binaries talk directly to the kernel through `open`, `read`,
-`write`, `unlink`, `mkdir`, `getdents`, and friends.
+Native binaries talk directly to the OS: raw syscalls (`open`, `read`,
+`write`, `unlink`, `mkdir`, `getdents`, and friends) on Linux and
+macOS, or the equivalent Win64 `kernel32.dll` calls (`CreateFileA`,
+`ReadFile`, `WriteFile`, `DeleteFileA`, `CreateDirectoryA`,
+`FindFirstFileA`, and friends) on the Windows target. The language
+surface below is identical on every target; the one Windows-specific
+caveat is that those calls are ANSI-only, so non-ASCII paths are
+unsupported.
 
 ## Reading
 
@@ -66,9 +72,9 @@ if (Dir#exists("/tmp/klassic-demo")) {
 | `Dir#list(path)` | Entries (no parent path prefix) |
 | `Dir#listFull(path)` | Entries with the directory prefix |
 | `Dir#copy(src, dst)`, `Dir#move(src, dst)` | Recursive |
-| `Dir#current()` | `getcwd` |
-| `Dir#home()` | `$HOME` |
-| `Dir#temp()` | `$TMPDIR`, falling back to `/tmp` |
+| `Dir#current()` | `getcwd` (Windows: `GetCurrentDirectoryA`) |
+| `Dir#home()` | `$HOME` (Windows: `%USERPROFILE%`) |
+| `Dir#temp()` | `$TMPDIR`, falling back to `/tmp` (Windows: `GetTempPathA`) |
 
 ## Callback style
 

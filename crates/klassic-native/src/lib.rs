@@ -76,6 +76,9 @@ pub struct NativeTargetSpec {
     pub operating_system: NativeOperatingSystem,
     pub abi: NativeAbi,
     pub executable_format: NativeExecutableFormat,
+    /// Support tier as documented in docs/native-coverage.md: "0" is
+    /// the must-stay-green tier, "1" is supported but younger.
+    pub tier: &'static str,
 }
 
 const LINUX_X86_64_ALIASES: &[&str] = &["linux-x86_64", "x86_64-unknown-linux-gnu"];
@@ -100,6 +103,7 @@ const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[
         operating_system: NativeOperatingSystem::Linux,
         abi: NativeAbi::Gnu,
         executable_format: NativeExecutableFormat::Elf64,
+        tier: "0",
     },
     NativeTargetSpec {
         target: NativeTarget::MacosAarch64,
@@ -112,6 +116,7 @@ const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[
         operating_system: NativeOperatingSystem::MacOs,
         abi: NativeAbi::Apple,
         executable_format: NativeExecutableFormat::MachO64,
+        tier: "1",
     },
     // Reuses the entire DirectX86_64 (Linux) codegen: the generated
     // machine code is identical Win64-compatible x86_64 instructions,
@@ -130,6 +135,7 @@ const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[
         operating_system: NativeOperatingSystem::Windows,
         abi: NativeAbi::Msvc,
         executable_format: NativeExecutableFormat::Pe64,
+        tier: "0",
     },
 ];
 
@@ -326,22 +332,22 @@ impl NativeTarget {
     pub fn target_matrix() -> String {
         let mut lines = Vec::new();
         lines.push(format!(
-            "{:<32}{:<14}{:<14}{:<6}{}",
+            "{:<32}{:<15}{:<14}{:<6}{}",
             "TARGET", "BACKEND", "ARTIFACT", "TIER", "STATUS"
         ));
         for spec in Self::supported_specs() {
             lines.push(format!(
-                "{:<32}{:<14}{:<14}{:<6}{}",
+                "{:<32}{:<15}{:<14}{:<6}{}",
                 spec.standard_triple,
                 spec.backend.name(),
                 "executable",
-                "0",
+                spec.tier,
                 "supported"
             ));
         }
         for planned in PLANNED_TARGETS {
             lines.push(format!(
-                "{:<32}{:<14}{:<14}{:<6}{}",
+                "{:<32}{:<15}{:<14}{:<6}{}",
                 planned.triple, planned.backend, planned.artifact, planned.tier, "planned"
             ));
         }
@@ -45027,6 +45033,50 @@ mod tests {
         assert_eq!(platform.stdin_fd(), 0);
         assert_eq!(platform.stdout_fd(), 1);
         assert_eq!(platform.stderr_fd(), 2);
+    }
+
+    #[test]
+    fn target_matrix_reports_documented_tiers_and_aligned_columns() {
+        // `klassic targets` used to hardcode tier "0" for every
+        // supported target (docs/native-coverage.md documents
+        // aarch64-apple-darwin as tier 1) and pad the backend column
+        // to exactly 14 chars, so the 14-char "direct-aarch64" ran
+        // straight into the artifact column.
+        let matrix = NativeTarget::target_matrix();
+        let mac_row = matrix
+            .lines()
+            .find(|line| line.starts_with("aarch64-apple-darwin"))
+            .expect("matrix should list aarch64-apple-darwin");
+        assert!(
+            mac_row.contains("direct-aarch64 "),
+            "backend column should be whitespace-separated: {mac_row}"
+        );
+        let columns: Vec<&str> = mac_row.split_whitespace().collect();
+        assert_eq!(
+            columns,
+            [
+                "aarch64-apple-darwin",
+                "direct-aarch64",
+                "executable",
+                "1",
+                "supported"
+            ]
+        );
+        let windows_row = matrix
+            .lines()
+            .find(|line| line.starts_with("x86_64-pc-windows-msvc"))
+            .expect("matrix should list x86_64-pc-windows-msvc");
+        let columns: Vec<&str> = windows_row.split_whitespace().collect();
+        assert_eq!(
+            columns,
+            [
+                "x86_64-pc-windows-msvc",
+                "direct-x86_64",
+                "executable",
+                "0",
+                "supported"
+            ]
+        );
     }
 
     #[test]

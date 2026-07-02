@@ -1,8 +1,13 @@
 # Tagging vX.Y.Z builds release binaries — a statically-linked Linux
 # binary (musl, so it runs on any x86_64 Linux without a Rust
-# toolchain) and macOS binaries for Apple Silicon and Intel — and
-# attaches them to a GitHub Release. Keep Cargo.toml's `version` in
-# sync with the tag so `klassic --version` matches the release.
+# toolchain), macOS binaries for Apple Silicon and Intel, and a
+# Windows x86_64 klassic.exe — and attaches them to a GitHub Release.
+# Keep Cargo.toml's `version` in sync with the tag so
+# `klassic --version` matches the release. The release body comes from
+# docs/release-notes/<tag>.md via the release-notes job (the asset
+# jobs deliberately do not generate notes: with several jobs updating
+# one release, generate_release_notes appended the changelog once per
+# job — v0.3.0's body has it twice).
 name: Release
 
 on:
@@ -53,7 +58,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: klassic-*.tar.gz
-          generate_release_notes: true
 
   # macOS: the evaluator, REPL, and C backend run on macOS as-is (the
   # direct ELF backend stays Linux-only). The arm64 runner also
@@ -96,4 +100,61 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: klassic-*.tar.gz
-          generate_release_notes: true
+
+  # Windows: the direct x86_64-pc-windows-msvc PE64 backend needs no
+  # external toolchain, so `klassic build` on Windows produces a
+  # native .exe out of the box. The C backend's host-link path is not
+  # wired for MSVC (find_runtime_staticlib looks for
+  # libklassic_runtime.a and link_c_program only searches
+  # cc/clang/gcc), so this job ships klassic.exe alone rather than a
+  # staticlib nothing can consume yet.
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build runtime staticlib
+        # Kept for shape-parity with the other jobs; the C-backend
+        # link tests are #[cfg(unix)]-gated so it is not load-bearing
+        # on this runner today.
+        run: cargo build -p klassic-runtime
+
+      - name: Test
+        run: cargo test
+
+      - name: Build binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item target\x86_64-pc-windows-msvc\release\klassic.exe klassic.exe
+          Compress-Archive -Path klassic.exe -DestinationPath "klassic-$env:GITHUB_REF_NAME-x86_64-pc-windows-msvc.zip"
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: klassic-*.zip
+
+  # Sets the curated release body exactly once, after every asset job
+  # has attached its files. Cutting a release therefore requires
+  # docs/release-notes/<tag>.md to exist — write it before tagging.
+  release-notes:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [release-linux, release-macos, release-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set release body
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: docs/release-notes/${{ github.ref_name }}.md

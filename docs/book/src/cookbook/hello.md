@@ -10,8 +10,9 @@ println("Hello, World!")
 ```
 
 The simplest possible program. The string lives in the binary's
-`.data` section; the native compiler emits a single `write` syscall
-plus a newline.
+data section; the native compiler emits a single write to stdout (a
+`write` syscall on Linux/macOS, a `WriteFile` call on Windows) plus a
+newline.
 
 ## With interpolation
 

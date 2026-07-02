@@ -890,32 +890,22 @@ cargo run -- -e "1 + 2"
   hand-maintained match arm, so adding a new imported function is a
   three-line change (a variant, an `ALL` entry, a `name()` arm) that
   never touches `pe.rs`. Verified end-to-end under WSL2 binfmt
-  built generically over the full `ImportSymbol::ALL` list (originally
-  just `GetStdHandle`/`WriteFile`/`ExitProcess`/`VirtualAlloc`, now
-  also the directory-family imports described below) from a single
-  `kernel32.dll` descriptor, with a fixed `ImageBase` and no `.reloc`
-  section (mirrors the "no external toolchain" property of the ELF
-  and Mach-O writers); adding a new import is purely mechanical (one
-  enum variant, one `ALL` entry, one `name()` arm — `iat_index` is
-  derived from position in `ALL`, and `pe.rs` needs no changes).
-  Verified end-to-end under WSL2 binfmt
   interop (`./program.exe` launches the real Windows loader from
   Linux) against hello-world, recursive `def`s, string/enum/record/list
   operations, closures, and a GC-churn stress program, all matching
   the evaluator's output byte-for-byte.
 
-  Every builtin whose native codegen would otherwise reach that
-  `syscall_number` tripwire on Windows is gated at its own `compile_*`
-  entry point (`if self.is_windows { return Err(...) }`, before any
-  codegen for that builtin runs) unless it has its own Win64 shim:
-  `StandardInput#all`/`#lines`, the whole `FileOutput#`/`FileInput#`
-  family, the whole `Dir#` family, `Environment#vars`/`#get`/`#exists`,
-  and `CommandLine#args` each raise a `` `Feature` is not yet
-  supported when targeting x86_64-pc-windows-msvc `` diagnostic
-  instead of panicking. `sleep`, `stopwatch`, and `Time#nowMillis` are
-  no longer gated: `compile_sleep` stages the millisecond count into
-  rdi and calls the `emit_win_sleep_runtime` shim, which moves it into
-  ecx and calls `Sleep` directly (no seconds/nanos split needed, unlike
+  Every native-codegen path that could otherwise reach the
+  `syscall_number` tripwire on Windows now has its own Win64 shim, so
+  the tripwire is unreachable in practice; the `unsupported_on_target`
+  diagnostic helper that used to raise a `` `Feature` is not yet
+  supported when targeting x86_64-pc-windows-msvc `` error for
+  not-yet-implemented builtins was removed once the last gate was
+  replaced (it is referenced only in a comment now). `sleep`,
+  `stopwatch`, and `Time#nowMillis` were the first to gain real
+  codegen: `compile_sleep` stages the millisecond count into `rdi` and
+  calls the `emit_win_sleep_runtime` shim, which moves it into `ecx`
+  and calls `Sleep` directly (no seconds/nanos split needed, unlike
   Linux's `nanosleep`); `compile_time_now_millis` calls
   `emit_win_time_now_millis_runtime`, which wraps
   `GetSystemTimeAsFileTime` and converts its 100ns-tick FILETIME output
@@ -926,28 +916,20 @@ cargo run -- -e "1 + 2"
   `emit_win_qpf_runtime` (wrapping `QueryPerformanceFrequency`) and
   computes `elapsed_ticks * 1000 / frequency`. All three shims follow
   the same save-every-register/self-aligning-`rsp` pattern as the
-  original four Win64 shims. `Environment#*` and `CommandLine#args`
-  don't reach a raw syscall at
-  `syscall_number` tripwire on Windows is now gated at its own
-  `compile_*` entry point (`if self.is_windows { return Err(...) }`,
-  before any codegen for that builtin runs): `sleep`, `stopwatch`,
-  `Time#nowMillis`, `StandardInput#all`/`#lines`, the whole
-  `FileOutput#`/`FileInput#` family, `Dir#home`/`#list`/`#listFull`,
-  `Environment#vars`/`#get`/`#exists`, and `CommandLine#args` each
-  raise a `` `Feature` is not yet supported when targeting
-  x86_64-pc-windows-msvc `` diagnostic instead of panicking.
+  original four Win64 shims (`__win_write`/`__win_mmap`/`__win_exit`/
+  `__win_init`).
 
   The rest of the `Dir#` family (`#mkdir`/`#mkdirs`/`#delete`/`#move`/
-  `#copy`/`#current`/`#exists`/`#isDirectory`/`#isFile`/`#temp`) is
-  un-gated and backed by seven new Win64 shims built on the same
-  save-registers/align-stack/epilogue scaffold as `__win_write`:
+  `#copy`/`#current`/`#exists`/`#isDirectory`/`#isFile`/`#temp`/
+  `#list`/`#listFull`/`#home`) is backed by Win64 shims built on the
+  same save-registers/align-stack/epilogue scaffold as `__win_write`:
   `__win_mkdir`/`__win_rmdir`/`__win_move`/`__win_copy_file` wrap
   `CreateDirectoryA`/`RemoveDirectoryA`/`MoveFileExA`/`CopyFileA`
   (the last replacing the Linux open/`sendfile`-loop/close sequence
   with one call) and share a `GetLastError()`-translating BOOL-result
   normalizer that maps `ERROR_FILE_NOT_FOUND`/`ERROR_PATH_NOT_FOUND`
   to `-errno_no_entry()` and `ERROR_ALREADY_EXISTS`/`ERROR_FILE_EXISTS`
-  to `-errno_exists()` (both now real Windows sentinels, `-2`/`-17`,
+  to `-errno_exists()` (both real Windows sentinels, `-2`/`-17`,
   rather than the placeholder `0` every other
   `WINDOWS_X86_64_PLATFORM_CONSTANTS` field carries) so the reused
   Linux `emit_runtime_error_if_rax_negative[_except_errno]` call sites
@@ -964,98 +946,102 @@ cargo run -- -e "1 + 2"
   value and silently defeat every `cmp rax,0;jge ok`-style caller),
   backing `Dir#exists`/`#isDirectory`/`#isFile`'s shared
   `emit_runtime_path_exists_label`/`emit_runtime_path_type_check_label`
-  helpers. Two related, non-codegen fixes shipped alongside these
-  shims: `emit_dir_mkdirs_label`'s runtime path-prefix scanner gained a
-  parallel `\`-handling block (Windows paths may use either separator)
-  that restores the original separator byte rather than hardcoding
-  `/`; and `compile_dir_exists`/`_is_directory`/`_is_file` now force
-  the runtime (non-folded) path check whenever `self.is_windows`,
-  since their existing compile-time constant fold for a
-  statically-known path argument queries the *compiling host's*
+  helpers. `Dir#list`/`#listFull` use a `FindFirstFileA`/
+  `FindNextFileA`/`FindClose` loop that mirrors the Linux `getdents64`
+  output contract (newline buffer, dot-entry skip, `listFull` prefix,
+  shared sort pass), with the same 65536-byte listing cap as Linux.
+  `StandardInput#all`/`#lines` read through a `ReadFile` shim against a
+  stdin handle cached at startup. Two related, non-codegen fixes ship
+  alongside these shims: `emit_dir_mkdirs_label`'s runtime path-prefix
+  scanner gained a parallel `\`-handling block (Windows paths may use
+  either separator) that restores the original separator byte rather
+  than hardcoding `/`; and `compile_dir_exists`/`_is_directory`/
+  `_is_file` force the runtime (non-folded) path check whenever
+  `self.is_windows`, since their existing compile-time constant fold
+  for a statically-known path argument queries the *compiling host's*
   filesystem — correct for a same-target build, silently wrong for a
-  Windows cross-build. Every path in this family reuses the existing
-  ANSI (`A`-suffixed) kernel32 functions, so non-ASCII paths remain
-  best-effort/undefined until a UTF-8-to-UTF-16LE `W`-function pass is
-  added.
-  `Environment#*` and `CommandLine#args` don't reach a raw syscall at
-  all — they walk the `environment_base`/`command_line_argc`/
-  `syscall_number` tripwire on Windows was originally gated at its own
-  `compile_*` entry point (`if self.is_windows { return Err(...) }`,
-  before any codegen for that builtin runs), raising a `` `Feature` is
-  not yet supported when targeting x86_64-pc-windows-msvc `` diagnostic
-  instead of panicking. As of the un-gating work described below, only
-  `sleep`, `stopwatch`, `Time#nowMillis`, `StandardInput#all`/`#lines`,
-  most of the `Dir#` family (`current`/`temp`/`exists`/`isDirectory`/
-  `isFile`/`mkdir`/`mkdirs`/`list`/`listFull`/`delete`/`copy`/`move`)
-  still raise that diagnostic; `Dir#home`, `Environment#vars`/`#get`/
-  `#exists`, `CommandLine#args`, and the whole `FileOutput#`/
-  `FileInput#` family no longer do. `Environment#*` and
-  `CommandLine#args` never reached a raw syscall in the first place —
-  they walk the `environment_base`/`command_line_argc`/
-  `command_line_argv1_base` slots `emit_store_command_line_state`
-  used to leave zeroed on Windows — so an ungated build would have
-  silently compiled a binary that always observed an empty
-  environment/argument list rather than failing to build; they were
-  gated for that "wrong answer, not a crash" reason instead of the
-  syscall-tripwire reason. `emit_print_expr_fragment`'s
-  `println(FileInput#all(...))` / `println(FileInput#lines(...))` /
-  `println(FileInput#open(path, s => s.readLines()))` print-fusion fast
-  paths stream a file straight to the target fd without going through
-  `compile_file_input_all`/`compile_file_input_lines`; each fast path's
-  own `!self.is_windows` guard still skips it on Windows even now that
-  the underlying builtins are Windows-safe (the fast paths themselves
-  still call the raw-syscall-only `emit_file_stream_to_fd_path_label`),
-  falling through to the ordinary (now Windows-safe) call dispatch
-  instead. `thread { ... }` needed no gate of its own: a queued thread
-  body is compiled into the tail of `main` via the same `compile_expr`
-  dispatch as any other call site (no real OS thread, no syscall of its
-  own), so a thread body that touches a still-gated builtin is already
-  caught transitively.
+  Windows cross-build.
 
-  Two of the originally-gated families above are now un-gated.
-  `emit_store_command_line_state`'s Windows branch synthesizes the Linux
-  `argv`/`envp` layout at startup instead of leaving it zeroed:
-  `GetEnvironmentStringsA`'s flat block is walked once
-  into a synthesized `char*` pointer array (`environment_base`, never freed
-  — its entries point directly into the still-live `GetEnvironmentStringsA`
-  block, mirroring the GC heap's own "never free" policy), and
-  `GetCommandLineA`'s single ANSI string is hand-tokenized by a two-state
-  (in-quotes / not) FSA into a NUL-separated buffer plus a matching pointer
-  array (`command_line_argc`/`command_line_argv1_base`). The tokenizer
-  deliberately does not implement `CommandLineToArgvW`'s `""`-unescaping or
-  backslash-escaping rules — backslash is always literal — so a quoted
-  Windows path ending in a backslash before its closing quote does not
-  tokenize identically to the real CRT. Both slots keep the exact shape
-  every existing `emit_command_line_args`/`emit_environment_*`/
-  `emit_find_environment_*` consumer already assumes, so `CommandLine#args`,
-  `Environment#vars`/`#get`/`#exists`, and (via a `USERPROFILE`-instead-of-
-  `HOME` key swap) `Dir#home` are un-gated with no changes to those
-  consumers. Separately, `FileOutput#write`/`#append`/`#writeLines`/
-  `#exists`/`#delete` and `FileInput#all`/`#readAll`/`#lines`/`#readLines`
-  are un-gated by branching their `Open`/`Read`/`Write`/`Close`/`Unlink`/
-  `Access` syscall sites to new Win64 shims: `win_create_file` (wraps
-  `CreateFileA`, selecting `GENERIC_READ`+`OPEN_EXISTING` /
-  `GENERIC_WRITE`+`CREATE_ALWAYS` / `FILE_APPEND_DATA`+`OPEN_ALWAYS` from a
-  small selector carried in the target's `open_read_flags`/
-  `open_write_flags` constants), `win_read` and `win_write_handle` (twins of
-  `win_write` wrapping `ReadFile`/`WriteFile` against a raw file `HANDLE`
-  rather than `win_write`'s cached-stdout/stderr selector), `win_close_handle`
-  (wraps `CloseHandle`), `win_delete_file` (wraps `DeleteFileA`, translating
-  a `GetLastError()` failure via `emit_win_translate_last_error_to_errno`
-  so `ERROR_FILE_NOT_FOUND`/`ERROR_PATH_NOT_FOUND` map to the same
-  `errno_no_entry` sentinel the Linux `Unlink` path already tolerates), and
-  `win_get_file_attributes` (wraps `GetFileAttributesA`; its
-  `INVALID_FILE_ATTRIBUTES` sentinel zero-extends to a *positive* 64-bit
-  value, so the shim compares against the exact 64-bit constant rather than
-  a sign-extended `-1`). All paths use the kernel32 "A" (ANSI) functions
-  reusing the existing UTF-8 path-staging code as-is, so non-ASCII paths
-  and environment values are unsupported on this target for now. Two
-  `compile_*` entry points (`FileOutput#exists`, `FileInput#all`/`#lines`)
-  also fold a statically-known-constant path's existence/content from the
-  *compiling host's* filesystem at compile time as an optimization; that
-  fold is forced off whenever `self.is_windows`, since a Windows build's
-  path only makes sense to check against the eventual Windows target's
-  filesystem at runtime, not the Linux/macOS build machine's.
+  `Environment#vars`/`#get`/`#exists` and `CommandLine#args` never
+  reached a raw syscall in the first place — they walk the
+  `environment_base`/`command_line_argc`/`command_line_argv1_base`
+  slots that `emit_store_command_line_state` used to leave zeroed on
+  Windows, so an ungated build would have silently compiled a binary
+  that always observed an empty environment/argument list rather than
+  failing to build; they were gated for that "wrong answer, not a
+  crash" reason rather than the syscall-tripwire reason.
+  `emit_store_command_line_state`'s Windows branch now synthesizes
+  that layout at startup instead: `GetEnvironmentStringsA`'s flat
+  block is walked once into a synthesized `char*` pointer array
+  (`environment_base`, never freed — its entries point directly into
+  the still-live `GetEnvironmentStringsA` block, mirroring the GC
+  heap's own "never free" policy), and `GetCommandLineA`'s single ANSI
+  string is hand-tokenized by a two-state (in-quotes / not) FSA into a
+  NUL-separated buffer plus a matching pointer array
+  (`command_line_argc`/`command_line_argv1_base`). The tokenizer
+  deliberately does not implement `CommandLineToArgvW`'s
+  `""`-unescaping or backslash-escaping rules — backslash is always
+  literal — so a quoted Windows path ending in a backslash before its
+  closing quote does not tokenize identically to the real CRT. Both
+  slots keep the exact shape every existing
+  `emit_command_line_args`/`emit_environment_*`/
+  `emit_find_environment_*` consumer already assumed, so
+  `CommandLine#args`, `Environment#vars`/`#get`/`#exists`, and (via a
+  `USERPROFILE`-instead-of-`HOME` key swap) `Dir#home` needed no
+  further changes to those consumers. Single-key `Environment#get`/
+  `#exists` lookups additionally go through a `GetEnvironmentVariableA`
+  shim so the OS resolves the name — Windows stores variables with
+  OS-native casing (`Path=`, not `PATH=`) and resolves them
+  case-insensitively, which a byte-for-byte envp-array walk does not;
+  `Environment#vars` keeps the block walk since it only enumerates.
+
+  `FileOutput#write`/`#append`/`#writeLines`/`#exists`/`#delete` and
+  `FileInput#all`/`#readAll`/`#lines`/`#readLines` (`std.file`) branch
+  their `Open`/`Read`/`Write`/`Close`/`Unlink`/`Access` syscall sites
+  to Win64 shims: `win_create_file` (wraps `CreateFileA`, selecting
+  `GENERIC_READ`+`OPEN_EXISTING` / `GENERIC_WRITE`+`CREATE_ALWAYS` /
+  `FILE_APPEND_DATA`+`OPEN_ALWAYS` from a small selector carried in
+  the target's `open_read_flags`/`open_write_flags` constants),
+  `win_read` and `win_write_handle` (twins of `win_write` wrapping
+  `ReadFile`/`WriteFile` against a raw file `HANDLE` rather than
+  `win_write`'s cached-stdout/stderr selector), `win_close_handle`
+  (wraps `CloseHandle`), `win_delete_file` (wraps `DeleteFileA`,
+  translating a `GetLastError()` failure via
+  `emit_win_translate_last_error_to_errno` so
+  `ERROR_FILE_NOT_FOUND`/`ERROR_PATH_NOT_FOUND` map to the same
+  `errno_no_entry` sentinel the Linux `Unlink` path already tolerates),
+  and `win_get_file_attributes` (wraps `GetFileAttributesA`; its
+  `INVALID_FILE_ATTRIBUTES` sentinel zero-extends to a *positive*
+  64-bit value, so the shim compares against the exact 64-bit constant
+  rather than a sign-extended `-1`). Two `compile_*` entry points
+  (`FileOutput#exists`, `FileInput#all`/`#lines`) also fold a
+  statically-known-constant path's existence/content from the
+  *compiling host's* filesystem at compile time as an optimization;
+  that fold is forced off whenever `self.is_windows`, since a Windows
+  build's path only makes sense to check against the eventual Windows
+  target's filesystem at runtime, not the Linux/macOS build machine's.
+  `emit_print_expr_fragment`'s `println(FileInput#all(...))`/
+  `println(FileInput#lines(...))`/
+  `println(FileInput#open(path, s => s.readLines()))` print-fusion
+  fast paths stream a file straight to the target fd without going
+  through `compile_file_input_all`/`compile_file_input_lines`; each
+  fast path's own `!self.is_windows` guard still skips it on Windows
+  (the fast paths themselves still call the raw-syscall-only
+  `emit_file_stream_to_fd_path_label`), falling through to the
+  ordinary (Windows-safe) call dispatch instead — so those `println`
+  calls still work on Windows, just through the general path rather
+  than the fused fast path.
+
+  All of the shims above use only the kernel32 "A" (ANSI) functions,
+  reusing the existing UTF-8 path-staging code as-is, so non-ASCII
+  paths and environment values/keys are unsupported (best-effort /
+  undefined) on this target — the one documented Windows limitation.
+  `thread { ... }` needs no gate of its own: a queued thread body is
+  compiled into the tail of `main` via the same `compile_expr`
+  dispatch as any other call site (no real OS thread, no syscall of
+  its own). `Process#run`/`#nrun` (process spawning) has no
+  native-backend implementation on any target yet, so there is
+  nothing Windows-specific to gate there.
 
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program

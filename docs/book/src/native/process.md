@@ -66,6 +66,11 @@ Aliases:
 - `hasEnv(name)` for `Environment#exists`
 - `env()` for `Environment#vars`
 
+On the Windows target, `Environment#get` / `Environment#exists` resolve
+names case-insensitively (matching Windows' own semantics — the OS
+stores `Path`, not `PATH`), while on Linux and macOS lookups are
+case-sensitive.
+
 ## Sample CLI tool
 
 ```kl

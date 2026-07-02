@@ -97,14 +97,21 @@ Targets are tracked as tiers; status lives in
 - **Tier 0 (direct PE64)** — `x86_64-pc-windows-msvc`: reuses the
   entire `DirectX86_64` (Linux) codegen as-is (the generated x86_64
   machine code is already Win64-ABI-compatible) and only swaps the OS
-  boundary (a handful of Win64 `kernel32.dll` import-call shims
-  replacing bare Linux `syscall` instructions at the `write`/`mmap`/
-  `exit` sites) and the container format (a minimal unsigned PE64
-  writer, `crates/klassic-native/src/pe.rs`, no external toolchain).
-  Non-core-language syscalls are not yet gated for Windows and remain
-  a follow-up slice (see `docs/native-coverage.md`'s target-matrix
-  notes) — reaching one from a Windows build is a deliberate
-  compile-time panic, not a silently wrong binary.
+  boundary (Win64 `kernel32.dll` import-call shims replacing bare
+  Linux `syscall` instructions) and the container format (a minimal
+  unsigned PE64 writer, `crates/klassic-native/src/pe.rs`, no external
+  toolchain). Windows now has full OS-builtin coverage: the core
+  language, `sleep`/`stopwatch`/`Time#nowMillis`, stdin, the whole
+  `FileOutput#`/`FileInput#` family, the whole `Dir#` family,
+  `Environment#`, and `CommandLine#args` all compile and run on this
+  target (see `docs/native-coverage.md`'s target-matrix notes for the
+  full builtin-by-builtin breakdown). Every builtin that could reach
+  `TargetPlatform::syscall_number`'s deliberate panic tripwire now has
+  its own Win64 shim instead, so the tripwire is unreachable in
+  practice. The one remaining limitation is that those shims use only
+  the kernel32 "A" (ANSI) functions, so non-ASCII paths and
+  environment values/keys are unsupported (best-effort/undefined) on
+  this target.
 
 The original key rule here ("no Mach-O / PE direct syscall paths") was
 revised twice. On 2026-06-11: macOS arm64 is important enough to
