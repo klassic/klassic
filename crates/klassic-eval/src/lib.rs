@@ -38,6 +38,7 @@ use runtime_types::{
     constraint_runtime_type_name, dynamic_type_name, infer_constraint_substitutions,
     known_type_from_value,
 };
+use value::EnumFields;
 pub use value::{BuiltinFunctionValue, FunctionValue, Value};
 
 #[derive(Clone, Debug)]
@@ -366,10 +367,12 @@ fn restore_thread_value(snapshot: ThreadValueSnapshot) -> Value {
         } => Value::Enum {
             enum_name,
             variant,
-            fields: fields
-                .into_iter()
-                .map(|(field, value)| (field, restore_thread_value(value)))
-                .collect(),
+            fields: Rc::new(EnumFields::new(
+                fields
+                    .into_iter()
+                    .map(|(field, value)| (field, restore_thread_value(value)))
+                    .collect(),
+            )),
         },
         ThreadValueSnapshot::EnumConstructor {
             enum_name,
@@ -682,7 +685,7 @@ fn register_enum_constructors(expr: &Expr, environment: &mut Environment) {
             let value = Value::Enum {
                 enum_name: name.clone(),
                 variant: variant.name.clone(),
-                fields: Vec::new(),
+                fields: Rc::new(EnumFields::new(Vec::new())),
             };
             environment.declare_with_value(variant.name.clone(), false, value);
         } else {
@@ -1967,10 +1970,12 @@ fn apply_callable(
                     ),
                 ));
             }
-            let fields = param_names
-                .into_iter()
-                .zip(argument_values)
-                .collect::<Vec<_>>();
+            let fields = Rc::new(EnumFields::new(
+                param_names
+                    .into_iter()
+                    .zip(argument_values)
+                    .collect::<Vec<_>>(),
+            ));
             Ok(Value::Enum {
                 enum_name,
                 variant,
