@@ -923,6 +923,65 @@ fn stdlib_enum_type_annotations_resolve() {
     );
 }
 
+/// Regression test for issue #542 (evaluator typechecker nondeterminism).
+/// The bundled `std.option` module — which declares `enum Option<a> {
+/// case Some(v: a); case None }` — is evaluated into every session
+/// unconditionally (`prepare_evaluator` walks `STDLIB_MODULES` before
+/// running user code), regardless of whether the program writes `import
+/// std.option`. So a user enum that reuses the `Some` / `None` variant
+/// names — here `Opt`, exactly as in the minimized issue repro — always
+/// has a real competing `Option` schema to contend with. `check`'s
+/// parameter is unannotated, so at the match arms `o`'s type is still a
+/// bare type variable and constructor resolution falls back to the
+/// (formerly `HashMap`-order-dependent) "no scrutinee to pin against"
+/// path. Before the fix this failed nondeterministically — observed
+/// ~35% of the time in a 30-run loop — with "type mismatch: Option<'a>
+/// is not compatible with Opt<'a>"; the user's later declaration must
+/// deterministically shadow the prelude's.
+#[test]
+fn user_enum_shadows_implicit_stdlib_option_for_unannotated_match() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum Opt<a> { case Some(v: a); case None }\n\
+             def check(o) = o match { case None => 0; case Some(v) => 1 }\n\
+             println(check(None))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "a user enum reusing Some/None must shadow the implicit stdlib Option\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "0\n()\n");
+}
+
+/// Task 4c companion to the shadowing test above: when there is no
+/// conflicting user enum, `std.option`'s own `Some` / `None` must keep
+/// resolving correctly through the very same unannotated-match code
+/// path — the shadowing fix must not regress the ordinary case where
+/// there is nothing to shadow.
+#[test]
+fn stdlib_option_still_resolves_through_unannotated_match_without_a_conflicting_enum() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.option.{Some, None}\n\
+             def unwrap(o) = o match { case None => -1; case Some(v) => v }\n\
+             println(unwrap(Some(42)))\n\
+             println(unwrap(None))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "std.option's Some/None should still resolve without a conflicting enum\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n-1\n()\n");
+}
+
 /// A match arm whose constructor an earlier unguarded, irrefutably-bound
 /// arm already matches is reported as unreachable — but a refutable
 /// earlier payload (`case S(1)`) does not close the variant, and guards
