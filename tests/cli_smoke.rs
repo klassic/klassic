@@ -283,6 +283,58 @@ fn arithmetic_typeclass_rejects_bad_operands() {
 /// in a single program — matching the evaluator.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn native_dir_move_tracks_descendant_paths() {
+    // Issue #539: `Dir#move` swapped only the exact source->target key
+    // in the compile-time virtual filesystem state, so a child created
+    // under the source before the move kept its stale key -- and
+    // `Dir#isDirectory` constant-folded to the pre-move world (old
+    // path true, new path false; the evaluator says the opposite).
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_dirmove_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_dirmove_{stamp}.bin"));
+    let work_dir = std::env::temp_dir().join(format!("klassic_dirmove_{stamp}.work"));
+    fs::create_dir(&work_dir).expect("work dir should create");
+    fs::write(
+        &source_path,
+        "Dir#mkdir(\"mvbase\")\nDir#mkdir(\"mvbase/x\")\nDir#move(\"mvbase\", \"mvmoved\")\nprintln(Dir#isDirectory(\"mvbase/x\"))\nprintln(Dir#isDirectory(\"mvmoved/x\"))\nDir#delete(\"mvmoved/x\")\nDir#delete(\"mvmoved\")\n",
+    )
+    .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "dir-move program should build natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .current_dir(&work_dir)
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_dir_all(&work_dir);
+    assert!(
+        run.status.success(),
+        "dir-move program should run\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // The evaluator (oracle) prints false (old child path is gone)
+    // then true (the child moved with its parent).
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "false\ntrue\n");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn native_generic_arithmetic_monomorphizes() {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
