@@ -1,0 +1,47 @@
+// Cross-exec guarantee: enum + match, nominal records, lists, and a
+// modest GC-churn loop (20k allocations of enums + records) that
+// produces a deterministic checksum instead of anything timing- or
+// address-dependent.
+enum Shape { case Circle(radius: Int); case Rectangle(width: Int, height: Int) }
+
+record Counter {
+  total: Int
+  count: Int
+}
+
+// Klassic has no `%` infix operator (`%` is the map/set literal
+// prefix), so modulus is spelled out explicitly.
+def mod(n: Int, m: Int): Int = n - (n / m) * m
+
+def area(s: Shape): Int = s match {
+  case Circle(r) => r * r * 3
+  case Rectangle(w, h) => w * h
+}
+
+// List-of-enum literals are a known native-codegen gap (see
+// docs/architecture-rust.md), so the enum values themselves stay in
+// plain `val`s and only their derived `Int` areas go into a list.
+// `map`/`foldLeft` (higher-order builtin calls) are avoided too: the
+// aarch64-apple-darwin backend does not implement them yet, so the
+// same reduction is spelled out by hand to keep this program buildable
+// on every cross-exec target.
+val c1 = Circle(2)
+val r1 = Rectangle(3, 4)
+val c2 = Circle(5)
+val a1 = area(c1)
+val a2 = area(r1)
+val a3 = area(c2)
+val areas = [a1, a2, a3]
+println(areas)
+println(size(areas))
+println(a1 + a2 + a3)
+
+mutable acc = #Counter(0, 0)
+mutable i = 0
+while(i < 20000) {
+  val s = if(mod(i, 2) == 0) Circle(mod(i, 7)) else Rectangle(mod(i, 5), mod(i, 3))
+  acc = #Counter(acc.total + area(s), acc.count + 1)
+  i = i + 1
+}
+println(acc.total)
+println(acc.count)

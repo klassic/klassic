@@ -1,0 +1,34 @@
+// Cross-exec guarantee: recursion + arithmetic + comparison operators.
+// Klassic has no `%` infix operator (`%` is the map/set literal
+// prefix), so modulus is spelled out explicitly. Parameters are
+// annotated: the native compiler inlines unannotated recursive
+// functions at each call site, and a recursive call whose argument is
+// itself a call to another unannotated function (like `gcd` calling
+// `mod`) is not supported by that inlining path yet.
+def mod(n: Int, m: Int): Int = n - (n / m) * m
+
+def fib(n: Int): Int = if(n < 2) n else fib(n - 1) + fib(n - 2)
+
+mutable i = 0
+while(i <= 15) {
+  println(fib(i))
+  i = i + 1
+}
+
+def gcd(a: Int, b: Int): Int = if(b == 0) a else gcd(b, mod(a, b))
+println(gcd(48, 18))
+println(gcd(17, 5))
+
+val x = 7
+val y = 3
+println(x + y)
+println(x - y)
+println(x * y)
+println(x / y)
+println(mod(x, y))
+println(x > y)
+println(x < y)
+println(x >= 7)
+println(x <= 6)
+println(x == 7)
+println(x != y)

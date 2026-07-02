@@ -1,0 +1,21 @@
+// Cross-exec guarantee: hello world + string interpolation + string ops.
+// Output must be byte-identical whether this program is run by the
+// evaluator, a Linux-native binary, a cross-built Windows binary, or a
+// cross-built macOS binary.
+val name = "Klassic"
+val version = 4
+val greeting = "Hello, #{name} v#{version}!"
+println(greeting)
+println(toUpperCase(greeting))
+println(toLowerCase(greeting))
+println(length(greeting))
+println(substring(greeting, 0, 5))
+println(replaceAll(greeting, "l", "L"))
+println(reverse("klassic"))
+println(startsWith(greeting, "Hello"))
+println(endsWith(greeting, "!"))
+val parts = split("alpha,beta,gamma", ",")
+println(parts)
+println(parts.join("-"))
+println(trim("  padded  "))
+println("sum=#{1 + 2}, product=#{3 * 4}")

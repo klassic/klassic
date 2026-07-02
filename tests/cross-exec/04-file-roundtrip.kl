@@ -1,0 +1,16 @@
+// Cross-exec guarantee: FileOutput/FileInput round-trip using a
+// relative path in whatever cwd the runner gives us. Only booleans
+// and file content (never a path) are printed, and the file is
+// cleaned up at the end so repeated runs are idempotent.
+val path = "kl_cross_exec_roundtrip.txt"
+
+println(FileOutput#exists(path))
+FileOutput#write(path, "line one")
+println(FileOutput#exists(path))
+println(FileInput#all(path))
+
+FileOutput#append(path, "\nline two")
+println(FileInput#all(path))
+
+FileOutput#delete(path)
+println(FileOutput#exists(path))

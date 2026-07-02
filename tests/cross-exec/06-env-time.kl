@@ -1,0 +1,12 @@
+// Cross-exec guarantee: Environment / Time, reported only as
+// deterministic booleans. Never print raw env values or timestamps,
+// since those legitimately differ across OSes and CI runs.
+println(Environment#exists("PATH"))
+println(Environment#exists("KL_CROSS_EXEC_DEFINITELY_NOT_SET_XYZ_123"))
+
+println(Time#nowMillis() > 1700000000000)
+println(Time#nowMillis() > 0)
+
+val a = Time#nowMillis()
+val b = Time#nowMillis()
+println(b >= a)
