@@ -1,8 +1,12 @@
 # Native Compiler Coverage
 
 This document enumerates the language constructs the native compiler currently
-lowers to direct ELF for Linux x86_64, selectable as `linux-x86_64`,
-`x86_64-unknown-linux-gnu`, or `native` on a matching host. Anything not listed
+lowers to direct ELF for Linux x86_64 (selectable as `linux-x86_64`,
+`x86_64-unknown-linux-gnu`), PE64 for Windows x86_64 (selectable as
+`windows-x86_64`, `x86_64-pc-windows-msvc`), and direct Mach-O arm64 for macOS
+(selectable as `macos-aarch64`, `aarch64-apple-darwin`). On matching hosts, a
+target-less bare `klassic build` defaults to the host platform (i.e., `native`);
+Windows x86_64 hosts now use the direct PE64 backend. Anything not listed
 here fails at build time rather than falling back to the evaluator.
 
 ## Core Surface
@@ -584,7 +588,7 @@ lands. See `docs/roadmap-targets-stdlib.md` for the wider rationale.
 | `wasm32-wasi`                  | wasm module emitter    | wasm-module   | 2    | planned     |
 | `x86_64-apple-darwin`          | portable C backend     | executable    | 2    | planned     |
 | `aarch64-apple-darwin`         | direct Mach-O writer   | executable    | 1    | supported (small subset, growing) |
-| `x86_64-pc-windows-msvc`       | portable C backend     | executable    | 2    | planned     |
+| `x86_64-pc-windows-msvc`       | direct PE64 writer (reuses DirectX86_64 codegen) | executable | 0 | supported (core language: arithmetic, if/while, recursive def, strings, enums/match, records, lists, closures, GC) |
 
 Rules:
 
@@ -596,8 +600,39 @@ Rules:
   (`aarch64-apple-darwin`) is tier 1 and uses a direct Mach-O arm64 backend
   (svc #0x80), not the portable C backend.
 - Tier 2 targets reach the matrix through the portable runtime call
-  path / C backend. x86_64 macOS and Windows reach the matrix through the
-  portable C backend.
+  path / C backend. x86_64 macOS still reaches the matrix through the
+  portable C backend. `x86_64-pc-windows-msvc` is the one deliberate
+  exception below tier 2: it reuses the entire `DirectX86_64` (Linux)
+  code generator rather than going through the C backend or getting a
+  dedicated codegen module like aarch64 -- only the OS boundary
+  (syscalls -> Win64 `kernel32.dll` import-call shims) and the
+  container format (PE64, see `crates/klassic-native/src/pe.rs`)
+  differ. `TargetPlatform::syscall_number` still panics unconditionally
+  for the Windows target as a deliberate invariant tripwire, but as of
+  W1-b every native-codegen path that could reach it is gated first:
+  `sleep`, `stopwatch`, `Time#nowMillis` (`std.time`), `StandardInput#all`/
+  `StandardInput#lines` (`stdin()`/`stdinLines()`), the `FileOutput#`/
+  `FileInput#` family including `std.file` and the `println(FileInput#
+  all(...))`/`println(FileInput#lines(...))` print-fusion fast paths,
+  the `Dir#` family including `std.dir`, `Environment#vars`/`#get`/
+  `#exists` (`std.env`, and the `env()`/`getEnv()`/`hasEnv()` prelude
+  aliases), and `CommandLine#args` (`args()`, `std.cli`, `std.process`)
+  all fail to build for `x86_64-pc-windows-msvc` with a
+  `` `Feature` is not yet supported when targeting x86_64-pc-windows-msvc ``
+  diagnostic instead of reaching the panic. `Environment#*` and
+  `CommandLine#args` are gated even though they don't reach a syscall
+  at all, because their backing argv/envp slots are left zeroed on
+  Windows (see `emit_store_command_line_state`) and would otherwise
+  silently compile a binary that always observes empty arguments/
+  environment rather than failing to build. `thread { ... }` needs no
+  gate of its own -- a queued thread body is spliced into the tail of
+  `main` and compiled through the same per-builtin gates as any other
+  call site, so an OS-touching thread body is still caught, and a
+  thread body that stays inside the core language still builds.
+  Process spawning (`Process#run`/`nrun`) has no native-backend
+  implementation on any target yet, so there is nothing Windows-specific
+  to gate there. See `tests/cli_smoke.rs`'s
+  `build_target_windows_x86_64_gates_*` tests for the coverage.
 - An unsupported target must produce a `TargetSpec`-style diagnostic,
   not a panic.
 

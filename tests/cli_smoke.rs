@@ -27016,6 +27016,7 @@ fn build_without_target_produces_runnable_host_binary() {
 /// char-indexed substring/at, concat, equality, toString. The test
 /// compiles and links through the automatic cc path and compares
 /// against the evaluator's output.
+#[cfg(unix)]
 #[test]
 fn build_backend_c_strings_match_the_evaluator() {
     let cc_available = Command::new("cc")
@@ -27089,6 +27090,7 @@ fn build_backend_c_strings_match_the_evaluator() {
 /// runtime shim used `f64::to_string`, so a whole-number Double printed
 /// as `4` while the evaluator (and the direct native backend) printed
 /// `4.0`.
+#[cfg(unix)]
 #[test]
 fn build_backend_c_formats_doubles_like_evaluator() {
     let cc_available = Command::new("cc")
@@ -27164,6 +27166,7 @@ fn build_backend_c_formats_doubles_like_evaluator() {
 /// only on stdio/stdint; when a `cc` is available the test compiles
 /// and runs it and asserts evaluator-identical output. Unsupported
 /// constructs get source-located diagnostics.
+#[cfg(unix)]
 #[test]
 fn build_backend_c_emits_compilable_c() {
     let stamp = SystemTime::now()
@@ -28261,5 +28264,861 @@ fn process_run_captures_stdout_and_exit_codes() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "hello\n\n0\n-1\ntrue\n()\n"
+    );
+}
+
+/// The Windows target reuses the entire DirectX86_64 (Linux) codegen
+/// (see `NativeCodeGenerator::is_windows` in `klassic-native`) and
+/// only swaps the OS boundary and the container format, so this
+/// structurally validates the PE64 bytes `pe::write_executable`
+/// produces without executing them -- runs on any host, including
+/// Linux CI. Actual execution is asserted by the
+/// `target_os = "windows"`-gated tests below. Mirrors the core of
+/// report-pe-spec.md's section 7 validation checklist.
+#[test]
+fn build_target_windows_x86_64_emits_pe() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_{stamp}.exe"));
+    fs::write(&source_path, "println(\"hello windows\")\nprintln(7)\n")
+        .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let image = fs::read(&exe_path).expect("output should exist");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+
+    let u16_at = |offset: usize| u16::from_le_bytes(image[offset..offset + 2].try_into().unwrap());
+    let u32_at = |offset: usize| u32::from_le_bytes(image[offset..offset + 4].try_into().unwrap());
+    let u64_at = |offset: usize| u64::from_le_bytes(image[offset..offset + 8].try_into().unwrap());
+
+    // 1: MZ + e_lfanew -> "PE\0\0".
+    assert_eq!(&image[0..2], b"MZ");
+    let e_lfanew = u32_at(0x3c) as usize;
+    assert!(e_lfanew + 4 <= image.len());
+    assert_eq!(&image[e_lfanew..e_lfanew + 4], b"PE\0\0");
+
+    let coff = e_lfanew + 4;
+    // 2: COFF.Machine == IMAGE_FILE_MACHINE_AMD64.
+    assert_eq!(u16_at(coff), 0x8664);
+    let number_of_sections = u16_at(coff + 2) as usize;
+    let size_of_optional_header = u16_at(coff + 16);
+    let characteristics = u16_at(coff + 18);
+    // RELOCS_STRIPPED | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE.
+    assert_eq!(characteristics, 0x0023);
+
+    let opt = coff + 20;
+    // 4: PE32+ optional header magic (not PE32's 0x010b).
+    assert_eq!(u16_at(opt), 0x020b);
+    let number_of_rva_and_sizes = u32_at(opt + 108);
+    // 3, 5: header-size / data-directory-count consistency.
+    assert_eq!(number_of_rva_and_sizes, 16);
+    assert_eq!(
+        size_of_optional_header as u32,
+        112 + 8 * number_of_rva_and_sizes
+    );
+
+    let image_base = u64_at(opt + 24);
+    // 6: ImageBase 64 KiB aligned.
+    assert_eq!(image_base, 0x1_4000_0000);
+    assert_eq!(image_base % 0x10000, 0);
+
+    let section_alignment = u32_at(opt + 32) as u64;
+    let file_alignment = u32_at(opt + 36) as u64;
+    // 7: alignment sanity.
+    assert!(file_alignment.is_power_of_two() && file_alignment >= 0x200);
+    assert!(section_alignment.is_power_of_two() && section_alignment > file_alignment);
+
+    let size_of_image = u32_at(opt + 56) as u64;
+    let size_of_headers = u32_at(opt + 60) as u64;
+    let subsystem = u16_at(opt + 68);
+    // 20: console subsystem.
+    assert_eq!(subsystem, 3);
+
+    let entry_rva = u32_at(opt + 16) as u64;
+
+    let data_dir = opt + 112;
+    let import_dir_va = u32_at(data_dir + 8) as u64;
+    let import_dir_size = u32_at(data_dir + 12);
+    // 13: import data directory populated, sized for exactly one DLL
+    // descriptor plus its null terminator.
+    assert_ne!(import_dir_va, 0);
+    assert_ne!(import_dir_size, 0);
+    assert_eq!(import_dir_size % 20, 0);
+    assert_eq!(import_dir_size, 40);
+    // IAT data directory (index 12) is deliberately left {0,0}.
+    assert_eq!(u32_at(data_dir + 12 * 8), 0);
+    assert_eq!(u32_at(data_dir + 12 * 8 + 4), 0);
+
+    let section_table = opt + size_of_optional_header as usize;
+    struct Section {
+        va: u64,
+        virtual_size: u64,
+        raw_size: u64,
+        raw_ptr: u64,
+        characteristics: u32,
+    }
+    let mut sections = Vec::new();
+    for i in 0..number_of_sections {
+        let off = section_table + i * 40;
+        sections.push(Section {
+            virtual_size: u32_at(off + 8) as u64,
+            va: u32_at(off + 12) as u64,
+            raw_size: u32_at(off + 16) as u64,
+            raw_ptr: u32_at(off + 20) as u64,
+            characteristics: u32_at(off + 36),
+        });
+    }
+    assert_eq!(sections.len(), 3);
+
+    // 8, 9: every section's VA/PointerToRawData aligned, sections
+    // ascending and non-overlapping.
+    for (i, section) in sections.iter().enumerate() {
+        assert_eq!(
+            section.va % section_alignment,
+            0,
+            "section {i} VA misaligned"
+        );
+        assert_eq!(
+            section.raw_ptr % file_alignment,
+            0,
+            "section {i} PointerToRawData misaligned"
+        );
+        if i > 0 {
+            let previous = &sections[i - 1];
+            let previous_end = previous.va + align_up(previous.virtual_size, section_alignment);
+            assert!(
+                previous_end <= section.va,
+                "sections must be ascending and non-overlapping"
+            );
+        }
+    }
+
+    // 10: SizeOfImage exactly covers the last section.
+    let last = sections.last().expect("at least one section");
+    assert_eq!(
+        size_of_image,
+        align_up(last.va + last.virtual_size, section_alignment)
+    );
+
+    // 11: headers sized/aligned correctly and don't overlap the first
+    // section's raw data; first section starts at RVA
+    // `section_alignment` since headers are far smaller than one unit.
+    assert_eq!(size_of_headers % file_alignment, 0);
+    assert!(size_of_headers <= sections[0].raw_ptr);
+    assert_eq!(sections[0].va, section_alignment);
+
+    // 12: entry point lands inside an executable section.
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    let entry_section = sections
+        .iter()
+        .find(|s| entry_rva >= s.va && entry_rva < s.va + s.virtual_size)
+        .expect("entry point should be inside a section");
+    assert_ne!(entry_section.characteristics & IMAGE_SCN_MEM_EXECUTE, 0);
+
+    // 15-17: import directory descriptor, ILT/IAT, and hint/name
+    // entries resolve to valid in-bounds, readable data.
+    let rva_to_file_offset = |rva: u64| -> Option<usize> {
+        sections.iter().find_map(|s| {
+            if rva >= s.va && rva < s.va + s.virtual_size {
+                Some((s.raw_ptr + (rva - s.va)) as usize)
+            } else {
+                None
+            }
+        })
+    };
+    let descriptor_off = rva_to_file_offset(import_dir_va).expect("import dir should be mapped");
+    let original_first_thunk = u32_at(descriptor_off) as u64;
+    let name_rva = u32_at(descriptor_off + 12) as u64;
+    let first_thunk = u32_at(descriptor_off + 16) as u64;
+    // 14: the descriptor at the end of the sized array is the
+    // all-zero terminator.
+    let terminator_off =
+        rva_to_file_offset(import_dir_va).unwrap() + (import_dir_size as usize - 20);
+    assert_eq!(&image[terminator_off..terminator_off + 20], &[0u8; 20]);
+
+    let name_off = rva_to_file_offset(name_rva).expect("DLL name should be mapped");
+    let nul = image[name_off..].iter().position(|&b| b == 0).unwrap();
+    assert_eq!(&image[name_off..name_off + nul], b"KERNEL32.DLL");
+
+    assert_ne!(original_first_thunk, 0);
+    assert_ne!(first_thunk, 0);
+    let ilt_off = rva_to_file_offset(original_first_thunk).expect("ILT should be mapped");
+    let iat_off = rva_to_file_offset(first_thunk).expect("IAT should be mapped");
+    let mut ilt_names = Vec::new();
+    let mut iat_names = Vec::new();
+    for (table_off, names) in [(ilt_off, &mut ilt_names), (iat_off, &mut iat_names)] {
+        let mut i = 0;
+        loop {
+            let thunk = u64_at(table_off + i * 8);
+            if thunk == 0 {
+                break;
+            }
+            // 17: non-ordinal (bit 63 clear), hint/name RVA in bounds.
+            assert_eq!(thunk >> 63, 0);
+            let hint_name_off = rva_to_file_offset(thunk).expect("hint/name should be mapped");
+            let name_start = hint_name_off + 2; // skip the WORD hint
+            let name_end = image[name_start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|len| name_start + len)
+                .expect("hint/name entry should be NUL-terminated");
+            names.push(String::from_utf8_lossy(&image[name_start..name_end]).into_owned());
+            i += 1;
+        }
+    }
+    // 16: ILT and IAT agree on count and order.
+    assert_eq!(ilt_names, iat_names);
+    assert_eq!(
+        ilt_names,
+        vec!["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc"]
+    );
+
+    // 19: RELOCS_STRIPPED implies no .reloc / DYNAMIC_BASE.
+    assert_eq!(u32_at(data_dir + 5 * 8), 0);
+    assert_eq!(u32_at(data_dir + 5 * 8 + 4), 0);
+    let dll_characteristics = u16_at(opt + 70);
+    assert_eq!(dll_characteristics & 0x0040, 0);
+
+    // 21: the file is not truncated.
+    let last_end = last.raw_ptr + last.raw_size;
+    assert!(image.len() as u64 >= size_of_headers);
+    assert!(image.len() as u64 >= last_end);
+}
+
+fn align_up(value: u64, alignment: u64) -> u64 {
+    value.div_ceil(alignment) * alignment
+}
+
+/// Shared middle-end regression guard for the Windows target, mirrored
+/// on `build_target_aarch64_apple_darwin_enum_cross_build`: runs on
+/// any host (including fast Linux CI) and exercises the constructs
+/// most likely to leak a shared-pass artifact the Windows codegen
+/// path doesn't understand (see the aarch64
+/// `__enum_shape_named`/`__enum_shape_hint` incident this pattern was
+/// modeled on) -- Int/Bool/String arithmetic, if/while, an annotated
+/// recursive def, string concat/interpolation, enum+match, records,
+/// and lists.
+#[test]
+fn build_target_windows_x86_64_cross_build_core_language() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_core_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_core_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "def fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)\n\
+         val a = 3\n\
+         val b = 4\n\
+         println(a + b)\n\
+         println(a < b)\n\
+         mutable i = 0\n\
+         mutable total = 0\n\
+         while (i < 5) {\n\
+           total = total + i\n\
+           i = i + 1\n\
+         }\n\
+         println(total)\n\
+         println(fib(10))\n\
+         val name = \"Klassic\"\n\
+         println(\"hi \" + name + \"!\")\n\
+         println(\"len=#{name.length()}\")\n\
+         enum Shape { case Circle(radius: Int); case Square(side: Int) }\n\
+         def area(s: Shape): Int = s match { case Circle(r) => 3 * r * r; case Square(side) => side * side }\n\
+         println(area(Circle(2)))\n\
+         println(area(Square(3)))\n\
+         record Point { x: Int; y: Int }\n\
+         val p = #Point(1, 2)\n\
+         println(p.x + p.y)\n\
+         val xs = [1 2 3 4 5]\n\
+         println(xs.size())\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        build_output.status.success(),
+        "windows core-language cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
+/// Executes the generated `.exe` directly (this test only compiles
+/// and runs on a Windows CI host -- there is no WSL2-style interop
+/// path on `cfg(target_os = "windows")` runners, `Command::output`
+/// launches it natively) and asserts its stdout matches the
+/// evaluator's output byte-for-byte, mirroring
+/// `build_target_aarch64_apple_darwin_binary_runs`.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_hello_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_hello_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_hello_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "println(\"hello from klassic on windows\")\nprintln(42)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "hello from klassic on windows\n42\n"
+    );
+}
+
+/// Recursive `def` and deep call depth on the Windows target: fib(20)
+/// asserted against the well-known value (also matches the
+/// evaluator).
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_fib_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_fib_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_fib_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "def fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)\nprintln(fib(20))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows fib build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "6765\n");
+}
+
+/// Monomorphic enum construction + `match` on the Windows target,
+/// asserted against the evaluator's output -- the same construct the
+/// aarch64 shared-middle-end incident (see
+/// `build_target_aarch64_apple_darwin_enum_cross_build`) was about.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_enum_match_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_enum_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_enum_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "enum Shape { case Circle(radius: Int); case Square(side: Int) }\n\
+         def area(s: Shape): Int = s match { case Circle(r) => 3 * r * r; case Square(side) => side * side }\n\
+         println(area(Circle(2)))\n\
+         println(area(Square(3)))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows enum build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "12\n9\n");
+}
+
+/// Shared assertion for W1-b Windows-target gating (slice after
+/// W1-a's `x86_64-pc-windows-msvc` PE64 backend landed): cross-builds
+/// `source` for the Windows target and asserts the build fails with a
+/// clean, span-aware diagnostic containing `expected_diagnostic`
+/// rather than panicking. Every not-yet-Windows-gated syscall path in
+/// `klassic-native` reaches `TargetPlatform::syscall_number`'s
+/// deliberate `panic!` tripwire (see that method's doc comment in
+/// `crates/klassic-native/src/lib.rs`), so asserting the absence of
+/// "internal error" / "panicked" here is what actually distinguishes
+/// a real gate from an unguarded path that happened to hit a
+/// different early error first. Runs on any host (including Linux
+/// CI): building for the Windows target never requires executing the
+/// result.
+fn assert_windows_target_gate(unique_tag: &str, source: &str, expected_diagnostic: &str) {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_gate_{unique_tag}_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_gate_{unique_tag}_{stamp}.exe"));
+    fs::write(&source_path, source).expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    let stderr = String::from_utf8_lossy(&build_output.stderr);
+    assert!(
+        !build_output.status.success(),
+        "windows build of gated feature ({unique_tag}) should fail to build\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&build_output.stdout)
+    );
+    assert!(
+        !stderr.contains("internal error") && !stderr.contains("panicked"),
+        "windows build of gated feature ({unique_tag}) must fail with a clean diagnostic, not a panic\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(expected_diagnostic),
+        "windows build of gated feature ({unique_tag}) should mention {expected_diagnostic:?}\nstderr:\n{stderr}"
+    );
+}
+
+/// `sleep` reaches the `Nanosleep` syscall (`compile_sleep`) and has
+/// no Win64 shim, so it must be gated rather than panic.
+#[test]
+fn build_target_windows_x86_64_gates_sleep() {
+    assert_windows_target_gate(
+        "sleep",
+        "sleep(0)\nprintln(\"unreachable\")\n",
+        "`sleep` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `stopwatch` and `Time#nowMillis` both reach the `ClockGettime`
+/// syscall (`compile_stopwatch` / `compile_time_now_millis`) and have
+/// no Win64 shim.
+#[test]
+fn build_target_windows_x86_64_gates_time() {
+    assert_windows_target_gate(
+        "time_stopwatch",
+        "val e = stopwatch(() => 1)\nprintln(e)\n",
+        "`stopwatch` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "time_now_millis",
+        "println(Time#nowMillis())\n",
+        "`Time#nowMillis` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `StandardInput#all` / `StandardInput#lines` (and their `stdin()` /
+/// `stdinLines()` aliases) reach the `Read` syscall
+/// (`emit_standard_input_to_runtime_string`) and have no Win64 shim.
+#[test]
+fn build_target_windows_x86_64_gates_stdin() {
+    assert_windows_target_gate(
+        "stdin_all",
+        "println(StandardInput#all())\n",
+        "`StandardInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "stdin_lines",
+        "println(StandardInput#lines())\n",
+        "`StandardInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `std.file` / `FileOutput#` / `FileInput#` reach `Open`/`Read`/
+/// `Write`/`Close`/`Unlink` (`emit_file_write*`,
+/// `emit_file_read_to_runtime_string*`, `emit_file_delete*`), none of
+/// which have a Win64 shim beyond the stdout/stderr-only `win_write`
+/// (which the file-write helpers reuse for the *shape* of the call
+/// but which would resolve to the wrong handle for a real file
+/// descriptor, so the whole operation is gated instead of only the
+/// `Open`/`Close` bookends). Also covers the `println(FileInput#all
+/// (...))` / `println(FileInput#lines(...))` /
+/// `println(FileInput#open(path, s => s.readLines()))` print-fusion
+/// fast paths in `emit_print_expr_fragment`, which stream straight to
+/// the target fd and would otherwise bypass the
+/// `compile_file_input_all` / `compile_file_input_lines` gates.
+#[test]
+fn build_target_windows_x86_64_gates_file() {
+    assert_windows_target_gate(
+        "file_write",
+        "FileOutput#write(\"a.txt\", \"hi\")\n",
+        "`FileOutput#write` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_append",
+        "FileOutput#append(\"a.txt\", \"hi\")\n",
+        "`FileOutput#append` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_write_lines",
+        "FileOutput#writeLines(\"a.txt\", [\"x\"])\n",
+        "`FileOutput#writeLines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_exists",
+        "println(FileOutput#exists(\"a.txt\"))\n",
+        "`FileOutput#exists` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_delete",
+        "FileOutput#delete(\"a.txt\")\n",
+        "`FileOutput#delete` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_all",
+        "println(FileInput#all(\"Cargo.toml\"))\n",
+        "`FileInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_read_all",
+        "println(FileInput#readAll(\"Cargo.toml\"))\n",
+        "`FileInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_lines",
+        "println(FileInput#lines(\"Cargo.toml\"))\n",
+        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_read_lines",
+        "println(FileInput#readLines(\"Cargo.toml\"))\n",
+        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    // Print-fusion fast paths in `emit_print_expr_fragment` that
+    // bypass the plain `FileInput#all`/`FileInput#lines` call
+    // dispatch entirely -- these must be independently confirmed
+    // gated, not just the plain-call form above.
+    assert_windows_target_gate(
+        "file_input_all_print_fusion",
+        "println(FileInput#all(\"Cargo.toml\"))\n",
+        "`FileInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_lines_print_fusion",
+        "println(FileInput#lines(\"Cargo.toml\"))\n",
+        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_open_print_fusion",
+        "println(FileInput#open(\"Cargo.toml\", (stream) => FileInput#readLines(stream)))\n",
+        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `std.dir` / `Dir#*` reach `Getcwd`/`Access`/`Newfstatat`/`Mkdir`/
+/// `Rmdir`/`Rename`/`Open`/`Getdents64`/`Close`/`Sendfile` (or, for
+/// `home`/`temp`, the argv/envp startup slots W1-a leaves zeroed on
+/// Windows -- see `emit_store_command_line_state` -- which would
+/// otherwise silently return `"/tmp"` for `Dir#temp` or a spurious
+/// "not set" runtime error for `Dir#home` instead of a compile-time
+/// diagnostic), none of which have a Win64 shim.
+#[test]
+fn build_target_windows_x86_64_gates_dir() {
+    assert_windows_target_gate(
+        "dir_current",
+        "println(Dir#current())\n",
+        "`Dir#current` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_home",
+        "println(Dir#home())\n",
+        "`Dir#home` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_temp",
+        "println(Dir#temp())\n",
+        "`Dir#temp` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_exists",
+        "println(Dir#exists(\"src\"))\n",
+        "`Dir#exists` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_is_directory",
+        "println(Dir#isDirectory(\"src\"))\n",
+        "`Dir#isDirectory` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_is_file",
+        "println(Dir#isFile(\"Cargo.toml\"))\n",
+        "`Dir#isFile` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_mkdir",
+        "Dir#mkdir(\"newdir\")\n",
+        "`Dir#mkdir` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_mkdirs",
+        "Dir#mkdirs(\"a/b/c\")\n",
+        "`Dir#mkdirs` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_list",
+        "println(Dir#list(\"src\"))\n",
+        "`Dir#list` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_list_full",
+        "println(Dir#listFull(\"src\"))\n",
+        "`Dir#listFull` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_delete",
+        "Dir#delete(\"newdir\")\n",
+        "`Dir#delete` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_copy",
+        "Dir#copy(\"a.txt\", \"b.txt\")\n",
+        "`Dir#copy` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_move",
+        "Dir#move(\"a.txt\", \"b.txt\")\n",
+        "`Dir#move` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `Environment#vars` / `Environment#get` / `Environment#exists` (and
+/// the `env()` / `getEnv()` / `hasEnv()` prelude aliases, plus
+/// `std.env`) all walk the `environment_base` linked block that W1-a
+/// leaves zeroed on Windows (see `emit_store_command_line_state`) --
+/// unlike the syscall-backed families above, an ungated build of
+/// these would not panic at all, it would silently compile a binary
+/// where `Environment#vars()` is always `[]`, `Environment#exists`
+/// is always `false`, and `Environment#get` always raises the
+/// "missing environment variable" runtime error, so this is the
+/// "produces wrong results without syscalls" case called out
+/// alongside `CommandLine#args` below.
+#[test]
+fn build_target_windows_x86_64_gates_environment() {
+    assert_windows_target_gate(
+        "env_vars",
+        "println(Environment#vars())\n",
+        "`Environment#vars` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "env_get",
+        "println(Environment#get(\"PATH\"))\n",
+        "`Environment#get` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "env_exists",
+        "println(Environment#exists(\"PATH\"))\n",
+        "`Environment#exists` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `CommandLine#args` (and the `args()` prelude alias, plus
+/// `std.process.args`/`std.cli`) walks the argc/argv1 startup slots
+/// W1-a leaves zeroed on Windows (see
+/// `emit_store_command_line_state`), so an ungated build would
+/// silently compile a binary where `CommandLine#args()` is always
+/// `[]` instead of failing to build.
+#[test]
+fn build_target_windows_x86_64_gates_command_line_args() {
+    assert_windows_target_gate(
+        "command_line_args",
+        "println(CommandLine#args())\n",
+        "`CommandLine#args` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `thread { ... }` (`compile_thread`/`emit_queued_threads`) itself
+/// never reaches a syscall: unlike a real OS thread, a queued
+/// `thread` body is compiled straight into the tail of `main` and run
+/// serially before exit, so it needs no per-target gate of its own --
+/// confirmed here by asserting a `thread` body that touches no OS
+/// feature builds successfully for Windows. A `thread` body that
+/// *does* use a gated feature is caught transitively through that
+/// feature's own gate, confirmed by the second half of this test
+/// (`emit_queued_threads` calls `compile_expr` on the body, which
+/// dispatches through the same gated `compile_file_output_write` as
+/// any other call site).
+#[test]
+fn build_target_windows_x86_64_thread_gate_is_transitive() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_thread_ok_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_thread_ok_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "mutable x = 1\nthread(() => { x = x + 1 })\nprintln(x)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        build_output.status.success(),
+        "a thread body touching no OS feature should build for windows\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    assert_windows_target_gate(
+        "thread_file_io",
+        "thread(() => { FileOutput#write(\"a.txt\", \"hi\") })\n",
+        "`FileOutput#write` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// Positive control for every gate above: importing a `std.*` module
+/// and calling only its pure helpers (no OS feature) must still build
+/// for Windows. `std.time`'s `formatIso`/`durationMillis` operate on
+/// an already-materialized epoch-millis integer and never call
+/// `Time#nowMillis` themselves, so this is a real "import without
+/// use" case rather than a trivially-empty program (`std.cli`'s
+/// otherwise-equally-pure `flag`/`option`/`positionals` were tried
+/// here first, but they hit an unrelated pre-existing native-compiler
+/// limitation -- "native recursive function requiring call-site
+/// inlining is not supported" -- on every target, including Linux, so
+/// they are not a usable positive control).
+#[test]
+fn build_target_windows_x86_64_pure_stdlib_use_is_not_gated() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_pure_stdlib_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_pure_stdlib_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "import std.time\nprintln(formatIso(0))\nprintln(durationMillis(100, 250))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        build_output.status.success(),
+        "std.cli pure-helper use should build for windows without tripping any OS-feature gate\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
     );
 }
