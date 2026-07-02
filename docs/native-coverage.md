@@ -608,23 +608,38 @@ Rules:
   (syscalls -> Win64 `kernel32.dll` import-call shims) and the
   container format (PE64, see `crates/klassic-native/src/pe.rs`)
   differ. `TargetPlatform::syscall_number` still panics unconditionally
+  for the Windows target as a deliberate invariant tripwire, but every
+  native-codegen path that could reach it is gated first unless it has
+  its own Win64 shim. `sleep`, `stopwatch`, and `Time#nowMillis`
+  (`std.time`) are no longer gated (W1-c): `sleep` wraps `Sleep` and
+  `Time#nowMillis` wraps `GetSystemTimeAsFileTime` (converting its
+  100ns-tick FILETIME output to unix epoch millis with the well-known
+  `116_444_736_000_000_000` 1601/1970 epoch offset), while `stopwatch`
+  snapshots `QueryPerformanceCounter` before and after the timed body
+  and divides the tick delta by `QueryPerformanceFrequency` to get
+  elapsed milliseconds -- see `emit_win_sleep_runtime`,
+  `emit_win_time_now_millis_runtime`, `emit_win_qpc_runtime`,
+  `emit_win_qpf_runtime`, and `emit_win_elapsed_millis_qpc` in
+  `crates/klassic-native/src/lib.rs`. The remaining gated paths --
+  `StandardInput#all`/`StandardInput#lines` (`stdin()`/`stdinLines()`),
+  the `FileOutput#`/`FileInput#` family including `std.file` and the
+  `println(FileInput#all(...))`/`println(FileInput#lines(...))`
+  print-fusion fast paths, the `Dir#` family including `std.dir`,
+  `Environment#vars`/`#get`/`#exists` (`std.env`, and the `env()`/
+  `getEnv()`/`hasEnv()` prelude aliases), and `CommandLine#args`
+  (`args()`, `std.cli`, `std.process`) -- all fail to build for
+  `x86_64-pc-windows-msvc` with a
   for the Windows target as a deliberate invariant tripwire, but as of
-  W1-b every native-codegen path that could reach it is gated first:
-  `sleep`, `stopwatch`, `Time#nowMillis` (`std.time`), `StandardInput#all`/
-  `StandardInput#lines` (`stdin()`/`stdinLines()`), the `FileOutput#`/
-  `FileInput#` family including `std.file` and the `println(FileInput#
-  all(...))`/`println(FileInput#lines(...))` print-fusion fast paths,
-  the `Dir#` family including `std.dir`, `Environment#vars`/`#get`/
-  `#exists` (`std.env`, and the `env()`/`getEnv()`/`hasEnv()` prelude
-  aliases), and `CommandLine#args` (`args()`, `std.cli`, `std.process`)
-  all fail to build for `x86_64-pc-windows-msvc` with a
+  W1-b every native-codegen path that could reach it was gated first;
+  since then, two of those families have been un-gated with real Win64
+  shim implementations instead (see below). `sleep`, `stopwatch`,
+  `Time#nowMillis` (`std.time`), `StandardInput#all`/`StandardInput#lines`
+  (`stdin()`/`stdinLines()`), and most of the `Dir#` family (`current`/
+  `temp`/`exists`/`isDirectory`/`isFile`/`mkdir`/`mkdirs`/`list`/
+  `listFull`/`delete`/`copy`/`move`, including `std.dir`) still fail to
+  build for `x86_64-pc-windows-msvc` with a
   `` `Feature` is not yet supported when targeting x86_64-pc-windows-msvc ``
-  diagnostic instead of reaching the panic. `Environment#*` and
-  `CommandLine#args` are gated even though they don't reach a syscall
-  at all, because their backing argv/envp slots are left zeroed on
-  Windows (see `emit_store_command_line_state`) and would otherwise
-  silently compile a binary that always observes empty arguments/
-  environment rather than failing to build. `thread { ... }` needs no
+  diagnostic instead of reaching the panic. `thread { ... }` needs no
   gate of its own -- a queued thread body is spliced into the tail of
   `main` and compiled through the same per-builtin gates as any other
   call site, so an OS-touching thread body is still caught, and a
@@ -632,7 +647,35 @@ Rules:
   Process spawning (`Process#run`/`nrun`) has no native-backend
   implementation on any target yet, so there is nothing Windows-specific
   to gate there. See `tests/cli_smoke.rs`'s
-  `build_target_windows_x86_64_gates_*` tests for the coverage.
+  `build_target_windows_x86_64_gates_*` tests for the still-gated
+  coverage and `build_target_windows_x86_64_supports_*` /
+  `build_target_windows_x86_64_sleep_and_stopwatch_run` /
+  `build_target_windows_x86_64_time_now_millis_runs` /
+  `build_target_windows_x86_64_format_iso_of_now_millis_runs` for the
+  sleep/stopwatch/time coverage.
+  coverage and `build_target_windows_x86_64_supports_*` for the
+  now-supported coverage.
+
+  `Environment#vars`/`#get`/`#exists` (`std.env`, and the `env()`/
+  `getEnv()`/`hasEnv()` prelude aliases), `CommandLine#args` (`args()`,
+  `std.cli`, `std.process`), and `Dir#home` no longer reach that
+  syscall-tripwire gate: `emit_store_command_line_state`'s Windows
+  branch now synthesizes the Linux `argv`/`envp` slot layout at startup
+  from `GetCommandLineA` (hand-tokenized) and `GetEnvironmentStringsA`
+  (walked into a synthesized pointer array) instead of leaving those
+  slots zeroed, so the existing envp-scan/argv-walk consumers work
+  unmodified (`Dir#home` reuses the same envp scan, keyed on
+  `USERPROFILE` instead of `HOME`). The whole `FileOutput#`/`FileInput#`
+  family (`write`/`append`/`writeLines`/`exists`/`delete`,
+  `all`/`readAll`/`lines`/`readLines`, `std.file`, and the
+  `println(FileInput#all(...))`/`println(FileInput#lines(...))`
+  print-fusion fast paths) is also un-gated: their `Open`/`Read`/
+  `Write`/`Close`/`Unlink`/`Access` syscall sites now branch to new
+  `CreateFileA`/`ReadFile`/`WriteFile`/`CloseHandle`/`DeleteFileA`/
+  `GetFileAttributesA`-backed Win64 shims. Both un-gated slices use only
+  the kernel32 "A" (ANSI) functions, reusing the existing UTF-8
+  path-staging code as-is, so non-ASCII paths and environment
+  values/keys are unsupported (best-effort/undefined) on this target.
 - An unsupported target must produce a `TargetSpec`-style diagnostic,
   not a panic.
 

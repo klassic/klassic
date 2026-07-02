@@ -28487,9 +28487,47 @@ fn build_target_windows_x86_64_emits_pe() {
     }
     // 16: ILT and IAT agree on count and order.
     assert_eq!(ilt_names, iat_names);
+    // The import table is built generically over the full
+    // `ImportSymbol::ALL` list (see `pe.rs`), not filtered by what a
+    // given program actually calls, so this list grows every time a
+    // new kernel32 import is added -- currently the base shims
+    // (GetStdHandle/WriteFile/ExitProcess/VirtualAlloc) plus the
+    // Slice 2 directory-operation imports
+    // (CreateDirectoryA/RemoveDirectoryA/MoveFileExA/CopyFileA/
+    // GetCurrentDirectoryA/GetTempPathA/GetFileAttributesA/
+    // GetLastError), plus GetEnvironmentVariableA (backs the
+    // case-insensitive single-key `Environment#get`/`#exists`/
+    // `Dir#home` lookup; see `emit_win_get_env_var_runtime`).
     assert_eq!(
         ilt_names,
-        vec!["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc"]
+        vec![
+            "GetStdHandle",
+            "WriteFile",
+            "ExitProcess",
+            "VirtualAlloc",
+            "GetSystemTimeAsFileTime",
+            "Sleep",
+            "QueryPerformanceCounter",
+            "QueryPerformanceFrequency",
+            "CreateDirectoryA",
+            "RemoveDirectoryA",
+            "MoveFileExA",
+            "CopyFileA",
+            "GetCurrentDirectoryA",
+            "GetTempPathA",
+            "GetFileAttributesA",
+            "GetLastError",
+            "ReadFile",
+            "FindFirstFileA",
+            "FindNextFileA",
+            "FindClose",
+            "GetCommandLineA",
+            "GetEnvironmentStringsA",
+            "CreateFileA",
+            "CloseHandle",
+            "DeleteFileA",
+            "GetEnvironmentVariableA",
+        ]
     );
 
     // 19: RELOCS_STRIPPED implies no .reloc / DYNAMIC_BASE.
@@ -28729,28 +28767,497 @@ fn build_target_windows_x86_64_enum_match_runs() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "12\n9\n");
 }
 
-/// Shared assertion for W1-b Windows-target gating (slice after
-/// W1-a's `x86_64-pc-windows-msvc` PE64 backend landed): cross-builds
-/// `source` for the Windows target and asserts the build fails with a
-/// clean, span-aware diagnostic containing `expected_diagnostic`
-/// rather than panicking. Every not-yet-Windows-gated syscall path in
-/// `klassic-native` reaches `TargetPlatform::syscall_number`'s
-/// deliberate `panic!` tripwire (see that method's doc comment in
-/// `crates/klassic-native/src/lib.rs`), so asserting the absence of
-/// "internal error" / "panicked" here is what actually distinguishes
-/// a real gate from an unguarded path that happened to hit a
-/// different early error first. Runs on any host (including Linux
-/// CI): building for the Windows target never requires executing the
-/// result.
-fn assert_windows_target_gate(unique_tag: &str, source: &str, expected_diagnostic: &str) {
+/// Cross-build-only positive counterpart to `assert_windows_target_gate`:
+/// asserts `source` builds successfully for the Windows target (no
+/// execution, so this runs on any host including Linux CI). Used by
+/// the `build_target_windows_x86_64_supports_*` tests below, which
+/// replaced the `_gates_*` tests for builtins that used to hit the
+/// W1-b gate and now have a Win64 shim.
+fn assert_windows_target_builds(unique_tag: &str, source: &str) {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
         .as_nanos();
     let dir = std::env::temp_dir();
-    let source_path = dir.join(format!("klassic_pe_gate_{unique_tag}_{stamp}.kl"));
-    let exe_path = dir.join(format!("klassic_pe_gate_{unique_tag}_{stamp}.exe"));
+    let source_path = dir.join(format!("klassic_pe_supports_{unique_tag}_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_supports_{unique_tag}_{stamp}.exe"));
     fs::write(&source_path, source).expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let stderr = String::from_utf8_lossy(&build_output.stderr);
+    assert!(
+        build_output.status.success(),
+        "windows build of {unique_tag} should succeed\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&build_output.stdout)
+    );
+    assert!(
+        exe_path.exists(),
+        "windows build of {unique_tag} should produce a PE64 file at {exe_path:?}"
+    );
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+}
+
+/// `sleep` now has a Win64 shim (`emit_win_sleep_runtime`, wrapping
+/// `Sleep`) instead of hitting the W1-b gate. See
+/// `build_target_windows_x86_64_sleep_and_stopwatch_run` for an
+/// execution-level check.
+#[test]
+fn build_target_windows_x86_64_supports_sleep() {
+    assert_windows_target_builds("sleep", "sleep(0)\nprintln(\"done\")\n");
+}
+
+/// `stopwatch` and `Time#nowMillis` both now have Win64 shims
+/// (`emit_win_qpc_runtime`/`emit_win_qpf_runtime`, wrapping
+/// `QueryPerformanceCounter`/`QueryPerformanceFrequency`, and
+/// `emit_win_time_now_millis_runtime`, wrapping
+/// `GetSystemTimeAsFileTime`) instead of hitting the W1-b gate. See
+/// `build_target_windows_x86_64_sleep_and_stopwatch_run` and
+/// `build_target_windows_x86_64_time_now_millis_runs` for
+/// execution-level checks.
+#[test]
+fn build_target_windows_x86_64_supports_time() {
+    assert_windows_target_builds("time_stopwatch", "val e = stopwatch(() => 1)\nprintln(e)\n");
+    assert_windows_target_builds("time_now_millis", "println(Time#nowMillis())\n");
+}
+
+/// Executes `Time#nowMillis()` on the Windows target and asserts the
+/// result is a plausible current UNIX-epoch-millis value, matching the
+/// evaluator's `SystemTime::now().duration_since(UNIX_EPOCH)` semantics
+/// (see `emit_win_time_now_millis_runtime`'s doc comment for the
+/// FILETIME-to-unix-millis conversion this checks end to end).
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_time_now_millis_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_now_millis_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_now_millis_{stamp}.exe"));
+    fs::write(&source_path, "println(Time#nowMillis())\n").expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows Time#nowMillis build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    let millis: i64 = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .parse()
+        .expect("Time#nowMillis output should be an integer");
+    // 2023-11-14 .. 2065-01-24, a generous plausibility window that
+    // won't need touching for decades.
+    assert!(
+        millis > 1_700_000_000_000 && millis < 3_000_000_000_000,
+        "Time#nowMillis returned an implausible value: {millis}"
+    );
+}
+
+/// Executes `sleep` and a `stopwatch`-wrapped `sleep` on the Windows
+/// target: `sleep(200)` should observe roughly 200ms of Win64 `Sleep`
+/// wall-clock delay, and the `stopwatch` (`QueryPerformanceCounter`/
+/// `QueryPerformanceFrequency`-based, see `emit_win_elapsed_millis_qpc`)
+/// should report an elapsed duration in the same ballpark, mirroring
+/// the evaluator's `Instant::now()`-based `stopwatch` semantics.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_sleep_and_stopwatch_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_sleep_stopwatch_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_sleep_stopwatch_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "val e = stopwatch(() => { sleep(200) })\nprintln(e)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows sleep/stopwatch build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let wall_clock_start = std::time::Instant::now();
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let wall_clock_elapsed = wall_clock_start.elapsed();
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    // The wall clock around the whole process (Sleep(200) plus process
+    // startup/teardown) should be at least the requested delay -- a
+    // loose lower bound that tolerates scheduler slack without being
+    // able to pass trivially.
+    assert!(
+        wall_clock_elapsed.as_millis() >= 150,
+        "process wall-clock time ({:?}) should be at least ~200ms given sleep(200)",
+        wall_clock_elapsed
+    );
+    let stopwatch_millis: i64 = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .parse()
+        .expect("stopwatch output should be an integer");
+    assert!(
+        (150..5000).contains(&stopwatch_millis),
+        "stopwatch around sleep(200) reported an implausible duration: {stopwatch_millis}"
+    );
+}
+
+/// `std.time`'s `formatIso` is a pure function over an already
+/// materialized epoch-millis integer (see
+/// `build_target_windows_x86_64_pure_stdlib_use_is_not_gated`), so
+/// feeding it `Time#nowMillis()`'s Windows-native result should format
+/// a normal current-era ISO-8601 UTC timestamp, exercising the
+/// Windows `Time#nowMillis` shim and the shared pure-stdlib codegen
+/// path together end to end.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_format_iso_of_now_millis_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_format_iso_now_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_format_iso_now_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "import std.time\nprintln(formatIso(nowMillis()))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows formatIso(nowMillis()) build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        stdout.starts_with("20") && stdout.contains('T') && stdout.ends_with('Z'),
+        "formatIso(nowMillis()) should render a current-era ISO-8601 UTC timestamp, got {stdout:?}"
+    );
+}
+
+/// `StandardInput#all` / `StandardInput#lines` (and their `stdin()` /
+/// `stdinLines()` aliases) reach the `Read` syscall
+/// (`emit_standard_input_to_runtime_string`), which now has a Win64
+/// shim (`win_read_stdin`, wrapping `ReadFile` against the handle
+/// `win_init` caches via `GetStdHandle(STD_INPUT_HANDLE)`), so the
+/// cross-build must succeed instead of being gated.
+#[test]
+fn build_target_windows_x86_64_supports_stdin() {
+    assert_windows_target_builds("stdin_all", "println(StandardInput#all())\n");
+    assert_windows_target_builds("stdin_lines", "println(StandardInput#lines())\n");
+}
+
+/// Real-Windows execution counterpart to
+/// `build_target_windows_x86_64_supports_stdin`: pipes bytes into the
+/// generated PE64's stdin and asserts `StandardInput#all` reads them
+/// back through `win_read_stdin` (`ReadFile` against the
+/// `win_init`-cached `GetStdHandle(STD_INPUT_HANDLE)` handle), mirroring
+/// `builds_native_executable_for_standard_input_all`'s Linux coverage.
+/// Only compiled/run on an actual Windows host -- this backend has no
+/// Windows CI executor yet, so this is exercised manually there.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_stdin_all_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_stdin_all_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_stdin_all_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "val text = StandardInput#all()\nprintln(trimRight(text))\nprintln(length(text))\nassertResult(\"alpha\\nbeta\\n\")(text)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows stdin build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let mut child = Command::new(&exe_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("generated PE64 should run");
+    {
+        let mut stdin = child.stdin.take().expect("stdin should be piped");
+        stdin
+            .write_all(b"alpha\nbeta\n")
+            .expect("stdin should accept input");
+    }
+    let run_output = child
+        .wait_with_output()
+        .expect("generated PE64 should finish after stdin closes");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "alpha\nbeta\n11\n"
+    );
+}
+
+/// Real-Windows execution counterpart to
+/// `build_target_windows_x86_64_supports_dir_list`: creates a small
+/// directory with a host `std::fs` call (not `Dir#mkdir`/
+/// `FileOutput#write`, which belong to a different slice and may not
+/// be un-gated in every worktree this runs from) and asserts
+/// `Dir#list`/`Dir#listFull` read it back correctly through the
+/// `FindFirstFileA`/`FindNextFileA`/`FindClose` loop
+/// (`emit_dir_list_path_label_windows`), including that `"."`/`".."`
+/// are skipped and the result is sorted. Only compiled/run on an
+/// actual Windows host.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_dir_list_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_dir_list_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_dir_list_{stamp}.exe"));
+    let listed_dir = dir.join(format!("klassic_pe_dir_list_target_{stamp}"));
+    fs::create_dir_all(&listed_dir).expect("target directory should be creatable");
+    fs::write(listed_dir.join("a.txt"), b"a").expect("a.txt should write");
+    fs::write(listed_dir.join("b.txt"), b"b").expect("b.txt should write");
+    let listed_dir_literal = listed_dir.to_string_lossy().replace('\\', "\\\\");
+    fs::write(
+        &source_path,
+        format!(
+            "val entries = Dir#list(\"{listed_dir_literal}\")\nprintln(entries)\nassertResult([\"a.txt\", \"b.txt\"])(entries)\n"
+        ),
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows dir list build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    let _ = fs::remove_file(listed_dir.join("a.txt"));
+    let _ = fs::remove_file(listed_dir.join("b.txt"));
+    let _ = fs::remove_dir(&listed_dir);
+
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "[a.txt, b.txt]\n"
+    );
+}
+
+/// `std.file` / `FileOutput#` / `FileInput#` (write/append/writeLines/
+/// exists/delete, all/readAll/lines/readLines) now build for Windows:
+/// `emit_file_write*`/`emit_file_read_to_runtime_string*`/
+/// `emit_file_delete*`/`emit_runtime_path_exists*` each branch to a
+/// `CreateFileA`/`ReadFile`/`win_write_handle`/`CloseHandle`/
+/// `DeleteFileA`/`GetFileAttributesA` Win64 shim instead of a raw
+/// Linux syscall. This also confirms the `println(FileInput#all(...))`
+/// / `println(FileInput#lines(...))` /
+/// `println(FileInput#open(path, s => s.readLines()))` print-fusion
+/// fast paths in `emit_print_expr_fragment` build too: their own
+/// `!self.is_windows` guards make them fall through to the (now
+/// Windows-safe) plain `compile_file_input_all`/`compile_file_input_lines`
+/// dispatch instead of ever reaching the still-unguarded raw-syscall
+/// fast path itself.
+#[test]
+fn build_target_windows_x86_64_supports_file() {
+    assert_windows_target_builds("file_write", "FileOutput#write(\"a.txt\", \"hi\")\n");
+    assert_windows_target_builds("file_append", "FileOutput#append(\"a.txt\", \"hi\")\n");
+    assert_windows_target_builds(
+        "file_write_lines",
+        "FileOutput#writeLines(\"a.txt\", [\"x\"])\n",
+    );
+    assert_windows_target_builds("file_exists", "println(FileOutput#exists(\"a.txt\"))\n");
+    assert_windows_target_builds("file_delete", "FileOutput#delete(\"a.txt\")\n");
+    assert_windows_target_builds("file_input_all", "println(FileInput#all(\"Cargo.toml\"))\n");
+    assert_windows_target_builds(
+        "file_input_read_all",
+        "println(FileInput#readAll(\"Cargo.toml\"))\n",
+    );
+    assert_windows_target_builds(
+        "file_input_lines",
+        "println(FileInput#lines(\"Cargo.toml\"))\n",
+    );
+    assert_windows_target_builds(
+        "file_input_read_lines",
+        "println(FileInput#readLines(\"Cargo.toml\"))\n",
+    );
+    // Print-fusion fast paths in `emit_print_expr_fragment` -- same
+    // source as the plain-call forms above, but exercised through
+    // `println(...)` so that, were the `!self.is_windows` guard ever
+    // removed without checking the underlying path is Windows-safe,
+    // this would catch it.
+    assert_windows_target_builds(
+        "file_input_all_print_fusion",
+        "println(FileInput#all(\"Cargo.toml\"))\n",
+    );
+    assert_windows_target_builds(
+        "file_input_lines_print_fusion",
+        "println(FileInput#lines(\"Cargo.toml\"))\n",
+    );
+    assert_windows_target_builds(
+        "file_input_open_print_fusion",
+        "println(FileInput#open(\"Cargo.toml\", (stream) => FileInput#readLines(stream)))\n",
+    );
+}
+
+/// Cross-builds a broad `Dir#*` (mkdir/mkdirs/exists/isDirectory/
+/// isFile/current/move/copy/delete/temp) program for the Windows
+/// target and asserts the build succeeds. Also exercises the design
+/// doc Risk 4 fix (`emit_dir_mkdirs_label` treating `\` as a path
+/// separator alongside `/`, via a dynamic/non-static path argument
+/// so the runtime scanner -- not the host-side `mkdir_prefixes`
+/// string-splitting used for static path literals -- actually
+/// compiles this path). Runs on any host: building for the Windows
+/// target never requires executing the result.
+#[test]
+fn build_target_windows_x86_64_supports_dir() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_dir_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_dir_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "def makeDirs(base: String): Unit = {\n\
+         \x20\x20Dir#mkdirs(\"#{base}x\\\\y\\\\z\")\n\
+         }\n\
+         Dir#mkdir(\"newdir\")\n\
+         Dir#mkdirs(\"a/b/c\")\n\
+         makeDirs(\"nested_\")\n\
+         println(Dir#exists(\"newdir\"))\n\
+         println(Dir#isDirectory(\"newdir\"))\n\
+         println(Dir#isFile(\"Cargo.toml\"))\n\
+         println(Dir#current())\n\
+         println(Dir#temp())\n\
+         Dir#move(\"newdir\", \"renamed\")\n\
+         Dir#copy(\"Cargo.toml\", \"Cargo2.toml\")\n\
+         Dir#delete(\"renamed\")\n",
+    )
+    .expect("temp source file should write");
     let build_output = Command::new(klassic_bin())
         .args([
             "--target",
@@ -28764,267 +29271,159 @@ fn assert_windows_target_gate(unique_tag: &str, source: &str, expected_diagnosti
         .expect("binary should run");
     let _ = fs::remove_file(&source_path);
     let _ = fs::remove_file(&exe_path);
-    let stderr = String::from_utf8_lossy(&build_output.stderr);
     assert!(
-        !build_output.status.success(),
-        "windows build of gated feature ({unique_tag}) should fail to build\nstdout:\n{}\nstderr:\n{stderr}",
-        String::from_utf8_lossy(&build_output.stdout)
+        build_output.status.success(),
+        "windows Dir# cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
     );
+}
+
+/// Executes the generated `.exe` directly (Windows-only, like
+/// `build_target_windows_x86_64_hello_runs`): creates a directory
+/// tree with `Dir#mkdir`/`#mkdirs`, checks it with `Dir#exists`/
+/// `#isDirectory`/`#isFile`, reads `Dir#current`, renames it with
+/// `Dir#move`, copies a file with `Dir#copy`, and removes it with
+/// `Dir#delete`, asserting the whole sequence's stdout matches the
+/// evaluator's output byte-for-byte.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_dir_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let work_dir = dir.join(format!("klassic_pe_dir_run_{stamp}"));
+    fs::create_dir_all(&work_dir).expect("work dir should create");
+    let source_path = dir.join(format!("klassic_pe_dir_run_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_dir_run_{stamp}.exe"));
+    let target_dir = work_dir.join("newdir");
+    let renamed_dir = work_dir.join("renamed");
+    let source_file = work_dir.join("a.txt");
+    let copy_file = work_dir.join("b.txt");
+    fs::write(&source_file, "hi").expect("source file should write");
+    let escape = |p: &std::path::Path| p.display().to_string().replace('\\', "\\\\");
+    fs::write(
+        &source_path,
+        format!(
+            "Dir#mkdir(\"{target}\")\n\
+             println(Dir#exists(\"{target}\"))\n\
+             println(Dir#isDirectory(\"{target}\"))\n\
+             println(Dir#isFile(\"{source_file}\"))\n\
+             Dir#move(\"{target}\", \"{renamed}\")\n\
+             println(Dir#exists(\"{renamed}\"))\n\
+             Dir#copy(\"{source_file}\", \"{copy_file}\")\n\
+             println(Dir#isFile(\"{copy_file}\"))\n\
+             Dir#delete(\"{renamed}\")\n\
+             println(Dir#exists(\"{renamed}\"))\n",
+            target = escape(&target_dir),
+            renamed = escape(&renamed_dir),
+            source_file = escape(&source_file),
+            copy_file = escape(&copy_file),
+        ),
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
     assert!(
-        !stderr.contains("internal error") && !stderr.contains("panicked"),
-        "windows build of gated feature ({unique_tag}) must fail with a clean diagnostic, not a panic\nstderr:\n{stderr}"
+        build_output.status.success(),
+        "windows Dir# build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
     );
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    let _ = fs::remove_dir_all(&work_dir);
     assert!(
-        stderr.contains(expected_diagnostic),
-        "windows build of gated feature ({unique_tag}) should mention {expected_diagnostic:?}\nstderr:\n{stderr}"
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "true\ntrue\ntrue\ntrue\ntrue\nfalse\n"
     );
 }
 
-/// `sleep` reaches the `Nanosleep` syscall (`compile_sleep`) and has
-/// no Win64 shim, so it must be gated rather than panic.
+/// `Dir#list` / `Dir#listFull` reach the `Open`/`Getdents64`/`Close`
+/// syscalls on Linux, which now have a Windows counterpart
+/// (`FindFirstFileA`/`FindNextFileA`/`FindClose`, see
+/// `emit_dir_list_path_label_windows`), so the cross-build must
+/// succeed instead of being gated. Also covers the static-constant-path
+/// form (`Dir#list("src")`), which must bypass the host-filesystem
+/// constant-fold (`compile_dir_list`'s `std::path::Path::new(&path)
+/// .exists()` branch) on Windows and always emit the runtime
+/// `FindFirstFileA` loop instead -- otherwise this cross-build from a
+/// Linux host would silently bake in the *build host's* view of
+/// whether `"src"` exists.
 #[test]
-fn build_target_windows_x86_64_gates_sleep() {
-    assert_windows_target_gate(
-        "sleep",
-        "sleep(0)\nprintln(\"unreachable\")\n",
-        "`sleep` is not yet supported when targeting x86_64-pc-windows-msvc",
+fn build_target_windows_x86_64_supports_dir_list() {
+    assert_windows_target_builds("dir_list_static", "println(Dir#list(\"src\"))\n");
+    assert_windows_target_builds("dir_list_full_static", "println(Dir#listFull(\"src\"))\n");
+    // `StandardInput#all()` is recognized by `expr_may_yield_runtime_string`
+    // as always producing a `RuntimeString`, so this exercises
+    // `compile_dir_list`'s `expr_may_yield_runtime_string` branch (built
+    // via `compile_runtime_path_argument_ref`) rather than the
+    // static-constant-path branch above.
+    assert_windows_target_builds(
+        "dir_list_runtime",
+        "println(Dir#list(StandardInput#all()))\n",
     );
 }
 
-/// `stopwatch` and `Time#nowMillis` both reach the `ClockGettime`
-/// syscall (`compile_stopwatch` / `compile_time_now_millis`) and have
-/// no Win64 shim.
+/// `Dir#home` reuses `emit_environment_get_static_key` keyed on
+/// `USERPROFILE` (design doc A, "Dir#home" row); on Windows that
+/// function resolves via the case-insensitive `GetEnvironmentVariableA`
+/// -backed `win_get_env_var` shim instead of the `environment_base`
+/// envp-array scan the non-Windows path uses -- see
+/// `emit_win_get_env_var_runtime` -- while
+/// `build_target_windows_x86_64_gates_dir`'s doc comment explains why
+/// the rest of `Dir#*` stays gated.
 #[test]
-fn build_target_windows_x86_64_gates_time() {
-    assert_windows_target_gate(
-        "time_stopwatch",
-        "val e = stopwatch(() => 1)\nprintln(e)\n",
-        "`stopwatch` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "time_now_millis",
-        "println(Time#nowMillis())\n",
-        "`Time#nowMillis` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-}
-
-/// `StandardInput#all` / `StandardInput#lines` (and their `stdin()` /
-/// `stdinLines()` aliases) reach the `Read` syscall
-/// (`emit_standard_input_to_runtime_string`) and have no Win64 shim.
-#[test]
-fn build_target_windows_x86_64_gates_stdin() {
-    assert_windows_target_gate(
-        "stdin_all",
-        "println(StandardInput#all())\n",
-        "`StandardInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "stdin_lines",
-        "println(StandardInput#lines())\n",
-        "`StandardInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-}
-
-/// `std.file` / `FileOutput#` / `FileInput#` reach `Open`/`Read`/
-/// `Write`/`Close`/`Unlink` (`emit_file_write*`,
-/// `emit_file_read_to_runtime_string*`, `emit_file_delete*`), none of
-/// which have a Win64 shim beyond the stdout/stderr-only `win_write`
-/// (which the file-write helpers reuse for the *shape* of the call
-/// but which would resolve to the wrong handle for a real file
-/// descriptor, so the whole operation is gated instead of only the
-/// `Open`/`Close` bookends). Also covers the `println(FileInput#all
-/// (...))` / `println(FileInput#lines(...))` /
-/// `println(FileInput#open(path, s => s.readLines()))` print-fusion
-/// fast paths in `emit_print_expr_fragment`, which stream straight to
-/// the target fd and would otherwise bypass the
-/// `compile_file_input_all` / `compile_file_input_lines` gates.
-#[test]
-fn build_target_windows_x86_64_gates_file() {
-    assert_windows_target_gate(
-        "file_write",
-        "FileOutput#write(\"a.txt\", \"hi\")\n",
-        "`FileOutput#write` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "file_append",
-        "FileOutput#append(\"a.txt\", \"hi\")\n",
-        "`FileOutput#append` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "file_write_lines",
-        "FileOutput#writeLines(\"a.txt\", [\"x\"])\n",
-        "`FileOutput#writeLines` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "file_exists",
-        "println(FileOutput#exists(\"a.txt\"))\n",
-        "`FileOutput#exists` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "file_delete",
-        "FileOutput#delete(\"a.txt\")\n",
-        "`FileOutput#delete` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "file_input_all",
-        "println(FileInput#all(\"Cargo.toml\"))\n",
-        "`FileInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "file_input_read_all",
-        "println(FileInput#readAll(\"Cargo.toml\"))\n",
-        "`FileInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "file_input_lines",
-        "println(FileInput#lines(\"Cargo.toml\"))\n",
-        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "file_input_read_lines",
-        "println(FileInput#readLines(\"Cargo.toml\"))\n",
-        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    // Print-fusion fast paths in `emit_print_expr_fragment` that
-    // bypass the plain `FileInput#all`/`FileInput#lines` call
-    // dispatch entirely -- these must be independently confirmed
-    // gated, not just the plain-call form above.
-    assert_windows_target_gate(
-        "file_input_all_print_fusion",
-        "println(FileInput#all(\"Cargo.toml\"))\n",
-        "`FileInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "file_input_lines_print_fusion",
-        "println(FileInput#lines(\"Cargo.toml\"))\n",
-        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "file_input_open_print_fusion",
-        "println(FileInput#open(\"Cargo.toml\", (stream) => FileInput#readLines(stream)))\n",
-        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-}
-
-/// `std.dir` / `Dir#*` reach `Getcwd`/`Access`/`Newfstatat`/`Mkdir`/
-/// `Rmdir`/`Rename`/`Open`/`Getdents64`/`Close`/`Sendfile` (or, for
-/// `home`/`temp`, the argv/envp startup slots W1-a leaves zeroed on
-/// Windows -- see `emit_store_command_line_state` -- which would
-/// otherwise silently return `"/tmp"` for `Dir#temp` or a spurious
-/// "not set" runtime error for `Dir#home` instead of a compile-time
-/// diagnostic), none of which have a Win64 shim.
-#[test]
-fn build_target_windows_x86_64_gates_dir() {
-    assert_windows_target_gate(
-        "dir_current",
-        "println(Dir#current())\n",
-        "`Dir#current` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_home",
-        "println(Dir#home())\n",
-        "`Dir#home` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_temp",
-        "println(Dir#temp())\n",
-        "`Dir#temp` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_exists",
-        "println(Dir#exists(\"src\"))\n",
-        "`Dir#exists` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_is_directory",
-        "println(Dir#isDirectory(\"src\"))\n",
-        "`Dir#isDirectory` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_is_file",
-        "println(Dir#isFile(\"Cargo.toml\"))\n",
-        "`Dir#isFile` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_mkdir",
-        "Dir#mkdir(\"newdir\")\n",
-        "`Dir#mkdir` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_mkdirs",
-        "Dir#mkdirs(\"a/b/c\")\n",
-        "`Dir#mkdirs` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_list",
-        "println(Dir#list(\"src\"))\n",
-        "`Dir#list` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_list_full",
-        "println(Dir#listFull(\"src\"))\n",
-        "`Dir#listFull` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_delete",
-        "Dir#delete(\"newdir\")\n",
-        "`Dir#delete` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_copy",
-        "Dir#copy(\"a.txt\", \"b.txt\")\n",
-        "`Dir#copy` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "dir_move",
-        "Dir#move(\"a.txt\", \"b.txt\")\n",
-        "`Dir#move` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
+fn build_target_windows_x86_64_supports_dir_home() {
+    assert_windows_target_builds("dir_home", "println(Dir#home())\n");
 }
 
 /// `Environment#vars` / `Environment#get` / `Environment#exists` (and
 /// the `env()` / `getEnv()` / `hasEnv()` prelude aliases, plus
-/// `std.env`) all walk the `environment_base` linked block that W1-a
-/// leaves zeroed on Windows (see `emit_store_command_line_state`) --
-/// unlike the syscall-backed families above, an ungated build of
-/// these would not panic at all, it would silently compile a binary
-/// where `Environment#vars()` is always `[]`, `Environment#exists`
-/// is always `false`, and `Environment#get` always raises the
-/// "missing environment variable" runtime error, so this is the
-/// "produces wrong results without syscalls" case called out
-/// alongside `CommandLine#args` below.
+/// `std.env`) now build for Windows. `Environment#vars` (full
+/// enumeration, where case doesn't matter) is populated at startup by
+/// `emit_win_store_command_line_state`'s `GetEnvironmentStringsA`
+/// -backed envp synthesis and still walks it via the existing
+/// `emit_environment_vars`/`emit_find_environment_*` helpers, but
+/// `Environment#get`/`#exists` (single-key lookups, where real Windows
+/// env-var names are case-insensitive) instead call
+/// `GetEnvironmentVariableA` directly through the `win_get_env_var`
+/// shim -- see `emit_win_get_env_var_runtime`.
 #[test]
-fn build_target_windows_x86_64_gates_environment() {
-    assert_windows_target_gate(
-        "env_vars",
-        "println(Environment#vars())\n",
-        "`Environment#vars` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "env_get",
-        "println(Environment#get(\"PATH\"))\n",
-        "`Environment#get` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
-    assert_windows_target_gate(
-        "env_exists",
-        "println(Environment#exists(\"PATH\"))\n",
-        "`Environment#exists` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
+fn build_target_windows_x86_64_supports_environment() {
+    assert_windows_target_builds("env_vars", "println(Environment#vars())\n");
+    assert_windows_target_builds("env_get", "println(Environment#get(\"PATH\"))\n");
+    assert_windows_target_builds("env_exists", "println(Environment#exists(\"PATH\"))\n");
 }
 
 /// `CommandLine#args` (and the `args()` prelude alias, plus
-/// `std.process.args`/`std.cli`) walks the argc/argv1 startup slots
-/// W1-a leaves zeroed on Windows (see
-/// `emit_store_command_line_state`), so an ungated build would
-/// silently compile a binary where `CommandLine#args()` is always
-/// `[]` instead of failing to build.
+/// `std.process.args`/`std.cli`) now builds for Windows:
+/// `command_line_argc`/`command_line_argv1_base` are populated at
+/// startup by `emit_win_store_command_line_state`'s
+/// `GetCommandLineA`-backed hand tokenizer instead of being left
+/// zeroed, so the existing `emit_command_line_args` argv-array walk
+/// works unmodified.
 #[test]
-fn build_target_windows_x86_64_gates_command_line_args() {
-    assert_windows_target_gate(
-        "command_line_args",
-        "println(CommandLine#args())\n",
-        "`CommandLine#args` is not yet supported when targeting x86_64-pc-windows-msvc",
-    );
+fn build_target_windows_x86_64_supports_command_line_args() {
+    assert_windows_target_builds("command_line_args", "println(CommandLine#args())\n");
 }
 
 /// `thread { ... }` (`compile_thread`/`emit_queued_threads`) itself
@@ -29032,14 +29431,15 @@ fn build_target_windows_x86_64_gates_command_line_args() {
 /// `thread` body is compiled straight into the tail of `main` and run
 /// serially before exit, so it needs no per-target gate of its own --
 /// confirmed here by asserting a `thread` body that touches no OS
-/// feature builds successfully for Windows. A `thread` body that
-/// *does* use a gated feature is caught transitively through that
-/// feature's own gate, confirmed by the second half of this test
-/// (`emit_queued_threads` calls `compile_expr` on the body, which
-/// dispatches through the same gated `compile_file_output_write` as
-/// any other call site).
+/// feature builds successfully for Windows, and that a body which
+/// *does* use an OS builtin (`Dir#mkdir`) also builds now that every
+/// family has a Win64 shim: `emit_queued_threads` calls
+/// `compile_expr` on the body, which dispatches through the same
+/// `compile_dir_mkdir` as any other call site, so shim coverage is
+/// inherited transitively (this same path used to inherit the W1-b
+/// gates before they were all replaced).
 #[test]
-fn build_target_windows_x86_64_thread_gate_is_transitive() {
+fn build_target_windows_x86_64_thread_os_builtins_build_transitively() {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -29071,10 +29471,9 @@ fn build_target_windows_x86_64_thread_gate_is_transitive() {
         String::from_utf8_lossy(&build_output.stderr)
     );
 
-    assert_windows_target_gate(
-        "thread_file_io",
-        "thread(() => { FileOutput#write(\"a.txt\", \"hi\") })\n",
-        "`FileOutput#write` is not yet supported when targeting x86_64-pc-windows-msvc",
+    assert_windows_target_builds(
+        "thread_dir_mkdir",
+        "thread(() => { Dir#mkdir(\"newdir\") })\n",
     );
 }
 
@@ -29120,5 +29519,246 @@ fn build_target_windows_x86_64_pure_stdlib_use_is_not_gated() {
         build_output.status.success(),
         "std.cli pure-helper use should build for windows without tripping any OS-feature gate\nstderr:\n{}",
         String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
+/// Real-Windows execution counterpart to
+/// `build_target_windows_x86_64_supports_command_line_args`, mirroring
+/// `builds_native_executable_for_command_line_args`'s ELF version:
+/// asserts `emit_win_tokenize_command_line`'s hand tokenizer correctly
+/// splits `GetCommandLineA`'s output into the same
+/// `["alpha", "two words", "gamma"]` argv the Linux target derives
+/// from the kernel-populated initial stack, including the quoted
+/// `"two words"` argument (Rust's `Command::args` quotes it in the
+/// Win32 command line it builds; the FSA's in-quotes handling must
+/// treat the embedded space as literal, not a separator).
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_command_line_args_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_cli_args_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_cli_args_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "val xs = CommandLine#args()\nprintln(xs)\nprintln(size(xs))\nprintln(head(xs))\nprintln(join(xs, \"|\"))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows command line args build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&exe_path)
+        .args(["alpha", "two words", "gamma"])
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "[alpha, two words, gamma]\n3\nalpha\nalpha|two words|gamma\n"
+    );
+}
+
+/// Real-Windows execution counterpart to
+/// `build_target_windows_x86_64_supports_environment`, mirroring
+/// `builds_native_executable_for_environment_vars`/
+/// `_environment_get_and_exists`'s ELF versions: asserts
+/// `emit_win_store_command_line_state`'s `GetEnvironmentStringsA`
+/// -backed envp synthesis is actually walkable end to end for
+/// `Environment#vars` (a variable set on the child process is visible,
+/// and a missing one is correctly reported absent), and that
+/// `Environment#get`/`#exists`'s `win_get_env_var`
+/// (`GetEnvironmentVariableA`) shim resolves a real Windows env var
+/// (`PATH`, always present) case-insensitively: `PATH` and a
+/// deliberately mixed-case `pAtH` probe must both report present, and
+/// the looked-up value must be non-empty. Regression coverage for the
+/// bug where `Environment#get`/`#exists` walked `environment_base`
+/// (which stores `Path=`, not `PATH=`) with a byte-for-byte scan, so a
+/// case-mismatched lookup like `Environment#get("PATH")` always
+/// reported "missing" even though `PATH` plainly exists.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_environment_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_env_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_env_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "val vars = Environment#vars()\nmutable found = false\nforeach(entry in vars) {\n  if(entry == \"KLASSIC_PE_ENV_TEST=alpha\") {\n    found = true\n  }\n}\nprintln(found)\nprintln(Environment#get(\"KLASSIC_PE_ENV_TEST\"))\nprintln(Environment#exists(\"KLASSIC_PE_ENV_TEST\"))\nprintln(Environment#exists(\"KLASSIC_PE_ENV_MISSING\"))\nprintln(Environment#exists(\"PATH\"))\nprintln(Environment#get(\"PATH\") != \"\")\nprintln(Environment#exists(\"pAtH\"))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows environment build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&exe_path)
+        .env("KLASSIC_PE_ENV_TEST", "alpha")
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "true\nalpha\ntrue\nfalse\ntrue\ntrue\ntrue\n"
+    );
+}
+
+/// Real-Windows execution counterpart to
+/// `build_target_windows_x86_64_supports_dir_home`: asserts
+/// `Dir#home()` actually returns the `USERPROFILE` value set on the
+/// child process, mirroring the Linux target's `HOME`-based
+/// `builds_native_executable_for_runtime_dir_home_and_temp` test.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_dir_home_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let home_dir = dir.join(format!("klassic_pe_userprofile_{stamp}"));
+    let home_text = home_dir.display().to_string();
+    let source_path = dir.join(format!("klassic_pe_dir_home_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_dir_home_{stamp}.exe"));
+    fs::write(&source_path, "println(Dir#home())\n").expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows Dir#home build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&exe_path)
+        .env("USERPROFILE", &home_dir)
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        format!("{home_text}\n")
+    );
+}
+
+/// Real-Windows execution counterpart to
+/// `build_target_windows_x86_64_supports_file`: a full
+/// write/append/exists/read round trip through `CreateFileA`/
+/// `win_write_handle`/`GetFileAttributesA`/`ReadFile`/`CloseHandle`,
+/// plus `writeLines`/`lines` and `delete`, asserted against the exact
+/// output shape the Linux target's
+/// `builds_native_executable_for_file_helper_argument_side_effects`
+/// -style tests already establish.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_file_io_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let file_path = dir.join(format!("klassic_pe_file_{stamp}.txt"));
+    let lines_path = dir.join(format!("klassic_pe_file_lines_{stamp}.txt"));
+    let file_text = file_path.display().to_string().replace('\\', "\\\\");
+    let lines_text = lines_path.display().to_string().replace('\\', "\\\\");
+    let source_path = dir.join(format!("klassic_pe_file_io_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_file_io_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        format!(
+            "val path = \"{file_text}\"\nval path2 = \"{lines_text}\"\nFileOutput#write(path, \"hello\")\nFileOutput#append(path, \"!\")\nprintln(FileOutput#exists(path))\nprintln(FileInput#all(path))\nFileOutput#writeLines(path2, [\"a\", \"b\"])\nprintln(FileInput#lines(path2))\nFileOutput#delete(path)\nFileOutput#delete(path2)\nprintln(FileOutput#exists(path))\nprintln(FileOutput#exists(path2))\n"
+        ),
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows file io build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    let _ = fs::remove_file(&file_path);
+    let _ = fs::remove_file(&lines_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "true\nhello!\n[a, b]\nfalse\nfalse\n"
     );
 }
