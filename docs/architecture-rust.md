@@ -40,6 +40,29 @@ cargo run -- -e "1 + 2"
 - Untyped AST
 - Functions, modules/imports, records, typeclass/instance declarations,
   theorem/trust/axiom declarations, collection literals, and type annotations
+- The parser tracks a shared nesting-depth counter across every
+  mutually-recursive entry point that can recurse on nested source text
+  (`parse_expression` for parens/call arguments/lambda bodies/collection
+  literal elements, `parse_unary` for chained unary operators, and
+  `parse_pattern` for nested match constructor patterns). Once nesting
+  exceeds `MAX_NESTING_DEPTH` (64, chosen with more than 2x margin below the
+  tightest failure observed anywhere in the pipeline on a debug build —
+  nested match patterns and unary chains overflow `klassic-types`'
+  unguarded AST walk at roughly 150-190 levels, well before the parser's
+  own, higher tolerance) the parser reports a normal source-located
+  diagnostic instead of overflowing its own Rust stack, so every downstream
+  pass (rewrite, types, eval, native codegen, the C backend) is protected
+  by construction rather than needing its own stack-overflow guard.
+
+  Note: this guard is scoped to *nesting depth*. A separate, unrelated
+  overflow exists for very long *flat* operator chains built by the
+  iterative precedence-climbing loop (`1 + 1 + 1 + ...`): parsing itself
+  handles tens of thousands of terms fine, but the resulting deeply
+  left-leaning `Expr::Binary` AST still overflows `klassic-types`'
+  unguarded recursive type-check at roughly 190 terms on a debug build
+  (and a few thousand terms in `--release`). That is a distinct bug in
+  `klassic-types`'s (lack of) stack-growth protection, not the parser, and
+  is not fixed here.
 
 ### `klassic-rewrite`
 - Placeholder desugaring

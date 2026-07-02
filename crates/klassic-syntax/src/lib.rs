@@ -1090,7 +1090,33 @@ struct Parser {
     /// must be declared before use (forward references already fail), so
     /// the set is complete by the time a `#Name` is reached.
     record_names: std::collections::HashSet<String>,
+    /// Current recursive-descent nesting depth, shared across every
+    /// mutually-recursive entry point that can recurse on nested source
+    /// text (`parse_expression`, `parse_unary`, `parse_pattern`). Bounded
+    /// by `MAX_NESTING_DEPTH` so pathologically deep input (deeply nested
+    /// parens, unary operators, call arguments, lambda bodies, list/map/set
+    /// literal elements, match patterns, ...) is rejected with a normal
+    /// source-located diagnostic instead of overflowing the parser's own
+    /// Rust stack — every downstream pass (rewrite, types, eval, native
+    /// codegen, the C backend) relies on the parser to have already ruled
+    /// this out, since none of them but the evaluator have stack-overflow
+    /// protection of their own, and several (klassic-types in particular)
+    /// overflow at even shallower AST depth than the parser itself does on
+    /// a debug build.
+    depth: usize,
 }
+
+/// Maximum recursive-descent nesting depth accepted by the parser. Calibrated
+/// against the tightest observed failure across the whole pipeline (parser,
+/// rewrite, types, eval, native codegen, C backend) on a debug build, which
+/// is materially lower than the parser's own tolerance: nested match
+/// constructor patterns and nested unary operators overflow `klassic-types`'
+/// unguarded AST walk at roughly 150-190 levels on the default 8 MiB stack
+/// (worse than the ~700-1000 levels the parser itself can take for plain
+/// parens, or the release-mode numbers a `--release` build tolerates).
+/// `MAX_NESTING_DEPTH` is kept at least 2x below that measured floor so
+/// `cargo test`'s debug-profile binaries stay safe, with headroom to spare.
+const MAX_NESTING_DEPTH: usize = 64;
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
@@ -1098,7 +1124,31 @@ impl Parser {
             tokens,
             index: 0,
             record_names: std::collections::HashSet::new(),
+            depth: 0,
         }
+    }
+
+    /// Enter one level of recursive-descent nesting, or fail with a
+    /// source-located diagnostic if `MAX_NESTING_DEPTH` would be exceeded.
+    /// Pair with `leave_nesting_depth` around the recursive body; because
+    /// the depth is always decremented right after the wrapped call
+    /// returns (regardless of `Ok`/`Err`), early returns via `?` inside the
+    /// wrapped body cannot leak an unbalanced depth count.
+    fn enter_nesting_depth(&mut self) -> Result<(), Diagnostic> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(Diagnostic::parse(
+                self.peek().span,
+                format!(
+                    "expression nesting exceeds the maximum supported depth ({MAX_NESTING_DEPTH})"
+                ),
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave_nesting_depth(&mut self) {
+        self.depth -= 1;
     }
 
     fn parse_program(mut self) -> Result<Expr, Diagnostic> {
@@ -1156,7 +1206,15 @@ impl Parser {
 
     fn parse_expression(&mut self) -> Result<Expr, Diagnostic> {
         self.consume_separators();
-        let expr = match self.peek().kind {
+        self.enter_nesting_depth()?;
+        let result = self.parse_expression_inner();
+        self.leave_nesting_depth();
+        let expr = result?;
+        self.parse_cleanup_suffix(expr)
+    }
+
+    fn parse_expression_inner(&mut self) -> Result<Expr, Diagnostic> {
+        match self.peek().kind {
             TokenKind::Module => self.parse_module_header(),
             TokenKind::Import => self.parse_import_expression(),
             // Only intercept record *declarations* here. A record *literal*
@@ -1185,8 +1243,7 @@ impl Parser {
             TokenKind::Foreach => self.parse_foreach_expression(),
             TokenKind::While => self.parse_while_expression(),
             _ => self.parse_assignment(),
-        }?;
-        self.parse_cleanup_suffix(expr)
+        }
     }
 
     fn parse_record_declaration(&mut self) -> Result<Expr, Diagnostic> {
@@ -1798,6 +1855,13 @@ impl Parser {
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        self.enter_nesting_depth()?;
+        let result = self.parse_pattern_inner();
+        self.leave_nesting_depth();
+        result
+    }
+
+    fn parse_pattern_inner(&mut self) -> Result<Pattern, Diagnostic> {
         let token = self.peek().clone();
         match token.kind {
             TokenKind::True => {
@@ -2444,6 +2508,13 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, Diagnostic> {
+        self.enter_nesting_depth()?;
+        let result = self.parse_unary_inner();
+        self.leave_nesting_depth();
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, Diagnostic> {
         match self.peek().kind {
             TokenKind::Plus => {
                 let token = self.bump().span;
@@ -4419,7 +4490,7 @@ fn rewrap_span(expr: Expr, span: Span) -> Expr {
 
 #[cfg(test)]
 mod tests {
-    use super::{BinaryOp, Expr, parse_source};
+    use super::{BinaryOp, Expr, MAX_NESTING_DEPTH, parse_source};
     use klassic_span::SourceFile;
 
     #[test]
@@ -4984,5 +5055,127 @@ mod tests {
             }
             other => panic!("unexpected program: {other:?}"),
         }
+    }
+
+    // --- Nesting-depth guard (issue: parser stack overflow on deeply
+    // nested expressions) ---
+    //
+    // A bare unary-operator chain of `k` `-` tokens costs exactly
+    // `k + 2` recursion-depth units: one for the enclosing
+    // `parse_expression`, plus `k + 1` calls to `parse_unary` (`k` that
+    // each consume one `-` and recurse, plus one final pass-through call
+    // that falls through to `parse_postfix` for the trailing integer
+    // literal). That makes it the simplest possible way to hit the guard
+    // at an exact, predictable boundary: a chain of `MAX_NESTING_DEPTH - 2`
+    // minus signs is the deepest one that still parses, and one more
+    // pushes it over the limit.
+    fn unary_minus_chain(len: usize) -> String {
+        let mut src = "-".repeat(len);
+        src.push('1');
+        src
+    }
+
+    #[test]
+    fn parses_unary_chain_exactly_at_max_nesting_depth() {
+        let src = unary_minus_chain(MAX_NESTING_DEPTH - 2);
+        parse_source(&SourceFile::new("test.kl", &src))
+            .expect("nesting exactly at the limit should still parse");
+    }
+
+    #[test]
+    fn rejects_unary_chain_one_past_max_nesting_depth() {
+        let src = unary_minus_chain(MAX_NESTING_DEPTH - 1);
+        let error = parse_source(&SourceFile::new("test.kl", &src))
+            .expect_err("nesting one past the limit should be rejected");
+        assert!(
+            error.message.contains(&format!(
+                "expression nesting exceeds the maximum supported depth ({MAX_NESTING_DEPTH})"
+            )),
+            "unexpected diagnostic: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rejects_deeply_nested_parens_with_diagnostic_not_a_crash() {
+        // Comfortably past the limit; parenthesized primaries cost more
+        // depth per nesting level than a bare unary chain, so a source
+        // level a good deal below MAX_NESTING_DEPTH already trips it.
+        let depth = MAX_NESTING_DEPTH;
+        let src = format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
+        let error = parse_source(&SourceFile::new("test.kl", &src))
+            .expect_err("deeply nested parens should be rejected, not overflow the stack");
+        assert!(error.message.contains("expression nesting exceeds"));
+    }
+
+    #[test]
+    fn rejects_deeply_nested_list_literals() {
+        let depth = MAX_NESTING_DEPTH;
+        let src = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let error = parse_source(&SourceFile::new("test.kl", &src))
+            .expect_err("deeply nested list literals should be rejected");
+        assert!(error.message.contains("expression nesting exceeds"));
+    }
+
+    #[test]
+    fn rejects_deeply_nested_call_arguments() {
+        let depth = MAX_NESTING_DEPTH;
+        let src = format!(
+            "def id(x) = x\n{}1{}",
+            "id(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let error = parse_source(&SourceFile::new("test.kl", &src))
+            .expect_err("deeply nested call arguments should be rejected");
+        assert!(error.message.contains("expression nesting exceeds"));
+    }
+
+    #[test]
+    fn rejects_deeply_nested_immediately_invoked_closures() {
+        // The worst-case construct from the crash sweep: costs the most
+        // recursion depth per source-level of nesting of anything tried,
+        // so it is rejected at the smallest nesting level of all.
+        let depth = MAX_NESTING_DEPTH;
+        let mut src = String::new();
+        for _ in 0..depth {
+            src.push_str("(() => ");
+        }
+        src.push('1');
+        for _ in 0..depth {
+            src.push_str(")()");
+        }
+        let error = parse_source(&SourceFile::new("test.kl", &src))
+            .expect_err("deeply nested IIFEs should be rejected, not overflow the stack");
+        assert!(error.message.contains("expression nesting exceeds"));
+    }
+
+    #[test]
+    fn rejects_deeply_nested_match_patterns() {
+        let depth = MAX_NESTING_DEPTH;
+        let mut src = String::from(
+            "enum Box { case Full(value: Box); case Empty }\n\
+             def build(n: Int): Box = if (n == 0) Empty else Full(build(n - 1))\n\
+             val x = build(1)\n\
+             val y = x match { case ",
+        );
+        src.push_str(&"Full(".repeat(depth));
+        src.push_str("Empty");
+        src.push_str(&")".repeat(depth));
+        src.push_str(" => 1; case _ => 0 }\n");
+        let error = parse_source(&SourceFile::new("test.kl", &src))
+            .expect_err("deeply nested match patterns should be rejected");
+        assert!(error.message.contains("expression nesting exceeds"));
+    }
+
+    #[test]
+    fn ordinary_hand_written_nesting_is_unaffected() {
+        // A handful of nesting levels -- the kind any real program
+        // actually uses -- must keep parsing exactly as before.
+        let program = parse_source(&SourceFile::new(
+            "test.kl",
+            "def id(x) = x\nprintln(-(-(1 + id(id(id(2))))) * ((3 + 4) * (5 - 6)))",
+        ))
+        .expect("ordinary nesting should parse fine");
+        assert!(matches!(program, Expr::Block { .. }));
     }
 }

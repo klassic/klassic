@@ -28263,3 +28263,88 @@ fn process_run_captures_stdout_and_exit_codes() {
         "hello\n\n0\n-1\ntrue\n()\n"
     );
 }
+
+/// Regression for the parser-depth crash sweep: deeply nested primary
+/// expressions (parens, unary chains, immediately-invoked closures, list
+/// literals, call arguments, match patterns, ...) used to overflow
+/// klassic-syntax's own recursive-descent Rust stack -- SIGABRT, no
+/// diagnostic -- in every backend (evaluator, native ELF build, and the
+/// portable C backend), since parsing is shared infrastructure upstream
+/// of all of them. The parser now tracks a nesting-depth counter shared
+/// across every mutually-recursive entry point (`parse_expression`,
+/// `parse_unary`, `parse_pattern`) and reports a normal source-located
+/// diagnostic once nesting exceeds the supported limit, so this is now a
+/// clean exit 1 instead of a fatal signal.
+#[test]
+fn deeply_nested_parens_report_diagnostic_not_a_crash() {
+    let expr = format!("{}1{}", "(".repeat(1000), ")".repeat(1000));
+    let output = Command::new(klassic_bin())
+        .args(["-e", &expr])
+        .output()
+        .expect("binary should run");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "should exit 1 with a diagnostic, not die on a signal (stderr: {})",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("expression nesting exceeds the maximum supported depth"),
+        "expected a nesting-depth diagnostic, got: {stderr}"
+    );
+}
+
+/// Same crash-sweep finding, but through `klassic build`: the crash used
+/// to happen during the build step itself (parsing happens before any
+/// codegen and native builds do not fall back to the evaluator), so this
+/// must also become a clean diagnostic + exit 1 with no partial output
+/// file. Uses nested immediately-invoked closures -- the worst-case
+/// construct from the sweep, which overflowed the parser's Rust stack at
+/// only ~250-300 levels, far shallower than plain nested parens.
+#[test]
+fn native_build_reports_deep_nesting_diagnostic_not_a_crash() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_deepnest_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_deepnest_{stamp}.bin"));
+    let mut src = String::from("println(");
+    for _ in 0..300 {
+        src.push_str("(() => ");
+    }
+    src.push('1');
+    for _ in 0..300 {
+        src.push_str(")()");
+    }
+    src.push(')');
+    fs::write(&source_path, &src).expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let output_existed = output_path.exists();
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert_eq!(
+        build.status.code(),
+        Some(1),
+        "`klassic build` should exit 1 with a diagnostic, not die on a signal (stderr: {})",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(
+        !output_existed,
+        "a rejected build should not leave a partial output binary behind"
+    );
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("expression nesting exceeds the maximum supported depth"),
+        "expected a nesting-depth diagnostic, got: {stderr}"
+    );
+}
