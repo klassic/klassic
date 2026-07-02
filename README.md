@@ -1,435 +1,114 @@
 # Klassic
 
-Klassic is a statically typed object-functional programming language written in
-Rust. The implementation builds a native `klassic` executable with Cargo.
+A statically typed object-functional language whose compiler writes
+native executables byte by byte — ELF on Linux, ad-hoc-signed Mach-O
+on Apple Silicon, PE64 on Windows — with no `cc`, `as`, `ld`,
+`codesign`, or `link.exe` anywhere in the loop.
 
-📖 **User documentation:** [The Klassic Book](https://klassic.github.io/klassic/)
-(or build it locally — see [`docs/book/`](docs/book/)).
+```bash
+$ cat fib.kl
+def fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)
+println(fib(25))
 
-## Features
+$ klassic build fib.kl -o fib && ./fib
+75025
 
-- Hindley-Milner style type inference with annotations and generalized schemes
-- Algebraic data types with real nominal typing, match exhaustiveness and
-  unreachable-arm diagnostics, and pattern matching with nesting, literals,
-  and guards
-- Row-polymorphic records and record field selection
-- First-class functions, closures, named recursive functions, mutually
-  recursive top-level functions, and mutable locals
-- Type classes, constrained polymorphism, and repository-backed higher-kinded examples
-- Lightweight theorem / trust / axiom surface with `--warn-trust` and `--deny-trust`
-- String interpolation, comments, cleanup clauses, loops, ternary expressions, and casts
-- List, map, and set literals with comma, space, or newline separators
-- Multi-file programs: `import` resolves user modules from neighboring files
-  in both the evaluator and native builds
-- Standard library written in Klassic itself — `std.list`, `std.string`,
-  `std.math`, `std.option`, `std.result`, `std.map`, `std.set`, `std.json`,
-  `std.time`, and more
-- Native CLI and a REPL that echoes every value with its inferred type
-- Direct-to-native-executable compiler (no `cc`/`as`/`ld`) targeting Linux
-  x86_64 (ELF64), Apple Silicon macOS (ad-hoc-signed Mach-O arm64), and
-  Windows x86_64 (PE64), with by-pointer calling conventions for enums and
-  strings, a stack-overflow probe, and compile-time-budgeted constant folding
-- Portable C backend (`--backend c`) emitting a single C99 translation unit
-  for a growing subset
-- Precise mark-and-sweep garbage collector with multi-segment heap growth and
-  mmap-backed tables, exposed through 68 `__gc_*` debug builtins
-- Release automation: tagged pushes publish statically-linked Linux binaries
-  plus macOS (Apple Silicon and Intel) and Windows x86_64 binaries
-- Standalone Rust macro PEG subsystem
+$ klassic --target x86_64-pc-windows-msvc build fib.kl -o fib.exe
+$ file fib fib.exe
+fib:     ELF 64-bit LSB executable, x86-64, statically linked
+fib.exe: PE32+ executable (console) x86-64, for MS Windows
+```
+
+Hindley–Milner inference, algebraic data types with exhaustive
+`match`, row-polymorphic records, type classes, a standard library
+written in Klassic itself, a precise garbage collector inside every
+binary, and a typed REPL.
+
+📖 **[The Klassic Book](https://klassic.github.io/klassic/)** is the
+documentation: installation, a full language tour, native compilation,
+and the GC.
 
 ## Install
 
-One line, Linux (x86_64) or macOS (Apple Silicon / Intel):
+Linux (x86_64) or macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/klassic/klassic/main/install.sh | sh
 ```
 
-The installer detects your platform, downloads the latest
-[release](https://github.com/klassic/klassic/releases) into
-`~/.klassic/bin` (binary plus `libklassic_runtime.a` for the C
-backend), and verifies the install by running a Klassic program with
-it. Set `KLASSIC_VERSION=v0.4.0` to pin a release, `KLASSIC_HOME` to
-change the install root. The Linux build is statically linked (musl)
-and runs on any x86_64 Linux.
+Windows: download `klassic-<version>-x86_64-pc-windows-msvc.zip` from
+the [releases](https://github.com/klassic/klassic/releases), extract
+`klassic.exe`, put it on `PATH`.
 
-On macOS the evaluator, REPL, and native builds are fully supported.
-On Apple Silicon, `klassic build program.kl -o program` targets the
-host automatically: the direct Mach-O arm64 backend compiles and
-ad-hoc-signs the executable with no external toolchain, and programs
-outside its (growing) subset fall back to the portable C backend
-(the system `cc` links against the bundled runtime). Anything beyond
-both paths runs with `klassic program.kl`.
+From source: `cargo install --git https://github.com/klassic/klassic`
 
-On Windows, download `klassic-<version>-x86_64-pc-windows-msvc.zip`
-from the [releases page](https://github.com/klassic/klassic/releases),
-extract `klassic.exe`, and put it on `PATH`. The evaluator, REPL, and
-`klassic build` all work out of the box: `klassic build` on a Windows
-host targets `x86_64-pc-windows-msvc` automatically and the direct
-PE64 backend compiles with no external toolchain (no Visual Studio,
-MSVC, or WSL required). The Windows zip ships `klassic.exe` alone —
-`libklassic_runtime.a` is not bundled, so `--backend c` needs a
-source build with a C compiler available.
+| Host | `klassic build` | Cross-builds |
+| --- | --- | --- |
+| Linux x86_64 | direct ELF64 | any of the three targets |
+| macOS arm64 | direct Mach-O, portable-C fallback | any of the three targets |
+| Windows x86_64 | direct PE64 | any of the three targets |
 
-Alternatively, build from source with Cargo:
+`klassic targets` prints the live matrix.
 
-```bash
-cargo install --git https://github.com/klassic/klassic
+## A taste
+
+```klassic
+enum Shape {
+  case Circle(r: Double)
+  case Rect(w: Double, h: Double)
+}
+
+def describe(s: Shape): String = s match {
+  case Circle(r) if r > 100.0 => "a big circle"
+  case Circle(r)              => "a circle"
+  case Rect(w, h)             => "a #{w}x#{h} box"
+}
+
+println(describe(Rect(3.0, 4.0)))   // a 3.0x4.0 box
+
+val ages = %["alice": 30, "bob": 27]
+foreach (name in ["alice", "bob"]) {
+  println("#{name} is #{ages.getOrElse(name, 0)}")
+}
 ```
 
-### Platform matrix
+The [language tour](https://klassic.github.io/klassic/tour/variables.html)
+walks through the whole surface — records, type classes, modules,
+cleanup clauses, and the `axiom`/`theorem` trust surface.
 
-| | Evaluator / REPL | `klassic build` (as host) | `klassic build --target ...` (cross-build) |
-| --- | --- | --- | --- |
-| Linux x86_64 | yes | direct ELF64 (most complete) | `linux-x86_64` / `x86_64-unknown-linux-gnu` |
-| macOS arm64 (Apple Silicon) | yes | direct Mach-O arm64, portable-C fallback | `macos-aarch64` / `aarch64-apple-darwin` (from any host) |
-| macOS x86_64 (Intel) | yes | portable C backend (needs Xcode CLT's `cc`) | via portable C backend |
-| Windows x86_64 | yes | direct PE64 (core language plus full OS-builtin coverage; ANSI-only paths/env) | `windows-x86_64` / `x86_64-pc-windows-msvc` (from any host) |
+## CLI
 
-`klassic targets` prints the live matrix, including the still-planned
-tier 1/2 targets (`x86_64-unknown-linux-musl`,
-`aarch64-unknown-linux-gnu`, `wasm32-wasi`).
+```bash
+klassic program.kl                 # run through the evaluator
+klassic -e '1 + 2'                 # evaluate an expression
+klassic                            # typed REPL (3: Int)
+klassic build program.kl -o out    # native executable for the host
+klassic --target windows-x86_64 build program.kl -o out.exe
+klassic --backend c build program.kl -o out.c   # portable C99
+klassic targets                    # target matrix
+klassic --warn-trust proofs.kl     # report trusted proofs
+```
 
-## Build And Test
+## Going deeper
 
-Install a recent Rust toolchain, then use the normal Cargo workflow:
+- [Native compilation](https://klassic.github.io/klassic/native/building.html)
+  and the exhaustive [coverage matrix](docs/native-coverage.md)
+- [The GC heap](https://klassic.github.io/klassic/gc/why.html) and its
+  `__gc_*` debug builtins
+- [Architecture notes](docs/architecture-rust.md) — how the compiler
+  pipeline and the three binary writers fit together
+
+## Development
+
+Rust workspace; the usual Cargo workflow is the whole build:
 
 ```bash
 cargo build
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-cargo run -- -e "1 + 2"
 ```
 
-Build an optimized native executable:
-
-```bash
-cargo build --release
-./target/release/klassic -e "1 + 2"
-```
-
-## CLI
-
-Evaluate an expression:
-
-```bash
-klassic -e '1 + 2'
-```
-
-Run a file:
-
-```bash
-klassic path/to/program.kl
-klassic -f path/to/program.kl
-```
-
-Build a native executable for the host:
-
-```bash
-klassic build path/to/program.kl -o program
-./program
-```
-
-Pass `--target` to select a target explicitly — `linux-x86_64` /
-`x86_64-unknown-linux-gnu` (direct ELF), `macos-aarch64` /
-`aarch64-apple-darwin` (direct signed Mach-O), and `windows-x86_64` /
-`x86_64-pc-windows-msvc` (direct PE64) are the implemented direct
-targets, all cross-buildable from any host; `--target native` picks
-the host's. `klassic targets` lists the full matrix.
-
-Emit portable C instead of an ELF executable:
-
-```bash
-klassic --backend c build path/to/program.kl -o program.c
-cc -o program program.c
-```
-
-The C backend covers a growing subset — integers, doubles, booleans, full
-string values (concatenation, equality, `length`, `substring`, `at`,
-`toString`), `println`, `if` / `while`, and annotated `def`s including
-recursion — with strings served by the `klassic_rt_*` shims in the bundled
-`libklassic_runtime.a`, which share their semantics with the evaluator.
-When the output name doesn't end in `.c`, klassic invokes the system C
-compiler and links the runtime automatically, producing an executable in
-one step (that's the native-binary path on macOS). Unsupported constructs
-are source-located diagnostics.
-
-Start the REPL:
-
-```bash
-klassic
-```
-
-The REPL echoes every value with its inferred type (`3: Int`,
-`[1, 2, 3]: List<Int>`); commands include `:history`, `:load <path>`,
-`:reset`, and `:exit`. `klassic --version` prints the release version.
-
-Trust diagnostics:
-
-```bash
-klassic --warn-trust proofs.kl
-klassic --deny-trust proofs.kl
-```
-
-`--warn-trust` reports trusted proof dependencies. `--deny-trust` rejects any
-proof graph that depends on a trusted theorem or axiom.
-
-## Native Compiler Coverage
-
-The native compiler lowers a growing slice of the language directly to a
-selected native target with no external toolchain. Linux x86_64
-(`linux-x86_64` / `x86_64-unknown-linux-gnu`) emits ELF64 and covers the most
-language surface; Apple Silicon macOS (`macos-aarch64` /
-`aarch64-apple-darwin`) emits ad-hoc-signed Mach-O arm64 for a growing subset
-(Int/Bool/String expressions, locals, control flow, functions with recursion,
-string builtins, monomorphic enums and match, cons lists, records, sets with
-method dispatch); Windows x86_64 (`windows-x86_64` / `x86_64-pc-windows-msvc`)
-emits PE64 by reusing the entire Linux x86_64 codegen (only the OS boundary
-and container format differ), so it matches Linux x86_64's core-language
-coverage plus full OS-builtin coverage. Linux x86_64 highlights:
-
-- Core integer / boolean / string / list expressions, control flow, and
-  recursive `def`s (including annotated `String` and `List<String>` parameters).
-- Static folding for pure expressions, with mutable side effects preserved when
-  a value can still be recovered statically.
-- Fixed-buffer runtime strings, line lists, runtime lists, and runtime records,
-  including dynamic `if` branches that merge compatible runtime values.
-- Static maps and sets, plus runtime-key lookups that copy entries into runtime
-  storage without losing the selected length.
-- Linux file / directory / process / environment / stdin / argv builtins via
-  direct syscalls, with virtual filesystem tracking for static paths.
-- Source-located stderr diagnostics for runtime failures (`assert`,
-  `assertResult`, `head([])`, negative `sleep`, FileOutput / Dir errors).
-
-The Windows target covers the same file / directory / process / environment /
-stdin / argv / time builtins through direct Win64 `kernel32.dll` import calls
-instead of raw syscalls, with one limitation: those calls are ANSI-only, so
-non-ASCII paths and environment values/keys are unsupported.
-
-Anything not yet supported fails at build time rather than falling back to the
-evaluator. See [`docs/native-coverage.md`](docs/native-coverage.md) for the
-exhaustive feature matrix.
-
-## Native Garbage Collector
-
-Generated native executables embed a precise mark-and-sweep collector that
-manages a private heap separate from the static `.data` buffers used elsewhere
-by the codegen. The heap starts at 1 MiB and grows in 1 MiB segments via
-additional `mmap` calls (up to 64 segments / 64 MiB) when even a post-collection
-retry cannot satisfy the bump path. Each block carries a 16-byte header (size +
-mark bit, type tag) with five tag values: free, raw bytes, pointer record,
-pointer array, and pointer list (where the first qword is a length the mark
-phase skips). Roots come from three sources: a static 1024-entry pin table, an
-8192-entry shadow stack of every `HeapPointer`-typed stack slot, and mutable
-`HeapPointer` slot reassignment paths.
-
-Source programs reach the heap through a 68-builtin debug surface:
-
-- Allocation: `__gc_alloc(size)`, `__gc_record(num_fields)`,
-  `__gc_array(num_slots)`, `__gc_list_int(n)`, `__gc_list_ptr(n)`.
-- Heap strings: `__gc_string("text")`, `__gc_string_alloc(n)`,
-  `__gc_string_concat(a, b)`, `__gc_string_substring(s, start, end)`,
-  `__gc_string_repeat(s, n)`, `__gc_string_replace(s, from, to)`,
-  `__gc_string_trim(s)`, `__gc_string_to_lower(s)`,
-  `__gc_string_to_upper(s)`, `__gc_string_println(g)`,
-  `__gc_string_len(s)`, `__gc_string_eq(a, b)`,
-  `__gc_string_get_byte(s, idx)`, `__gc_string_set_byte(s, idx, byte)`,
-  `__gc_string_starts_with(s, prefix)`, `__gc_string_ends_with(s, suffix)`,
-  `__gc_string_contains(haystack, needle)`,
-  `__gc_string_index_of(s, byte)`, `__gc_string_index_of_from(s, byte, start)`,
-  `__gc_string_last_index_of(s, byte)`, `__gc_string_to_int(s)`,
-  `__gc_string_split(s, sep_byte)`, `__gc_string_lines(s)`, and
-  `__gc_int_to_string(n)`.
-- Int-list helpers: `__gc_list_int_len`, `_get`, `_set`, `_push`, `_pop`,
-  `_reverse`, `_sum`, `_min`, `_max`, `_println`, and `_to_string`, plus
-  `__gc_list_concat(a, b)`.
-- Pointer-list helpers: `__gc_list_ptr_len`, `_get`, `_get_string`, `_set`,
-  `_push`, `_pop`, `_reverse`, `_concat`, and `_join`.
-- String-keyed maps: `__gc_smap_new`, `_size`, `_has`, `_get`, `_get_string`,
-  `_set`, `_keys`, and `_values`.
-- Raw pointer access: `__gc_read(addr, offset)`,
-  `__gc_read_ptr(addr, offset)`, `__gc_read_string(addr, offset)`, and
-  `__gc_write(addr, offset, value)` (which double as record-field and array-slot
-  access).
-- Roots and observability: `__gc_pin(addr)` / `__gc_unpin(addr)`,
-  `__gc_collect()`, `__gc_collect_count()`, `__gc_segment_count()`,
-  `__gc_pointer_count(addr)`.
-
-All length-aware list and string-byte operations bounds-check through a shared
-`gc_bounds_error` subroutine that prints `klassic gc: index out of bounds` and
-exits with status 1; OOM, segment-limit, root-overflow, worklist-overflow, and
-shadow-overflow paths each print their own dedicated diagnostic.
-
-## Quick Start
-
-Create `hello.kl`:
-
-```klassic
-println("Hello, World!")
-```
-
-Run it:
-
-```bash
-cargo run -- hello.kl
-```
-
-## Syntax Examples
-
-### Variables
-
-```klassic
-val one = 1
-
-mutable i = 1
-i = i + 1
-i += 1
-```
-
-`val` bindings are immutable. `mutable` bindings can be reassigned.
-
-### Functions
-
-```klassic
-val add = (x, y) => x + y
-
-def fact(n) =
-  if(n < 2) 1 else n * fact(n - 1)
-
-println(add(1, 2))
-println(fact(5))
-```
-
-### Blocks And Cleanup
-
-```klassic
-mutable i = 0
-while(i < 10) {
-  i += 1
-} cleanup {
-  println(i)
-}
-```
-
-Cleanup clauses run after the associated expression finishes.
-
-### Collections
-
-```klassic
-val list1 = [1, 2, 3]
-val list2 = [
-  1
-  2
-  3
-]
-
-val map = %["A": 1, "B": 2]
-
-val set1 = %(1, 2, 3)
-val set2 = %(
-  1
-  2
-  3
-)
-```
-
-Lists, maps, and sets accept commas, spaces, and line breaks as separators where
-the language grammar allows collection separators.
-
-### Strings
-
-```klassic
-val name = "Klassic"
-println("Hello, #{name}!")
-println(substring("abcdef", 1, 3))
-```
-
-### Records
-
-```klassic
-record Point {
-  x: Int
-  y: Int
-}
-
-val p = Point(10, 20)
-println(p.x + p.y)
-
-def add_xy(o) = o.x + o.y
-println(add_xy(record { x = 1; y = 2 }))
-```
-
-Record field access participates in the Rust type checker's row-polymorphic
-constraints, including nominal records used through structural field functions.
-Call-site lambdas are checked against expected function types, so reducers such
-as `foldLeft(xs)([])((acc, e) => e #cons acc)` infer the empty accumulator from
-the reducer result instead of escaping through `*`.
-
-### Modules And Imports
-
-```klassic
-module math.demo {
-  def double(x) = x * 2
-}
-
-import math.demo.{double}
-println(double(21))
-```
-
-### Type Classes
-
-```klassic
-typeclass Show<'a> where {
-  show: ('a) => String
-}
-
-instance Show<Int> where {
-  def show(x: Int): String = "Int: " + x
-}
-
-def display<'a>(x: 'a): String where Show<'a> = show(x)
-
-println(display(42))
-```
-
-### Trust Surface
-
-```klassic
-axiom sortedBase(xs: List<Int>): { true }
-
-theorem sortedAgain(xs: List<Int>): { true } =
-  sortedBase(xs)
-```
-
-This compiles normally, warns under `--warn-trust`, and fails under
-`--deny-trust` because it depends on an axiom.
-
-## Repository Layout
-
-- `src/`: native `klassic` CLI binary
-- `crates/klassic-span`: source spans and diagnostics
-- `crates/klassic-syntax`: lexer, parser, and AST
-- `crates/klassic-rewrite`: placeholder desugaring and syntax normalization
-- `crates/klassic-types`: type inference, records, type classes, and proof checks
-- `crates/klassic-eval`: evaluator, runtime behavior, builtins, modules, and REPL state
-- `crates/klassic-runtime`: shared runtime crate scaffold
-- `crates/klassic-macro-peg`: Rust macro PEG implementation
-- `tests/`: Rust integration tests and `.kl` golden harnesses
-- `test-programs/`: sample Klassic programs used by the test harness
-- `docs/`: architecture and native-coverage notes
-- `docs/book/`: mdBook source for [The Klassic Book](https://klassic.github.io/klassic/)
-
-## Development
-
-Use `rg` for source search and keep changes covered by Rust tests:
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo build --release
-cargo test -p klassic-macro-peg
-```
-
-The main build/test path is Rust-only.
+Crates live under `crates/` (`klassic-syntax`, `klassic-types`,
+`klassic-eval`, `klassic-native`, …); sample programs under
+`test-programs/`; the book source under `docs/book/`.
