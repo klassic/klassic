@@ -28495,7 +28495,9 @@ fn build_target_windows_x86_64_emits_pe() {
     // Slice 2 directory-operation imports
     // (CreateDirectoryA/RemoveDirectoryA/MoveFileExA/CopyFileA/
     // GetCurrentDirectoryA/GetTempPathA/GetFileAttributesA/
-    // GetLastError).
+    // GetLastError), plus GetEnvironmentVariableA (backs the
+    // case-insensitive single-key `Environment#get`/`#exists`/
+    // `Dir#home` lookup; see `emit_win_get_env_var_runtime`).
     assert_eq!(
         ilt_names,
         vec![
@@ -28524,6 +28526,7 @@ fn build_target_windows_x86_64_emits_pe() {
             "CreateFileA",
             "CloseHandle",
             "DeleteFileA",
+            "GetEnvironmentVariableA",
         ]
     );
 
@@ -29381,10 +29384,13 @@ fn build_target_windows_x86_64_supports_dir_list() {
 }
 
 /// `Dir#home` reuses `emit_environment_get_static_key` keyed on
-/// `USERPROFILE` (design doc A, "Dir#home" row) once `environment_base`
-/// is populated by `emit_win_store_command_line_state` -- see
-/// `build_target_windows_x86_64_gates_dir`'s doc comment for why the
-/// rest of `Dir#*` stays gated.
+/// `USERPROFILE` (design doc A, "Dir#home" row); on Windows that
+/// function resolves via the case-insensitive `GetEnvironmentVariableA`
+/// -backed `win_get_env_var` shim instead of the `environment_base`
+/// envp-array scan the non-Windows path uses -- see
+/// `emit_win_get_env_var_runtime` -- while
+/// `build_target_windows_x86_64_gates_dir`'s doc comment explains why
+/// the rest of `Dir#*` stays gated.
 #[test]
 fn build_target_windows_x86_64_supports_dir_home() {
     assert_windows_target_builds("dir_home", "println(Dir#home())\n");
@@ -29392,11 +29398,15 @@ fn build_target_windows_x86_64_supports_dir_home() {
 
 /// `Environment#vars` / `Environment#get` / `Environment#exists` (and
 /// the `env()` / `getEnv()` / `hasEnv()` prelude aliases, plus
-/// `std.env`) now build for Windows: `environment_base` is populated at
-/// startup by `emit_win_store_command_line_state`'s
-/// `GetEnvironmentStringsA`-backed envp synthesis instead of being left
-/// zeroed, so the existing `emit_environment_*`/`emit_find_environment_*`
-/// envp-scan helpers work unmodified.
+/// `std.env`) now build for Windows. `Environment#vars` (full
+/// enumeration, where case doesn't matter) is populated at startup by
+/// `emit_win_store_command_line_state`'s `GetEnvironmentStringsA`
+/// -backed envp synthesis and still walks it via the existing
+/// `emit_environment_vars`/`emit_find_environment_*` helpers, but
+/// `Environment#get`/`#exists` (single-key lookups, where real Windows
+/// env-var names are case-insensitive) instead call
+/// `GetEnvironmentVariableA` directly through the `win_get_env_var`
+/// shim -- see `emit_win_get_env_var_runtime`.
 #[test]
 fn build_target_windows_x86_64_supports_environment() {
     assert_windows_target_builds("env_vars", "println(Environment#vars())\n");
@@ -29576,9 +29586,18 @@ fn build_target_windows_x86_64_command_line_args_runs() {
 /// `builds_native_executable_for_environment_vars`/
 /// `_environment_get_and_exists`'s ELF versions: asserts
 /// `emit_win_store_command_line_state`'s `GetEnvironmentStringsA`
-/// -backed envp synthesis is actually walkable end to end (a variable
-/// set on the child process is visible to `Environment#vars`/`#get`/
-/// `#exists`, and a missing one is correctly reported absent).
+/// -backed envp synthesis is actually walkable end to end for
+/// `Environment#vars` (a variable set on the child process is visible,
+/// and a missing one is correctly reported absent), and that
+/// `Environment#get`/`#exists`'s `win_get_env_var`
+/// (`GetEnvironmentVariableA`) shim resolves a real Windows env var
+/// (`PATH`, always present) case-insensitively: `PATH` and a
+/// deliberately mixed-case `pAtH` probe must both report present, and
+/// the looked-up value must be non-empty. Regression coverage for the
+/// bug where `Environment#get`/`#exists` walked `environment_base`
+/// (which stores `Path=`, not `PATH=`) with a byte-for-byte scan, so a
+/// case-mismatched lookup like `Environment#get("PATH")` always
+/// reported "missing" even though `PATH` plainly exists.
 #[cfg(target_os = "windows")]
 #[test]
 fn build_target_windows_x86_64_environment_runs() {
@@ -29591,7 +29610,7 @@ fn build_target_windows_x86_64_environment_runs() {
     let exe_path = dir.join(format!("klassic_pe_env_{stamp}.exe"));
     fs::write(
         &source_path,
-        "val vars = Environment#vars()\nmutable found = false\nforeach(entry in vars) {\n  if(entry == \"KLASSIC_PE_ENV_TEST=alpha\") {\n    found = true\n  }\n}\nprintln(found)\nprintln(Environment#get(\"KLASSIC_PE_ENV_TEST\"))\nprintln(Environment#exists(\"KLASSIC_PE_ENV_TEST\"))\nprintln(Environment#exists(\"KLASSIC_PE_ENV_MISSING\"))\n",
+        "val vars = Environment#vars()\nmutable found = false\nforeach(entry in vars) {\n  if(entry == \"KLASSIC_PE_ENV_TEST=alpha\") {\n    found = true\n  }\n}\nprintln(found)\nprintln(Environment#get(\"KLASSIC_PE_ENV_TEST\"))\nprintln(Environment#exists(\"KLASSIC_PE_ENV_TEST\"))\nprintln(Environment#exists(\"KLASSIC_PE_ENV_MISSING\"))\nprintln(Environment#exists(\"PATH\"))\nprintln(Environment#get(\"PATH\") != \"\")\nprintln(Environment#exists(\"pAtH\"))\n",
     )
     .expect("temp source file should write");
     let build_output = Command::new(klassic_bin())
@@ -29624,7 +29643,7 @@ fn build_target_windows_x86_64_environment_runs() {
     );
     assert_eq!(
         String::from_utf8_lossy(&run_output.stdout),
-        "true\nalpha\ntrue\nfalse\n"
+        "true\nalpha\ntrue\nfalse\ntrue\ntrue\ntrue\n"
     );
 }
 

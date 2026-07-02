@@ -4179,6 +4179,18 @@ struct WindowsRuntime {
     /// from `write_bytes_scratch` even though the shape is identical,
     /// since read and write are conceptually distinct call sites.
     read_bytes_scratch: DataLabel,
+    /// `GetEnvironmentVariableA(name, buf, cap)`-shaped shim: rdi=
+    /// lpName (NUL-terminated ANSI key), rsi=lpBuffer, rdx=nSize (DWORD
+    /// capacity incl. NUL) in, rax=value length **excl.** NUL on
+    /// success, -2 if the variable does not exist, or -1 for any other
+    /// failure (including `nSize` too small) out. Lets the OS resolve
+    /// env-var lookups directly -- real Windows env-var names are
+    /// case-insensitive, unlike the byte-for-byte comparison the
+    /// emulated `environment_base` envp-array scan performs, so single
+    /// -key lookups (`Environment#get`/`#exists`, `Dir#home`) use this
+    /// shim instead of that scan. `Environment#vars` (full enumeration,
+    /// where case doesn't matter) still walks `environment_base`.
+    win_get_env_var: TextLabel,
 }
 
 struct NativeCodeGenerator {
@@ -4467,6 +4479,7 @@ impl NativeCodeGenerator {
                 // 4096 entries + 1 NULL terminator slot.
                 argv_pointer_array: asm.data_label_with_i64s(&vec![0; 4097]),
                 read_bytes_scratch: asm.data_label_with_i64s(&[0]),
+                win_get_env_var: asm.create_text_label(),
             })
         } else {
             None
@@ -5157,6 +5170,7 @@ impl NativeCodeGenerator {
             self.emit_win_write_handle_runtime();
             self.emit_win_close_handle_runtime();
             self.emit_win_delete_file_runtime();
+            self.emit_win_get_env_var_runtime();
         }
         Ok(self.asm.finish())
     }
@@ -5164,26 +5178,6 @@ impl NativeCodeGenerator {
     fn emit_syscall_number(&mut self, syscall: PlatformSyscall) {
         self.asm
             .mov_imm64(Reg::Rax, self.platform.syscall_number(syscall));
-    }
-
-    /// Diagnostic for a builtin whose native codegen needs a raw
-    /// syscall (or a startup-populated slot the current target
-    /// leaves zeroed, e.g. argv/envp on Windows) that isn't wired up
-    /// for `self.platform.target` yet. Every call site guards this
-    /// with an `is_windows` (or other per-target) check itself --
-    /// this only builds the message, naming the concrete target
-    /// triple so it stays accurate as more targets gain coverage.
-    /// This is the compile-time counterpart to the
-    /// `TargetPlatform::syscall_number` panic tripwire: a builtin
-    /// gated here never reaches that panic.
-    fn unsupported_on_target(&self, span: Span, name: &str) -> Diagnostic {
-        Diagnostic::compile(
-            span,
-            format!(
-                "`{name}` is not yet supported when targeting {}",
-                self.platform.target.standard_triple()
-            ),
-        )
     }
 
     fn emit_store_command_line_state(&mut self) {
@@ -23998,7 +23992,7 @@ impl NativeCodeGenerator {
         self.expect_static_arity("Environment#exists", arguments, 1, span)?;
         let key =
             self.compile_environment_key_argument(&arguments[0], span, "Environment#exists")?;
-        self.emit_environment_exists_key_ref(key);
+        self.emit_environment_exists_key_ref(key, span);
         Ok(NativeValue::Bool)
     }
 
@@ -24019,6 +24013,10 @@ impl NativeCodeGenerator {
         span: Span,
         missing_message: &str,
     ) -> NativeValue {
+        if self.is_windows {
+            let key_label = self.nul_terminated_data_label(key);
+            return self.emit_win_environment_get_from_key_label(key_label, span, missing_message);
+        }
         const RUNTIME_STRING_CAP: usize = 65_536;
         let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
         let len = self.asm.data_label_with_i64s(&[0]);
@@ -24041,6 +24039,50 @@ impl NativeCodeGenerator {
             "Environment#get result exceeds 65536 bytes",
         );
         self.emit_store_runtime_string_len_from_offset(len, offset);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(not_found);
+        self.emit_runtime_error(span, missing_message);
+        self.asm.bind_text_label(done);
+
+        NativeValue::RuntimeString { data, len }
+    }
+
+    /// Windows-only: the shared tail of `emit_environment_get_static_key`
+    /// and `emit_environment_get_key_ref`'s Windows branches. `key_label`
+    /// must already be a NUL-terminated ANSI buffer (the static-key
+    /// caller stages one via `nul_terminated_data_label`, the
+    /// `NativeStringRef` caller via `emit_nul_terminated_path_buffer`).
+    /// Calls `win_get_env_var` (`GetEnvironmentVariableA`) directly
+    /// instead of walking the emulated `environment_base` envp array,
+    /// so the lookup is case-insensitive like real Windows env-var
+    /// semantics -- see `emit_win_get_env_var_runtime`.
+    fn emit_win_environment_get_from_key_label(
+        &mut self,
+        key_label: DataLabel,
+        span: Span,
+        missing_message: &str,
+    ) -> NativeValue {
+        const RUNTIME_STRING_CAP: usize = 65_536;
+        let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
+        let len = self.asm.data_label_with_i64s(&[0]);
+
+        self.asm.mov_data_addr(Reg::Rdi, key_label);
+        self.asm.mov_data_addr(Reg::Rsi, data);
+        self.asm.mov_imm64(Reg::Rdx, RUNTIME_STRING_CAP as u64);
+        self.asm.call_label(self.windows_runtime().win_get_env_var);
+
+        self.emit_runtime_error_if_rax_negative_except_errno(
+            span,
+            self.platform.errno_no_entry(),
+            "Environment#get result exceeds 65536 bytes",
+        );
+        let not_found = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm
+            .cmp_reg_imm8(Reg::Rax, self.platform.errno_no_entry());
+        self.asm.jcc_label(Condition::Equal, not_found);
+        self.asm.mov_data_addr(Reg::R10, len);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         self.asm.jmp_label(done);
         self.asm.bind_text_label(not_found);
         self.emit_runtime_error(span, missing_message);
@@ -24124,6 +24166,10 @@ impl NativeCodeGenerator {
         span: Span,
         missing_message: &str,
     ) -> NativeValue {
+        if self.is_windows {
+            let key_label = self.emit_nul_terminated_path_buffer(key, span, "Environment#get");
+            return self.emit_win_environment_get_from_key_label(key_label, span, missing_message);
+        }
         const RUNTIME_STRING_CAP: usize = 65_536;
         let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
         let len = self.asm.data_label_with_i64s(&[0]);
@@ -24199,12 +24245,46 @@ impl NativeCodeGenerator {
         NativeValue::RuntimeString { data, len }
     }
 
-    fn emit_environment_exists_key_ref(&mut self, key: NativeStringRef) {
+    fn emit_environment_exists_key_ref(&mut self, key: NativeStringRef, span: Span) {
+        if self.is_windows {
+            self.emit_win_environment_exists_key_ref(key, span);
+            return;
+        }
         let found = self.emit_find_environment_key_ref(key);
         let done = self.asm.create_text_label();
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Equal, done);
         self.asm.bind_text_label(found);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.bind_text_label(done);
+    }
+
+    /// Windows-only counterpart of `emit_environment_exists_key_ref`:
+    /// probes via `win_get_env_var` (`GetEnvironmentVariableA`) instead
+    /// of walking `environment_base` byte-for-byte, so the check is
+    /// case-insensitive like real Windows env-var semantics. Any
+    /// outcome other than "does not exist" (`-2`) counts as existing --
+    /// including the pathological "value too long for the probe
+    /// buffer" case (`-1`), since that still means the variable exists,
+    /// it just couldn't be read into 65536 bytes.
+    fn emit_win_environment_exists_key_ref(&mut self, key: NativeStringRef, span: Span) {
+        const PROBE_CAP: usize = 65_536;
+        let key_label = self.emit_nul_terminated_path_buffer(key, span, "Environment#exists");
+        let probe = self.asm.data_label_with_bytes(&vec![0; PROBE_CAP]);
+
+        self.asm.mov_data_addr(Reg::Rdi, key_label);
+        self.asm.mov_data_addr(Reg::Rsi, probe);
+        self.asm.mov_imm64(Reg::Rdx, PROBE_CAP as u64);
+        self.asm.call_label(self.windows_runtime().win_get_env_var);
+
+        let exists = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm
+            .cmp_reg_imm8(Reg::Rax, self.platform.errno_no_entry());
+        self.asm.jcc_label(Condition::NotEqual, exists);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(exists);
         self.asm.mov_imm64(Reg::Rax, 1);
         self.asm.bind_text_label(done);
     }
@@ -25194,10 +25274,12 @@ impl NativeCodeGenerator {
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("Dir#home", arguments, 0, span)?;
         // Windows has no `HOME` env var by default; `USERPROFILE` is
-        // its equivalent. Everything else about the lookup (the
-        // envp-array scan `emit_environment_get_static_key` performs)
-        // is target-agnostic once `environment_base` is populated --
-        // see design doc A, "Dir#home" row.
+        // its equivalent. `emit_environment_get_static_key` itself
+        // branches on `self.is_windows`: on Windows it resolves via
+        // `GetEnvironmentVariableA` (case-insensitive, matching real
+        // Windows env-var semantics) instead of the byte-for-byte
+        // `environment_base` envp-array scan the non-Windows path
+        // still uses -- see `emit_win_get_env_var_runtime`.
         if self.is_windows {
             Ok(self.emit_environment_get_static_key(
                 "USERPROFILE",
@@ -40274,6 +40356,84 @@ impl NativeCodeGenerator {
         self.emit_win_shim_epilogue();
     }
 
+    /// `GetEnvironmentVariableA(lpName, lpBuffer, nSize)`-shaped shim.
+    /// Input: rdi=lpName (NUL-terminated ANSI key), rsi=lpBuffer,
+    /// rdx=nSize (DWORD capacity incl. NUL room). Output: rax=value
+    /// length **excl.** NUL on success, -2 if the variable does not
+    /// exist (`GetLastError() == ERROR_ENVVAR_NOT_FOUND`), or -1 for
+    /// any other failure.
+    ///
+    /// A 0 return from `GetEnvironmentVariableA` is ambiguous between
+    /// "not found" and "found, but the value is the empty string" --
+    /// disambiguated here via `GetLastError`, matching the same
+    /// pattern `emit_win_get_file_attributes_runtime` uses for
+    /// `INVALID_FILE_ATTRIBUTES`. A nonzero return that is `>=` the
+    /// `nSize` that was passed in means the buffer was too small:
+    /// `GetEnvironmentVariableA` reports that case by returning the
+    /// *required* size (incl. NUL), which is always `>=` an
+    /// insufficient `nSize`, whereas a successful copy always writes
+    /// strictly fewer chars (excl. NUL) than `nSize`. `nSize` is
+    /// stashed in the Win64 non-volatile `rbx` across the call (`rdi`/
+    /// `rsi` also survive unclobbered, but `rdx` -- where `nSize`
+    /// started -- is volatile and gets overwritten by the call).
+    ///
+    /// Exists so `Environment#get`/`Environment#exists`/`Dir#home` can
+    /// let the OS resolve the lookup directly instead of walking the
+    /// emulated `environment_base` envp array by hand: real Windows
+    /// env-var names are case-insensitive (e.g. the block stores
+    /// `Path=`, not `PATH=`), but that scan compares keys byte-for-
+    /// byte, so `Environment#get("PATH")` silently failed to find a
+    /// variable that plainly exists. `Environment#vars` (full
+    /// enumeration, where case doesn't matter) is unaffected and still
+    /// uses the scan.
+    fn emit_win_get_env_var_runtime(&mut self) {
+        const ERROR_ENVVAR_NOT_FOUND: i32 = 203;
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_get_env_var);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        // rdi=lpName, rsi=lpBuffer, rdx=nSize. Stash nSize in `rbx`
+        // (Win64 non-volatile, so it survives the call below) before
+        // shuffling registers into the WinAPI argument order.
+        self.asm.mov_reg_reg(Reg::Rbx, Reg::Rdx); // nSize (kept for the too-small check)
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rdx); // nSize
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rsi); // lpBuffer
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi); // lpName
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::GetEnvironmentVariableA);
+
+        let zero_result = self.asm.create_text_label();
+        let too_small = self.asm.create_text_label();
+        let not_found = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, zero_result);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rbx);
+        self.asm.jcc_label(Condition::GreaterEqual, too_small);
+        self.asm.jmp_label(done); // success; rax = value length excl. NUL
+
+        self.asm.bind_text_label(zero_result);
+        self.asm.call_import(ImportSymbol::GetLastError);
+        self.asm.cmp_reg_imm32(Reg::Rax, ERROR_ENVVAR_NOT_FOUND);
+        self.asm.jcc_label(Condition::Equal, not_found);
+        // 0 without ERROR_ENVVAR_NOT_FOUND: an empty-valued variable
+        // (e.g. `FOO=`) -- success, length 0.
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.jmp_label(done);
+
+        self.asm.bind_text_label(not_found);
+        self.asm.mov_imm64(Reg::Rax, (-2i64) as u64);
+        self.asm.jmp_label(done);
+
+        self.asm.bind_text_label(too_small);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+
+        self.asm.bind_text_label(done);
+        self.emit_win_shim_epilogue();
+    }
+
     /// `open(path, flags, mode)`-shaped shim wrapping `CreateFileA`.
     /// Input: rdi=path (LPCSTR), rsi=disposition selector
     /// (0=read,1=write-truncate,2=write-append -- see
@@ -43762,10 +43922,11 @@ enum ImportSymbol {
     CreateFileA,
     CloseHandle,
     DeleteFileA,
+    GetEnvironmentVariableA,
 }
 
 impl ImportSymbol {
-    const ALL: [ImportSymbol; 25] = [
+    const ALL: [ImportSymbol; 26] = [
         ImportSymbol::GetStdHandle,
         ImportSymbol::WriteFile,
         ImportSymbol::ExitProcess,
@@ -43791,6 +43952,7 @@ impl ImportSymbol {
         ImportSymbol::CreateFileA,
         ImportSymbol::CloseHandle,
         ImportSymbol::DeleteFileA,
+        ImportSymbol::GetEnvironmentVariableA,
     ];
 
     /// Exact, case-sensitive export name from `kernel32.dll`.
@@ -43821,6 +43983,7 @@ impl ImportSymbol {
             ImportSymbol::CreateFileA => "CreateFileA",
             ImportSymbol::CloseHandle => "CloseHandle",
             ImportSymbol::DeleteFileA => "DeleteFileA",
+            ImportSymbol::GetEnvironmentVariableA => "GetEnvironmentVariableA",
         }
     }
 
