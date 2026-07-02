@@ -36,9 +36,14 @@ Linux (x86_64) or macOS:
 curl -fsSL https://raw.githubusercontent.com/klassic/klassic/main/install.sh | sh
 ```
 
-Windows: download `klassic-<version>-x86_64-pc-windows-msvc.zip` from
-the [releases](https://github.com/klassic/klassic/releases), extract
-`klassic.exe`, put it on `PATH`.
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/klassic/klassic/main/install.ps1 | iex
+```
+
+(or grab the zip from the
+[releases](https://github.com/klassic/klassic/releases) by hand.)
 
 From source: `cargo install --git https://github.com/klassic/klassic`
 
