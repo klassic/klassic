@@ -142,11 +142,16 @@ cargo run -- -e "1 + 2"
   captures without overwriting saved argument values.
   Startup computes a stack floor from `getrlimit(RLIMIT_STACK)` (initial
   rsp minus the limit plus a 256 KiB margin) and every emitted function
-  prologue probes rsp against it, so recursing past the stack reports
-  `klassic: stack overflow` and exits 1 instead of dying on the guard
-  page with a bare SIGSEGV. The probe is inert when the limit is
-  unlimited (floor zero) and skipped entirely for programs that spawn
-  threads, whose stacks live at unrelated addresses.
+  prologue probes rsp against it unconditionally, so recursing past the
+  stack reports `klassic: stack overflow` and exits 1 instead of dying
+  on the guard page with a bare SIGSEGV. The probe is inert when the
+  limit is unlimited (floor zero). It is not skipped for programs that
+  spawn threads: `thread(...)` bodies never run on a genuinely separate
+  stack in this backend (there is no clone/fork syscall anywhere in
+  native codegen) — each queued body is drained and inlined into the
+  same main-thread instruction stream ahead of `emit_functions`, with
+  the drain looping until the queue is truly empty so a thread nested
+  inside another queued thread body is compiled too.
   `println` / `printlnError` stream simple
   string-concatenation and interpolation expressions directly until a heap string
   runtime is added. That streaming fast path is skipped when a fragment performs
