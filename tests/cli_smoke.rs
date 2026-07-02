@@ -28488,3 +28488,173 @@ fn native_build_reports_stack_overflow_with_nested_thread_present() {
         String::from_utf8_lossy(&run_output.stderr)
     );
 }
+
+/// Unannotated mutual recursion with a literal call-site argument (no
+/// return-type annotation, so the return type can't be hinted structurally
+/// because the `else` branch is a bare call to the other function) makes
+/// both `isEven` and `isOdd` require compile-time call-site inlining. The
+/// existing direct-self-recursion check only looks at whether a function's
+/// body references its *own* name, so an `isEven` -> `isOdd` -> `isEven`
+/// cycle slipped past it and the inliner recursed the compiler's own Rust
+/// stack proportional to the literal argument, aborting `klassic build`
+/// itself with no diagnostic at large enough literals (e.g. 2000). Cycle
+/// detection across the whole inline-expansion path now rejects this with
+/// the same source-located diagnostic used for direct recursion, cleanly
+/// and well before the literal is large enough to matter.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_reports_mutual_recursion_inline_cycle() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_mutual_inline_cycle_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_mutual_inline_cycle_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "def isEven(n) = if (n == 0) true else isOdd(n - 1)\n\
+         def isOdd(n) = if (n == 0) false else isEven(n - 1)\n\
+         println(isEven(2000))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !build_output.status.success(),
+        "unannotated mutual recursion at a large literal should fail to build, not crash it\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    assert_eq!(
+        build_output.status.code(),
+        Some(1),
+        "should be a clean diagnostic exit, not a signal (SIGABRT/SIGSEGV)\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&build_output.stderr)
+            .contains("native recursive function requiring call-site inlining"),
+        "expected the recursive call-site-inlining diagnostic, got:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
+/// Companion to `native_build_reports_mutual_recursion_inline_cycle`:
+/// mutual recursion with explicit type annotations never needs call-site
+/// inlining (the return type is known from the annotation), so it keeps
+/// compiling to real recursive calls through the regular by-value ABI and
+/// must be unaffected by the inline-cycle guard above. Exercises both a
+/// small input (correctness) and, past the point of the existing
+/// `RLIMIT_STACK`-based guard (issue #418), a very deep one that still
+/// gracefully reports `klassic: stack overflow` rather than crashing the
+/// produced binary.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_runs_annotated_mutual_recursion() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source = "def isEven(n: Int): Bool = if (n == 0) true else isOdd(n - 1)\n\
+         def isOdd(n: Int): Bool = if (n == 0) false else isEven(n - 1)\n";
+
+    // Small input: builds and runs to the correct result.
+    let small_source_path =
+        std::env::temp_dir().join(format!("klassic_native_mutual_annot_small_{stamp}.kl"));
+    let small_output_path =
+        std::env::temp_dir().join(format!("klassic_native_mutual_annot_small_{stamp}.bin"));
+    fs::write(
+        &small_source_path,
+        format!("{source}println(isEven(10))\nprintln(isOdd(7))\n"),
+    )
+    .expect("temp source file should write");
+
+    let small_build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            small_source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            small_output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        small_build_output.status.success(),
+        "annotated mutual recursion should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&small_build_output.stderr)
+    );
+    let small_run_output = Command::new(&small_output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&small_source_path);
+    let _ = fs::remove_file(&small_output_path);
+    assert!(
+        small_run_output.status.success(),
+        "small-input annotated mutual recursion should run cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&small_run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&small_run_output.stdout),
+        "true\ntrue\n"
+    );
+
+    // Deep input: builds, and the *runtime* stack-overflow guard (not this
+    // fix) reports the overflow gracefully instead of crashing.
+    let deep_source_path =
+        std::env::temp_dir().join(format!("klassic_native_mutual_annot_deep_{stamp}.kl"));
+    let deep_output_path =
+        std::env::temp_dir().join(format!("klassic_native_mutual_annot_deep_{stamp}.bin"));
+    fs::write(
+        &deep_source_path,
+        format!("{source}println(isEven(1000000))\n"),
+    )
+    .expect("temp source file should write");
+
+    let deep_build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            deep_source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            deep_output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        deep_build_output.status.success(),
+        "annotated mutual recursion at a deep call-site literal should still compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&deep_build_output.stderr)
+    );
+    let deep_run_output = Command::new(&deep_output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&deep_source_path);
+    let _ = fs::remove_file(&deep_output_path);
+    assert!(
+        !deep_run_output.status.success(),
+        "deep mutual recursion should abort gracefully, not succeed"
+    );
+    assert_eq!(
+        deep_run_output.status.code(),
+        Some(1),
+        "graceful exit, not a signal"
+    );
+    assert!(
+        String::from_utf8_lossy(&deep_run_output.stderr).contains("klassic: stack overflow"),
+        "stderr should carry the stack overflow report, got:\n{}",
+        String::from_utf8_lossy(&deep_run_output.stderr)
+    );
+}
