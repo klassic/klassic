@@ -33,11 +33,22 @@ Linux. The macOS builds run on macOS 11+.
 
 ## Windows
 
-Download the `klassic-vX.Y.Z-x86_64-pc-windows-msvc.zip` asset from
-the latest [release](https://github.com/klassic/klassic/releases),
-extract it, and put the folder containing `klassic.exe` on your `PATH`
-(for example, via *System Properties → Environment Variables*, or
-`setx PATH "%PATH%;C:\klassic"` in an elevated prompt). Then confirm it
+One line, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/klassic/klassic/main/install.ps1 | iex
+```
+
+The installer downloads the latest release into `%USERPROFILE%\.klassic\bin`,
+verifies it by running a Klassic program, and prints the one-liner that
+adds it to your user `PATH`. Set `KLASSIC_VERSION` to pin a tag,
+`KLASSIC_HOME` to change the install root — the same knobs as the Unix
+installer.
+
+Prefer doing it by hand? Download the
+`klassic-vX.Y.Z-x86_64-pc-windows-msvc.zip` asset from the latest
+[release](https://github.com/klassic/klassic/releases), extract it, and
+put the folder containing `klassic.exe` on your `PATH`. Then confirm it
 works from PowerShell or `cmd.exe`:
 
 ```bat
