@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use klassic_span::{Diagnostic, DiagnosticKind, Severity, Span};
@@ -108,6 +108,19 @@ struct RecordSchema {
 struct EnumSchema {
     type_params: Vec<String>,
     variants: Vec<(String, Vec<Type>)>,
+    /// Process-wide monotonic registration order (see
+    /// `next_enum_declaration_order`), used to deterministically
+    /// resolve a bare constructor name shared by two enums in favour
+    /// of the more recently declared one — mirroring the ordinary
+    /// scope-shadowing rule already used for the constructor's own
+    /// binding (`declare_poly` simply overwrites the prior entry).
+    /// A `HashMap` iteration order is NOT usable for this: it is
+    /// re-randomised every process (`RandomState`), which previously
+    /// made programs that shadow a prelude constructor (e.g. a user
+    /// `enum Opt { case None; .. }` next to the prelude's `Option`)
+    /// typecheck successfully or fail with a bogus "type mismatch"
+    /// depending on the run.
+    declared_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +198,27 @@ thread_local! {
     /// the caller.
     static USER_EXTENSION_METHODS: RefCell<HashMap<(String, String), StoredType>> =
         RefCell::new(HashMap::new());
+    /// Backing counter for `next_enum_declaration_order`. Deliberately
+    /// never reset by `clear_user_enum_schemas` (or anything else): it
+    /// only needs to keep growing so that any two `EnumSchema`s ever
+    /// alive at once compare in the order they were declared, even
+    /// across the `USER_ENUM_SCHEMAS` export/import round trip that
+    /// happens between successive top-level typechecks (REPL
+    /// statements, module compilation units, etc.) in the same
+    /// process/thread.
+    static ENUM_DECLARATION_ORDER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Hand out a fresh, process-thread-monotonic sequence number for an
+/// enum declaration, used to break ties deterministically when a
+/// constructor name (e.g. `None`) is shared by more than one visible
+/// enum. See the `declared_at` field of `EnumSchema`.
+fn next_enum_declaration_order() -> u64 {
+    ENUM_DECLARATION_ORDER.with(|counter| {
+        let order = counter.get();
+        counter.set(order + 1);
+        order
+    })
 }
 
 fn normalise_receiver_annotation(annotation: &TypeAnnotation) -> String {
@@ -4398,6 +4432,7 @@ impl TypeChecker {
             EnumSchema {
                 type_params: type_params.clone(),
                 variants: schema_variants.clone(),
+                declared_at: next_enum_declaration_order(),
             },
         );
         // Each constructor is a polymorphic function into the enum
@@ -4688,17 +4723,38 @@ impl TypeChecker {
         ))
     }
 
+    /// Resolve a bare constructor name (no scrutinee enum to pin it to)
+    /// against every enum currently in scope. When more than one enum
+    /// declares a variant of this name — most commonly a user enum
+    /// reusing a prelude name like `Some`/`None`/`Ok`/`Err` — the most
+    /// recently declared enum wins, by `EnumSchema::declared_at`. This
+    /// is a deliberate shadowing rule (user declarations, which are
+    /// always registered after the prelude's, shadow the prelude; a
+    /// later user enum shadows an earlier one), not an artifact of
+    /// `HashMap` iteration: iterating `self.enum_schemas` directly for
+    /// the first structural match was the actual bug (`RandomState`
+    /// reseeds every process, so the answer flipped run to run — see
+    /// issue #542). Ties (which `declared_at` cannot produce, since it
+    /// is a strictly increasing counter) would be broken by enum name
+    /// for full determinism, but are unreachable in practice.
     fn enum_variant_schema(&self, variant: &str) -> Option<(String, Vec<String>, Vec<Type>)> {
-        for (enum_name, schema) in &self.enum_schemas {
-            if let Some((_, fields)) = schema.variants.iter().find(|(name, _)| name == variant) {
-                return Some((
+        self.enum_schemas
+            .iter()
+            .filter_map(|(enum_name, schema)| {
+                schema
+                    .variants
+                    .iter()
+                    .find(|(name, _)| name == variant)
+                    .map(|(_, fields)| (enum_name, schema, fields))
+            })
+            .max_by_key(|(enum_name, schema, _)| (schema.declared_at, enum_name.as_str()))
+            .map(|(enum_name, schema, fields)| {
+                (
                     enum_name.clone(),
                     schema.type_params.clone(),
                     fields.clone(),
-                ));
-            }
-        }
-        None
+                )
+            })
     }
 
     fn infer_extension_declaration(
@@ -7136,7 +7192,7 @@ mod tests {
     use klassic_span::SourceFile;
     use klassic_syntax::parse_source;
 
-    use super::typecheck_program;
+    use super::{EnumSchema, Type, TypeChecker, next_enum_declaration_order, typecheck_program};
 
     #[test]
     fn accepts_basic_function_annotations() {
@@ -7436,6 +7492,87 @@ mod tests {
             error
                 .message
                 .contains("proof body does not establish declared proposition")
+        );
+    }
+
+    /// Regression test for issue #542: `enum_variant_schema` used to pick
+    /// among enums sharing a variant name by iterating `enum_schemas`
+    /// (a `HashMap`), whose order is re-randomised every process. That
+    /// made a program with both the prelude's `Option` and a user enum
+    /// declaring `None` typecheck or fail nondeterministically depending
+    /// on which enum the hash-order iteration happened to reach first.
+    /// This test bypasses the (already-deterministic, hash-order-blind)
+    /// program-level entry points and exercises the private resolution
+    /// method directly, so a regression here can't hide behind a lucky
+    /// hash seed the way a single end-to-end run could.
+    #[test]
+    fn enum_variant_schema_prefers_the_more_recently_declared_enum() {
+        let mut checker = TypeChecker::default();
+        let option_variants = vec![
+            ("Some".to_string(), vec![Type::Generic("a".to_string())]),
+            ("None".to_string(), Vec::new()),
+        ];
+        checker.enum_schemas.insert(
+            "Option".to_string(),
+            EnumSchema {
+                type_params: vec!["a".to_string()],
+                variants: option_variants.clone(),
+                declared_at: next_enum_declaration_order(),
+            },
+        );
+        // A user `enum Opt` is always registered strictly after the
+        // prelude's `Option` (the prelude is installed first; user
+        // source is typechecked afterwards), so it must win.
+        checker.enum_schemas.insert(
+            "Opt".to_string(),
+            EnumSchema {
+                type_params: vec!["a".to_string()],
+                variants: option_variants,
+                declared_at: next_enum_declaration_order(),
+            },
+        );
+        let (enum_name, _type_params, _fields) = checker
+            .enum_variant_schema("None")
+            .expect("`None` should resolve against one of the two registered enums");
+        assert_eq!(
+            enum_name, "Opt",
+            "a later-declared user enum must shadow an earlier one (here, the prelude's Option) \
+             for a shared bare constructor name"
+        );
+
+        // Insertion order into the `HashMap` must not matter — only
+        // `declared_at` does. Re-run with a fresh checker where `Opt` is
+        // inserted into the map before `Option`, but still declared
+        // (via `next_enum_declaration_order`) after it.
+        let mut checker = TypeChecker::default();
+        let opt_variants = vec![
+            ("Some".to_string(), vec![Type::Generic("a".to_string())]),
+            ("None".to_string(), Vec::new()),
+        ];
+        let option_order = next_enum_declaration_order();
+        let opt_order = next_enum_declaration_order();
+        checker.enum_schemas.insert(
+            "Opt".to_string(),
+            EnumSchema {
+                type_params: vec!["a".to_string()],
+                variants: opt_variants.clone(),
+                declared_at: opt_order,
+            },
+        );
+        checker.enum_schemas.insert(
+            "Option".to_string(),
+            EnumSchema {
+                type_params: vec!["a".to_string()],
+                variants: opt_variants,
+                declared_at: option_order,
+            },
+        );
+        let (enum_name, _type_params, _fields) = checker
+            .enum_variant_schema("None")
+            .expect("`None` should resolve against one of the two registered enums");
+        assert_eq!(
+            enum_name, "Opt",
+            "resolution must follow declaration recency, not HashMap insertion order"
         );
     }
 }

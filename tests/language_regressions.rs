@@ -797,6 +797,72 @@ fn match_resolves_constructors_against_the_scrutinee_enum() {
     );
 }
 
+/// Pins the exact minimized reproduction from issue #542: a user enum
+/// with an unannotated match scrutinee inside a generic function. `o`
+/// has NO type annotation, so at the point the match arms are checked
+/// the scrutinee is still a bare type variable, not a known
+/// `Type::Enum`. That forces the resolver down the "no scrutinee to pin
+/// against" path (`TypeChecker::enum_variant_schema`), which — before
+/// the fix — picked among enums sharing the `None` / `Some` names by
+/// iterating a `HashMap` whose order is re-randomised every process.
+/// `evaluate_text` alone (no bundled stdlib) only has this one enum
+/// registered, so it cannot reproduce the flakiness by itself; see
+/// `later_user_enum_shadows_an_earlier_user_enum_with_the_same_variant_names`
+/// below and `enum_variant_schema_prefers_the_more_recently_declared_enum` in
+/// `klassic-types` for tests that put two competing enums in
+/// `enum_schemas` and so exercise the actual HashMap-order hazard, and
+/// the fix's CLI-level 30x-loop verification (which does load the real
+/// stdlib `Option`) for empirical coverage of the flakiness itself.
+#[test]
+fn user_enum_constructor_resolves_deterministically_against_unannotated_scrutinee() {
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "enum Opt<a> { case Some(v: a); case None }\n\
+             def check(o) = o match { case None => 0; case Some(v) => 1 }\n\
+             check(None)",
+        )
+        .unwrap(),
+        Value::Int(0)
+    );
+}
+
+/// Two user enums sharing the `Some` / `None` variant names, both
+/// registered in the same typecheck pass, is exactly the shape that
+/// exposed the `HashMap`-iteration-order bug: both entries land in the
+/// same `enum_schemas` map, and the pre-fix blind lookup returned
+/// whichever the hasher visited first. The declared shadowing rule is
+/// "most recently declared wins" — mirroring the deterministic,
+/// scope-based shadowing that already applied to the constructor's own
+/// binding (`Some`/`None` as plain identifiers) even before this fix.
+/// `Second` is declared after `First`, so `Second` must win for both
+/// the unannotated match arm and the literal constructor call.
+#[test]
+fn later_user_enum_shadows_an_earlier_user_enum_with_the_same_variant_names() {
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "enum First<a> { case Some(v: a); case None }\n\
+             enum Second<a> { case Some(v: a); case None }\n\
+             def check(o) = o match { case None => 0; case Some(v) => 1 }\n\
+             check(None)",
+        )
+        .unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "enum First<a> { case Some(v: a); case None }\n\
+             enum Second<a> { case Some(v: a); case None }\n\
+             def check(o) = o match { case None => 0; case Some(v) => 1 }\n\
+             check(Some(9))",
+        )
+        .unwrap(),
+        Value::Int(1)
+    );
+}
+
 #[test]
 fn record_specs_are_covered_more_directly() {
     assert_eq!(
