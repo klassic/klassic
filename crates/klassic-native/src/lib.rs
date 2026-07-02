@@ -25581,6 +25581,70 @@ impl NativeCodeGenerator {
         Ok(NativeValue::Unit)
     }
 
+    /// After a directory move, every tracked path underneath the moved
+    /// source has physically moved with it. Rewriting only the exact
+    /// source->target key left descendants keyed under the stale prefix,
+    /// so `Dir#isDirectory` constant-folded to the pre-move world.
+    fn move_virtual_descendants(&mut self, source: &str, target: &str) {
+        let source_prefix = format!("{source}/");
+        let target_prefix = format!("{target}/");
+        let moved_dirs: Vec<String> = self
+            .virtual_dirs
+            .iter()
+            .filter(|path| path.starts_with(&source_prefix))
+            .cloned()
+            .collect();
+        for old in moved_dirs {
+            self.virtual_dirs.remove(&old);
+            let renamed = format!("{target_prefix}{}", &old[source_prefix.len()..]);
+            self.unknown_virtual_paths.remove(&renamed);
+            self.virtual_dirs.insert(renamed);
+        }
+        let moved_files: Vec<String> = self
+            .virtual_files
+            .keys()
+            .filter(|path| path.starts_with(&source_prefix))
+            .cloned()
+            .collect();
+        for old in moved_files {
+            if let Some(content) = self.virtual_files.remove(&old) {
+                let renamed = format!("{target_prefix}{}", &old[source_prefix.len()..]);
+                self.unknown_virtual_paths.remove(&renamed);
+                self.virtual_files.insert(renamed, content);
+            }
+        }
+        let moved_unknown: Vec<String> = self
+            .unknown_virtual_paths
+            .iter()
+            .filter(|path| path.starts_with(&source_prefix))
+            .cloned()
+            .collect();
+        for old in moved_unknown {
+            self.unknown_virtual_paths.remove(&old);
+            self.unknown_virtual_paths
+                .insert(format!("{target_prefix}{}", &old[source_prefix.len()..]));
+        }
+    }
+
+    /// Conservative variant for moves where only one endpoint is
+    /// statically known: descendants of that endpoint become unknown
+    /// (their new location cannot be computed at compile time).
+    fn forget_virtual_descendants(&mut self, root: &str) {
+        let prefix = format!("{root}/");
+        let stale: Vec<String> = self
+            .virtual_dirs
+            .iter()
+            .chain(self.virtual_files.keys())
+            .filter(|path| path.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for path in stale {
+            self.virtual_dirs.remove(&path);
+            self.virtual_files.remove(&path);
+            self.unknown_virtual_paths.insert(path);
+        }
+    }
+
     fn compile_dir_move(
         &mut self,
         arguments: &[Expr],
@@ -25596,11 +25660,13 @@ impl NativeCodeGenerator {
                 self.compile_path_argument_to_label(&arguments[1], span, "Dir#move")?;
             self.emit_dir_move_labels(source_label, target_label, span, "Dir#move");
             if let Some(source) = source {
+                self.forget_virtual_descendants(&source);
                 self.virtual_files.remove(&source);
                 self.virtual_dirs.remove(&source);
                 self.unknown_virtual_paths.insert(source);
             }
             if let Some(target) = target {
+                self.forget_virtual_descendants(&target);
                 self.virtual_files.remove(&target);
                 self.virtual_dirs.remove(&target);
                 self.unknown_virtual_paths.insert(target);
@@ -25614,6 +25680,10 @@ impl NativeCodeGenerator {
         let moved_file = self.virtual_files.remove(&source);
         let moved_dir = self.virtual_dirs.remove(&source);
         self.emit_dir_move(&source, &target, span, "Dir#move");
+        // Whatever previously lived under the target is gone; the
+        // source's subtree is now the target's subtree.
+        self.forget_virtual_descendants(&target);
+        self.move_virtual_descendants(&source, &target);
         if let Some(content) = moved_file {
             self.virtual_files.insert(target.clone(), content);
             self.unknown_virtual_paths.remove(&source);
