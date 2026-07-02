@@ -28725,3 +28725,397 @@ fn build_target_windows_x86_64_enum_match_runs() {
     );
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "12\n9\n");
 }
+
+/// Shared assertion for W1-b Windows-target gating (slice after
+/// W1-a's `x86_64-pc-windows-msvc` PE64 backend landed): cross-builds
+/// `source` for the Windows target and asserts the build fails with a
+/// clean, span-aware diagnostic containing `expected_diagnostic`
+/// rather than panicking. Every not-yet-Windows-gated syscall path in
+/// `klassic-native` reaches `TargetPlatform::syscall_number`'s
+/// deliberate `panic!` tripwire (see that method's doc comment in
+/// `crates/klassic-native/src/lib.rs`), so asserting the absence of
+/// "internal error" / "panicked" here is what actually distinguishes
+/// a real gate from an unguarded path that happened to hit a
+/// different early error first. Runs on any host (including Linux
+/// CI): building for the Windows target never requires executing the
+/// result.
+fn assert_windows_target_gate(unique_tag: &str, source: &str, expected_diagnostic: &str) {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_gate_{unique_tag}_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_gate_{unique_tag}_{stamp}.exe"));
+    fs::write(&source_path, source).expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    let stderr = String::from_utf8_lossy(&build_output.stderr);
+    assert!(
+        !build_output.status.success(),
+        "windows build of gated feature ({unique_tag}) should fail to build\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&build_output.stdout)
+    );
+    assert!(
+        !stderr.contains("internal error") && !stderr.contains("panicked"),
+        "windows build of gated feature ({unique_tag}) must fail with a clean diagnostic, not a panic\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(expected_diagnostic),
+        "windows build of gated feature ({unique_tag}) should mention {expected_diagnostic:?}\nstderr:\n{stderr}"
+    );
+}
+
+/// `sleep` reaches the `Nanosleep` syscall (`compile_sleep`) and has
+/// no Win64 shim, so it must be gated rather than panic.
+#[test]
+fn build_target_windows_x86_64_gates_sleep() {
+    assert_windows_target_gate(
+        "sleep",
+        "sleep(0)\nprintln(\"unreachable\")\n",
+        "`sleep` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `stopwatch` and `Time#nowMillis` both reach the `ClockGettime`
+/// syscall (`compile_stopwatch` / `compile_time_now_millis`) and have
+/// no Win64 shim.
+#[test]
+fn build_target_windows_x86_64_gates_time() {
+    assert_windows_target_gate(
+        "time_stopwatch",
+        "val e = stopwatch(() => 1)\nprintln(e)\n",
+        "`stopwatch` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "time_now_millis",
+        "println(Time#nowMillis())\n",
+        "`Time#nowMillis` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `StandardInput#all` / `StandardInput#lines` (and their `stdin()` /
+/// `stdinLines()` aliases) reach the `Read` syscall
+/// (`emit_standard_input_to_runtime_string`) and have no Win64 shim.
+#[test]
+fn build_target_windows_x86_64_gates_stdin() {
+    assert_windows_target_gate(
+        "stdin_all",
+        "println(StandardInput#all())\n",
+        "`StandardInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "stdin_lines",
+        "println(StandardInput#lines())\n",
+        "`StandardInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `std.file` / `FileOutput#` / `FileInput#` reach `Open`/`Read`/
+/// `Write`/`Close`/`Unlink` (`emit_file_write*`,
+/// `emit_file_read_to_runtime_string*`, `emit_file_delete*`), none of
+/// which have a Win64 shim beyond the stdout/stderr-only `win_write`
+/// (which the file-write helpers reuse for the *shape* of the call
+/// but which would resolve to the wrong handle for a real file
+/// descriptor, so the whole operation is gated instead of only the
+/// `Open`/`Close` bookends). Also covers the `println(FileInput#all
+/// (...))` / `println(FileInput#lines(...))` /
+/// `println(FileInput#open(path, s => s.readLines()))` print-fusion
+/// fast paths in `emit_print_expr_fragment`, which stream straight to
+/// the target fd and would otherwise bypass the
+/// `compile_file_input_all` / `compile_file_input_lines` gates.
+#[test]
+fn build_target_windows_x86_64_gates_file() {
+    assert_windows_target_gate(
+        "file_write",
+        "FileOutput#write(\"a.txt\", \"hi\")\n",
+        "`FileOutput#write` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_append",
+        "FileOutput#append(\"a.txt\", \"hi\")\n",
+        "`FileOutput#append` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_write_lines",
+        "FileOutput#writeLines(\"a.txt\", [\"x\"])\n",
+        "`FileOutput#writeLines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_exists",
+        "println(FileOutput#exists(\"a.txt\"))\n",
+        "`FileOutput#exists` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_delete",
+        "FileOutput#delete(\"a.txt\")\n",
+        "`FileOutput#delete` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_all",
+        "println(FileInput#all(\"Cargo.toml\"))\n",
+        "`FileInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_read_all",
+        "println(FileInput#readAll(\"Cargo.toml\"))\n",
+        "`FileInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_lines",
+        "println(FileInput#lines(\"Cargo.toml\"))\n",
+        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_read_lines",
+        "println(FileInput#readLines(\"Cargo.toml\"))\n",
+        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    // Print-fusion fast paths in `emit_print_expr_fragment` that
+    // bypass the plain `FileInput#all`/`FileInput#lines` call
+    // dispatch entirely -- these must be independently confirmed
+    // gated, not just the plain-call form above.
+    assert_windows_target_gate(
+        "file_input_all_print_fusion",
+        "println(FileInput#all(\"Cargo.toml\"))\n",
+        "`FileInput#all` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_lines_print_fusion",
+        "println(FileInput#lines(\"Cargo.toml\"))\n",
+        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "file_input_open_print_fusion",
+        "println(FileInput#open(\"Cargo.toml\", (stream) => FileInput#readLines(stream)))\n",
+        "`FileInput#lines` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `std.dir` / `Dir#*` reach `Getcwd`/`Access`/`Newfstatat`/`Mkdir`/
+/// `Rmdir`/`Rename`/`Open`/`Getdents64`/`Close`/`Sendfile` (or, for
+/// `home`/`temp`, the argv/envp startup slots W1-a leaves zeroed on
+/// Windows -- see `emit_store_command_line_state` -- which would
+/// otherwise silently return `"/tmp"` for `Dir#temp` or a spurious
+/// "not set" runtime error for `Dir#home` instead of a compile-time
+/// diagnostic), none of which have a Win64 shim.
+#[test]
+fn build_target_windows_x86_64_gates_dir() {
+    assert_windows_target_gate(
+        "dir_current",
+        "println(Dir#current())\n",
+        "`Dir#current` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_home",
+        "println(Dir#home())\n",
+        "`Dir#home` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_temp",
+        "println(Dir#temp())\n",
+        "`Dir#temp` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_exists",
+        "println(Dir#exists(\"src\"))\n",
+        "`Dir#exists` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_is_directory",
+        "println(Dir#isDirectory(\"src\"))\n",
+        "`Dir#isDirectory` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_is_file",
+        "println(Dir#isFile(\"Cargo.toml\"))\n",
+        "`Dir#isFile` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_mkdir",
+        "Dir#mkdir(\"newdir\")\n",
+        "`Dir#mkdir` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_mkdirs",
+        "Dir#mkdirs(\"a/b/c\")\n",
+        "`Dir#mkdirs` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_list",
+        "println(Dir#list(\"src\"))\n",
+        "`Dir#list` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_list_full",
+        "println(Dir#listFull(\"src\"))\n",
+        "`Dir#listFull` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_delete",
+        "Dir#delete(\"newdir\")\n",
+        "`Dir#delete` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_copy",
+        "Dir#copy(\"a.txt\", \"b.txt\")\n",
+        "`Dir#copy` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "dir_move",
+        "Dir#move(\"a.txt\", \"b.txt\")\n",
+        "`Dir#move` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `Environment#vars` / `Environment#get` / `Environment#exists` (and
+/// the `env()` / `getEnv()` / `hasEnv()` prelude aliases, plus
+/// `std.env`) all walk the `environment_base` linked block that W1-a
+/// leaves zeroed on Windows (see `emit_store_command_line_state`) --
+/// unlike the syscall-backed families above, an ungated build of
+/// these would not panic at all, it would silently compile a binary
+/// where `Environment#vars()` is always `[]`, `Environment#exists`
+/// is always `false`, and `Environment#get` always raises the
+/// "missing environment variable" runtime error, so this is the
+/// "produces wrong results without syscalls" case called out
+/// alongside `CommandLine#args` below.
+#[test]
+fn build_target_windows_x86_64_gates_environment() {
+    assert_windows_target_gate(
+        "env_vars",
+        "println(Environment#vars())\n",
+        "`Environment#vars` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "env_get",
+        "println(Environment#get(\"PATH\"))\n",
+        "`Environment#get` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+    assert_windows_target_gate(
+        "env_exists",
+        "println(Environment#exists(\"PATH\"))\n",
+        "`Environment#exists` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `CommandLine#args` (and the `args()` prelude alias, plus
+/// `std.process.args`/`std.cli`) walks the argc/argv1 startup slots
+/// W1-a leaves zeroed on Windows (see
+/// `emit_store_command_line_state`), so an ungated build would
+/// silently compile a binary where `CommandLine#args()` is always
+/// `[]` instead of failing to build.
+#[test]
+fn build_target_windows_x86_64_gates_command_line_args() {
+    assert_windows_target_gate(
+        "command_line_args",
+        "println(CommandLine#args())\n",
+        "`CommandLine#args` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// `thread { ... }` (`compile_thread`/`emit_queued_threads`) itself
+/// never reaches a syscall: unlike a real OS thread, a queued
+/// `thread` body is compiled straight into the tail of `main` and run
+/// serially before exit, so it needs no per-target gate of its own --
+/// confirmed here by asserting a `thread` body that touches no OS
+/// feature builds successfully for Windows. A `thread` body that
+/// *does* use a gated feature is caught transitively through that
+/// feature's own gate, confirmed by the second half of this test
+/// (`emit_queued_threads` calls `compile_expr` on the body, which
+/// dispatches through the same gated `compile_file_output_write` as
+/// any other call site).
+#[test]
+fn build_target_windows_x86_64_thread_gate_is_transitive() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_thread_ok_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_thread_ok_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "mutable x = 1\nthread(() => { x = x + 1 })\nprintln(x)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        build_output.status.success(),
+        "a thread body touching no OS feature should build for windows\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    assert_windows_target_gate(
+        "thread_file_io",
+        "thread(() => { FileOutput#write(\"a.txt\", \"hi\") })\n",
+        "`FileOutput#write` is not yet supported when targeting x86_64-pc-windows-msvc",
+    );
+}
+
+/// Positive control for every gate above: importing a `std.*` module
+/// and calling only its pure helpers (no OS feature) must still build
+/// for Windows. `std.time`'s `formatIso`/`durationMillis` operate on
+/// an already-materialized epoch-millis integer and never call
+/// `Time#nowMillis` themselves, so this is a real "import without
+/// use" case rather than a trivially-empty program (`std.cli`'s
+/// otherwise-equally-pure `flag`/`option`/`positionals` were tried
+/// here first, but they hit an unrelated pre-existing native-compiler
+/// limitation -- "native recursive function requiring call-site
+/// inlining is not supported" -- on every target, including Linux, so
+/// they are not a usable positive control).
+#[test]
+fn build_target_windows_x86_64_pure_stdlib_use_is_not_gated() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_pure_stdlib_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_pure_stdlib_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "import std.time\nprintln(formatIso(0))\nprintln(durationMillis(100, 250))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        build_output.status.success(),
+        "std.cli pure-helper use should build for windows without tripping any OS-feature gate\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}

@@ -866,9 +866,8 @@ cargo run -- -e "1 + 2"
   probe) that have no Windows equivalent at this raw an entry point.
   `TargetPlatform::syscall_number` panics unconditionally for a
   Windows target as a compile-time tripwire, so any not-yet-gated
-  syscall path (file/dir/time/thread/stdin — out of scope for this
-  slice) fails loudly instead of silently emitting a Linux syscall
-  number into a Windows binary. Each shim forces 16-byte `rsp`
+  syscall path fails loudly instead of silently emitting a Linux
+  syscall number into a Windows binary. Each shim forces 16-byte `rsp`
   alignment via `and rsp, -16` before its own `call [rip+iat]`
   regardless of how it was entered — the reused Linux codegen was
   never written to maintain the Win64 "aligned before every call"
@@ -885,6 +884,35 @@ cargo run -- -e "1 + 2"
   Linux) against hello-world, recursive `def`s, string/enum/record/list
   operations, closures, and a GC-churn stress program, all matching
   the evaluator's output byte-for-byte.
+
+  Every builtin whose native codegen would otherwise reach that
+  `syscall_number` tripwire on Windows is now gated at its own
+  `compile_*` entry point (`if self.is_windows { return Err(...) }`,
+  before any codegen for that builtin runs): `sleep`, `stopwatch`,
+  `Time#nowMillis`, `StandardInput#all`/`#lines`, the whole
+  `FileOutput#`/`FileInput#` family, the whole `Dir#` family,
+  `Environment#vars`/`#get`/`#exists`, and `CommandLine#args` each
+  raise a `` `Feature` is not yet supported when targeting
+  x86_64-pc-windows-msvc `` diagnostic instead of panicking.
+  `Environment#*` and `CommandLine#args` don't reach a raw syscall at
+  all — they walk the `environment_base`/`command_line_argc`/
+  `command_line_argv1_base` slots `emit_store_command_line_state`
+  leaves zeroed on Windows — so without a gate they would silently
+  compile a binary that always observes an empty environment/argument
+  list rather than failing to build; they're gated for that "wrong
+  answer, not a crash" reason instead. Two call sites reach a subset
+  of these builtins' raw codegen a second way and needed their own
+  guard: `emit_print_expr_fragment`'s `println(FileInput#all(...))` /
+  `println(FileInput#lines(...))` / `println(FileInput#open(path, s
+  => s.readLines()))` print-fusion fast paths stream a file straight
+  to the target fd without going through `compile_file_input_all`/
+  `compile_file_input_lines`, so each fast path is itself skipped
+  when `is_windows`, falling through to the ordinary (gated) call
+  dispatch. `thread { ... }` needed no gate of its own: a queued
+  thread body is compiled into the tail of `main` via the same
+  `compile_expr` dispatch as any other call site (no real OS thread,
+  no syscall of its own), so a thread body that touches a gated
+  builtin is already caught transitively.
 
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program

@@ -4923,6 +4923,26 @@ impl NativeCodeGenerator {
             .mov_imm64(Reg::Rax, self.platform.syscall_number(syscall));
     }
 
+    /// Diagnostic for a builtin whose native codegen needs a raw
+    /// syscall (or a startup-populated slot the current target
+    /// leaves zeroed, e.g. argv/envp on Windows) that isn't wired up
+    /// for `self.platform.target` yet. Every call site guards this
+    /// with an `is_windows` (or other per-target) check itself --
+    /// this only builds the message, naming the concrete target
+    /// triple so it stays accurate as more targets gain coverage.
+    /// This is the compile-time counterpart to the
+    /// `TargetPlatform::syscall_number` panic tripwire: a builtin
+    /// gated here never reaches that panic.
+    fn unsupported_on_target(&self, span: Span, name: &str) -> Diagnostic {
+        Diagnostic::compile(
+            span,
+            format!(
+                "`{name}` is not yet supported when targeting {}",
+                self.platform.target.standard_triple()
+            ),
+        )
+    }
+
     fn emit_store_command_line_state(&mut self) {
         if self.is_windows {
             // No CRT means no argc/argv/envp setup at this raw an
@@ -12322,6 +12342,9 @@ impl NativeCodeGenerator {
     }
 
     fn compile_sleep(&mut self, arguments: &[Expr], span: Span) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "sleep"));
+        }
         if arguments.len() != 1 {
             return Err(Diagnostic::compile(
                 span,
@@ -17281,6 +17304,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "stopwatch"));
+        }
         if arguments.len() != 1 {
             return Err(Diagnostic::compile(
                 span,
@@ -17351,6 +17377,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Time#nowMillis"));
+        }
         if !arguments.is_empty() {
             return Err(Diagnostic::compile(
                 span,
@@ -23112,6 +23141,9 @@ impl NativeCodeGenerator {
         } else {
             "FileOutput#write"
         };
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, name));
+        }
         self.expect_static_arity(name, arguments, 2, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label = self.compile_runtime_path_argument(&arguments[0], span, name)?;
@@ -23178,6 +23210,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "FileOutput#writeLines"));
+        }
         self.expect_static_arity("FileOutput#writeLines", arguments, 2, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -23247,6 +23282,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "FileOutput#exists"));
+        }
         self.expect_static_arity("FileOutput#exists", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -23274,6 +23312,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "FileOutput#delete"));
+        }
         self.expect_static_arity("FileOutput#delete", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -23297,6 +23338,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "StandardInput#all"));
+        }
         self.expect_static_arity("StandardInput#all", arguments, 0, span)?;
         Ok(self.emit_standard_input_to_runtime_string(span, "StandardInput#all"))
     }
@@ -23306,6 +23350,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "StandardInput#lines"));
+        }
         self.expect_static_arity("StandardInput#lines", arguments, 0, span)?;
         let NativeValue::RuntimeString { data, len } =
             self.emit_standard_input_to_runtime_string(span, "StandardInput#lines")
@@ -23352,6 +23399,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Environment#vars"));
+        }
         self.expect_static_arity("Environment#vars", arguments, 0, span)?;
         Ok(self.emit_environment_vars(span))
     }
@@ -23410,6 +23460,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Environment#get"));
+        }
         self.expect_static_arity("Environment#get", arguments, 1, span)?;
         let key = self.compile_environment_key_argument(&arguments[0], span, "Environment#get")?;
         Ok(self.emit_environment_get_key_ref(
@@ -23424,6 +23477,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Environment#exists"));
+        }
         self.expect_static_arity("Environment#exists", arguments, 1, span)?;
         let key =
             self.compile_environment_key_argument(&arguments[0], span, "Environment#exists")?;
@@ -23744,6 +23800,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "CommandLine#args"));
+        }
         self.expect_static_arity("CommandLine#args", arguments, 0, span)?;
         Ok(self.emit_command_line_args(span))
     }
@@ -23997,6 +24056,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "FileInput#all"));
+        }
         self.expect_static_arity("FileInput#all", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -24029,6 +24091,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "FileInput#lines"));
+        }
         self.expect_static_arity("FileInput#lines", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -24449,6 +24514,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Dir#current"));
+        }
         self.expect_static_arity("Dir#current", arguments, 0, span)?;
         Ok(self.emit_dir_current(span))
     }
@@ -24478,6 +24546,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Dir#home"));
+        }
         self.expect_static_arity("Dir#home", arguments, 0, span)?;
         Ok(self.emit_environment_get_static_key(
             "HOME",
@@ -24491,6 +24562,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Dir#temp"));
+        }
         self.expect_static_arity("Dir#temp", arguments, 0, span)?;
         Ok(self.emit_environment_get_static_key_or_default("TMPDIR", "/tmp", span))
     }
@@ -24500,6 +24574,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Dir#exists"));
+        }
         self.expect_static_arity("Dir#exists", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -24523,6 +24600,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Dir#isDirectory"));
+        }
         self.expect_static_arity("Dir#isDirectory", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -24549,6 +24629,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Dir#isFile"));
+        }
         self.expect_static_arity("Dir#isFile", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -24574,6 +24657,9 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         let name = if recursive { "Dir#mkdirs" } else { "Dir#mkdir" };
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, name));
+        }
         self.expect_static_arity(name, arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label = self.compile_runtime_path_argument(&arguments[0], span, name)?;
@@ -24606,6 +24692,9 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         let name = if full { "Dir#listFull" } else { "Dir#list" };
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, name));
+        }
         self.expect_static_arity(name, arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let (path_label, path) =
@@ -24667,6 +24756,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Dir#delete"));
+        }
         self.expect_static_arity("Dir#delete", arguments, 1, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0]) {
             let path_label =
@@ -24687,6 +24779,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Dir#copy"));
+        }
         self.expect_static_arity("Dir#copy", arguments, 2, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0])
             || self.expr_may_yield_runtime_string(&arguments[1])
@@ -24723,6 +24818,9 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
+        if self.is_windows {
+            return Err(self.unsupported_on_target(span, "Dir#move"));
+        }
         self.expect_static_arity("Dir#move", arguments, 2, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0])
             || self.expr_may_yield_runtime_string(&arguments[1])
@@ -33640,7 +33738,17 @@ impl NativeCodeGenerator {
             return Ok(());
         }
 
-        if let Some(name) = self.file_input_all_print_call_name(expr) {
+        // Windows has no Win64 shim for the read side of this
+        // fast-streaming path (it always reaches the raw `Open`/
+        // `Read`/`Close` syscalls below, even for a compile-time
+        // constant path), so this optimization is skipped on that
+        // target: falling through lets `self.compile_expr(expr)`
+        // dispatch to the ordinary `FileInput#all`/`readAll` builtin,
+        // which raises `unsupported_on_target` instead of the
+        // syscall-number tripwire.
+        if !self.is_windows
+            && let Some(name) = self.file_input_all_print_call_name(expr)
+        {
             let Expr::Call { arguments, .. } = expr else {
                 unreachable!("file input print call matched only call expressions");
             };
@@ -33659,7 +33767,12 @@ impl NativeCodeGenerator {
             return Ok(());
         }
 
-        if let Some(name) = self.file_input_lines_print_call_name(expr) {
+        // Same reasoning as the `file_input_all_print_call_name` guard
+        // above: skip the fast path on Windows so the plain
+        // `FileInput#lines`/`readLines` builtin gate fires instead.
+        if !self.is_windows
+            && let Some(name) = self.file_input_lines_print_call_name(expr)
+        {
             let Expr::Call { arguments, .. } = expr else {
                 unreachable!("file input lines print call matched only call expressions");
             };
@@ -33676,7 +33789,13 @@ impl NativeCodeGenerator {
             }
         }
 
-        if let Some((path, name)) = self.file_input_open_read_lines_print_call(expr)
+        // Same reasoning again: this path reaches
+        // `emit_file_read_to_runtime_string_from_path_label` directly,
+        // bypassing `compile_file_input_lines`'s gate, so it is
+        // skipped on Windows and falls through to the ordinary
+        // `FileInput#open` compile path instead.
+        if !self.is_windows
+            && let Some((path, name)) = self.file_input_open_read_lines_print_call(expr)
             && self.expr_may_yield_runtime_string(path)
         {
             let path_label = self.compile_runtime_path_argument(path, span, "FileInput#open")?;

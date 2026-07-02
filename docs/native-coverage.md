@@ -603,10 +603,32 @@ Rules:
   dedicated codegen module like aarch64 -- only the OS boundary
   (syscalls -> Win64 `kernel32.dll` import-call shims) and the
   container format (PE64, see `crates/klassic-native/src/pe.rs`)
-  differ. Non-core-language syscalls (file/dir/time/thread/stdin, ...)
-  are not yet gated for Windows; reaching one from a Windows build is
-  a deliberate compile-time panic (see `TargetPlatform::syscall_number`)
-  rather than a silently wrong binary, and is the next slice of work.
+  differ. `TargetPlatform::syscall_number` still panics unconditionally
+  for the Windows target as a deliberate invariant tripwire, but as of
+  W1-b every native-codegen path that could reach it is gated first:
+  `sleep`, `stopwatch`, `Time#nowMillis` (`std.time`), `StandardInput#all`/
+  `StandardInput#lines` (`stdin()`/`stdinLines()`), the `FileOutput#`/
+  `FileInput#` family including `std.file` and the `println(FileInput#
+  all(...))`/`println(FileInput#lines(...))` print-fusion fast paths,
+  the `Dir#` family including `std.dir`, `Environment#vars`/`#get`/
+  `#exists` (`std.env`, and the `env()`/`getEnv()`/`hasEnv()` prelude
+  aliases), and `CommandLine#args` (`args()`, `std.cli`, `std.process`)
+  all fail to build for `x86_64-pc-windows-msvc` with a
+  `` `Feature` is not yet supported when targeting x86_64-pc-windows-msvc ``
+  diagnostic instead of reaching the panic. `Environment#*` and
+  `CommandLine#args` are gated even though they don't reach a syscall
+  at all, because their backing argv/envp slots are left zeroed on
+  Windows (see `emit_store_command_line_state`) and would otherwise
+  silently compile a binary that always observes empty arguments/
+  environment rather than failing to build. `thread { ... }` needs no
+  gate of its own -- a queued thread body is spliced into the tail of
+  `main` and compiled through the same per-builtin gates as any other
+  call site, so an OS-touching thread body is still caught, and a
+  thread body that stays inside the core language still builds.
+  Process spawning (`Process#run`/`nrun`) has no native-backend
+  implementation on any target yet, so there is nothing Windows-specific
+  to gate there. See `tests/cli_smoke.rs`'s
+  `build_target_windows_x86_64_gates_*` tests for the coverage.
 - An unsupported target must produce a `TargetSpec`-style diagnostic,
   not a panic.
 
