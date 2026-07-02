@@ -5008,6 +5008,263 @@ fn builds_native_executable_for_function_returning_mutable_closure_capture() {
     assert!(run.stderr.is_empty());
 }
 
+/// klassic issue #543: a closure created inside a `foreach` body captures
+/// the loop-controlled binding by frame-relative stack slot, not by value.
+/// A compile-time-unrolled literal-list foreach reuses that exact slot on
+/// every iteration, so once a closure escapes its iteration (here, by being
+/// consed onto a `mutable` declared before the loop) and is called after the
+/// loop, it silently reads whatever the slot holds by then rather than the
+/// value it captured -- the evaluator (oracle) prints "2\n1\n", the old
+/// native backend printed "2\n<garbage>\n". Native must refuse this shape
+/// with a clean diagnostic instead of miscompiling it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_refuses_closure_escaping_foreach_loop_scope() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-loopesc-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-loopesc-{unique}"));
+    fs::write(
+        &source_path,
+        "mutable fns = []\n\
+         foreach (x in [1, 2]) {\n\
+         \x20 fns = cons(() => x, fns)\n\
+         }\n\
+         foreach (f in fns) {\n\
+         \x20 println(f())\n\
+         }\n",
+    )
+    .expect("source should write");
+
+    // The evaluator (oracle) accepts it and prints each captured value.
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "2\n1\n");
+
+    // Native refuses rather than silently reading a stale/reused stack slot.
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    let _ = fs::remove_file(&source_path);
+    let binary_created = output_path.exists();
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !build.status.success(),
+        "native must refuse a closure escaping a foreach loop scope, not miscompile it"
+    );
+    assert!(
+        !binary_created,
+        "native must not emit a binary for a refused build"
+    );
+    assert!(
+        String::from_utf8_lossy(&build.stderr)
+            .contains("closure capturing a loop-scoped binding escaping the loop"),
+        "expected a clean unsupported diagnostic, got:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+/// `while`-loop counterpart of `native_refuses_closure_escaping_foreach_loop_scope`.
+/// A `while` body is compiled once and shares its single stack slot across
+/// every runtime iteration, so a closure over a `val` declared in the body
+/// that escapes into a pre-loop `mutable` has the same failure mode.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_refuses_closure_escaping_while_loop_scope() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-whileesc-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-whileesc-{unique}"));
+    fs::write(
+        &source_path,
+        "mutable fns = []\n\
+         mutable i = 0\n\
+         while (i < 2) {\n\
+         \x20 val x = i\n\
+         \x20 fns = cons(() => x, fns)\n\
+         \x20 i = i + 1\n\
+         }\n\
+         foreach (f in fns) {\n\
+         \x20 println(f())\n\
+         }\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "1\n0\n");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    let _ = fs::remove_file(&source_path);
+    let binary_created = output_path.exists();
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !build.status.success(),
+        "native must refuse a closure escaping a while loop scope, not miscompile it"
+    );
+    assert!(
+        !binary_created,
+        "native must not emit a binary for a refused build"
+    );
+    assert!(
+        String::from_utf8_lossy(&build.stderr)
+            .contains("closure capturing a loop-scoped binding escaping the loop"),
+        "expected a clean unsupported diagnostic, got:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+/// No-regression probe alongside `native_refuses_closure_escaping_foreach_loop_scope`:
+/// a closure over the loop binding that is *called within the same
+/// iteration* -- either as an immediately-invoked lambda, or passed to a
+/// helper that calls it right away -- never outlives the stack slot it
+/// captured, so it must keep working.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_closure_called_within_same_loop_iteration() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-loopiife-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-loopiife-{unique}"));
+    fs::write(
+        &source_path,
+        "def apply(f) = f()\n\
+         foreach (x in [1, 2]) {\n\
+         \x20 val doubled = (() => x * 2)()\n\
+         \x20 println(doubled)\n\
+         \x20 println(apply(() => x))\n\
+         }\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "native must not refuse a closure that is called within the same loop iteration:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout),
+        "native must match eval for a closure called within the same loop iteration"
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "2\n1\n4\n2\n");
+}
+
+/// No-regression probe alongside `native_refuses_closure_escaping_foreach_loop_scope`:
+/// a closure that escapes the loop but only captures a `val` bound *before*
+/// the loop started keeps working, because that binding's stack slot is not
+/// reused by the next iteration (`current_runtime_captures` sweeps every
+/// in-scope name into a lambda's `runtime_captures`, including loop-scoped
+/// siblings the body never reads, so the detection must not flag those).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_closure_capturing_pre_loop_val() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-preloopval-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-preloopval-{unique}"));
+    fs::write(
+        &source_path,
+        "val y = 10\n\
+         mutable fns = []\n\
+         foreach (x in [1, 2]) {\n\
+         \x20 fns = cons(() => y, fns)\n\
+         }\n\
+         foreach (f in fns) {\n\
+         \x20 println(f())\n\
+         }\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "10\n10\n");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "native must not refuse a closure that only captures a pre-loop val:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "10\n10\n");
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_build_honors_deny_trust() {

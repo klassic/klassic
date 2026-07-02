@@ -388,6 +388,22 @@ cargo run -- -e "1 + 2"
   would snapshot a stale value and discard writes. The non-recursive case is
   inlined and reaches the real slot, so it keeps working. Direct calls and value aliases for
   user-defined functions shadow same-named native builtins.
+  A closure created inside a `foreach`/`while` body captures a loop-controlled
+  or loop-body-local binding by frame-relative stack slot, not by value: a
+  compile-time-unrolled foreach reuses that slot on every iteration once the
+  iteration's scope is popped, and a `while` loop (or a runtime-length
+  foreach) compiles its body once and shares the single slot across every
+  runtime iteration. That is invisible as long as the closure is only called
+  within the iteration that created it, but assigning it -- directly, or
+  nested in a list/record/map/set -- into a binding that outlives every
+  currently-open loop lets it later read whatever the slot happens to hold
+  instead of the value it captured, so such an assignment is refused with a
+  clean diagnostic rather than compiled. The check only counts a capture the
+  closure body actually reads as a free variable, so a closure that merely
+  happens to be compiled alongside an unrelated loop-scoped binding (e.g. it
+  only reads a pre-loop `val`) still escapes cleanly, and a closure called
+  within the same iteration (directly or via a helper) never triggers it
+  since the slot is still live at that point.
   Immutable aliases to curried helpers such as `assertResult`, `cons`, `map`,
   and `foldLeft` resolve through the same native special-call paths as direct
   helper calls.

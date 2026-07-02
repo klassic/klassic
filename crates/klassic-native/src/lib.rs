@@ -4280,6 +4280,18 @@ struct NativeCodeGenerator {
     /// `val` shadowed by the param. Saved/restored around each inline body.
     inline_static_params: Vec<String>,
     scope_base_offsets: Vec<i32>,
+    /// Base offset (see `scope_base_offsets`) of each currently-open
+    /// foreach/while loop-body scope, outermost first. A lambda compiled
+    /// while this is non-empty may capture a loop-controlled binding by a
+    /// frame-relative stack slot (`closure_runtime_captures`) that is
+    /// reused across iterations (compile-time-unrolled foreach) or shared
+    /// by a single compiled instance across runtime iterations (while, and
+    /// runtime-length foreach) -- reading it after the loop, or after a
+    /// later iteration has overwritten it, silently reads the wrong value.
+    /// Used to refuse an assignment that lets such a closure escape into a
+    /// binding that outlives the loop, instead of miscompiling it; see
+    /// `refuse_loop_escaping_assignment`.
+    loop_body_scope_base_offsets: Vec<i32>,
     next_stack_offset: i32,
     next_var_slot_id: usize,
     functions: HashMap<String, NativeFunction>,
@@ -4564,6 +4576,7 @@ impl NativeCodeGenerator {
             static_scopes: vec![HashMap::new()],
             inline_static_params: Vec::new(),
             scope_base_offsets: vec![0],
+            loop_body_scope_base_offsets: Vec::new(),
             next_stack_offset: 0,
             next_var_slot_id: 0,
             functions: HashMap::new(),
@@ -6573,6 +6586,7 @@ impl NativeCodeGenerator {
                             "native runtime-list assignment for this value type",
                         ));
                     }
+                    self.refuse_loop_escaping_assignment(name, slot.offset, compiled, *span)?;
                     self.emit_copy_native_list_to_runtime_list_output(
                         compiled,
                         label,
@@ -6596,6 +6610,7 @@ impl NativeCodeGenerator {
                             "native static aggregate assignment with non-static value",
                         ));
                     }
+                    self.refuse_loop_escaping_assignment(name, slot.offset, compiled, *span)?;
                     self.assign_var_value(name, compiled);
                     if let Some(value) = self.static_value_from_native(compiled) {
                         self.assign_static_value(name, value);
@@ -30489,10 +30504,13 @@ impl NativeCodeGenerator {
         }
     }
 
-    fn static_lambda_captures_current_scope(&self, label: LambdaLabel) -> bool {
-        let Some(base_offset) = self.scope_base_offsets.last().copied() else {
-            return false;
-        };
+    /// Whether the lambda's `runtime_captures` include a stack slot
+    /// allocated after `base_offset` -- i.e. a slot local to a scope that
+    /// began at or after `base_offset`. Called both with the innermost open
+    /// scope (mirroring the pre-refactor `static_lambda_captures_current_scope`)
+    /// and with an arbitrary still-open ancestor scope, such as a loop-body
+    /// scope several blocks up (see `loop_body_scope_base_offsets`).
+    fn static_lambda_captures_offset_since(&self, label: LambdaLabel, base_offset: i32) -> bool {
         self.static_lambdas.get(label.0).is_some_and(|lambda| {
             lambda
                 .runtime_captures
@@ -30546,31 +30564,48 @@ impl NativeCodeGenerator {
     }
 
     fn native_value_captures_current_scope(&self, value: NativeValue) -> bool {
+        let Some(base_offset) = self.scope_base_offsets.last().copied() else {
+            return false;
+        };
+        self.native_value_captures_offset_since(value, base_offset)
+    }
+
+    /// Whether `value` transitively contains a captured runtime stack slot
+    /// allocated after `base_offset` -- e.g. a `StaticLambda` closure whose
+    /// `runtime_captures` reach into a scope that began at or after
+    /// `base_offset`, possibly nested inside a list/record/map/set/etc.
+    /// Generalizes `native_value_captures_current_scope` (fixed to the
+    /// innermost open scope) so callers can check against an arbitrary
+    /// still-open ancestor scope. Used to detect a closure escaping a
+    /// loop-body scope by being written into a longer-lived binding; see
+    /// `loop_body_scope_base_offsets` and `refuse_loop_escaping_assignment`.
+    fn native_value_captures_offset_since(&self, value: NativeValue, base_offset: i32) -> bool {
         match value {
-            NativeValue::StaticLambda { label } => self.static_lambda_captures_current_scope(label),
+            NativeValue::StaticLambda { label } => {
+                self.static_lambda_captures_offset_since(label, base_offset)
+            }
             NativeValue::StaticList { label } => {
                 self.static_lists.get(label.0).is_some_and(|list| {
                     list.elements
                         .iter()
-                        .any(|value| self.static_value_captures_current_scope(value))
+                        .any(|value| self.static_value_captures_offset_since(value, base_offset))
                 })
             }
             NativeValue::StaticRecord { label } => {
                 self.static_records.get(label.0).is_some_and(|record| {
-                    record
-                        .fields
-                        .iter()
-                        .any(|(_, value)| self.static_value_captures_current_scope(value))
+                    record.fields.iter().any(|(_, value)| {
+                        self.static_value_captures_offset_since(value, base_offset)
+                    })
                 })
             }
             NativeValue::RuntimeRecord { label } => {
                 self.runtime_records.get(label.0).is_some_and(|record| {
                     record.fields.iter().any(|(_, value)| match value {
                         RuntimeRecordField::Static(value) => {
-                            self.static_value_captures_current_scope(value)
+                            self.static_value_captures_offset_since(value, base_offset)
                         }
                         RuntimeRecordField::Runtime(value) => {
-                            self.native_value_captures_current_scope(*value)
+                            self.native_value_captures_offset_since(*value, base_offset)
                         }
                         RuntimeRecordField::Scalar { .. } => false,
                     })
@@ -30580,7 +30615,7 @@ impl NativeCodeGenerator {
                 self.runtime_lists.get(label.0).is_some_and(|list| {
                     list.elements.iter().any(|value| match value {
                         CompiledLiteralValue::Native(value) => {
-                            self.native_value_captures_current_scope(*value)
+                            self.native_value_captures_offset_since(*value, base_offset)
                         }
                         CompiledLiteralValue::Scalar { .. } => false,
                     })
@@ -30588,14 +30623,14 @@ impl NativeCodeGenerator {
             }
             NativeValue::StaticMap { label } => self.static_maps.get(label.0).is_some_and(|map| {
                 map.entries.iter().any(|(key, value)| {
-                    self.static_value_captures_current_scope(key)
-                        || self.static_value_captures_current_scope(value)
+                    self.static_value_captures_offset_since(key, base_offset)
+                        || self.static_value_captures_offset_since(value, base_offset)
                 })
             }),
             NativeValue::StaticSet { label } => self.static_sets.get(label.0).is_some_and(|set| {
                 set.elements
                     .iter()
-                    .any(|value| self.static_value_captures_current_scope(value))
+                    .any(|value| self.static_value_captures_offset_since(value, base_offset))
             }),
             NativeValue::RuntimeMapCallableDispatch(label) => self
                 .runtime_map_callable_dispatches
@@ -30604,10 +30639,7 @@ impl NativeCodeGenerator {
                     let key_captures_current_scope = match dispatch.key {
                         RuntimeMapCallableDispatchKey::Scalar(
                             RuntimeMapCallableDispatchScalarKey::Stack(slot),
-                        ) => self
-                            .scope_base_offsets
-                            .last()
-                            .is_some_and(|base_offset| slot.offset > *base_offset),
+                        ) => slot.offset > base_offset,
                         RuntimeMapCallableDispatchKey::String(_)
                         | RuntimeMapCallableDispatchKey::Scalar(
                             RuntimeMapCallableDispatchScalarKey::Data(_),
@@ -30615,7 +30647,7 @@ impl NativeCodeGenerator {
                     };
                     key_captures_current_scope
                         || dispatch.candidates.iter().any(|candidate| {
-                            self.native_value_captures_current_scope(candidate.callable)
+                            self.native_value_captures_offset_since(candidate.callable, base_offset)
                         })
                 }),
             NativeValue::Int
@@ -30635,35 +30667,42 @@ impl NativeCodeGenerator {
     }
 
     fn static_value_captures_current_scope(&self, value: &StaticValue) -> bool {
+        let Some(base_offset) = self.scope_base_offsets.last().copied() else {
+            return false;
+        };
+        self.static_value_captures_offset_since(value, base_offset)
+    }
+
+    /// See `native_value_captures_offset_since`; the `StaticValue` counterpart.
+    fn static_value_captures_offset_since(&self, value: &StaticValue, base_offset: i32) -> bool {
         match value {
             StaticValue::StaticLambda { label } => {
-                self.static_lambda_captures_current_scope(*label)
+                self.static_lambda_captures_offset_since(*label, base_offset)
             }
             StaticValue::StaticList { label } => {
                 self.static_lists.get(label.0).is_some_and(|list| {
                     list.elements
                         .iter()
-                        .any(|value| self.static_value_captures_current_scope(value))
+                        .any(|value| self.static_value_captures_offset_since(value, base_offset))
                 })
             }
             StaticValue::StaticRecord { label } => {
                 self.static_records.get(label.0).is_some_and(|record| {
-                    record
-                        .fields
-                        .iter()
-                        .any(|(_, value)| self.static_value_captures_current_scope(value))
+                    record.fields.iter().any(|(_, value)| {
+                        self.static_value_captures_offset_since(value, base_offset)
+                    })
                 })
             }
             StaticValue::StaticMap { label } => self.static_maps.get(label.0).is_some_and(|map| {
                 map.entries.iter().any(|(key, value)| {
-                    self.static_value_captures_current_scope(key)
-                        || self.static_value_captures_current_scope(value)
+                    self.static_value_captures_offset_since(key, base_offset)
+                        || self.static_value_captures_offset_since(value, base_offset)
                 })
             }),
             StaticValue::StaticSet { label } => self.static_sets.get(label.0).is_some_and(|set| {
                 set.elements
                     .iter()
-                    .any(|value| self.static_value_captures_current_scope(value))
+                    .any(|value| self.static_value_captures_offset_since(value, base_offset))
             }),
             StaticValue::Int(_)
             | StaticValue::Float(_)
@@ -30675,6 +30714,203 @@ impl NativeCodeGenerator {
             | StaticValue::StaticIntList { .. }
             | StaticValue::BuiltinFunction { .. } => false,
         }
+    }
+
+    /// Loop-escape-specific counterpart of `native_value_captures_offset_since`,
+    /// used only by `refuse_loop_escaping_assignment`.
+    ///
+    /// `current_runtime_captures` (which feeds `lambda.runtime_captures` at
+    /// intern time) records the slot for *every* binding in scope, whether
+    /// or not the lambda body actually reads it -- `lambda_uses_runtime_captures`
+    /// exists for the same reason. Reusing the unfiltered
+    /// `native_value_captures_offset_since` here would flag a lambda that
+    /// merely happens to be compiled while an unrelated loop-scoped binding
+    /// is in scope (e.g. it only reads a pre-loop `val`, per no-regression
+    /// probe `probe_preloop_val`), so this variant only counts a capture the
+    /// lambda body genuinely reads as a free variable. Kept as a separate
+    /// traversal (rather than threading a filter flag through the shared
+    /// one) so the existing `_current_scope` decisions elsewhere -- which
+    /// intentionally use the unfiltered check -- are untouched.
+    fn native_value_escapes_loop_scope(&self, value: NativeValue, base_offset: i32) -> bool {
+        match value {
+            NativeValue::StaticLambda { label } => {
+                self.static_lambda_escapes_loop_scope(label, base_offset)
+            }
+            NativeValue::StaticList { label } => {
+                self.static_lists.get(label.0).is_some_and(|list| {
+                    list.elements
+                        .iter()
+                        .any(|value| self.static_value_escapes_loop_scope(value, base_offset))
+                })
+            }
+            NativeValue::StaticRecord { label } => {
+                self.static_records.get(label.0).is_some_and(|record| {
+                    record
+                        .fields
+                        .iter()
+                        .any(|(_, value)| self.static_value_escapes_loop_scope(value, base_offset))
+                })
+            }
+            NativeValue::RuntimeRecord { label } => {
+                self.runtime_records.get(label.0).is_some_and(|record| {
+                    record.fields.iter().any(|(_, value)| match value {
+                        RuntimeRecordField::Static(value) => {
+                            self.static_value_escapes_loop_scope(value, base_offset)
+                        }
+                        RuntimeRecordField::Runtime(value) => {
+                            self.native_value_escapes_loop_scope(*value, base_offset)
+                        }
+                        RuntimeRecordField::Scalar { .. } => false,
+                    })
+                })
+            }
+            NativeValue::RuntimeList { label } => {
+                self.runtime_lists.get(label.0).is_some_and(|list| {
+                    list.elements.iter().any(|value| match value {
+                        CompiledLiteralValue::Native(value) => {
+                            self.native_value_escapes_loop_scope(*value, base_offset)
+                        }
+                        CompiledLiteralValue::Scalar { .. } => false,
+                    })
+                })
+            }
+            NativeValue::StaticMap { label } => self.static_maps.get(label.0).is_some_and(|map| {
+                map.entries.iter().any(|(key, value)| {
+                    self.static_value_escapes_loop_scope(key, base_offset)
+                        || self.static_value_escapes_loop_scope(value, base_offset)
+                })
+            }),
+            NativeValue::StaticSet { label } => self.static_sets.get(label.0).is_some_and(|set| {
+                set.elements
+                    .iter()
+                    .any(|value| self.static_value_escapes_loop_scope(value, base_offset))
+            }),
+            NativeValue::RuntimeMapCallableDispatch(label) => self
+                .runtime_map_callable_dispatches
+                .get(label.0)
+                .is_some_and(|dispatch| {
+                    dispatch.candidates.iter().any(|candidate| {
+                        self.native_value_escapes_loop_scope(candidate.callable, base_offset)
+                    })
+                }),
+            NativeValue::Int
+            | NativeValue::HeapPointer
+            | NativeValue::HeapString
+            | NativeValue::Bool
+            | NativeValue::Null
+            | NativeValue::Unit
+            | NativeValue::StaticFloat { .. }
+            | NativeValue::StaticDouble { .. }
+            | NativeValue::StaticString { .. }
+            | NativeValue::RuntimeString { .. }
+            | NativeValue::RuntimeLinesList { .. }
+            | NativeValue::StaticIntList { .. }
+            | NativeValue::BuiltinFunction { .. } => false,
+        }
+    }
+
+    /// See `native_value_escapes_loop_scope`; the `StaticValue` counterpart.
+    fn static_value_escapes_loop_scope(&self, value: &StaticValue, base_offset: i32) -> bool {
+        match value {
+            StaticValue::StaticLambda { label } => {
+                self.static_lambda_escapes_loop_scope(*label, base_offset)
+            }
+            StaticValue::StaticList { label } => {
+                self.static_lists.get(label.0).is_some_and(|list| {
+                    list.elements
+                        .iter()
+                        .any(|value| self.static_value_escapes_loop_scope(value, base_offset))
+                })
+            }
+            StaticValue::StaticRecord { label } => {
+                self.static_records.get(label.0).is_some_and(|record| {
+                    record
+                        .fields
+                        .iter()
+                        .any(|(_, value)| self.static_value_escapes_loop_scope(value, base_offset))
+                })
+            }
+            StaticValue::StaticMap { label } => self.static_maps.get(label.0).is_some_and(|map| {
+                map.entries.iter().any(|(key, value)| {
+                    self.static_value_escapes_loop_scope(key, base_offset)
+                        || self.static_value_escapes_loop_scope(value, base_offset)
+                })
+            }),
+            StaticValue::StaticSet { label } => self.static_sets.get(label.0).is_some_and(|set| {
+                set.elements
+                    .iter()
+                    .any(|value| self.static_value_escapes_loop_scope(value, base_offset))
+            }),
+            StaticValue::Int(_)
+            | StaticValue::Float(_)
+            | StaticValue::Double(_)
+            | StaticValue::Bool(_)
+            | StaticValue::Null
+            | StaticValue::Unit
+            | StaticValue::StaticString { .. }
+            | StaticValue::StaticIntList { .. }
+            | StaticValue::BuiltinFunction { .. } => false,
+        }
+    }
+
+    /// See `native_value_escapes_loop_scope`; the leaf check. A capture is
+    /// only counted if its slot was allocated after `base_offset` AND the
+    /// lambda body genuinely reads the captured name as a free variable
+    /// (mirroring `lambda_uses_runtime_captures`'s shadowing treatment: a
+    /// name reused as one of the lambda's own params does not count).
+    fn static_lambda_escapes_loop_scope(&self, label: LambdaLabel, base_offset: i32) -> bool {
+        self.static_lambdas.get(label.0).is_some_and(|lambda| {
+            lambda.runtime_captures.iter().any(|(name, slot)| {
+                slot.offset > base_offset
+                    && !lambda.params.contains(name)
+                    && expr_references_any_name(&lambda.body, &HashSet::from([name.clone()]))
+            })
+        })
+    }
+
+    /// Refuse an `Expr::Assign` that would let a closure capturing a
+    /// loop-scoped binding escape the loop.
+    ///
+    /// A lambda compiled inside a foreach/while body captures a loop-local
+    /// variable by frame-relative stack slot, not by value
+    /// (`closure_runtime_captures`). A compile-time-unrolled foreach
+    /// (literal/static list) reuses that exact slot on every iteration once
+    /// the iteration's scope is popped; a `while` loop or a runtime-length
+    /// foreach compiles the body once and shares the single slot across all
+    /// runtime iterations. Either way, once the loop-body scope that
+    /// allocated the slot is gone (or reused by the next iteration), reading
+    /// it back returns whatever the slot currently holds -- not the value it
+    /// held when the closure was created. That is invisible as long as the
+    /// closure stays inside the iteration that made it, but assigning it
+    /// (directly, or nested in a list/record/map/set) into a binding that
+    /// lives outside every currently-open loop turns that stale read into an
+    /// observable, silent miscompile (klassic issue #543).
+    ///
+    /// `target_offset` is the assignment target's own slot offset;
+    /// `compiled` is the value about to be stored there. This checks every
+    /// currently-open loop-body scope (outermost first, via
+    /// `loop_body_scope_base_offsets`) and refuses as soon as it finds one
+    /// the target predates while `compiled` still reaches into it.
+    fn refuse_loop_escaping_assignment(
+        &self,
+        name: &str,
+        target_offset: i32,
+        compiled: NativeValue,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        for &loop_base in &self.loop_body_scope_base_offsets {
+            if target_offset <= loop_base
+                && self.native_value_escapes_loop_scope(compiled, loop_base)
+            {
+                return Err(unsupported(
+                    span,
+                    &format!(
+                        "a closure capturing a loop-scoped binding escaping the loop via assignment to `{name}`"
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn intern_builtin_alias(&mut self, name: String) -> BuiltinLabel {
@@ -34427,7 +34663,11 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::Equal, end_label);
         self.dynamic_control_depth += 1;
         self.push_scope();
-        self.compile_expr(body)?;
+        self.loop_body_scope_base_offsets
+            .push(self.next_stack_offset);
+        let body_result = self.compile_expr(body);
+        self.loop_body_scope_base_offsets.pop();
+        body_result?;
         self.pop_scope();
         self.dynamic_control_depth -= 1;
         self.asm.jmp_label(loop_label);
@@ -34517,11 +34757,15 @@ impl NativeCodeGenerator {
                 )?;
                 for element in self.asm.i64s_for_label(label, len) {
                     self.push_scope();
+                    self.loop_body_scope_base_offsets
+                        .push(self.next_stack_offset);
                     self.asm.mov_imm64(Reg::Rax, element as u64);
                     let slot = self.allocate_slot(binding.to_string(), NativeValue::Int);
                     self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                     self.bind_static_value(binding.to_string(), StaticValue::Int(element));
-                    self.compile_expr(body)?;
+                    let body_result = self.compile_expr(body);
+                    self.loop_body_scope_base_offsets.pop();
+                    body_result?;
                     if self.queued_threads_capture_current_scope() {
                         self.pop_scope_preserving_allocations();
                     } else {
@@ -34544,8 +34788,12 @@ impl NativeCodeGenerator {
                 )?;
                 for element in elements {
                     self.push_scope();
+                    self.loop_body_scope_base_offsets
+                        .push(self.next_stack_offset);
                     self.bind_static_iteration_value(binding, &element);
-                    self.compile_expr(body)?;
+                    let body_result = self.compile_expr(body);
+                    self.loop_body_scope_base_offsets.pop();
+                    body_result?;
                     if self.queued_threads_capture_current_scope() {
                         self.pop_scope_preserving_allocations();
                     } else {
@@ -34662,8 +34910,11 @@ impl NativeCodeGenerator {
                         self.dynamic_control_depth += 1;
                     }
                     self.push_scope();
+                    self.loop_body_scope_base_offsets
+                        .push(self.next_stack_offset);
                     self.bind_compiled_literal_iteration_value(binding, element);
                     let result = self.compile_expr(body);
+                    self.loop_body_scope_base_offsets.pop();
                     if self.queued_threads_capture_current_scope() {
                         self.pop_scope_preserving_allocations();
                     } else {
@@ -34693,8 +34944,12 @@ impl NativeCodeGenerator {
         let elements = self.compile_literal_values(elements)?;
         for element in elements {
             self.push_scope();
+            self.loop_body_scope_base_offsets
+                .push(self.next_stack_offset);
             self.bind_compiled_literal_iteration_value(binding, element);
-            self.compile_expr(body)?;
+            let body_result = self.compile_expr(body);
+            self.loop_body_scope_base_offsets.pop();
+            body_result?;
             if self.queued_threads_capture_current_scope() {
                 self.pop_scope_preserving_allocations();
             } else {
