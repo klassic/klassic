@@ -28263,3 +28263,143 @@ fn process_run_captures_stdout_and_exit_codes() {
         "hello\n\n0\n-1\ntrue\n()\n"
     );
 }
+
+/// A `thread(...)` call nested inside another `thread(...)` body used to
+/// be silently dropped by the native compiler: `emit_queued_threads` took
+/// `self.queued_threads` once and iterated it, but compiling a queued
+/// body that itself calls `thread(...)` pushes a fresh entry onto the
+/// (now separate) live queue mid-loop, so that entry was never emitted.
+/// The evaluator genuinely spawns nested OS threads, so it is the
+/// semantic oracle here; the outer thread body sleeps briefly after
+/// queuing the inner thread so the inner `println` reliably lands before
+/// the process (native) or `join_active_threads` (evaluator) moves on.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_emits_nested_thread_body() {
+    let source = "thread(() => {\n  thread(() => { println(\"inner\") })\n  sleep(50)\n})\n";
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_nested_thread_emit_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_nested_thread_emit_{stamp}.bin"));
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    // Evaluate the same source file (not `-e`, which also prints the
+    // top-level expression's value) so the evaluator's stdout is
+    // directly comparable to the compiled binary's stdout.
+    let eval_output = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(
+        eval_output.status.success(),
+        "evaluator run should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&eval_output.stdout), "inner\n");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("native build should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&eval_output.stdout),
+        "native stdout should match the evaluator's for the nested thread body"
+    );
+}
+
+/// Regression for the bug where a nested `thread(...)` call left
+/// `self.queued_threads` non-empty after `emit_queued_threads`, which
+/// disabled the function-prologue stack-overflow probe for every
+/// subsequently emitted function (the probe used to be skipped whenever
+/// `self.queued_threads` was non-empty). A program that both spawns a
+/// nested thread and recurses deep enough to exceed the real stack used
+/// to die on the guard page with a bare SIGSEGV instead of getting the
+/// intended `klassic: stack overflow` diagnostic added for #418.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_reports_stack_overflow_with_nested_thread_present() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_nested_thread_stack_probe_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_nested_thread_stack_probe_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "thread(() => { thread(() => {}) })\n\
+         def sum(n) = if (n == 0) 0 else n + sum(n - 1)\n\
+         println(sum(3000000))\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("native build should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stdout),
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !run_output.status.success(),
+        "deep recursion should abort, not succeed"
+    );
+    assert_eq!(
+        run_output.status.code(),
+        Some(1),
+        "graceful exit, not a signal (was SIGSEGV / exit 139 before the fix)\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_output.stderr).contains("klassic: stack overflow"),
+        "stderr should carry the stack overflow report, got:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+}

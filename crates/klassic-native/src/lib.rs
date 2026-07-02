@@ -17076,12 +17076,32 @@ impl NativeCodeGenerator {
         Ok(NativeValue::Unit)
     }
 
+    /// A `thread(...)` body can itself call `thread(...)`: compiling it
+    /// pushes a fresh entry onto `self.queued_threads` while this
+    /// function is already mid-loop, so a single `mem::take` pass over
+    /// the queue silently drops any thread nested inside another one.
+    /// Drain repeatedly until the queue is truly empty instead, so
+    /// nested thread bodies are always emitted. `MAX_QUEUED_THREADS`
+    /// guards against a pathological self-queuing source program (for
+    /// example compile-time-inlined recursion that spawns a thread on
+    /// every unrolled level) turning this into an unbounded loop.
     fn emit_queued_threads(&mut self) -> Result<(), Diagnostic> {
-        for thread in std::mem::take(&mut self.queued_threads) {
-            self.push_scope();
-            self.bind_queued_thread_captures(&thread);
-            self.compile_expr(&thread.body)?;
-            self.pop_scope();
+        const MAX_QUEUED_THREADS: usize = 100_000;
+        let mut emitted = 0usize;
+        while !self.queued_threads.is_empty() {
+            for thread in std::mem::take(&mut self.queued_threads) {
+                emitted += 1;
+                if emitted > MAX_QUEUED_THREADS {
+                    return Err(unsupported(
+                        thread.body.span(),
+                        "native thread nesting deeper than the compiler's queued-thread limit",
+                    ));
+                }
+                self.push_scope();
+                self.bind_queued_thread_captures(&thread);
+                self.compile_expr(&thread.body)?;
+                self.pop_scope();
+            }
         }
         Ok(())
     }
@@ -37854,17 +37874,20 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
         // Stack probe: deep recursion otherwise dies on the guard page
-        // with a bare SIGSEGV. Skipped when the program spawns threads —
-        // thread stacks live at unrelated addresses, so the main-stack
-        // floor would misfire there (the floor is also zero, and the
-        // probe inert, when RLIMIT_STACK is unlimited).
-        if self.queued_threads.is_empty() {
-            self.asm.mov_data_addr(Reg::R10, self.stack_floor);
-            self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-            self.asm.cmp_reg_reg(Reg::Rsp, Reg::R10);
-            self.asm
-                .jcc_label(Condition::Below, self.stack_overflow_abort);
-        }
+        // with a bare SIGSEGV. `thread(...)` bodies never run on a
+        // genuinely separate stack in this backend — there is no
+        // clone/fork syscall anywhere in native codegen; a `thread(...)`
+        // call only queues its body (see `emit_queued_threads`), which
+        // inlines it into the same main-thread instruction stream ahead
+        // of `emit_functions`. So the probe applies unconditionally
+        // here, for every function, thread-spawning programs included;
+        // the floor itself is already inert (zero) when RLIMIT_STACK is
+        // unlimited or unavailable.
+        self.asm.mov_data_addr(Reg::R10, self.stack_floor);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.cmp_reg_reg(Reg::Rsp, Reg::R10);
+        self.asm
+            .jcc_label(Condition::Below, self.stack_overflow_abort);
 
         let qword_params = function
             .params
