@@ -3326,6 +3326,8 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
                 Diagnostic::runtime(span, format!("failed to get current dir: {error}"))
             }),
         "Dir#home" => env::var("HOME")
+            // Windows has no HOME by default; USERPROFILE is the equivalent.
+            .or_else(|_| env::var("USERPROFILE"))
             .map(Value::String)
             .map_err(|error| Diagnostic::runtime(span, format!("failed to get home dir: {error}"))),
         "Dir#temp" => Ok(Value::String(env::temp_dir().display().to_string())),
