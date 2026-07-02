@@ -28489,7 +28489,16 @@ fn build_target_windows_x86_64_emits_pe() {
     assert_eq!(ilt_names, iat_names);
     assert_eq!(
         ilt_names,
-        vec!["GetStdHandle", "WriteFile", "ExitProcess", "VirtualAlloc"]
+        vec![
+            "GetStdHandle",
+            "WriteFile",
+            "ExitProcess",
+            "VirtualAlloc",
+            "GetSystemTimeAsFileTime",
+            "Sleep",
+            "QueryPerformanceCounter",
+            "QueryPerformanceFrequency",
+        ]
     );
 
     // 19: RELOCS_STRIPPED implies no .reloc / DYNAMIC_BASE.
@@ -28780,31 +28789,243 @@ fn assert_windows_target_gate(unique_tag: &str, source: &str, expected_diagnosti
     );
 }
 
-/// `sleep` reaches the `Nanosleep` syscall (`compile_sleep`) and has
-/// no Win64 shim, so it must be gated rather than panic.
-#[test]
-fn build_target_windows_x86_64_gates_sleep() {
-    assert_windows_target_gate(
-        "sleep",
-        "sleep(0)\nprintln(\"unreachable\")\n",
-        "`sleep` is not yet supported when targeting x86_64-pc-windows-msvc",
+/// Cross-build-only positive counterpart to `assert_windows_target_gate`:
+/// asserts `source` builds successfully for the Windows target (no
+/// execution, so this runs on any host including Linux CI). Used by
+/// the `build_target_windows_x86_64_supports_*` tests below, which
+/// replaced the `_gates_*` tests for builtins that used to hit the
+/// W1-b gate and now have a Win64 shim.
+fn assert_windows_target_builds(unique_tag: &str, source: &str) {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_supports_{unique_tag}_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_supports_{unique_tag}_{stamp}.exe"));
+    fs::write(&source_path, source).expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        build_output.status.success(),
+        "windows build of {unique_tag} should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
     );
 }
 
-/// `stopwatch` and `Time#nowMillis` both reach the `ClockGettime`
-/// syscall (`compile_stopwatch` / `compile_time_now_millis`) and have
-/// no Win64 shim.
+/// `sleep` now has a Win64 shim (`emit_win_sleep_runtime`, wrapping
+/// `Sleep`) instead of hitting the W1-b gate. See
+/// `build_target_windows_x86_64_sleep_and_stopwatch_run` for an
+/// execution-level check.
 #[test]
-fn build_target_windows_x86_64_gates_time() {
-    assert_windows_target_gate(
-        "time_stopwatch",
-        "val e = stopwatch(() => 1)\nprintln(e)\n",
-        "`stopwatch` is not yet supported when targeting x86_64-pc-windows-msvc",
+fn build_target_windows_x86_64_supports_sleep() {
+    assert_windows_target_builds("sleep", "sleep(0)\nprintln(\"done\")\n");
+}
+
+/// `stopwatch` and `Time#nowMillis` both now have Win64 shims
+/// (`emit_win_qpc_runtime`/`emit_win_qpf_runtime`, wrapping
+/// `QueryPerformanceCounter`/`QueryPerformanceFrequency`, and
+/// `emit_win_time_now_millis_runtime`, wrapping
+/// `GetSystemTimeAsFileTime`) instead of hitting the W1-b gate. See
+/// `build_target_windows_x86_64_sleep_and_stopwatch_run` and
+/// `build_target_windows_x86_64_time_now_millis_runs` for
+/// execution-level checks.
+#[test]
+fn build_target_windows_x86_64_supports_time() {
+    assert_windows_target_builds("time_stopwatch", "val e = stopwatch(() => 1)\nprintln(e)\n");
+    assert_windows_target_builds("time_now_millis", "println(Time#nowMillis())\n");
+}
+
+/// Executes `Time#nowMillis()` on the Windows target and asserts the
+/// result is a plausible current UNIX-epoch-millis value, matching the
+/// evaluator's `SystemTime::now().duration_since(UNIX_EPOCH)` semantics
+/// (see `emit_win_time_now_millis_runtime`'s doc comment for the
+/// FILETIME-to-unix-millis conversion this checks end to end).
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_time_now_millis_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_now_millis_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_now_millis_{stamp}.exe"));
+    fs::write(&source_path, "println(Time#nowMillis())\n").expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows Time#nowMillis build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
     );
-    assert_windows_target_gate(
-        "time_now_millis",
-        "println(Time#nowMillis())\n",
-        "`Time#nowMillis` is not yet supported when targeting x86_64-pc-windows-msvc",
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    let millis: i64 = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .parse()
+        .expect("Time#nowMillis output should be an integer");
+    // 2023-11-14 .. 2065-01-24, a generous plausibility window that
+    // won't need touching for decades.
+    assert!(
+        millis > 1_700_000_000_000 && millis < 3_000_000_000_000,
+        "Time#nowMillis returned an implausible value: {millis}"
+    );
+}
+
+/// Executes `sleep` and a `stopwatch`-wrapped `sleep` on the Windows
+/// target: `sleep(200)` should observe roughly 200ms of Win64 `Sleep`
+/// wall-clock delay, and the `stopwatch` (`QueryPerformanceCounter`/
+/// `QueryPerformanceFrequency`-based, see `emit_win_elapsed_millis_qpc`)
+/// should report an elapsed duration in the same ballpark, mirroring
+/// the evaluator's `Instant::now()`-based `stopwatch` semantics.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_sleep_and_stopwatch_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_sleep_stopwatch_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_sleep_stopwatch_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "val e = stopwatch(() => { sleep(200) })\nprintln(e)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows sleep/stopwatch build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let wall_clock_start = std::time::Instant::now();
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let wall_clock_elapsed = wall_clock_start.elapsed();
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    // The wall clock around the whole process (Sleep(200) plus process
+    // startup/teardown) should be at least the requested delay -- a
+    // loose lower bound that tolerates scheduler slack without being
+    // able to pass trivially.
+    assert!(
+        wall_clock_elapsed.as_millis() >= 150,
+        "process wall-clock time ({:?}) should be at least ~200ms given sleep(200)",
+        wall_clock_elapsed
+    );
+    let stopwatch_millis: i64 = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .parse()
+        .expect("stopwatch output should be an integer");
+    assert!(
+        (150..5000).contains(&stopwatch_millis),
+        "stopwatch around sleep(200) reported an implausible duration: {stopwatch_millis}"
+    );
+}
+
+/// `std.time`'s `formatIso` is a pure function over an already
+/// materialized epoch-millis integer (see
+/// `build_target_windows_x86_64_pure_stdlib_use_is_not_gated`), so
+/// feeding it `Time#nowMillis()`'s Windows-native result should format
+/// a normal current-era ISO-8601 UTC timestamp, exercising the
+/// Windows `Time#nowMillis` shim and the shared pure-stdlib codegen
+/// path together end to end.
+#[cfg(target_os = "windows")]
+#[test]
+fn build_target_windows_x86_64_format_iso_of_now_millis_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_format_iso_now_{stamp}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_format_iso_now_{stamp}.exe"));
+    fs::write(
+        &source_path,
+        "import std.time\nprintln(formatIso(nowMillis()))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "windows formatIso(nowMillis()) build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("generated PE64 should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&exe_path);
+    assert!(
+        run_output.status.success(),
+        "PE64 exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        stdout.starts_with("20") && stdout.contains('T') && stdout.ends_with('Z'),
+        "formatIso(nowMillis()) should render a current-era ISO-8601 UTC timestamp, got {stdout:?}"
     );
 }
 

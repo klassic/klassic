@@ -857,11 +857,13 @@ cargo run -- -e "1 + 2"
   generator as-is, since the generated x86_64 machine code is already
   Win64-ABI-compatible; only the OS boundary and the container format
   differ. `NativeCodeGenerator` carries an `is_windows` flag that gates
-  every syscall-emission site (`write`, `mmap`, `exit`) to call one of
-  four small Win64 import-call shims (`__win_write`, `__win_mmap`,
-  `__win_exit`, plus a `__win_init` startup routine that caches
-  `GetStdHandle` results) instead of a bare Linux `syscall`
-  instruction, and skips the two pieces of Linux-initial-stack-layout
+  every syscall-emission site (`write`, `mmap`, `exit`, `sleep`,
+  `stopwatch`, `Time#nowMillis`) to call one of a small set of Win64
+  import-call shims (`__win_write`, `__win_mmap`, `__win_exit`,
+  `__win_sleep`, `__win_time_now_millis`, `__win_qpc`, `__win_qpf`,
+  plus a `__win_init` startup routine that caches `GetStdHandle`
+  results) instead of a bare Linux `syscall` instruction, and skips
+  the two pieces of Linux-initial-stack-layout
   setup (`argc`/`argv`/`envp`, the `getrlimit`-based stack-overflow
   probe) that have no Windows equivalent at this raw an entry point.
   `TargetPlatform::syscall_number` panics unconditionally for a
@@ -876,25 +878,47 @@ cargo run -- -e "1 + 2"
   incoming alignment reliably crashed inside `KERNELBASE.dll` on first
   contact. The PE64 writer is `crates/klassic-native/src/pe.rs`: a
   minimal three-section (`.text`/`.rdata`/`.data`) unsigned image
-  importing only `GetStdHandle`/`WriteFile`/`ExitProcess`/
-  `VirtualAlloc` from `kernel32.dll`, with a fixed `ImageBase` and no
-  `.reloc` section (mirrors the "no external toolchain" property of
-  the ELF and Mach-O writers). Verified end-to-end under WSL2 binfmt
+  importing every `kernel32.dll` function named in `ImportSymbol::ALL`
+  (`GetStdHandle`, `WriteFile`, `ExitProcess`, `VirtualAlloc`,
+  `GetSystemTimeAsFileTime`, `Sleep`, `QueryPerformanceCounter`,
+  `QueryPerformanceFrequency` as of this writing), with a fixed
+  `ImageBase` and no `.reloc` section (mirrors the "no external
+  toolchain" property of the ELF and Mach-O writers). The ILT/IAT/
+  hint-name table layout is derived entirely from `ImportSymbol::ALL`
+  (order and count), and `ImportSymbol::iat_index` derives each
+  symbol's IAT slot from its position in `ALL` rather than a
+  hand-maintained match arm, so adding a new imported function is a
+  three-line change (a variant, an `ALL` entry, a `name()` arm) that
+  never touches `pe.rs`. Verified end-to-end under WSL2 binfmt
   interop (`./program.exe` launches the real Windows loader from
   Linux) against hello-world, recursive `def`s, string/enum/record/list
   operations, closures, and a GC-churn stress program, all matching
   the evaluator's output byte-for-byte.
 
   Every builtin whose native codegen would otherwise reach that
-  `syscall_number` tripwire on Windows is now gated at its own
-  `compile_*` entry point (`if self.is_windows { return Err(...) }`,
-  before any codegen for that builtin runs): `sleep`, `stopwatch`,
-  `Time#nowMillis`, `StandardInput#all`/`#lines`, the whole
-  `FileOutput#`/`FileInput#` family, the whole `Dir#` family,
-  `Environment#vars`/`#get`/`#exists`, and `CommandLine#args` each
-  raise a `` `Feature` is not yet supported when targeting
-  x86_64-pc-windows-msvc `` diagnostic instead of panicking.
-  `Environment#*` and `CommandLine#args` don't reach a raw syscall at
+  `syscall_number` tripwire on Windows is gated at its own `compile_*`
+  entry point (`if self.is_windows { return Err(...) }`, before any
+  codegen for that builtin runs) unless it has its own Win64 shim:
+  `StandardInput#all`/`#lines`, the whole `FileOutput#`/`FileInput#`
+  family, the whole `Dir#` family, `Environment#vars`/`#get`/`#exists`,
+  and `CommandLine#args` each raise a `` `Feature` is not yet
+  supported when targeting x86_64-pc-windows-msvc `` diagnostic
+  instead of panicking. `sleep`, `stopwatch`, and `Time#nowMillis` are
+  no longer gated: `compile_sleep` stages the millisecond count into
+  rdi and calls the `emit_win_sleep_runtime` shim, which moves it into
+  ecx and calls `Sleep` directly (no seconds/nanos split needed, unlike
+  Linux's `nanosleep`); `compile_time_now_millis` calls
+  `emit_win_time_now_millis_runtime`, which wraps
+  `GetSystemTimeAsFileTime` and converts its 100ns-tick FILETIME output
+  to unix epoch millis via the fixed `116_444_736_000_000_000`
+  1601/1970 epoch offset; and `compile_stopwatch` calls
+  `emit_win_qpc_runtime` (wrapping `QueryPerformanceCounter`) before
+  and after the timed body, then `emit_win_elapsed_millis_qpc` calls
+  `emit_win_qpf_runtime` (wrapping `QueryPerformanceFrequency`) and
+  computes `elapsed_ticks * 1000 / frequency`. All three shims follow
+  the same save-every-register/self-aligning-`rsp` pattern as the
+  original four Win64 shims. `Environment#*` and `CommandLine#args`
+  don't reach a raw syscall at
   all — they walk the `environment_base`/`command_line_argc`/
   `command_line_argv1_base` slots `emit_store_command_line_state`
   leaves zeroed on Windows — so without a gate they would silently

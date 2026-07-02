@@ -3983,6 +3983,21 @@ struct WindowsRuntime {
     /// `exit(code)`-shaped shim: rdi=code in, never returns. Wraps
     /// `ExitProcess`.
     win_exit: TextLabel,
+    /// `Sleep(dwMilliseconds)`-shaped shim: rdi=millis in, no output.
+    /// Wraps `Sleep`.
+    win_sleep: TextLabel,
+    /// Wall-clock shim: no input, rax=unix epoch millis out. Wraps
+    /// `GetSystemTimeAsFileTime`, converting its FILETIME output to
+    /// the same epoch-millis value `Time#nowMillis` returns elsewhere.
+    win_time_now_millis: TextLabel,
+    /// Monotonic tick-count shim: no input, rax=raw performance
+    /// counter value out. Wraps `QueryPerformanceCounter`. Paired
+    /// with `win_qpf` to turn two snapshots into elapsed milliseconds
+    /// for `stopwatch`.
+    win_qpc: TextLabel,
+    /// Monotonic counter frequency shim: no input, rax=ticks-per-second
+    /// out. Wraps `QueryPerformanceFrequency`.
+    win_qpf: TextLabel,
     /// Cached `GetStdHandle(STD_OUTPUT_HANDLE)` result, populated by
     /// `win_init`.
     stdout_handle: DataLabel,
@@ -3993,6 +4008,17 @@ struct WindowsRuntime {
     /// unused high 32 bits stay zero) for `WriteFile`'s required
     /// `lpNumberOfBytesWritten` out-parameter.
     write_bytes_scratch: DataLabel,
+    /// Scratch `FILETIME` (8 bytes: `dwLowDateTime`/`dwHighDateTime`,
+    /// contiguous and little-endian, so it reads back as one 64-bit
+    /// tick count) for `GetSystemTimeAsFileTime`'s out-parameter.
+    filetime_scratch: DataLabel,
+    /// Scratch `LARGE_INTEGER` (8 bytes) shared by the `win_qpc`/
+    /// `win_qpf` shims. Safe to share: Klassic's native codegen has no
+    /// real OS-thread concurrency (`thread { .. }` bodies are spliced
+    /// into `main` at compile time, not dispatched to actual kernel
+    /// threads), and each shim call fully reads the value back into
+    /// rax before the next shim call can overwrite it.
+    perf_counter_scratch: DataLabel,
 }
 
 struct NativeCodeGenerator {
@@ -4246,9 +4272,15 @@ impl NativeCodeGenerator {
                 win_write: asm.create_text_label(),
                 win_mmap: asm.create_text_label(),
                 win_exit: asm.create_text_label(),
+                win_sleep: asm.create_text_label(),
+                win_time_now_millis: asm.create_text_label(),
+                win_qpc: asm.create_text_label(),
+                win_qpf: asm.create_text_label(),
                 stdout_handle: asm.data_label_with_i64s(&[0]),
                 stderr_handle: asm.data_label_with_i64s(&[0]),
                 write_bytes_scratch: asm.data_label_with_i64s(&[0]),
+                filetime_scratch: asm.data_label_with_i64s(&[0]),
+                perf_counter_scratch: asm.data_label_with_i64s(&[0]),
             })
         } else {
             None
@@ -4916,6 +4948,10 @@ impl NativeCodeGenerator {
             self.emit_win_write_runtime();
             self.emit_win_mmap_runtime();
             self.emit_win_exit_runtime();
+            self.emit_win_sleep_runtime();
+            self.emit_win_time_now_millis_runtime();
+            self.emit_win_qpc_runtime();
+            self.emit_win_qpf_runtime();
         }
         Ok(self.asm.finish())
     }
@@ -12344,9 +12380,6 @@ impl NativeCodeGenerator {
     }
 
     fn compile_sleep(&mut self, arguments: &[Expr], span: Span) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "sleep"));
-        }
         if arguments.len() != 1 {
             return Err(Diagnostic::compile(
                 span,
@@ -12356,6 +12389,11 @@ impl NativeCodeGenerator {
         if let Some(millis) = const_int_expr(&arguments[0]) {
             if millis < 0 {
                 self.emit_runtime_error(span, "sleep expects a non-negative integer index");
+                return Ok(NativeValue::Unit);
+            }
+            if self.is_windows {
+                self.asm.mov_imm64(Reg::Rdi, millis as u64);
+                self.asm.call_label(self.windows_runtime().win_sleep);
                 return Ok(NativeValue::Unit);
             }
             let seconds = millis / 1000;
@@ -12380,6 +12418,12 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::GreaterEqual, ok);
         self.emit_runtime_error(span, "sleep expects a non-negative integer index");
         self.asm.bind_text_label(ok);
+
+        if self.is_windows {
+            self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+            self.asm.call_label(self.windows_runtime().win_sleep);
+            return Ok(NativeValue::Unit);
+        }
 
         self.asm.mov_imm64(Reg::Rbx, 1000);
         self.asm.cqo();
@@ -17306,9 +17350,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "stopwatch"));
-        }
         if arguments.len() != 1 {
             return Err(Diagnostic::compile(
                 span,
@@ -17321,6 +17362,33 @@ impl NativeCodeGenerator {
             "native stopwatch for non-lambda argument",
             "native stopwatch for lambda with parameters",
         )?;
+
+        if self.is_windows {
+            // One raw tick count per snapshot (vs. the Linux path's
+            // {tv_sec, tv_nsec} pair) -- `QueryPerformanceCounter`
+            // already returns a single opaque counter value.
+            let start = self.asm.data_label_with_i64s(&[0]);
+            let end = self.asm.data_label_with_i64s(&[0]);
+            self.asm.call_label(self.windows_runtime().win_qpc);
+            self.asm.mov_data_addr(Reg::Rcx, start);
+            self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
+
+            self.push_scope();
+            self.bind_static_lambda_captures(&lambda);
+            self.compile_expr(&lambda.body)?;
+            if self.queued_threads_capture_current_scope() {
+                self.pop_scope_preserving_allocations();
+            } else {
+                self.pop_scope();
+            }
+
+            self.asm.call_label(self.windows_runtime().win_qpc);
+            self.asm.mov_data_addr(Reg::Rcx, end);
+            self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
+
+            self.emit_win_elapsed_millis_qpc(start, end);
+            return Ok(NativeValue::Int);
+        }
 
         let start = self.asm.data_label_with_i64s(&[0, 0]);
         let end = self.asm.data_label_with_i64s(&[0, 0]);
@@ -17379,9 +17447,6 @@ impl NativeCodeGenerator {
         arguments: &[Expr],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if self.is_windows {
-            return Err(self.unsupported_on_target(span, "Time#nowMillis"));
-        }
         if !arguments.is_empty() {
             return Err(Diagnostic::compile(
                 span,
@@ -17390,6 +17455,11 @@ impl NativeCodeGenerator {
                     arguments.len()
                 ),
             ));
+        }
+        if self.is_windows {
+            self.asm
+                .call_label(self.windows_runtime().win_time_now_millis);
+            return Ok(NativeValue::Int);
         }
         let now = self.asm.data_label_with_i64s(&[0, 0]);
         self.emit_syscall_number(PlatformSyscall::ClockGettime);
@@ -17829,6 +17899,31 @@ impl NativeCodeGenerator {
         self.asm.idiv_reg(Reg::Rbx);
         self.asm.pop_reg(Reg::Rcx);
         self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
+    }
+
+    /// Windows counterpart to `emit_elapsed_millis`: `start`/`end` are
+    /// raw `QueryPerformanceCounter` tick counts (one i64 each, not a
+    /// `{tv_sec, tv_nsec}` pair) rather than `clock_gettime` output.
+    /// `elapsed_ticks * 1000 / frequency` gives millis; the frequency
+    /// query happens first so its own `call_label` doesn't clobber the
+    /// arithmetic in rax/rcx that follows. No overflow guard is needed
+    /// for realistic stopwatch durations: even at a low
+    /// `QueryPerformanceFrequency` of 1 (worst case), `elapsed_ticks *
+    /// 1000` only overflows i64 past ~292 million years of elapsed
+    /// wall-clock time.
+    fn emit_win_elapsed_millis_qpc(&mut self, start: DataLabel, end: DataLabel) {
+        self.asm.call_label(self.windows_runtime().win_qpf);
+        self.asm.mov_reg_reg(Reg::Rbx, Reg::Rax); // rbx = ticks/sec
+
+        self.asm.mov_data_addr(Reg::Rax, end);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        self.asm.mov_data_addr(Reg::Rcx, start);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rcx, 0);
+        self.asm.sub_reg_reg(Reg::Rax, Reg::Rcx); // rax = elapsed ticks
+        self.asm.mov_imm64(Reg::Rcx, 1000);
+        self.asm.imul_reg_reg(Reg::Rax, Reg::Rcx); // rax = elapsed ticks * 1000
+        self.asm.cqo();
+        self.asm.idiv_reg(Reg::Rbx); // rax = elapsed millis
     }
 
     fn compile_static_method_call(
@@ -38816,6 +38911,124 @@ impl NativeCodeGenerator {
         self.asm.ud2();
     }
 
+    /// `Sleep(dwMilliseconds)`-shaped shim. Input: rdi=millis. Unlike
+    /// Linux's `nanosleep(const struct timespec*, ...)`, `Sleep` takes
+    /// the duration directly in milliseconds -- no seconds/nanos split
+    /// needed. Output: none (`Sleep` returns `void`); rax is left
+    /// however `Sleep` happened to leave it, which is fine since
+    /// `compile_sleep` always yields `NativeValue::Unit` and never
+    /// reads rax afterward.
+    fn emit_win_sleep_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_sleep);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+
+        // ecx = dwMilliseconds. `emit_win_shim_save_registers` only
+        // *copies* rdi into the save area, so the register itself
+        // still holds the caller's millis value here.
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+        self.asm.call_import(ImportSymbol::Sleep);
+
+        self.emit_win_shim_epilogue();
+    }
+
+    /// Wall-clock shim wrapping `GetSystemTimeAsFileTime`, converting
+    /// its FILETIME (100ns ticks since 1601-01-01 UTC) output to the
+    /// same "milliseconds since the UNIX epoch" value both the
+    /// evaluator's `Time#nowMillis`
+    /// (`SystemTime::now().duration_since(UNIX_EPOCH)`) and the Linux
+    /// native path (`clock_gettime(CLOCK_REALTIME, ..)`) produce.
+    /// `116_444_736_000_000_000` is the fixed, well-known number of
+    /// 100ns ticks between 1601-01-01 and 1970-01-01 (the FILETIME /
+    /// UNIX epoch offset). Output: rax = unix epoch millis
+    /// (`NativeValue::Int`) -- the whole conversion happens inside the
+    /// shim, so the call site just needs `call_label` then treat rax
+    /// as the result, exactly like the Linux path leaves its computed
+    /// value in rax.
+    fn emit_win_time_now_millis_runtime(&mut self) {
+        const FILETIME_UNIX_EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_time_now_millis);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+
+        self.asm.mov_data_addr(Reg::Rcx, windows.filetime_scratch);
+        self.asm.call_import(ImportSymbol::GetSystemTimeAsFileTime);
+
+        // The FILETIME struct's two DWORDs (dwLowDateTime then
+        // dwHighDateTime) sit contiguously in `.data` in that order,
+        // which on this little-endian target is exactly the bytes of
+        // the 64-bit tick count -- one plain qword load.
+        self.asm.mov_data_addr(Reg::Rax, windows.filetime_scratch);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        self.asm.mov_imm64(Reg::Rcx, FILETIME_UNIX_EPOCH_DIFF_100NS);
+        self.asm.sub_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.cqo();
+        self.asm.mov_imm64(Reg::Rbx, 10_000); // 100ns ticks -> ms
+        self.asm.idiv_reg(Reg::Rbx);
+
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `QueryPerformanceCounter`-wrapping shim: reads the current raw
+    /// tick count of Windows' monotonic high-resolution counter into
+    /// rax. Paired with `emit_win_qpf_runtime` (and
+    /// `emit_win_elapsed_millis_qpc`) to turn a `start`/`end` pair of
+    /// these raw counts into elapsed milliseconds, mirroring how the
+    /// Linux `stopwatch` path snapshots `CLOCK_MONOTONIC` twice via
+    /// `emit_clock_gettime`.
+    fn emit_win_qpc_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_qpc);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+
+        self.asm
+            .mov_data_addr(Reg::Rcx, windows.perf_counter_scratch);
+        self.asm.call_import(ImportSymbol::QueryPerformanceCounter);
+
+        self.asm
+            .mov_data_addr(Reg::Rax, windows.perf_counter_scratch);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `QueryPerformanceFrequency`-wrapping shim: reads the counter's
+    /// fixed ticks-per-second denominator into rax. This value is
+    /// constant for the life of the process, but this shim is
+    /// re-queried on every `stopwatch` call rather than cached at
+    /// startup -- correctness over a negligible extra import call.
+    /// Reuses `perf_counter_scratch`: safe for the same reason
+    /// `emit_win_qpc_runtime` sharing it is (see that field's doc
+    /// comment on `WindowsRuntime`).
+    fn emit_win_qpf_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_qpf);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+
+        self.asm
+            .mov_data_addr(Reg::Rcx, windows.perf_counter_scratch);
+        self.asm
+            .call_import(ImportSymbol::QueryPerformanceFrequency);
+
+        self.asm
+            .mov_data_addr(Reg::Rax, windows.perf_counter_scratch);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+
+        self.emit_win_shim_epilogue();
+    }
+
     /// Shared abort target for the function-prologue stack probe:
     /// report and exit instead of dying on the guard page with a bare
     /// SIGSEGV.
@@ -42039,24 +42252,37 @@ enum RelocKind {
 }
 
 /// A `kernel32.dll` function imported by the PE64 backend's Win64
-/// shims. Variant order is load-bearing: it fixes the ILT/IAT slot
-/// order the `pe` writer lays the import table out in, and every
+/// shims. `ImportSymbol::ALL`'s order is the single source of truth
+/// for import-table layout: it fixes the ILT/IAT slot order the `pe`
+/// writer lays the import table out in (derived automatically from
+/// `ALL` -- see `pe::write_executable`), and `ImportSymbol::iat_index`
+/// derives each symbol's slot from its position in `ALL` too, so every
 /// `call [rip+disp32]` emitted by `Assembler::call_import` resolves
-/// against that same order via `ImportSymbol::iat_index`.
+/// against that same order. Adding a new imported function only ever
+/// needs a new variant, an `ALL` entry, and a `name()` arm -- nothing
+/// in `pe.rs` or `iat_index` needs to change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ImportSymbol {
     GetStdHandle,
     WriteFile,
     ExitProcess,
     VirtualAlloc,
+    GetSystemTimeAsFileTime,
+    Sleep,
+    QueryPerformanceCounter,
+    QueryPerformanceFrequency,
 }
 
 impl ImportSymbol {
-    const ALL: [ImportSymbol; 4] = [
+    const ALL: [ImportSymbol; 8] = [
         ImportSymbol::GetStdHandle,
         ImportSymbol::WriteFile,
         ImportSymbol::ExitProcess,
         ImportSymbol::VirtualAlloc,
+        ImportSymbol::GetSystemTimeAsFileTime,
+        ImportSymbol::Sleep,
+        ImportSymbol::QueryPerformanceCounter,
+        ImportSymbol::QueryPerformanceFrequency,
     ];
 
     /// Exact, case-sensitive export name from `kernel32.dll`.
@@ -42066,17 +42292,21 @@ impl ImportSymbol {
             ImportSymbol::WriteFile => "WriteFile",
             ImportSymbol::ExitProcess => "ExitProcess",
             ImportSymbol::VirtualAlloc => "VirtualAlloc",
+            ImportSymbol::GetSystemTimeAsFileTime => "GetSystemTimeAsFileTime",
+            ImportSymbol::Sleep => "Sleep",
+            ImportSymbol::QueryPerformanceCounter => "QueryPerformanceCounter",
+            ImportSymbol::QueryPerformanceFrequency => "QueryPerformanceFrequency",
         }
     }
 
-    /// This symbol's zero-based slot in the ILT/IAT arrays.
+    /// This symbol's zero-based slot in the ILT/IAT arrays, derived
+    /// from its position in `ALL` so `ALL`'s order is the only place
+    /// that fixes the layout.
     fn iat_index(self) -> usize {
-        match self {
-            ImportSymbol::GetStdHandle => 0,
-            ImportSymbol::WriteFile => 1,
-            ImportSymbol::ExitProcess => 2,
-            ImportSymbol::VirtualAlloc => 3,
-        }
+        Self::ALL
+            .iter()
+            .position(|&symbol| symbol == self)
+            .expect("every ImportSymbol variant must appear in ImportSymbol::ALL")
     }
 }
 
