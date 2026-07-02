@@ -1,15 +1,17 @@
 # Why a GC?
 
-Klassic compiles directly to ELF without `libc`, so it cannot lean on
-`malloc` / `free` from the system. At the same time, real programs
-need values whose lifetime extends past the stack frame that built
-them: a string returned from `String#concat`, a list grown inside a
-loop, a dictionary that records counts.
+Klassic compiles directly to a native executable (ELF64 on Linux,
+Mach-O arm64 on macOS, PE64 on Windows) without `libc`, so it cannot
+lean on `malloc` / `free` from the system. At the same time, real
+programs need values whose lifetime extends past the stack frame that
+built them: a string returned from `String#concat`, a list grown
+inside a loop, a dictionary that records counts.
 
 The native compiler embeds its own precise mark-and-sweep collector
 to give those values a managed home. Concretely:
 
-- The runtime starts with a 1 MiB heap (`mmap`'d at startup).
+- The runtime starts with a 1 MiB heap (`mmap`'d at startup on Linux
+  and macOS; `VirtualAlloc`'d on Windows).
 - When even a post-collection retry can't satisfy a request, the
   allocator `mmap`s another 1 MiB segment. Up to 64 segments
   total — `64 MiB` — before the program exits with

@@ -19,7 +19,7 @@ klassic-types      (Hindley-Milner inference + records + type classes + proofs)
    ↓
 klassic-eval       (evaluator + builtins + REPL)
    ↓ (only for `klassic build`)
-klassic-native     (Linux x86_64 codegen + ELF writer)
+klassic-native     (x86_64 codegen + ELF64 / Mach-O arm64 / PE64 writers)
 ```
 
 ## Crates
@@ -31,7 +31,7 @@ klassic-native     (Linux x86_64 codegen + ELF writer)
 | `klassic-rewrite` | Placeholder desugaring and normalization. |
 | `klassic-types` | Type checking, type classes, proof checks. |
 | `klassic-eval` | Evaluator, runtime builtins, REPL state. |
-| `klassic-native` | x86_64 codegen and ELF64 writer. |
+| `klassic-native` | x86_64/arm64 codegen and the ELF64, Mach-O arm64, and PE64 writers. |
 | `klassic-runtime` | Shared runtime crate scaffold (work in progress). |
 | `klassic-macro-peg` | Standalone Rust macro PEG implementation. |
 
@@ -41,7 +41,9 @@ klassic-native     (Linux x86_64 codegen + ELF writer)
 pipeline and lowers a growing subset of the resulting AST directly
 to machine code:
 
-- Direct syscall I/O — no `libc`, `cc`, `as`, or `ld` involvement.
+- Direct OS-level I/O with no `libc`, `cc`, `as`, `ld`, or `codesign`
+  involvement — raw syscalls on Linux and macOS, Win64 `kernel32.dll`
+  import calls on Windows.
 - Precise mark-and-sweep GC with multi-segment heap growth (see
   [Why a GC?](../gc/why.md)).
 - Fixed-buffer representations for runtime strings / lists / records

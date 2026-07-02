@@ -25,11 +25,33 @@ Two environment variables tune the installer:
 
 | Variable | Effect |
 | --- | --- |
-| `KLASSIC_VERSION=v0.3.0` | Pin a specific release instead of the latest |
+| `KLASSIC_VERSION=v0.4.0` | Pin a specific release instead of the latest |
 | `KLASSIC_HOME=/opt/klassic` | Change the install root (binaries go to `$KLASSIC_HOME/bin`) |
 
 The Linux build is statically linked (musl) and runs on any x86_64
 Linux. The macOS builds run on macOS 11+.
+
+## Windows
+
+Download the `klassic-vX.Y.Z-x86_64-pc-windows-msvc.zip` asset from
+the latest [release](https://github.com/klassic/klassic/releases),
+extract it, and put the folder containing `klassic.exe` on your `PATH`
+(for example, via *System Properties → Environment Variables*, or
+`setx PATH "%PATH%;C:\klassic"` in an elevated prompt). Then confirm it
+works from PowerShell or `cmd.exe`:
+
+```bat
+klassic --version
+klassic -e "1 + 2"
+```
+
+Windows x86_64 is a tier-0 target with its own direct PE64 backend —
+no Visual Studio, MSVC toolchain, or WSL required to run the evaluator,
+REPL, or `klassic build`. The Windows release zip ships `klassic.exe`
+alone (unlike the Linux/macOS archives, it does not bundle
+`libklassic_runtime.a`), so `--backend c` is not available from the
+downloaded binary; use the direct PE64 backend (the default on
+Windows) for native builds.
 
 ## What works where
 
@@ -38,6 +60,7 @@ Linux. The macOS builds run on macOS 11+.
 | Linux x86_64 | ✅ | ✅ direct ELF64 (most complete) |
 | macOS arm64 (Apple Silicon) | ✅ | ✅ direct signed Mach-O, portable-C fallback |
 | macOS x86_64 | ✅ | ✅ portable C backend (needs Xcode CLT's `cc`) |
+| Windows x86_64 | ✅ | ✅ direct PE64 (core language plus full OS-builtin coverage; ANSI-only paths/env) |
 | anywhere Rust runs | ✅ | — |
 
 ## Build from source

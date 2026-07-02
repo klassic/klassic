@@ -25,14 +25,16 @@ Rust. The implementation builds a native `klassic` executable with Cargo.
   `std.math`, `std.option`, `std.result`, `std.map`, `std.set`, `std.json`,
   `std.time`, and more
 - Native CLI and a REPL that echoes every value with its inferred type
-- Direct-to-ELF native compiler (no `cc`/`as`/`ld`) with by-pointer calling
-  conventions for enums and strings, a stack-overflow probe, and
-  compile-time-budgeted constant folding
+- Direct-to-native-executable compiler (no `cc`/`as`/`ld`) targeting Linux
+  x86_64 (ELF64), Apple Silicon macOS (ad-hoc-signed Mach-O arm64), and
+  Windows x86_64 (PE64), with by-pointer calling conventions for enums and
+  strings, a stack-overflow probe, and compile-time-budgeted constant folding
 - Portable C backend (`--backend c`) emitting a single C99 translation unit
   for a growing subset
 - Precise mark-and-sweep garbage collector with multi-segment heap growth and
   mmap-backed tables, exposed through 68 `__gc_*` debug builtins
 - Release automation: tagged pushes publish statically-linked Linux binaries
+  plus macOS (Apple Silicon and Intel) and Windows x86_64 binaries
 - Standalone Rust macro PEG subsystem
 
 ## Install
@@ -47,7 +49,7 @@ The installer detects your platform, downloads the latest
 [release](https://github.com/klassic/klassic/releases) into
 `~/.klassic/bin` (binary plus `libklassic_runtime.a` for the C
 backend), and verifies the install by running a Klassic program with
-it. Set `KLASSIC_VERSION=v0.3.0` to pin a release, `KLASSIC_HOME` to
+it. Set `KLASSIC_VERSION=v0.4.0` to pin a release, `KLASSIC_HOME` to
 change the install root. The Linux build is statically linked (musl)
 and runs on any x86_64 Linux.
 
@@ -59,11 +61,34 @@ outside its (growing) subset fall back to the portable C backend
 (the system `cc` links against the bundled runtime). Anything beyond
 both paths runs with `klassic program.kl`.
 
+On Windows, download `klassic-<version>-x86_64-pc-windows-msvc.zip`
+from the [releases page](https://github.com/klassic/klassic/releases),
+extract `klassic.exe`, and put it on `PATH`. The evaluator, REPL, and
+`klassic build` all work out of the box: `klassic build` on a Windows
+host targets `x86_64-pc-windows-msvc` automatically and the direct
+PE64 backend compiles with no external toolchain (no Visual Studio,
+MSVC, or WSL required). The Windows zip ships `klassic.exe` alone —
+`libklassic_runtime.a` is not bundled, so `--backend c` needs a
+source build with a C compiler available.
+
 Alternatively, build from source with Cargo:
 
 ```bash
 cargo install --git https://github.com/klassic/klassic
 ```
+
+### Platform matrix
+
+| | Evaluator / REPL | `klassic build` (as host) | `klassic build --target ...` (cross-build) |
+| --- | --- | --- | --- |
+| Linux x86_64 | yes | direct ELF64 (most complete) | `linux-x86_64` / `x86_64-unknown-linux-gnu` |
+| macOS arm64 (Apple Silicon) | yes | direct Mach-O arm64, portable-C fallback | `macos-aarch64` / `aarch64-apple-darwin` (from any host) |
+| macOS x86_64 (Intel) | yes | portable C backend (needs Xcode CLT's `cc`) | via portable C backend |
+| Windows x86_64 | yes | direct PE64 (core language plus full OS-builtin coverage; ANSI-only paths/env) | `windows-x86_64` / `x86_64-pc-windows-msvc` (from any host) |
+
+`klassic targets` prints the live matrix, including the still-planned
+tier 1/2 targets (`x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-gnu`, `wasm32-wasi`).
 
 ## Build And Test
 
@@ -107,10 +132,11 @@ klassic build path/to/program.kl -o program
 ```
 
 Pass `--target` to select a target explicitly — `linux-x86_64` /
-`x86_64-unknown-linux-gnu` (direct ELF) and `macos-aarch64` /
-`aarch64-apple-darwin` (direct signed Mach-O, cross-buildable from any
-host) are the implemented direct targets; `--target native` picks the
-host's. `klassic targets` lists the full matrix.
+`x86_64-unknown-linux-gnu` (direct ELF), `macos-aarch64` /
+`aarch64-apple-darwin` (direct signed Mach-O), and `windows-x86_64` /
+`x86_64-pc-windows-msvc` (direct PE64) are the implemented direct
+targets, all cross-buildable from any host; `--target native` picks
+the host's. `klassic targets` lists the full matrix.
 
 Emit portable C instead of an ELF executable:
 
@@ -158,7 +184,10 @@ language surface; Apple Silicon macOS (`macos-aarch64` /
 `aarch64-apple-darwin`) emits ad-hoc-signed Mach-O arm64 for a growing subset
 (Int/Bool/String expressions, locals, control flow, functions with recursion,
 string builtins, monomorphic enums and match, cons lists, records, sets with
-method dispatch). Linux x86_64 highlights:
+method dispatch); Windows x86_64 (`windows-x86_64` / `x86_64-pc-windows-msvc`)
+emits PE64 by reusing the entire Linux x86_64 codegen (only the OS boundary
+and container format differ), so it matches Linux x86_64's core-language
+coverage plus full OS-builtin coverage. Linux x86_64 highlights:
 
 - Core integer / boolean / string / list expressions, control flow, and
   recursive `def`s (including annotated `String` and `List<String>` parameters).
@@ -172,6 +201,11 @@ method dispatch). Linux x86_64 highlights:
   direct syscalls, with virtual filesystem tracking for static paths.
 - Source-located stderr diagnostics for runtime failures (`assert`,
   `assertResult`, `head([])`, negative `sleep`, FileOutput / Dir errors).
+
+The Windows target covers the same file / directory / process / environment /
+stdin / argv / time builtins through direct Win64 `kernel32.dll` import calls
+instead of raw syscalls, with one limitation: those calls are ANSI-only, so
+non-ASCII paths and environment values/keys are unsupported.
 
 Anything not yet supported fails at build time rather than falling back to the
 evaluator. See [`docs/native-coverage.md`](docs/native-coverage.md) for the

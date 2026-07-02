@@ -28,7 +28,7 @@ klassic hello.kl
 `klassic <path>` and `klassic -f <path>` are equivalent — both run
 the program through the evaluator.
 
-## Compile to a native ELF
+## Compile to a native executable
 
 ```bash
 klassic build hello.kl -o hello
@@ -36,9 +36,16 @@ klassic build hello.kl -o hello
 # Hello, World!
 ```
 
-The native compiler emits a Linux x86_64 ELF that talks directly to
-the kernel through syscalls. There is no `libc` dependency, so the
-resulting binary is a few KiB and starts essentially instantly.
+A target-less `build` compiles for the detected host, writing the
+executable container itself with no external toolchain: a direct ELF64
+on Linux x86_64, an ad-hoc-signed Mach-O arm64 on Apple Silicon macOS,
+or a PE64 on Windows x86_64 (`klassic build hello.kl -o hello.exe`).
+None of them depend on `libc`, so the resulting binary is a few KiB
+and starts essentially instantly. See
+[Building Executables](../native/building.md) for the full host/target
+matrix.
+
+On Linux:
 
 ```bash
 file hello
