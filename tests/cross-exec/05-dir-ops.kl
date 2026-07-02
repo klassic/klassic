@@ -1,14 +1,8 @@
 // Cross-exec guarantee: Dir mkdir/mkdirs/exists/isDirectory/move/delete,
 // all reported as booleans only (never a path or directory listing) so
-// output is identical across OSes. Cleans up after itself.
-//
-// Deliberately avoids checking `isDirectory` on a nested child path
-// immediately after moving its parent directory: the native compiler's
-// path-tracking for `Dir#move` does not currently propagate renames to
-// previously created child entries, which is an existing, narrow
-// native-codegen gap unrelated to the OS-execution guarantee this
-// suite checks. Each directory used here is moved/deleted as a whole,
-// independent unit instead.
+// output is identical across OSes. Cleans up after itself. Includes
+// the move-then-check-nested-child shape that used to be a native
+// path-tracking miscompile (#539/#540) so the suite now guards it.
 val base = "kl_cross_exec_dir_base"
 val extra = "kl_cross_exec_dir_extra"
 val moved = "kl_cross_exec_dir_moved"
@@ -21,10 +15,16 @@ println(Dir#isDirectory(base))
 Dir#mkdirs(extra)
 println(Dir#isDirectory(extra))
 
+Dir#mkdir("kl_cross_exec_dir_base/child")
+println(Dir#isDirectory("kl_cross_exec_dir_base/child"))
+
 Dir#move(base, moved)
 println(Dir#exists(base))
 println(Dir#isDirectory(moved))
+println(Dir#isDirectory("kl_cross_exec_dir_base/child"))
+println(Dir#isDirectory("kl_cross_exec_dir_moved/child"))
 
+Dir#delete("kl_cross_exec_dir_moved/child")
 Dir#delete(moved)
 println(Dir#exists(moved))
 
