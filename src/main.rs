@@ -271,8 +271,10 @@ fn collect_user_modules(
 /// Locate `libklassic_runtime.a` for the C backend: an explicit
 /// `KLASSIC_RT_LIB` wins, then the directory next to the `klassic`
 /// executable (release tarballs ship the library beside the binary,
-/// and a cargo build leaves it in the same `target/<profile>/`
-/// directory).
+/// and a `cargo build` uplifts it into the same `target/<profile>/`
+/// directory), then — for `cargo test`, which never performs that
+/// uplift — the most recently modified hashed copy in the sibling
+/// `deps/` directory (`libklassic_runtime-<hash>.a`).
 fn find_runtime_staticlib() -> Option<std::path::PathBuf> {
     if let Ok(explicit) = std::env::var("KLASSIC_RT_LIB") {
         let path = std::path::PathBuf::from(explicit);
@@ -282,12 +284,30 @@ fn find_runtime_staticlib() -> Option<std::path::PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    [
+    if let Some(found) = [
         dir.join("libklassic_runtime.a"),
         dir.join("lib").join("libklassic_runtime.a"),
     ]
     .into_iter()
     .find(|candidate| candidate.is_file())
+    {
+        return Some(found);
+    }
+    let deps_dir = dir.join("deps");
+    let entries = fs::read_dir(&deps_dir).ok()?;
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path.file_name().and_then(|name| name.to_str());
+            name.is_some_and(|name| name.starts_with("libklassic_runtime-") && name.ends_with(".a"))
+        })
+        .filter_map(|path| {
+            let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
 }
 
 /// Compile generated C and link it with the runtime staticlib using
