@@ -61,11 +61,12 @@ cargo run -- -e "1 + 2"
 - REPL/session state
 
 ### `klassic-native`
-- Batch native compilation through `klassic build [--target linux-x86_64|x86_64-unknown-linux-gnu|macos-aarch64|aarch64-apple-darwin|native] <file.kl> -o <output>`
+- Batch native compilation through `klassic build [--target linux-x86_64|x86_64-unknown-linux-gnu|macos-aarch64|aarch64-apple-darwin|windows-x86_64|x86_64-pc-windows-msvc|native] <file.kl> -o <output>`
 - Reuses the Rust parser, rewrite pass, typechecker, and proof/trust analysis
-- Emits target-native machine code directly; both `LinuxX86_64` and `MacOsAArch64` are implemented
+- Emits target-native machine code directly; `LinuxX86_64`, `MacOsAArch64`, and `WindowsX86_64` are implemented
 - Also emits ad-hoc-signed Mach-O arm64 executables for `aarch64-apple-darwin` (direct backend, growing subset)
-- Carries an explicit `NativeTarget`; the implemented targets are `LinuxX86_64` and `MacOsAArch64`
+- `WindowsX86_64` reuses the `LinuxX86_64` codegen backend (`DirectX86_64`) wholesale and only swaps the OS boundary (Win64 import-call shims) and container format (PE64)
+- Carries an explicit `NativeTarget`; the implemented targets are `LinuxX86_64`, `MacOsAArch64`, and `WindowsX86_64`
 - Keeps supported targets in a metadata registry containing the compact name,
   standard triple, architecture, direct-codegen backend, data layout,
   operating system, ABI, and executable format
@@ -75,8 +76,9 @@ cargo run -- -e "1 + 2"
   spec with its platform constants before entering codegen
 - Keeps target-specific syscall numbers and OS constants such as fds, open
   modes, errno values, stat masks, clocks, mmap flags, and sendfile limits in a
-  target-keyed platform constants registry
-- Writes ELF64 executables (Linux x86_64) and ad-hoc-signed Mach-O arm64 executables (Apple Silicon) directly without invoking `cc`, `as`, `ld`, Java, Scala, or the JVM
+  target-keyed platform constants registry; `TargetPlatform::syscall_number`
+  panics for the Windows target as a deliberate tripwire (see below)
+- Writes ELF64 executables (Linux x86_64), ad-hoc-signed Mach-O arm64 executables (Apple Silicon), and PE64 executables (Windows x86_64) directly without invoking `cc`, `as`, `ld`, Java, Scala, or the JVM
 - Current native codegen covers the first vertical slice: integer and boolean
   expressions, string literal printing, `println` / `printlnError`, `assert`,
   curried `assertResult`, `if`, `while`, mutable integer/boolean locals,
@@ -848,6 +850,41 @@ cargo run -- -e "1 + 2"
   Silicon defaults to this backend and falls back to the portable C
   backend for programs outside the direct subset; Linux x86_64 keeps
   the full-featured direct ELF backend with no fallback.
+
+  `x86_64-pc-windows-msvc` (`--target x86_64-pc-windows-msvc` /
+  `windows-x86_64`) is the one target that does *not* get its own
+  codegen module: it reuses the entire `DirectX86_64` (Linux) code
+  generator as-is, since the generated x86_64 machine code is already
+  Win64-ABI-compatible; only the OS boundary and the container format
+  differ. `NativeCodeGenerator` carries an `is_windows` flag that gates
+  every syscall-emission site (`write`, `mmap`, `exit`) to call one of
+  four small Win64 import-call shims (`__win_write`, `__win_mmap`,
+  `__win_exit`, plus a `__win_init` startup routine that caches
+  `GetStdHandle` results) instead of a bare Linux `syscall`
+  instruction, and skips the two pieces of Linux-initial-stack-layout
+  setup (`argc`/`argv`/`envp`, the `getrlimit`-based stack-overflow
+  probe) that have no Windows equivalent at this raw an entry point.
+  `TargetPlatform::syscall_number` panics unconditionally for a
+  Windows target as a compile-time tripwire, so any not-yet-gated
+  syscall path (file/dir/time/thread/stdin — out of scope for this
+  slice) fails loudly instead of silently emitting a Linux syscall
+  number into a Windows binary. Each shim forces 16-byte `rsp`
+  alignment via `and rsp, -16` before its own `call [rip+iat]`
+  regardless of how it was entered — the reused Linux codegen was
+  never written to maintain the Win64 "aligned before every call"
+  invariant, so a shim reached from deep inside a closure/GC-allocation
+  call chain can see `rsp` at either parity, and assuming a fixed
+  incoming alignment reliably crashed inside `KERNELBASE.dll` on first
+  contact. The PE64 writer is `crates/klassic-native/src/pe.rs`: a
+  minimal three-section (`.text`/`.rdata`/`.data`) unsigned image
+  importing only `GetStdHandle`/`WriteFile`/`ExitProcess`/
+  `VirtualAlloc` from `kernel32.dll`, with a fixed `ImageBase` and no
+  `.reloc` section (mirrors the "no external toolchain" property of
+  the ELF and Mach-O writers). Verified end-to-end under WSL2 binfmt
+  interop (`./program.exe` launches the real Windows loader from
+  Linux) against hello-world, recursive `def`s, string/enum/record/list
+  operations, closures, and a GC-churn stress program, all matching
+  the evaluator's output byte-for-byte.
 
   The native runtime owns a dedicated GC heap that is separate from the
   static `.data` buffers used by the rest of the codegen. At program

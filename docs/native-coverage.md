@@ -584,7 +584,7 @@ lands. See `docs/roadmap-targets-stdlib.md` for the wider rationale.
 | `wasm32-wasi`                  | wasm module emitter    | wasm-module   | 2    | planned     |
 | `x86_64-apple-darwin`          | portable C backend     | executable    | 2    | planned     |
 | `aarch64-apple-darwin`         | direct Mach-O writer   | executable    | 1    | supported (small subset, growing) |
-| `x86_64-pc-windows-msvc`       | portable C backend     | executable    | 2    | planned     |
+| `x86_64-pc-windows-msvc`       | direct PE64 writer (reuses DirectX86_64 codegen) | executable | 0 | supported (core language: arithmetic, if/while, recursive def, strings, enums/match, records, lists, closures, GC) |
 
 Rules:
 
@@ -596,8 +596,17 @@ Rules:
   (`aarch64-apple-darwin`) is tier 1 and uses a direct Mach-O arm64 backend
   (svc #0x80), not the portable C backend.
 - Tier 2 targets reach the matrix through the portable runtime call
-  path / C backend. x86_64 macOS and Windows reach the matrix through the
-  portable C backend.
+  path / C backend. x86_64 macOS still reaches the matrix through the
+  portable C backend. `x86_64-pc-windows-msvc` is the one deliberate
+  exception below tier 2: it reuses the entire `DirectX86_64` (Linux)
+  code generator rather than going through the C backend or getting a
+  dedicated codegen module like aarch64 -- only the OS boundary
+  (syscalls -> Win64 `kernel32.dll` import-call shims) and the
+  container format (PE64, see `crates/klassic-native/src/pe.rs`)
+  differ. Non-core-language syscalls (file/dir/time/thread/stdin, ...)
+  are not yet gated for Windows; reaching one from a Windows build is
+  a deliberate compile-time panic (see `TargetPlatform::syscall_number`)
+  rather than a silently wrong binary, and is the next slice of work.
 - An unsupported target must produce a `TargetSpec`-style diagnostic,
   not a panic.
 

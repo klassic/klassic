@@ -24,6 +24,7 @@ pub enum NativeTarget {
     #[default]
     LinuxX86_64,
     MacosAarch64,
+    WindowsX86_64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,12 +54,14 @@ pub struct NativeDataLayout {
 pub enum NativeOperatingSystem {
     Linux,
     MacOs,
+    Windows,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeAbi {
     Gnu,
     Apple,
+    Msvc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +86,7 @@ const X86_64_DATA_LAYOUT: NativeDataLayout = NativeDataLayout {
 const AARCH64_DATA_LAYOUT: NativeDataLayout = X86_64_DATA_LAYOUT;
 
 const MACOS_AARCH64_ALIASES: &[&str] = &["macos-aarch64", "aarch64-apple-darwin"];
+const WINDOWS_X86_64_ALIASES: &[&str] = &["windows-x86_64", "x86_64-pc-windows-msvc"];
 
 const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[
     NativeTargetSpec {
@@ -108,6 +112,24 @@ const NATIVE_TARGET_SPECS: &[NativeTargetSpec] = &[
         operating_system: NativeOperatingSystem::MacOs,
         abi: NativeAbi::Apple,
         executable_format: NativeExecutableFormat::MachO64,
+    },
+    // Reuses the entire DirectX86_64 (Linux) codegen: the generated
+    // machine code is identical Win64-compatible x86_64 instructions,
+    // this target only swaps the OS boundary (syscalls -> kernel32
+    // imports via Win64 shims, see `emit_syscall_number`'s Windows
+    // tripwire) and the container format (PE64 instead of ELF64, see
+    // `pe.rs`).
+    NativeTargetSpec {
+        target: NativeTarget::WindowsX86_64,
+        canonical_name: "windows-x86_64",
+        standard_triple: "x86_64-pc-windows-msvc",
+        aliases: WINDOWS_X86_64_ALIASES,
+        architecture: NativeArchitecture::X86_64,
+        backend: NativeBackend::DirectX86_64,
+        data_layout: X86_64_DATA_LAYOUT,
+        operating_system: NativeOperatingSystem::Windows,
+        abi: NativeAbi::Msvc,
+        executable_format: NativeExecutableFormat::Pe64,
     },
 ];
 
@@ -154,13 +176,6 @@ const PLANNED_TARGETS: &[PlannedTarget] = &[
         artifact: "executable",
         tier: 2,
     },
-    PlannedTarget {
-        triple: "x86_64-pc-windows-msvc",
-        aliases: &["windows-x86_64"],
-        backend: "portable-c",
-        artifact: "executable",
-        tier: 2,
-    },
 ];
 
 /// Result of recognising a `--target` argument. Distinguishing
@@ -179,6 +194,8 @@ impl NativeTarget {
         "x86_64-unknown-linux-gnu",
         "macos-aarch64",
         "aarch64-apple-darwin",
+        "windows-x86_64",
+        "x86_64-pc-windows-msvc",
         "native",
     ];
 
@@ -334,6 +351,7 @@ impl NativeTarget {
 pub enum NativeExecutableFormat {
     Elf64,
     MachO64,
+    Pe64,
 }
 
 impl NativeArchitecture {
@@ -453,6 +471,7 @@ mod cbackend;
 #[allow(clippy::result_large_err)]
 mod aarch64;
 mod macho;
+mod pe;
 
 /// Compile `text` to a portable C translation unit (`--backend c`).
 /// The supported subset is deliberately small (see `cbackend`);
@@ -3367,10 +3386,14 @@ fn write_executable_for_target(target: NativeTargetContext, object: ObjectFile) 
         NativeExecutableFormat::Elf64 => elf::write_executable(object, target.spec),
         // Mach-O images are laid out and signed by the aarch64 backend
         // itself (`aarch64::emit_macho_program`); the ObjectFile path
-        // is ELF-only.
+        // is ELF-only for Mach-O.
         NativeExecutableFormat::MachO64 => {
             unreachable!("Mach-O executables are written by the aarch64 backend")
         }
+        // PE64 images reuse the DirectX86_64 ObjectFile the same way
+        // ELF does (unlike Mach-O, the Windows target goes through
+        // this generic path since it shares the Linux codegen).
+        NativeExecutableFormat::Pe64 => pe::write_executable(object, target.spec),
     }
 }
 
@@ -3733,10 +3756,53 @@ const LINUX_X86_64_PLATFORM_CONSTANTS: PlatformConstants = PlatformConstants {
     sendfile_chunk_max: 0x7ffff000,
 };
 
-const PLATFORM_CONSTANTS_BY_TARGET: &[PlatformConstantsEntry] = &[PlatformConstantsEntry {
-    target: NativeTarget::LinuxX86_64,
-    constants: &LINUX_X86_64_PLATFORM_CONSTANTS,
-}];
+/// Placeholder constants for the Windows target. `syscall_numbers` and
+/// every Linux-specific flag/mode value here are never legitimately
+/// read: `TargetPlatform::syscall_number` panics unconditionally for a
+/// Windows target (see below) rather than returning one of these Linux
+/// syscall numbers, and every native-codegen call site that reaches a
+/// raw syscall must branch on `is_windows` *before* calling
+/// `emit_syscall_number` -- so any not-yet-Windows-gated syscall path
+/// is a compile-time tripwire instead of a silently wrong binary. Only
+/// the OS-independent bits (`stdin_fd`/`stdout_fd`/`stderr_fd`) carry
+/// real meaning on Windows: the Win64 shims (`__win_write` etc.)
+/// interpret those same small integers to pick a cached
+/// `GetStdHandle` result.
+const WINDOWS_X86_64_PLATFORM_CONSTANTS: PlatformConstants = PlatformConstants {
+    syscall_numbers: [0; PLATFORM_SYSCALL_COUNT],
+    stdin_fd: 0,
+    stdout_fd: 1,
+    stderr_fd: 2,
+    open_read_flags: 0,
+    open_write_truncate_flags: 0,
+    open_write_append_flags: 0,
+    open_directory_flags: 0,
+    default_file_mode: 0,
+    default_dir_mode: 0,
+    at_fdcwd: 0,
+    errno_no_entry: 0,
+    errno_exists: 0,
+    stat_file_type_mask: 0,
+    stat_directory_type: 0,
+    stat_regular_file_type: 0,
+    clock_realtime: 0,
+    clock_monotonic: 0,
+    mmap_prot_read_write: 0,
+    mmap_private_anonymous_flags: 0,
+    mmap_anonymous_fd: 0,
+    sendfile_chunk_max: 0,
+};
+
+const PLATFORM_CONSTANTS_BY_TARGET: &[PlatformConstantsEntry] = &[
+    PlatformConstantsEntry {
+        target: NativeTarget::LinuxX86_64,
+        constants: &LINUX_X86_64_PLATFORM_CONSTANTS,
+    },
+    PlatformConstantsEntry {
+        target: NativeTarget::WindowsX86_64,
+        constants: &WINDOWS_X86_64_PLATFORM_CONSTANTS,
+    },
+];
 
 impl TargetPlatform {
     fn for_target(target: NativeTarget) -> Self {
@@ -3748,7 +3814,21 @@ impl TargetPlatform {
         Self { target, constants }
     }
 
+    /// Linux syscall number for `syscall`. **Deliberate invariant
+    /// tripwire**: panics unconditionally when `self.target` is
+    /// Windows, since Windows has no raw syscall ABI available to
+    /// user code at all -- every codegen call site that can reach a
+    /// raw syscall instruction must check `is_windows` and dispatch
+    /// to a Win64 import-call shim *before* ever calling this method.
+    /// A panic here at compile time means some syscall-emission site
+    /// is missing that gate, which is far better than silently
+    /// emitting a Linux syscall number into a Windows binary.
     fn syscall_number(self, syscall: PlatformSyscall) -> u64 {
+        if self.target.operating_system() == NativeOperatingSystem::Windows {
+            panic!(
+                "internal error: Linux syscall emission reached on x86_64-pc-windows-msvc target (missing Windows gate)"
+            );
+        }
         self.constants.syscall_numbers[syscall as usize]
     }
 
@@ -3877,10 +3957,53 @@ enum PlatformSyscall {
     Getrlimit,
 }
 
+/// Windows-only runtime resources: the four Win64 import-call shims
+/// (each a self-aligning routine emitted once, called via
+/// `Assembler::call_label` from every OS-boundary site) plus the
+/// `.data` slots they use. `None` on every non-Windows target, so
+/// neither the shim bodies nor these `.data` slots are ever allocated
+/// (and therefore never shift a single byte of Linux codegen output).
+#[derive(Clone, Copy, Debug)]
+struct WindowsRuntime {
+    /// Calls `GetStdHandle` for stdout and stderr once at startup and
+    /// caches the two handles; called before any code that could
+    /// print or allocate.
+    win_init: TextLabel,
+    /// `write(fd, buf, len)`-shaped shim: rdi=fd (1 or 2), rsi=buf,
+    /// rdx=len in, rax=bytes written out. Wraps `WriteFile`.
+    win_write: TextLabel,
+    /// `mmap`-shaped shim: rsi=len in (other Linux mmap staging
+    /// registers are ignored), rax=base pointer or -1 out. Wraps
+    /// `VirtualAlloc`, converting its 0-on-failure return to -1 so
+    /// existing `cmp rax,0; jge ok`-style call sites keep working
+    /// unmodified.
+    win_mmap: TextLabel,
+    /// `exit(code)`-shaped shim: rdi=code in, never returns. Wraps
+    /// `ExitProcess`.
+    win_exit: TextLabel,
+    /// Cached `GetStdHandle(STD_OUTPUT_HANDLE)` result, populated by
+    /// `win_init`.
+    stdout_handle: DataLabel,
+    /// Cached `GetStdHandle(STD_ERROR_HANDLE)` result, populated by
+    /// `win_init`.
+    stderr_handle: DataLabel,
+    /// Scratch `DWORD` (stored as a zero-initialized qword so the
+    /// unused high 32 bits stay zero) for `WriteFile`'s required
+    /// `lpNumberOfBytesWritten` out-parameter.
+    write_bytes_scratch: DataLabel,
+}
+
 struct NativeCodeGenerator {
     source: SourceFile,
     user_view: Option<UserSourceView>,
     platform: TargetPlatform,
+    /// True when `platform.target`'s operating system is Windows.
+    /// Cached at construction so OS-boundary call sites can branch
+    /// without re-deriving it from `platform` each time.
+    is_windows: bool,
+    /// Win64 shim labels and `.data` slots, present only when
+    /// `is_windows`. See `WindowsRuntime`.
+    windows: Option<WindowsRuntime>,
     /// Seed cell for `Random#seed` / `Random#nextInt`. Lives in the
     /// data segment as a single u64 initialised to zero — same
     /// observable starting state as the evaluator's `RANDOM_STATE`.
@@ -4111,6 +4234,23 @@ impl NativeCodeGenerator {
         let stack_floor = asm.data_label_with_i64s(&[0]);
         let stack_overflow_abort = asm.create_text_label();
         let stack_overflow_text = asm.data_label_with_bytes(b"klassic: stack overflow\n");
+        let is_windows = platform.target.operating_system() == NativeOperatingSystem::Windows;
+        // Only allocated for the Windows target, so a Linux build's
+        // `.data`/`.text` label sequence -- and therefore its emitted
+        // bytes -- is completely unaffected by this branch.
+        let windows = if is_windows {
+            Some(WindowsRuntime {
+                win_init: asm.create_text_label(),
+                win_write: asm.create_text_label(),
+                win_mmap: asm.create_text_label(),
+                win_exit: asm.create_text_label(),
+                stdout_handle: asm.data_label_with_i64s(&[0]),
+                stderr_handle: asm.data_label_with_i64s(&[0]),
+                write_bytes_scratch: asm.data_label_with_i64s(&[0]),
+            })
+        } else {
+            None
+        };
         let mut record_schemas = HashMap::new();
         record_schemas.insert(
             "Point".to_string(),
@@ -4129,6 +4269,8 @@ impl NativeCodeGenerator {
             source,
             user_view,
             platform,
+            is_windows,
+            windows,
             random_state,
             asm,
             newline,
@@ -4224,6 +4366,14 @@ impl NativeCodeGenerator {
             static_eval_call_depth: 0,
             static_eval_fuel: 0,
         }
+    }
+
+    /// The Windows shim labels/data slots. Only call when
+    /// `self.is_windows` is true (every call site that reaches this
+    /// is itself behind an `is_windows` check).
+    fn windows_runtime(&self) -> WindowsRuntime {
+        self.windows
+            .expect("windows_runtime() called without a Windows target")
     }
 
     /// Call-body evaluations granted to one top-level fold attempt —
@@ -4737,6 +4887,11 @@ impl NativeCodeGenerator {
         self.register_enum_value_aliases(expr);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        if self.is_windows {
+            // Must run before anything that can print or allocate:
+            // caches the stdout/stderr handles the write shim needs.
+            self.asm.call_label(self.windows_runtime().win_init);
+        }
         self.emit_store_command_line_state();
         self.emit_initialize_stack_floor();
         self.emit_initialize_gc_heap();
@@ -4754,6 +4909,12 @@ impl NativeCodeGenerator {
         self.emit_gc_unpin_runtime();
         self.emit_gc_grow_heap_runtime();
         self.emit_gc_bounds_error_runtime();
+        if self.is_windows {
+            self.emit_win_init_runtime();
+            self.emit_win_write_runtime();
+            self.emit_win_mmap_runtime();
+            self.emit_win_exit_runtime();
+        }
         Ok(self.asm.finish())
     }
 
@@ -4763,6 +4924,23 @@ impl NativeCodeGenerator {
     }
 
     fn emit_store_command_line_state(&mut self) {
+        if self.is_windows {
+            // No CRT means no argc/argv/envp setup at this raw an
+            // entry point on Windows, and there's no equivalent of
+            // the Linux initial-stack layout `[rbp+8]` reads below
+            // (this is a normal `call`ed function on Windows, not a
+            // kernel-populated initial stack) -- so command-line
+            // access is simply unavailable in this slice.
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.mov_data_addr(Reg::R10, self.command_line_argc);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm
+                .mov_data_addr(Reg::R10, self.command_line_argv1_base);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.mov_data_addr(Reg::R10, self.environment_base);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            return;
+        }
         self.asm.mov_data_addr(Reg::R10, self.command_line_argc);
         self.asm.load_ptr_disp32(Reg::R8, Reg::Rbp, 8);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R8);
@@ -12695,15 +12873,27 @@ impl NativeCodeGenerator {
         self.asm.add_reg_imm32(Reg::Rsi, 8);
         self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rax, 0);
         self.emit_gc_string_length_check(span, "__gc_string_println", Reg::Rdx);
-        self.emit_syscall_number(PlatformSyscall::Write);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Write);
+        }
         self.asm.mov_imm64(Reg::Rdi, self.platform.stdout_fd());
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.asm.syscall();
+        }
         // newline
-        self.emit_syscall_number(PlatformSyscall::Write);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Write);
+        }
         self.asm.mov_imm64(Reg::Rdi, self.platform.stdout_fd());
         self.asm.mov_data_addr(Reg::Rsi, self.newline);
         self.asm.mov_imm64(Reg::Rdx, 1);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.asm.syscall();
+        }
         Ok(NativeValue::Unit)
     }
 
@@ -23633,9 +23823,15 @@ impl NativeCodeGenerator {
                 self.emit_runtime_error(span, "Process#exit expects a non-negative integer index");
                 return Ok(NativeValue::Unit);
             }
-            self.emit_syscall_number(PlatformSyscall::Exit);
+            if !self.is_windows {
+                self.emit_syscall_number(PlatformSyscall::Exit);
+            }
             self.asm.mov_imm64(Reg::Rdi, code as u64);
-            self.asm.syscall();
+            if self.is_windows {
+                self.asm.call_label(self.windows_runtime().win_exit);
+            } else {
+                self.asm.syscall();
+            }
             return Ok(NativeValue::Unit);
         }
 
@@ -23649,8 +23845,14 @@ impl NativeCodeGenerator {
         self.emit_runtime_error(span, "Process#exit expects a non-negative integer index");
         self.asm.bind_text_label(ok);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        self.emit_syscall_number(PlatformSyscall::Exit);
-        self.asm.syscall();
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Exit);
+        }
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_exit);
+        } else {
+            self.asm.syscall();
+        }
         Ok(NativeValue::Unit)
     }
 
@@ -23917,10 +24119,16 @@ impl NativeCodeGenerator {
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open file"));
         self.asm.push_reg(Reg::Rax);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        self.emit_syscall_number(PlatformSyscall::Write);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Write);
+        }
         self.asm.mov_data_addr(Reg::Rsi, content_label);
         self.asm.mov_imm64(Reg::Rdx, bytes.len() as u64);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.asm.syscall();
+        }
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to write file"));
         self.asm.pop_reg(Reg::Rdi);
         self.emit_syscall_number(PlatformSyscall::Close);
@@ -23957,10 +24165,16 @@ impl NativeCodeGenerator {
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open file"));
         self.asm.push_reg(Reg::Rax);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        self.emit_syscall_number(PlatformSyscall::Write);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Write);
+        }
         self.asm.mov_data_addr(Reg::Rsi, content.data);
         self.emit_load_native_string_len(Reg::Rdx, content.len);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.asm.syscall();
+        }
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to write file"));
         self.asm.pop_reg(Reg::Rdi);
         self.emit_syscall_number(PlatformSyscall::Close);
@@ -24152,11 +24366,17 @@ impl NativeCodeGenerator {
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Equal, done);
         self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
-        self.emit_syscall_number(PlatformSyscall::Write);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Write);
+        }
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_data_addr(Reg::Rsi, buffer);
         self.asm.mov_reg_reg(Reg::Rdx, Reg::R8);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.asm.syscall();
+        }
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to write output"));
         self.asm.jmp_label(read_loop);
         self.asm.bind_text_label(done);
@@ -33944,9 +34164,15 @@ impl NativeCodeGenerator {
                 self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
                 self.asm.add_reg_imm32(Reg::Rsi, 8);
                 self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rax, 0);
-                self.emit_syscall_number(PlatformSyscall::Write);
+                if !self.is_windows {
+                    self.emit_syscall_number(PlatformSyscall::Write);
+                }
                 self.asm.mov_imm64(Reg::Rdi, fd);
-                self.asm.syscall();
+                if self.is_windows {
+                    self.asm.call_label(self.windows_runtime().win_write);
+                } else {
+                    self.asm.syscall();
+                }
             }
             NativeValue::Bool => self.emit_print_bool_fragment(fd),
             NativeValue::StaticFloat { bits } => {
@@ -34249,11 +34475,17 @@ impl NativeCodeGenerator {
 
         self.asm.mov_reg_reg(Reg::Rdx, Reg::R8);
         self.asm.sub_reg_reg(Reg::Rdx, Reg::R9);
-        self.emit_syscall_number(PlatformSyscall::Write);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Write);
+        }
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_data_addr(Reg::Rsi, input.data);
         self.asm.add_reg_reg(Reg::Rsi, Reg::R9);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.asm.syscall();
+        }
     }
 
     fn emit_runtime_lines_list_to_runtime_string(
@@ -35566,20 +35798,32 @@ impl NativeCodeGenerator {
     }
 
     fn emit_write_data(&mut self, fd: u64, label: DataLabel, len: usize) {
-        self.emit_syscall_number(PlatformSyscall::Write);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Write);
+        }
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_data_addr(Reg::Rsi, label);
         self.asm.mov_imm64(Reg::Rdx, len as u64);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.asm.syscall();
+        }
     }
 
     fn emit_write_data_dynamic_len(&mut self, fd: u64, data: DataLabel, len: DataLabel) {
-        self.emit_syscall_number(PlatformSyscall::Write);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Write);
+        }
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_data_addr(Reg::Rsi, data);
         self.asm.mov_data_addr(Reg::Rdx, len);
         self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.asm.syscall();
+        }
     }
 
     /// Materialize a GC heap string (length-prefixed, pointer in rax)
@@ -37805,9 +38049,15 @@ impl NativeCodeGenerator {
     }
 
     fn emit_exit_code(&mut self, code: u64) {
-        self.emit_syscall_number(PlatformSyscall::Exit);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Exit);
+        }
         self.asm.mov_imm64(Reg::Rdi, code);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_exit);
+        } else {
+            self.asm.syscall();
+        }
     }
 
     fn emit_functions(&mut self) -> Result<(), Diagnostic> {
@@ -38127,10 +38377,16 @@ impl NativeCodeGenerator {
         self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'-');
         self.asm.inc_reg(Reg::Rcx);
         self.asm.bind_text_label(write);
-        self.emit_syscall_number(PlatformSyscall::Write);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Write);
+        }
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R10);
         self.asm.mov_reg_reg(Reg::Rdx, Reg::Rcx);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.asm.syscall();
+        }
         self.asm.leave();
         self.asm.ret();
     }
@@ -38195,6 +38451,14 @@ impl NativeCodeGenerator {
     /// Unlimited / failed lookups leave the floor at zero, which the
     /// prologue probe can never go below — probing disabled.
     fn emit_initialize_stack_floor(&mut self) {
+        if self.is_windows {
+            // `stack_floor`'s backing `.data` qword is already
+            // zero-initialized, and zero means "the prologue probe
+            // never fires" (see the field's doc comment) -- there is
+            // no Windows equivalent of `getrlimit(RLIMIT_STACK)`
+            // wired up in this slice, so the probe stays disabled.
+            return;
+        }
         const RLIMIT_STACK: u64 = 3;
         const STACK_FLOOR_MARGIN: i32 = 256 * 1024;
         let done = self.asm.create_text_label();
@@ -38227,6 +38491,210 @@ impl NativeCodeGenerator {
         self.asm.add_reg_imm32(Reg::Rsp, 16);
     }
 
+    /// Save every general-purpose register the codegen might have a
+    /// live value in in a fixed `rbp`-relative save area -- strictly
+    /// more conservative than a Linux `syscall`, which only clobbers
+    /// `rax`/`rcx`/`r11` -- so a Win64 shim is free to clobber any of
+    /// them internally, and pairs with `emit_win_shim_epilogue`.
+    ///
+    /// Deliberately does **not** assume anything about the incoming
+    /// `rsp` alignment: the ELF/Linux codegen this backend reuses was
+    /// never written to maintain the Win64 "16-byte aligned
+    /// immediately before every `call`" invariant (Linux `syscall`
+    /// has no such requirement), so a shim reached from inside a
+    /// deeply-nested call chain (closures passed to `.map`/
+    /// `foldLeft`, GC allocation paths, ...) can see `rsp` at any
+    /// parity. This save area is addressed purely via `rbp` (an
+    /// invariant reference point, set once and never adjusted here),
+    /// so it doesn't care what `rsp` becomes; the subsequent `and rsp,
+    /// -16` in `emit_win_shim_align_stack` then forces correct
+    /// alignment before the shim's own `call [rip+iat]` regardless of
+    /// how it was entered. Caller must have already done `push rbp;
+    /// mov rbp, rsp`.
+    fn emit_win_shim_save_registers(&mut self) {
+        self.asm
+            .sub_reg_imm32(Reg::Rsp, Self::WIN_SHIM_SAVE_AREA_SIZE);
+        self.asm.store_rbp_slot(8, Reg::Rbx);
+        self.asm.store_rbp_slot(16, Reg::Rcx);
+        self.asm.store_rbp_slot(24, Reg::Rdx);
+        self.asm.store_rbp_slot(32, Reg::Rsi);
+        self.asm.store_rbp_slot(40, Reg::Rdi);
+        self.asm.store_rbp_slot(48, Reg::R8);
+        self.asm.store_rbp_slot(56, Reg::R9);
+        self.asm.store_rbp_slot(64, Reg::R10);
+        self.asm.store_rbp_slot(72, Reg::R11);
+    }
+
+    /// 9 saved registers * 8 bytes, rounded up to a 16-byte multiple.
+    const WIN_SHIM_SAVE_AREA_SIZE: i32 = 80;
+
+    /// Forces 16-byte `rsp` alignment regardless of how the shim was
+    /// entered (`and rsp, -16` rounds down unconditionally, discarding
+    /// at most 15 bytes of headroom that already belongs to nothing),
+    /// then reserves `extra_bytes` more (must itself be a multiple of
+    /// 16 to preserve alignment) for the call's shadow space and any
+    /// stack arguments. Must run after `emit_win_shim_save_registers`
+    /// (which needs the *unaligned* `rsp` to still be usable via
+    /// `rbp`-relative addressing, unaffected either way) and before
+    /// the shim's `call_import`.
+    fn emit_win_shim_align_stack(&mut self, extra_bytes: i32) {
+        self.asm.and_reg_imm32(Reg::Rsp, -16);
+        self.asm.sub_reg_imm32(Reg::Rsp, extra_bytes);
+    }
+
+    /// Restores every register `emit_win_shim_save_registers` saved
+    /// (via `rbp`-relative loads, so this doesn't care what `rsp` was
+    /// left at by the shim body), then unwinds the whole frame in one
+    /// step (`mov rsp, rbp` undoes every `sub`/`and` since the
+    /// prologue) and returns. `rax` is left untouched -- callers set
+    /// it to the shim's return value before calling this.
+    fn emit_win_shim_epilogue(&mut self) {
+        self.asm.load_rbp_slot(Reg::R11, 72);
+        self.asm.load_rbp_slot(Reg::R10, 64);
+        self.asm.load_rbp_slot(Reg::R9, 56);
+        self.asm.load_rbp_slot(Reg::R8, 48);
+        self.asm.load_rbp_slot(Reg::Rdi, 40);
+        self.asm.load_rbp_slot(Reg::Rsi, 32);
+        self.asm.load_rbp_slot(Reg::Rdx, 24);
+        self.asm.load_rbp_slot(Reg::Rcx, 16);
+        self.asm.load_rbp_slot(Reg::Rbx, 8);
+        self.asm.mov_reg_reg(Reg::Rsp, Reg::Rbp);
+        self.asm.pop_reg(Reg::Rbp);
+        self.asm.ret();
+    }
+
+    /// Startup shim: caches `GetStdHandle(STD_OUTPUT_HANDLE)` and
+    /// `GetStdHandle(STD_ERROR_HANDLE)` into `.data` so `__win_write`
+    /// never has to call `GetStdHandle` itself. Called once, before
+    /// any code that could print or allocate.
+    fn emit_win_init_runtime(&mut self) {
+        const STD_OUTPUT_HANDLE: u64 = (-11i64) as u64;
+        const STD_ERROR_HANDLE: u64 = (-12i64) as u64;
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_init);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+
+        self.asm.mov_imm64(Reg::Rcx, STD_OUTPUT_HANDLE);
+        self.asm.call_import(ImportSymbol::GetStdHandle);
+        self.asm.mov_data_addr(Reg::R10, windows.stdout_handle);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        self.asm.mov_imm64(Reg::Rcx, STD_ERROR_HANDLE);
+        self.asm.call_import(ImportSymbol::GetStdHandle);
+        self.asm.mov_data_addr(Reg::R10, windows.stderr_handle);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `write(fd, buf, len)`-shaped shim wrapping `WriteFile`. Input:
+    /// rdi=fd (1 or 2, selecting the cached stdout/stderr handle from
+    /// `win_init`), rsi=buf, rdx=len -- the same three registers every
+    /// existing Linux `write` syscall call site already stages.
+    /// Output: rax=bytes written (read back from the scratch
+    /// `lpNumberOfBytesWritten` slot, mirroring what the Linux `write`
+    /// syscall would have left in rax on success).
+    fn emit_win_write_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_write);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+
+        // Select the cached handle by fd into rcx before rdi/rsi/rdx
+        // get reused for the WriteFile argument registers below.
+        let use_stderr = self.asm.create_text_label();
+        let handle_loaded = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rdi, 2);
+        self.asm.jcc_label(Condition::Equal, use_stderr);
+        self.asm.mov_data_addr(Reg::R10, windows.stdout_handle);
+        self.asm.jmp_label(handle_loaded);
+        self.asm.bind_text_label(use_stderr);
+        self.asm.mov_data_addr(Reg::R10, windows.stderr_handle);
+        self.asm.bind_text_label(handle_loaded);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
+
+        // r8 = len (original rdx) captured before rdx is overwritten
+        // with the buffer pointer below.
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rdx);
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rsi);
+        self.asm.mov_data_addr(Reg::R9, windows.write_bytes_scratch);
+        self.asm.xor_reg_reg(Reg::R10, Reg::R10);
+        // Shadow space (32) + 1 stack arg (lpOverlapped, 8 bytes),
+        // rounded up to 48 to stay a multiple of 16.
+        self.emit_win_shim_align_stack(0x30);
+        // lpOverlapped = NULL, the 5th arg at [rsp+0x20]. `rsp` is now
+        // the dynamically-aligned pointer computed above, so its
+        // offset from `rbp` isn't known at codegen time -- this must
+        // address it relative to `rsp` itself.
+        self.asm.store_ptr_disp32(Reg::Rsp, 0x20, Reg::R10);
+        self.asm.call_import(ImportSymbol::WriteFile);
+
+        // rax = bytes written, read back from the scratch DWORD
+        // (allocated as a zero-initialized qword, so the untouched
+        // high 32 bits keep this a correct zero-extended value).
+        self.asm
+            .mov_data_addr(Reg::R10, windows.write_bytes_scratch);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `mmap`-shaped shim wrapping `VirtualAlloc`. Input: rsi=len
+    /// (every existing Linux `mmap` staging site sets rdi/rdx/r10/r8/r9
+    /// too, for the syscall's addr/prot/flags/fd/offset arguments --
+    /// this shim ignores all of them and always requests a fresh
+    /// read-write anonymous mapping). Output: rax=base pointer, or -1
+    /// on failure -- `VirtualAlloc` itself returns 0 on failure, which
+    /// this shim converts to -1 so every existing `cmp rax,0; jge ok`
+    /// Linux-mmap-errno-style call site keeps working unmodified.
+    fn emit_win_mmap_runtime(&mut self) {
+        const MEM_COMMIT_RESERVE: u64 = 0x1000 | 0x2000;
+        const PAGE_READWRITE: u64 = 0x04;
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_mmap);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.emit_win_shim_align_stack(0x20); // shadow space only
+
+        self.asm.mov_imm64(Reg::Rcx, 0); // lpAddress = NULL
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rsi); // dwSize
+        self.asm.mov_imm64(Reg::R8, MEM_COMMIT_RESERVE);
+        self.asm.mov_imm64(Reg::R9, PAGE_READWRITE);
+        self.asm.call_import(ImportSymbol::VirtualAlloc);
+
+        let done = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::NotEqual, done);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.bind_text_label(done);
+
+        self.emit_win_shim_epilogue();
+    }
+
+    /// `exit(code)`-shaped shim wrapping `ExitProcess`. Input: rdi=code.
+    /// Never returns, so unlike the other shims there is nothing to
+    /// restore; a trailing `ud2` is a defensive trap that should never
+    /// execute (mirrors the ELF backend's own exit call sites, which
+    /// also never expect control to fall through). Still forces
+    /// alignment via `and rsp, -16` for the same reason the other
+    /// shims do -- it can be reached from anywhere.
+    fn emit_win_exit_runtime(&mut self) {
+        let windows = self.windows_runtime();
+        self.asm.bind_text_label(windows.win_exit);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.and_reg_imm32(Reg::Rsp, -16);
+        self.asm.sub_reg_imm32(Reg::Rsp, 0x20);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.asm.call_import(ImportSymbol::ExitProcess);
+        self.asm.ud2();
+    }
+
     /// Shared abort target for the function-prologue stack probe:
     /// report and exit instead of dying on the guard page with a bare
     /// SIGSEGV.
@@ -38243,7 +38711,9 @@ impl NativeCodeGenerator {
     fn emit_initialize_gc_heap(&mut self) {
         // mmap(NULL, GC_HEAP_SIZE, PROT_READ | PROT_WRITE,
         //      MAP_ANON | MAP_PRIVATE, -1, 0)
-        self.emit_syscall_number(PlatformSyscall::Mmap);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Mmap);
+        }
         self.asm.mov_imm64(Reg::Rdi, 0); // addr = NULL
         self.asm.mov_imm64(Reg::Rsi, Self::GC_HEAP_SIZE);
         self.asm
@@ -38253,7 +38723,11 @@ impl NativeCodeGenerator {
         self.asm
             .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
         self.asm.mov_imm64(Reg::R9, 0); // offset = 0
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_mmap);
+        } else {
+            self.asm.syscall();
+        }
 
         // Bail out hard if mmap returned a negative errno value.
         let mmap_ok = self.asm.create_text_label();
@@ -38290,7 +38764,9 @@ impl NativeCodeGenerator {
         // Map the GC tables (root table, shadow stack, mark worklist)
         // in one anonymous mapping — mmap memory is zero-filled, which
         // is exactly the tables' required initial state.
-        self.emit_syscall_number(PlatformSyscall::Mmap);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Mmap);
+        }
         self.asm.mov_imm64(Reg::Rdi, 0);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TABLES_BYTES);
         self.asm
@@ -38300,7 +38776,11 @@ impl NativeCodeGenerator {
         self.asm
             .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
         self.asm.mov_imm64(Reg::R9, 0);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_mmap);
+        } else {
+            self.asm.syscall();
+        }
         let tables_ok = self.asm.create_text_label();
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::GreaterEqual, tables_ok);
@@ -39068,7 +39548,9 @@ impl NativeCodeGenerator {
 
         // mmap(NULL, alloc_size, PROT_READ|PROT_WRITE,
         //      MAP_ANON|MAP_PRIVATE, -1, 0).
-        self.emit_syscall_number(PlatformSyscall::Mmap);
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Mmap);
+        }
         self.asm.mov_imm64(Reg::Rdi, 0);
         self.asm.load_rbp_slot(Reg::Rsi, 8);
         self.asm
@@ -39078,7 +39560,11 @@ impl NativeCodeGenerator {
         self.asm
             .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
         self.asm.mov_imm64(Reg::R9, 0);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_mmap);
+        } else {
+            self.asm.syscall();
+        }
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Less, mmap_failed);
 
@@ -41431,10 +41917,57 @@ enum RelocKind {
     Abs64,
 }
 
+/// A `kernel32.dll` function imported by the PE64 backend's Win64
+/// shims. Variant order is load-bearing: it fixes the ILT/IAT slot
+/// order the `pe` writer lays the import table out in, and every
+/// `call [rip+disp32]` emitted by `Assembler::call_import` resolves
+/// against that same order via `ImportSymbol::iat_index`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportSymbol {
+    GetStdHandle,
+    WriteFile,
+    ExitProcess,
+    VirtualAlloc,
+}
+
+impl ImportSymbol {
+    const ALL: [ImportSymbol; 4] = [
+        ImportSymbol::GetStdHandle,
+        ImportSymbol::WriteFile,
+        ImportSymbol::ExitProcess,
+        ImportSymbol::VirtualAlloc,
+    ];
+
+    /// Exact, case-sensitive export name from `kernel32.dll`.
+    fn name(self) -> &'static str {
+        match self {
+            ImportSymbol::GetStdHandle => "GetStdHandle",
+            ImportSymbol::WriteFile => "WriteFile",
+            ImportSymbol::ExitProcess => "ExitProcess",
+            ImportSymbol::VirtualAlloc => "VirtualAlloc",
+        }
+    }
+
+    /// This symbol's zero-based slot in the ILT/IAT arrays.
+    fn iat_index(self) -> usize {
+        match self {
+            ImportSymbol::GetStdHandle => 0,
+            ImportSymbol::WriteFile => 1,
+            ImportSymbol::ExitProcess => 2,
+            ImportSymbol::VirtualAlloc => 3,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RelocTarget {
     Text(TextLabel),
     Data(DataLabel),
+    /// Only produced by `Assembler::call_import` (PE64/Windows target
+    /// only). Patched by `pe::write_executable` against the IAT slot
+    /// for the symbol; `elf::patch_relocations` never sees one since
+    /// the Linux backend never calls `call_import`.
+    Import(ImportSymbol),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41665,6 +42198,15 @@ impl Assembler {
         self.rex_w(dst, base);
         self.byte(0x8b);
         self.byte(0x80 | (((dst as u8) & 7) << 3) | ((base as u8) & 7));
+        // ModRM.rm == 100b (rsp's low 3 bits) doesn't mean "register
+        // rsp" for a memory operand -- it's the escape code that
+        // requires a following SIB byte. `0x24` = scale 00, no index
+        // (100b), base = rsp (100b): plain `[rsp+disp]`, no index
+        // register. Every other `base` this codegen uses (rbp, r10,
+        // r8, ...) has rm != 100b and needs no SIB byte.
+        if (base as u8) & 7 == 4 {
+            self.byte(0x24);
+        }
         self.text.extend_from_slice(&disp.to_le_bytes());
     }
 
@@ -41696,6 +42238,10 @@ impl Assembler {
         self.rex_w(src, base);
         self.byte(0x89);
         self.byte(0x80 | (((src as u8) & 7) << 3) | ((base as u8) & 7));
+        // See `load_ptr_disp32`: rm == 100b (rsp) requires a SIB byte.
+        if (base as u8) & 7 == 4 {
+            self.byte(0x24);
+        }
         self.text.extend_from_slice(&disp.to_le_bytes());
     }
 
@@ -41847,6 +42393,24 @@ impl Assembler {
         });
     }
 
+    /// `call qword ptr [rip+disp32]` (`FF 15 <disp32>`) through an
+    /// import's IAT slot -- the idiomatic Win64 way to call a DLL
+    /// import. The patch arithmetic is identical to a normal
+    /// `Rel32`/`call rel32` (`target - (pos_after_instruction)`), only
+    /// the target resolves against the IAT instead of a `Text`/`Data`
+    /// label, so this reuses `RelocKind::Rel32` with a
+    /// `RelocTarget::Import` target.
+    fn call_import(&mut self, symbol: ImportSymbol) {
+        self.bytes(&[0xff, 0x15]);
+        let pos = self.text.len();
+        self.imm32(0);
+        self.relocs.push(Reloc {
+            pos,
+            kind: RelocKind::Rel32,
+            target: RelocTarget::Import(symbol),
+        });
+    }
+
     fn inc_reg(&mut self, reg: Reg) {
         self.rex_w(Reg::Rax, reg);
         self.byte(0xff);
@@ -41948,6 +42512,12 @@ impl Assembler {
         self.bytes(&[0x0f, 0x05]);
     }
 
+    /// `ud2` — guaranteed-invalid instruction, used as a defensive
+    /// trap after a call that should never return (e.g. `ExitProcess`).
+    fn ud2(&mut self) {
+        self.bytes(&[0x0f, 0x0b]);
+    }
+
     /// `rep movsb` — copy `rcx` bytes from `[rsi]` to `[rdi]`, advancing
     /// both pointers and decrementing rcx until it reaches zero. The
     /// caller is responsible for setting up rsi / rdi / rcx beforehand.
@@ -42019,6 +42589,13 @@ mod elf {
             let target = match reloc.target {
                 RelocTarget::Text(label) => TEXT_VADDR + object.text_labels[label.0] as u64,
                 RelocTarget::Data(label) => data_vaddr + object.data_labels[label.0] as u64,
+                // `call_import` (the only source of an `Import`
+                // target) is only ever emitted by Windows-gated
+                // codegen paths; the Linux ELF backend never reaches
+                // one.
+                RelocTarget::Import(_) => {
+                    unreachable!("ELF relocations never target a PE import")
+                }
             };
             match reloc.kind {
                 RelocKind::Rel32 => {
@@ -42228,12 +42805,22 @@ mod tests {
             Some(NativeTarget::MacosAarch64)
         );
         assert_eq!(
+            NativeTarget::parse("windows-x86_64"),
+            Some(NativeTarget::WindowsX86_64)
+        );
+        assert_eq!(
+            NativeTarget::parse("x86_64-pc-windows-msvc"),
+            Some(NativeTarget::WindowsX86_64)
+        );
+        assert_eq!(
             NativeTarget::supported_names(),
             &[
                 "linux-x86_64",
                 "x86_64-unknown-linux-gnu",
                 "macos-aarch64",
                 "aarch64-apple-darwin",
+                "windows-x86_64",
+                "x86_64-pc-windows-msvc",
                 "native"
             ]
         );
@@ -42242,7 +42829,7 @@ mod tests {
     #[test]
     fn native_target_metadata_is_registry_backed() {
         let specs = NativeTarget::supported_specs();
-        assert_eq!(specs.len(), 2);
+        assert_eq!(specs.len(), 3);
         let linux = NativeTarget::LinuxX86_64;
         let spec = linux.spec();
         assert_eq!(spec.target, linux);
@@ -42275,6 +42862,23 @@ mod tests {
         assert_eq!(macos.operating_system(), NativeOperatingSystem::MacOs);
         assert_eq!(macos.abi(), NativeAbi::Apple);
         assert_eq!(macos.executable_format(), NativeExecutableFormat::MachO64);
+
+        let windows = NativeTarget::WindowsX86_64;
+        let spec = windows.spec();
+        assert_eq!(spec.target, windows);
+        assert_eq!(spec.canonical_name, "windows-x86_64");
+        assert_eq!(spec.standard_triple, "x86_64-pc-windows-msvc");
+        assert_eq!(spec.aliases, &["windows-x86_64", "x86_64-pc-windows-msvc"]);
+        // Reuses the entire DirectX86_64 (Linux) codegen -- only the
+        // OS boundary and executable format differ.
+        assert_eq!(windows.architecture(), NativeArchitecture::X86_64);
+        assert_eq!(windows.backend(), NativeBackend::DirectX86_64);
+        assert_eq!(windows.backend().name(), "direct-x86_64");
+        assert_eq!(windows.pointer_width_bits(), 64);
+        assert_eq!(windows.endianness(), NativeEndianness::Little);
+        assert_eq!(windows.operating_system(), NativeOperatingSystem::Windows);
+        assert_eq!(windows.abi(), NativeAbi::Msvc);
+        assert_eq!(windows.executable_format(), NativeExecutableFormat::Pe64);
     }
 
     #[test]
@@ -42320,7 +42924,7 @@ mod tests {
     fn linux_x86_64_platform_names_os_abi_constants() {
         let platform = TargetPlatform::for_target(NativeTarget::LinuxX86_64);
         assert_eq!(platform.target, NativeTarget::LinuxX86_64);
-        assert_eq!(PLATFORM_CONSTANTS_BY_TARGET.len(), 1);
+        assert_eq!(PLATFORM_CONSTANTS_BY_TARGET.len(), 2);
         assert_eq!(
             PLATFORM_CONSTANTS_BY_TARGET[0].target,
             NativeTarget::LinuxX86_64
@@ -42356,6 +42960,31 @@ mod tests {
         assert_eq!(platform.mmap_prot_read_write(), 3);
         assert_eq!(platform.mmap_private_anonymous_flags(), 0x22);
         assert_eq!(platform.mmap_anonymous_fd(), (-1_i64) as u64);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing Windows gate")]
+    fn windows_syscall_number_is_a_compile_time_tripwire() {
+        // Windows has no raw syscall ABI: every codegen call site that
+        // could reach `emit_syscall_number` must branch on
+        // `is_windows` first. This asserts the tripwire itself fires
+        // -- a regression here would mean an un-gated syscall site
+        // could silently emit a Linux syscall number into a Windows
+        // binary instead of failing loudly at compile time.
+        let platform = TargetPlatform::for_target(NativeTarget::WindowsX86_64);
+        let _ = platform.syscall_number(PlatformSyscall::Write);
+    }
+
+    #[test]
+    fn windows_target_stdio_fds_match_linux() {
+        // Only the OS-independent fd numbers are meaningful on
+        // Windows (the Win64 shims interpret them to pick a cached
+        // GetStdHandle result) -- everything else in
+        // WINDOWS_X86_64_PLATFORM_CONSTANTS is an unread placeholder.
+        let platform = TargetPlatform::for_target(NativeTarget::WindowsX86_64);
+        assert_eq!(platform.stdin_fd(), 0);
+        assert_eq!(platform.stdout_fd(), 1);
+        assert_eq!(platform.stderr_fd(), 2);
     }
 
     #[test]

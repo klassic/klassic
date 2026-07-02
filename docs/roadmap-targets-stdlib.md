@@ -93,12 +93,28 @@ Targets are tracked as tiers; status lives in
   parity.
 - **Tier 2** — `wasm32-wasi` (WASI imports for I/O and env, no
   threads / processes initially), `x86_64-apple-darwin` (via runtime
-  call path / C backend), `x86_64-pc-windows-msvc` (same).
+  call path / C backend).
+- **Tier 0 (direct PE64)** — `x86_64-pc-windows-msvc`: reuses the
+  entire `DirectX86_64` (Linux) codegen as-is (the generated x86_64
+  machine code is already Win64-ABI-compatible) and only swaps the OS
+  boundary (a handful of Win64 `kernel32.dll` import-call shims
+  replacing bare Linux `syscall` instructions at the `write`/`mmap`/
+  `exit` sites) and the container format (a minimal unsigned PE64
+  writer, `crates/klassic-native/src/pe.rs`, no external toolchain).
+  Non-core-language syscalls are not yet gated for Windows and remain
+  a follow-up slice (see `docs/native-coverage.md`'s target-matrix
+  notes) — reaching one from a Windows build is a deliberate
+  compile-time panic, not a silently wrong binary.
 
-The original key rule here ("no Mach-O / PE direct syscall paths")
-was revised on 2026-06-11: macOS arm64 is important enough to deserve
-a direct backend, and the C backend remains the portable fallback.
-Windows still enters through the portable runtime call path only.
+The original key rule here ("no Mach-O / PE direct syscall paths") was
+revised twice. On 2026-06-11: macOS arm64 is important enough to
+deserve a direct backend, and the C backend remains the portable
+fallback. Windows was revised again after that: rather than a
+dedicated PE codegen module mirroring aarch64's Mach-O backend,
+Windows reuses the Linux x86_64 codegen outright, since a Win64-ABI
+console program built from the same instruction stream as a Linux ELF
+program needs no new instruction encoder at all — only new OS-boundary
+plumbing and a new container writer.
 
 ## Runtime Sharing Strategy
 
@@ -111,18 +127,24 @@ the native compiler genuinely share:
   / env / fs / time / sleep / args / exit
 - C-ABI shim functions (`klassic_rt_*`) the portable backends call
 
-There are two execution paths:
+There are three execution paths:
 
 1. **Direct syscall path** — Linux x86_64 today, plus possible AArch64
    Linux additions. This path inlines syscalls into the emitted
    executable and does not link `klassic-runtime` at all. It exists
    because writing a tiny tool that has no external dependencies is
    one of Klassic's selling points; this path must stay fast and small.
-2. **Runtime call path** — macOS, Windows, Wasm, and the portable C
-   backend. The native compiler emits calls into `klassic-runtime`,
-   which is the only place that owns OS-specific behaviour. The
-   evaluator uses the same runtime crate by linking to it as a Rust
-   dependency.
+2. **Runtime call path** — macOS (x86_64) and the portable C backend.
+   The native compiler emits calls into `klassic-runtime`, which is
+   the only place that owns OS-specific behaviour. The evaluator uses
+   the same runtime crate by linking to it as a Rust dependency.
+3. **Direct OS-import path** — `aarch64-apple-darwin` (Mach-O, `svc
+   #0x80` syscalls) and `x86_64-pc-windows-msvc` (PE64, Win64
+   `kernel32.dll` import-call shims). Like path 1, no `klassic-runtime`
+   dependency and no external toolchain; unlike path 1, the OS gives
+   no raw syscall ABI to user code (Windows) or the kernel demands an
+   embedded code signature (Apple Silicon), so each target's writer
+   handles its own OS-specific obligation instead of sharing one.
 
 The evaluator should converge on the runtime crate's primitives over
 time, so evaluator and native always agree on display, equality, and
