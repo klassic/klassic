@@ -77,3 +77,217 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  # --------------------------------------------------------------------
+  # Cross-execution guarantee.
+  #
+  # `test-macos` / `test-windows` above prove "a binary built ON that OS
+  # FOR that OS runs correctly there" (their build-and-run tests are
+  # cfg-gated to the matching host). They say nothing about a binary
+  # that was *cross-built on Linux* for `x86_64-pc-windows-msvc` or
+  # `aarch64-apple-darwin` -- which is the normal way klassic-native
+  # produces those binaries in practice, since the direct backends need
+  # no host `cc`/`as`/`ld`. These three jobs close that gap: `cross-build`
+  # (ubuntu-latest) evaluates each program in tests/cross-exec/*.kl to
+  # pin down its expected stdout, builds+runs the Linux-native binary
+  # immediately as the Linux leg of the guarantee, then cross-builds the
+  # Windows and macOS binaries and uploads them as artifacts;
+  # `cross-exec-windows` / `cross-exec-macos` download those binaries and
+  # actually execute them on the target OS, diffing stdout against the
+  # evaluator's output.
+  #
+  # aarch64-apple-darwin note: the direct Mach-O backend is younger than
+  # the shared x86_64 backend and does not implement every construct yet
+  # -- notably the OS-builtin modules (File/Dir/Environment/Time) and
+  # string interpolation. Cross-building for macOS is therefore
+  # best-effort per program: one that the backend can't build yet is
+  # logged and left out of the macOS bundle rather than failing the job,
+  # so this stays a real regression guard for whatever the backend
+  # *does* support today without blocking on a known, pre-existing
+  # coverage gap. Windows (which recently gained full OS-builtin
+  # coverage) and Linux have no such carve-out: every program in
+  # tests/cross-exec/ is required to build there, and to execute
+  # correctly on Linux.
+  cross-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build klassic
+        run: cargo build
+
+      - name: Build and verify cross-exec fixtures
+        run: |
+          set -uo pipefail
+          bin="$PWD/target/debug/klassic"
+          mkdir -p cross-exec-out/windows cross-exec-out/macos
+          status=0
+
+          for src in tests/cross-exec/*.kl; do
+            name=$(basename "$src" .kl)
+            echo "=== $name ==="
+
+            # The evaluator is the oracle every backend must match.
+            if ! "$bin" "$src" > "cross-exec-out/windows/$name.expected"; then
+              echo "FAIL: evaluator failed for $name"
+              status=1
+              continue
+            fi
+            cp "cross-exec-out/windows/$name.expected" "cross-exec-out/macos/$name.expected"
+
+            # Linux leg of the guarantee: build for the host target and
+            # run it immediately, right here -- no second runner needed.
+            if ! "$bin" --target x86_64-unknown-linux-gnu build "$src" -o "/tmp/$name.linux"; then
+              echo "FAIL: Linux native build failed for $name"
+              status=1
+              continue
+            fi
+            chmod +x "/tmp/$name.linux"
+            if ! (cd /tmp && "/tmp/$name.linux" >"/tmp/$name.linux.out"); then
+              echo "FAIL: Linux native run failed for $name"
+              status=1
+              continue
+            fi
+            if ! diff -u "cross-exec-out/windows/$name.expected" "/tmp/$name.linux.out"; then
+              echo "FAIL: Linux-native output mismatch for $name"
+              status=1
+              continue
+            fi
+            echo "  linux: build + run matches the evaluator"
+
+            # Windows: full OS-builtin coverage, so every program here
+            # is required to cross-build.
+            if ! "$bin" --target x86_64-pc-windows-msvc build "$src" -o "cross-exec-out/windows/$name.exe"; then
+              echo "FAIL: Windows cross-build failed for $name"
+              status=1
+              continue
+            fi
+            echo "  windows: cross-built"
+
+            # macOS: best-effort (see job comment above).
+            if "$bin" --target aarch64-apple-darwin build "$src" -o "cross-exec-out/macos/$name.macho" 2>"/tmp/$name.macos.err"; then
+              echo "  macos: cross-built"
+            else
+              echo "  macos: skipped (not supported yet by the aarch64-apple-darwin backend)"
+              sed 's/^/    /' "/tmp/$name.macos.err"
+              rm -f "cross-exec-out/macos/$name.expected" "cross-exec-out/macos/$name.macho"
+            fi
+          done
+
+          exit "$status"
+
+      - name: Upload Windows cross-exec bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-exec-windows
+          path: cross-exec-out/windows
+
+      - name: Upload macOS cross-exec bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-exec-macos
+          path: cross-exec-out/macos
+
+  cross-exec-windows:
+    needs: cross-build
+    runs-on: windows-latest
+    steps:
+      - name: Download cross-exec bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: cross-exec-windows
+          path: cross-exec-out
+
+      - name: Run each cross-built program and diff against the evaluator
+        shell: pwsh
+        run: |
+          $failed = $false
+          $checked = 0
+          Get-ChildItem -Path cross-exec-out -Filter *.exe | ForEach-Object {
+            $checked++
+            $exe = $_.FullName
+            $name = $_.BaseName
+            Write-Host "=== $name ==="
+            $expectedPath = Join-Path "cross-exec-out" "$name.expected"
+            if (-not (Test-Path $expectedPath)) {
+              Write-Host "FAIL: no .expected file found for $name"
+              $failed = $true
+              return
+            }
+            $actualRaw = & $exe | Out-String
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "FAIL: $name exited with code $LASTEXITCODE on Windows"
+              $failed = $true
+              return
+            }
+            $actual = ($actualRaw -replace "`r`n", "`n").TrimEnd("`n")
+            $expected = ((Get-Content -Raw -Path $expectedPath) -replace "`r`n", "`n").TrimEnd("`n")
+            if ($actual -ne $expected) {
+              Write-Host "FAIL: output mismatch for $name on Windows"
+              Write-Host "--- expected ---"
+              Write-Host $expected
+              Write-Host "--- actual ---"
+              Write-Host $actual
+              $failed = $true
+            } else {
+              Write-Host "$name matches"
+            }
+          }
+          if ($checked -eq 0) {
+            Write-Host "FAIL: no .exe binaries found in the cross-exec-windows artifact"
+            $failed = $true
+          }
+          if ($failed) {
+            exit 1
+          }
+
+  cross-exec-macos:
+    needs: cross-build
+    runs-on: macos-latest
+    steps:
+      - name: Show runner architecture
+        run: uname -m  # must be arm64; the Mach-O binaries here are arm64
+
+      - name: Download cross-exec bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: cross-exec-macos
+          path: cross-exec-out
+
+      - name: Run each cross-built program and diff against the evaluator
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          binaries=(cross-exec-out/*.macho)
+          if [ ${#binaries[@]} -eq 0 ]; then
+            echo "FAIL: no .macho binaries found in the cross-exec-macos artifact"
+            exit 1
+          fi
+          failed=0
+          for bin in "${binaries[@]}"; do
+            name=$(basename "$bin" .macho)
+            echo "=== $name ==="
+            chmod +x "$bin"
+            expected="cross-exec-out/$name.expected"
+            if [ ! -f "$expected" ]; then
+              echo "FAIL: no .expected file found for $name"
+              failed=1
+              continue
+            fi
+            if ! "$bin" >"/tmp/$name.macos.out"; then
+              echo "FAIL: $name exited non-zero on macOS"
+              failed=1
+              continue
+            fi
+            if ! diff -u "$expected" "/tmp/$name.macos.out"; then
+              echo "FAIL: output mismatch for $name on macOS"
+              failed=1
+              continue
+            fi
+            echo "$name matches"
+          done
+          exit "$failed"
