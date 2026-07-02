@@ -3957,6 +3957,24 @@ struct NativeCodeGenerator {
     function_order: Vec<String>,
     referenced_functions: HashSet<String>,
     active_function_name: Option<String>,
+    /// Names of functions whose OWN BODY is currently being compiled as
+    /// part of compile-time call-site inlining
+    /// (`compile_inline_function_call`), forming the active
+    /// inline-expansion call stack. Direct self-recursion is already
+    /// rejected earlier via `unsupported_recursive_inline`, but a
+    /// *mutual* inline cycle (`isEven` inlines a call to `isOdd`, which
+    /// inlines a call back to `isEven`, ...) is invisible to that
+    /// single-name check. Revisiting a name already on this stack means
+    /// the expansion would recurse the Rust compiler itself without
+    /// bound (proportional to the call-site literal, with no depth
+    /// protection), so it is rejected with the same diagnostic as direct
+    /// self-recursion instead of letting the compiler's own stack
+    /// overflow. A name is pushed only around compiling *that*
+    /// function's body, not its caller-supplied arguments, so a chained
+    /// call like `some(3).map(f).map(g)` (`map(map(x, f), g)`) is not
+    /// mistaken for a cycle: the inner `map` fully expands and pops
+    /// before the outer `map`'s body is ever entered.
+    inlining_call_stack: HashSet<String>,
     instance_methods: Vec<NativeInstanceMethod>,
     record_schemas: HashMap<String, Vec<NativeRecordFieldSchema>>,
     static_lists: Vec<StaticList>,
@@ -4189,6 +4207,7 @@ impl NativeCodeGenerator {
             function_order: Vec::new(),
             referenced_functions: HashSet::new(),
             active_function_name: None,
+            inlining_call_stack: HashSet::new(),
             instance_methods: Vec::new(),
             record_schemas,
             static_lists: Vec::new(),
@@ -7387,10 +7406,10 @@ impl NativeCodeGenerator {
             ));
         }
         if function.inline_at_call_site {
-            return self.compile_inline_function_call(&function, arguments, span);
+            return self.compile_inline_function_call(name, &function, arguments, span);
         }
         if self.should_inline_unannotated_runtime_function_call(name, &function, arguments) {
-            return self.compile_inline_function_call(&function, arguments, span);
+            return self.compile_inline_function_call(name, &function, arguments, span);
         }
         self.referenced_functions.insert(name.to_string());
         if arguments.len() != function.params.len() {
@@ -8471,6 +8490,7 @@ impl NativeCodeGenerator {
 
     fn compile_inline_function_call(
         &mut self,
+        name: &str,
         function: &NativeFunction,
         arguments: &[Expr],
         span: Span,
@@ -8610,7 +8630,34 @@ impl NativeCodeGenerator {
                 }
             }
         }
-        let value = self.compile_expr(&function.body)?;
+        // Cycle detection across the whole inline-expansion path, scoped
+        // to compiling this function's OWN body (not its caller-supplied
+        // arguments, staged above). Direct self-recursion is already
+        // caught earlier (`unsupported_recursive_inline`, keyed on a
+        // function referencing its own name), but that check is blind to
+        // a *mutual* cycle such as `isEven` inlining a call to `isOdd`,
+        // which inlines a call back to `isEven`. Without this, expanding
+        // such a cycle at a literal call-site argument recurses the
+        // compiler's own Rust stack proportional to the literal value
+        // with no bound, aborting the build itself. Revisiting a name
+        // already on the active body-expansion stack means the expansion
+        // would never terminate structurally, so it is rejected here
+        // with the same diagnostic used for direct self-recursion,
+        // instead of overflowing the stack. The guard is deliberately
+        // narrow: an argument expression that itself calls this same
+        // function (e.g. `some(3).map(f).map(g)`, i.e. `map(map(x, f),
+        // g)`) is compiled above, before this point, and is not a cycle
+        // — it is two independent, sequential inline expansions.
+        if !self.inlining_call_stack.insert(name.to_string()) {
+            self.pop_scope();
+            return Err(unsupported(
+                span,
+                "native recursive function requiring call-site inlining",
+            ));
+        }
+        let value = self.compile_expr(&function.body);
+        self.inlining_call_stack.remove(name);
+        let value = value?;
         if self.native_value_captures_current_scope(value)
             || self.queued_threads_capture_current_scope()
         {
