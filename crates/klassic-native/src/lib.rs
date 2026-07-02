@@ -6728,6 +6728,13 @@ impl NativeCodeGenerator {
             }
             (UnaryOp::Minus, NativeValue::Int) => {
                 self.asm.neg_reg(Reg::Rax);
+                // `neg` sets OF exactly when the operand is i64::MIN,
+                // whose negation is unrepresentable; the evaluator
+                // reports this as a checked-arithmetic error.
+                let ok = self.asm.create_text_label();
+                self.asm.jcc_label(Condition::NoOverflow, ok);
+                self.emit_runtime_error(span, "integer overflow in unary negation");
+                self.asm.bind_text_label(ok);
                 Ok(NativeValue::Int)
             }
             (UnaryOp::Minus, NativeValue::StaticFloat { bits }) => Ok(NativeValue::StaticFloat {
@@ -7121,6 +7128,18 @@ impl NativeCodeGenerator {
                 self.asm.jcc_label(Condition::NotEqual, nonzero);
                 self.emit_runtime_error(span, "division by zero");
                 self.asm.bind_text_label(nonzero);
+                // i64::MIN / -1 overflows (the quotient is
+                // unrepresentable) and a bare `idiv` raises SIGFPE for
+                // it, just like division by zero; the evaluator
+                // reports `integer overflow`.
+                let do_divide = self.asm.create_text_label();
+                self.asm.cmp_reg_imm8(Reg::Rbx, -1);
+                self.asm.jcc_label(Condition::NotEqual, do_divide);
+                self.asm.mov_imm64(Reg::R10, i64::MIN as u64);
+                self.asm.cmp_reg_reg(Reg::Rax, Reg::R10);
+                self.asm.jcc_label(Condition::NotEqual, do_divide);
+                self.emit_runtime_error(span, "integer overflow");
+                self.asm.bind_text_label(do_divide);
                 self.asm.cqo();
                 self.asm.idiv_reg(Reg::Rbx);
             }

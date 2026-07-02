@@ -25215,6 +25215,93 @@ fn native_integer_overflow_is_a_clean_error() {
     );
 }
 
+/// Dividing i64::MIN by -1 overflows (the quotient is unrepresentable):
+/// the evaluator reports a clean `integer overflow`; the bare idiv used
+/// to raise SIGFPE (exit 136) with no diagnostic at all.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_min_int_division_by_minus_one_is_a_clean_error() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_divmin_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_divmin_{stamp}.bin"));
+    fs::write(&source_path, "println((-9223372036854775807 - 1) / -1)\n")
+        .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "division program should build\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert_eq!(run.status.code(), Some(1), "expected a clean exit-1 error");
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("integer overflow"),
+        "expected `integer overflow` on stderr, got:\nstdout:{}\nstderr:{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// Negating i64::MIN overflows: the evaluator reports `integer overflow
+/// in unary negation`; native used to wrap silently and print
+/// -9223372036854775808.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_min_int_negation_is_a_clean_error() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_negmin_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_negmin_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "val x = -9223372036854775807 - 1\nprintln(-x)\n",
+    )
+    .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "negation program should build\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert_eq!(run.status.code(), Some(1), "expected a clean exit-1 error");
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("integer overflow in unary negation"),
+        "expected `integer overflow in unary negation` on stderr, got:\nstdout:{}\nstderr:{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 /// An unannotated parameter the body uses as a String (here passed to
 /// the String-only `length`) now compiles natively: its native type is
 /// inferred from body usage as a heap string instead of defaulting to
