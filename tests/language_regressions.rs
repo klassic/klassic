@@ -1887,3 +1887,31 @@ join(upper, " - ")"#,
         Value::String("HELLO - WORLD!".to_string())
     );
 }
+
+#[test]
+fn deep_recursive_match_over_a_cons_style_enum_does_not_overflow_the_stack() {
+    // A recursive `match` over a self-referential enum (a hand-rolled
+    // cons list) used to overflow the evaluator's own Rust stack at
+    // only ~2500 levels of Klassic-level recursion, versus ~1,000,000
+    // for plain `if`/arithmetic recursion at the same depth. The
+    // `match` arm's `Cons(h, t)` pattern clones the tail sub-value out
+    // of the scrutinee on every level (`t`'s `Variable` pattern binds
+    // via `Value::clone()`), and prior to the fix `Value::Enum`
+    // cloned its whole nested payload with plain, unprotected native
+    // Rust recursion (one stack frame per remaining list element) —
+    // entirely outside the `stacker::maybe_grow` checkpoints that
+    // guard `eval_expr` itself. 30,000 levels reliably crashed the
+    // unfixed evaluator (the crash threshold was ~2,500) while
+    // staying fast enough to run as a regular test.
+    assert_eq!(
+        evaluate_text(
+            "<expr>",
+            "enum IList { case Cons(head: Int, tail: IList); case Nil }\n\
+             def build(n: Int): IList = if (n == 0) Nil else Cons(n, build(n - 1))\n\
+             def sumList(l: IList): Int = l match { case Cons(h, t) => h + sumList(t); case Nil => 0 }\n\
+             sumList(build(30000))",
+        )
+        .unwrap(),
+        Value::Int(30000 * 30001 / 2)
+    );
+}

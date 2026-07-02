@@ -26,10 +26,23 @@ pub enum Value {
     /// constructor. The enum name comes from the declaration, the
     /// variant name from the constructor that built this value, and
     /// fields hold each named parameter in declaration order.
+    ///
+    /// `fields` is `Rc`-shared (mirroring `Function`/`BuiltinFunction`
+    /// below) rather than plain `Vec` so that cloning a `Value::Enum`
+    /// is O(1): a recursive enum like a cons-list stores its tail as
+    /// another `Value::Enum` nested inside `fields`, and a naive
+    /// per-field clone would recurse one native Rust stack frame per
+    /// list element, overflowing the host stack a few thousand
+    /// elements deep on any code path that clones the value (pattern
+    /// binding a tail variable in `match`, reading a variable out of
+    /// the environment, passing it as an argument, ...). Bumping a
+    /// refcount instead makes clone depth-independent; see
+    /// `EnumFields`'s `Drop` impl below for the matching fix on the
+    /// teardown side.
     Enum {
         enum_name: String,
         variant: String,
-        fields: Vec<(String, Value)>,
+        fields: Rc<EnumFields>,
     },
     /// Reference to an `enum` variant constructor — produced when the
     /// user writes the variant name without arguments. Calling the
@@ -47,6 +60,75 @@ pub enum Value {
     },
     BuiltinFunction(Rc<BuiltinFunctionValue>),
     Function(Rc<FunctionValue>),
+}
+
+/// The field list backing a `Value::Enum`, always accessed behind an
+/// `Rc` (see the doc comment on `Value::Enum`). This is a thin
+/// newtype around `Vec<(String, Value)>` — rather than using the
+/// `Vec` directly — purely so it can carry its own `Drop` impl below.
+/// `Value` itself deliberately does *not* implement `Drop`: countless
+/// call sites throughout the evaluator match an owned `Value` by
+/// value and move a variant's payload out (`Value::Function(f) => ...`
+/// and friends), which the language forbids for a type that
+/// implements `Drop` (E0509). Hanging the custom teardown off this
+/// separate, rarely-pattern-matched type sidesteps that restriction
+/// entirely.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EnumFields(pub(crate) Vec<(String, Value)>);
+
+impl EnumFields {
+    pub(crate) fn new(fields: Vec<(String, Value)>) -> Self {
+        Self(fields)
+    }
+}
+
+impl std::ops::Deref for EnumFields {
+    type Target = Vec<(String, Value)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for EnumFields {
+    fn drop(&mut self) {
+        // A recursive enum (e.g. a cons-style list built by repeated
+        // `Cons(head, tail)` calls) nests one `Value::Enum` inside
+        // the next via `Rc<EnumFields>`. Left to the default,
+        // compiler-generated drop glue, tearing down the outermost
+        // `EnumFields` would drop its `Value`s, and if one of those
+        // turns out to be the last owner of *another* `Rc<EnumFields>`
+        // that would recurse straight back into this same
+        // `Drop::drop` — one native Rust stack frame per level of
+        // nesting, which overflows the host stack a few hundred
+        // thousand elements deep. Flatten the whole reachable chain
+        // onto an explicit, heap-allocated worklist first instead, so
+        // the actual teardown is an iterative loop.
+        let mut pending = std::mem::take(&mut self.0);
+        let mut index = 0;
+        while index < pending.len() {
+            let reclaimed = if let Value::Enum { fields, .. } = &mut pending[index].1
+                && let Some(owned) = Rc::get_mut(fields)
+            {
+                Some(std::mem::take(&mut owned.0))
+            } else {
+                None
+            };
+            if let Some(mut reclaimed) = reclaimed {
+                pending.append(&mut reclaimed);
+            }
+            index += 1;
+        }
+        // `pending` drops here. Every `Value::Enum` we could uniquely
+        // reclaim above (`Rc::get_mut` returned `Some`) now has empty
+        // `fields`, so the ordinary, per-item drop glue that runs as
+        // this `Vec` is torn down does O(1) work per entry instead of
+        // recursing again. Entries whose `fields` were still shared
+        // elsewhere (`Rc::get_mut` returned `None`) merely have their
+        // refcount decremented here, which is also O(1); whoever
+        // holds the other reference is responsible for the eventual
+        // real teardown, using this same iterative path.
+    }
 }
 
 impl PartialEq for Value {
