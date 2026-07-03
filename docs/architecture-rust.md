@@ -1365,6 +1365,21 @@ cargo run -- -e "1 + 2"
   `RuntimeDouble`. Generic enums keep rejecting `Double` fields
   (`classify_generic_field`) since per-instantiation shape tracking for
   them isn't wired up yet.
+  `.map`/`.foldLeft` over a genuinely runtime (non-constant-folded) list
+  compile their mapper/reducer body once per element via a Rust-side loop
+  (`compile_compiled_literal_values_map`/`_fold_left`) whose
+  `push_scope`/`pop_scope` pair reuses the same frame-relative stack slot
+  for the element parameter on every iteration -- the same slot-reuse
+  hazard the loop-escape check above guards for `foreach`/`while` bodies,
+  but that checker never inspected this codegen-synthesized loop. A
+  closure returned from the mapper/reducer that captures the element
+  parameter and is folded into the mapped list or the accumulator (both of
+  which outlive the iteration) escaped into a stale/reused slot, a silent
+  miscompile rather than a diagnostic. Both loops now run the same
+  `native_value_escapes_loop_scope` check against the per-element scope's
+  base offset on the compiled per-iteration result and refuse with a clean
+  diagnostic when it escapes, leaving lambdas that return plain values or
+  closures over pre-loop bindings unaffected.
 
 ### `klassic-runtime`
 - Shared runtime crate scaffold for behavior that should move out of `klassic-eval`

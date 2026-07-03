@@ -30678,3 +30678,462 @@ fn native_double_enum_field_windows_cross_build() {
          println(describe(Rect(3.0, 4.0)))\n",
     );
 }
+
+/// klassic issue #548: `.map`'s native lowering over a genuinely runtime
+/// (non-constant-folded) list compiles the mapper body once per element via
+/// a Rust-side loop (`compile_compiled_literal_values_map`) whose
+/// `push_scope`/`pop_scope` pair reuses the exact same frame-relative stack
+/// slot for the element parameter on every iteration -- the same
+/// slot-reuse hazard PR #546 guarded for foreach/while bodies, but that
+/// escape-checker never inspects this codegen-synthesized loop. A closure
+/// returned from the mapper that captures the element parameter reads
+/// whatever now occupies that slot once later code reuses it, rather than
+/// the value captured at closure-creation time -- a silent miscompile, not
+/// merely a wrong-but-deterministic answer.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_refuses_closure_escaping_map_lambda_per_element_loop() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-mapesc-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-mapesc-{unique}"));
+    fs::write(
+        &source_path,
+        "mutable xs = []\n\
+         mutable i = 0\n\
+         while (i < 2) {\n\
+         \x20 xs = cons(i, xs)\n\
+         \x20 i = i + 1\n\
+         }\n\
+         val fns = xs.map((x) => (() => x * 10))\n\
+         foreach (f in fns) {\n\
+         \x20 println(f())\n\
+         }\n",
+    )
+    .expect("source should write");
+
+    // The evaluator (oracle) accepts it and prints each captured value.
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "10\n0\n");
+
+    // Native must refuse rather than silently reading a stale/reused stack
+    // slot (previously: built successfully, then printed garbage at run
+    // time -- exit code 0, no diagnostic).
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    let _ = fs::remove_file(&source_path);
+    let binary_created = output_path.exists();
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !build.status.success(),
+        "native must refuse a closure escaping a `.map` lambda's per-element loop, not miscompile it"
+    );
+    assert!(
+        !binary_created,
+        "native must not emit a binary for a refused build"
+    );
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("captures the element parameter")
+            && stderr.contains("escapes the per-element loop"),
+        "expected a clean unsupported diagnostic, got:\n{stderr}"
+    );
+}
+
+/// `.foldLeft` counterpart of `native_refuses_closure_escaping_map_lambda_per_element_loop`:
+/// the reducer body is compiled once per element by
+/// `compile_compiled_literal_values_fold_left`, which has the identical
+/// per-iteration stack-slot reuse. Folding a closure that captures the
+/// element parameter into the (list) accumulator lets it escape the
+/// per-element scope.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_refuses_closure_escaping_fold_left_reducer_per_element_loop() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-foldesc-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-foldesc-{unique}"));
+    fs::write(
+        &source_path,
+        "mutable xs = []\n\
+         mutable i = 0\n\
+         while (i < 2) {\n\
+         \x20 xs = cons(i, xs)\n\
+         \x20 i = i + 1\n\
+         }\n\
+         val fns = foldLeft(xs)([])((acc, x) => cons(() => x, acc))\n\
+         foreach (f in fns) {\n\
+         \x20 println(f())\n\
+         }\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+    assert_eq!(String::from_utf8_lossy(&eval.stdout), "0\n1\n");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    let _ = fs::remove_file(&source_path);
+    let binary_created = output_path.exists();
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !build.status.success(),
+        "native must refuse a closure escaping a `.foldLeft` reducer's per-element loop, not miscompile it"
+    );
+    assert!(
+        !binary_created,
+        "native must not emit a binary for a refused build"
+    );
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("captures the element parameter")
+            && stderr.contains("escapes the per-element loop"),
+        "expected a clean unsupported diagnostic, got:\n{stderr}"
+    );
+}
+
+/// No-regression probe alongside `native_refuses_closure_escaping_map_lambda_per_element_loop`:
+/// a `.map` lambda that returns a plain (non-closure) value over a
+/// genuinely runtime list must keep compiling and matching eval, since the
+/// returned value never references the per-element stack slot after the
+/// iteration's scope pops.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_map_lambda_returning_plain_value() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-mapplain-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-mapplain-{unique}"));
+    fs::write(
+        &source_path,
+        "mutable xs = []\n\
+         mutable i = 0\n\
+         while (i < 2) {\n\
+         \x20 xs = cons(i, xs)\n\
+         \x20 i = i + 1\n\
+         }\n\
+         val ys = xs.map((x) => x * 10)\n\
+         foreach (y in ys) {\n\
+         \x20 println(y)\n\
+         }\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "native must not refuse a `.map` lambda that returns a plain value:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "10\n0\n");
+}
+
+/// No-regression probe: a `.map` lambda doing plain arithmetic (no
+/// closures at all) over a genuinely runtime list.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_map_lambda_arithmetic_addition() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-mapadd-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-mapadd-{unique}"));
+    fs::write(
+        &source_path,
+        "mutable xs = []\n\
+         mutable i = 0\n\
+         while (i < 2) {\n\
+         \x20 xs = cons(i, xs)\n\
+         \x20 i = i + 1\n\
+         }\n\
+         val ys = xs.map((x) => x + 1)\n\
+         foreach (y in ys) {\n\
+         \x20 println(y)\n\
+         }\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "native must not refuse a `.map` lambda doing plain arithmetic:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "2\n1\n");
+}
+
+/// No-regression probe alongside `native_refuses_closure_escaping_fold_left_reducer_per_element_loop`:
+/// a `.foldLeft` reducer that only sums scalar values (no closures) over a
+/// genuinely runtime list must keep compiling and matching eval.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_fold_left_summing_values() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-foldsum-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-foldsum-{unique}"));
+    fs::write(
+        &source_path,
+        "mutable xs = []\n\
+         mutable i = 0\n\
+         while (i < 4) {\n\
+         \x20 xs = cons(i, xs)\n\
+         \x20 i = i + 1\n\
+         }\n\
+         val total = foldLeft(xs)(0)((acc, x) => acc + x)\n\
+         println(total)\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "native must not refuse a `.foldLeft` reducer that only sums scalars:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "6\n");
+}
+
+/// No-regression probe alongside `native_refuses_closure_escaping_map_lambda_per_element_loop`:
+/// a closure returned from a `.map` lambda that captures only a pre-loop
+/// `val` (not the element parameter) must keep working, because
+/// `native_value_escapes_loop_scope` only flags a capture whose slot was
+/// allocated *after* the per-element scope's base offset -- the pre-loop
+/// `val`'s slot predates it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_map_closure_capturing_pre_loop_val() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-mappreval-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-mappreval-{unique}"));
+    fs::write(
+        &source_path,
+        "val k = 100\n\
+         mutable xs = []\n\
+         mutable i = 0\n\
+         while (i < 2) {\n\
+         \x20 xs = cons(i, xs)\n\
+         \x20 i = i + 1\n\
+         }\n\
+         val fns = xs.map((x) => (() => k))\n\
+         foreach (f in fns) {\n\
+         \x20 println(f())\n\
+         }\n",
+    )
+    .expect("source should write");
+
+    let eval = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("evaluator should run");
+    assert!(eval.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+    assert!(
+        build.status.success(),
+        "native must not refuse a `.map` closure that only captures a pre-loop val:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&eval.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "100\n100\n");
+}
+
+/// Cross-build-only counterpart to `native_refuses_closure_escaping_map_lambda_per_element_loop`:
+/// the per-element loop and its escape check live in the shared
+/// target-independent codegen (`crates/klassic-native/src/lib.rs`), so the
+/// refusal must reproduce for the Windows PE64 target too, not just the
+/// Linux ELF path this host builds natively.
+#[test]
+fn native_refuses_closure_escaping_map_lambda_windows_cross_build() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_pe_mapesc_{unique}.kl"));
+    let exe_path = dir.join(format!("klassic_pe_mapesc_{unique}.exe"));
+    fs::write(
+        &source_path,
+        "mutable xs = []\n\
+         mutable i = 0\n\
+         while (i < 2) {\n\
+         \x20 xs = cons(i, xs)\n\
+         \x20 i = i + 1\n\
+         }\n\
+         val fns = xs.map((x) => (() => x * 10))\n\
+         foreach (f in fns) {\n\
+         \x20 println(f())\n\
+         }\n",
+    )
+    .expect("temp source file should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            exe_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let exe_created = exe_path.exists();
+    let _ = fs::remove_file(&exe_path);
+
+    assert!(
+        !build.status.success(),
+        "windows cross-build must also refuse a closure escaping a `.map` lambda's per-element loop"
+    );
+    assert!(
+        !exe_created,
+        "windows cross-build must not produce a PE64 file for a refused build"
+    );
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("captures the element parameter")
+            && stderr.contains("escapes the per-element loop"),
+        "expected a clean unsupported diagnostic, got:\n{stderr}"
+    );
+}

@@ -10082,6 +10082,7 @@ impl NativeCodeGenerator {
                 self.dynamic_control_depth += 1;
             }
             self.push_scope();
+            let iteration_base_offset = self.scope_base_offsets.last().copied();
             self.bind_runtime_line_lambda_captures(&mapper);
             self.bind_compiled_literal_iteration_value(param, element);
             let mapped = self.compile_expr(&mapper.body);
@@ -10090,6 +10091,26 @@ impl NativeCodeGenerator {
                 self.dynamic_control_depth -= 1;
             }
             let mapped = mapped?;
+            // The mapper body is compiled once per element by this Rust
+            // loop, but each iteration's `push_scope`/`pop_scope` reuses the
+            // exact same frame-relative stack slot for `param` (see
+            // `native_value_escapes_loop_scope` and PR #546's
+            // `refuse_loop_escaping_assignment`, the same slot-reuse
+            // mechanism applied there to foreach/while bodies). A closure
+            // returned from the mapper that captures `param` by that slot
+            // silently reads garbage once later iterations -- or any later
+            // code -- reuse the address, so refuse instead of miscompiling
+            // (klassic issue #548).
+            if let Some(base_offset) = iteration_base_offset
+                && self.native_value_escapes_loop_scope(mapped, base_offset)
+            {
+                return Err(unsupported(
+                    span,
+                    &format!(
+                        "a closure returned from a `.map` lambda over {context} that captures the element parameter and escapes the per-element loop"
+                    ),
+                ));
+            }
             let mapped = self.compiled_literal_value_from_native(mapped);
             mapped_values.push(self.stabilize_runtime_list_literal_value(
                 mapped,
@@ -10937,6 +10958,7 @@ impl NativeCodeGenerator {
                 _ => None,
             };
             self.push_scope();
+            let iteration_base_offset = self.scope_base_offsets.last().copied();
             self.bind_runtime_line_lambda_captures(&reducer);
             match &accumulator {
                 LiteralFoldAccumulator::Scalar {
@@ -10988,6 +11010,25 @@ impl NativeCodeGenerator {
                 self.dynamic_control_depth -= 1;
             }
             let next_acc = next_acc?;
+            // Same slot-reuse hazard as `compile_compiled_literal_values_map`
+            // (see its comment and klassic issue #548): the reducer body is
+            // compiled once per element by this Rust loop, reusing the same
+            // frame-relative stack slot for `element_param` (and, for the
+            // scalar accumulator case, `acc_param`) on every iteration. A
+            // closure returned from the reducer that captures either by
+            // that slot -- and is folded into the accumulator, which
+            // outlives this iteration by design -- silently reads garbage
+            // once a later iteration or later code reuses the slot.
+            if let Some(base_offset) = iteration_base_offset
+                && self.native_value_escapes_loop_scope(next_acc, base_offset)
+            {
+                return Err(unsupported(
+                    span,
+                    &format!(
+                        "a closure returned from a `.foldLeft` reducer over {context} that captures the element parameter and escapes the per-element loop"
+                    ),
+                ));
+            }
             match &mut accumulator {
                 LiteralFoldAccumulator::Scalar {
                     storage,
