@@ -24,7 +24,7 @@
     <em class="kl-terminal-title">klassic — 80×14</em>
   </div>
   <pre><code><span class="kl-prompt">$</span> curl -fsSL https://raw.githubusercontent.com/klassic/klassic/main/install.sh | sh
-<span class="kl-dim">installed: klassic 0.4.0 -&gt; ~/.klassic/bin</span>
+<span class="kl-dim">installed: klassic 0.5.0 -&gt; ~/.klassic/bin</span>
 <span class="kl-prompt">$</span> cat fib.kl
 <span class="kl-out">def fib(n: Int): Int = if (n &lt; 2) n else fib(n - 1) + fib(n - 2)
 println(fib(25))</span>
