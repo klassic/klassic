@@ -25,7 +25,7 @@ Two environment variables tune the installer:
 
 | Variable | Effect |
 | --- | --- |
-| `KLASSIC_VERSION=v0.5.0` | Pin a specific release instead of the latest |
+| `KLASSIC_VERSION=v0.6.0` | Pin a specific release instead of the latest |
 | `KLASSIC_HOME=/opt/klassic` | Change the install root (binaries go to `$KLASSIC_HOME/bin`) |
 
 The Linux build is statically linked (musl) and runs on any x86_64
