@@ -25612,7 +25612,9 @@ fn native_deep_recursion_with_per_frame_alloc_runs() {
         "churn program should build\nstderr:\n{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    let run = Command::new(&output_path).output().expect("binary should run");
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
     let _ = fs::remove_file(&source_path);
     let _ = fs::remove_file(&output_path);
     assert!(
