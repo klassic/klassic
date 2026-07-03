@@ -30654,27 +30654,119 @@ fn native_double_enum_field_mixed_with_int_variant() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "d:7.0\ni:9\n");
 }
 
-/// A fractional Double (`2.5`) reaching `println` has no general
-/// Ryu-style formatter available (only the whole-number fast path is
-/// implemented), so it must trap with a clean runtime error -- never
-/// emit wrong digits. This is the same acceptance bar as the existing
-/// `division by zero` / `integer overflow` runtime traps: the *build*
-/// succeeds (the fractional-ness of a runtime value isn't known until
-/// the value is computed), but running the binary exits non-zero with a
-/// diagnostic message and empty stdout.
+/// A fractional Double whose *exact* binary expansion is long (`0.1`,
+/// `0.3`, `123.456` -- none of these are exact binary fractions, so
+/// their true decimal expansion runs to ~50+ digits) has no general
+/// Ryu-style shortest-round-trip formatter available, so each must trap
+/// with a clean runtime error -- never emit wrong (or merely
+/// mismatched-length) digits. This is the same acceptance bar as the
+/// existing `division by zero` / `integer overflow` runtime traps: the
+/// *build* succeeds (the fractional-ness of a runtime value isn't known
+/// until the value is computed), but running the binary exits non-zero
+/// with a diagnostic message and empty stdout. Short exact binary
+/// fractions like `2.5` are covered separately by
+/// `native_double_enum_field_exact_fraction_matches_evaluator`, which
+/// now formats rather than traps.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn native_double_enum_field_fractional_traps_instead_of_wrong_digits() {
+fn native_double_enum_field_long_decimal_expansion_traps() {
+    for literal in ["0.1", "0.3", "123.456"] {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let source_path = dir.join(format!("klassic_native_double_longtail_{stamp}.kl"));
+        let output_path = dir.join(format!("klassic_native_double_longtail_{stamp}.bin"));
+        let source = format!(
+            "enum Shape {{ case Circle(r: Double); case Rect(w: Double, h: Double) }}\n\
+             println(Circle({literal}) match {{ case Circle(r) => r; case Rect(w, h) => 0.0 }})\n"
+        );
+        fs::write(&source_path, &source).expect("temp source file should write");
+
+        let build_output = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_str().expect("path should be utf-8"),
+                "-o",
+                output_path.to_str().expect("path should be utf-8"),
+            ])
+            .output()
+            .expect("binary should run");
+        assert!(
+            build_output.status.success(),
+            "native build of {literal} should succeed (fractional-ness is a runtime property)\nstderr:\n{}",
+            String::from_utf8_lossy(&build_output.stderr)
+        );
+
+        let run_output = Command::new(&output_path)
+            .output()
+            .expect("compiled binary should run");
+
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&output_path);
+
+        assert!(
+            !run_output.status.success(),
+            "{literal} should trap rather than print wrong/mismatched digits"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run_output.stdout),
+            "",
+            "no digits (right or wrong) should reach stdout before the trap for {literal}"
+        );
+        let stderr = String::from_utf8_lossy(&run_output.stderr);
+        assert!(
+            stderr.contains("whole numbers") && stderr.contains("exact binary fractions"),
+            "stderr should explain the whole-number/exact-fraction limitation for {literal}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// Exact binary fractions (`M / 2^k` for odd `M`, short `k`) now format
+/// via `emit_load_runtime_double_ascii`'s bit-pattern-recovery path
+/// instead of tripping the whole-number-only trap: `2.5`, `3.25`,
+/// `0.5`, `0.25`, `6.75`, `-2.5`, and `7.5` all have short exact decimal
+/// expansions that are also Rust's shortest round-trip `to_string()`
+/// form. Also covers the whole-number path as a regression (`3.0`
+/// stays `3.0`) and confirms the fraction path composes with
+/// `RuntimeDouble` arithmetic (`3.0 * 2.5 == 7.5`).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_double_enum_field_exact_fraction_matches_evaluator() {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
         .as_nanos();
     let dir = std::env::temp_dir();
-    let source_path = dir.join(format!("klassic_native_double_fractional_{stamp}.kl"));
-    let output_path = dir.join(format!("klassic_native_double_fractional_{stamp}.bin"));
+    let source_path = dir.join(format!("klassic_native_double_exactfrac_{stamp}.kl"));
+    let output_path = dir.join(format!("klassic_native_double_exactfrac_{stamp}.bin"));
     let source = "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
-                  println(Circle(2.5) match { case Circle(r) => r; case Rect(w, h) => 0.0 })\n";
+                  def r(s: Shape): Double = s match { case Circle(x) => x; case Rect(w, h) => 0.0 }\n\
+                  println(r(Circle(2.5)))\n\
+                  println(r(Circle(3.25)))\n\
+                  println(r(Circle(0.5)))\n\
+                  println(r(Circle(0.25)))\n\
+                  println(r(Circle(6.75)))\n\
+                  println(r(Circle(-2.5)))\n\
+                  println(r(Circle(7.5)))\n\
+                  println(r(Circle(3.0)))\n\
+                  println(r(Circle(3.0)) * 2.5)\n";
     fs::write(&source_path, source).expect("temp source file should write");
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("evaluator should run");
+    assert!(
+        eval_output.status.success(),
+        "evaluator run should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&eval_output.stdout),
+        "2.5\n3.25\n0.5\n0.25\n6.75\n-2.5\n7.5\n3.0\n7.5\n"
+    );
 
     let build_output = Command::new(klassic_bin())
         .args([
@@ -30687,7 +30779,7 @@ fn native_double_enum_field_fractional_traps_instead_of_wrong_digits() {
         .expect("binary should run");
     assert!(
         build_output.status.success(),
-        "native build should succeed (fractional-ness is a runtime property)\nstderr:\n{}",
+        "native build should succeed\nstderr:\n{}",
         String::from_utf8_lossy(&build_output.stderr)
     );
 
@@ -30699,18 +30791,79 @@ fn native_double_enum_field_fractional_traps_instead_of_wrong_digits() {
     let _ = fs::remove_file(&output_path);
 
     assert!(
-        !run_output.status.success(),
-        "a fractional Double should trap rather than print wrong digits"
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
     );
     assert_eq!(
         String::from_utf8_lossy(&run_output.stdout),
-        "",
-        "no digits (right or wrong) should reach stdout before the trap"
+        String::from_utf8_lossy(&eval_output.stdout),
+        "native stdout should byte-for-byte match the evaluator"
     );
-    let stderr = String::from_utf8_lossy(&run_output.stderr);
+}
+
+/// The README-style string-interpolation path
+/// (`emit_append_whole_runtime_double_to_runtime_buffer_offset_label`,
+/// shared with `__gc_double_to_string`) also exercises the exact-fraction
+/// formatter, not just direct `println`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_double_enum_field_exact_fraction_interpolation() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_native_double_exactfrac_interp_{stamp}.kl"));
+    let output_path = dir.join(format!(
+        "klassic_native_double_exactfrac_interp_{stamp}.bin"
+    ));
+    let source = "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
+                  def describe(s: Shape): String = s match { case Circle(r) => \"circle\"; case Rect(w, h) => \"a #{w}x#{h} box\" }\n\
+                  println(describe(Rect(2.5, 3.25)))\n";
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("evaluator should run");
+    assert!(eval_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&eval_output.stdout),
+        "a 2.5x3.25 box\n"
+    );
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
     assert!(
-        stderr.contains("whole numbers"),
-        "stderr should explain the whole-number-only limitation\nstderr:\n{stderr}"
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&eval_output.stdout),
+        "native stdout should byte-for-byte match the evaluator"
     );
 }
 
@@ -30726,6 +30879,21 @@ fn native_double_enum_field_windows_cross_build() {
         "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
          def describe(s: Shape): String = s match { case Circle(r) => \"circle\"; case Rect(w, h) => \"a #{w}x#{h} box\" }\n\
          println(describe(Rect(3.0, 4.0)))\n",
+    );
+}
+
+/// Cross-build a *fractional* Double example for
+/// `x86_64-pc-windows-msvc`: the exact-fraction formatter added to
+/// `emit_load_runtime_double_ascii` is shared between the Linux ELF and
+/// Windows PE64 paths, so this only needs to verify the build succeeds,
+/// not execute the PE64 on this host.
+#[test]
+fn native_double_enum_field_exact_fraction_windows_cross_build() {
+    assert_windows_target_builds(
+        "double_enum_exact_fraction",
+        "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
+         def describe(s: Shape): String = s match { case Circle(r) => \"circle\"; case Rect(w, h) => \"a #{w}x#{h} box\" }\n\
+         println(describe(Rect(2.5, 3.25)))\n",
     );
 }
 
