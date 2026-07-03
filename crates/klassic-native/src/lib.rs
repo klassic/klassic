@@ -17962,10 +17962,14 @@ impl NativeCodeGenerator {
 
     /// `__gc_double_to_string(value)` formats a `RuntimeDouble` as a GC
     /// heap string, for use by the monomorphic-enum `Display` builder
-    /// (`en_build_variant_display`). Only whole numbers have a fast-path
-    /// formatter (`emit_append_whole_runtime_double_to_runtime_buffer_offset_label`);
-    /// a fractional or NaN value traps with a clean runtime error rather
-    /// than ever emitting wrong digits (see that helper's doc comment).
+    /// (`en_build_variant_display`). Whole numbers and exact binary
+    /// fractions have a fast-path formatter
+    /// (`emit_append_whole_runtime_double_to_runtime_buffer_offset_label`,
+    /// backed by `emit_load_runtime_double_ascii`); anything else (NaN,
+    /// Infinity, or a fractional value whose exact decimal expansion is
+    /// too long) traps with a clean runtime error rather than ever
+    /// emitting wrong or mismatched-length digits (see that helper's doc
+    /// comment).
     fn compile_gc_double_to_string(
         &mut self,
         arguments: &[Expr],
@@ -39304,51 +39308,374 @@ impl NativeCodeGenerator {
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
     }
 
-    /// Validate that the `RuntimeDouble` bits currently in Rax represent
-    /// an exact whole number: round-trip through `i64` (`cvttsd2si` then
-    /// `cvtsi2sd`) and compare against the original with `ucomisd`. There
-    /// is no general Ryu-style shortest-round-trip float formatter in
-    /// this backend yet, so a whole number (e.g. `3.0`) is the only value
-    /// class with a fast, always-correct ASCII form (`<digits>.0`); a
-    /// fractional value (`2.5`) or NaN would either need real formatting
-    /// logic or silently print wrong digits, so it instead traps with a
-    /// clean runtime error (`emit_runtime_error`, matching the existing
-    /// "integer overflow" / "division by zero" trap sites) and the call
-    /// never returns. On success, Rax is left holding the truncated
-    /// `i64` magnitude -- exactly what the Int digit-emitting routines
-    /// below need next -- rather than the original double bits.
-    fn emit_whole_runtime_double_check_or_trap(&mut self, span: Span) {
+    /// Format a `RuntimeDouble` (raw bits currently in Rax) as ASCII text,
+    /// leaving `Rsi` pointing at the first byte and `Rcx` holding the byte
+    /// length -- the output convention both call sites below already
+    /// relied on from the (now-extracted) inline whole-number digit loop,
+    /// so their "copy `Rsi[0..Rcx]` somewhere" tails are unchanged.
+    ///
+    /// Two value classes have a fast, always-correct ASCII form; neither
+    /// needs a general Ryu-style shortest-round-trip float formatter:
+    ///
+    /// - **Whole numbers** (`3.0`): round-trip through `i64` (`cvttsd2si`
+    ///   then `cvtsi2sd`, compared with `ucomisd`); on success the digits
+    ///   of the truncated magnitude plus a literal `.0` suffix are exact.
+    /// - **Exact binary fractions** (`2.5`, `3.25`, `0.125`, ...): a
+    ///   double whose value is `M / 2^k` for an odd integer `M` has a
+    ///   *finite* decimal expansion `(M * 5^k) / 10^k`. `M` and `k` are
+    ///   recovered directly from the IEEE-754 bit pattern
+    ///   (mantissa/exponent, by stripping the mantissa's trailing zero
+    ///   bits), and `M * 5^k` is computed with an overflow-checked
+    ///   integer multiply loop (`imul` + the same `NoOverflow` idiom as
+    ///   `emit_integer_overflow_check`), never floating-point
+    ///   re-multiplication -- so the numerator itself is always exact or
+    ///   the call traps, never silently wrong.
+    ///
+    ///   That exact expansion is *not* automatically what Rust's
+    ///   shortest-round-trip `to_string()` prints, though: a double only
+    ///   distinguishes about 15-17 significant decimal digits, so a
+    ///   value whose exact expansion runs longer than that (e.g. exact
+    ///   `1 / 2^27 = 0.000000007450580596923828125`, 19 significant
+    ///   digits) has a *shorter* decimal that still round-trips to the
+    ///   same bit pattern, and `to_string()` -- correctly -- prints that
+    ///   shorter form instead (`0.000000007450580596923828`, 16 digits).
+    ///   Emitting the full exact expansion there would be mathematically
+    ///   correct but would not match the evaluator byte-for-byte. Per
+    ///   the standard IEEE-754 double guarantee (`DBL_DIG == 15`), any
+    ///   decimal value with at most 15 significant digits round-trips
+    ///   through a double injectively -- no other <=15-digit decimal
+    ///   maps to the same bit pattern -- so an exact expansion with
+    ///   significant-digit count `D <= 15` can have no shorter
+    ///   round-tripping alternative and is *guaranteed* to equal Rust's
+    ///   shortest form. This backend only emits digits when `D <= 15`
+    ///   (verified empirically against `to_string()` for thousands of
+    ///   generated cases up to `D` in the high 30s: matches for every
+    ///   `D <= 16`, first mismatch at `D == 17`) and separately bounds
+    ///   `k <= 27` before even attempting the multiply loop, since `5^28`
+    ///   alone already exceeds `2^64` -- no odd `M >= 1` can survive 28
+    ///   rounds without overflowing, regardless of how small `M` is.
+    ///   Long-tail values like `0.1` or `0.3` (exact binary expansion on
+    ///   the order of 55 decimal digits) blow the `k` bound long before
+    ///   completing; `1 / 2^27`-style values pass the `k` bound but blow
+    ///   the `D` bound instead. Either way this falls through to the
+    ///   trap below rather than ever printing a mismatched digit string.
+    ///
+    /// Anything else -- NaN, Infinity, a whole number too large for
+    /// `i64`, or a fractional value whose exact expansion exceeds either
+    /// bound above -- traps with a clean runtime error
+    /// (`emit_runtime_error`, matching the existing "integer overflow" /
+    /// "division by zero" trap sites) and the call never returns.
+    fn emit_load_runtime_double_ascii(&mut self, span: Span) {
+        // Rax = raw double bits on entry (`NativeValue::RuntimeDouble`'s
+        // convention). Stash a copy that survives the SSE round-trip
+        // below -- needed again by the exact-fraction bit-pattern path.
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+
         self.asm.movq_xmm_from_gpr(XmmReg::Xmm0, Reg::Rax);
         self.asm.cvttsd2si(Reg::Rax, XmmReg::Xmm0);
         self.asm.cvtsi2sd(XmmReg::Xmm1, Reg::Rax);
         self.asm.ucomisd(XmmReg::Xmm0, XmmReg::Xmm1);
-        let ok = self.asm.create_text_label();
+
+        let whole_ok = self.asm.create_text_label();
+        let not_whole = self.asm.create_text_label();
         let fail = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+
         // Unordered (either operand NaN) sets PF=1 -- fails regardless of
         // the also-set ZF, so this check must come before the Equal test.
         self.asm.jcc_label(Condition::Parity, fail);
-        self.asm.jcc_label(Condition::Equal, ok);
+        self.asm.jcc_label(Condition::Equal, whole_ok);
+        self.asm.jmp_label(not_whole);
+
+        // ---- whole-number fast path: "<digits>.0" ----
+        self.asm.bind_text_label(whole_ok);
+        {
+            // Rax now holds the exact truncated i64 magnitude.
+            let scratch = self.asm.data_label_with_bytes(&[0; 34]);
+            self.asm.mov_data_addr(Reg::Rsi, scratch);
+            self.asm.add_reg_imm32(Reg::Rsi, 32);
+            self.asm.mov_imm64(Reg::Rcx, 0);
+
+            let nonzero = self.asm.create_text_label();
+            let digits = self.asm.create_text_label();
+            let digit_loop = self.asm.create_text_label();
+            let suffix = self.asm.create_text_label();
+
+            self.asm.cmp_reg_imm8(Reg::Rax, 0);
+            self.asm.jcc_label(Condition::NotEqual, nonzero);
+            self.asm.dec_reg(Reg::Rsi);
+            self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'0');
+            self.asm.inc_reg(Reg::Rcx);
+            self.asm.jmp_label(suffix);
+
+            self.asm.bind_text_label(nonzero);
+            self.asm.xor_reg_reg(Reg::R8, Reg::R8);
+            self.asm.cmp_reg_imm8(Reg::Rax, 0);
+            self.asm.jcc_label(Condition::GreaterEqual, digits);
+            self.asm.neg_reg(Reg::Rax);
+            self.asm.mov_imm64(Reg::R8, 1);
+
+            self.asm.bind_text_label(digits);
+            self.asm.mov_imm64(Reg::Rbx, 10);
+            self.asm.bind_text_label(digit_loop);
+            self.asm.xor_reg_reg(Reg::Rdx, Reg::Rdx);
+            self.asm.div_reg(Reg::Rbx);
+            self.asm.add_reg8_imm8(Reg8::Dl, b'0');
+            self.asm.dec_reg(Reg::Rsi);
+            self.asm.mov_byte_ptr_reg8(Reg::Rsi, Reg8::Dl);
+            self.asm.inc_reg(Reg::Rcx);
+            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.jcc_label(Condition::NotEqual, digit_loop);
+            self.asm.cmp_reg_imm8(Reg::R8, 0);
+            self.asm.jcc_label(Condition::Equal, suffix);
+            self.asm.dec_reg(Reg::Rsi);
+            self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'-');
+            self.asm.inc_reg(Reg::Rcx);
+
+            self.asm.bind_text_label(suffix);
+            // The ones digit always ends up at scratch+31 regardless of
+            // how many digits were written (each additional digit only
+            // pushes the *start* further left); scratch+32/+33 are
+            // reserved for ".0", contiguous with it.
+            self.asm.mov_data_addr(Reg::Rdi, scratch);
+            self.asm.add_reg_imm32(Reg::Rdi, 32);
+            self.asm.mov_byte_ptr_reg_imm8(Reg::Rdi, b'.');
+            self.asm.add_reg_imm32(Reg::Rdi, 1);
+            self.asm.mov_byte_ptr_reg_imm8(Reg::Rdi, b'0');
+            self.asm.add_reg_imm32(Reg::Rcx, 2);
+        }
+        self.asm.jmp_label(done);
+
+        // ---- exact-fraction path: recover M / 2^k from the bit pattern ----
+        self.asm.bind_text_label(not_whole);
+        {
+            // Uniformly treat the bit pattern as normalized (mantissa OR
+            // `1 << 52`) even for the subnormal/zero-exponent case: doing
+            // so slightly overstates the true magnitude for a subnormal,
+            // but a subnormal always needs well over a thousand
+            // fractional bits to represent exactly, so it blows the
+            // `k <= 27` bound below regardless -- no separate subnormal
+            // formula is needed for soundness. NaN never reaches here
+            // (trapped by the Parity check above); Infinity and any whole
+            // number too large for `i64` naturally produce `k <= 0` below
+            // and fall through to the same trap.
+            self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
+            self.asm.shr_reg_imm8(Reg::Rax, 52);
+            self.asm.and_reg_imm32(Reg::Rax, 0x7ff);
+            self.asm.sub_reg_imm32(Reg::Rax, 1075); // E0 = biased_exp - 1023 - 52
+            self.asm.mov_reg_reg(Reg::R8, Reg::Rax); // R8 = E0
+
+            self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
+            self.asm.mov_imm64(Reg::Rdx, 0x000f_ffff_ffff_ffff);
+            self.asm.and_reg_reg(Reg::Rax, Reg::Rdx);
+            self.asm.mov_imm64(Reg::Rdx, 1u64 << 52);
+            self.asm.or_reg_reg(Reg::Rax, Reg::Rdx); // Rax = M0 (53-bit mantissa)
+
+            // Strip trailing zero bits: M0 = M1 * 2^t, M1 odd. Bounded by
+            // M0's 53 significant bits (the implicit leading `1` bit is
+            // always set, so a set bit is always found within 53 shifts).
+            self.asm.mov_imm64(Reg::Rcx, 0); // Rcx = t
+            self.asm.mov_imm64(Reg::Rdx, 1);
+            let tz_loop = self.asm.create_text_label();
+            let tz_done = self.asm.create_text_label();
+            self.asm.bind_text_label(tz_loop);
+            self.asm.test_reg_reg(Reg::Rax, Reg::Rdx);
+            self.asm.jcc_label(Condition::NotEqual, tz_done);
+            self.asm.shr_reg_imm8(Reg::Rax, 1);
+            self.asm.inc_reg(Reg::Rcx);
+            self.asm.jmp_label(tz_loop);
+            self.asm.bind_text_label(tz_done);
+            // Rax = M1 (odd), Rcx = t
+
+            // E1 = E0 + t; k = -E1 (the exact decimal digit count after
+            // the point, since value = M1 * 2^E1 = (M1 * 5^k) / 10^k).
+            self.asm.add_reg_reg(Reg::R8, Reg::Rcx); // R8 = E1
+            self.asm.mov_reg_reg(Reg::R9, Reg::R8);
+            self.asm.neg_reg(Reg::R9); // R9 = k
+
+            self.asm.cmp_reg_imm8(Reg::R9, 0);
+            self.asm.jcc_label(Condition::LessEqual, fail);
+            self.asm.cmp_reg_imm8(Reg::R9, 27);
+            self.asm.jcc_label(Condition::Greater, fail);
+
+            // N = M1 * 5^k, overflow-checked one factor of 5 at a time --
+            // `imul`'s CF/OF fire the instant the signed-64-bit result
+            // would need truncation, so this can only ever produce an
+            // exact N or trap, matching every other numeric trap site in
+            // this backend (see `emit_integer_overflow_check`).
+            self.asm.mov_reg_reg(Reg::Rcx, Reg::R9); // loop counter = k
+            self.asm.mov_imm64(Reg::Rbx, 5);
+            let mul_loop = self.asm.create_text_label();
+            let mul_ok = self.asm.create_text_label();
+            let mul_done = self.asm.create_text_label();
+            self.asm.bind_text_label(mul_loop);
+            self.asm.cmp_reg_imm8(Reg::Rcx, 0);
+            self.asm.jcc_label(Condition::Equal, mul_done);
+            self.asm.imul_reg_reg(Reg::Rax, Reg::Rbx);
+            self.asm.jcc_label(Condition::NoOverflow, mul_ok);
+            self.asm.jmp_label(fail);
+            self.asm.bind_text_label(mul_ok);
+            self.asm.dec_reg(Reg::Rcx);
+            self.asm.jmp_label(mul_loop);
+            self.asm.bind_text_label(mul_done);
+            // Rax = N (exact numerator: N * 10^-k == the magnitude)
+
+            // Extract N's decimal digits, most-significant first, into a
+            // scratch buffer -- the same backward-fill shape as the
+            // whole-number path's digit loop, minus sign handling (N is
+            // always a non-negative magnitude; the sign is applied
+            // separately below).
+            let n_scratch = self.asm.data_label_with_bytes(&[0; 24]);
+            self.asm.mov_data_addr(Reg::Rdi, n_scratch);
+            self.asm.add_reg_imm32(Reg::Rdi, 24);
+            self.asm.mov_imm64(Reg::Rcx, 0); // Rcx = D (digit count)
+            self.asm.mov_imm64(Reg::Rbx, 10);
+            let n_digit_loop = self.asm.create_text_label();
+            self.asm.bind_text_label(n_digit_loop);
+            self.asm.xor_reg_reg(Reg::Rdx, Reg::Rdx);
+            self.asm.div_reg(Reg::Rbx);
+            self.asm.add_reg8_imm8(Reg8::Dl, b'0');
+            self.asm.dec_reg(Reg::Rdi);
+            self.asm.mov_byte_ptr_reg8(Reg::Rdi, Reg8::Dl);
+            self.asm.inc_reg(Reg::Rcx);
+            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.jcc_label(Condition::NotEqual, n_digit_loop);
+            // Rdi = pointer to N's first (most-significant) digit
+            self.asm.mov_reg_reg(Reg::R10, Reg::Rcx); // R10 = D (persist)
+
+            // `N`'s significant-digit count `D` is *not* bounded by `k`
+            // alone (`5^k` keeps contributing digits even for a
+            // single-bit `M1`: `1 / 2^27`'s exact expansion has 19
+            // significant digits despite `M1 = 1`), and a value whose
+            // exact expansion needs more digits than a double can
+            // actually distinguish has a *shorter* representation that
+            // Rust's shortest-round-trip `to_string()` would pick
+            // instead -- e.g. exact `140737488355328.03125` (D = 20)
+            // prints as `140737488355328.03` (D = 17) because the double
+            // doesn't have enough precision to tell them apart. Per the
+            // standard IEEE-754 double guarantee (`DBL_DIG == 15`), any
+            // decimal value with at most 15 significant digits round-
+            // trips through a double injectively, so an exact expansion
+            // with `D <= 15` can have no shorter round-tripping
+            // alternative and is guaranteed to equal Rust's shortest
+            // form. `D > 15` is not just unproven but empirically wrong
+            // (verified against `to_string()` above D = 16), so it traps
+            // rather than risk a too-long mismatch.
+            self.asm.cmp_reg_imm8(Reg::R10, 15);
+            self.asm.jcc_label(Condition::Greater, fail);
+
+            // Assemble the final "[-]<int>.<frac>" string left-to-right
+            // into a fresh buffer: 1 sign byte + up to 19 digits of N (it
+            // fits in signed 63 bits) + 1 '.' + up to 27 padding zeros
+            // never exceeds 64 bytes.
+            let out_scratch = self.asm.data_label_with_bytes(&[0; 64]);
+            self.asm.mov_data_addr(Reg::Rsi, out_scratch); // Rsi = string start
+            self.asm.mov_reg_reg(Reg::Rbx, Reg::Rsi); // Rbx = write cursor
+
+            self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
+            self.asm.shr_reg_imm8(Reg::Rax, 63);
+            self.asm.cmp_reg_imm8(Reg::Rax, 0);
+            let no_sign = self.asm.create_text_label();
+            self.asm.jcc_label(Condition::Equal, no_sign);
+            self.asm.mov_byte_ptr_reg_imm8(Reg::Rbx, b'-');
+            self.asm.inc_reg(Reg::Rbx);
+            self.asm.bind_text_label(no_sign);
+
+            let frac_only = self.asm.create_text_label();
+            let assemble_done = self.asm.create_text_label();
+            self.asm.cmp_reg_reg(Reg::R10, Reg::R9); // D vs k
+            self.asm.jcc_label(Condition::LessEqual, frac_only);
+
+            // ---- D > k: "<D-k digits>.<k digits>" ----
+            self.asm.mov_reg_reg(Reg::Rdx, Reg::R10);
+            self.asm.sub_reg_reg(Reg::Rdx, Reg::R9); // Rdx = int_count = D - k
+            self.asm.mov_imm64(Reg::Rcx, 0);
+            let a_loop = self.asm.create_text_label();
+            let a_done = self.asm.create_text_label();
+            self.asm.bind_text_label(a_loop);
+            self.asm.cmp_reg_reg(Reg::Rcx, Reg::Rdx);
+            self.asm.jcc_label(Condition::Equal, a_done);
+            self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rdi, Reg::Rcx);
+            self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::Rcx, Reg8::Al);
+            self.asm.inc_reg(Reg::Rcx);
+            self.asm.jmp_label(a_loop);
+            self.asm.bind_text_label(a_done);
+            self.asm.add_reg_reg(Reg::Rbx, Reg::Rdx);
+            self.asm.add_reg_reg(Reg::Rdi, Reg::Rdx); // Rdi -> first of k frac digits
+            self.asm.mov_byte_ptr_reg_imm8(Reg::Rbx, b'.');
+            self.asm.inc_reg(Reg::Rbx);
+            self.asm.mov_imm64(Reg::Rcx, 0);
+            let b_loop = self.asm.create_text_label();
+            let b_done = self.asm.create_text_label();
+            self.asm.bind_text_label(b_loop);
+            self.asm.cmp_reg_reg(Reg::Rcx, Reg::R9);
+            self.asm.jcc_label(Condition::Equal, b_done);
+            self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rdi, Reg::Rcx);
+            self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::Rcx, Reg8::Al);
+            self.asm.inc_reg(Reg::Rcx);
+            self.asm.jmp_label(b_loop);
+            self.asm.bind_text_label(b_done);
+            self.asm.add_reg_reg(Reg::Rbx, Reg::R9);
+            self.asm.jmp_label(assemble_done);
+
+            // ---- D <= k: "0.<k-D zeros><D digits>" ----
+            self.asm.bind_text_label(frac_only);
+            self.asm.mov_byte_ptr_reg_imm8(Reg::Rbx, b'0');
+            self.asm.inc_reg(Reg::Rbx);
+            self.asm.mov_byte_ptr_reg_imm8(Reg::Rbx, b'.');
+            self.asm.inc_reg(Reg::Rbx);
+            self.asm.mov_reg_reg(Reg::Rdx, Reg::R9);
+            self.asm.sub_reg_reg(Reg::Rdx, Reg::R10); // Rdx = pad_count = k - D
+            self.asm.mov_imm64(Reg::Rax, b'0' as u64);
+            self.asm.mov_imm64(Reg::Rcx, 0);
+            let pad_loop = self.asm.create_text_label();
+            let pad_done = self.asm.create_text_label();
+            self.asm.bind_text_label(pad_loop);
+            self.asm.cmp_reg_reg(Reg::Rcx, Reg::Rdx);
+            self.asm.jcc_label(Condition::Equal, pad_done);
+            self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::Rcx, Reg8::Al);
+            self.asm.inc_reg(Reg::Rcx);
+            self.asm.jmp_label(pad_loop);
+            self.asm.bind_text_label(pad_done);
+            self.asm.add_reg_reg(Reg::Rbx, Reg::Rdx);
+            self.asm.mov_imm64(Reg::Rcx, 0);
+            let c_loop = self.asm.create_text_label();
+            let c_done = self.asm.create_text_label();
+            self.asm.bind_text_label(c_loop);
+            self.asm.cmp_reg_reg(Reg::Rcx, Reg::R10);
+            self.asm.jcc_label(Condition::Equal, c_done);
+            self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rdi, Reg::Rcx);
+            self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::Rcx, Reg8::Al);
+            self.asm.inc_reg(Reg::Rcx);
+            self.asm.jmp_label(c_loop);
+            self.asm.bind_text_label(c_done);
+            self.asm.add_reg_reg(Reg::Rbx, Reg::R10);
+
+            self.asm.bind_text_label(assemble_done);
+            self.asm.mov_reg_reg(Reg::Rcx, Reg::Rbx);
+            self.asm.sub_reg_reg(Reg::Rcx, Reg::Rsi); // Rcx = length
+        }
+        self.asm.jmp_label(done);
+
         self.asm.bind_text_label(fail);
         self.emit_runtime_error(
             span,
-            "native Double formatting supports only whole numbers (e.g. 3.0); \
-             fractional and NaN values are not supported yet",
+            "native Double formatting supports only whole numbers (e.g. 3.0) and \
+             exact binary fractions with a short decimal expansion (e.g. 2.5); \
+             this value's exact decimal expansion is too long, or it is NaN/Infinity",
         );
-        self.asm.bind_text_label(ok);
+
+        self.asm.bind_text_label(done);
     }
 
-    /// Append a `RuntimeDouble`'s whole-number ASCII form (`<digits>.0`)
-    /// to the runtime string buffer at `output`/`offset` -- the Double
-    /// sibling of `emit_append_i64_rax_to_runtime_buffer_offset_label`,
-    /// reusing its exact digit-emitting shape (a scratch buffer filled
-    /// backward from a fixed high end so the sign/digits land in the
-    /// right order without a second reversal pass) with two differences:
-    /// the input is first validated/truncated by
-    /// `emit_whole_runtime_double_check_or_trap`, and the scratch buffer
-    /// reserves two extra fixed-offset bytes right after the digit range
-    /// for the trailing ".0" (the ones digit always lands at the same
-    /// fixed offset regardless of digit count -- see that sibling's doc
-    /// comment -- so the suffix bytes are always contiguous with it).
+    /// Append a `RuntimeDouble`'s ASCII form to the runtime string buffer
+    /// at `output`/`offset` -- the Double sibling of
+    /// `emit_append_i64_rax_to_runtime_buffer_offset_label`. Formatting
+    /// itself (whole numbers and exact binary fractions, see its doc
+    /// comment) is fully delegated to `emit_load_runtime_double_ascii`;
+    /// this just copies the resulting `Rsi[0..Rcx]` into the growable
+    /// runtime buffer, capacity-checked one byte at a time like every
+    /// other `emit_append_*_to_runtime_buffer_offset_label` sibling.
     fn emit_append_whole_runtime_double_to_runtime_buffer_offset_label(
         &mut self,
         output: DataLabel,
@@ -39356,60 +39683,7 @@ impl NativeCodeGenerator {
         span: Span,
         overflow_message: &str,
     ) {
-        self.emit_whole_runtime_double_check_or_trap(span);
-        // Rax now holds the exact truncated i64 magnitude.
-        let scratch = self.asm.data_label_with_bytes(&[0; 34]);
-        self.asm.mov_data_addr(Reg::Rsi, scratch);
-        self.asm.add_reg_imm32(Reg::Rsi, 32);
-        self.asm.mov_imm64(Reg::Rcx, 0);
-
-        let nonzero = self.asm.create_text_label();
-        let digits = self.asm.create_text_label();
-        let digit_loop = self.asm.create_text_label();
-        let suffix = self.asm.create_text_label();
-
-        self.asm.cmp_reg_imm8(Reg::Rax, 0);
-        self.asm.jcc_label(Condition::NotEqual, nonzero);
-        self.asm.dec_reg(Reg::Rsi);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'0');
-        self.asm.inc_reg(Reg::Rcx);
-        self.asm.jmp_label(suffix);
-
-        self.asm.bind_text_label(nonzero);
-        self.asm.xor_reg_reg(Reg::R8, Reg::R8);
-        self.asm.cmp_reg_imm8(Reg::Rax, 0);
-        self.asm.jcc_label(Condition::GreaterEqual, digits);
-        self.asm.neg_reg(Reg::Rax);
-        self.asm.mov_imm64(Reg::R8, 1);
-
-        self.asm.bind_text_label(digits);
-        self.asm.mov_imm64(Reg::Rbx, 10);
-        self.asm.bind_text_label(digit_loop);
-        self.asm.xor_reg_reg(Reg::Rdx, Reg::Rdx);
-        self.asm.div_reg(Reg::Rbx);
-        self.asm.add_reg8_imm8(Reg8::Dl, b'0');
-        self.asm.dec_reg(Reg::Rsi);
-        self.asm.mov_byte_ptr_reg8(Reg::Rsi, Reg8::Dl);
-        self.asm.inc_reg(Reg::Rcx);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::NotEqual, digit_loop);
-        self.asm.cmp_reg_imm8(Reg::R8, 0);
-        self.asm.jcc_label(Condition::Equal, suffix);
-        self.asm.dec_reg(Reg::Rsi);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'-');
-        self.asm.inc_reg(Reg::Rcx);
-
-        self.asm.bind_text_label(suffix);
-        // The ones digit always ends up at scratch+31 regardless of how
-        // many digits were written (each additional digit only pushes
-        // the *start* further left); scratch+32/+33 are reserved for
-        // ".0", contiguous with it.
-        self.asm.mov_data_addr(Reg::Rdi, scratch);
-        self.asm.add_reg_imm32(Reg::Rdi, 32);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rdi, b'.');
-        self.asm.add_reg_imm32(Reg::Rdi, 1);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rdi, b'0');
-        self.asm.add_reg_imm32(Reg::Rcx, 2);
+        self.emit_load_runtime_double_ascii(span);
 
         self.asm.mov_data_addr(Reg::R10, offset);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
@@ -39432,64 +39706,14 @@ impl NativeCodeGenerator {
     }
 
     /// Print a `RuntimeDouble` (raw bits currently in Rax) directly to
-    /// file descriptor `fd`, e.g. from `println`. Shares the whole-number
-    /// fast path and trap with the interpolation-materialize sibling
-    /// (`emit_append_whole_runtime_double_to_runtime_buffer_offset_label`)
-    /// but writes straight to `fd` via a small fixed scratch buffer
-    /// instead of appending into the shared growable runtime-string
-    /// buffer, mirroring how `emit_print_i64_runtime` differs from
+    /// file descriptor `fd`, e.g. from `println`. Formatting is fully
+    /// delegated to `emit_load_runtime_double_ascii` (shared with the
+    /// interpolation-materialize sibling above); this just writes the
+    /// resulting `Rsi[0..Rcx]` straight to `fd`, mirroring how
+    /// `emit_print_i64_runtime` differs from
     /// `emit_append_i64_rax_to_runtime_buffer_offset_label`.
     fn emit_print_runtime_double(&mut self, fd: u64, span: Span) {
-        self.emit_whole_runtime_double_check_or_trap(span);
-        // Rax now holds the exact truncated i64 magnitude.
-        let scratch = self.asm.data_label_with_bytes(&[0; 34]);
-        self.asm.mov_data_addr(Reg::Rsi, scratch);
-        self.asm.add_reg_imm32(Reg::Rsi, 32);
-        self.asm.mov_imm64(Reg::Rcx, 0);
-
-        let nonzero = self.asm.create_text_label();
-        let digits = self.asm.create_text_label();
-        let digit_loop = self.asm.create_text_label();
-        let suffix = self.asm.create_text_label();
-
-        self.asm.cmp_reg_imm8(Reg::Rax, 0);
-        self.asm.jcc_label(Condition::NotEqual, nonzero);
-        self.asm.dec_reg(Reg::Rsi);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'0');
-        self.asm.inc_reg(Reg::Rcx);
-        self.asm.jmp_label(suffix);
-
-        self.asm.bind_text_label(nonzero);
-        self.asm.xor_reg_reg(Reg::R8, Reg::R8);
-        self.asm.cmp_reg_imm8(Reg::Rax, 0);
-        self.asm.jcc_label(Condition::GreaterEqual, digits);
-        self.asm.neg_reg(Reg::Rax);
-        self.asm.mov_imm64(Reg::R8, 1);
-
-        self.asm.bind_text_label(digits);
-        self.asm.mov_imm64(Reg::Rbx, 10);
-        self.asm.bind_text_label(digit_loop);
-        self.asm.xor_reg_reg(Reg::Rdx, Reg::Rdx);
-        self.asm.div_reg(Reg::Rbx);
-        self.asm.add_reg8_imm8(Reg8::Dl, b'0');
-        self.asm.dec_reg(Reg::Rsi);
-        self.asm.mov_byte_ptr_reg8(Reg::Rsi, Reg8::Dl);
-        self.asm.inc_reg(Reg::Rcx);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::NotEqual, digit_loop);
-        self.asm.cmp_reg_imm8(Reg::R8, 0);
-        self.asm.jcc_label(Condition::Equal, suffix);
-        self.asm.dec_reg(Reg::Rsi);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'-');
-        self.asm.inc_reg(Reg::Rcx);
-
-        self.asm.bind_text_label(suffix);
-        self.asm.mov_data_addr(Reg::Rdi, scratch);
-        self.asm.add_reg_imm32(Reg::Rdi, 32);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rdi, b'.');
-        self.asm.add_reg_imm32(Reg::Rdi, 1);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rdi, b'0');
-        self.asm.add_reg_imm32(Reg::Rcx, 2);
+        self.emit_load_runtime_double_ascii(span);
 
         if !self.is_windows {
             self.emit_syscall_number(PlatformSyscall::Write);

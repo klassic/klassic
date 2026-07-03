@@ -1352,13 +1352,18 @@ cargo run -- -e "1 + 2"
   `cvttsd2si`/`cvtsi2sd`) backs `+ - * / == != < <= > >=`, with the four
   ordering comparisons made NaN-safe by swapping operands into the
   existing CF-based `Above`/`AboveOrEqual` conditions and `==`/`!=` using
-  a new `Condition::Parity` guard. Formatting only has a whole-number
-  fast path (`<digits>.0`, shared by direct `println` and the string-
+  a new `Condition::Parity` guard. Formatting has a whole-number fast
+  path (`<digits>.0`) and an exact-binary-fraction path (`<digits>.
+  <digits>`, e.g. `2.5`), shared by direct `println` and the string-
   interpolation materialize path via
-  `emit_append_whole_runtime_double_to_runtime_buffer_offset_label`); a
-  fractional or NaN value traps with a clean runtime error rather than
-  risk wrong digits, since there is no general shortest-round-trip
-  formatter here. A `Double` literal's `Expr::Double` arm now also
+  `emit_append_whole_runtime_double_to_runtime_buffer_offset_label` (see
+  the later `emit_load_runtime_double_ascii` entry below for how the
+  fraction path recovers exact digits); a value outside both paths (NaN,
+  Infinity, or a fractional value whose exact decimal expansion is too
+  long, e.g. `0.1`) traps with a clean runtime error rather than risk
+  wrong or mismatched-length digits, since there is no general
+  shortest-round-trip formatter here. A `Double` literal's `Expr::Double`
+  arm now also
   materializes its bits into Rax (previously purely a compile-time
   `StaticDouble` tag with no codegen) so an `if`/`match` branch merging a
   literal Double arm with a genuinely runtime one unifies soundly to
@@ -1380,6 +1385,32 @@ cargo run -- -e "1 + 2"
   base offset on the compiled per-iteration result and refuse with a clean
   diagnostic when it escapes, leaving lambdas that return plain values or
   closures over pre-loop bindings unaffected.
+- Runtime `Double` formatting now also handles exact binary fractions
+  (`2.5`, `3.25`, `0.125`, ...), not just whole numbers. The whole-number
+  check and both formatting sites (`emit_print_runtime_double`,
+  `emit_append_whole_runtime_double_to_runtime_buffer_offset_label`) were
+  refactored to share one `emit_load_runtime_double_ascii` routine that
+  leaves `Rsi`/`Rcx` pointing at the formatted ASCII bytes. When the
+  whole-number round trip fails, it recovers the IEEE-754 mantissa/
+  exponent directly from the raw bits (all GPR bit ops, no floating-point
+  re-multiplication), strips the mantissa's trailing zero bits to find
+  the odd `M` and exponent `k` such that `value == M / 2^k`, and computes
+  the exact numerator `M * 5^k` with an overflow-checked `imul` loop
+  (`NoOverflow`-gated, same idiom as `emit_integer_overflow_check`) bounded
+  at `k <= 27` (`5^28` alone exceeds `2^64`, so no larger `k` can avoid
+  overflow regardless of `M`). A second, independent bound rejects any
+  result whose significant-digit count exceeds 15: a double's exact
+  terminating expansion can run longer than what the type actually
+  distinguishes (e.g. `1 / 2^27` has a 19-significant-digit exact
+  expansion but prints as a 16-digit `to_string()`), and per the
+  IEEE-754 `DBL_DIG == 15` guarantee, any <=15-significant-digit decimal
+  round-trips through a double injectively, so a `D <= 15` exact
+  expansion is guaranteed to equal Rust's shortest form (verified against
+  `to_string()` for thousands of generated cases; empirically the first
+  mismatch appears at `D == 17`). Values outside either bound (`0.1`,
+  `0.3`, `123.456`, NaN, Infinity) keep tripping the existing clean
+  runtime-error trap rather than ever emitting a wrong or mismatched-
+  length digit string.
 
 ### `klassic-runtime`
 - Shared runtime crate scaffold for behavior that should move out of `klassic-eval`
