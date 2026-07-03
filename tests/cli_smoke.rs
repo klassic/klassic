@@ -25576,6 +25576,56 @@ fn native_min_int_division_by_minus_one_is_a_clean_error() {
 /// `abs(i64::MIN)` overflows (|MIN| is unrepresentable): the evaluator
 /// traps with `integer overflow`; native's `neg`-based abs used to
 /// return MIN unchanged, silently.
+/// Deep recursion where each frame allocates a heap value (an enum
+/// here) keeps a GC shadow-stack root live per frame until it returns.
+/// The fixed shadow-stack/mark-worklist caps used to overflow well
+/// before the C stack did, aborting a program the evaluator runs
+/// fine. The caps now comfortably exceed what the call stack can hold,
+/// so a 50k-deep churn completes and matches the evaluator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_deep_recursion_with_per_frame_alloc_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_gcchurn_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_gcchurn_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Box { case Full(v: Int); case Empty }\n\
+         def churn(n: Int): Int = if (n <= 0) 0 else { val junk = Full(n); churn(n - 1) }\n\
+         println(churn(50000))\n",
+    )
+    .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "churn program should build\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        run.status.success(),
+        "50k-deep churn should run cleanly\nstdout:{}\nstderr:{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "0\n");
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_abs_min_int_is_a_clean_error() {
