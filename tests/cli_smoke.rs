@@ -25573,6 +25573,77 @@ fn native_min_int_division_by_minus_one_is_a_clean_error() {
     );
 }
 
+/// `abs(i64::MIN)` overflows (|MIN| is unrepresentable): the evaluator
+/// traps with `integer overflow`; native's `neg`-based abs used to
+/// return MIN unchanged, silently.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_abs_min_int_is_a_clean_error() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_absmin_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_absmin_{stamp}.bin"));
+    fs::write(&source_path, "println(abs(-9223372036854775807 - 1))\n")
+        .expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "abs program should build\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert_eq!(run.status.code(), Some(1), "expected a clean exit-1 error");
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("integer overflow"),
+        "expected `integer overflow` on stderr, got:\nstdout:{}\nstderr:{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// `abs` of an ordinary negative still works natively.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_abs_of_ordinary_negative_works() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_absok_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_absok_{stamp}.bin"));
+    fs::write(&source_path, "println(abs(-5))\nprintln(abs(7))\n").expect("source should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(build.status.success(), "abs program should build");
+    let run = Command::new(&output_path)
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "5\n7\n");
+}
+
 /// Negating i64::MIN overflows: the evaluator reports `integer overflow
 /// in unary negation`; native used to wrap silently and print
 /// -9223372036854775808.

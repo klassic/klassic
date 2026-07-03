@@ -12828,6 +12828,14 @@ impl NativeCodeGenerator {
                 self.asm.cmp_reg_imm8(Reg::Rax, 0);
                 self.asm.jcc_label(Condition::GreaterEqual, done);
                 self.asm.neg_reg(Reg::Rax);
+                // `neg` sets OF exactly when the operand is i64::MIN,
+                // whose absolute value is unrepresentable; the evaluator
+                // reports this as a checked-arithmetic error rather than
+                // returning MIN unchanged.
+                let ok = self.asm.create_text_label();
+                self.asm.jcc_label(Condition::NoOverflow, ok);
+                self.emit_runtime_error(span, "integer overflow");
+                self.asm.bind_text_label(ok);
                 self.asm.bind_text_label(done);
                 Ok(NativeValue::Int)
             }
