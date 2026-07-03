@@ -455,13 +455,14 @@ evaluator. Runtime string values can be used as syscall paths for
 `FileInput#all`, direct file-input printing, and `FileInput#open` callback
 bodies or callable callback values whose stream parameter flows through
 supported runtime string and file helpers, including `readAll` / `readLines`,
-`length`, `cleanup`, or returning the path itself. Fixed-buffer runtime strings
-can be copied onto the GC heap with `__gc_string(runtimeString)`, providing an
-explicit bridge from runtime file/stdin data into `HeapString` operations.
+`length`, `cleanup`, or returning the path itself. A `String` payload read back out of an enum normalizes onto the GC heap as a
+`HeapString` (the desugar pass synthesizes an internal `__gc_string` call --
+not a user-callable builtin, see `docs/architecture-rust.md`), providing a
+bridge from string data into heap-backed operations.
 Heap string operands also participate in native `+`, using the same
-shadow-stack-rooted concatenation path as `__gc_string_concat` and lifting
-static or runtime string fragments when needed.
-Native `==` / `!=`, `assertResult`, and `__gc_string_eq` over heap strings
+shadow-stack-rooted concatenation path and lifting static or runtime string
+fragments when needed.
+Native `==` / `!=` and `assertResult` over heap strings
 root the left operand while the right-hand side is evaluated, then compare
 length-prefixed byte payloads through the same scan path.
 `toString(heapString)` copies heap bytes back into a fixed-buffer
@@ -469,28 +470,21 @@ length-prefixed byte payloads through the same scan path.
 ordinary `String` helpers consume explicitly heap-backed data. Runtime string
 interpolation appends `HeapString` fragments into the same fixed-buffer
 representation.
-High-level collection literals reject `HeapPointer` / `HeapString` values for
-now instead of preserving them in unrooted fixed-buffer runtime-list metadata;
-the explicit `__gc_list_ptr_*` helpers remain the native path for collections
-of heap pointers.
-Address-taking GC helper calls also reject plain `Int` native values at build
-time; pointer-producing expressions keep their `HeapPointer` / `HeapString`
-native value tags even though the temporary source-level debug API is still
-typed through integers.
-Raw `__gc_write` accepts `Int`, `HeapPointer`, and `HeapString` values as qwords,
-so pointer records and arrays can store heap strings through the same field path
-used for generic heap objects.
-Raw `__gc_read` remains an integer qword load; `__gc_read_ptr` emits the same
-load but returns `NativeValue::HeapPointer`, so pointer-record fields can flow
-back into strict address-taking GC helpers without reopening arbitrary plain
-`Int` addresses.
-`__gc_read_string` is the string-specific companion that returns
-`NativeValue::HeapString`, letting a raw field re-enter natural heap-string
-printing, `+`, `toString`, and `assertResult` paths.
-`__gc_list_ptr_get_string` provides the same string-specific projection for
-tag-4 pointer lists whose slots are known to contain heap strings.
-`__gc_smap_get_string` applies that convention to string-keyed maps, preserving
-`NativeValue::HeapString` for present values whose payloads are heap strings.
+Address-taking GC helper calls (the eleven compiler-internal `__gc_*`
+dispatch tags listed in `docs/architecture-rust.md`) reject plain `Int`
+native values at build time; pointer-producing expressions keep their
+`HeapPointer` / `HeapString` native value tags. Raw `__gc_write` accepts
+`Int`, `HeapPointer`, and `HeapString` values as qwords, so enum payload
+slots can store heap strings through the same field path used for generic
+heap objects. Raw `__gc_read` remains an integer qword load; `__gc_read_ptr`
+emits the same load but returns `NativeValue::HeapPointer`; `__gc_read_string`
+is the string-specific companion that returns `NativeValue::HeapString`,
+letting a field re-enter natural heap-string printing, `+`, `toString`, and
+`assertResult` paths. A larger family of heap-pointer-list and
+string-keyed-map primitives that used to be directly callable
+(`__gc_list_ptr_*`, `__gc_smap_*`, and friends) has been removed from the
+language entirely -- ordinary `List<T>` and `Map<K, V>` values are the only
+way to build collections.
 Direct printing or immutable
 printable bindings of `FileInput#lines` / `readLines` are also supported.
 Runtime line-list values also support `size`, `isEmpty`, `head`, `tail`,

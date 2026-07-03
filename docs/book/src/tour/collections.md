@@ -199,7 +199,6 @@ seeds an empty one.
 
 Most collection literals fold to compile-time constants if all their
 elements are also static. The native compiler handles dynamic
-collections through the GC heap and through fixed-buffer runtime
-representations — see [Heap-Backed Lists](../gc/lists.md) and
-[String-Keyed Maps](../gc/maps.md) when you need to grow collections
-at runtime.
+collections through fixed-buffer runtime representations, growing
+them automatically as elements are added — you never manage that
+storage directly.

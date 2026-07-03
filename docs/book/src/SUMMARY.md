@@ -38,15 +38,6 @@
 - [Standard Streams and the Environment](./native/process.md)
 - [Threads, Sleep, Stopwatch](./native/concurrency.md)
 
-# The GC Heap
-
-- [Why a GC?](./gc/why.md)
-- [Heap-Allocated Strings](./gc/strings.md)
-- [Heap-Backed Lists](./gc/lists.md)
-- [String-Keyed Maps](./gc/maps.md)
-- [GC Builtins Reference](./gc/builtins-reference.md)
-- [Roadmap](./gc/roadmap.md)
-
 # Reference
 
 - [Standard Prelude](./reference/stdlib-prelude.md)

@@ -199,34 +199,27 @@ static or runtime integer counts, and string search predicates, plus ASCII
 `toLowerCase` / `toUpperCase`, simple `matches` with static or runtime
 patterns, first-occurrence `replace` with static or runtime literal operands,
 all-occurrence `replaceAll` with static or runtime pattern and replacement
-strings, and UTF-8 `reverse`. `__gc_string(runtimeString)` can also copy these
-fixed-buffer runtime strings onto the GC heap as `HeapString` values for
-heap-backed string composition. Once an operand is a `HeapString`, native `+`
-lifts static or runtime string fragments as needed and concatenates through
-the GC heap, and native `==` / `!=` plus
-`assertResult` compare heap strings by byte content while keeping left-hand
-temporaries rooted across right-hand evaluation. `toString(heapString)` copies
-heap bytes back into a fixed-buffer runtime `String` for ordinary string
-helpers; method-style `heapString.toString()` uses the same bridge. Runtime
-string interpolation can append `HeapString` fragments.
-High-level collection literals reject GC heap pointer values for now; use the
-explicit `__gc_list_ptr_*` helpers for heap-pointer collections until Phase B
-migrates ordinary lists onto the GC heap.
-GC helper calls that consume heap addresses require values produced by GC
-allocation or pointer-returning helpers; plain `Int` values are rejected at
-build time even though the temporary debug surface is still source-typed as
-integers. Raw `__gc_write` still accepts `Int`, `HeapPointer`, or `HeapString`
-values as qwords, while its address operand must come from a GC pointer source.
-Use `__gc_read_ptr(addr, offset)` rather than `__gc_read(addr, offset)` when a
-raw field is meant to flow back into address-taking GC helpers; `__gc_read`
-continues to model scalar qword reads as `Int`. Use
-`__gc_read_string(addr, offset)` when the field is known to hold a heap string
-and should re-enter the `HeapString` surface for `println`, `+`, `toString`, and
-`assertResult`. Pointer lists have the same split surface: `__gc_list_ptr_get`
-preserves generic pointer provenance, while `__gc_list_ptr_get_string` returns a
-known heap-string slot as `HeapString`. String-keyed maps mirror that convention
-with `__gc_smap_get` for generic pointer values and `__gc_smap_get_string` for
-present values known to be heap strings.
+strings, and UTF-8 `reverse`. A `String` payload read back out of an enum
+also normalizes onto the GC heap as a `HeapString` (see the enum-lowering
+notes in `docs/architecture-rust.md`) for heap-backed string composition.
+Once an operand is a `HeapString`, native `+` lifts static or runtime string
+fragments as needed and concatenates through the GC heap, and native `==` /
+`!=` plus `assertResult` compare heap strings by byte content while keeping
+left-hand temporaries rooted across right-hand evaluation. `toString(heapString)`
+copies heap bytes back into a fixed-buffer runtime `String` for ordinary
+string helpers; method-style `heapString.toString()` uses the same bridge.
+Runtime string interpolation can append `HeapString` fragments.
+The raw GC-heap primitives (`__gc_alloc`, `__gc_record`, `__gc_write`,
+`__gc_read` / `__gc_read_ptr` / `__gc_read_string` / `__gc_read_double`,
+`__gc_string` / `__gc_string_concat`, `__gc_int_to_string` /
+`__gc_double_to_string`) are compiler-internal dispatch tags synthesized
+only by the enum-lowering desugar pass; they are not declared to the
+typechecker, so a Klassic program cannot reference them directly. A larger
+family of heap-pointer-list and string-keyed-map primitives that used to be
+directly callable (`__gc_list_ptr_*`, `__gc_smap_*`, and friends) has been
+removed from the language entirely — ordinary `List<T>` and `Map<K, V>`
+values, not a separate heap-pointer API, are the only way to build
+collections.
 
 Static string concatenation can be used in immutable bindings and static
 record fields when at least one operand is a static string, including

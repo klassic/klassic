@@ -2,59 +2,57 @@
 
 Evaluate a single integer expression like `2 + 3 * 4` from the
 command line. Demonstrates a minimal recursive-descent parser
-hand-written in Klassic, plus left-to-right reduction over a
-heap-backed integer list.
+hand-written in Klassic, plus left-to-right reduction over an
+ordinary `List<String>` — automatic GC means the list, its string
+elements, and every intermediate value are managed for you.
 
 We split on spaces and only handle `+`, `-`, `*`, `/` in left-to-right
 order — perfect for showing the moving parts without a full grammar.
 
 ```kl
-import std.math.{mod}
-
 val args = CommandLine#args()
 if (size(args) != 1) {
   printlnError("usage: calc \"2 + 3 * 4\"")
   Process#exit(1)
 }
 
-val tokens = __gc_string_split(__gc_string(head(args)), 32)
-val n = __gc_list_ptr_len(tokens)
+val tokens = split(head(args), " ")
+val n = size(tokens)
 
-if (n == 0 || mod(n, 2) == 0) {
+if (n == 0 || n - (n / 2) * 2 == 0) {
   printlnError("expected: NUM (OP NUM)*")
   Process#exit(2)
 }
 
-mutable acc = __gc_string_to_int(__gc_list_ptr_get(tokens, 0))
-mutable i = 1
-while (i < n) {
-  val op = __gc_list_ptr_get(tokens, i)
-  val rhs = __gc_string_to_int(__gc_list_ptr_get(tokens, i + 1))
-  if (__gc_string_eq(op, __gc_string("+"))) {
+mutable acc = String#parseInt(head(tokens))
+mutable rest = tail(tokens)
+while (!isEmpty(rest)) {
+  val op = head(rest)
+  val rhs = String#parseInt(head(tail(rest)))
+  if (op == "+") {
     acc = acc + rhs
   } else {
-    if (__gc_string_eq(op, __gc_string("-"))) {
+    if (op == "-") {
       acc = acc - rhs
     } else {
-      if (__gc_string_eq(op, __gc_string("*"))) {
+      if (op == "*") {
         acc = acc * rhs
       } else {
-        if (__gc_string_eq(op, __gc_string("/"))) {
+        if (op == "/") {
           if (rhs == 0) {
             printlnError("division by zero")
             Process#exit(3)
           }
           acc = acc / rhs
         } else {
-          printlnError("unknown operator: ")
-          __gc_string_println(op)
+          printlnError("unknown operator: " + op)
           Process#exit(4)
           acc = 0   // unreachable; aligns the branch types
         }
       }
     }
   }
-  i += 2
+  rest = tail(tail(rest))
 }
 
 println(acc)
@@ -90,6 +88,5 @@ folding with operators — are the building blocks for that next step.
 ## What's nice
 
 - The full program is one source file, no external libraries.
-- Native build is sub-10 KiB and starts essentially instantly.
 - Every error path exits with a distinct status code so shell
   callers can tell what went wrong.

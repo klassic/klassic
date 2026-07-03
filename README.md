@@ -98,8 +98,6 @@ klassic --warn-trust proofs.kl     # report trusted proofs
 
 - [Native compilation](https://klassic.github.io/klassic/native/building.html)
   and the exhaustive [coverage matrix](docs/native-coverage.md)
-- [The GC heap](https://klassic.github.io/klassic/gc/why.html) and its
-  `__gc_*` debug builtins
 - [Architecture notes](docs/architecture-rust.md) — how the compiler
   pipeline and the three binary writers fit together
 

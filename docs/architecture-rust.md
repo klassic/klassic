@@ -1120,229 +1120,28 @@ cargo run -- -e "1 + 2"
   comparisons, and printing now all treat `HeapPointer` like `Int`
   so `val a = __gc_alloc(...); println(a > 0)` compiles cleanly.
 
-  The debug builtins drive the GC end-to-end:
-  `__gc_alloc(size)` (type tag 1, raw bytes, with native runtime
-  guards against negative and overflowing sizes); `__gc_record(num_fields)`
-  (type tag 2, packed heap pointers, fixed shape); `__gc_array(num_slots)`
-  (type tag 3, packed heap pointers, indexed); `__gc_string(text)`
-  (heap-allocated length-prefixed string built from a static literal or runtime
-  `String`);
-  `__gc_string_concat(a, b)` (joins two heap strings into a new one,
-  spilling both inputs into shadow-stack-tracked slots so the
-  allocation in the middle cannot reclaim them, and checking total
-  byte length before payload-size arithmetic); `__gc_string_println(g)`
-  (writes the heap string's bytes followed by `\n` to stdout); native `+`
-  lowers through the same heap concatenation path when a `HeapString`
-  participates, lifting static or runtime string fragments as needed, and
-  native `==` / `!=` plus `assertResult` root the left operand across
-  right-hand evaluation before reusing the byte-content equality scan;
-  top-level or method-style `toString` copies heap bytes back into a
-  fixed-buffer runtime `String` for ordinary string helpers; runtime string
-  interpolation can append `HeapString` fragments into its fixed buffer;
-  `__gc_string_len(s)` (validates and returns the byte length stored at
-  offset 0);
-  `__gc_string_alloc(n)` (reserves an `n`-byte zero-filled string for
-  byte-by-byte construction); `__gc_string_get_byte(s, idx)` /
-  `__gc_string_set_byte(s, idx, byte)` (single-byte access after
-  validating the stored string length);
-  `__gc_string_eq(a, b)` and heap string equality operators
-  (stored-length validation followed by length-then-`repe cmpsb`
-  byte equality);
-  `__gc_string_substring(s, start, end)` (allocates a fresh heap
-  string holding bytes `[start, end)` with three bounds checks
-  and a stored-length sanity check before the destination allocation
-  runs);
-  `__gc_string_repeat(s, n)` (concatenates `s` with itself `n`
-  times in a single allocation; negative `n` jumps to
-  `gc_bounds_error`, the stored source length is validated, and
-  total length is checked before allocation size arithmetic);
-  `__gc_string_replace(s, from, to)` (counts non-overlapping
-  matches, validates all stored string lengths, and checks the
-  replacement result length before allocation);
-  `__gc_string_split(s, sep_byte)` (counts separator bytes,
-  checks the resulting list length before allocation, zeroes the
-  destination pointer-list slots, then fills each slot with a fresh
-  heap string segment);
-  `__gc_string_index_of(s, byte)` (returns the first index of
-  the low-byte of `byte` in `s`, or `-1` if absent — no
-  allocation, just a movzx/cmp loop, after validating the stored
-  string length);
-  `__gc_string_index_of_from(s, byte, start)` (same byte search
-  starting at `start`, returning `-1` if the cursor is at or past
-  the end);
-  `__gc_string_last_index_of(s, byte)` (reverse byte search,
-  returning the highest matching byte index or `-1`);
-  `__gc_string_to_int(s)` (permissive base-10 parser with
-  optional leading `-` that stops at the first non-digit and
-  returns 0 on empty / no-digit inputs, after validating the stored
-  string length);
-  `__gc_int_to_string(n)` (renders a signed integer to a fresh
-  heap string via a digit-counting pass followed by a render-
-  backwards pass into the exact-sized destination);
-  `__gc_string_starts_with(s, prefix)` and
-  `__gc_string_ends_with(s, suffix)` (length precheck plus
-  `repe cmpsb` against the leading or trailing bytes, after
-  validating both stored string lengths);
-  `__gc_string_contains(haystack, needle)` (naive O(n*m) search
-  via an outer i-loop and inner `repe cmpsb`, with all loop
-  scratch slots allocated up front so no early conditional
-  return skips a `sub rsp` emission, and both stored string
-  lengths validated before scanning);
-  `__gc_pointer_count(addr)` (derives the slot count of a record or
-  array from the GC header — note that the count reflects the
-  16-byte-aligned actual allocation, not the user-requested fields,
-  and impossible or unaligned header sizes are rejected before the
-  payload calculation);
-  `__gc_segment_count()` (returns how many heap segments are
-  currently mmap'd);
-  `__gc_list_ptr(n)` (a heap-backed pointer list using a new tag-4
-  layout `[len, ptr_0, ...]` whose mark phase skips the leading
-  length qword); `__gc_list_ptr_len(lst)` validates and returns the
-  stored length;
-  `__gc_list_ptr_set(lst, idx, ptr)` /
-  `__gc_list_ptr_get(lst, idx)` /
-  `__gc_list_ptr_get_string(lst, idx)` (length and indexed pointer access
-  for the new list, including a string-specific read for slots known to
-  hold heap strings, and validating stored length before indexed
-  access); `__gc_list_ptr_push(lst, ptr)` (returns a
-  fresh tag-4 list with `ptr` appended, spilling both inputs into
-  shadow-stack slots so neither the source list nor an inline
-  `__gc_alloc(...)` argument is reclaimed by the destination's
-  own allocation, and rejecting corrupted lengths before deriving
-  the allocation size); `__gc_list_ptr_concat(a, b)` (returns a
-  fresh tag-4 pointer list after checking that the two stored
-  lengths can be safely summed for the destination allocation);
-  `__gc_list_ptr_pop(lst)` / `__gc_list_ptr_reverse(lst)` (return
-  fresh tag-4 pointer lists after checking that the stored length
-  can be represented as the destination allocation size);
-  `__gc_list_ptr_join(parts, sep)` validates the stored list,
-  separator, and part lengths before using them to drive the
-  two-pass join loop, and checks total output length before
-  allocation;
-  `__gc_list_int(n)` (a heap-backed integer list of length `n`,
-  zero-initialized via a runtime fill loop so a free-list reuse
-  cannot surface stale bytes); `__gc_list_int_len(lst)` (validated
-  stored length read); `__gc_list_int_set(lst, idx, value)`
-  and `__gc_list_int_get(lst, idx)` (untrusted-index element
-  access, mirroring `__gc_read`/`__gc_write` for the dedicated
-  list layout after validating stored length);
-  `__gc_list_int_push(lst, v)` (returns a fresh list one slot
-  longer with `v` appended — both inputs spill
-  into shadow-stack slots so a collection inside the destination
-  allocation cannot reclaim the source mid-copy, and corrupted
-  lengths are rejected before the derived allocation size is
-  computed);
-  `__gc_list_int_pop(lst)` (returns a fresh list with the
-  trailing element removed; popping an empty list jumps to
-  `gc_bounds_error`, and corrupted lengths are rejected before
-  deriving the smaller allocation size);
-  `__gc_list_int_reverse(lst)` (returns a fresh list with the
-  same payload in reverse order after checking the stored length
-  can be represented as a destination allocation);
-  `__gc_list_concat(a, b)` (returns a fresh int list whose
-  payload is `a` followed by `b`, both copied via two rep movsb
-  passes after checking that the two stored lengths can be safely
-  summed for the destination allocation);
-  `__gc_list_int_println(lst)` (prints `[a, b, c]\n`
-  by driving `print_i64` per element through two anonymous stack
-  slots that are released on exit after validating the stored
-  list length); `__gc_list_int_sum` / `__gc_list_int_min` /
-  `__gc_list_int_max` validate the stored list length before
-  iterating; `__gc_list_int_to_string` additionally validates
-  the separator length and checks total output length before
-  allocation; `__gc_collect()`;
-  `__gc_pin(addr)` / `__gc_unpin(addr)` for explicit static-table
-  registration alongside the automatic shadow-stack tracking; and
-  `__gc_read(addr, offset)` / `__gc_read_ptr(addr, offset)` /
-  `__gc_read_string(addr, offset)` / `__gc_write(addr, offset, value)` for raw
-  qword access, including scalar reads, pointer- or heap-string-provenance
-  reads, and `Int`, `HeapPointer`, or `HeapString` stores (which doubles as
-  record-field and array-slot access since both share the same packed-pointer
-  layout). String-keyed maps validate that their backing pointer-list length is
-  non-negative, in range, and even before scanning interleaved key/value slots;
-  key string lengths are checked before equality scans. They use
-  `__gc_smap_get` for generic pointer values and `__gc_smap_get_string` when a
-  present value is known to hold a heap string.
-  Marking uses an iterative
-  worklist keyed off the type-tag header field: the
-  `gc_mark_visit` subroutine sets the mark bit and pushes the
-  block onto a 4096-entry trace stack; the trace loop pops each
-  block and, when its tag is at or above "pointer record", walks
-  the payload qword by qword recursively visiting every non-null
-  pointer field.
-
-  Thirty-five integration tests cover the lifecycle: reclamation when
-  nothing is rooted, explicit-pin survival across a heap stress
-  loop, recursive marking through a pointer record's two child
-  blocks, automatic stack-slot retention so a `val a = __gc_alloc(...)`
-  binding survives a heap-stress collection without any explicit
-  `__gc_pin`, a basic `__gc_alloc` / `__gc_collect` smoke check,
-  an eight-slot 1.2 MiB workload whose live blocks force the
-  runtime to grow the heap beyond the initial segment and still
-  read back the original sentinels after a follow-up collection,
-  a `__gc_array` test that proves tag-3 payloads are walked
-  identically to records, a `__gc_string` concat test that
-  builds heap-allocated strings, joins them with a fresh heap
-  allocation, drops the originals from explicit reach, runs two
-  collections under heap pressure, and prints the survivors via
-  `__gc_string_println` to confirm both copies and tracing work
-  correctly, a `__gc_list_int` round-trip test that populates
-  a heap-backed integer list, forces a heap-pressure collection
-  while only the slot pins it, then reads back individual
-  elements and the full `__gc_list_int_println` formatting, a
-  heap-string introspection test exercising `__gc_string_len`,
-  `__gc_string_eq` for both equal and unequal inputs, and a
-  dynamically-allocated string built byte-by-byte through
-  `__gc_string_alloc` + `__gc_string_set_byte` that survives an
-  intermediate heap-pressure collection, and a final introspection
-  test for `__gc_pointer_count` on a record and an array plus
-  `__gc_segment_count` increasing past one once the heap grows,
-  a `__gc_list_ptr` test that builds four sentinel children,
-  stores them through the indexed setter, drops the direct
-  references, pins only the list, and forces a heap-pressure
-  collection — every child must still be reachable through the
-  list's slots, proving the new tag-4 trace branch correctly
-  skips the leading length and walks the rest as pointers,
-  two bounds-check tests (one for a negative index, one for
-  index >= length) that confirm the shared `gc_bounds_error`
-  subroutine prints `klassic gc: index out of bounds` and exits
-  with status 1 instead of writing past the payload, and a
-  five-test `__gc_string_substring` matrix covering the in-
-  bounds happy path (mid / full / empty windows), survival
-  across an intervening heap-pressure collection, and the three
-  failure modes (negative start, end past length, start > end)
-  that all funnel into the same diagnostic and exit code, and a
-  pair of `__gc_list_int_push` tests that build a five-element
-  list incrementally and confirm it survives interleaved
-  heap-pressure collections that drop every previous version,
-  a pair of `__gc_list_ptr_push` tests covering the same
-  incremental-grow scenario for tag-4 pointer lists — the second
-  test appends inline `__gc_alloc(...)` results never bound to a
-  `val`, so the only reason the children survive a heap-pressure
-  collection is the list's mark-phase trace through its slots,
-  plus a seven-test sweep of higher-level operations:
-  `__gc_string_repeat` (basic, empty-source fast path,
-  negative-count rejection, and size-overflow rejection),
-  `__gc_string_index_of` (start / mid / end / missing / empty),
-  `__gc_string_to_int` (positive, zero, negative, empty,
-  partial-parse, invalid-leading, large), `__gc_list_int_pop`
-  (round-trip down to `[]` plus an empty-list bounds error), and
-  `__gc_list_concat` (both non-empty plus three empty-side
-  combinations), and a four-test sweep covering
-  `__gc_int_to_string` (zero, single digit, multi digit,
-  negative, large), combined `__gc_string_starts_with` /
-  `__gc_string_ends_with` (matching / non-matching / empty /
-  longer-than-string / equal-length), `__gc_string_contains`
-  (start / mid / end / missing / empty needle / longer needle /
-  empty haystack — this test exposed a stack-tracker bug where
-  an early conditional jump skipped a `sub rsp` emission and
-  corrupted successive callers, fixed by allocating loop scratch
-  slots before any control-flow split), and
-  `__gc_list_int_reverse` (5 element, single, empty).
-  The next phase of integration is wiring the existing
-  structural string / list / record builtins onto the heap so
-  any source program participates in GC without going through
-  the explicit `__gc_*` interface.
+  The debug builtins originally exposed the raw heap surface end to
+  end: allocation, tagged records/arrays, heap-string construction
+  and every string/list/map operation, pin/unpin, and introspection
+  (pointer/segment/collection counts). That surface has since been
+  removed from the user-facing language (the typechecker no longer
+  declares them, so a Klassic program cannot reference them; a large
+  Rust-side test and codegen suite for the removed primitives was
+  deleted alongside it). Eleven primitives remain as
+  compiler-internal-only dispatch tags, reachable exclusively through
+  the desugar passes that synthesize them (never from parsed user
+  source, since nothing declares them to the typechecker):
+  `__gc_alloc`, `__gc_record`, `__gc_write` (enum construction),
+  `__gc_read` / `__gc_read_ptr` / `__gc_read_string` /
+  `__gc_read_double` (enum field access), `__gc_string` /
+  `__gc_string_concat` (normalizing a Display/interpolation result
+  into a traced heap string), and `__gc_int_to_string` /
+  `__gc_double_to_string` (interpolation number formatting). Ordinary
+  `String`, `List`, and `Map` values -- built through the runtime
+  scratch-buffer representations described elsewhere in this
+  document, not the tagged-heap-object primitives above -- remain
+  the only heap-backed values a Klassic program can construct
+  directly; the GC manages all of them without any explicit API.
 - Monomorphic enums support a `Double` payload field
   (`EnumFieldRepr::DoubleField`): a new `NativeValue::RuntimeDouble`
   carries raw IEEE-754 bits in Rax (mirroring `Int`), boxed into an
