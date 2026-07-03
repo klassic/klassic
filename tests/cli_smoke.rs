@@ -30288,3 +30288,393 @@ fn build_target_windows_x86_64_file_io_runs() {
         "true\nhello!\n[a, b]\nfalse\nfalse\n"
     );
 }
+
+/// Native monomorphic-enum `Double` payloads (`NativeValue::RuntimeDouble`,
+/// `EnumFieldRepr::DoubleField`): the README-sized example combining a
+/// boxed/unboxed Double field with string interpolation, whose result is
+/// materialized into a heap string (not streamed straight to the fd) --
+/// exact stdout match against the evaluator.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_double_enum_field_readme_example_matches_evaluator() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_native_double_readme_{stamp}.kl"));
+    let output_path = dir.join(format!("klassic_native_double_readme_{stamp}.bin"));
+    let source = "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
+                  def describe(s: Shape): String = s match { case Circle(r) => \"circle\"; case Rect(w, h) => \"a #{w}x#{h} box\" }\n\
+                  println(describe(Rect(3.0, 4.0)))\n";
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let eval_output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("evaluator should run");
+    assert!(
+        eval_output.status.success(),
+        "evaluator run should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&eval_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&eval_output.stdout),
+        "a 3.0x4.0 box\n"
+    );
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&eval_output.stdout),
+        "native stdout should byte-for-byte match the evaluator"
+    );
+}
+
+/// Regression guard for the silent-miscompile both prior attempts hit:
+/// `Expr::Identifier`'s reload guard must include `RuntimeDouble`, else a
+/// second read of a Double-typed variable returns whatever stale value
+/// was last left in Rax instead of reloading from its stack slot. Two
+/// distinct Double fields read from the same match arm and interpolated
+/// together must print as two *different* numbers.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_double_enum_field_two_fields_do_not_alias() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_native_double_twofield_{stamp}.kl"));
+    let output_path = dir.join(format!("klassic_native_double_twofield_{stamp}.bin"));
+    let source = "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
+                  def dims(s: Shape): String = s match { case Circle(r) => \"circle\"; case Rect(w, h) => \"#{w} #{h}\" }\n\
+                  println(dims(Rect(4.0, 5.0)))\n";
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "4.0 5.0\n");
+}
+
+/// Direct `println` of a Double extracted from a `match` (the
+/// `emit_print_runtime_double` path, distinct from the string-
+/// interpolation-materialize path exercised above): whole-number fast
+/// path renders as `<int>.0`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_double_enum_field_direct_println() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_native_double_println_{stamp}.kl"));
+    let output_path = dir.join(format!("klassic_native_double_println_{stamp}.bin"));
+    let source = "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
+                  println(Circle(3.0) match { case Circle(r) => r; case Rect(w, h) => 0.0 })\n";
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "3.0\n");
+}
+
+/// `RuntimeDouble` arithmetic (`addsd`/`subsd`/`mulsd`/`divsd` via the new
+/// SSE2 codegen) over an unboxed field and a Double literal rhs
+/// (`materialize_runtime_double` coercing the literal's bits-less
+/// `StaticDouble` tag into Rax).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_double_enum_field_arithmetic() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_native_double_arith_{stamp}.kl"));
+    let output_path = dir.join(format!("klassic_native_double_arith_{stamp}.bin"));
+    let source = "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
+                  def doubled(s: Shape): Double = s match { case Circle(r) => r * 2.0; case Rect(w, h) => 0.0 }\n\
+                  println(doubled(Circle(3.0)))\n";
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "6.0\n");
+}
+
+/// `==`/`!=` over two enum values with Double payloads: structural
+/// equality (`gc_deep_equal`) walks the boxed field cells, which now hold
+/// real IEEE-754 bits (materialized by `Expr::Double`'s literal arm) --
+/// same value compares equal, different value compares unequal.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_double_enum_field_equality() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_native_double_eq_{stamp}.kl"));
+    let output_path = dir.join(format!("klassic_native_double_eq_{stamp}.bin"));
+    let source = "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
+                  println(Circle(3.0) == Circle(3.0))\n\
+                  println(Circle(3.0) == Circle(2.0))\n";
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "true\nfalse\n");
+}
+
+/// A monomorphic enum mixing a `Double` variant and an `Int` variant in
+/// the same declaration: each variant's field keeps its own repr
+/// (`EnumFieldRepr::DoubleField` vs `EnumFieldRepr::Scalar`)
+/// independently.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_double_enum_field_mixed_with_int_variant() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_native_double_mixed_{stamp}.kl"));
+    let output_path = dir.join(format!("klassic_native_double_mixed_{stamp}.bin"));
+    let source = "enum Mixed { case D(x: Double); case I(n: Int) }\n\
+                  def describe(m: Mixed): String = m match { case D(x) => \"d:#{x}\"; case I(n) => \"i:#{n}\" }\n\
+                  println(describe(D(7.0)))\n\
+                  println(describe(I(9)))\n";
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "d:7.0\ni:9\n");
+}
+
+/// A fractional Double (`2.5`) reaching `println` has no general
+/// Ryu-style formatter available (only the whole-number fast path is
+/// implemented), so it must trap with a clean runtime error -- never
+/// emit wrong digits. This is the same acceptance bar as the existing
+/// `division by zero` / `integer overflow` runtime traps: the *build*
+/// succeeds (the fractional-ness of a runtime value isn't known until
+/// the value is computed), but running the binary exits non-zero with a
+/// diagnostic message and empty stdout.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_double_enum_field_fractional_traps_instead_of_wrong_digits() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_native_double_fractional_{stamp}.kl"));
+    let output_path = dir.join(format!("klassic_native_double_fractional_{stamp}.bin"));
+    let source = "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
+                  println(Circle(2.5) match { case Circle(r) => r; case Rect(w, h) => 0.0 })\n";
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed (fractional-ness is a runtime property)\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        !run_output.status.success(),
+        "a fractional Double should trap rather than print wrong digits"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "",
+        "no digits (right or wrong) should reach stdout before the trap"
+    );
+    let stderr = String::from_utf8_lossy(&run_output.stderr);
+    assert!(
+        stderr.contains("whole numbers"),
+        "stderr should explain the whole-number-only limitation\nstderr:\n{stderr}"
+    );
+}
+
+/// Cross-build the README example for `x86_64-pc-windows-msvc`: the
+/// Double SSE2 codegen (`crates/klassic-native/src/lib.rs`) is shared
+/// between the Linux ELF and Windows PE64 paths (both go through the
+/// same `DirectX86_64` object-file codegen), so this only needs to
+/// verify the build succeeds, not execute the PE64 on this host.
+#[test]
+fn native_double_enum_field_windows_cross_build() {
+    assert_windows_target_builds(
+        "double_enum_readme",
+        "enum Shape { case Circle(r: Double); case Rect(w: Double, h: Double) }\n\
+         def describe(s: Shape): String = s match { case Circle(r) => \"circle\"; case Rect(w, h) => \"a #{w}x#{h} box\" }\n\
+         println(describe(Rect(3.0, 4.0)))\n",
+    );
+}

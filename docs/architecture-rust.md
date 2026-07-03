@@ -1343,6 +1343,28 @@ cargo run -- -e "1 + 2"
   structural string / list / record builtins onto the heap so
   any source program participates in GC without going through
   the explicit `__gc_*` interface.
+- Monomorphic enums support a `Double` payload field
+  (`EnumFieldRepr::DoubleField`): a new `NativeValue::RuntimeDouble`
+  carries raw IEEE-754 bits in Rax (mirroring `Int`), boxed into an
+  enum's `__gc_record` slot exactly like a scalar and unboxed via a new
+  `__gc_read_double` builtin; minimal SSE2 codegen (`movq`
+  xmm&lt;-&gt;gpr, `addsd`/`subsd`/`mulsd`/`divsd`, `ucomisd`,
+  `cvttsd2si`/`cvtsi2sd`) backs `+ - * / == != < <= > >=`, with the four
+  ordering comparisons made NaN-safe by swapping operands into the
+  existing CF-based `Above`/`AboveOrEqual` conditions and `==`/`!=` using
+  a new `Condition::Parity` guard. Formatting only has a whole-number
+  fast path (`<digits>.0`, shared by direct `println` and the string-
+  interpolation materialize path via
+  `emit_append_whole_runtime_double_to_runtime_buffer_offset_label`); a
+  fractional or NaN value traps with a clean runtime error rather than
+  risk wrong digits, since there is no general shortest-round-trip
+  formatter here. A `Double` literal's `Expr::Double` arm now also
+  materializes its bits into Rax (previously purely a compile-time
+  `StaticDouble` tag with no codegen) so an `if`/`match` branch merging a
+  literal Double arm with a genuinely runtime one unifies soundly to
+  `RuntimeDouble`. Generic enums keep rejecting `Double` fields
+  (`classify_generic_field`) since per-instantiation shape tracking for
+  them isn't wired up yet.
 
 ### `klassic-runtime`
 - Shared runtime crate scaffold for behavior that should move out of `klassic-eval`

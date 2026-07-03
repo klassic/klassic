@@ -1566,6 +1566,11 @@ enum EnumFieldRepr {
     Scalar,
     BoolField,
     StringField,
+    /// A `Double` payload: boxed into the same 8-byte cell a `Scalar`
+    /// uses (the cell holds raw IEEE-754 bits instead of an integer),
+    /// and unboxed via `__gc_read_double` so the read re-types the loaded
+    /// bits to `NativeValue::RuntimeDouble` instead of `Int`.
+    DoubleField,
     EnumField,
 }
 
@@ -1689,6 +1694,7 @@ fn classify_enum_field(text: &str, supported: &HashSet<String>) -> Option<EnumFi
         "Int" | "Long" | "Short" | "Byte" => Some(EnumFieldRepr::Scalar),
         "Bool" | "Boolean" => Some(EnumFieldRepr::BoolField),
         "String" => Some(EnumFieldRepr::StringField),
+        "Double" => Some(EnumFieldRepr::DoubleField),
         other if supported.contains(other) => Some(EnumFieldRepr::EnumField),
         _ => None,
     }
@@ -1709,6 +1715,17 @@ fn classify_generic_field(
     let trimmed = text.trim();
     if let Some(index) = type_params.iter().position(|p| p == trimmed) {
         return Some(GenericField::Param(index));
+    }
+    // Double payloads are supported for monomorphic enums only (see
+    // `NativeValue::RuntimeDouble`'s doc comment): a generic enum's fixed
+    // `Double` field, or a type-param field instantiated with a Double
+    // argument, would need per-instantiation shape tracking through
+    // RuntimeDouble at resolution sites that do not have it. Leave a
+    // generic enum with a `Double` field unregistered -- the existing
+    // "generic enum not supported" diagnostic -- rather than risk it
+    // being read back as an Int.
+    if trimmed == "Double" {
+        return None;
     }
     if let Some(field) = classify_enum_field(trimmed, supported_mono).map(GenericField::Fixed) {
         return Some(field);
@@ -2584,6 +2601,17 @@ fn en_build_construct(
             // traced pointer (string literals are otherwise static
             // `.rodata` the collector must never chase).
             EnumFieldRepr::StringField => en_call("__gc_string", vec![arg], span),
+            // Box the raw IEEE-754 bits into the same 8-byte cell a
+            // Scalar uses; `__gc_write` treats a RuntimeDouble argument's
+            // Rax bits as an opaque qword, same as it does for Int.
+            // `__runtime_double` first coerces a literal argument (which
+            // compiles to a bits-less `StaticDouble` tag) into real
+            // RuntimeDouble bits in Rax -- a bare `en_box_scalar(arg)`
+            // would otherwise hand `__gc_write` a value with nothing in
+            // Rax to write for a construction like `Rect(3.0, 4.0)`.
+            EnumFieldRepr::DoubleField => {
+                en_box_scalar(counter, en_call("__runtime_double", vec![arg], span), span)
+            }
             EnumFieldRepr::EnumField => arg,
         };
         stmts.push(en_call(
@@ -2745,6 +2773,18 @@ fn en_build_variant_display(
             EnumFieldRepr::StringField => {
                 en_call("__gc_read_string", vec![en_ident(obj, span), offset], span)
             }
+            EnumFieldRepr::DoubleField => en_call(
+                "__gc_double_to_string",
+                vec![en_call(
+                    "__gc_read_double",
+                    vec![
+                        en_call("__gc_read_ptr", vec![en_ident(obj, span), offset], span),
+                        en_int(0, span),
+                    ],
+                    span,
+                )],
+                span,
+            ),
             EnumFieldRepr::EnumField => match (nested_enabled, &field.nested) {
                 (true, Some(nested)) => en_build_enum_display(
                     counter,
@@ -2973,6 +3013,13 @@ fn en_field_read(subject: Expr, repr: EnumFieldRepr, i: usize, span: Span) -> Ex
             en_binary(raw, BinaryOp::NotEqual, en_int(0, span), span)
         }
         EnumFieldRepr::StringField => en_call("__gc_read_string", vec![subject, offset], span),
+        // Re-derive a `RuntimeDouble` from the boxed cell: read the cell's
+        // pointer, then re-type its raw bits via `__gc_read_double`
+        // instead of `__gc_read` (which would tag the result `Int`).
+        EnumFieldRepr::DoubleField => {
+            let cell = en_call("__gc_read_ptr", vec![subject, offset], span);
+            en_call("__gc_read_double", vec![cell, en_int(0, span)], span)
+        }
         EnumFieldRepr::EnumField => en_call("__gc_read_ptr", vec![subject, offset], span),
     }
 }
@@ -3422,6 +3469,16 @@ enum NativeValue {
     Bool,
     Null,
     Unit,
+    /// A double-precision float computed or loaded at runtime, whose raw
+    /// IEEE-754 bit pattern lives in Rax (mirroring how `Int` lives in
+    /// Rax) -- unlike `StaticFloat`/`StaticDouble`, whose bits are known
+    /// at compile time. Arithmetic/comparison/formatting temporarily
+    /// moves the bits into an SSE register (`movq`) and back; storage
+    /// (stack slots, boxed enum-field cells) always keeps the bits in a
+    /// plain qword, exactly like `Int`. Currently only produced by
+    /// unboxing a monomorphic enum's `Double` field (`__gc_read_double`)
+    /// or by arithmetic over an existing `RuntimeDouble`.
+    RuntimeDouble,
     StaticFloat {
         bits: u32,
     },
@@ -6231,9 +6288,24 @@ impl NativeCodeGenerator {
                 FloatLiteralKind::Float => Ok(NativeValue::StaticFloat {
                     bits: (*value as f32).to_bits(),
                 }),
-                FloatLiteralKind::Double => Ok(NativeValue::StaticDouble {
-                    bits: value.to_bits(),
-                }),
+                FloatLiteralKind::Double => {
+                    let bits = value.to_bits();
+                    // Also materialize the bits into Rax (like `Int`'s
+                    // literal arm always does), even though this compiles
+                    // to the compile-time-constant `StaticDouble` tag:
+                    // an `if`/`match` branch merge that unifies this
+                    // literal with a genuinely runtime `RuntimeDouble`
+                    // sibling branch (see `compile_if`'s Double-merge
+                    // arm) needs Rax to already hold correct bits
+                    // whichever branch is taken -- there is no later
+                    // point to retroactively inject this once the other
+                    // branch's runtime-ness is known. Existing StaticDouble
+                    // consumers only ever read the `bits` field, never Rax,
+                    // so this added instruction changes no existing
+                    // behavior.
+                    self.asm.mov_imm64(Reg::Rax, bits);
+                    Ok(NativeValue::StaticDouble { bits })
+                }
             },
             Expr::Bool { value, .. } => {
                 self.asm.mov_imm64(Reg::Rax, u64::from(*value));
@@ -6408,6 +6480,7 @@ impl NativeCodeGenerator {
                         | NativeValue::Bool
                         | NativeValue::HeapPointer
                         | NativeValue::HeapString
+                        | NativeValue::RuntimeDouble
                 ) {
                     self.asm.load_rbp_slot(Reg::Rax, slot.offset);
                 }
@@ -6436,7 +6509,8 @@ impl NativeCodeGenerator {
                     NativeValue::Int
                     | NativeValue::Bool
                     | NativeValue::HeapPointer
-                    | NativeValue::HeapString => {
+                    | NativeValue::HeapString
+                    | NativeValue::RuntimeDouble => {
                         let slot = self.allocate_slot(name.clone(), compiled);
                         self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                         if static_expr_is_pure(value)
@@ -6676,6 +6750,7 @@ impl NativeCodeGenerator {
                         | NativeValue::Bool
                         | NativeValue::HeapPointer
                         | NativeValue::HeapString
+                        | NativeValue::RuntimeDouble
                 ) {
                     return Err(unsupported(*span, "native assignment to this value type"));
                 }
@@ -7109,6 +7184,9 @@ impl NativeCodeGenerator {
             }
             return Ok(NativeValue::Bool);
         }
+        if lhs_value == NativeValue::RuntimeDouble {
+            return self.compile_runtime_double_binary(lhs_value, op, rhs, span);
+        }
         if !matches!(lhs_value, NativeValue::Int | NativeValue::HeapPointer) {
             return Err(unsupported(span, "native binary operation for non-Int lhs"));
         }
@@ -7184,6 +7262,104 @@ impl NativeCodeGenerator {
             BinaryOp::LogicalAnd | BinaryOp::LogicalOr => unreachable!("handled above"),
         }
         Ok(NativeValue::Int)
+    }
+
+    /// Arithmetic/comparison over two `RuntimeDouble` operands (raw bits
+    /// in Rax, per `NativeValue::RuntimeDouble`'s doc comment). Follows
+    /// the exact same "spill lhs, compile rhs, pop lhs" shape the trailing
+    /// Int path in `compile_binary` uses, just moving through `Xmm0`/
+    /// `Xmm1` for the SSE instructions instead of operating on the GPRs
+    /// directly.
+    ///
+    /// The four ordering comparisons (`<`, `<=`, `>`, `>=`) are NaN-safe
+    /// (false whenever either operand is NaN) "for free": `ucomisd` sets
+    /// CF=1 for both "less" and "unordered", so a plain `Below`-family
+    /// setcc would incorrectly treat NaN as less-than. Swapping the
+    /// compare operands and testing `Above`/`AboveOrEqual` instead (whose
+    /// CF=0 excludes the unordered case) sidesteps that without needing
+    /// `Condition::Parity` at all -- e.g. `lhs < rhs` becomes
+    /// `ucomisd(rhs, lhs); seta` (rhs > lhs, ordered).
+    ///
+    /// `==`/`!=` cannot use that trick (equality is symmetric, so there is
+    /// no swap that turns "unordered" into a excluded case) and instead
+    /// branches explicitly on `Condition::Parity` before trusting the
+    /// ZF-based Equal/NotEqual setcc, which alone can't distinguish
+    /// "equal" from "unordered" (both set ZF=1).
+    fn compile_runtime_double_binary(
+        &mut self,
+        lhs_value: NativeValue,
+        op: BinaryOp,
+        rhs: &Expr,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        debug_assert_eq!(lhs_value, NativeValue::RuntimeDouble);
+        self.push_temp_reg(Reg::Rax);
+        let rhs_value = self.compile_expr(rhs)?;
+        // A literal rhs (e.g. `r * 2.0`) compiles to a bits-less
+        // `StaticDouble` tag; materialize it into Rax like the enum
+        // constructor boxing path does (see `materialize_runtime_double`'s
+        // doc comment) instead of rejecting it outright.
+        let rhs_value = self
+            .materialize_runtime_double(rhs_value, span)
+            .map_err(|_| unsupported(span, "native Double binary operation for non-Double rhs"))?;
+        debug_assert_eq!(rhs_value, NativeValue::RuntimeDouble);
+        // lhs bits -> Rcx; rhs bits are already in Rax from
+        // `materialize_runtime_double`/`compile_expr`.
+        self.pop_temp_reg(Reg::Rcx);
+        match op {
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
+                self.asm.movq_xmm_from_gpr(XmmReg::Xmm0, Reg::Rcx);
+                self.asm.movq_xmm_from_gpr(XmmReg::Xmm1, Reg::Rax);
+                match op {
+                    BinaryOp::Add => self.asm.addsd(XmmReg::Xmm0, XmmReg::Xmm1),
+                    BinaryOp::Subtract => self.asm.subsd(XmmReg::Xmm0, XmmReg::Xmm1),
+                    BinaryOp::Multiply => self.asm.mulsd(XmmReg::Xmm0, XmmReg::Xmm1),
+                    BinaryOp::Divide => self.asm.divsd(XmmReg::Xmm0, XmmReg::Xmm1),
+                    _ => unreachable!("arithmetic op matched above"),
+                }
+                self.asm.movq_gpr_from_xmm(Reg::Rax, XmmReg::Xmm0);
+                Ok(NativeValue::RuntimeDouble)
+            }
+            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
+                let (first, second, condition) = match op {
+                    BinaryOp::Less => (Reg::Rax, Reg::Rcx, Condition::Above),
+                    BinaryOp::LessEqual => (Reg::Rax, Reg::Rcx, Condition::AboveOrEqual),
+                    BinaryOp::Greater => (Reg::Rcx, Reg::Rax, Condition::Above),
+                    BinaryOp::GreaterEqual => (Reg::Rcx, Reg::Rax, Condition::AboveOrEqual),
+                    _ => unreachable!("ordering op matched above"),
+                };
+                self.asm.movq_xmm_from_gpr(XmmReg::Xmm0, first);
+                self.asm.movq_xmm_from_gpr(XmmReg::Xmm1, second);
+                self.asm.ucomisd(XmmReg::Xmm0, XmmReg::Xmm1);
+                self.asm.setcc_al(condition);
+                self.asm.movzx_rax_al();
+                Ok(NativeValue::Bool)
+            }
+            BinaryOp::Equal | BinaryOp::NotEqual => {
+                self.asm.movq_xmm_from_gpr(XmmReg::Xmm0, Reg::Rcx);
+                self.asm.movq_xmm_from_gpr(XmmReg::Xmm1, Reg::Rax);
+                self.asm.ucomisd(XmmReg::Xmm0, XmmReg::Xmm1);
+                let unordered = self.asm.create_text_label();
+                let done = self.asm.create_text_label();
+                self.asm.jcc_label(Condition::Parity, unordered);
+                self.asm.setcc_al(if op == BinaryOp::Equal {
+                    Condition::Equal
+                } else {
+                    Condition::NotEqual
+                });
+                self.asm.movzx_rax_al();
+                self.asm.jmp_label(done);
+                self.asm.bind_text_label(unordered);
+                self.asm
+                    .mov_imm64(Reg::Rax, u64::from(op == BinaryOp::NotEqual));
+                self.asm.bind_text_label(done);
+                Ok(NativeValue::Bool)
+            }
+            _ => Err(unsupported(
+                span,
+                "native Double binary operation for this operator",
+            )),
+        }
     }
 
     fn compile_logical(
@@ -7670,6 +7846,9 @@ impl NativeCodeGenerator {
             "__gc_read" => self.compile_gc_read(arguments, span),
             "__gc_read_ptr" => self.compile_gc_read_ptr(arguments, span),
             "__gc_read_string" => self.compile_gc_read_string(arguments, span),
+            "__gc_read_double" => self.compile_gc_read_double(arguments, span),
+            "__gc_double_to_string" => self.compile_gc_double_to_string(arguments, span),
+            "__runtime_double" => self.compile_runtime_double_of(arguments, span),
             "__gc_write" => self.compile_gc_write(arguments, span),
             "__enum_shape_hint" => self.compile_enum_shape_hint(arguments, span),
             "__enum_shape_named" => self.compile_enum_shape_named(arguments, span),
@@ -8694,6 +8873,9 @@ impl NativeCodeGenerator {
             "__gc_read" => self.compile_gc_read(arguments, span).map(Some),
             "__gc_read_ptr" => self.compile_gc_read_ptr(arguments, span).map(Some),
             "__gc_read_string" => self.compile_gc_read_string(arguments, span).map(Some),
+            "__gc_read_double" => self.compile_gc_read_double(arguments, span).map(Some),
+            "__gc_double_to_string" => self.compile_gc_double_to_string(arguments, span).map(Some),
+            "__runtime_double" => self.compile_runtime_double_of(arguments, span).map(Some),
             "__gc_write" => self.compile_gc_write(arguments, span).map(Some),
             "__enum_shape_hint" => self.compile_enum_shape_hint(arguments, span).map(Some),
             "__enum_shape_named" => self.compile_enum_shape_named(arguments, span).map(Some),
@@ -8875,6 +9057,14 @@ impl NativeCodeGenerator {
                 self.emit_assert_result_failed_runtime(span, expected);
                 self.asm.bind_text_label(ok);
                 Ok(NativeValue::Unit)
+            }
+            // A bit-for-bit `cmp_reg_reg` (the Int/Bool path above) would
+            // be wrong for Double (e.g. NaN != NaN, +0.0 == -0.0), and
+            // `assertResult` over a Double isn't exercised by any native
+            // Double coverage yet, so this stays a clean diagnostic rather
+            // than risk a silently incorrect comparison.
+            NativeValue::RuntimeDouble => {
+                Err(unsupported(span, "native assertResult for Double values"))
             }
             NativeValue::HeapPointer => {
                 // A heap value (enum, cons cell, ...) must compare
@@ -9277,7 +9467,8 @@ impl NativeCodeGenerator {
                 NativeValue::Int
                 | NativeValue::Bool
                 | NativeValue::HeapPointer
-                | NativeValue::HeapString => {
+                | NativeValue::HeapString
+                | NativeValue::RuntimeDouble => {
                     let slot = self.allocate_slot(param.clone(), value);
                     self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                     if let Some(value) = static_argument {
@@ -9393,7 +9584,8 @@ impl NativeCodeGenerator {
                     NativeValue::Int
                     | NativeValue::Bool
                     | NativeValue::HeapPointer
-                    | NativeValue::HeapString => {
+                    | NativeValue::HeapString
+                    | NativeValue::RuntimeDouble => {
                         let slot = self.allocate_slot(param.clone(), value);
                         self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                         if let Some(value) = static_argument {
@@ -17707,6 +17899,119 @@ impl NativeCodeGenerator {
         self.compile_gc_read_qword(arguments, span, "__gc_read_string", NativeValue::HeapString)
     }
 
+    /// `__gc_read_double(addr, byte_offset)` reads a qword from
+    /// `addr + byte_offset` and re-types its raw bits as a
+    /// `NativeValue::RuntimeDouble` instead of `Int` -- the unboxing half
+    /// of a monomorphic enum's `Double` field (see `EnumFieldRepr::DoubleField`).
+    /// The load itself is identical to `__gc_read`; only the resulting
+    /// `NativeValue` tag differs, exactly like `__gc_read_ptr`/`__gc_read_string`
+    /// differ from `__gc_read` only in provenance.
+    fn compile_gc_read_double(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.compile_gc_read_qword(
+            arguments,
+            span,
+            "__gc_read_double",
+            NativeValue::RuntimeDouble,
+        )
+    }
+
+    /// `__gc_double_to_string(value)` formats a `RuntimeDouble` as a GC
+    /// heap string, for use by the monomorphic-enum `Display` builder
+    /// (`en_build_variant_display`). Only whole numbers have a fast-path
+    /// formatter (`emit_append_whole_runtime_double_to_runtime_buffer_offset_label`);
+    /// a fractional or NaN value traps with a clean runtime error rather
+    /// than ever emitting wrong digits (see that helper's doc comment).
+    fn compile_gc_double_to_string(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 1 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__gc_double_to_string expects 1 argument but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let value = self.compile_expr(&arguments[0])?;
+        if value != NativeValue::RuntimeDouble {
+            return Err(unsupported(
+                span,
+                "native __gc_double_to_string for non-Double argument",
+            ));
+        }
+        const RUNTIME_STRING_CAP: usize = 64;
+        let data = self.asm.data_label_with_bytes(&[0; RUNTIME_STRING_CAP]);
+        let offset = self.asm.data_label_with_i64s(&[0]);
+        self.emit_reset_runtime_buffer_offset_label(offset);
+        self.emit_append_whole_runtime_double_to_runtime_buffer_offset_label(
+            data,
+            offset,
+            span,
+            "double-to-string result exceeds 64 bytes",
+        );
+        self.emit_runtime_string_to_heap_string(data, offset);
+        Ok(NativeValue::HeapString)
+    }
+
+    /// Materialize a Double `NativeValue` into `RuntimeDouble` form: a
+    /// literal `Expr::Double` compiles to a bare `StaticDouble { bits }`
+    /// tag with *no* codegen at all (the bits are compile-time-known, not
+    /// in any register), so this loads them into Rax via `mov_imm64`;
+    /// `RuntimeDouble` is already correctly in Rax from `compile_expr`
+    /// and passes through unchanged. Used everywhere a Double-typed
+    /// runtime operation (boxing an enum field, `RuntimeDouble`
+    /// arithmetic) must accept a literal argument, not just an
+    /// already-runtime one -- e.g. `Rect(3.0, 4.0)`'s literal fields or
+    /// `r * 2.0`'s literal rhs.
+    fn materialize_runtime_double(
+        &mut self,
+        value: NativeValue,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        match value {
+            NativeValue::RuntimeDouble => Ok(NativeValue::RuntimeDouble),
+            NativeValue::StaticDouble { bits } => {
+                self.asm.mov_imm64(Reg::Rax, bits);
+                Ok(NativeValue::RuntimeDouble)
+            }
+            _ => Err(unsupported(
+                span,
+                "native Double coercion for this value type",
+            )),
+        }
+    }
+
+    /// `__runtime_double(x)` coerces a Double `x` (literal or already
+    /// runtime) to `RuntimeDouble` form. Synthesized by the enum lowering
+    /// to box a `Double` field's constructor argument (see
+    /// `EnumFieldRepr::DoubleField`'s boxing in `en_build_construct`),
+    /// which otherwise reaches `__gc_write` as a bits-less `StaticDouble`
+    /// for a literal argument like `Rect(3.0, 4.0)`.
+    fn compile_runtime_double_of(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 1 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__runtime_double expects 1 argument but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let value = self.compile_expr(&arguments[0])?;
+        self.materialize_runtime_double(value, span)
+    }
+
     /// `__gc_write(addr, byte_offset, value)` writes `value` (qword) at
     /// `addr + byte_offset`.
     fn compile_gc_write(
@@ -17744,7 +18049,10 @@ impl NativeCodeGenerator {
         let value = self.compile_expr(&arguments[2])?;
         if !matches!(
             value,
-            NativeValue::Int | NativeValue::HeapPointer | NativeValue::HeapString
+            NativeValue::Int
+                | NativeValue::HeapPointer
+                | NativeValue::HeapString
+                | NativeValue::RuntimeDouble
         ) {
             return Err(unsupported(
                 span,
@@ -19199,7 +19507,8 @@ impl NativeCodeGenerator {
                     NativeValue::Int
                     | NativeValue::Bool
                     | NativeValue::HeapPointer
-                    | NativeValue::HeapString => {
+                    | NativeValue::HeapString
+                    | NativeValue::RuntimeDouble => {
                         let slot = self.allocate_slot(param.clone(), value);
                         self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                         if let Some(value) = static_argument {
@@ -28166,7 +28475,8 @@ impl NativeCodeGenerator {
                     NativeValue::Int
                     | NativeValue::Bool
                     | NativeValue::HeapPointer
-                    | NativeValue::HeapString => {
+                    | NativeValue::HeapString
+                    | NativeValue::RuntimeDouble => {
                         let slot = self.allocate_slot(param.clone(), value);
                         self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                         if let Some(value) = static_argument {
@@ -29306,6 +29616,7 @@ impl NativeCodeGenerator {
             | NativeValue::HeapPointer
             | NativeValue::HeapString
             | NativeValue::Bool
+            | NativeValue::RuntimeDouble
             | NativeValue::RuntimeString { .. }
             | NativeValue::RuntimeLinesList { .. }
             | NativeValue::RuntimeList { .. }
@@ -30681,6 +30992,7 @@ impl NativeCodeGenerator {
             | NativeValue::HeapPointer
             | NativeValue::HeapString
             | NativeValue::Bool
+            | NativeValue::RuntimeDouble
             | NativeValue::Null
             | NativeValue::Unit
             | NativeValue::StaticFloat { .. }
@@ -30824,6 +31136,7 @@ impl NativeCodeGenerator {
             | NativeValue::HeapPointer
             | NativeValue::HeapString
             | NativeValue::Bool
+            | NativeValue::RuntimeDouble
             | NativeValue::Null
             | NativeValue::Unit
             | NativeValue::StaticFloat { .. }
@@ -34442,6 +34755,22 @@ impl NativeCodeGenerator {
             Ok(NativeValue::RuntimeRecord {
                 label: output.label,
             })
+        } else if matches!(
+            then_value,
+            NativeValue::RuntimeDouble | NativeValue::StaticDouble { .. }
+        ) && matches!(
+            else_value,
+            NativeValue::RuntimeDouble | NativeValue::StaticDouble { .. }
+        ) {
+            // Unify a literal Double branch with a genuinely runtime one
+            // (e.g. one `match` arm reads an unboxed enum field, another
+            // returns a bare `0.0`) as `RuntimeDouble`. Both branches
+            // already left correct bits in Rax: `RuntimeDouble` from its
+            // own codegen, `StaticDouble` because the literal arm above
+            // (`Expr::Double`) always materializes its bits into Rax too,
+            // specifically so this merge is sound without having to
+            // retroactively patch either branch's already-emitted code.
+            Ok(NativeValue::RuntimeDouble)
         } else {
             Err(unsupported(
                 span,
@@ -35007,10 +35336,15 @@ impl NativeCodeGenerator {
     fn bind_static_iteration_value(&mut self, binding: &str, value: &StaticValue) {
         let value = self.emit_static_value(value);
         match value {
+            // `emit_static_value` never yields RuntimeDouble (it only
+            // produces compile-time-constant `NativeValue` variants); this
+            // arm exists for exhaustiveness, grouped with the other
+            // qword-materialized types it would need if it ever did.
             NativeValue::Int
             | NativeValue::Bool
             | NativeValue::HeapPointer
-            | NativeValue::HeapString => {
+            | NativeValue::HeapString
+            | NativeValue::RuntimeDouble => {
                 let slot = self.allocate_slot(binding.to_string(), value);
                 self.asm.store_rbp_slot(slot.offset, Reg::Rax);
             }
@@ -35061,7 +35395,7 @@ impl NativeCodeGenerator {
                     if self.expr_writes_console_output(hole))
             }) {
                 let value = self.emit_runtime_interpolated_string(parts, *string_span)?;
-                self.emit_print_value_fragment(fd, value);
+                self.emit_print_value_fragment(fd, value, *string_span);
                 return Ok(());
             }
             return self.emit_print_interpolated_string(fd, parts, *string_span);
@@ -35091,7 +35425,7 @@ impl NativeCodeGenerator {
             span,
             "collection-literal print result exceeds 65536 bytes",
         )? {
-            self.emit_print_value_fragment(fd, value);
+            self.emit_print_value_fragment(fd, value, span);
             return Ok(());
         }
 
@@ -35170,10 +35504,10 @@ impl NativeCodeGenerator {
             && let Some(shape) = self.pending_enum_shape.take()
         {
             let formatted = self.emit_enum_display_runtime_string(&shape, span)?;
-            self.emit_print_value_fragment(fd, formatted);
+            self.emit_print_value_fragment(fd, formatted, span);
             return Ok(());
         }
-        self.emit_print_value_fragment(fd, value);
+        self.emit_print_value_fragment(fd, value, span);
         Ok(())
     }
 
@@ -35567,6 +35901,13 @@ impl NativeCodeGenerator {
                         span,
                         "string interpolation result exceeds 65536 bytes",
                     );
+                } else if fragment == NativeValue::RuntimeDouble {
+                    self.emit_append_whole_runtime_double_to_runtime_buffer_offset_label(
+                        data,
+                        offset,
+                        span,
+                        "string interpolation result exceeds 65536 bytes",
+                    );
                 } else if let NativeValue::RuntimeMapCallableDispatch(label) = fragment {
                     self.emit_append_runtime_map_callable_dispatch_display_to_runtime_buffer(
                         data,
@@ -35626,7 +35967,7 @@ impl NativeCodeGenerator {
         Ok(NativeValue::RuntimeString { data, len })
     }
 
-    fn emit_print_value_fragment(&mut self, fd: u64, value: NativeValue) {
+    fn emit_print_value_fragment(&mut self, fd: u64, value: NativeValue, span: Span) {
         match value {
             NativeValue::Int | NativeValue::HeapPointer => {
                 self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -35660,6 +36001,9 @@ impl NativeCodeGenerator {
                 let text = format_static_double(bits);
                 let label = self.asm.data_label_with_bytes(text.as_bytes());
                 self.emit_write_data(fd, label, text.len());
+            }
+            NativeValue::RuntimeDouble => {
+                self.emit_print_runtime_double(fd, span);
             }
             NativeValue::Null => {
                 self.emit_write_data(fd, self.null_text, 4);
@@ -35757,12 +36101,17 @@ impl NativeCodeGenerator {
     }
 
     fn emit_print_compiled_literal_value_fragment(&mut self, fd: u64, value: CompiledLiteralValue) {
+        // Collection-literal elements never carry a RuntimeDouble in this
+        // slice (no list/map/set/record support for Double payloads yet),
+        // so the span passed to `emit_print_value_fragment` is never
+        // exercised here; a zero span is a safe placeholder.
+        let span = Span::new(0, 0);
         match value {
-            CompiledLiteralValue::Native(value) => self.emit_print_value_fragment(fd, value),
+            CompiledLiteralValue::Native(value) => self.emit_print_value_fragment(fd, value, span),
             CompiledLiteralValue::Scalar { value, slot } => {
                 self.asm.mov_data_addr(Reg::R10, slot);
                 self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-                self.emit_print_value_fragment(fd, value);
+                self.emit_print_value_fragment(fd, value, span);
             }
         }
     }
@@ -35893,7 +36242,11 @@ impl NativeCodeGenerator {
                 self.emit_write_data(fd, self.comma_space, 2);
             }
             let value = self.emit_static_value(value);
-            self.emit_print_value_fragment(fd, value);
+            // `emit_static_value` never yields RuntimeDouble (it only
+            // produces compile-time-constant `NativeValue` variants), so
+            // the span is never exercised; a zero span is a safe
+            // placeholder.
+            self.emit_print_value_fragment(fd, value, Span::new(0, 0));
         }
         self.emit_write_data(fd, self.list_close, 1);
     }
@@ -37191,7 +37544,9 @@ impl NativeCodeGenerator {
                 self.emit_write_data(fd, self.comma_space, 2);
             }
             let value = self.emit_static_value(value);
-            self.emit_print_value_fragment(fd, value);
+            // `emit_static_value` never yields RuntimeDouble; see
+            // `emit_print_static_list`'s identical placeholder comment.
+            self.emit_print_value_fragment(fd, value, Span::new(0, 0));
         }
         self.emit_write_data(fd, self.paren_close, 1);
     }
@@ -37210,18 +37565,22 @@ impl NativeCodeGenerator {
             if index > 0 {
                 self.emit_write_data(fd, self.comma_space, 2);
             }
+            // Record fields have no Double support yet (no path stores a
+            // RuntimeDouble into a `RuntimeRecordField`), so the span is
+            // never exercised; a zero span is a safe placeholder, as in
+            // `emit_print_static_list`.
             match value {
                 RuntimeRecordField::Static(value) => {
                     let value = self.emit_static_value(value);
-                    self.emit_print_value_fragment(fd, value);
+                    self.emit_print_value_fragment(fd, value, Span::new(0, 0));
                 }
                 RuntimeRecordField::Runtime(value) => {
-                    self.emit_print_value_fragment(fd, *value);
+                    self.emit_print_value_fragment(fd, *value, Span::new(0, 0));
                 }
                 RuntimeRecordField::Scalar { value, slot } => {
                     self.asm.mov_data_addr(Reg::R10, *slot);
                     self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-                    self.emit_print_value_fragment(fd, *value);
+                    self.emit_print_value_fragment(fd, *value, Span::new(0, 0));
                 }
             }
         }
@@ -37237,11 +37596,13 @@ impl NativeCodeGenerator {
             if index > 0 {
                 self.emit_write_data(fd, self.comma_space, 2);
             }
+            // `emit_static_value` never yields RuntimeDouble; see
+            // `emit_print_static_list`'s identical placeholder comment.
             let key = self.emit_static_value(key);
-            self.emit_print_value_fragment(fd, key);
+            self.emit_print_value_fragment(fd, key, Span::new(0, 0));
             self.emit_write_data(fd, self.colon_space, 2);
             let value = self.emit_static_value(value);
-            self.emit_print_value_fragment(fd, value);
+            self.emit_print_value_fragment(fd, value, Span::new(0, 0));
         }
         self.emit_write_data(fd, self.list_close, 1);
     }
@@ -37256,7 +37617,9 @@ impl NativeCodeGenerator {
                 self.emit_write_data(fd, self.comma_space, 2);
             }
             let value = self.emit_static_value(value);
-            self.emit_print_value_fragment(fd, value);
+            // `emit_static_value` never yields RuntimeDouble; see
+            // `emit_print_static_list`'s identical placeholder comment.
+            self.emit_print_value_fragment(fd, value, Span::new(0, 0));
         }
         self.emit_write_data(fd, self.paren_close, 1);
     }
@@ -38900,6 +39263,205 @@ impl NativeCodeGenerator {
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
     }
 
+    /// Validate that the `RuntimeDouble` bits currently in Rax represent
+    /// an exact whole number: round-trip through `i64` (`cvttsd2si` then
+    /// `cvtsi2sd`) and compare against the original with `ucomisd`. There
+    /// is no general Ryu-style shortest-round-trip float formatter in
+    /// this backend yet, so a whole number (e.g. `3.0`) is the only value
+    /// class with a fast, always-correct ASCII form (`<digits>.0`); a
+    /// fractional value (`2.5`) or NaN would either need real formatting
+    /// logic or silently print wrong digits, so it instead traps with a
+    /// clean runtime error (`emit_runtime_error`, matching the existing
+    /// "integer overflow" / "division by zero" trap sites) and the call
+    /// never returns. On success, Rax is left holding the truncated
+    /// `i64` magnitude -- exactly what the Int digit-emitting routines
+    /// below need next -- rather than the original double bits.
+    fn emit_whole_runtime_double_check_or_trap(&mut self, span: Span) {
+        self.asm.movq_xmm_from_gpr(XmmReg::Xmm0, Reg::Rax);
+        self.asm.cvttsd2si(Reg::Rax, XmmReg::Xmm0);
+        self.asm.cvtsi2sd(XmmReg::Xmm1, Reg::Rax);
+        self.asm.ucomisd(XmmReg::Xmm0, XmmReg::Xmm1);
+        let ok = self.asm.create_text_label();
+        let fail = self.asm.create_text_label();
+        // Unordered (either operand NaN) sets PF=1 -- fails regardless of
+        // the also-set ZF, so this check must come before the Equal test.
+        self.asm.jcc_label(Condition::Parity, fail);
+        self.asm.jcc_label(Condition::Equal, ok);
+        self.asm.bind_text_label(fail);
+        self.emit_runtime_error(
+            span,
+            "native Double formatting supports only whole numbers (e.g. 3.0); \
+             fractional and NaN values are not supported yet",
+        );
+        self.asm.bind_text_label(ok);
+    }
+
+    /// Append a `RuntimeDouble`'s whole-number ASCII form (`<digits>.0`)
+    /// to the runtime string buffer at `output`/`offset` -- the Double
+    /// sibling of `emit_append_i64_rax_to_runtime_buffer_offset_label`,
+    /// reusing its exact digit-emitting shape (a scratch buffer filled
+    /// backward from a fixed high end so the sign/digits land in the
+    /// right order without a second reversal pass) with two differences:
+    /// the input is first validated/truncated by
+    /// `emit_whole_runtime_double_check_or_trap`, and the scratch buffer
+    /// reserves two extra fixed-offset bytes right after the digit range
+    /// for the trailing ".0" (the ones digit always lands at the same
+    /// fixed offset regardless of digit count -- see that sibling's doc
+    /// comment -- so the suffix bytes are always contiguous with it).
+    fn emit_append_whole_runtime_double_to_runtime_buffer_offset_label(
+        &mut self,
+        output: DataLabel,
+        offset: DataLabel,
+        span: Span,
+        overflow_message: &str,
+    ) {
+        self.emit_whole_runtime_double_check_or_trap(span);
+        // Rax now holds the exact truncated i64 magnitude.
+        let scratch = self.asm.data_label_with_bytes(&[0; 34]);
+        self.asm.mov_data_addr(Reg::Rsi, scratch);
+        self.asm.add_reg_imm32(Reg::Rsi, 32);
+        self.asm.mov_imm64(Reg::Rcx, 0);
+
+        let nonzero = self.asm.create_text_label();
+        let digits = self.asm.create_text_label();
+        let digit_loop = self.asm.create_text_label();
+        let suffix = self.asm.create_text_label();
+
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::NotEqual, nonzero);
+        self.asm.dec_reg(Reg::Rsi);
+        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'0');
+        self.asm.inc_reg(Reg::Rcx);
+        self.asm.jmp_label(suffix);
+
+        self.asm.bind_text_label(nonzero);
+        self.asm.xor_reg_reg(Reg::R8, Reg::R8);
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, digits);
+        self.asm.neg_reg(Reg::Rax);
+        self.asm.mov_imm64(Reg::R8, 1);
+
+        self.asm.bind_text_label(digits);
+        self.asm.mov_imm64(Reg::Rbx, 10);
+        self.asm.bind_text_label(digit_loop);
+        self.asm.xor_reg_reg(Reg::Rdx, Reg::Rdx);
+        self.asm.div_reg(Reg::Rbx);
+        self.asm.add_reg8_imm8(Reg8::Dl, b'0');
+        self.asm.dec_reg(Reg::Rsi);
+        self.asm.mov_byte_ptr_reg8(Reg::Rsi, Reg8::Dl);
+        self.asm.inc_reg(Reg::Rcx);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::NotEqual, digit_loop);
+        self.asm.cmp_reg_imm8(Reg::R8, 0);
+        self.asm.jcc_label(Condition::Equal, suffix);
+        self.asm.dec_reg(Reg::Rsi);
+        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'-');
+        self.asm.inc_reg(Reg::Rcx);
+
+        self.asm.bind_text_label(suffix);
+        // The ones digit always ends up at scratch+31 regardless of how
+        // many digits were written (each additional digit only pushes
+        // the *start* further left); scratch+32/+33 are reserved for
+        // ".0", contiguous with it.
+        self.asm.mov_data_addr(Reg::Rdi, scratch);
+        self.asm.add_reg_imm32(Reg::Rdi, 32);
+        self.asm.mov_byte_ptr_reg_imm8(Reg::Rdi, b'.');
+        self.asm.add_reg_imm32(Reg::Rdi, 1);
+        self.asm.mov_byte_ptr_reg_imm8(Reg::Rdi, b'0');
+        self.asm.add_reg_imm32(Reg::Rcx, 2);
+
+        self.asm.mov_data_addr(Reg::R10, offset);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+        self.asm.mov_data_addr(Reg::Rbx, output);
+        self.asm.mov_imm64(Reg::R8, 0);
+        let copy_loop = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.bind_text_label(copy_loop);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::Rcx);
+        self.asm.jcc_label(Condition::Equal, done);
+        self.emit_runtime_buffer_capacity_check(Reg::R9, 65_536, span, overflow_message);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R8);
+        self.asm.mov_byte_indexed_reg8(Reg::Rbx, Reg::R9, Reg8::Al);
+        self.asm.inc_reg(Reg::R8);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.jmp_label(copy_loop);
+        self.asm.bind_text_label(done);
+        self.asm.mov_data_addr(Reg::R10, offset);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
+    }
+
+    /// Print a `RuntimeDouble` (raw bits currently in Rax) directly to
+    /// file descriptor `fd`, e.g. from `println`. Shares the whole-number
+    /// fast path and trap with the interpolation-materialize sibling
+    /// (`emit_append_whole_runtime_double_to_runtime_buffer_offset_label`)
+    /// but writes straight to `fd` via a small fixed scratch buffer
+    /// instead of appending into the shared growable runtime-string
+    /// buffer, mirroring how `emit_print_i64_runtime` differs from
+    /// `emit_append_i64_rax_to_runtime_buffer_offset_label`.
+    fn emit_print_runtime_double(&mut self, fd: u64, span: Span) {
+        self.emit_whole_runtime_double_check_or_trap(span);
+        // Rax now holds the exact truncated i64 magnitude.
+        let scratch = self.asm.data_label_with_bytes(&[0; 34]);
+        self.asm.mov_data_addr(Reg::Rsi, scratch);
+        self.asm.add_reg_imm32(Reg::Rsi, 32);
+        self.asm.mov_imm64(Reg::Rcx, 0);
+
+        let nonzero = self.asm.create_text_label();
+        let digits = self.asm.create_text_label();
+        let digit_loop = self.asm.create_text_label();
+        let suffix = self.asm.create_text_label();
+
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::NotEqual, nonzero);
+        self.asm.dec_reg(Reg::Rsi);
+        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'0');
+        self.asm.inc_reg(Reg::Rcx);
+        self.asm.jmp_label(suffix);
+
+        self.asm.bind_text_label(nonzero);
+        self.asm.xor_reg_reg(Reg::R8, Reg::R8);
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, digits);
+        self.asm.neg_reg(Reg::Rax);
+        self.asm.mov_imm64(Reg::R8, 1);
+
+        self.asm.bind_text_label(digits);
+        self.asm.mov_imm64(Reg::Rbx, 10);
+        self.asm.bind_text_label(digit_loop);
+        self.asm.xor_reg_reg(Reg::Rdx, Reg::Rdx);
+        self.asm.div_reg(Reg::Rbx);
+        self.asm.add_reg8_imm8(Reg8::Dl, b'0');
+        self.asm.dec_reg(Reg::Rsi);
+        self.asm.mov_byte_ptr_reg8(Reg::Rsi, Reg8::Dl);
+        self.asm.inc_reg(Reg::Rcx);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::NotEqual, digit_loop);
+        self.asm.cmp_reg_imm8(Reg::R8, 0);
+        self.asm.jcc_label(Condition::Equal, suffix);
+        self.asm.dec_reg(Reg::Rsi);
+        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'-');
+        self.asm.inc_reg(Reg::Rcx);
+
+        self.asm.bind_text_label(suffix);
+        self.asm.mov_data_addr(Reg::Rdi, scratch);
+        self.asm.add_reg_imm32(Reg::Rdi, 32);
+        self.asm.mov_byte_ptr_reg_imm8(Reg::Rdi, b'.');
+        self.asm.add_reg_imm32(Reg::Rdi, 1);
+        self.asm.mov_byte_ptr_reg_imm8(Reg::Rdi, b'0');
+        self.asm.add_reg_imm32(Reg::Rcx, 2);
+
+        if !self.is_windows {
+            self.emit_syscall_number(PlatformSyscall::Write);
+        }
+        self.asm.mov_imm64(Reg::Rdi, fd);
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rcx);
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.asm.syscall();
+        }
+    }
+
     fn emit_bool_rax_to_runtime_string_ref(
         &mut self,
         span: Span,
@@ -39480,10 +40042,10 @@ impl NativeCodeGenerator {
         let stderr = self.platform.stderr_fd();
         self.emit_write_data(stderr, prefix, prefix_text.len());
         let expected = self.emit_static_value(expected);
-        self.emit_print_value_fragment(stderr, expected);
+        self.emit_print_value_fragment(stderr, expected, span);
         self.emit_write_data(stderr, middle, " but got ".len());
         let actual = self.emit_static_value(actual);
-        self.emit_print_value_fragment(stderr, actual);
+        self.emit_print_value_fragment(stderr, actual, span);
         self.emit_write_data(stderr, self.newline, 1);
         self.emit_exit_code(1);
     }
@@ -39516,10 +40078,10 @@ impl NativeCodeGenerator {
         let stderr = self.platform.stderr_fd();
         self.emit_write_data(stderr, prefix, prefix_text.len());
         self.asm.pop_reg(Reg::Rax);
-        self.emit_print_value_fragment(stderr, value);
+        self.emit_print_value_fragment(stderr, value, span);
         self.emit_write_data(stderr, middle, " but got ".len());
         self.asm.pop_reg(Reg::Rax);
-        self.emit_print_value_fragment(stderr, value);
+        self.emit_print_value_fragment(stderr, value, span);
         self.emit_write_data(stderr, self.newline, 1);
         self.emit_exit_code(1);
     }
@@ -42211,10 +42773,13 @@ impl NativeCodeGenerator {
     fn bind_static_runtime_value(&mut self, name: String, value: StaticValue) {
         let native = self.emit_static_value(&value);
         match native {
+            // `emit_static_value` never yields RuntimeDouble; see
+            // `bind_static_iteration_value`'s identical placeholder note.
             NativeValue::Int
             | NativeValue::Bool
             | NativeValue::HeapPointer
-            | NativeValue::HeapString => {
+            | NativeValue::HeapString
+            | NativeValue::RuntimeDouble => {
                 let slot = self.allocate_slot(name.clone(), native);
                 self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                 self.bind_static_value(name, value);
@@ -44099,6 +44664,7 @@ fn heap_string_returning_helper(name: &str) -> bool {
             | "__gc_string_to_lower"
             | "__gc_string_to_upper"
             | "__gc_int_to_string"
+            | "__gc_double_to_string"
             | "__gc_list_int_to_string"
             | "__gc_list_ptr_join"
             | "__gc_read_string"
@@ -44405,6 +44971,16 @@ enum Reg8 {
     Dl = 2,
 }
 
+/// SSE scratch registers used for `RuntimeDouble` arithmetic/comparison/
+/// formatting. Only two are ever needed (binary ops have exactly two
+/// operands), so the set is deliberately minimal rather than a full
+/// xmm0-xmm15 allocator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum XmmReg {
+    Xmm0 = 0,
+    Xmm1 = 1,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Condition {
     Equal,
@@ -44417,6 +44993,12 @@ enum Condition {
     Greater,
     GreaterEqual,
     NoOverflow,
+    /// PF=1 (x86 "parity"). `ucomisd` sets PF=1 exactly when the operands
+    /// are unordered (either is NaN) -- used to guard NaN-aware Double
+    /// equality/inequality before trusting the ZF-based Equal/NotEqual
+    /// setcc, which alone can't distinguish "equal" from "unordered"
+    /// (both set ZF=1).
+    Parity,
 }
 
 impl Condition {
@@ -44432,6 +45014,7 @@ impl Condition {
             Self::Greater => 0x9f,
             Self::GreaterEqual => 0x9d,
             Self::NoOverflow => 0x91,
+            Self::Parity => 0x9a,
         }
     }
 
@@ -44447,6 +45030,7 @@ impl Condition {
             Self::Greater => 0x8f,
             Self::GreaterEqual => 0x8d,
             Self::NoOverflow => 0x81,
+            Self::Parity => 0x8a,
         }
     }
 }
@@ -44715,6 +45299,96 @@ impl Assembler {
 
     fn cqo(&mut self) {
         self.bytes(&[0x48, 0x99]);
+    }
+
+    /// REX.W prefix with R/B extension bits computed from raw register
+    /// numbers, generalizing `rex_w` (which is typed to `Reg`) to `XmmReg`
+    /// operands -- both follow the same "low 3 bits in ModRM, bit 3 in
+    /// REX.R/B" scheme, so the raw `u8` form works for either.
+    fn rex_w_raw(&mut self, reg_field: u8, rm_field: u8) {
+        let r = (reg_field >> 3) & 1;
+        let b = (rm_field >> 3) & 1;
+        self.byte(0x48 | (r << 2) | b);
+    }
+
+    /// `MOVQ xmm, r/m64` (66 REX.W 0F 6E /r): load a GPR's 64 bits into an
+    /// XMM register's low qword. The entry point for operating on a
+    /// `RuntimeDouble`'s raw bits (which live in a GPR exactly like
+    /// `Int`, per `NativeValue::RuntimeDouble`'s doc comment) with an SSE
+    /// instruction.
+    fn movq_xmm_from_gpr(&mut self, xmm: XmmReg, gpr: Reg) {
+        self.byte(0x66);
+        self.rex_w_raw(xmm as u8, gpr as u8);
+        self.bytes(&[0x0f, 0x6e]);
+        self.modrm(xmm as u8, gpr as u8);
+    }
+
+    /// `MOVQ r/m64, xmm` (66 REX.W 0F 7E /r): the inverse of
+    /// `movq_xmm_from_gpr` -- spill an XMM register's low 64 bits back
+    /// into a GPR so a `RuntimeDouble` result can be stored/returned the
+    /// same way `Int` is (a raw qword in Rax).
+    fn movq_gpr_from_xmm(&mut self, gpr: Reg, xmm: XmmReg) {
+        self.byte(0x66);
+        self.rex_w_raw(xmm as u8, gpr as u8);
+        self.bytes(&[0x0f, 0x7e]);
+        self.modrm(xmm as u8, gpr as u8);
+    }
+
+    /// `CVTTSD2SI r64, xmm` (F2 REX.W 0F 2C /r): truncating double-to-i64
+    /// conversion (round toward zero), the first half of the
+    /// whole-number round-trip check that gates Double formatting.
+    fn cvttsd2si(&mut self, dst: Reg, src: XmmReg) {
+        self.byte(0xf2);
+        self.rex_w_raw(dst as u8, src as u8);
+        self.bytes(&[0x0f, 0x2c]);
+        self.modrm(dst as u8, src as u8);
+    }
+
+    /// `CVTSI2SD xmm, r64` (F2 REX.W 0F 2A /r): i64-to-double conversion,
+    /// the second half of the whole-number round-trip check.
+    fn cvtsi2sd(&mut self, dst: XmmReg, src: Reg) {
+        self.byte(0xf2);
+        self.rex_w_raw(dst as u8, src as u8);
+        self.bytes(&[0x0f, 0x2a]);
+        self.modrm(dst as u8, src as u8);
+    }
+
+    /// `UCOMISD xmm1, xmm2` (66 0F 2E /r): unordered double compare,
+    /// setting ZF/PF/CF the way an unsigned integer compare would (PF=1
+    /// marks an unordered/NaN operand). `Xmm0`/`Xmm1` never need REX
+    /// extension bits, so no REX prefix is emitted.
+    fn ucomisd(&mut self, lhs: XmmReg, rhs: XmmReg) {
+        self.byte(0x66);
+        self.bytes(&[0x0f, 0x2e]);
+        self.modrm(lhs as u8, rhs as u8);
+    }
+
+    /// `ADDSD xmm1, xmm2` (F2 0F 58 /r): `dst = dst + src`.
+    fn addsd(&mut self, dst: XmmReg, src: XmmReg) {
+        self.byte(0xf2);
+        self.bytes(&[0x0f, 0x58]);
+        self.modrm(dst as u8, src as u8);
+    }
+
+    /// `SUBSD xmm1, xmm2` (F2 0F 5C /r): `dst = dst - src`.
+    fn subsd(&mut self, dst: XmmReg, src: XmmReg) {
+        self.byte(0xf2);
+        self.bytes(&[0x0f, 0x5c]);
+        self.modrm(dst as u8, src as u8);
+    }
+
+    /// `MULSD xmm1, xmm2` (F2 0F 59 /r): `dst = dst * src`.
+    fn mulsd(&mut self, dst: XmmReg, src: XmmReg) {
+        self.byte(0xf2);
+        self.bytes(&[0x0f, 0x59]);
+        self.modrm(dst as u8, src as u8);
+    }
+
+    /// `DIVSD xmm1, xmm2` (F2 0F 5E /r): `dst = dst / src`.
+    fn divsd(&mut self, dst: XmmReg, src: XmmReg) {
+        self.byte(0xf2);
+        self.bytes(&[0x0f, 0x5e]);
+        self.modrm(dst as u8, src as u8);
     }
 
     fn neg_reg(&mut self, reg: Reg) {
