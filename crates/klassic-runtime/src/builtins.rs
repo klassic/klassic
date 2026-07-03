@@ -9,10 +9,13 @@
 //! `builtin_name` / `builtin_arity` match arms without changing
 //! behaviour.
 //!
-//! Internal debug builtins (`__gc_*`) intentionally stay in the
-//! evaluator's local registry. They are not part of the public surface,
-//! and the roadmap calls for them to live behind `std.gc.debug` rather
-//! than the shared manifest.
+//! The raw GC-heap debug builtins (`__gc_*`) that used to live outside
+//! this manifest have been removed from the user-facing language
+//! entirely — the typechecker no longer declares them, so a Klassic
+//! program cannot reference them. A handful of `__gc_*` names remain
+//! as compiler-internal dispatch tags inside `klassic-native`'s
+//! enum-lowering desugar pass (never reachable from parsed source);
+//! see `docs/architecture-rust.md` for the current list.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;

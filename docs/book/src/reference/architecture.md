@@ -44,10 +44,12 @@ to machine code:
 - Direct OS-level I/O with no `libc`, `cc`, `as`, `ld`, or `codesign`
   involvement — raw syscalls on Linux and macOS, Win64 `kernel32.dll`
   import calls on Windows.
-- Precise mark-and-sweep GC with multi-segment heap growth (see
-  [Why a GC?](../gc/why.md)).
-- Fixed-buffer representations for runtime strings / lists / records
-  that the GC migration plan will replace with heap allocations.
+- Precise mark-and-sweep GC with multi-segment heap growth, managing
+  every heap-backed value automatically -- there is no user-facing
+  API for allocation, rooting, or collection.
+- Fixed-buffer representations for runtime strings / lists / records,
+  with select values (e.g. a `String` payload read back out of an
+  enum) normalizing onto the GC heap.
 
 When the native compiler hits an unsupported construct it emits a
 source-located diagnostic and exits non-zero. There is no runtime

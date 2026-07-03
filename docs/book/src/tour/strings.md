@@ -1,17 +1,10 @@
 # Strings
 
-Klassic strings are UTF-8. There are two flavours that interoperate
-freely in the evaluator and through native compilation:
-
-- **Static strings** — string literals and the result of pure folding.
-  They live in the executable's `.data` section.
-- **Heap strings** — produced by `__gc_string*` builtins (and, on the
-  native compiler's roadmap, by every dynamic operation eventually).
-  They live on the GC heap and survive arbitrary collections.
-
-Both kinds work with `println` and the standard library helpers below.
-The difference is mostly internal — heap strings can grow at runtime
-without filling fixed-size scratch buffers.
+Klassic strings are UTF-8. Automatic garbage collection means you
+never manage a string's storage yourself — a literal, an
+interpolated result, and the output of a loop that concatenates in
+a `mutable` are all just `String` values, managed identically by
+the GC.
 
 ## Literals and interpolation
 
@@ -146,15 +139,14 @@ println("x".isInteger())            // false
 The same operations are available as free functions under
 `import std.string.{parseInt, parseDouble, parseIntOr, parseDoubleOr}`.
 
-## Heap strings
+## Building strings at runtime
 
-When you need string values that grow at runtime (concatenating in a
-loop, building output incrementally), reach for the GC builtins:
+Growing a string in a loop needs no special API — `+` and
+interpolation both work on a `mutable` binding, and the GC manages
+the result exactly like any other value:
 
 ```kl
-mutable greeting = __gc_string("Hello")
-greeting = __gc_string_concat(greeting, __gc_string(", world!"))
-println(greeting)
+mutable greeting = "Hello"
+greeting = greeting + ", world!"
+println(greeting)   // Hello, world!
 ```
-
-See [Heap-Allocated Strings](../gc/strings.md) for the full toolkit.

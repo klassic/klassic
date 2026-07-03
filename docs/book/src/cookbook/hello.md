@@ -1,6 +1,6 @@
 # Hello, World variations
 
-Three ways to print "Hello, World!" — each illustrates a different
+Two ways to print "Hello, World!" — each illustrates a different
 slice of the runtime.
 
 ## Static literal
@@ -21,25 +21,10 @@ val target = "World"
 println("Hello, #{target}!")
 ```
 
-`#{...}` splices any expression into the surrounding string. The
-result is still a runtime string in a fixed buffer (until the
-[Phase A](../gc/roadmap.md) migration completes).
-
-## On the GC heap
-
-```kl
-val greeting = __gc_string_concat(
-  __gc_string("Hello, "),
-  __gc_string("World!")
-)
-println(greeting)
-```
-
-The result is a heap-allocated string (`HeapString`). `println`
-dispatches automatically to a byte-emitting path — no
-`__gc_string_println` needed. This is the path you reach for when
-you want to build strings dynamically (see
-[Heap-Allocated Strings](../gc/strings.md)).
+`#{...}` splices any expression into the surrounding string, building
+it dynamically at runtime. Klassic's automatic GC manages the result
+the same way it manages every other value — there's no separate API
+to reach for when a string needs to live on the heap.
 
 ## Trying them
 

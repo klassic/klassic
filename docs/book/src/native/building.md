@@ -52,7 +52,6 @@ language:
 - Monomorphic and shape-tracked generic enums with `match`.
 - `println`, `printlnError`, `assert`, `assertResult`.
 - File I/O, environment variables, command-line args, stdin / stdout.
-- `__gc_*` builtins for the GC heap.
 
 On macOS arm64, the younger direct backend covers Int/Bool/String
 expressions, locals, `if` / `while`, annotated functions with

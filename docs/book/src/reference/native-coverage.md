@@ -28,25 +28,24 @@ diagnostic; there is no silent fallback to the evaluator.
 - Static folding for pure expressions, with mutable side effects
   preserved when a value can still be recovered statically.
 - Fixed-buffer runtime strings, line lists, runtime lists, and
-  runtime records, with explicit runtime `String` to `HeapString`
-  lifting through `__gc_string` and heap-backed `+` when a `HeapString`
-  participates, including static and runtime string fragments; rooted content
-  equality and `assertResult` for heap strings; and
-  top-level or method-style `toString` / interpolation bridging from
-  `HeapString` back to runtime `String`.
+  runtime records, with a `String` payload read back out of an enum
+  normalizing onto the GC heap as a `HeapString` and heap-backed `+`
+  when a `HeapString` participates, including static and runtime
+  string fragments; rooted content equality and `assertResult` for
+  heap strings; and top-level or method-style `toString` /
+  interpolation bridging from `HeapString` back to runtime `String`.
 - Static maps and sets, plus runtime-key lookups that copy entries
   into runtime storage without losing the selected length.
-- High-level collection literals currently reject GC heap pointer values; use
-  `__gc_list_ptr_*` until ordinary lists are heap-backed.
-- GC helper calls that consume heap addresses reject plain `Int` arguments in
-  native builds, even while the debug surface is source-typed through integers;
-  raw `__gc_write` may still store `Int`, `HeapPointer`, or `HeapString` qwords.
-  `__gc_read_ptr` preserves pointer provenance for raw fields that flow back
-  into address-taking helpers, while `__gc_read` remains the scalar qword read.
-  `__gc_read_string` preserves heap-string provenance for fields that should
-  re-enter ordinary heap-string printing, concatenation, and `toString`; pointer
-  lists and string-keyed maps expose the same string-specific path through
-  `__gc_list_ptr_get_string` and `__gc_smap_get_string`.
+- A handful of GC-heap primitives (`__gc_alloc`, `__gc_record`,
+  `__gc_write`, `__gc_read` / `__gc_read_ptr` / `__gc_read_string` /
+  `__gc_read_double`, `__gc_string` / `__gc_string_concat`,
+  `__gc_int_to_string` / `__gc_double_to_string`) remain as
+  compiler-internal dispatch tags synthesized only by the
+  enum-lowering desugar pass -- not user-callable, since the
+  typechecker no longer declares them. Every other heap-pointer-list
+  and string-keyed-map primitive that used to be directly callable
+  has been removed from the language entirely; ordinary `List<T>`
+  and `Map<K, V>` values are the only way to build collections.
 - Linux file / directory / process / environment / stdin / argv
   builtins via direct syscalls; the same builtin families are also
   fully covered on the Windows target via direct Win64 `kernel32.dll`

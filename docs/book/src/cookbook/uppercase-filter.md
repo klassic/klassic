@@ -22,23 +22,6 @@ echo -e "hello\nworld" | ./upper
 ./upper < /etc/hostname
 ```
 
-## Heap-string variant
-
-If you want the result to live on the GC heap (handy when you
-chain through other heap operations), use the `__gc_*` family:
-
-```kl
-val lines = StandardInput#lines()
-foreach (line in lines) {
-  val heap = __gc_string(line)
-  println(__gc_string_to_upper(heap))
-}
-```
-
-`__gc_string(line)` copies the runtime string onto the heap;
-`__gc_string_to_upper` returns a fresh heap string. `println`
-dispatches naturally because the result is a `HeapString`.
-
 ## Adding line numbers
 
 ```kl

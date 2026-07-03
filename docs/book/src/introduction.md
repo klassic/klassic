@@ -131,9 +131,6 @@ foreach (name in ["alice", "bob"]) {
   tasks (filter, word count, calculator, …).
 - ⚙️ **Native Compilation** — producing standalone executables for
   Linux, Apple Silicon, and Windows.
-- 🧠 **The GC Heap** — why the runtime has its own collector, how to
-  use heap-backed strings / lists / maps, and a reference for every
-  `__gc_*` debug builtin.
 - 📚 **Reference** — the comprehensive native compiler coverage and
   architecture overview.
 
