@@ -40492,17 +40492,18 @@ impl NativeCodeGenerator {
     // The mark worklist must hold the breadth-first frontier of the
     // live object graph; deep recursion with per-frame heap values
     // makes the live set proportional to recursion depth.
-    const GC_MARK_WORKLIST_LEN: usize = 65536;
+    const GC_MARK_WORKLIST_LEN: usize = 262144;
     /// Maximum number of stack-frame heap-pointer slots tracked at any
     /// one time. Allocating a 33rd nested heap-pointer var beyond this
     /// limit aborts with an explicit shadow-stack overflow message.
     // Sized for deep recursion: every live frame of a function with
-    // heap-pointer parameters holds roots here (param slots plus any
-    // rooted temporaries), so the cap bounds recursion depth for
-    // string- and enum-carrying functions. Overflow stays a clean
-    // abort. The tables are zero-filled .data, so growing them grows
-    // every emitted binary — keep proportionate.
-    const GC_SHADOW_STACK_LEN: usize = 32768;
+    // heap-pointer parameters holds roots here. The GC tables are
+    // lazily-backed mmap (see the GC-table init), so a large cap
+    // reserves address space without committing pages until used;
+    // sized to comfortably exceed the frame count the C call stack can
+    // hold, so a deep recursion trips the stack-overflow probe (a
+    // clean diagnostic) before this cap, matching the evaluator.
+    const GC_SHADOW_STACK_LEN: usize = 262144;
     const GC_MAX_PAYLOAD_SIZE: u64 = i64::MAX as u64 - 31 - 4095;
     const GC_MAX_STRING_ALLOC_SIZE: u64 = Self::GC_MAX_PAYLOAD_SIZE - 15;
     const GC_MAX_POINTER_SLOT_COUNT: u64 = Self::GC_MAX_PAYLOAD_SIZE / 8;
