@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
@@ -83,6 +84,13 @@ pub struct Diagnostic {
     pub span: Option<Span>,
     pub message: String,
     pub incomplete_input: bool,
+    /// The source file `span` actually indexes into, when known. A
+    /// runtime error raised inside a stdlib/imported module's
+    /// function body carries a span in that module's own byte space;
+    /// tagging it here lets rendering pick the right `SourceFile`
+    /// instead of misrendering against whichever file happens to be
+    /// evaluating when the error surfaces (issue #450).
+    pub source: Option<Arc<SourceFile>>,
 }
 
 impl Diagnostic {
@@ -93,6 +101,7 @@ impl Diagnostic {
             span: Some(span),
             message: message.into(),
             incomplete_input: false,
+            source: None,
         }
     }
 
@@ -103,6 +112,7 @@ impl Diagnostic {
             span: Some(span),
             message: message.into(),
             incomplete_input: false,
+            source: None,
         }
     }
 
@@ -113,6 +123,7 @@ impl Diagnostic {
             span: Some(span),
             message: message.into(),
             incomplete_input: false,
+            source: None,
         }
     }
 
@@ -123,6 +134,7 @@ impl Diagnostic {
             span: None,
             message: message.into(),
             incomplete_input: false,
+            source: None,
         }
     }
 
@@ -142,6 +154,16 @@ impl Diagnostic {
                 format!("{}:{}:{}: {}", source.name(), line, column, self.message)
             }
             None => format!("{}: {}", source.name(), self.message),
+        }
+    }
+
+    /// Render against `self.source` when tagged (a runtime error that
+    /// crossed into a different module's function body), falling back
+    /// to `fallback` (the file actually being evaluated) otherwise.
+    pub fn render_with_fallback(&self, fallback: &SourceFile) -> String {
+        match &self.source {
+            Some(source) => self.render(source),
+            None => self.render(fallback),
         }
     }
 }

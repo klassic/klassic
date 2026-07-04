@@ -1,6 +1,8 @@
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 
+use klassic_span::SourceFile;
 use klassic_syntax::{Expr, TypeAnnotation, TypeClassConstraint};
 
 use super::Environment;
@@ -211,4 +213,11 @@ pub struct FunctionValue {
     pub(crate) constraints: Vec<TypeClassConstraint>,
     pub(crate) body: Expr,
     pub(crate) env: Environment,
+    /// The module this def/lambda was declared in, if known — lets a
+    /// runtime error raised inside `body` render against the file it
+    /// actually came from rather than whatever file happens to be
+    /// evaluating when the call fails (issue #450). `None` only for
+    /// values built in isolated test/internal paths that never go
+    /// through the evaluator's normal source-tracked evaluation.
+    pub(crate) source: Option<Arc<SourceFile>>,
 }

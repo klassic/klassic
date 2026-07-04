@@ -87,6 +87,7 @@ struct ThreadFunctionSnapshot {
     constraints: Vec<TypeClassConstraint>,
     body: Expr,
     env: ThreadEnvironmentSnapshot,
+    source: Option<Arc<SourceFile>>,
 }
 
 thread_local! {
@@ -116,10 +117,25 @@ thread_local! {
     /// entries pointing at the same Arc reuse the same `Rc` and we
     /// don't re-walk the same snapshot tree N times.
     static FUNCTION_RESTORE_CACHE: RefCell<HashMap<*const ThreadFunctionSnapshot, Rc<FunctionValue>>> = RefCell::new(HashMap::new());
+
+    /// The `SourceFile` `evaluate_text_typed` is currently evaluating.
+    /// Every `FunctionValue` created while it's set is tagged with a
+    /// clone, so a runtime error raised inside that def's body later
+    /// (from a different call site, possibly in a different module)
+    /// can be rendered against the module it actually came from
+    /// instead of whatever file happens to be evaluating when the
+    /// error surfaces (issue #450).
+    static CURRENT_SOURCE: RefCell<Option<Arc<SourceFile>>> = const { RefCell::new(None) };
 }
 
 fn clear_function_snapshot_cache() {
     FUNCTION_SNAPSHOT_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+/// The `SourceFile` currently being evaluated, if any — see
+/// `CURRENT_SOURCE`.
+fn current_source() -> Option<Arc<SourceFile>> {
+    CURRENT_SOURCE.with(|cell| cell.borrow().clone())
 }
 
 fn clear_function_restore_cache() {
@@ -162,7 +178,7 @@ type ThreadInstanceDictionaries = HashMap<String, Vec<ThreadInstanceDictionaryEn
 
 #[derive(Clone, Debug)]
 pub struct EvaluationError {
-    pub source: SourceFile,
+    pub source: Arc<SourceFile>,
     pub diagnostic: Diagnostic,
 }
 
@@ -174,7 +190,7 @@ impl EvaluationError {
 
 impl fmt::Display for EvaluationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.diagnostic.render(&self.source))
+        write!(f, "{}", self.diagnostic.render_with_fallback(&self.source))
     }
 }
 
@@ -262,6 +278,7 @@ fn snapshot_value_for_thread(value: &Value) -> ThreadValueSnapshot {
                 constraints: function.constraints.clone(),
                 body: function.body.clone(),
                 env,
+                source: function.source.clone(),
             });
             FUNCTION_SNAPSHOT_CACHE.with(|cache| {
                 cache.borrow_mut().insert(ptr, Arc::clone(&snapshot));
@@ -353,6 +370,7 @@ fn restore_thread_value(snapshot: ThreadValueSnapshot) -> Value {
                 constraints: inner.constraints,
                 body: inner.body,
                 env: restore_thread_environment(inner.env),
+                source: inner.source,
             });
             FUNCTION_RESTORE_CACHE.with(|cache| {
                 cache.borrow_mut().insert(key, Rc::clone(&rc));
@@ -652,6 +670,7 @@ fn register_extension_methods(expr: &Expr, environment: &Environment) {
             constraints: constraints.clone(),
             body: (**body).clone(),
             env: environment.clone(),
+            source: current_source(),
         }));
         USER_EXTENSION_METHODS.with(|registry| {
             registry
@@ -910,7 +929,24 @@ impl Evaluator {
         name: &str,
         text: &str,
     ) -> Result<(Value, String), EvaluationError> {
-        let source = SourceFile::new(name, text);
+        let source = Arc::new(SourceFile::new(name, text));
+        // Every `FunctionValue` created below is tagged with this
+        // source (see `current_source`), so a runtime error raised
+        // later inside its body renders against the module it was
+        // actually declared in (issue #450). Restore the previous
+        // value on the way out rather than unconditionally clearing
+        // it, in case of (currently nonexistent, but cheap to guard
+        // against) nested `evaluate_text_typed` calls.
+        let previous_source = CURRENT_SOURCE.with(|cell| cell.borrow().clone());
+        CURRENT_SOURCE.with(|cell| *cell.borrow_mut() = Some(source.clone()));
+        struct RestoreSource(Option<Arc<SourceFile>>);
+        impl Drop for RestoreSource {
+            fn drop(&mut self) {
+                CURRENT_SOURCE.with(|cell| *cell.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore_source = RestoreSource(previous_source);
+
         let expr = parse_source(&source).map_err(|diagnostic| EvaluationError {
             source: source.clone(),
             diagnostic,
@@ -983,6 +1019,7 @@ fn type_diagnostic(span: Span, message: String) -> Diagnostic {
         span: Some(span),
         message,
         incomplete_input: false,
+        source: None,
     }
 }
 
@@ -1121,6 +1158,7 @@ fn eval_expr_inner(
                 constraints: Vec::new(),
                 body: (*proposition.clone()),
                 env: environment.clone(),
+                source: current_source(),
             }));
             placeholder.borrow_mut().set_value(function);
             Ok(Value::Unit)
@@ -1167,6 +1205,7 @@ fn eval_expr_inner(
                 constraints: constraints.clone(),
                 body: (*body.clone()),
                 env: environment.clone(),
+                source: current_source(),
             }));
             placeholder.borrow_mut().set_value(function);
             Ok(Value::Unit)
@@ -1182,6 +1221,7 @@ fn eval_expr_inner(
             constraints: Vec::new(),
             body: (*body.clone()),
             env: environment.clone(),
+            source: current_source(),
         }))),
         Expr::Assign { name, value, span } => {
             let evaluated = eval_expr(value, environment, state)?;
@@ -1703,6 +1743,7 @@ fn define_instance(
             constraints: constraints.clone(),
             body: (*body.clone()),
             env: environment.clone(),
+            source: current_source(),
         }));
         entries.push((name.clone(), function));
     }
@@ -2028,6 +2069,7 @@ fn partially_apply_callable(
                 constraints: function.constraints.clone(),
                 body: function.body.clone(),
                 env: partial_env,
+                source: function.source.clone(),
             })))
         }
         Value::BuiltinFunction(function) => {
@@ -2079,7 +2121,20 @@ fn invoke_user_function(
     let mut state = EvaluationState::default();
     let result = eval_expr(&function.body, &mut call_env, &mut state);
     call_env.pop_scope();
-    result
+    // The innermost failure (e.g. a builtin call deep inside this
+    // def's body) doesn't know which module it came from. Tag it with
+    // this function's own source the first time it crosses a function
+    // boundary, so it renders against the module the def actually
+    // lives in rather than whichever file is evaluating at the top
+    // level (issue #450). A diagnostic that already has a source came
+    // from a still-deeper call — leave it alone so the tag reflects
+    // the innermost def, not every frame it unwound through.
+    result.map_err(|mut diagnostic| {
+        if diagnostic.source.is_none() {
+            diagnostic.source = function.source.clone();
+        }
+        diagnostic
+    })
 }
 
 fn bind_constraint_methods_for_call(
@@ -2208,6 +2263,12 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             let record_schemas = USER_RECORDS.with(|records| records.borrow().clone());
             let instance_methods = snapshot_instance_methods_for_thread();
             let instance_dictionaries = snapshot_instance_dictionaries_for_thread();
+            // So any FunctionValue built inside the spawned thread body
+            // (e.g. a def/lambda declared in a block the callable
+            // executes) still gets tagged with the right source
+            // (issue #450) — Arc<SourceFile> is Send+Sync, safe to
+            // move across the thread boundary.
+            let thread_source = current_source();
             let handle = thread::spawn(move || {
                 USER_MODULES.with(|modules| {
                     *modules.borrow_mut() = restore_module_exports_for_thread(module_exports);
@@ -2222,6 +2283,7 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
                     *dictionaries.borrow_mut() =
                         restore_instance_dictionaries_for_thread(instance_dictionaries);
                 });
+                CURRENT_SOURCE.with(|cell| *cell.borrow_mut() = thread_source);
                 clear_function_restore_cache();
                 let callable = restore_thread_value(callable);
                 clear_function_restore_cache();
