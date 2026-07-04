@@ -208,6 +208,63 @@ fn runtime_error_inside_local_module_reports_module_source() {
     );
 }
 
+/// The second half of issue #450: a runtime error raised inside a
+/// stdlib function's body must also name the function the user
+/// actually called (`last`), not just the innermost builtin
+/// (`head`). `def last(xs) = if(isEmpty(tail(xs))) head(xs) else
+/// last(tail(xs))` calls `head` internally on an empty list.
+#[test]
+fn runtime_error_names_the_function_the_user_called() {
+    let output = Command::new(klassic_bin())
+        .args(["-e", "import std.list.{last}\nlast([])"])
+        .output()
+        .expect("binary should run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.trim_end(),
+        "<stdlib std.list>:31:38: last: head expects a non-empty list"
+    );
+}
+
+/// A bare builtin call with no wrapping user `def` must NOT gain a
+/// spurious call-name prefix — there is no user-level call to
+/// attribute the error to.
+#[test]
+fn runtime_error_bare_builtin_call_has_no_call_name_prefix() {
+    let output = Command::new(klassic_bin())
+        .args(["-e", "head([])"])
+        .output()
+        .expect("binary should run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.trim_end(),
+        "<expression>:1:1: head expects a non-empty list"
+    );
+}
+
+/// When a user def wraps a call into a stdlib function, the
+/// call-name attribution names the innermost def (`last`), not the
+/// user's own wrapper (`wrapper`) — matching the "innermost def wins"
+/// rule the source-attribution half of #450 already established.
+#[test]
+fn runtime_error_through_wrapper_names_innermost_def() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.list.{last}\ndef wrapper(xs) = last(xs)\nwrapper([])",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.trim_end(),
+        "<stdlib std.list>:31:38: last: head expects a non-empty list"
+    );
+}
+
 /// Consistency helpers added across the ADT/collection stdlib:
 /// `Result.getOrElse` (the Option name, aliasing unwrapOr), `contains` /
 /// `exists` predicates on both Option and Result (dispatching by

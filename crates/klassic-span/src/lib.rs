@@ -91,6 +91,13 @@ pub struct Diagnostic {
     /// instead of misrendering against whichever file happens to be
     /// evaluating when the error surfaces (issue #450).
     pub source: Option<Arc<SourceFile>>,
+    /// The name the user actually called to reach the def whose body
+    /// raised this error, when known — e.g. `last` for a `head`
+    /// failure raised deep inside `def last(xs) = ... head(xs) ...`.
+    /// Rendered as a `{name}: ` prefix on the message so the error
+    /// names what the user called instead of only the innermost
+    /// builtin (issue #450, second half).
+    pub call_name: Option<String>,
 }
 
 impl Diagnostic {
@@ -102,6 +109,7 @@ impl Diagnostic {
             message: message.into(),
             incomplete_input: false,
             source: None,
+            call_name: None,
         }
     }
 
@@ -113,6 +121,7 @@ impl Diagnostic {
             message: message.into(),
             incomplete_input: false,
             source: None,
+            call_name: None,
         }
     }
 
@@ -124,6 +133,7 @@ impl Diagnostic {
             message: message.into(),
             incomplete_input: false,
             source: None,
+            call_name: None,
         }
     }
 
@@ -135,6 +145,7 @@ impl Diagnostic {
             message: message.into(),
             incomplete_input: false,
             source: None,
+            call_name: None,
         }
     }
 
@@ -147,13 +158,21 @@ impl Diagnostic {
         self.incomplete_input
     }
 
+    fn formatted_message(&self) -> String {
+        match &self.call_name {
+            Some(name) => format!("{name}: {}", self.message),
+            None => self.message.clone(),
+        }
+    }
+
     pub fn render(&self, source: &SourceFile) -> String {
+        let message = self.formatted_message();
         match self.span {
             Some(span) => {
                 let (line, column) = source.line_col(span.start);
-                format!("{}:{}:{}: {}", source.name(), line, column, self.message)
+                format!("{}:{}:{}: {}", source.name(), line, column, message)
             }
-            None => format!("{}: {}", source.name(), self.message),
+            None => format!("{}: {}", source.name(), message),
         }
     }
 
