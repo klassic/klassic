@@ -94,6 +94,12 @@ enum Reg {
     X19 = 19,
     /// Callee-saved: bump-allocator end pointer.
     X20 = 20,
+    /// Callee-saved: `argc`, captured from dyld's `LC_MAIN` entry.
+    X21 = 21,
+    /// Callee-saved: `argv`, captured from dyld's `LC_MAIN` entry.
+    X22 = 22,
+    /// Callee-saved: `envp`, captured from dyld's `LC_MAIN` entry.
+    X23 = 23,
 }
 
 /// AAPCS64 integer argument registers, in order.
@@ -1384,6 +1390,62 @@ impl Emitter {
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: Dir#move failed\n");
         self.asm.mov_imm64(Reg::X0, 0); // Unit
+    }
+
+    /// `Environment#exists`(key): walks the NUL-terminated `envp`
+    /// array (x23, captured from dyld's `LC_MAIN` entry) looking for
+    /// an entry whose `"KEY="` prefix matches `key`. Each `envp`
+    /// entry is a NUL-terminated C string `"KEY=VALUE"`; a match
+    /// means the first `key.len()` bytes equal `key` and the very
+    /// next byte is `'='` (so `"FOO"` doesn't spuriously match an
+    /// entry for `"FOOBAR"`), matching the evaluator's
+    /// `env::var_os(key).is_some()` (M16, issue #538).
+    fn emit_environment_exists(&mut self, key: &str) {
+        let key_len = key.len() as u64;
+        let key_offset = self.asm.intern_rodata(key.as_bytes());
+
+        self.asm.mov_reg(Reg::X6, Reg::X23); // envp cursor
+        let loop_start = self.asm.new_label();
+        let try_match = self.asm.new_label();
+        let check_equals = self.asm.new_label();
+        let advance_entry = self.asm.new_label();
+        let found = self.asm.new_label();
+        let not_found = self.asm.new_label();
+        let done = self.asm.new_label();
+
+        self.asm.bind(loop_start);
+        self.asm.ldr_imm(Reg::X7, Reg::X6, 0); // entry ptr
+        self.asm.branch(not_found, BranchKind::CompareZero(Reg::X7));
+        self.asm.mov_reg(Reg::X8, Reg::X7); // entry byte cursor
+        self.asm.load_rodata_address(Reg::X9, key_offset); // key byte cursor
+        self.asm.mov_imm64(Reg::X10, key_len); // remaining length
+
+        self.asm.bind(try_match);
+        self.asm
+            .branch(check_equals, BranchKind::CompareZero(Reg::X10));
+        self.asm.ldrb_post_increment(Reg::X11, Reg::X8);
+        self.asm.ldrb_post_increment(Reg::X12, Reg::X9);
+        self.asm.cmp_reg(Reg::X11, Reg::X12);
+        self.asm
+            .branch(advance_entry, BranchKind::Conditional(Cond::Ne));
+        self.asm.sub_reg_imm(Reg::X10, Reg::X10, 1);
+        self.asm.branch(try_match, BranchKind::Unconditional);
+
+        self.asm.bind(check_equals);
+        self.asm.ldrb(Reg::X11, Reg::X8); // peek, no advance
+        self.asm.cmp_imm(Reg::X11, u32::from(b'='));
+        self.asm.branch(found, BranchKind::Conditional(Cond::Eq));
+
+        self.asm.bind(advance_entry);
+        self.asm.add_reg_imm(Reg::X6, Reg::X6, 8); // next envp slot
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+
+        self.asm.bind(found);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(not_found);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
     }
 
     fn binary(
@@ -2862,6 +2924,23 @@ impl Emitter {
                 self.emit_dir_move(source_offset, target_offset);
                 Ok(Some(ValueType::Unit))
             }
+            ("Environment#exists", 1) => {
+                let Expr::String {
+                    value: key,
+                    span: key_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(
+                        arguments[0].span(),
+                        "a non-literal environment variable name",
+                    ));
+                };
+                if key.contains("#{") {
+                    return Err(unsupported(*key_span, "string interpolation"));
+                }
+                self.emit_environment_exists(key);
+                Ok(Some(ValueType::Bool))
+            }
             _ => Ok(None),
         }
     }
@@ -3305,6 +3384,14 @@ pub(crate) fn emit_macho_program(
     emitter.scopes.push(HashMap::new());
     collect_records(expr, &mut emitter);
     collect_functions(expr, &mut emitter);
+
+    // dyld calls the LC_MAIN entry as a plain AAPCS64 call:
+    // x0=argc, x1=argv, x2=envp, x3=apple. Capture into callee-saved
+    // registers before anything else can clobber x0-x2 (M16, issue
+    // #538).
+    emitter.asm.mov_reg(Reg::X21, Reg::X0);
+    emitter.asm.mov_reg(Reg::X22, Reg::X1);
+    emitter.asm.mov_reg(Reg::X23, Reg::X2);
 
     // Empty heap: the first allocation's capacity check fails and
     // mmaps the first segment.

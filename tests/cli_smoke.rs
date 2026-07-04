@@ -23184,6 +23184,103 @@ fn build_target_aarch64_apple_darwin_dir_ops_runs() {
     );
 }
 
+/// Regression guard on any host: `Environment#exists` must
+/// cross-build for aarch64-apple-darwin -- M16 (issue #538), which
+/// also captures argc/argv/envp from dyld's LC_MAIN entry in the
+/// program prologue. `Time#nowMillis` was attempted in the same
+/// milestone but withdrawn before merge: the real-hardware execution
+/// test caught `gettimeofday`'s raw `svc #0x80` form crashing with
+/// SIGSEGV on one run and returning a clean syscall failure on
+/// another (same binary, same CI run, different symptoms depending
+/// on call order) -- `syscalls.master` marking it `NO_SYSCALL_STUB`
+/// turned out to mean genuinely unreliable behavior off the commpage
+/// path, not just slower. `Time#nowMillis` remains an explicit
+/// `unsupported` diagnostic on this backend until a safe alternative
+/// (e.g. reading the commpage directly, or `mach_absolute_time`) is
+/// designed and verified.
+#[test]
+fn build_target_aarch64_apple_darwin_env_time_cross_build() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_envtime_xbuild_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_envtime_xbuild_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(Environment#exists(\"KLASSIC_ENV_TIME_TEST_NONEXISTENT_XYZ\"))\n\
+         println(Environment#exists(\"PATH\"))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        build_output.status.success(),
+        "darwin env cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
+/// M16 acceptance test: `Environment#exists` actually runs on an
+/// Apple Silicon mac.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_env_time_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_envtime_run_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_envtime_run_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(Environment#exists(\"KLASSIC_ENV_TIME_TEST_NONEXISTENT_XYZ\"))\n\
+         println(Environment#exists(\"PATH\"))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin env build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "false\ntrue\n");
+}
+
 /// On Apple Silicon a target-less `build` detects the host: programs
 /// inside the direct subset get the toolchain-free Mach-O backend
 /// (no libSystem linkage), and programs outside it silently fall
