@@ -1530,11 +1530,19 @@ impl Emitter {
         }
 
         self.asm.sub_reg(Reg::X2, Reg::X8, Reg::X9);
-        self.asm.add_reg(Reg::X6, Reg::X3, Reg::X9);
+        // X9 (trim start index) is outside the X0-X5 range
+        // `emit_alloc`'s heap-grow path preserves, so it must be saved
+        // across the call explicitly rather than folded into X6
+        // beforehand (a prior version computed the slice pointer here
+        // and lost it to a heap-grow mmap when the bump allocator's
+        // segment was full).
+        self.asm.push(Reg::X9);
         self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
         self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
         self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
         self.emit_alloc();
+        self.asm.pop(Reg::X9);
+        self.asm.add_reg(Reg::X6, Reg::X3, Reg::X9);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
         self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X8);

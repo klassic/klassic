@@ -22759,6 +22759,76 @@ fn build_target_aarch64_apple_darwin_string_builtins_m13_run() {
     );
 }
 
+/// GC stress regression for the M13 string builtins (issue #538): a
+/// prior version of `trim`/`trimLeft`/`trimRight` computed the result
+/// slice's start pointer into a scratch register (x6) *before*
+/// calling `emit_alloc`, then used it afterward. `emit_alloc`'s
+/// heap-grow path only preserves x0-x5 across the mmap it performs,
+/// so once the bump allocator's 64 MiB segment filled up and a grow
+/// actually fired, that pointer was silently clobbered -- a `SIGSEGV`
+/// this test is sized to trigger (100,000 calls to `trim` on a
+/// 1000-byte string is ~100 MiB of allocation, comfortably past one
+/// segment).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_string_trim_survives_heap_growth() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_trim_growth_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_trim_growth_{stamp}.bin"));
+    let padded = "x".repeat(1000);
+    fs::write(
+        &source_path,
+        format!(
+            "mutable i = 0\n\
+             mutable lastLen = 0\n\
+             while (i < 100000) {{\n\
+             \x20 val t = trim(\"{padded}\")\n\
+             \x20 lastLen = length(t)\n\
+             \x20 i = i + 1\n\
+             }}\n\
+             println(lastLen)\n\
+             println(i)\n"
+        ),
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin trim heap-growth build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?} (a SIGSEGV here means emit_str_trim clobbered a \
+         pointer across a heap-grow mmap)\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "1000\n100000\n"
+    );
+}
+
 /// On Apple Silicon a target-less `build` detects the host: programs
 /// inside the direct subset get the toolchain-free Mach-O backend
 /// (no libSystem linkage), and programs outside it silently fall
