@@ -51,6 +51,11 @@ enum Reg {
     X5 = 5,
     X6 = 6,
     X7 = 7,
+    X8 = 8,
+    X9 = 9,
+    X10 = 10,
+    X11 = 11,
+    X12 = 12,
     /// Darwin syscall number register.
     X16 = 16,
     /// Callee-saved: bump-allocator next pointer. The generated code
@@ -494,6 +499,23 @@ impl Assembler {
         self.word(0xf100_001f | (imm << 10) | ((reg as u32) << 5));
     }
 
+    /// `dst = 1` if the byte in `byte_reg` is ASCII whitespace
+    /// (space/tab/LF/CR/VT/FF, matching the x86_64 backend's
+    /// `emit_jump_if_ascii_whitespace` set), `0` otherwise.
+    fn is_ascii_whitespace_into(&mut self, byte_reg: Reg, dst: Reg) {
+        let is_ws = self.new_label();
+        let done = self.new_label();
+        for byte in [b' ', b'\t', b'\n', b'\r', 0x0b, 0x0c] {
+            self.cmp_imm(byte_reg, u32::from(byte));
+            self.branch(is_ws, BranchKind::Conditional(Cond::Eq));
+        }
+        self.mov_imm64(dst, 0);
+        self.branch(done, BranchKind::Unconditional);
+        self.bind(is_ws);
+        self.mov_imm64(dst, 1);
+        self.bind(done);
+    }
+
     /// `lsr xd, xn, #shift`
     fn lsr_imm(&mut self, dst: Reg, src: Reg, shift: u32) {
         debug_assert!(shift < 64);
@@ -533,6 +555,18 @@ impl Assembler {
     /// `str xt, [xn, xm]` — register-offset store.
     fn str_reg_offset(&mut self, src: Reg, base: Reg, offset: Reg) {
         self.word(0xf820_6800 | ((offset as u32) << 16) | ((base as u32) << 5) | src as u32);
+    }
+
+    /// `ldrb wt, [xn, xm]` — register-offset byte load, no advance.
+    /// Same size-field flip (`11` -> `00`) from `ldr_reg_offset` that
+    /// `ldrb_post_increment` applies to `ldr_post_increment`.
+    fn ldrb_reg_offset(&mut self, dst: Reg, base: Reg, offset: Reg) {
+        self.word(0x3860_6800 | ((offset as u32) << 16) | ((base as u32) << 5) | dst as u32);
+    }
+
+    /// `strb wt, [xn, xm]` — register-offset byte store, no advance.
+    fn strb_reg_offset(&mut self, src: Reg, base: Reg, offset: Reg) {
+        self.word(0x3820_6800 | ((offset as u32) << 16) | ((base as u32) << 5) | src as u32);
     }
 
     /// `ldrb wt, [xn], #1`
@@ -1268,6 +1302,64 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X5);
     }
 
+    /// `startsWith(s, prefix)`: s in x0, prefix in x1 -> Bool in x0.
+    fn emit_str_starts_with(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.ldr_imm(Reg::X3, Reg::X1, 0);
+        let fail = self.asm.new_label();
+        let ok = self.asm.new_label();
+        let end = self.asm.new_label();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(fail, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X6, Reg::X0, 8);
+        self.asm.add_reg_imm(Reg::X7, Reg::X1, 8);
+        let byte_loop = self.asm.new_label();
+        self.asm.bind(byte_loop);
+        self.asm.branch(ok, BranchKind::CompareZero(Reg::X3));
+        self.asm.ldrb_post_increment(Reg::X4, Reg::X6);
+        self.asm.ldrb_post_increment(Reg::X5, Reg::X7);
+        self.asm.cmp_reg(Reg::X4, Reg::X5);
+        self.asm.branch(fail, BranchKind::Conditional(Cond::Ne));
+        self.asm.sub_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.branch(byte_loop, BranchKind::Unconditional);
+        self.asm.bind(ok);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(end, BranchKind::Unconditional);
+        self.asm.bind(fail);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(end);
+    }
+
+    /// `endsWith(s, suffix)`: s in x0, suffix in x1 -> Bool in x0.
+    fn emit_str_ends_with(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.ldr_imm(Reg::X3, Reg::X1, 0);
+        let fail = self.asm.new_label();
+        let ok = self.asm.new_label();
+        let end = self.asm.new_label();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(fail, BranchKind::Conditional(Cond::Gt));
+        self.asm.sub_reg(Reg::X8, Reg::X2, Reg::X3);
+        self.asm.add_reg_imm(Reg::X6, Reg::X0, 8);
+        self.asm.add_reg(Reg::X6, Reg::X6, Reg::X8);
+        self.asm.add_reg_imm(Reg::X7, Reg::X1, 8);
+        let byte_loop = self.asm.new_label();
+        self.asm.bind(byte_loop);
+        self.asm.branch(ok, BranchKind::CompareZero(Reg::X3));
+        self.asm.ldrb_post_increment(Reg::X4, Reg::X6);
+        self.asm.ldrb_post_increment(Reg::X5, Reg::X7);
+        self.asm.cmp_reg(Reg::X4, Reg::X5);
+        self.asm.branch(fail, BranchKind::Conditional(Cond::Ne));
+        self.asm.sub_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.branch(byte_loop, BranchKind::Unconditional);
+        self.asm.bind(ok);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(end, BranchKind::Unconditional);
+        self.asm.bind(fail);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(end);
+    }
+
     /// String equality: a in x0, b in x1 → Bool in x0.
     fn emit_str_eq(&mut self) {
         let differ = self.asm.new_label();
@@ -1298,6 +1390,165 @@ impl Emitter {
 
     /// `length(s)`: UTF-8 character count, matching the evaluator —
     /// bytes whose top two bits are not `10` start a character.
+    /// `toUpperCase`/`toLowerCase`: s in x0 -> fresh string object in
+    /// x0, ASCII bytes shifted, everything else copied unchanged
+    /// (matching the evaluator's and x86_64 backend's ASCII-only
+    /// convention -- no full Unicode case tables).
+    fn emit_str_ascii_case(&mut self, to_upper: bool) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
+        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        self.emit_alloc();
+        self.asm.str_imm(Reg::X2, Reg::X5, 0);
+        self.asm.add_reg_imm(Reg::X6, Reg::X5, 8);
+        self.asm.mov_reg(Reg::X7, Reg::X2);
+        let loop_start = self.asm.new_label();
+        let store = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X7));
+        self.asm.ldrb_post_increment(Reg::X1, Reg::X3);
+        let (lo, hi) = if to_upper { (b'a', b'z') } else { (b'A', b'Z') };
+        self.asm.cmp_imm(Reg::X1, u32::from(lo));
+        self.asm.branch(store, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X1, u32::from(hi));
+        self.asm.branch(store, BranchKind::Conditional(Cond::Gt));
+        if to_upper {
+            self.asm.sub_reg_imm(Reg::X1, Reg::X1, 32);
+        } else {
+            self.asm.add_reg_imm(Reg::X1, Reg::X1, 32);
+        }
+        self.asm.bind(store);
+        self.asm.strb_post_increment(Reg::X1, Reg::X6);
+        self.asm.sub_reg_imm(Reg::X7, Reg::X7, 1);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(done);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
+    /// UTF-8 aware `reverse`: s in x0 -> fresh string object in x0
+    /// with characters in reverse order (bytes within each character
+    /// preserved). Scans backward from the end to find each
+    /// character's start byte (top bits != `10`), then copies that
+    /// character's bytes forward into the output at the current write
+    /// cursor -- characters are discovered in reverse order, so
+    /// writing them in discovery order reverses the string.
+    fn emit_str_reverse(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
+        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        self.emit_alloc();
+        self.asm.str_imm(Reg::X2, Reg::X5, 0);
+        self.asm.add_reg_imm(Reg::X6, Reg::X5, 8);
+        self.asm.mov_reg(Reg::X8, Reg::X2);
+        self.asm.mov_imm64(Reg::X9, 0);
+
+        let outer_loop = self.asm.new_label();
+        let find_start = self.asm.new_label();
+        let copy_start = self.asm.new_label();
+        let copy_loop = self.asm.new_label();
+        let copy_done = self.asm.new_label();
+        let done = self.asm.new_label();
+
+        self.asm.bind(outer_loop);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X8));
+        self.asm.mov_reg(Reg::X10, Reg::X8);
+
+        self.asm.bind(find_start);
+        self.asm.sub_reg_imm(Reg::X10, Reg::X10, 1);
+        self.asm.ldrb_reg_offset(Reg::X11, Reg::X3, Reg::X10);
+        self.asm.lsr_imm(Reg::X11, Reg::X11, 6);
+        self.asm.cmp_imm(Reg::X11, 2);
+        self.asm
+            .branch(copy_start, BranchKind::Conditional(Cond::Ne));
+        self.asm
+            .branch(find_start, BranchKind::CompareNonZero(Reg::X10));
+
+        self.asm.bind(copy_start);
+        self.asm.mov_reg(Reg::X12, Reg::X10);
+        self.asm.bind(copy_loop);
+        self.asm.cmp_reg(Reg::X12, Reg::X8);
+        self.asm
+            .branch(copy_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X11, Reg::X3, Reg::X12);
+        self.asm.strb_reg_offset(Reg::X11, Reg::X6, Reg::X9);
+        self.asm.add_reg_imm(Reg::X12, Reg::X12, 1);
+        self.asm.add_reg_imm(Reg::X9, Reg::X9, 1);
+        self.asm.branch(copy_loop, BranchKind::Unconditional);
+
+        self.asm.bind(copy_done);
+        self.asm.mov_reg(Reg::X8, Reg::X10);
+        self.asm.branch(outer_loop, BranchKind::Unconditional);
+
+        self.asm.bind(done);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
+    /// `trim`/`trimLeft`/`trimRight`: s in x0 -> fresh string object
+    /// in x0 with leading/trailing ASCII whitespace stripped (ASCII
+    /// only, matching the x86_64 backend's accepted precedent -- not
+    /// Rust's Unicode-aware `str::trim`).
+    fn emit_str_trim(&mut self, trim_left: bool, trim_right: bool) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
+        self.asm.mov_imm64(Reg::X9, 0);
+
+        if trim_left {
+            let left_loop = self.asm.new_label();
+            let left_done = self.asm.new_label();
+            self.asm.bind(left_loop);
+            self.asm.cmp_reg(Reg::X9, Reg::X2);
+            self.asm
+                .branch(left_done, BranchKind::Conditional(Cond::Ge));
+            self.asm.ldrb_reg_offset(Reg::X4, Reg::X3, Reg::X9);
+            self.asm.is_ascii_whitespace_into(Reg::X4, Reg::X5);
+            self.asm.branch(left_done, BranchKind::CompareZero(Reg::X5));
+            self.asm.add_reg_imm(Reg::X9, Reg::X9, 1);
+            self.asm.branch(left_loop, BranchKind::Unconditional);
+            self.asm.bind(left_done);
+        }
+
+        self.asm.mov_reg(Reg::X8, Reg::X2);
+        if trim_right {
+            let right_loop = self.asm.new_label();
+            let right_done = self.asm.new_label();
+            self.asm.bind(right_loop);
+            self.asm.cmp_reg(Reg::X8, Reg::X9);
+            self.asm
+                .branch(right_done, BranchKind::Conditional(Cond::Le));
+            self.asm.sub_reg_imm(Reg::X8, Reg::X8, 1);
+            self.asm.ldrb_reg_offset(Reg::X4, Reg::X3, Reg::X8);
+            self.asm.is_ascii_whitespace_into(Reg::X4, Reg::X5);
+            self.asm
+                .branch(right_loop, BranchKind::CompareNonZero(Reg::X5));
+            self.asm.add_reg_imm(Reg::X8, Reg::X8, 1);
+            self.asm.bind(right_done);
+        }
+
+        self.asm.sub_reg(Reg::X2, Reg::X8, Reg::X9);
+        // X9 (trim start index) is outside the X0-X5 range
+        // `emit_alloc`'s heap-grow path preserves, so it must be saved
+        // across the call explicitly rather than folded into X6
+        // beforehand (a prior version computed the slice pointer here
+        // and lost it to a heap-grow mmap when the bump allocator's
+        // segment was full).
+        self.asm.push(Reg::X9);
+        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        self.emit_alloc();
+        self.asm.pop(Reg::X9);
+        self.asm.add_reg(Reg::X6, Reg::X3, Reg::X9);
+        self.asm.str_imm(Reg::X2, Reg::X5, 0);
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X8);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
     fn emit_str_char_count(&mut self) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
         self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
@@ -1804,6 +2055,48 @@ impl Emitter {
                 }
                 Ok(Some(ValueType::Str))
             }
+            ("toUpperCase", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "toUpperCase of a non-string"));
+                }
+                self.emit_str_ascii_case(true);
+                Ok(Some(ValueType::Str))
+            }
+            ("toLowerCase", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "toLowerCase of a non-string"));
+                }
+                self.emit_str_ascii_case(false);
+                Ok(Some(ValueType::Str))
+            }
+            ("reverse", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "reverse of a non-string"));
+                }
+                self.emit_str_reverse();
+                Ok(Some(ValueType::Str))
+            }
+            ("trim", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "trim of a non-string"));
+                }
+                self.emit_str_trim(true, true);
+                Ok(Some(ValueType::Str))
+            }
+            ("trimLeft", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "trimLeft of a non-string"));
+                }
+                self.emit_str_trim(true, false);
+                Ok(Some(ValueType::Str))
+            }
+            ("trimRight", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "trimRight of a non-string"));
+                }
+                self.emit_str_trim(false, true);
+                Ok(Some(ValueType::Str))
+            }
             ("substring", 3) => {
                 if self.expression(&arguments[0])? != ValueType::Str {
                     return Err(unsupported(span, "substring of a non-string"));
@@ -1836,6 +2129,32 @@ impl Emitter {
                 self.asm.add_reg_imm(Reg::X2, Reg::X1, 1);
                 self.emit_substring();
                 Ok(Some(ValueType::Str))
+            }
+            ("startsWith", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "startsWith of a non-string"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "startsWith with a non-string prefix"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.pop(Reg::X0);
+                self.emit_str_starts_with();
+                Ok(Some(ValueType::Bool))
+            }
+            ("endsWith", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "endsWith of a non-string"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "endsWith with a non-string suffix"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.pop(Reg::X0);
+                self.emit_str_ends_with();
+                Ok(Some(ValueType::Bool))
             }
             ("head", 1) => {
                 let ty = self.expression(&arguments[0])?;
