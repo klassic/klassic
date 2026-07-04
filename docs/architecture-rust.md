@@ -954,6 +954,28 @@ cargo run -- -e "1 + 2"
   taught. Remaining plan after M14: M15 (directory ops), M16
   (environment/time), plus `replaceAll`/`split` above.
 
+  M15 (issue #538) adds directory ops: `Dir#mkdir`/`#mkdirs`
+  (`mkdir`=136, mode `0o755`), `Dir#delete` (`rmdir`=137),
+  `Dir#isDirectory` (`fstatat64`=470 with `AT_FDCWD`=-2, testing
+  `stat64.st_mode`'s file-type nibble against `S_IFDIR` -- Darwin
+  places `st_mode` as a 2-byte halfword at offset 4, not 8 bytes at
+  offset 24 like Linux), and `Dir#move` (`rename`=128). `Dir#mkdirs`
+  cannot mutate the path's `/` bytes at runtime to walk prefixes the
+  way the x86_64 backend does, because aarch64's rodata lives in the
+  Mach-O `__TEXT` segment (read-only, unlike ELF's writable `.data`);
+  since the path is already constrained to a compile-time literal,
+  the backend instead computes every `/`-separated prefix in Rust and
+  emits one `mkdir` (tolerating `EEXIST`, errno 17) per prefix. An
+  empty path emits no prefixes at all (a no-op), matching the
+  evaluator's `fs::create_dir_all("")` (which succeeds) rather than
+  `mkdir("")`'s own `ENOENT` failure.
+  `Dir#isDirectory` reads its 144-byte stat buffer from a fresh
+  bump-heap allocation -- safe today because this backend has no
+  collector yet to mistake the raw stat bytes for a pointer -- and
+  reports `false` rather than aborting on a failed stat, matching the
+  evaluator's `Path::is_dir()`. Introduces `ldrh_imm` (halfword load)
+  to the assembler.
+
   `x86_64-pc-windows-msvc` (`--target x86_64-pc-windows-msvc` /
   `windows-x86_64`) is the one target that does *not* get its own
   codegen module: it reuses the entire `DirectX86_64` (Linux) code

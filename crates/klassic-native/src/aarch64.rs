@@ -33,6 +33,16 @@ const SYS_CLOSE: u16 = 6;
 const SYS_UNLINK: u16 = 10;
 /// Darwin `access(path, mode)`. `mode = 0` (`F_OK`) checks existence.
 const SYS_ACCESS: u16 = 33;
+/// Darwin `rmdir`.
+const SYS_RMDIR: u16 = 137;
+/// Darwin `mkdir`.
+const SYS_MKDIR: u16 = 136;
+/// Darwin `fstatat64` -- used with `AT_FDCWD` for a plain `stat`.
+const SYS_FSTATAT64: u16 = 470;
+/// Darwin `rename`.
+const SYS_RENAME: u16 = 128;
+/// Darwin's `AT_FDCWD` is `-2`, not Linux's `-100` (bsd/sys/fcntl.h).
+const AT_FDCWD: i64 = -2;
 /// Darwin's `O_*` open flags (bsd/sys/fcntl.h) -- numerically
 /// different from Linux's; reusing Linux values would silently
 /// corrupt file-open semantics.
@@ -43,6 +53,8 @@ const O_CREAT: u64 = 0x200;
 const O_TRUNC: u64 = 0x400;
 /// `0o644`: rw-r--r--, the default mode for a newly created file.
 const DEFAULT_FILE_MODE: u64 = 0o644;
+/// `0o755`: rwxr-xr-x, the default mode for a newly created directory.
+const DEFAULT_DIR_MODE: u64 = 0o755;
 /// Darwin `mmap`. Heap segments come straight from the kernel.
 const SYS_MMAP: u16 = 197;
 const STDOUT_FD: u64 = 1;
@@ -576,6 +588,13 @@ impl Assembler {
     /// `ldrb wt, [xn]` — peek without advancing.
     fn ldrb(&mut self, dst: Reg, base: Reg) {
         self.word(0x3940_0000 | ((base as u32) << 5) | dst as u32);
+    }
+
+    /// `ldrh wt, [xn, #imm]` (unsigned, 2-byte scaled) -- used to read
+    /// Darwin's `stat64.st_mode`, a halfword field.
+    fn ldrh_imm(&mut self, dst: Reg, base: Reg, imm: u32) {
+        debug_assert!(imm.is_multiple_of(2) && imm / 2 < 4096);
+        self.word(0x7940_0000 | ((imm / 2) << 10) | ((base as u32) << 5) | dst as u32);
     }
 
     /// `ldr xt, [xn, xm]` — register-offset load.
@@ -1254,6 +1273,116 @@ impl Emitter {
             .emit_write_rodata(STDERR_FD, b"klassic: FileOutput#delete failed\n");
         self.asm.emit_exit(1);
         self.asm.bind(ok);
+        self.asm.mov_imm64(Reg::X0, 0); // Unit
+    }
+
+    /// `Dir#mkdir`(path): mkdir syscall on the NUL-terminated path
+    /// (rodata, `path_offset`) with mode `0o755`. Aborts with a
+    /// source-located message on any failure, matching the
+    /// evaluator's `fs::create_dir` (which errors on an
+    /// already-existing path) (M15, issue #538).
+    fn emit_dir_mkdir(&mut self, path_offset: usize) {
+        self.asm.load_rodata_address(Reg::X0, path_offset);
+        self.asm.mov_imm64(Reg::X1, DEFAULT_DIR_MODE);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_MKDIR));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: Dir#mkdir failed\n");
+        self.asm.mov_imm64(Reg::X0, 0); // Unit
+    }
+
+    /// `Dir#mkdirs` per-prefix step: mkdir syscall on the
+    /// NUL-terminated path (rodata, `path_offset`), tolerating
+    /// `EEXIST` (errno 17) as success -- an intermediate or final
+    /// directory may already exist, matching the evaluator's
+    /// `fs::create_dir_all` leniency. Aborts with a source-located
+    /// message on any other failure. Does not set a return value;
+    /// callers run this once per `/`-separated prefix and set the
+    /// `Unit` result after the last one (M15, issue #538).
+    fn emit_dir_mkdir_tolerating_eexist(&mut self, path_offset: usize) {
+        const EEXIST: u32 = 17;
+        self.asm.load_rodata_address(Reg::X0, path_offset);
+        self.asm.mov_imm64(Reg::X1, DEFAULT_DIR_MODE);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_MKDIR));
+        self.asm.svc_0x80();
+        let ok = self.asm.new_label();
+        self.asm.branch(ok, BranchKind::Conditional(Cond::Cc));
+        self.asm.cmp_imm(Reg::X0, EEXIST);
+        self.asm.branch(ok, BranchKind::Conditional(Cond::Eq));
+        self.asm
+            .emit_write_rodata(STDERR_FD, b"klassic: Dir#mkdirs failed\n");
+        self.asm.emit_exit(1);
+        self.asm.bind(ok);
+    }
+
+    /// `Dir#delete`(path): rmdir syscall on the NUL-terminated path
+    /// (rodata, `path_offset`). Aborts with a source-located message
+    /// on any failure, matching the evaluator's `fs::remove_dir`
+    /// (errors on a non-empty or missing directory) (M15, issue
+    /// #538).
+    fn emit_dir_delete(&mut self, path_offset: usize) {
+        self.asm.load_rodata_address(Reg::X0, path_offset);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_RMDIR));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: Dir#delete failed\n");
+        self.asm.mov_imm64(Reg::X0, 0); // Unit
+    }
+
+    /// `Dir#isDirectory`(path): `fstatat64(AT_FDCWD, path, &buf, 0)`
+    /// then tests whether `buf.st_mode`'s file-type bits equal
+    /// `S_IFDIR`. Darwin's `stat64` places `st_mode` as a 2-byte
+    /// halfword at offset 4 (not 8 bytes at offset 24 like Linux); the
+    /// 144-byte buffer is a fresh bump-heap allocation per call (no
+    /// GC exists yet on this backend to worry about tracing raw stat
+    /// bytes as pointers -- directory checks are not hot-path enough
+    /// to justify a reusable scratch slot). Shifts `st_mode` right by
+    /// 12 bits to compare only the file-type nibble against `S_IFDIR
+    /// >> 12` rather than emitting an `AND`-immediate (Darwin's
+    /// `S_IFMT` bitmask encoding is annoying to construct; a value
+    /// with a clean high nibble and zero low bits is bit-identical to
+    /// its own top bits after this shift). A failed stat (e.g. a
+    /// missing path) reports `false` rather than aborting, matching
+    /// the evaluator's `Path::is_dir()` (M15, issue #538).
+    fn emit_dir_is_directory(&mut self, path_offset: usize) {
+        const STAT_BUF_SIZE: u64 = 144;
+        const S_IFDIR_SHIFTED: u32 = 0o4; // S_IFDIR (0o040000) >> 12
+
+        self.asm.mov_imm64(Reg::X4, STAT_BUF_SIZE);
+        self.emit_alloc(); // x5 = stat buffer
+        self.asm.mov_reg(Reg::X6, Reg::X5);
+
+        self.asm.mov_imm64(Reg::X0, AT_FDCWD as u64);
+        self.asm.load_rodata_address(Reg::X1, path_offset);
+        self.asm.mov_reg(Reg::X2, Reg::X6);
+        self.asm.mov_imm64(Reg::X3, 0);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_FSTATAT64));
+        self.asm.svc_0x80();
+
+        let success = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.branch(success, BranchKind::Conditional(Cond::Cc));
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(success);
+        self.asm.ldrh_imm(Reg::X0, Reg::X6, 4);
+        self.asm.lsr_imm(Reg::X0, Reg::X0, 12);
+        self.asm.cmp_imm(Reg::X0, S_IFDIR_SHIFTED);
+        self.asm.cset(Reg::X0, Cond::Eq);
+        self.asm.bind(done);
+    }
+
+    /// `Dir#move`(source, target): rename syscall on the two
+    /// NUL-terminated paths (rodata, `source_offset`/`target_offset`).
+    /// Aborts with a source-located message on any failure, matching
+    /// the evaluator's `fs::rename` (M15, issue #538).
+    fn emit_dir_move(&mut self, source_offset: usize, target_offset: usize) {
+        self.asm.load_rodata_address(Reg::X0, source_offset);
+        self.asm.load_rodata_address(Reg::X1, target_offset);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_RENAME));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: Dir#move failed\n");
         self.asm.mov_imm64(Reg::X0, 0); // Unit
     }
 
@@ -2630,6 +2759,107 @@ impl Emitter {
                 }
                 let path_offset = self.asm.intern_nul_terminated(path);
                 self.emit_file_delete(path_offset);
+                Ok(Some(ValueType::Unit))
+            }
+            ("Dir#mkdir", 1) => {
+                let Expr::String {
+                    value: path,
+                    span: path_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if path.contains("#{") {
+                    return Err(unsupported(*path_span, "string interpolation"));
+                }
+                let path_offset = self.asm.intern_nul_terminated(path);
+                self.emit_dir_mkdir(path_offset);
+                Ok(Some(ValueType::Unit))
+            }
+            ("Dir#delete", 1) => {
+                let Expr::String {
+                    value: path,
+                    span: path_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if path.contains("#{") {
+                    return Err(unsupported(*path_span, "string interpolation"));
+                }
+                let path_offset = self.asm.intern_nul_terminated(path);
+                self.emit_dir_delete(path_offset);
+                Ok(Some(ValueType::Unit))
+            }
+            ("Dir#mkdirs", 1) => {
+                let Expr::String {
+                    value: path,
+                    span: path_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if path.contains("#{") {
+                    return Err(unsupported(*path_span, "string interpolation"));
+                }
+                // An empty path is a no-op, matching the evaluator's
+                // `fs::create_dir_all("")` (which succeeds); `mkdir("")`
+                // itself would fail with ENOENT, not EEXIST, and abort.
+                let mut prefixes = Vec::new();
+                if !path.is_empty() {
+                    for (index, ch) in path.char_indices() {
+                        if ch == '/' && index > 0 {
+                            prefixes.push(path[..index].to_string());
+                        }
+                    }
+                    prefixes.push(path.clone());
+                }
+                for prefix in prefixes {
+                    let prefix_offset = self.asm.intern_nul_terminated(&prefix);
+                    self.emit_dir_mkdir_tolerating_eexist(prefix_offset);
+                }
+                self.asm.mov_imm64(Reg::X0, 0); // Unit
+                Ok(Some(ValueType::Unit))
+            }
+            ("Dir#isDirectory", 1) => {
+                let Expr::String {
+                    value: path,
+                    span: path_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if path.contains("#{") {
+                    return Err(unsupported(*path_span, "string interpolation"));
+                }
+                let path_offset = self.asm.intern_nul_terminated(path);
+                self.emit_dir_is_directory(path_offset);
+                Ok(Some(ValueType::Bool))
+            }
+            ("Dir#move", 2) => {
+                let Expr::String {
+                    value: source,
+                    span: source_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if source.contains("#{") {
+                    return Err(unsupported(*source_span, "string interpolation"));
+                }
+                let Expr::String {
+                    value: target,
+                    span: target_span,
+                } = &arguments[1]
+                else {
+                    return Err(unsupported(arguments[1].span(), "a non-literal path"));
+                };
+                if target.contains("#{") {
+                    return Err(unsupported(*target_span, "string interpolation"));
+                }
+                let source_offset = self.asm.intern_nul_terminated(source);
+                let target_offset = self.asm.intern_nul_terminated(target);
+                self.emit_dir_move(source_offset, target_offset);
                 Ok(Some(ValueType::Unit))
             }
             _ => Ok(None),
