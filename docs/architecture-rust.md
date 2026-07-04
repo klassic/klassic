@@ -976,34 +976,35 @@ cargo run -- -e "1 + 2"
   evaluator's `Path::is_dir()`. Introduces `ldrh_imm` (halfword load)
   to the assembler.
 
-  M16 (issue #538) adds environment/time: `Environment#exists` and
-  `Time#nowMillis`, plus a program-prologue change both depend on.
-  dyld calls the Mach-O `LC_MAIN` entry as a plain AAPCS64 call --
-  `x0`=argc, `x1`=argv, `x2`=envp, `x3`=apple -- so `emit_macho_program`
-  now copies `x0`-`x2` into three newly reserved callee-saved
-  registers (`x21`-`x23`) before anything else can clobber them,
-  exactly the way `x19`/`x20` already carry the bump allocator's state
-  across the whole program without ever being spilled.
-  `Environment#exists` walks the NUL-terminated `envp` array pointed
-  to by `x23` (each entry a `"KEY=VALUE"` C string) comparing a
-  compile-time literal key's bytes against each entry's prefix,
+  M16 (issue #538) adds `Environment#exists`, plus a program-prologue
+  change it depends on. dyld calls the Mach-O `LC_MAIN` entry as a
+  plain AAPCS64 call -- `x0`=argc, `x1`=argv, `x2`=envp, `x3`=apple --
+  so `emit_macho_program` now copies `x0`-`x2` into three newly
+  reserved callee-saved registers (`x21`-`x23`) before anything else
+  can clobber them, exactly the way `x19`/`x20` already carry the bump
+  allocator's state across the whole program without ever being
+  spilled. `Environment#exists` walks the NUL-terminated `envp` array
+  pointed to by `x23` (each entry a `"KEY=VALUE"` C string) comparing
+  a compile-time literal key's bytes against each entry's prefix,
   requiring the byte right after the match to be `'='` so `"FOO"`
-  can't false-match an entry for `"FOOBAR"`. `Time#nowMillis` calls
-  `gettimeofday` (syscall 116) into a 16-byte scratch buffer and
-  computes `tv_sec*1000 + tv_usec/1000`; `syscalls.master` marks
-  `gettimeofday` `NO_SYSCALL_STUB` (normally served from the commpage
-  on real hardware for speed), so this is the one M16 syscall whose
-  raw two-argument `svc #0x80` form wasn't verified against a written
-  spec before landing -- the macOS CI execution test is what actually
-  proves it works. Reuses the existing `mul_reg`/`sdiv_reg` for the
-  millisecond conversion. `tv_usec` is Darwin's real 4-byte
-  `__int32_t` field (followed by 4 bytes of padding to round the
-  struct to 16 bytes) -- introduces `ldr_imm32` (32-bit load,
-  zero-extending) to read it, rather than the existing 64-bit
-  `ldr_imm`, so the result never depends on those padding bytes
-  happening to be zero (an independent review flagged the original
-  64-bit read as a correct-today-but-fragile assumption before this
-  landed).
+  can't false-match an entry for `"FOOBAR"`.
+
+  `Time#nowMillis` was attempted in the same milestone (calling
+  `gettimeofday`, syscall 116, into a scratch buffer) and withdrawn
+  before merge: `syscalls.master` marks `gettimeofday`
+  `NO_SYSCALL_STUB` (normally served from the commpage on real
+  hardware, not trapped), and the real-hardware CI execution test --
+  the only way to actually find out -- showed the raw two-argument
+  `svc #0x80` form is genuinely unreliable rather than just slower.
+  The same binary produced two different symptoms across CI runs
+  depending on call order: a clean, intentional syscall-failure abort
+  in one ordering (`Environment#exists` called first) and a SIGSEGV in
+  another (`Time#nowMillis` called first, so its `gettimeofday` was
+  the very first heap allocation in the program). `Time#nowMillis`
+  remains an explicit `unsupported` diagnostic on this backend until a
+  safe alternative (reading the commpage directly, or
+  `mach_absolute_time`) is designed and verified on real hardware
+  first.
 
   `x86_64-pc-windows-msvc` (`--target x86_64-pc-windows-msvc` /
   `windows-x86_64`) is the one target that does *not* get its own

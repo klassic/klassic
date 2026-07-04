@@ -41,15 +41,6 @@ const SYS_MKDIR: u16 = 136;
 const SYS_FSTATAT64: u16 = 470;
 /// Darwin `rename`.
 const SYS_RENAME: u16 = 128;
-/// Darwin `gettimeofday`. `syscalls.master` marks this
-/// `NO_SYSCALL_STUB` (normally commpage-served on real hardware for
-/// speed) -- the raw two-argument `svc #0x80` form used here is
-/// expected to still work as a fallback path into the same kernel
-/// handler, but this is the one M16 syscall whose raw-svc behavior
-/// wasn't verified against a spec before landing; treat a failure
-/// here as the first thing to suspect if `Time#nowMillis` misbehaves
-/// on real hardware.
-const SYS_GETTIMEOFDAY: u16 = 116;
 /// Darwin's `AT_FDCWD` is `-2`, not Linux's `-100` (bsd/sys/fcntl.h).
 const AT_FDCWD: i64 = -2;
 /// Darwin's `O_*` open flags (bsd/sys/fcntl.h) -- numerically
@@ -592,17 +583,6 @@ impl Assembler {
     fn ldr_imm(&mut self, dst: Reg, base: Reg, imm: u32) {
         debug_assert!(imm.is_multiple_of(8) && imm / 8 < 4096);
         self.word(0xf940_0000 | ((imm / 8) << 10) | ((base as u32) << 5) | dst as u32);
-    }
-
-    /// `ldr wt, [xn, #imm]` (unsigned, 4-byte scaled, 32-bit --
-    /// zero-extends into the full 64-bit register per AAPCS64
-    /// W-register write semantics). Used where a field is genuinely
-    /// 4 bytes and a 64-bit load would pull in unrelated trailing
-    /// bytes (e.g. Darwin's `struct timeval.tv_usec`, a
-    /// `__int32_t` immediately followed by 4 bytes of padding).
-    fn ldr_imm32(&mut self, dst: Reg, base: Reg, imm: u32) {
-        debug_assert!(imm.is_multiple_of(4) && imm / 4 < 4096);
-        self.word(0xb940_0000 | ((imm / 4) << 10) | ((base as u32) << 5) | dst as u32);
     }
 
     /// `str xt, [xn, #imm]` (unsigned, 8-byte scaled)
@@ -1466,33 +1446,6 @@ impl Emitter {
         self.asm.bind(not_found);
         self.asm.mov_imm64(Reg::X0, 0);
         self.asm.bind(done);
-    }
-
-    /// `Time#nowMillis`(): `gettimeofday(&buf, NULL)` into a fresh
-    /// 16-byte bump-heap buffer laid out as Darwin's actual
-    /// `struct timeval` (`tv_sec: i64` at offset 0, `tv_usec: i32` at
-    /// offset 8 followed by 4 bytes of padding -- read with a 32-bit
-    /// load so the result never depends on those padding bytes being
-    /// zero), then computes `tv_sec*1000 + tv_usec/1000` (M16, issue
-    /// #538).
-    fn emit_time_now_millis(&mut self) {
-        self.asm.mov_imm64(Reg::X4, 16);
-        self.emit_alloc(); // x5 = timeval buffer
-        self.asm.mov_reg(Reg::X6, Reg::X5);
-
-        self.asm.mov_reg(Reg::X0, Reg::X6);
-        self.asm.mov_imm64(Reg::X1, 0); // tzp = NULL
-        self.asm.mov_imm64(Reg::X16, u64::from(SYS_GETTIMEOFDAY));
-        self.asm.svc_0x80();
-        self.asm
-            .emit_abort_if_syscall_failed(b"klassic: Time#nowMillis failed\n");
-
-        self.asm.ldr_imm(Reg::X0, Reg::X6, 0); // tv_sec
-        self.asm.ldr_imm32(Reg::X1, Reg::X6, 8); // tv_usec (32-bit field)
-        self.asm.mov_imm64(Reg::X2, 1000);
-        self.asm.mul_reg(Reg::X0, Reg::X0, Reg::X2); // tv_sec * 1000
-        self.asm.sdiv_reg(Reg::X1, Reg::X1, Reg::X2); // tv_usec / 1000
-        self.asm.add_reg(Reg::X0, Reg::X0, Reg::X1);
     }
 
     fn binary(
@@ -2987,10 +2940,6 @@ impl Emitter {
                 }
                 self.emit_environment_exists(key);
                 Ok(Some(ValueType::Bool))
-            }
-            ("Time#nowMillis", 0) => {
-                self.emit_time_now_millis();
-                Ok(Some(ValueType::Int))
             }
             _ => Ok(None),
         }
