@@ -941,10 +941,28 @@ cargo run -- -e "1 + 2"
   `emit_alloc` call, the same one-value-survives-the-call discipline
   every other M13 routine already uses. Introduces the general
   `bytes_equal` helper (walks two pointers byte-by-byte, sets a
-  0/1 result) for the pattern-match test. `split` is left for a
-  follow-up once someone wants it (the same scratch-struct approach
-  should generalize, since it was the register pressure that blocked
-  progress, not anything split-specific).
+  0/1 result) for the pattern-match test.
+
+  `split` (issue #538) generalized the same scratch-struct approach,
+  confirming it was the register pressure that blocked progress and
+  not anything `replaceAll`-specific. Two paths: an empty delimiter
+  splits per UTF-8 character (the same lead-byte/continuation-byte
+  boundary test `emit_str_char_count` already uses); a non-empty
+  delimiter scans for non-overlapping matches, Rust
+  `str::split`-equivalent (so `split("", ",")` is a one-element list
+  `[""]`, while `split("", "")` is genuinely empty -- the two paths
+  deliberately diverge on empty input, matching the evaluator).  Both
+  paths share a `emit_split_build_segment_and_push` helper: build one
+  segment's exact-size string object and push its pointer onto the
+  *machine* stack, incrementing a running count, so the eight values
+  that must survive its `emit_alloc` call (six fixed registers plus
+  the computed length and start offset) get one push/pop bracket
+  instead of being threaded through by hand at each of the two call
+  sites. Once every segment is found, the routine pops them back off
+  the stack in reverse (last found first) and `cons`es each onto a
+  growing list via the existing `emit_cons_cell` -- since `cons`
+  prepends, popping last-to-first reassembles the original
+  left-to-right order.
 
   M14 (issue #538) adds file I/O: `FileOutput#write`/`#append`
   (opens with `O_WRONLY|O_CREAT|` `O_TRUNC` or `O_APPEND`, writes the

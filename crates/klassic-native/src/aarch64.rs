@@ -2163,6 +2163,213 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X5);
     }
 
+    /// Build a fresh string object holding `input_bytes_base[start..end]`
+    /// (byte offsets, in x0/x1) and push it onto the machine stack.
+    /// Expects the split scratch struct in x6, `input_bytes_base` in
+    /// x8, `input_len` in x9, scan position in x10, segment-start
+    /// offset in x11, and running segment count in x12 -- all six
+    /// survive the `emit_alloc` call this needs, via an explicit
+    /// push/pop bracket (the one-value-survives-the-call discipline
+    /// `emit_str_replace_all` uses, just for six values at once
+    /// instead of one).
+    fn emit_split_build_segment_and_push(&mut self, start: Reg, end: Reg) {
+        self.asm.sub_reg(Reg::X2, end, start); // len = end - start
+        self.asm.push(Reg::X6);
+        self.asm.push(Reg::X8);
+        self.asm.push(Reg::X9);
+        self.asm.push(Reg::X10);
+        self.asm.push(Reg::X11);
+        self.asm.push(Reg::X12);
+        self.asm.push(Reg::X2); // len
+        self.asm.push(start);
+        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        self.emit_alloc(); // x5 = new segment string object
+        self.asm.pop(Reg::X0); // start offset
+        self.asm.pop(Reg::X2); // len
+        self.asm.pop(Reg::X12);
+        self.asm.pop(Reg::X11);
+        self.asm.pop(Reg::X10);
+        self.asm.pop(Reg::X9);
+        self.asm.pop(Reg::X8);
+        self.asm.pop(Reg::X6);
+
+        self.asm.str_imm(Reg::X2, Reg::X5, 0);
+        self.asm.add_reg(Reg::X3, Reg::X8, Reg::X0); // src = input_bytes_base + start
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8); // dst = new object's payload
+        self.emit_copy_bytes(Reg::X2, Reg::X3, Reg::X7, Reg::X1);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+        self.asm.push(Reg::X0);
+        self.asm.add_reg_imm(Reg::X12, Reg::X12, 1);
+    }
+
+    /// `split`(input, delimiter): non-empty-delimiter path, `Rust
+    /// str::split`-equivalent semantics (non-overlapping matches
+    /// scanned left to right, an empty segment between adjacent
+    /// delimiters or at a leading/trailing delimiter). Two-pass-plus-
+    /// build design: scan once, building each segment string and
+    /// pushing it onto the machine stack in left-to-right order, then
+    /// pop them back off (right-to-left, i.e. last segment first) and
+    /// `cons` each onto a growing list -- since `cons` prepends, this
+    /// naturally reassembles the original left-to-right order.
+    ///
+    /// Uses the same scratch-heap-struct approach as `replaceAll` for
+    /// the two fixed values needed throughout (input/delimiter's
+    /// byte-base pointer and length), since that's what actually
+    /// solved the register-pressure wall that stalled the earlier
+    /// `replaceAll` attempt, generalized here to a 32-byte struct.
+    fn emit_str_split_nonempty_delimiter(&mut self) {
+        // x0 = input, x1 = delimiter
+        self.asm.push(Reg::X0);
+        self.asm.push(Reg::X1);
+        self.asm.mov_imm64(Reg::X4, 32);
+        self.emit_alloc(); // x5 = scratch struct
+        self.asm.mov_reg(Reg::X6, Reg::X5);
+        self.asm.pop(Reg::X1);
+        self.asm.pop(Reg::X0);
+
+        // Scratch layout: [0]=input_bytes_base [8]=input_len
+        // [16]=delimiter_bytes_base [24]=delimiter_len
+        self.asm.ldr_imm(Reg::X7, Reg::X0, 0);
+        self.asm.str_imm(Reg::X7, Reg::X6, 8);
+        self.asm.add_reg_imm(Reg::X7, Reg::X0, 8);
+        self.asm.str_imm(Reg::X7, Reg::X6, 0);
+        self.asm.ldr_imm(Reg::X7, Reg::X1, 0);
+        self.asm.str_imm(Reg::X7, Reg::X6, 24);
+        self.asm.add_reg_imm(Reg::X7, Reg::X1, 8);
+        self.asm.str_imm(Reg::X7, Reg::X6, 16);
+
+        self.asm.ldr_imm(Reg::X8, Reg::X6, 0); // input_bytes_base
+        self.asm.ldr_imm(Reg::X9, Reg::X6, 8); // input_len
+        self.asm.mov_imm64(Reg::X10, 0); // pos
+        self.asm.mov_imm64(Reg::X11, 0); // segment_start
+        self.asm.mov_imm64(Reg::X12, 0); // segment_count
+
+        let scan_loop = self.asm.new_label();
+        let scan_is_match = self.asm.new_label();
+        let scan_done = self.asm.new_label();
+        self.asm.bind(scan_loop);
+        self.asm.ldr_imm(Reg::X0, Reg::X6, 24); // delimiter_len
+        self.asm.add_reg(Reg::X1, Reg::X10, Reg::X0);
+        self.asm.cmp_reg(Reg::X1, Reg::X9);
+        self.asm
+            .branch(scan_done, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg(Reg::X0, Reg::X8, Reg::X10); // a_ptr
+        self.asm.ldr_imm(Reg::X1, Reg::X6, 16); // b_ptr = delimiter_bytes_base
+        self.asm.ldr_imm(Reg::X2, Reg::X6, 24); // len = delimiter_len
+        self.asm
+            .bytes_equal(Reg::X2, Reg::X0, Reg::X1, Reg::X3, Reg::X4, Reg::X7);
+        self.asm
+            .branch(scan_is_match, BranchKind::CompareNonZero(Reg::X3));
+        self.asm.add_reg_imm(Reg::X10, Reg::X10, 1);
+        self.asm.branch(scan_loop, BranchKind::Unconditional);
+
+        self.asm.bind(scan_is_match);
+        self.emit_split_build_segment_and_push(Reg::X11, Reg::X10);
+        self.asm.ldr_imm(Reg::X7, Reg::X6, 24); // delimiter_len
+        self.asm.add_reg(Reg::X10, Reg::X10, Reg::X7);
+        self.asm.mov_reg(Reg::X11, Reg::X10);
+        self.asm.branch(scan_loop, BranchKind::Unconditional);
+
+        self.asm.bind(scan_done);
+        self.emit_split_build_segment_and_push(Reg::X11, Reg::X9);
+
+        // Pop segments back off (last-pushed first) and cons each
+        // onto a growing list -- this reassembles left-to-right order.
+        self.asm.mov_imm64(Reg::X0, 0); // list = nil
+        let cons_loop = self.asm.new_label();
+        let cons_done = self.asm.new_label();
+        self.asm.bind(cons_loop);
+        self.asm
+            .branch(cons_done, BranchKind::CompareZero(Reg::X12));
+        self.emit_cons_cell();
+        self.asm.sub_reg_imm(Reg::X12, Reg::X12, 1);
+        self.asm.branch(cons_loop, BranchKind::Unconditional);
+        self.asm.bind(cons_done);
+    }
+
+    /// `split`(input, ""): each UTF-8 character becomes its own
+    /// one-character list element. Scans left to right, treating any
+    /// byte whose top two bits aren't `10` (a UTF-8 continuation
+    /// byte) as the start of a new character -- the same detection
+    /// `emit_str_char_count`/`emit_str_reverse` already use. Shares
+    /// `emit_split_build_segment_and_push`'s scratch-object
+    /// registers (x6/x8/x9/x10/x11/x12) even though there's no
+    /// delimiter scratch struct here; x6 is simply an unused
+    /// push/pop round-trip in this path (harmless, since nothing
+    /// reads it back).
+    fn emit_str_split_chars(&mut self) {
+        // x0 = input
+        self.asm.ldr_imm(Reg::X9, Reg::X0, 0); // input_len
+        self.asm.add_reg_imm(Reg::X8, Reg::X0, 8); // input_bytes_base
+        self.asm.mov_imm64(Reg::X10, 0); // pos
+        self.asm.mov_imm64(Reg::X12, 0); // char_count
+
+        let scan_loop = self.asm.new_label();
+        let scan_done = self.asm.new_label();
+        let continuation_loop = self.asm.new_label();
+        let char_end_found = self.asm.new_label();
+        self.asm.bind(scan_loop);
+        self.asm.cmp_reg(Reg::X10, Reg::X9);
+        self.asm
+            .branch(scan_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.mov_reg(Reg::X11, Reg::X10); // char_start = pos
+        self.asm.add_reg_imm(Reg::X10, Reg::X10, 1); // consume the lead byte
+
+        self.asm.bind(continuation_loop);
+        self.asm.cmp_reg(Reg::X10, Reg::X9);
+        self.asm
+            .branch(char_end_found, BranchKind::Conditional(Cond::Ge));
+        self.asm.add_reg(Reg::X0, Reg::X8, Reg::X10);
+        self.asm.ldrb(Reg::X1, Reg::X0);
+        self.asm.lsr_imm(Reg::X1, Reg::X1, 6);
+        self.asm.cmp_imm(Reg::X1, 2);
+        self.asm
+            .branch(char_end_found, BranchKind::Conditional(Cond::Ne));
+        self.asm.add_reg_imm(Reg::X10, Reg::X10, 1); // consume continuation byte
+        self.asm
+            .branch(continuation_loop, BranchKind::Unconditional);
+
+        self.asm.bind(char_end_found);
+        self.emit_split_build_segment_and_push(Reg::X11, Reg::X10);
+        self.asm.branch(scan_loop, BranchKind::Unconditional);
+        self.asm.bind(scan_done);
+
+        self.asm.mov_imm64(Reg::X0, 0); // list = nil
+        let cons_loop = self.asm.new_label();
+        let cons_done = self.asm.new_label();
+        self.asm.bind(cons_loop);
+        self.asm
+            .branch(cons_done, BranchKind::CompareZero(Reg::X12));
+        self.emit_cons_cell();
+        self.asm.sub_reg_imm(Reg::X12, Reg::X12, 1);
+        self.asm.branch(cons_loop, BranchKind::Unconditional);
+        self.asm.bind(cons_done);
+    }
+
+    /// `split`(input, delimiter): dispatches to the empty-delimiter
+    /// (per-character) or non-empty-delimiter path.
+    fn emit_str_split(&mut self) {
+        // x0 = input, x1 = delimiter
+        self.asm.push(Reg::X0);
+        self.asm.push(Reg::X1);
+        self.asm.ldr_imm(Reg::X2, Reg::X1, 0); // delimiter_len
+        let non_empty = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm
+            .branch(non_empty, BranchKind::CompareNonZero(Reg::X2));
+        self.asm.pop(Reg::X1);
+        self.asm.pop(Reg::X0);
+        self.emit_str_split_chars();
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(non_empty);
+        self.asm.pop(Reg::X1);
+        self.asm.pop(Reg::X0);
+        self.emit_str_split_nonempty_delimiter();
+        self.asm.bind(done);
+    }
+
     fn emit_str_char_count(&mut self) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
         self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
@@ -2807,6 +3014,19 @@ impl Emitter {
                 self.asm.pop(Reg::X0);
                 self.emit_str_replace_all();
                 Ok(Some(ValueType::Str))
+            }
+            ("split", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "split of a non-string"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "split with a non-string delimiter"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.pop(Reg::X0);
+                self.emit_str_split();
+                Ok(Some(ValueType::List(ListElem::Str)))
             }
             ("head", 1) => {
                 let ty = self.expression(&arguments[0])?;
