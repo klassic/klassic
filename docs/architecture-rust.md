@@ -886,9 +886,29 @@ cargo run -- -e "1 + 2"
   interpolation path there's no capacity to track — every
   intermediate concat result is a fresh, correctly-sized allocation.
   A nested interpolation or an enum/record/list hole is deferred with
-  a source-located diagnostic rather than guessed at. Remaining plan:
-  M13 (string builtin parity), M14 (file I/O), M15 (directory ops),
-  M16 (environment/time).
+  a source-located diagnostic rather than guessed at.
+
+  M13 (issue #538, first slice) adds `toUpperCase`/`toLowerCase`
+  (ASCII-only case shift, matching the x86_64 backend's accepted
+  precedent -- no full Unicode case tables), UTF-8-aware `reverse`
+  (scans backward to find each character's start byte, top bits != 2
+  once shifted right 6, then copies that character's bytes forward
+  into the output at the current write cursor -- characters are
+  discovered in reverse order, so writing them in discovery order
+  reverses the string), `startsWith`/`endsWith` (length-gated byte
+  comparison), and ASCII-only `trim`/`trimLeft`/`trimRight`. All of
+  these allocate a fresh, exact-size heap string via `emit_alloc`
+  rather than writing into a fixed-capacity scratch buffer, so there's
+  no capacity limit to enforce. Two new `Assembler` primitives back
+  this: `ldrb_reg_offset`/`strb_reg_offset` (register-offset byte
+  load/store, the same size-field flip from `ldr_reg_offset` that
+  `ldrb_post_increment` already applies to `ldr_post_increment`) and
+  `is_ascii_whitespace_into` (tests a byte against the same
+  space/tab/LF/CR/VT/FF set as the x86_64 backend's
+  `emit_jump_if_ascii_whitespace`). Remaining M13 slice:
+  `replaceAll`/`split`/`join`, which reuse the M7 cons-list machinery
+  and are left for a follow-up PR. Remaining plan after M13: M14 (file
+  I/O), M15 (directory ops), M16 (environment/time).
 
   `x86_64-pc-windows-msvc` (`--target x86_64-pc-windows-msvc` /
   `windows-x86_64`) is the one target that does *not* get its own
