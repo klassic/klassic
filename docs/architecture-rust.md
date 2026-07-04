@@ -923,15 +923,28 @@ cargo run -- -e "1 + 2"
   copying each element into a single exact-size allocation with the
   separator interspersed between elements). This is the first M13
   routine to walk a cons-list rather than operate on a single string.
-  Remaining M13 slice: `replaceAll`/`split`, which need pattern
-  matching plus a result whose length isn't known until the match
-  count is, and are left for a follow-up PR once a value-spilling
-  scheme is designed -- both routines need roughly 7 fixed values
-  (byte-base pointers and lengths for input/pattern/replacement, plus
-  a running match count and total result length) live simultaneously
-  across the copy loop, more than the register file holds without a
-  deliberate stack-spill discipline, and forcing it under time
-  pressure risks a repeat of (or worse than) the M13-slice-1 bug below.
+  `replaceAll` (M13's remaining slice, added later in issue #538 --
+  literal non-overlapping substring replacement; deliberately not the
+  evaluator's `"[0-9]"` pseudo-regex special case, and an empty
+  pattern aborts rather than replicating Rust's `str::replace("")`
+  between-every-character semantics, both explicit scope reductions
+  from x86_64 parity) needed the same six fixed values live
+  simultaneously across a two-pass count-then-copy algorithm that
+  stalled an earlier attempt at this routine (byte-base pointers and
+  lengths for input/pattern/replacement) -- more than the register
+  file holds without a deliberate spill scheme. Rather than spill to
+  individual stack slots, this writes all six values once into a
+  single 48-byte scratch heap object right after computing them, then
+  re-loads whichever value is needed from it by a fixed byte offset
+  wherever it's needed later, so only one pointer (to that object)
+  has to stay resident in a register across each subsequent
+  `emit_alloc` call, the same one-value-survives-the-call discipline
+  every other M13 routine already uses. Introduces the general
+  `bytes_equal` helper (walks two pointers byte-by-byte, sets a
+  0/1 result) for the pattern-match test. `split` is left for a
+  follow-up once someone wants it (the same scratch-struct approach
+  should generalize, since it was the register pressure that blocked
+  progress, not anything split-specific).
 
   M14 (issue #538) adds file I/O: `FileOutput#write`/`#append`
   (opens with `O_WRONLY|O_CREAT|` `O_TRUNC` or `O_APPEND`, writes the
