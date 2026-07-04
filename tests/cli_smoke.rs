@@ -22325,6 +22325,100 @@ fn build_target_aarch64_apple_darwin_string_builtins_run() {
     );
 }
 
+/// Regression guard on any host: `Dir#exists`/`FileOutput#exists`
+/// must cross-build for aarch64-apple-darwin. This is the first user
+/// of the M11 Darwin-syscall-failure convention (issue #538): the
+/// carry flag after `access`'s `svc #0x80` becomes the Bool result
+/// directly via `Cond::Cc`.
+#[test]
+fn build_target_aarch64_apple_darwin_dir_exists_cross_build() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_exists_xbuild_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_exists_xbuild_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(Dir#exists(\"/tmp\"))\n\
+         println(FileOutput#exists(\"/tmp\"))\n\
+         println(Dir#exists(\"/definitely-not-a-real-path-xyz\"))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        build_output.status.success(),
+        "darwin Dir#exists cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
+/// M11 acceptance test: `Dir#exists`/`FileOutput#exists` actually run
+/// on an Apple Silicon mac, driving Darwin's `access` syscall through
+/// the new carry-flag-to-Bool convention.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_dir_exists_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_exists_run_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_exists_run_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(Dir#exists(\"/tmp\"))\n\
+         println(FileOutput#exists(\"/tmp\"))\n\
+         println(Dir#exists(\"/definitely-not-a-real-path-xyz\"))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin Dir#exists build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "true\ntrue\nfalse\n"
+    );
+}
+
 /// On Apple Silicon a target-less `build` detects the host: programs
 /// inside the direct subset get the toolchain-free Mach-O backend
 /// (no libSystem linkage), and programs outside it silently fall

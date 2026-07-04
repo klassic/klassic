@@ -23,6 +23,8 @@ use crate::macho::{self, DataFixup};
 
 const SYS_EXIT: u16 = 1;
 const SYS_WRITE: u16 = 4;
+/// Darwin `access(path, mode)`. `mode = 0` (`F_OK`) checks existence.
+const SYS_ACCESS: u16 = 33;
 /// Darwin `mmap`. Heap segments come straight from the kernel.
 const SYS_MMAP: u16 = 197;
 const STDOUT_FD: u64 = 1;
@@ -81,6 +83,11 @@ const FP: u32 = 29;
 enum Cond {
     Eq = 0,
     Ne = 1,
+    /// Carry clear. Darwin's `svc #0x80` convention signals a
+    /// *successful* syscall this way (carry set = failure, x0 holds
+    /// the positive errno) — the mirror image of Linux's
+    /// negative-rax convention.
+    Cc = 3,
     /// After `fcmp`: strictly less, unordered fails — the float `<`.
     Mi = 4,
     /// After `fcmp`: less-or-equal, unordered fails — the float `<=`.
@@ -347,6 +354,17 @@ impl Assembler {
         offset
     }
 
+    /// Intern a NUL-terminated C string — the shape every Darwin
+    /// path-taking syscall (`access`, and later `open`/`unlink`/...)
+    /// requires, distinct from `intern_string_object`'s length-prefixed
+    /// Klassic string layout.
+    fn intern_nul_terminated(&mut self, text: &str) -> usize {
+        let offset = self.rodata.len();
+        self.rodata.extend_from_slice(text.as_bytes());
+        self.rodata.push(0);
+        offset
+    }
+
     /// write(fd, <rodata bytes>, len) — clobbers x0/x1/x2/x16.
     fn emit_write_rodata(&mut self, fd: u64, bytes: &[u8]) {
         let data_offset = self.intern_rodata(bytes);
@@ -355,6 +373,15 @@ impl Assembler {
         self.mov_imm64(Reg::X2, bytes.len() as u64);
         self.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
         self.svc_0x80();
+    }
+
+    /// `x0 = 1` if the preceding Darwin syscall succeeded (carry
+    /// clear), `0` otherwise — the qword-per-value sentinel `Dir#exists`
+    /// and friends return instead of aborting. Darwin's `svc #0x80`
+    /// carry-flag convention is the mirror image of Linux's
+    /// negative-rax convention (see issue #538, M11).
+    fn cset_syscall_succeeded(&mut self) {
+        self.cset(Reg::X0, Cond::Cc);
     }
 
     fn emit_exit(&mut self, status: u64) {
@@ -1910,6 +1937,28 @@ impl Emitter {
                     .emit_write_rodata(STDERR_FD, b"klassic: match: no pattern matched\n");
                 self.asm.emit_exit(1);
                 Ok(Some(ValueType::Never))
+            }
+            // `access(path, F_OK)`: the carry flag (Cond::Cc = success)
+            // becomes the Bool result directly — the first user of the
+            // M11 syscall-failure convention (issue #538).
+            ("Dir#exists", 1) | ("FileOutput#exists", 1) => {
+                let Expr::String {
+                    value,
+                    span: str_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if value.contains("#{") {
+                    return Err(unsupported(*str_span, "string interpolation"));
+                }
+                let path_offset = self.asm.intern_nul_terminated(value);
+                self.asm.load_rodata_address(Reg::X0, path_offset);
+                self.asm.mov_imm64(Reg::X1, 0); // F_OK
+                self.asm.mov_imm64(Reg::X16, u64::from(SYS_ACCESS));
+                self.asm.svc_0x80();
+                self.asm.cset_syscall_succeeded();
+                Ok(Some(ValueType::Bool))
             }
             _ => Ok(None),
         }

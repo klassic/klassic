@@ -867,6 +867,18 @@ cargo run -- -e "1 + 2"
   backend for programs outside the direct subset; Linux x86_64 keeps
   the full-featured direct ELF backend with no fallback.
 
+  M11 (issue #538) adds `Cond::Cc` (carry clear), the AArch64
+  condition Darwin's `svc #0x80` sets on syscall success — the mirror
+  image of Linux's negative-rax convention. `Dir#exists` /
+  `FileOutput#exists` are its first user: `access(path, F_OK)`
+  followed by `cset x0, cc` turns the syscall's carry flag directly
+  into the `Bool` result, no branch needed. The remaining M11 plan
+  (M12 string interpolation, M13 string builtin parity, M14 file I/O,
+  M15 directory ops, M16 environment/time) still needs the carry-set
+  (failure) half for abort-on-error paths; that arm is added only once
+  a caller actually needs it, to avoid dead-code churn between now and
+  then.
+
   `x86_64-pc-windows-msvc` (`--target x86_64-pc-windows-msvc` /
   `windows-x86_64`) is the one target that does *not* get its own
   codegen module: it reuses the entire `DirectX86_64` (Linux) code
