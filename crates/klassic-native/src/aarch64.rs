@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use klassic_span::{Diagnostic, Span};
-use klassic_syntax::{BinaryOp, Expr};
+use klassic_syntax::{BinaryOp, Expr, StringPart};
 
 use crate::macho::{self, DataFixup};
 
@@ -799,6 +799,31 @@ impl Emitter {
                 self.asm.load_rodata_address(Reg::X0, offset);
                 Ok(ValueType::Str)
             }
+            // `#{...}` holes: fold parts left to right through the
+            // existing `emit_str_concat`, converting each hole's value
+            // to `Str` first (M12, issue #538). Aarch64 strings are
+            // already exact-size heap objects, so unlike the x86_64
+            // backend's fixed-buffer path there's no capacity to
+            // track -- every intermediate concat result is a fresh,
+            // correctly-sized allocation.
+            Expr::StringInterpolation { parts, .. } => {
+                let mut iter = parts.iter();
+                match iter.next() {
+                    None => {
+                        let offset = self.asm.intern_string_object("");
+                        self.asm.load_rodata_address(Reg::X0, offset);
+                    }
+                    Some(first) => self.emit_string_part(first)?,
+                }
+                for part in iter {
+                    self.asm.push(Reg::X0);
+                    self.emit_string_part(part)?;
+                    self.asm.mov_reg(Reg::X1, Reg::X0);
+                    self.asm.pop(Reg::X0);
+                    self.emit_str_concat();
+                }
+                Ok(ValueType::Str)
+            }
             Expr::Identifier { name, span } => {
                 let Some((offset, ty)) = self.lookup(name) else {
                     return Err(unsupported(*span, &format!("identifier `{name}`")));
@@ -1009,6 +1034,35 @@ impl Emitter {
                 Ok(ty)
             }
             other => Err(unsupported(other.span(), "this expression")),
+        }
+    }
+
+    /// One `#{...}` interpolation part, leaving a `Str` value in x0.
+    /// A literal segment interns directly; a hole is evaluated and
+    /// converted to `Str` (`Int`/`Bool` supported for now — a nested
+    /// interpolation or enum/record hole is deferred, matching the
+    /// x86_64 backend's own incremental history).
+    fn emit_string_part(&mut self, part: &StringPart) -> Result<(), Diagnostic> {
+        match part {
+            StringPart::Literal(text) => {
+                let offset = self.asm.intern_string_object(text);
+                self.asm.load_rodata_address(Reg::X0, offset);
+                Ok(())
+            }
+            StringPart::Interpolation(hole) => {
+                match self.expression(hole)? {
+                    ValueType::Str => {}
+                    ValueType::Int => self.emit_int_to_str(),
+                    ValueType::Bool => self.emit_bool_to_str(),
+                    other => {
+                        return Err(unsupported(
+                            hole.span(),
+                            &format!("string interpolation of {other:?}"),
+                        ));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 

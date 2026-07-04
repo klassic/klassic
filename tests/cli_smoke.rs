@@ -22494,6 +22494,103 @@ fn build_target_aarch64_apple_darwin_dir_exists_runs() {
     );
 }
 
+/// Regression guard on any host: `#{...}` string interpolation must
+/// cross-build for aarch64-apple-darwin (M12, issue #538). Parts fold
+/// left to right through `emit_str_concat`, converting each hole to
+/// `Str` first (`Int`/`Bool` supported; a nested-interpolation or
+/// enum/record hole is deferred).
+#[test]
+fn build_target_aarch64_apple_darwin_string_interpolation_cross_build() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_interp_xbuild_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_interp_xbuild_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "val name = \"World\"\n\
+         println(\"Hello, #{name}!\")\n\
+         val n = 42\n\
+         println(\"n = #{n}\")\n\
+         println(\"b = #{true}\")\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        build_output.status.success(),
+        "darwin string interpolation cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
+/// M12 acceptance test: `#{...}` string interpolation actually runs on
+/// an Apple Silicon mac, matching the evaluator's output exactly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_string_interpolation_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_interp_run_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_interp_run_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "val name = \"World\"\n\
+         println(\"Hello, #{name}!\")\n\
+         val n = 42\n\
+         println(\"n = #{n}\")\n\
+         println(\"b = #{true}\")\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin string interpolation build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "Hello, World!\nn = 42\nb = true\n"
+    );
+}
+
 /// On Apple Silicon a target-less `build` detects the host: programs
 /// inside the direct subset get the toolchain-free Mach-O backend
 /// (no libSystem linkage), and programs outside it silently fall
