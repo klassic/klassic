@@ -22944,6 +22944,13 @@ fn build_target_aarch64_apple_darwin_file_io_cross_build() {
     let bin_path = dir.join(format!("klassic_macho_fileio_xbuild_{stamp}.bin"));
     let target_path = dir.join(format!("klassic_macho_fileio_target_{stamp}.txt"));
     let missing_path = dir.join(format!("klassic_macho_fileio_missing_{stamp}.txt"));
+    // Windows paths contain backslashes (e.g. `C:\Users\...`); embedded
+    // raw in a Klassic string literal, a segment like `\Users` reads
+    // as an (unsupported) escape sequence rather than a literal
+    // backslash. Escape them for the literal the same way any other
+    // backslash-containing string would need to be.
+    let target = target_path.display().to_string().replace('\\', "\\\\");
+    let missing = missing_path.display().to_string().replace('\\', "\\\\");
     fs::write(
         &source_path,
         format!(
@@ -22956,8 +22963,6 @@ fn build_target_aarch64_apple_darwin_file_io_cross_build() {
              println(FileOutput#exists(\"{target}\"))\n\
              FileOutput#delete(\"{missing}\")\n\
              println(\"delete-missing-ok\")\n",
-            target = target_path.display(),
-            missing = missing_path.display(),
         ),
     )
     .expect("temp source file should write");
@@ -22997,6 +23002,9 @@ fn build_target_aarch64_apple_darwin_file_io_runs() {
     let bin_path = dir.join(format!("klassic_macho_fileio_run_{stamp}.bin"));
     let target_path = dir.join(format!("klassic_macho_fileio_run_target_{stamp}.txt"));
     let missing_path = dir.join(format!("klassic_macho_fileio_run_missing_{stamp}.txt"));
+    // See the cross-build test above for why backslashes need escaping.
+    let target = target_path.display().to_string().replace('\\', "\\\\");
+    let missing = missing_path.display().to_string().replace('\\', "\\\\");
     fs::write(
         &source_path,
         format!(
@@ -23009,8 +23017,6 @@ fn build_target_aarch64_apple_darwin_file_io_runs() {
              println(FileOutput#exists(\"{target}\"))\n\
              FileOutput#delete(\"{missing}\")\n\
              println(\"delete-missing-ok\")\n",
-            target = target_path.display(),
-            missing = missing_path.display(),
         ),
     )
     .expect("temp source file should write");
