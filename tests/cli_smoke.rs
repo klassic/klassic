@@ -133,6 +133,81 @@ fn arity_diagnostic_pluralizes() {
     );
 }
 
+/// A runtime error raised inside a stdlib function's body must render
+/// against that stdlib module's own source, not the user file that
+/// happened to be evaluating when the error surfaced (issue #450).
+/// Before the fix this reported a bogus `file:line` (the user file's
+/// line count plus one, from `SourceFile::line_col`'s out-of-range
+/// clamp) with the innermost builtin's own diagnostic text.
+#[test]
+fn runtime_error_inside_stdlib_function_reports_stdlib_source() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_issue450_{stamp}.kl"));
+    // A short user file: the bogus line the old code produced would be
+    // "6:1" (5 lines + 1), never a real location inside std.list.
+    fs::write(
+        &source_path,
+        "val a = 1\nval b = 2\nval c = 3\nimport std.list.{last}\nprintln(last([]))\n",
+    )
+    .expect("temp source file should write");
+    let output = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("<stdlib std.list>:"),
+        "expected the stdlib module's own diagnostic name, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("6:1"),
+        "expected a real stdlib location, not the old bogus (user_lines + 1) line, got:\n{stderr}"
+    );
+}
+
+/// A runtime error raised inside a def declared in a different local
+/// module file (multi-file `import`, not stdlib) must likewise render
+/// against that module's own source (issue #450's fix is not
+/// stdlib-specific: any separately-evaluated SourceFile qualifies).
+#[test]
+fn runtime_error_inside_local_module_reports_module_source() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("klassic_issue450_multi_{stamp}"));
+    fs::create_dir_all(&dir).expect("temp dir should create");
+    let helper_path = dir.join("helper.kl");
+    let main_path = dir.join("main.kl");
+    fs::write(
+        &helper_path,
+        "module helper\n\ndef dangerous(xs) = head(xs)\n",
+    )
+    .expect("helper.kl should write");
+    fs::write(
+        &main_path,
+        "import helper.{dangerous}\nval a = 1\nval b = 2\nprintln(dangerous([]))\n",
+    )
+    .expect("main.kl should write");
+    let output = Command::new(klassic_bin())
+        .arg(main_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("helper:3:"),
+        "expected the module's own diagnostic name and its real line (3), got:\n{stderr}"
+    );
+}
+
 /// Consistency helpers added across the ADT/collection stdlib:
 /// `Result.getOrElse` (the Option name, aliasing unwrapOr), `contains` /
 /// `exists` predicates on both Option and Result (dispatching by

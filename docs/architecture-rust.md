@@ -1245,6 +1245,15 @@ cargo run -- -e "1 + 2"
 - The ELF writer computes the data segment offset from the actual text length and
   page-aligns it, so larger generated programs do not overwrite or truncate text.
 - Diagnostics are source-span aware across parse, type, and runtime errors.
+- Every `.kl` module the evaluator loads (the prelude, each imported `std.*`
+  module, each locally imported user file) is evaluated as its own
+  `SourceFile`, and every `FunctionValue`/`ThreadFunctionSnapshot` built while
+  one is active is tagged with an `Arc` clone (`CURRENT_SOURCE` in
+  `klassic-eval`). A runtime error that crosses a function-call boundary is
+  stamped with the innermost def's own source the first time it does, so
+  `Diagnostic::render_with_fallback` renders it against the module it
+  actually came from rather than whatever file the top-level caller happens
+  to be evaluating (issue #450).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
