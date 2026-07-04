@@ -872,12 +872,23 @@ cargo run -- -e "1 + 2"
   image of Linux's negative-rax convention. `Dir#exists` /
   `FileOutput#exists` are its first user: `access(path, F_OK)`
   followed by `cset x0, cc` turns the syscall's carry flag directly
-  into the `Bool` result, no branch needed. The remaining M11 plan
-  (M12 string interpolation, M13 string builtin parity, M14 file I/O,
-  M15 directory ops, M16 environment/time) still needs the carry-set
-  (failure) half for abort-on-error paths; that arm is added only once
-  a caller actually needs it, to avoid dead-code churn between now and
-  then.
+  into the `Bool` result, no branch needed. `Cond::Cs` (carry set /
+  failure) and an abort-on-failure helper are still deferred to
+  whichever later milestone first needs to bail out of a failed
+  syscall (M14 file I/O, M15 dir ops), to avoid dead-code churn.
+
+  M12 (issue #538) desugars `#{...}` string interpolation: `Expr::
+  StringInterpolation`'s parts fold left to right through the
+  existing `emit_str_concat`, converting each hole's value to `Str`
+  first via `emit_int_to_str`/`emit_bool_to_str` (a hole that's
+  already a `Str` needs no conversion). Aarch64 strings are exact-size
+  heap objects, so unlike the x86_64 backend's fixed-buffer
+  interpolation path there's no capacity to track — every
+  intermediate concat result is a fresh, correctly-sized allocation.
+  A nested interpolation or an enum/record/list hole is deferred with
+  a source-located diagnostic rather than guessed at. Remaining plan:
+  M13 (string builtin parity), M14 (file I/O), M15 (directory ops),
+  M16 (environment/time).
 
   `x86_64-pc-windows-msvc` (`--target x86_64-pc-windows-msvc` /
   `windows-x86_64`) is the one target that does *not* get its own
