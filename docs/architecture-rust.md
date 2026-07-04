@@ -925,8 +925,34 @@ cargo run -- -e "1 + 2"
   routine to walk a cons-list rather than operate on a single string.
   Remaining M13 slice: `replaceAll`/`split`, which need pattern
   matching plus a result whose length isn't known until the match
-  count is, and are left for a follow-up PR. Remaining plan after
-  M13: M14 (file I/O), M15 (directory ops), M16 (environment/time).
+  count is, and are left for a follow-up PR once a value-spilling
+  scheme is designed -- both routines need roughly 7 fixed values
+  (byte-base pointers and lengths for input/pattern/replacement, plus
+  a running match count and total result length) live simultaneously
+  across the copy loop, more than the register file holds without a
+  deliberate stack-spill discipline, and forcing it under time
+  pressure risks a repeat of (or worse than) the M13-slice-1 bug below.
+
+  M14 (issue #538) adds file I/O: `FileOutput#write`/`#append`
+  (opens with `O_WRONLY|O_CREAT|` `O_TRUNC` or `O_APPEND`, writes the
+  content bytes, closes), `FileInput#all` (opens `O_RDONLY`, reads up
+  to a 1 MiB cap into a scratch heap buffer, closes, then allocates a
+  second exact-size string object and copies just the bytes actually
+  read), and `FileOutput#delete` (unlinks, tolerating `ENOENT` as
+  success like the evaluator's `std::io::ErrorKind::NotFound`
+  leniency). Introduces `emit_abort_if_syscall_failed`, the
+  abort-on-failure counterpart to M11's `cset_syscall_succeeded` that
+  M11 deferred until a caller needed it. Darwin syscall numbers/flags
+  differ from Linux's (`open`=5, `read`=3, `close`=6, `unlink`=10;
+  `O_WRONLY`=1, `O_APPEND`=0x8, `O_CREAT`=0x200, `O_TRUNC`=0x400) --
+  reusing Linux's values would silently corrupt file-open semantics.
+  Every value that must survive an `emit_alloc` call across these
+  routines is pushed/popped explicitly rather than kept resident in a
+  register, since `emit_alloc` unconditionally clobbers `x6` (even on
+  its fast, no-heap-grow path) and only preserves `x0`-`x5` across its
+  slower heap-grow path -- the exact lesson M13 slice 1's `trim` bug
+  taught. Remaining plan after M14: M15 (directory ops), M16
+  (environment/time), plus `replaceAll`/`split` above.
 
   `x86_64-pc-windows-msvc` (`--target x86_64-pc-windows-msvc` /
   `windows-x86_64`) is the one target that does *not* get its own

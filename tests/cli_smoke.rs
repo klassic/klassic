@@ -22926,6 +22926,128 @@ fn build_target_aarch64_apple_darwin_string_join_runs() {
     );
 }
 
+/// Regression guard on any host: `FileOutput#write`/`#append`,
+/// `FileInput#all`, and `FileOutput#delete` (tolerating a missing
+/// file) must cross-build for aarch64-apple-darwin -- M14 (issue
+/// #538), the first milestone that performs real syscalls beyond
+/// `write`/`exit`/`mmap`/`access`. Introduces `Cond::Cc`'s
+/// abort-on-failure counterpart (`emit_abort_if_syscall_failed`),
+/// deferred from M11 until a caller needed it.
+#[test]
+fn build_target_aarch64_apple_darwin_file_io_cross_build() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_fileio_xbuild_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_fileio_xbuild_{stamp}.bin"));
+    let target_path = dir.join(format!("klassic_macho_fileio_target_{stamp}.txt"));
+    let missing_path = dir.join(format!("klassic_macho_fileio_missing_{stamp}.txt"));
+    fs::write(
+        &source_path,
+        format!(
+            "FileOutput#write(\"{target}\", \"hello\\n\")\n\
+             FileOutput#append(\"{target}\", \"world\\n\")\n\
+             val content = FileInput#all(\"{target}\")\n\
+             println(content)\n\
+             println(length(content))\n\
+             FileOutput#delete(\"{target}\")\n\
+             println(FileOutput#exists(\"{target}\"))\n\
+             FileOutput#delete(\"{missing}\")\n\
+             println(\"delete-missing-ok\")\n",
+            target = target_path.display(),
+            missing = missing_path.display(),
+        ),
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&target_path);
+    assert!(
+        build_output.status.success(),
+        "darwin file I/O cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
+/// M14 acceptance test: file I/O actually runs on an Apple Silicon
+/// mac, matching the evaluator's output exactly (including tolerating
+/// a delete of a file that was never created).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_file_io_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_fileio_run_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_fileio_run_{stamp}.bin"));
+    let target_path = dir.join(format!("klassic_macho_fileio_run_target_{stamp}.txt"));
+    let missing_path = dir.join(format!("klassic_macho_fileio_run_missing_{stamp}.txt"));
+    fs::write(
+        &source_path,
+        format!(
+            "FileOutput#write(\"{target}\", \"hello\\n\")\n\
+             FileOutput#append(\"{target}\", \"world\\n\")\n\
+             val content = FileInput#all(\"{target}\")\n\
+             println(content)\n\
+             println(length(content))\n\
+             FileOutput#delete(\"{target}\")\n\
+             println(FileOutput#exists(\"{target}\"))\n\
+             FileOutput#delete(\"{missing}\")\n\
+             println(\"delete-missing-ok\")\n",
+            target = target_path.display(),
+            missing = missing_path.display(),
+        ),
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin file I/O build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&target_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "hello\nworld\n\n12\nfalse\ndelete-missing-ok\n"
+    );
+}
+
 /// On Apple Silicon a target-less `build` detects the host: programs
 /// inside the direct subset get the toolchain-free Mach-O backend
 /// (no libSystem linkage), and programs outside it silently fall
