@@ -41,6 +41,15 @@ const SYS_MKDIR: u16 = 136;
 const SYS_FSTATAT64: u16 = 470;
 /// Darwin `rename`.
 const SYS_RENAME: u16 = 128;
+/// Darwin `gettimeofday`. `syscalls.master` marks this
+/// `NO_SYSCALL_STUB` (normally commpage-served on real hardware for
+/// speed) -- the raw two-argument `svc #0x80` form used here is
+/// expected to still work as a fallback path into the same kernel
+/// handler, but this is the one M16 syscall whose raw-svc behavior
+/// wasn't verified against a spec before landing; treat a failure
+/// here as the first thing to suspect if `Time#nowMillis` misbehaves
+/// on real hardware.
+const SYS_GETTIMEOFDAY: u16 = 116;
 /// Darwin's `AT_FDCWD` is `-2`, not Linux's `-100` (bsd/sys/fcntl.h).
 const AT_FDCWD: i64 = -2;
 /// Darwin's `O_*` open flags (bsd/sys/fcntl.h) -- numerically
@@ -94,6 +103,12 @@ enum Reg {
     X19 = 19,
     /// Callee-saved: bump-allocator end pointer.
     X20 = 20,
+    /// Callee-saved: `argc`, captured from dyld's `LC_MAIN` entry.
+    X21 = 21,
+    /// Callee-saved: `argv`, captured from dyld's `LC_MAIN` entry.
+    X22 = 22,
+    /// Callee-saved: `envp`, captured from dyld's `LC_MAIN` entry.
+    X23 = 23,
 }
 
 /// AAPCS64 integer argument registers, in order.
@@ -577,6 +592,17 @@ impl Assembler {
     fn ldr_imm(&mut self, dst: Reg, base: Reg, imm: u32) {
         debug_assert!(imm.is_multiple_of(8) && imm / 8 < 4096);
         self.word(0xf940_0000 | ((imm / 8) << 10) | ((base as u32) << 5) | dst as u32);
+    }
+
+    /// `ldr wt, [xn, #imm]` (unsigned, 4-byte scaled, 32-bit --
+    /// zero-extends into the full 64-bit register per AAPCS64
+    /// W-register write semantics). Used where a field is genuinely
+    /// 4 bytes and a 64-bit load would pull in unrelated trailing
+    /// bytes (e.g. Darwin's `struct timeval.tv_usec`, a
+    /// `__int32_t` immediately followed by 4 bytes of padding).
+    fn ldr_imm32(&mut self, dst: Reg, base: Reg, imm: u32) {
+        debug_assert!(imm.is_multiple_of(4) && imm / 4 < 4096);
+        self.word(0xb940_0000 | ((imm / 4) << 10) | ((base as u32) << 5) | dst as u32);
     }
 
     /// `str xt, [xn, #imm]` (unsigned, 8-byte scaled)
@@ -1384,6 +1410,89 @@ impl Emitter {
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: Dir#move failed\n");
         self.asm.mov_imm64(Reg::X0, 0); // Unit
+    }
+
+    /// `Environment#exists`(key): walks the NUL-terminated `envp`
+    /// array (x23, captured from dyld's `LC_MAIN` entry) looking for
+    /// an entry whose `"KEY="` prefix matches `key`. Each `envp`
+    /// entry is a NUL-terminated C string `"KEY=VALUE"`; a match
+    /// means the first `key.len()` bytes equal `key` and the very
+    /// next byte is `'='` (so `"FOO"` doesn't spuriously match an
+    /// entry for `"FOOBAR"`), matching the evaluator's
+    /// `env::var_os(key).is_some()` (M16, issue #538).
+    fn emit_environment_exists(&mut self, key: &str) {
+        let key_len = key.len() as u64;
+        let key_offset = self.asm.intern_rodata(key.as_bytes());
+
+        self.asm.mov_reg(Reg::X6, Reg::X23); // envp cursor
+        let loop_start = self.asm.new_label();
+        let try_match = self.asm.new_label();
+        let check_equals = self.asm.new_label();
+        let advance_entry = self.asm.new_label();
+        let found = self.asm.new_label();
+        let not_found = self.asm.new_label();
+        let done = self.asm.new_label();
+
+        self.asm.bind(loop_start);
+        self.asm.ldr_imm(Reg::X7, Reg::X6, 0); // entry ptr
+        self.asm.branch(not_found, BranchKind::CompareZero(Reg::X7));
+        self.asm.mov_reg(Reg::X8, Reg::X7); // entry byte cursor
+        self.asm.load_rodata_address(Reg::X9, key_offset); // key byte cursor
+        self.asm.mov_imm64(Reg::X10, key_len); // remaining length
+
+        self.asm.bind(try_match);
+        self.asm
+            .branch(check_equals, BranchKind::CompareZero(Reg::X10));
+        self.asm.ldrb_post_increment(Reg::X11, Reg::X8);
+        self.asm.ldrb_post_increment(Reg::X12, Reg::X9);
+        self.asm.cmp_reg(Reg::X11, Reg::X12);
+        self.asm
+            .branch(advance_entry, BranchKind::Conditional(Cond::Ne));
+        self.asm.sub_reg_imm(Reg::X10, Reg::X10, 1);
+        self.asm.branch(try_match, BranchKind::Unconditional);
+
+        self.asm.bind(check_equals);
+        self.asm.ldrb(Reg::X11, Reg::X8); // peek, no advance
+        self.asm.cmp_imm(Reg::X11, u32::from(b'='));
+        self.asm.branch(found, BranchKind::Conditional(Cond::Eq));
+
+        self.asm.bind(advance_entry);
+        self.asm.add_reg_imm(Reg::X6, Reg::X6, 8); // next envp slot
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+
+        self.asm.bind(found);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(not_found);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
+    }
+
+    /// `Time#nowMillis`(): `gettimeofday(&buf, NULL)` into a fresh
+    /// 16-byte bump-heap buffer laid out as Darwin's actual
+    /// `struct timeval` (`tv_sec: i64` at offset 0, `tv_usec: i32` at
+    /// offset 8 followed by 4 bytes of padding -- read with a 32-bit
+    /// load so the result never depends on those padding bytes being
+    /// zero), then computes `tv_sec*1000 + tv_usec/1000` (M16, issue
+    /// #538).
+    fn emit_time_now_millis(&mut self) {
+        self.asm.mov_imm64(Reg::X4, 16);
+        self.emit_alloc(); // x5 = timeval buffer
+        self.asm.mov_reg(Reg::X6, Reg::X5);
+
+        self.asm.mov_reg(Reg::X0, Reg::X6);
+        self.asm.mov_imm64(Reg::X1, 0); // tzp = NULL
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_GETTIMEOFDAY));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: Time#nowMillis failed\n");
+
+        self.asm.ldr_imm(Reg::X0, Reg::X6, 0); // tv_sec
+        self.asm.ldr_imm32(Reg::X1, Reg::X6, 8); // tv_usec (32-bit field)
+        self.asm.mov_imm64(Reg::X2, 1000);
+        self.asm.mul_reg(Reg::X0, Reg::X0, Reg::X2); // tv_sec * 1000
+        self.asm.sdiv_reg(Reg::X1, Reg::X1, Reg::X2); // tv_usec / 1000
+        self.asm.add_reg(Reg::X0, Reg::X0, Reg::X1);
     }
 
     fn binary(
@@ -2862,6 +2971,27 @@ impl Emitter {
                 self.emit_dir_move(source_offset, target_offset);
                 Ok(Some(ValueType::Unit))
             }
+            ("Environment#exists", 1) => {
+                let Expr::String {
+                    value: key,
+                    span: key_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(
+                        arguments[0].span(),
+                        "a non-literal environment variable name",
+                    ));
+                };
+                if key.contains("#{") {
+                    return Err(unsupported(*key_span, "string interpolation"));
+                }
+                self.emit_environment_exists(key);
+                Ok(Some(ValueType::Bool))
+            }
+            ("Time#nowMillis", 0) => {
+                self.emit_time_now_millis();
+                Ok(Some(ValueType::Int))
+            }
             _ => Ok(None),
         }
     }
@@ -3305,6 +3435,14 @@ pub(crate) fn emit_macho_program(
     emitter.scopes.push(HashMap::new());
     collect_records(expr, &mut emitter);
     collect_functions(expr, &mut emitter);
+
+    // dyld calls the LC_MAIN entry as a plain AAPCS64 call:
+    // x0=argc, x1=argv, x2=envp, x3=apple. Capture into callee-saved
+    // registers before anything else can clobber x0-x2 (M16, issue
+    // #538).
+    emitter.asm.mov_reg(Reg::X21, Reg::X0);
+    emitter.asm.mov_reg(Reg::X22, Reg::X1);
+    emitter.asm.mov_reg(Reg::X23, Reg::X2);
 
     // Empty heap: the first allocation's capacity check fails and
     // mmaps the first segment.
