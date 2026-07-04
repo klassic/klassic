@@ -23054,6 +23054,136 @@ fn build_target_aarch64_apple_darwin_file_io_runs() {
     );
 }
 
+/// Regression guard on any host: `Dir#mkdir`/`#mkdirs`/
+/// `#isDirectory`/`#delete`/`#move` must cross-build for
+/// aarch64-apple-darwin -- M15 (issue #538). Backslashes in the
+/// generated paths are escaped the same way M14's test learned to
+/// (see build_target_aarch64_apple_darwin_file_io_cross_build).
+#[test]
+fn build_target_aarch64_apple_darwin_dir_ops_cross_build() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_dirops_xbuild_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_dirops_xbuild_{stamp}.bin"));
+    let nested_path = dir.join(format!("klassic_macho_dirops_nested_{stamp}/a/b"));
+    let base_path = dir.join(format!("klassic_macho_dirops_nested_{stamp}"));
+    let moved_path = dir.join(format!("klassic_macho_dirops_moved_{stamp}"));
+    let nested = nested_path.display().to_string().replace('\\', "\\\\");
+    let moved = moved_path.display().to_string().replace('\\', "\\\\");
+    fs::write(
+        &source_path,
+        format!(
+            "Dir#mkdirs(\"{nested}\")\n\
+             println(Dir#exists(\"{nested}\"))\n\
+             println(Dir#isDirectory(\"{nested}\"))\n\
+             Dir#move(\"{nested}\", \"{moved}\")\n\
+             println(Dir#exists(\"{nested}\"))\n\
+             println(Dir#isDirectory(\"{moved}\"))\n\
+             Dir#delete(\"{moved}\")\n\
+             println(\"dir-ops-ok\")\n",
+        ),
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_dir_all(&base_path);
+    let _ = fs::remove_dir_all(&moved_path);
+    assert!(
+        build_output.status.success(),
+        "darwin dir ops cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
+/// M15 acceptance test: directory ops actually run on an Apple
+/// Silicon mac, matching the evaluator's output exactly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_dir_ops_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_dirops_run_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_dirops_run_{stamp}.bin"));
+    let nested_path = dir.join(format!("klassic_macho_dirops_run_nested_{stamp}/a/b"));
+    let base_path = dir.join(format!("klassic_macho_dirops_run_nested_{stamp}"));
+    let moved_path = dir.join(format!("klassic_macho_dirops_run_moved_{stamp}"));
+    let plain_file_path = dir.join(format!("klassic_macho_dirops_run_file_{stamp}.txt"));
+    let missing_path = dir.join(format!("klassic_macho_dirops_run_missing_{stamp}"));
+    let nested = nested_path.display().to_string().replace('\\', "\\\\");
+    let moved = moved_path.display().to_string().replace('\\', "\\\\");
+    let plain_file = plain_file_path.display().to_string().replace('\\', "\\\\");
+    let missing = missing_path.display().to_string().replace('\\', "\\\\");
+    fs::write(
+        &source_path,
+        format!(
+            "Dir#mkdirs(\"{nested}\")\n\
+             println(Dir#exists(\"{nested}\"))\n\
+             println(Dir#isDirectory(\"{nested}\"))\n\
+             Dir#move(\"{nested}\", \"{moved}\")\n\
+             println(Dir#exists(\"{nested}\"))\n\
+             println(Dir#isDirectory(\"{moved}\"))\n\
+             FileOutput#write(\"{plain_file}\", \"x\\n\")\n\
+             println(Dir#isDirectory(\"{plain_file}\"))\n\
+             println(Dir#isDirectory(\"{missing}\"))\n\
+             FileOutput#delete(\"{plain_file}\")\n\
+             Dir#delete(\"{moved}\")\n\
+             println(\"dir-ops-ok\")\n",
+        ),
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin dir ops build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_dir_all(&base_path);
+    let _ = fs::remove_dir_all(&moved_path);
+    let _ = fs::remove_file(&plain_file_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "true\ntrue\nfalse\ntrue\nfalse\nfalse\ndir-ops-ok\n"
+    );
+}
+
 /// On Apple Silicon a target-less `build` detects the host: programs
 /// inside the direct subset get the toolchain-free Mach-O backend
 /// (no libSystem linkage), and programs outside it silently fall
