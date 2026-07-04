@@ -23,8 +23,26 @@ use crate::macho::{self, DataFixup};
 
 const SYS_EXIT: u16 = 1;
 const SYS_WRITE: u16 = 4;
+/// Darwin `read`.
+const SYS_READ: u16 = 3;
+/// Darwin `open`.
+const SYS_OPEN: u16 = 5;
+/// Darwin `close`.
+const SYS_CLOSE: u16 = 6;
+/// Darwin `unlink`.
+const SYS_UNLINK: u16 = 10;
 /// Darwin `access(path, mode)`. `mode = 0` (`F_OK`) checks existence.
 const SYS_ACCESS: u16 = 33;
+/// Darwin's `O_*` open flags (bsd/sys/fcntl.h) -- numerically
+/// different from Linux's; reusing Linux values would silently
+/// corrupt file-open semantics.
+const O_RDONLY: u64 = 0;
+const O_WRONLY: u64 = 1;
+const O_APPEND: u64 = 0x8;
+const O_CREAT: u64 = 0x200;
+const O_TRUNC: u64 = 0x400;
+/// `0o644`: rw-r--r--, the default mode for a newly created file.
+const DEFAULT_FILE_MODE: u64 = 0o644;
 /// Darwin `mmap`. Heap segments come straight from the kernel.
 const SYS_MMAP: u16 = 197;
 const STDOUT_FD: u64 = 1;
@@ -387,6 +405,19 @@ impl Assembler {
     /// negative-rax convention (see issue #538, M11).
     fn cset_syscall_succeeded(&mut self) {
         self.cset(Reg::X0, Cond::Cc);
+    }
+
+    /// Abort with `message` to stderr and `exit(1)` if the preceding
+    /// Darwin syscall's carry flag signals failure (carry set). The
+    /// abort-on-failure counterpart to `cset_syscall_succeeded`,
+    /// deferred from M11 until a caller (M14 file I/O) actually
+    /// needed it.
+    fn emit_abort_if_syscall_failed(&mut self, message: &[u8]) {
+        let ok = self.new_label();
+        self.branch(ok, BranchKind::Conditional(Cond::Cc));
+        self.emit_write_rodata(STDERR_FD, message);
+        self.emit_exit(1);
+        self.bind(ok);
     }
 
     fn emit_exit(&mut self, status: u64) {
@@ -1098,6 +1129,132 @@ impl Emitter {
                 Ok(())
             }
         }
+    }
+
+    /// `FileOutput#write`/`FileOutput#append`(path, content): `path`
+    /// is a compile-time string literal already interned as a
+    /// NUL-terminated rodata blob at `path_offset`; the content
+    /// string object (`[len][bytes]`) is expected in x0. Opens with
+    /// `O_WRONLY|O_CREAT|` (`O_TRUNC` or `O_APPEND`), writes the
+    /// content bytes, then closes -- aborting with a source-located
+    /// message on any syscall failure (M14, issue #538).
+    fn emit_file_write(&mut self, path_offset: usize, append: bool) {
+        self.asm.push(Reg::X0); // content object
+
+        self.asm.load_rodata_address(Reg::X0, path_offset);
+        let flags = if append {
+            O_WRONLY | O_CREAT | O_APPEND
+        } else {
+            O_WRONLY | O_CREAT | O_TRUNC
+        };
+        self.asm.mov_imm64(Reg::X1, flags);
+        self.asm.mov_imm64(Reg::X2, DEFAULT_FILE_MODE);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_OPEN));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: FileOutput#write failed to open file\n");
+        self.asm.mov_reg(Reg::X3, Reg::X0); // fd
+        self.asm.pop(Reg::X4); // content object
+
+        self.asm.ldr_imm(Reg::X2, Reg::X4, 0); // content len
+        self.asm.add_reg_imm(Reg::X1, Reg::X4, 8); // content bytes
+        self.asm.mov_reg(Reg::X0, Reg::X3); // fd
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: FileOutput#write failed to write file\n");
+
+        self.asm.mov_reg(Reg::X0, Reg::X3); // fd
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_CLOSE));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: FileOutput#write failed to close file\n");
+
+        self.asm.mov_imm64(Reg::X0, 0); // Unit
+    }
+
+    /// `FileInput#all`(path): opens the NUL-terminated path (rodata,
+    /// `path_offset`) with `O_RDONLY`, reads up to `READ_CAP` bytes
+    /// into a scratch heap buffer, closes, then copies exactly the
+    /// bytes actually read into a fresh, exact-size string object
+    /// (M14, issue #538). Every value that must survive an
+    /// `emit_alloc` call is pushed/popped explicitly rather than kept
+    /// resident in a register, since `emit_alloc` unconditionally
+    /// clobbers x6 and only preserves x0-x5 across its heap-grow
+    /// path -- the same lesson #563's bug taught for `trim`.
+    fn emit_file_read_all(&mut self, path_offset: usize) {
+        const READ_CAP: u64 = 1_048_576;
+
+        self.asm.load_rodata_address(Reg::X0, path_offset);
+        self.asm.mov_imm64(Reg::X1, O_RDONLY);
+        self.asm.mov_imm64(Reg::X2, 0);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_OPEN));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: FileInput#all failed to open file\n");
+        self.asm.push(Reg::X0); // fd
+
+        self.asm.mov_imm64(Reg::X4, READ_CAP + 8);
+        self.emit_alloc(); // x5 = scratch buffer
+        self.asm.pop(Reg::X3); // fd
+
+        self.asm.mov_reg(Reg::X0, Reg::X3);
+        self.asm.add_reg_imm(Reg::X1, Reg::X5, 8);
+        self.asm.mov_imm64(Reg::X2, READ_CAP);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_READ));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: FileInput#all failed to read file\n");
+        // x0 = bytes actually read
+        self.asm.push(Reg::X0); // bytes_read
+        self.asm.push(Reg::X5); // scratch buffer ptr
+        self.asm.push(Reg::X3); // fd
+
+        self.asm.mov_reg(Reg::X0, Reg::X3);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_CLOSE));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: FileInput#all failed to close file\n");
+
+        self.asm.pop(Reg::X3); // fd, discarded
+        self.asm.pop(Reg::X5); // scratch buffer ptr
+        self.asm.pop(Reg::X2); // bytes_read (content length)
+
+        self.asm.push(Reg::X5); // scratch buffer ptr
+        self.asm.push(Reg::X2); // bytes_read
+        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        self.emit_alloc(); // x5 = result object
+        self.asm.pop(Reg::X2); // bytes_read
+        self.asm.pop(Reg::X6); // scratch buffer ptr
+
+        self.asm.str_imm(Reg::X2, Reg::X5, 0);
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
+        self.asm.add_reg_imm(Reg::X6, Reg::X6, 8);
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X3);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
+    /// `FileOutput#delete`(path): unlinks the NUL-terminated path
+    /// (rodata, `path_offset`). Tolerates a missing file (`ENOENT`,
+    /// errno 2) as success, matching the evaluator's
+    /// `std::io::ErrorKind::NotFound` leniency; any other failure
+    /// aborts with a source-located message (M14, issue #538).
+    fn emit_file_delete(&mut self, path_offset: usize) {
+        const ENOENT: u32 = 2;
+        self.asm.load_rodata_address(Reg::X0, path_offset);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_UNLINK));
+        self.asm.svc_0x80();
+        let ok = self.asm.new_label();
+        self.asm.branch(ok, BranchKind::Conditional(Cond::Cc));
+        self.asm.cmp_imm(Reg::X0, ENOENT);
+        self.asm.branch(ok, BranchKind::Conditional(Cond::Eq));
+        self.asm
+            .emit_write_rodata(STDERR_FD, b"klassic: FileOutput#delete failed\n");
+        self.asm.emit_exit(1);
+        self.asm.bind(ok);
+        self.asm.mov_imm64(Reg::X0, 0); // Unit
     }
 
     fn binary(
@@ -2423,6 +2580,57 @@ impl Emitter {
                 self.asm.svc_0x80();
                 self.asm.cset_syscall_succeeded();
                 Ok(Some(ValueType::Bool))
+            }
+            ("FileOutput#write", 2) | ("FileOutput#append", 2) => {
+                let Expr::String {
+                    value: path,
+                    span: path_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if path.contains("#{") {
+                    return Err(unsupported(*path_span, "string interpolation"));
+                }
+                let path_offset = self.asm.intern_nul_terminated(path);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(
+                        span,
+                        &format!("{name} with non-string content"),
+                    ));
+                }
+                self.emit_file_write(path_offset, name == "FileOutput#append");
+                Ok(Some(ValueType::Unit))
+            }
+            ("FileInput#all", 1) => {
+                let Expr::String {
+                    value: path,
+                    span: path_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if path.contains("#{") {
+                    return Err(unsupported(*path_span, "string interpolation"));
+                }
+                let path_offset = self.asm.intern_nul_terminated(path);
+                self.emit_file_read_all(path_offset);
+                Ok(Some(ValueType::Str))
+            }
+            ("FileOutput#delete", 1) => {
+                let Expr::String {
+                    value: path,
+                    span: path_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if path.contains("#{") {
+                    return Err(unsupported(*path_span, "string interpolation"));
+                }
+                let path_offset = self.asm.intern_nul_terminated(path);
+                self.emit_file_delete(path_offset);
+                Ok(Some(ValueType::Unit))
             }
             _ => Ok(None),
         }
