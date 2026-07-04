@@ -6845,6 +6845,7 @@ fn type_error(span: Span, message: impl Into<String>) -> Diagnostic {
         message: message.into(),
         incomplete_input: false,
         source: None,
+        call_name: None,
     }
 }
 

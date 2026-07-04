@@ -126,6 +126,17 @@ thread_local! {
     /// instead of whatever file happens to be evaluating when the
     /// error surfaces (issue #450).
     static CURRENT_SOURCE: RefCell<Option<Arc<SourceFile>>> = const { RefCell::new(None) };
+
+    /// The literal name the user wrote to reach the call currently in
+    /// flight (e.g. `"last"` for `last([])`), set around each call
+    /// site that knows one and restored on the way out. A single slot
+    /// is enough (not a stack) because each push remembers the prior
+    /// value and a drop guard restores it when that call's dynamic
+    /// extent ends -- correct nesting for free. `invoke_user_function`
+    /// reads this to attribute a runtime error to the name the user
+    /// actually called instead of only the innermost builtin (issue
+    /// #450, second half).
+    static CURRENT_CALL_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 fn clear_function_snapshot_cache() {
@@ -136,6 +147,31 @@ fn clear_function_snapshot_cache() {
 /// `CURRENT_SOURCE`.
 fn current_source() -> Option<Arc<SourceFile>> {
     CURRENT_SOURCE.with(|cell| cell.borrow().clone())
+}
+
+/// The literal name of the call currently in flight, if any — see
+/// `CURRENT_CALL_NAME`.
+fn current_call_name() -> Option<String> {
+    CURRENT_CALL_NAME.with(|cell| cell.borrow().clone())
+}
+
+/// Sets `CURRENT_CALL_NAME` to `name` for the caller's scope,
+/// restoring the previous value when this guard drops (including on
+/// early return through `?`).
+struct CallNameGuard(Option<String>);
+
+impl CallNameGuard {
+    fn push(name: impl Into<String>) -> Self {
+        let previous = CURRENT_CALL_NAME.with(|cell| cell.borrow().clone());
+        CURRENT_CALL_NAME.with(|cell| *cell.borrow_mut() = Some(name.into()));
+        Self(previous)
+    }
+}
+
+impl Drop for CallNameGuard {
+    fn drop(&mut self) {
+        CURRENT_CALL_NAME.with(|cell| *cell.borrow_mut() = self.0.take());
+    }
 }
 
 fn clear_function_restore_cache() {
@@ -1020,6 +1056,7 @@ fn type_diagnostic(span: Span, message: String) -> Diagnostic {
         message,
         incomplete_input: false,
         source: None,
+        call_name: None,
     }
 }
 
@@ -1909,6 +1946,7 @@ fn eval_call(
                 .iter()
                 .map(|argument| eval_expr(argument, environment, state))
                 .collect::<Result<Vec<_>, _>>()?;
+            let _call_name = CallNameGuard::push(field.as_str());
             return apply_callable(member, argument_values, span);
         }
         let target_value = eval_expr(target, environment, state)?;
@@ -1926,6 +1964,7 @@ fn eval_call(
             // applies when the method call supplies fewer args than
             // its arity: `xs.foldLeft(init)(f)` binds [xs, init] here,
             // then the trailing `(f)` completes it.
+            let _call_name = CallNameGuard::push(field.as_str());
             return apply_callable(
                 Value::BuiltinFunction(Rc::new(BuiltinFunctionValue {
                     name: builtin,
@@ -1944,6 +1983,7 @@ fn eval_call(
                     .map(|argument| eval_expr(argument, environment, state))
                     .collect::<Result<Vec<_>, _>>()?,
             );
+            let _call_name = CallNameGuard::push(field.as_str());
             return apply_callable(method, all_arguments, span);
         }
     }
@@ -1966,6 +2006,11 @@ fn eval_call(
     }
 
     let callee_value = eval_expr(callee, environment, state)?;
+    let _call_name = if let Expr::Identifier { name, .. } = callee {
+        Some(CallNameGuard::push(name.as_str()))
+    } else {
+        None
+    };
     apply_callable(callee_value, argument_values, span)
 }
 
@@ -2122,16 +2167,20 @@ fn invoke_user_function(
     let result = eval_expr(&function.body, &mut call_env, &mut state);
     call_env.pop_scope();
     // The innermost failure (e.g. a builtin call deep inside this
-    // def's body) doesn't know which module it came from. Tag it with
-    // this function's own source the first time it crosses a function
-    // boundary, so it renders against the module the def actually
-    // lives in rather than whichever file is evaluating at the top
-    // level (issue #450). A diagnostic that already has a source came
-    // from a still-deeper call — leave it alone so the tag reflects
-    // the innermost def, not every frame it unwound through.
+    // def's body) doesn't know which module it came from, or what
+    // name the user called to reach it. Tag both the first time the
+    // error crosses a function boundary, so it renders against the
+    // module the def actually lives in and names the call the user
+    // actually made rather than only the innermost builtin (issue
+    // #450). A diagnostic that already carries either tag came from a
+    // still-deeper call — leave it alone so the tags reflect the
+    // innermost def/call, not every frame they unwound through.
     result.map_err(|mut diagnostic| {
         if diagnostic.source.is_none() {
             diagnostic.source = function.source.clone();
+        }
+        if diagnostic.call_name.is_none() {
+            diagnostic.call_name = current_call_name();
         }
         diagnostic
     })

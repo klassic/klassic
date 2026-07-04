@@ -1265,6 +1265,24 @@ cargo run -- -e "1 + 2"
   `Diagnostic::render_with_fallback` renders it against the module it
   actually came from rather than whatever file the top-level caller happens
   to be evaluating (issue #450).
+- A `Diagnostic` also carries an optional `call_name`: the literal name the
+  user wrote to reach the call currently in flight (e.g. `last` for
+  `last([])`), tracked via a `CURRENT_CALL_NAME` thread-local pushed/restored
+  by a drop guard around each of `eval_call`'s four `apply_callable` call
+  sites in `klassic-eval`. `invoke_user_function` stamps a still-untagged
+  diagnostic with it the same way it stamps `source`, so a runtime error
+  raised deep inside a def's body (e.g. `head` failing inside `std.list`'s
+  `last`) renders as `last: head expects a non-empty list` instead of naming
+  only the innermost builtin — a bare builtin call with no wrapping user
+  `def` gets no prefix at all, and a chain of wrapper calls attributes to
+  the innermost def, not every frame it unwound through (issue #450, second
+  half). Known gap: the five `apply_callable` call sites reached from
+  *inside* a builtin's own implementation (a user callback passed to
+  `map`/`foldLeft`/`filter`/`thread`/`stopwatch`) have no textual name
+  available at that specific call point, so an error inside such a callback
+  inherits the enclosing builtin's own name (e.g. `map: ...`) rather than
+  naming the callback itself — an improvement over no name at all, but not
+  fully precise; left as a documented limitation rather than chased further.
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
