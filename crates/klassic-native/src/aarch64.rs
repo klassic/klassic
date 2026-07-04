@@ -565,6 +565,41 @@ impl Assembler {
         self.bind(done);
     }
 
+    /// `dst = 1` if the `len` bytes at `a_ptr` equal the `len` bytes
+    /// at `b_ptr`, `0` otherwise. Consumes `len`/`a_ptr`/`b_ptr`
+    /// (post-increments through them) -- callers that need the
+    /// originals intact afterward should pass working copies.
+    /// `scratch1`/`scratch2` hold one byte from each side per
+    /// iteration.
+    fn bytes_equal(
+        &mut self,
+        len: Reg,
+        a_ptr: Reg,
+        b_ptr: Reg,
+        dst: Reg,
+        scratch1: Reg,
+        scratch2: Reg,
+    ) {
+        let differ = self.new_label();
+        let same = self.new_label();
+        let done = self.new_label();
+        let loop_start = self.new_label();
+        self.bind(loop_start);
+        self.branch(same, BranchKind::CompareZero(len));
+        self.ldrb_post_increment(scratch1, a_ptr);
+        self.ldrb_post_increment(scratch2, b_ptr);
+        self.cmp_reg(scratch1, scratch2);
+        self.branch(differ, BranchKind::Conditional(Cond::Ne));
+        self.sub_reg_imm(len, len, 1);
+        self.branch(loop_start, BranchKind::Unconditional);
+        self.bind(same);
+        self.mov_imm64(dst, 1);
+        self.branch(done, BranchKind::Unconditional);
+        self.bind(differ);
+        self.mov_imm64(dst, 0);
+        self.bind(done);
+    }
+
     /// `lsr xd, xn, #shift`
     fn lsr_imm(&mut self, dst: Reg, src: Reg, shift: u32) {
         debug_assert!(shift < 64);
@@ -1971,6 +2006,163 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X5);
     }
 
+    /// `replaceAll`(input, pattern, replacement): literal-substring
+    /// replacement (not the evaluator's `"[0-9]"` pseudo-regex special
+    /// case, and an empty pattern aborts rather than replicating
+    /// Rust's between-every-character `str::replace("")` semantics --
+    /// both explicit, documented scope reductions from x86_64
+    /// parity). Non-overlapping matches, scanning left to right.
+    ///
+    /// This needs six fixed values alive across the whole two-pass
+    /// operation (each of input/pattern/replacement's byte-base
+    /// pointer and length) plus a running match count and total
+    /// result length -- more than fits resident in registers across
+    /// two `emit_alloc` calls without a deliberate spill scheme (this
+    /// is exactly the register-pressure wall an earlier attempt at
+    /// this routine hit and abandoned). Instead of spilling to
+    /// individual stack slots, the six fixed values are written once
+    /// into a single 48-byte scratch heap object right after they're
+    /// computed, and re-loaded from it by offset wherever needed --
+    /// so the only value that must stay resident in a register across
+    /// every subsequent `emit_alloc` call is the one pointer to that
+    /// object (`x6`), the same one-value-survives-the-call discipline
+    /// every other M13 routine already uses (M13 slice 1's `trim` bug
+    /// was exactly a missed instance of it).
+    fn emit_str_replace_all(&mut self) {
+        // x0=input, x1=pattern, x2=replacement
+        self.asm.ldr_imm(Reg::X3, Reg::X1, 0); // pattern_len
+        let pattern_ok = self.asm.new_label();
+        self.asm
+            .branch(pattern_ok, BranchKind::CompareNonZero(Reg::X3));
+        self.asm.emit_write_rodata(
+            STDERR_FD,
+            b"klassic: replaceAll pattern must not be empty\n",
+        );
+        self.asm.emit_exit(1);
+        self.asm.bind(pattern_ok);
+
+        self.asm.push(Reg::X0);
+        self.asm.push(Reg::X1);
+        self.asm.push(Reg::X2);
+        self.asm.mov_imm64(Reg::X4, 48);
+        self.emit_alloc(); // x5 = scratch struct
+        self.asm.mov_reg(Reg::X6, Reg::X5);
+        self.asm.pop(Reg::X2);
+        self.asm.pop(Reg::X1);
+        self.asm.pop(Reg::X0);
+
+        // Scratch layout: [0]=input_bytes_base [8]=input_len
+        // [16]=pattern_bytes_base [24]=pattern_len
+        // [32]=replacement_bytes_base [40]=replacement_len
+        self.asm.ldr_imm(Reg::X7, Reg::X0, 0);
+        self.asm.str_imm(Reg::X7, Reg::X6, 8);
+        self.asm.add_reg_imm(Reg::X7, Reg::X0, 8);
+        self.asm.str_imm(Reg::X7, Reg::X6, 0);
+        self.asm.ldr_imm(Reg::X7, Reg::X1, 0);
+        self.asm.str_imm(Reg::X7, Reg::X6, 24);
+        self.asm.add_reg_imm(Reg::X7, Reg::X1, 8);
+        self.asm.str_imm(Reg::X7, Reg::X6, 16);
+        self.asm.ldr_imm(Reg::X7, Reg::X2, 0);
+        self.asm.str_imm(Reg::X7, Reg::X6, 40);
+        self.asm.add_reg_imm(Reg::X7, Reg::X2, 8);
+        self.asm.str_imm(Reg::X7, Reg::X6, 32);
+
+        // Pass 1: count non-overlapping matches.
+        self.asm.ldr_imm(Reg::X8, Reg::X6, 0); // input_bytes_base
+        self.asm.ldr_imm(Reg::X9, Reg::X6, 8); // input_len
+        self.asm.mov_imm64(Reg::X10, 0); // pos
+        self.asm.mov_imm64(Reg::X11, 0); // match_count
+
+        let count_loop = self.asm.new_label();
+        let count_done = self.asm.new_label();
+        let count_is_match = self.asm.new_label();
+        self.asm.bind(count_loop);
+        self.asm.ldr_imm(Reg::X7, Reg::X6, 24); // pattern_len
+        self.asm.add_reg(Reg::X0, Reg::X10, Reg::X7);
+        self.asm.cmp_reg(Reg::X0, Reg::X9);
+        self.asm
+            .branch(count_done, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg(Reg::X0, Reg::X8, Reg::X10); // a_ptr
+        self.asm.ldr_imm(Reg::X1, Reg::X6, 16); // b_ptr = pattern_bytes_base
+        self.asm.mov_reg(Reg::X2, Reg::X7); // len = pattern_len
+        self.asm
+            .bytes_equal(Reg::X2, Reg::X0, Reg::X1, Reg::X3, Reg::X4, Reg::X12);
+        self.asm
+            .branch(count_is_match, BranchKind::CompareNonZero(Reg::X3));
+        self.asm.add_reg_imm(Reg::X10, Reg::X10, 1);
+        self.asm.branch(count_loop, BranchKind::Unconditional);
+        self.asm.bind(count_is_match);
+        self.asm.add_reg_imm(Reg::X11, Reg::X11, 1);
+        self.asm.add_reg(Reg::X10, Reg::X10, Reg::X7);
+        self.asm.branch(count_loop, BranchKind::Unconditional);
+        self.asm.bind(count_done);
+
+        // total_content_len = input_len + match_count*(replacement_len - pattern_len)
+        self.asm.ldr_imm(Reg::X0, Reg::X6, 40); // replacement_len
+        self.asm.ldr_imm(Reg::X1, Reg::X6, 24); // pattern_len
+        self.asm.sub_reg(Reg::X0, Reg::X0, Reg::X1);
+        self.asm.mul_reg(Reg::X0, Reg::X0, Reg::X11);
+        self.asm.add_reg(Reg::X0, Reg::X9, Reg::X0);
+
+        self.asm.push(Reg::X6);
+        self.asm.push(Reg::X0); // total_content_len
+        self.asm.add_reg_imm(Reg::X4, Reg::X0, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        self.emit_alloc(); // x5 = result object
+        self.asm.pop(Reg::X12); // total_content_len
+        self.asm.pop(Reg::X6); // scratch struct ptr
+
+        self.asm.str_imm(Reg::X12, Reg::X5, 0);
+
+        // Pass 2: copy, substituting at each match.
+        self.asm.mov_imm64(Reg::X10, 0); // pos
+        self.asm.add_reg_imm(Reg::X11, Reg::X5, 8); // dst cursor
+
+        let copy_loop = self.asm.new_label();
+        let copy_no_match = self.asm.new_label();
+        let copy_is_match = self.asm.new_label();
+        let copy_done = self.asm.new_label();
+        self.asm.bind(copy_loop);
+        self.asm.ldr_imm(Reg::X0, Reg::X6, 8); // input_len
+        self.asm.cmp_reg(Reg::X10, Reg::X0);
+        self.asm
+            .branch(copy_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldr_imm(Reg::X7, Reg::X6, 24); // pattern_len
+        self.asm.add_reg(Reg::X0, Reg::X10, Reg::X7);
+        self.asm.ldr_imm(Reg::X1, Reg::X6, 8); // input_len
+        self.asm.cmp_reg(Reg::X0, Reg::X1);
+        self.asm
+            .branch(copy_no_match, BranchKind::Conditional(Cond::Gt));
+        self.asm.ldr_imm(Reg::X0, Reg::X6, 0); // input_bytes_base
+        self.asm.add_reg(Reg::X0, Reg::X0, Reg::X10);
+        self.asm.ldr_imm(Reg::X1, Reg::X6, 16); // pattern_bytes_base
+        self.asm.mov_reg(Reg::X2, Reg::X7);
+        self.asm
+            .bytes_equal(Reg::X2, Reg::X0, Reg::X1, Reg::X3, Reg::X4, Reg::X12);
+        self.asm
+            .branch(copy_is_match, BranchKind::CompareNonZero(Reg::X3));
+
+        self.asm.bind(copy_no_match);
+        self.asm.ldr_imm(Reg::X0, Reg::X6, 0); // input_bytes_base
+        self.asm.add_reg(Reg::X0, Reg::X0, Reg::X10);
+        self.asm.ldrb_post_increment(Reg::X1, Reg::X0);
+        self.asm.strb_post_increment(Reg::X1, Reg::X11);
+        self.asm.add_reg_imm(Reg::X10, Reg::X10, 1);
+        self.asm.branch(copy_loop, BranchKind::Unconditional);
+
+        self.asm.bind(copy_is_match);
+        self.asm.ldr_imm(Reg::X0, Reg::X6, 32); // replacement_bytes_base
+        self.asm.ldr_imm(Reg::X1, Reg::X6, 40); // replacement_len
+        self.emit_copy_bytes(Reg::X1, Reg::X0, Reg::X11, Reg::X2);
+        self.asm.ldr_imm(Reg::X7, Reg::X6, 24); // pattern_len
+        self.asm.add_reg(Reg::X10, Reg::X10, Reg::X7);
+        self.asm.branch(copy_loop, BranchKind::Unconditional);
+        self.asm.bind(copy_done);
+
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
     fn emit_str_char_count(&mut self) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
         self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
@@ -2593,6 +2785,27 @@ impl Emitter {
                 self.asm.mov_reg(Reg::X1, Reg::X0);
                 self.asm.pop(Reg::X0);
                 self.emit_str_join();
+                Ok(Some(ValueType::Str))
+            }
+            ("replaceAll", 3) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "replaceAll of a non-string"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "replaceAll with a non-string pattern"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[2])? != ValueType::Str {
+                    return Err(unsupported(
+                        span,
+                        "replaceAll with a non-string replacement",
+                    ));
+                }
+                self.asm.mov_reg(Reg::X2, Reg::X0);
+                self.asm.pop(Reg::X1);
+                self.asm.pop(Reg::X0);
+                self.emit_str_replace_all();
                 Ok(Some(ValueType::Str))
             }
             ("head", 1) => {

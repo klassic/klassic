@@ -22926,6 +22926,170 @@ fn build_target_aarch64_apple_darwin_string_join_runs() {
     );
 }
 
+/// Regression guard on any host: `replaceAll` (literal non-overlapping
+/// substring replacement -- not the evaluator's `"[0-9]"` pseudo-regex
+/// special case, and an empty pattern is a deliberate `unsupported`
+/// scope reduction from x86_64 parity) must cross-build for
+/// aarch64-apple-darwin -- the remaining M13 slice (issue #538).
+#[test]
+fn build_target_aarch64_apple_darwin_string_replace_all_cross_build() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_replaceall_xbuild_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_replaceall_xbuild_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(replaceAll(\"abc\", \"b\", \"\"))\n\
+         println(replaceAll(\"aaa\", \"a\", \"bb\"))\n\
+         println(replaceAll(\"hello world hello\", \"hello\", \"hi\"))\n\
+         println(replaceAll(\"abcabc\", \"bc\", \"X\"))\n\
+         println(replaceAll(\"nomatch\", \"xyz\", \"replaced\"))\n\
+         println(replaceAll(\"aaaa\", \"aa\", \"b\"))\n\
+         println(replaceAll(\"overlapoverlapoverlap\", \"overlap\", \"X\"))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        build_output.status.success(),
+        "darwin replaceAll cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
+/// M13 acceptance test: `replaceAll` actually runs on an Apple Silicon
+/// mac, matching the evaluator's output exactly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_string_replace_all_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_replaceall_run_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_replaceall_run_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(replaceAll(\"abc\", \"b\", \"\"))\n\
+         println(replaceAll(\"aaa\", \"a\", \"bb\"))\n\
+         println(replaceAll(\"hello world hello\", \"hello\", \"hi\"))\n\
+         println(replaceAll(\"abcabc\", \"bc\", \"X\"))\n\
+         println(replaceAll(\"nomatch\", \"xyz\", \"replaced\"))\n\
+         println(replaceAll(\"aaaa\", \"aa\", \"b\"))\n\
+         println(replaceAll(\"overlapoverlapoverlap\", \"overlap\", \"X\"))\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin replaceAll build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "ac\nbbbbbb\nhi world hi\naXaX\nnomatch\nbb\nXXX\n"
+    );
+}
+
+/// GC stress regression guard, macOS-gated only: `replaceAll` calls
+/// two `emit_alloc`s (the 48-byte scratch struct, then the exact-size
+/// result) per call. Force enough allocation churn to guarantee at
+/// least one heap-grow mmap fires mid-routine, the same failure class
+/// M13 slice 1's `trim` bug (#563) was invisible to until a
+/// large-enough working set crossed a segment boundary.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_string_replace_all_survives_heap_growth() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_replaceall_churn_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_replaceall_churn_{stamp}.bin"));
+    let padded = "a".repeat(1000);
+    fs::write(
+        &source_path,
+        format!(
+            "mutable i = 0\n\
+             mutable lastLen = 0\n\
+             while (i < 50000) {{\n\
+             \x20 val r = replaceAll(\"{padded}\", \"a\", \"bb\")\n\
+             \x20 lastLen = length(r)\n\
+             \x20 i = i + 1\n\
+             }}\n\
+             println(lastLen)\n\
+             println(i)\n"
+        ),
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin replaceAll churn build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?} (a SIGSEGV here means emit_str_replace_all \
+         clobbered a pointer across a heap-grow mmap)\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "2000\n50000\n");
+}
+
 /// Regression guard on any host: `FileOutput#write`/`#append`,
 /// `FileInput#all`, and `FileOutput#delete` (tolerating a missing
 /// file) must cross-build for aarch64-apple-darwin -- M14 (issue
