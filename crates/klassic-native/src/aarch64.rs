@@ -1549,6 +1549,80 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X5);
     }
 
+    /// `join(list, separator)`: cons-list head in x0, separator
+    /// string in x1 -> fresh string object in x0. Two passes: the
+    /// first walks the list to total the element byte lengths and
+    /// count them (so the separator's contribution, `sep_len` times
+    /// `count minus one`, is known before allocating); the second
+    /// walks it again, copying each element into a single exact-size
+    /// allocation with the separator interspersed between elements
+    /// (never before the first or after the last).
+    fn emit_str_join(&mut self) {
+        self.asm.mov_reg(Reg::X10, Reg::X0);
+        self.asm.mov_imm64(Reg::X2, 0);
+        self.asm.mov_imm64(Reg::X9, 0);
+        let count_loop = self.asm.new_label();
+        let count_done = self.asm.new_label();
+        self.asm.bind(count_loop);
+        self.asm
+            .branch(count_done, BranchKind::CompareZero(Reg::X10));
+        self.asm.ldr_imm(Reg::X11, Reg::X10, 0);
+        self.asm.ldr_imm(Reg::X12, Reg::X11, 0);
+        self.asm.add_reg(Reg::X2, Reg::X2, Reg::X12);
+        self.asm.add_reg_imm(Reg::X9, Reg::X9, 1);
+        self.asm.ldr_imm(Reg::X10, Reg::X10, 8);
+        self.asm.branch(count_loop, BranchKind::Unconditional);
+        self.asm.bind(count_done);
+
+        let no_sep = self.asm.new_label();
+        self.asm.cmp_imm(Reg::X9, 0);
+        self.asm.branch(no_sep, BranchKind::Conditional(Cond::Eq));
+        self.asm.ldr_imm(Reg::X11, Reg::X1, 0);
+        self.asm.sub_reg_imm(Reg::X12, Reg::X9, 1);
+        self.asm.mul_reg(Reg::X11, Reg::X11, Reg::X12);
+        self.asm.add_reg(Reg::X2, Reg::X2, Reg::X11);
+        self.asm.bind(no_sep);
+
+        // X9 (count) is outside emit_alloc's x0-x5 preserved range, so
+        // it must be saved across the call explicitly (see the
+        // emit_str_trim fix for why this matters once a heap-grow
+        // mmap actually fires).
+        self.asm.push(Reg::X9);
+        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        self.emit_alloc();
+        self.asm.pop(Reg::X9);
+
+        self.asm.str_imm(Reg::X2, Reg::X5, 0);
+        self.asm.add_reg_imm(Reg::X6, Reg::X5, 8);
+        self.asm.mov_reg(Reg::X10, Reg::X0);
+        self.asm.mov_imm64(Reg::X12, 0);
+
+        let copy_loop = self.asm.new_label();
+        let copy_done = self.asm.new_label();
+        let skip_sep = self.asm.new_label();
+        self.asm.bind(copy_loop);
+        self.asm
+            .branch(copy_done, BranchKind::CompareZero(Reg::X10));
+        self.asm.cmp_imm(Reg::X12, 0);
+        self.asm.branch(skip_sep, BranchKind::Conditional(Cond::Eq));
+        self.asm.ldr_imm(Reg::X2, Reg::X1, 0);
+        self.asm.add_reg_imm(Reg::X3, Reg::X1, 8);
+        self.emit_copy_bytes(Reg::X2, Reg::X3, Reg::X6, Reg::X4);
+        self.asm.bind(skip_sep);
+        self.asm.ldr_imm(Reg::X11, Reg::X10, 0);
+        self.asm.ldr_imm(Reg::X2, Reg::X11, 0);
+        self.asm.add_reg_imm(Reg::X3, Reg::X11, 8);
+        self.emit_copy_bytes(Reg::X2, Reg::X3, Reg::X6, Reg::X4);
+        self.asm.add_reg_imm(Reg::X12, Reg::X12, 1);
+        self.asm.ldr_imm(Reg::X10, Reg::X10, 8);
+        self.asm.branch(copy_loop, BranchKind::Unconditional);
+        self.asm.bind(copy_done);
+
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
     fn emit_str_char_count(&mut self) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
         self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
@@ -2155,6 +2229,23 @@ impl Emitter {
                 self.asm.pop(Reg::X0);
                 self.emit_str_ends_with();
                 Ok(Some(ValueType::Bool))
+            }
+            ("join", 2) => {
+                let list_ty = self.expression(&arguments[0])?;
+                if !matches!(
+                    list_ty,
+                    ValueType::List(ListElem::Str) | ValueType::EmptyList
+                ) {
+                    return Err(unsupported(span, "join of a non-string list"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "join with a non-string separator"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.pop(Reg::X0);
+                self.emit_str_join();
+                Ok(Some(ValueType::Str))
             }
             ("head", 1) => {
                 let ty = self.expression(&arguments[0])?;

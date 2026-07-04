@@ -22829,6 +22829,103 @@ fn build_target_aarch64_apple_darwin_string_trim_survives_heap_growth() {
     );
 }
 
+/// Regression guard on any host: `join` (`List<String>` folded with a
+/// separator between elements, never before the first or after the
+/// last) must cross-build for aarch64-apple-darwin -- the second
+/// slice of M13 string builtin parity (issue #538), and the first
+/// M13 routine that walks a cons-list rather than a single string.
+#[test]
+fn build_target_aarch64_apple_darwin_string_join_cross_build() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_join_xbuild_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_join_xbuild_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(join([\"a\", \"b\", \"c\"], \", \"))\n\
+         println(join([\"single\"], \", \"))\n\
+         println(join([], \", \"))\n\
+         println(join([\"x\", \"y\"], \"\"))\n\
+         println(\"[\" + join([], \"-\") + \"]\")\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        build_output.status.success(),
+        "darwin join cross build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+}
+
+/// M13 slice 2 acceptance test: `join` actually runs on an Apple
+/// Silicon mac, matching the evaluator's output exactly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_string_join_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_join_run_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_join_run_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "println(join([\"a\", \"b\", \"c\"], \", \"))\n\
+         println(join([\"single\"], \", \"))\n\
+         println(join([], \", \"))\n\
+         println(join([\"x\", \"y\"], \"\"))\n\
+         println(\"[\" + join([], \"-\") + \"]\")\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin join build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "a, b, c\nsingle\n\nxy\n[]\n"
+    );
+}
+
 /// On Apple Silicon a target-less `build` detects the host: programs
 /// inside the direct subset get the toolchain-free Mach-O backend
 /// (no libSystem linkage), and programs outside it silently fall

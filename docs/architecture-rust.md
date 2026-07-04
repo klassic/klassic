@@ -905,10 +905,28 @@ cargo run -- -e "1 + 2"
   `ldrb_post_increment` already applies to `ldr_post_increment`) and
   `is_ascii_whitespace_into` (tests a byte against the same
   space/tab/LF/CR/VT/FF set as the x86_64 backend's
-  `emit_jump_if_ascii_whitespace`). Remaining M13 slice:
-  `replaceAll`/`split`/`join`, which reuse the M7 cons-list machinery
-  and are left for a follow-up PR. Remaining plan after M13: M14 (file
-  I/O), M15 (directory ops), M16 (environment/time).
+  `emit_jump_if_ascii_whitespace`). One bug caught by macOS CI's own
+  execution test: an early version of `trim` computed the result
+  slice's start pointer into a scratch register *before* calling
+  `emit_alloc`, whose heap-grow path only preserves `x0`-`x5` across
+  the mmap it performs -- once a program trimmed enough strings to
+  fill the bump allocator's 64 MiB segment and a grow actually fired,
+  that pointer was silently clobbered (`SIGSEGV`). Fixed by saving the
+  value across the call via push/pop and deferring the pointer
+  computation until after `emit_alloc` returns; a regression test
+  sized to force an actual heap-grow (100,000 `trim` calls on a
+  1000-byte string) guards against a repeat.
+
+  M13 slice 2 (issue #538) adds `join`: two passes over the cons-list
+  (walk once to total element byte lengths and count them, so the
+  separator's contribution is known before allocating; walk again,
+  copying each element into a single exact-size allocation with the
+  separator interspersed between elements). This is the first M13
+  routine to walk a cons-list rather than operate on a single string.
+  Remaining M13 slice: `replaceAll`/`split`, which need pattern
+  matching plus a result whose length isn't known until the match
+  count is, and are left for a follow-up PR. Remaining plan after
+  M13: M14 (file I/O), M15 (directory ops), M16 (environment/time).
 
   `x86_64-pc-windows-msvc` (`--target x86_64-pc-windows-msvc` /
   `windows-x86_64`) is the one target that does *not* get its own
