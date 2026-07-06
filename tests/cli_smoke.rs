@@ -23517,20 +23517,20 @@ fn build_target_aarch64_apple_darwin_dir_ops_runs() {
     );
 }
 
-/// Regression guard on any host: `Environment#exists` must
-/// cross-build for aarch64-apple-darwin -- M16 (issue #538), which
-/// also captures argc/argv/envp from dyld's LC_MAIN entry in the
-/// program prologue. `Time#nowMillis` was attempted in the same
-/// milestone but withdrawn before merge: the real-hardware execution
-/// test caught `gettimeofday`'s raw `svc #0x80` form crashing with
-/// SIGSEGV on one run and returning a clean syscall failure on
-/// another (same binary, same CI run, different symptoms depending
-/// on call order) -- `syscalls.master` marking it `NO_SYSCALL_STUB`
-/// turned out to mean genuinely unreliable behavior off the commpage
-/// path, not just slower. `Time#nowMillis` remains an explicit
-/// `unsupported` diagnostic on this backend until a safe alternative
-/// (e.g. reading the commpage directly, or `mach_absolute_time`) is
-/// designed and verified.
+/// Regression guard on any host: `Environment#exists` and
+/// `Time#nowMillis` must cross-build for aarch64-apple-darwin -- M16
+/// (issue #538), which also captures argc/argv/envp from dyld's
+/// LC_MAIN entry in the program prologue. `Time#nowMillis` was
+/// attempted once before and withdrawn after a real-hardware crash
+/// (see issue #570): the actual root cause turned out to be calling
+/// `gettimeofday` (syscall 116) with only 2 arguments when
+/// `syscalls.master` (apple-oss-distributions/xnu) defines it as a
+/// 3-argument, `NO_SYSCALL_STUB` syscall -- `int gettimeofday(struct
+/// timeval *tp, struct timezone *tzp, uint64_t *mach_absolute_time)`
+/// -- leaving x2 (the third argument) holding whatever garbage a
+/// prior computation left there, which the kernel likely
+/// misinterpreted as a pointer to write `mach_absolute_time`
+/// through. This attempt explicitly zeroes x2 before the trap.
 #[test]
 fn build_target_aarch64_apple_darwin_env_time_cross_build() {
     let stamp = SystemTime::now()
@@ -23542,7 +23542,10 @@ fn build_target_aarch64_apple_darwin_env_time_cross_build() {
     let bin_path = dir.join(format!("klassic_macho_envtime_xbuild_{stamp}.bin"));
     fs::write(
         &source_path,
-        "println(Environment#exists(\"KLASSIC_ENV_TIME_TEST_NONEXISTENT_XYZ\"))\n\
+        "val t = Time#nowMillis()\n\
+         println(t > 1700000000000)\n\
+         println(t < 3000000000000)\n\
+         println(Environment#exists(\"KLASSIC_ENV_TIME_TEST_NONEXISTENT_XYZ\"))\n\
          println(Environment#exists(\"PATH\"))\n",
     )
     .expect("temp source file should write");
@@ -23561,13 +23564,20 @@ fn build_target_aarch64_apple_darwin_env_time_cross_build() {
     let _ = fs::remove_file(&bin_path);
     assert!(
         build_output.status.success(),
-        "darwin env cross build should succeed\nstderr:\n{}",
+        "darwin env/time cross build should succeed\nstderr:\n{}",
         String::from_utf8_lossy(&build_output.stderr)
     );
 }
 
-/// M16 acceptance test: `Environment#exists` actually runs on an
-/// Apple Silicon mac.
+/// M16 acceptance test: `Environment#exists` and `Time#nowMillis`
+/// actually run on an Apple Silicon mac. `Time#nowMillis` can't be
+/// compared byte-for-byte against the evaluator (real time elapses
+/// between the two runs), so this checks the value falls in a sane
+/// range instead -- this is also the real-hardware re-verification of
+/// the 3-argument `gettimeofday` fix, on the exact class of test
+/// (`Time#nowMillis` called first, forcing its `gettimeofday` to be
+/// the very first heap allocation in the program) that caught the
+/// SIGSEGV the first time.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn build_target_aarch64_apple_darwin_env_time_runs() {
@@ -23580,7 +23590,10 @@ fn build_target_aarch64_apple_darwin_env_time_runs() {
     let bin_path = dir.join(format!("klassic_macho_envtime_run_{stamp}.bin"));
     fs::write(
         &source_path,
-        "println(Environment#exists(\"KLASSIC_ENV_TIME_TEST_NONEXISTENT_XYZ\"))\n\
+        "val t = Time#nowMillis()\n\
+         println(t > 1700000000000)\n\
+         println(t < 3000000000000)\n\
+         println(Environment#exists(\"KLASSIC_ENV_TIME_TEST_NONEXISTENT_XYZ\"))\n\
          println(Environment#exists(\"PATH\"))\n",
     )
     .expect("temp source file should write");
@@ -23597,7 +23610,7 @@ fn build_target_aarch64_apple_darwin_env_time_runs() {
         .expect("binary should run");
     assert!(
         build_output.status.success(),
-        "darwin env build should succeed\nstderr:\n{}",
+        "darwin env/time build should succeed\nstderr:\n{}",
         String::from_utf8_lossy(&build_output.stderr)
     );
     let run_output = Command::new(&bin_path)
@@ -23607,11 +23620,15 @@ fn build_target_aarch64_apple_darwin_env_time_runs() {
     let _ = fs::remove_file(&bin_path);
     assert!(
         run_output.status.success(),
-        "Mach-O exited with {:?}\nstderr:\n{}",
+        "Mach-O exited with {:?} (a SIGSEGV here means the 3-argument \
+         gettimeofday fix didn't hold)\nstderr:\n{}",
         run_output.status,
         String::from_utf8_lossy(&run_output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "false\ntrue\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "true\ntrue\nfalse\ntrue\n"
+    );
 }
 
 /// On Apple Silicon a target-less `build` detects the host: programs

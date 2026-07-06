@@ -1020,22 +1020,24 @@ cargo run -- -e "1 + 2"
   requiring the byte right after the match to be `'='` so `"FOO"`
   can't false-match an entry for `"FOOBAR"`.
 
-  `Time#nowMillis` was attempted in the same milestone (calling
-  `gettimeofday`, syscall 116, into a scratch buffer) and withdrawn
-  before merge: `syscalls.master` marks `gettimeofday`
-  `NO_SYSCALL_STUB` (normally served from the commpage on real
-  hardware, not trapped), and the real-hardware CI execution test --
-  the only way to actually find out -- showed the raw two-argument
-  `svc #0x80` form is genuinely unreliable rather than just slower.
-  The same binary produced two different symptoms across CI runs
-  depending on call order: a clean, intentional syscall-failure abort
-  in one ordering (`Environment#exists` called first) and a SIGSEGV in
-  another (`Time#nowMillis` called first, so its `gettimeofday` was
-  the very first heap allocation in the program). `Time#nowMillis`
-  remains an explicit `unsupported` diagnostic on this backend until a
-  safe alternative (reading the commpage directly, or
-  `mach_absolute_time`) is designed and verified on real hardware
-  first.
+  `Time#nowMillis` was attempted once and withdrawn after a
+  real-hardware crash (see issue #570), then re-landed with the actual
+  bug fixed. `gettimeofday` is syscall 116; `syscalls.master`
+  (apple-oss-distributions/xnu) defines it as a **3-argument**
+  syscall marked `NO_SYSCALL_STUB`: `int gettimeofday(struct timeval
+  *tp, struct timezone *tzp, uint64_t *mach_absolute_time)`. The first
+  attempt called it with only 2 arguments, leaving `x2` (the third
+  argument) holding whatever a prior computation left there -- the
+  kernel likely misinterpreted that garbage as a pointer to write
+  `mach_absolute_time` through, which explains the exact symptom
+  observed: the same binary produced a clean syscall-failure abort in
+  one CI run's call ordering and a SIGSEGV in another. The fix is one
+  instruction: explicitly zero `x2` before the trap. Reads the
+  resulting 16-byte `struct timeval` (`tv_sec: i64` at offset 0,
+  `tv_usec: i32` at offset 8 followed by 4 bytes of padding -- read
+  with the 32-bit `ldr_imm32` load introduced for this so the result
+  never depends on those padding bytes) and computes
+  `tv_sec*1000 + tv_usec/1000`.
 
   `x86_64-pc-windows-msvc` (`--target x86_64-pc-windows-msvc` /
   `windows-x86_64`) is the one target that does *not* get its own
