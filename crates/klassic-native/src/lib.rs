@@ -13276,6 +13276,17 @@ impl NativeCodeGenerator {
             "native heap string equality first argument",
             false,
         )?;
+        // Root the first operand in a shadow-tracked slot across the
+        // second's compile, and FREE it (via the scope) once the
+        // comparison is done. The old code allocated this slot without
+        // ever releasing it -- a permanent rsp/next_stack_offset
+        // imbalance that was harmless on its own but corrupts the stack
+        // when this equality is the short-circuited RHS of a `&&`: the
+        // runtime skips the leaked `sub rsp` but the enclosing scope's
+        // `pop_scope` still adds it back. (Exposed by rooting the
+        // gc_read staging in the enum field-read path.) The comparison
+        // result is a Bool in rax, which `pop_scope` preserves.
+        self.push_scope();
         let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
         let b = self.compile_expr(rhs)?;
@@ -13293,6 +13304,7 @@ impl NativeCodeGenerator {
             self.asm.setcc_al(Condition::Equal);
             self.asm.movzx_rax_al();
         }
+        self.pop_scope();
         Ok(NativeValue::Bool)
     }
 
@@ -13757,20 +13769,34 @@ impl NativeCodeGenerator {
                 &format!("native {name} for non-address argument"),
             ));
         }
-        self.asm.push_reg(Reg::Rax);
-        self.next_stack_offset += 8;
+        // Root the base in a shadow-tracked slot across the offset
+        // compile rather than holding it on the raw machine stack: an
+        // offset subexpression that allocates could otherwise let a
+        // collection sweep (or a moving collector relocate) the base
+        // out from under the load. The interior pointer is formed after
+        // the offset compile, from the rooted (relocation-updated)
+        // base. In practice the enum lowering always passes a literal
+        // offset, but this keeps the read sound for any offset
+        // expression and under a future moving collector. This is also
+        // the load site a ZGC load barrier will attach to (M5).
+        self.push_scope();
+        let base_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+        self.asm.store_rbp_slot(base_slot.offset, Reg::Rax);
         let offset = self.compile_expr(&arguments[1])?;
         if offset != NativeValue::Int {
+            self.pop_scope();
             return Err(unsupported(
                 span,
                 &format!("native {name} for non-Int byte_offset argument"),
             ));
         }
-        self.asm.pop_reg(Reg::Rcx);
-        self.next_stack_offset -= 8;
-        self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
-        // rax = address + offset; load *(rax)
+        // rax = offset; add the rooted base to form the interior
+        // pointer, then load. No allocation occurs between here and the
+        // load, so holding the result raw in rax afterward is safe.
+        self.asm.load_rbp_slot(Reg::Rcx, base_slot.offset);
+        self.asm.add_reg_reg(Reg::Rax, Reg::Rcx); // rax = offset + base
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        self.pop_scope();
         Ok(result)
     }
 
@@ -13941,20 +13967,32 @@ impl NativeCodeGenerator {
                 "native __gc_write for non-address argument",
             ));
         }
-        self.asm.push_reg(Reg::Rax);
-        self.next_stack_offset += 8;
+        // Root the base pointer in a shadow-tracked slot and stash the
+        // byte offset, then compile the value LAST and only afterward
+        // recompute `base + offset`. The old code held the interior
+        // pointer `base + offset` on the raw machine stack across the
+        // value compile, which for a boxed field allocates -- a
+        // moving collector could relocate the record at that
+        // allocation and leave the interior pointer stale (writing into
+        // freed memory). With the base rooted and the interior pointer
+        // formed only after the last allocation, the write always
+        // lands in the live object. (This also removes the old code's
+        // reliance on the record being kept alive by a separate
+        // construction-scope root while an unrooted interior pointer
+        // sat on the stack.)
+        self.push_scope();
+        let base_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+        self.asm.store_rbp_slot(base_slot.offset, Reg::Rax);
         let offset = self.compile_expr(&arguments[1])?;
         if offset != NativeValue::Int {
+            self.pop_scope();
             return Err(unsupported(
                 span,
                 "native __gc_write for non-Int byte_offset argument",
             ));
         }
-        self.asm.pop_reg(Reg::Rcx);
-        self.next_stack_offset -= 8;
-        self.asm.add_reg_reg(Reg::Rcx, Reg::Rax); // rcx = addr + offset
-        self.asm.push_reg(Reg::Rcx);
-        self.next_stack_offset += 8;
+        let offset_slot = self.allocate_anonymous_slot(NativeValue::Int);
+        self.asm.store_rbp_slot(offset_slot.offset, Reg::Rax);
         let value = self.compile_expr(&arguments[2])?;
         if !matches!(
             value,
@@ -13963,14 +14001,20 @@ impl NativeCodeGenerator {
                 | NativeValue::HeapString
                 | NativeValue::RuntimeDouble
         ) {
+            self.pop_scope();
             return Err(unsupported(
                 span,
                 "native __gc_write for non-qword value argument",
             ));
         }
-        self.asm.pop_reg(Reg::Rcx);
-        self.next_stack_offset -= 8;
+        // value is in rax. Recompute the interior pointer from the
+        // rooted base (updated in place if the value's allocation
+        // relocated it) plus the stashed offset, then store.
+        self.asm.load_rbp_slot(Reg::Rcx, base_slot.offset);
+        self.asm.load_rbp_slot(Reg::Rdx, offset_slot.offset);
+        self.asm.add_reg_reg(Reg::Rcx, Reg::Rdx); // rcx = base + offset
         self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
+        self.pop_scope();
         Ok(NativeValue::Unit)
     }
 
