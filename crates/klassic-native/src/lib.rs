@@ -27,6 +27,10 @@ pub struct NativeCompilerConfig {
     /// than a size-dependent heisenbug — the standing bug-shaker for
     /// the collector's staging invariants.
     pub gc_stress: bool,
+    /// `--gc-poison`: heap-stored pointers are colored with the BAD
+    /// color, so the load-barrier slow path runs on every load and any
+    /// unbarriered dereference faults on a non-canonical address.
+    pub gc_poison: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -643,6 +647,7 @@ fn compile_internal(
             generator.variant_owner_enum = variant_owner_enum;
             generator.gc_log = config.gc_log;
             generator.gc_stress = config.gc_stress;
+            generator.gc_poison = config.gc_poison;
             let object = generator.compile(&expr).map_err(|diagnostic| {
                 NativeCompileError::with_view(source, user_view, diagnostic)
             })?;
@@ -4342,10 +4347,18 @@ struct NativeCodeGenerator {
     /// when off.
     gc_log: bool,
     gc_stress: bool,
+    /// `--gc-poison`: color heap-stored pointers with a BAD color, so any
+    /// unbarriered dereference faults on a non-canonical address and the
+    /// load-barrier slow path is exercised on every load.
+    gc_poison: bool,
     gc_alloc: TextLabel,
     gc_collect: TextLabel,
     gc_mark_visit: TextLabel,
     gc_deep_equal: TextLabel,
+    /// ZGC load-barrier slow path: heals a bad-colored heap pointer
+    /// (strip, recolor to good, self-heal store) and returns the raw
+    /// address. Leaf routine; clobbers only rax (output) and r11.
+    gc_load_barrier_slow: TextLabel,
     /// Acquire a fresh empty region as the current bump target (from the
     /// free-region pool, else the uncommitted tail within budget).
     gc_acquire_region: TextLabel,
@@ -4545,6 +4558,7 @@ impl NativeCodeGenerator {
         let gc_collect = asm.create_text_label();
         let gc_mark_visit = asm.create_text_label();
         let gc_deep_equal = asm.create_text_label();
+        let gc_load_barrier_slow = asm.create_text_label();
         let gc_acquire_region = asm.create_text_label();
         let gc_alloc_large = asm.create_text_label();
         let gc_grow_budget = asm.create_text_label();
@@ -4669,10 +4683,12 @@ impl NativeCodeGenerator {
             gc_pause_start_ns,
             gc_log: false,
             gc_stress: false,
+            gc_poison: false,
             gc_alloc,
             gc_collect,
             gc_mark_visit,
             gc_deep_equal,
+            gc_load_barrier_slow,
             gc_acquire_region,
             gc_alloc_large,
             gc_grow_budget,
@@ -5260,6 +5276,7 @@ impl NativeCodeGenerator {
         self.emit_store_command_line_state();
         self.emit_initialize_stack_floor();
         self.emit_initialize_gc_heap();
+        self.emit_initialize_color_registers();
         self.compile_top_level(expr)?;
         self.emit_queued_threads()?;
         if self.gc_log {
@@ -5271,6 +5288,7 @@ impl NativeCodeGenerator {
         self.emit_print_i64_runtime();
         self.emit_gc_mark_visit_runtime();
         self.emit_gc_deep_equal_runtime();
+        self.emit_gc_load_barrier_slow_runtime();
         self.emit_gc_alloc_runtime();
         self.emit_gc_collect_runtime();
         self.emit_gc_acquire_region_runtime();
@@ -13852,7 +13870,24 @@ impl NativeCodeGenerator {
         // load, so holding the result raw in rax afterward is safe.
         self.asm.load_rbp_slot(Reg::Rcx, base_slot.offset);
         self.asm.add_reg_reg(Reg::Rax, Reg::Rcx); // rax = offset + base
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        if matches!(result, NativeValue::HeapPointer | NativeValue::HeapString) {
+            // ZGC load barrier: a heap slot holds a COLORED pointer. Save
+            // the field address (for self-heal), load the value, and if
+            // its color is bad take the slow path; then strip the color
+            // so the register holds a raw (canonical) pointer. Only the
+            // pointer-typed reads barrier -- an Int/Double read through
+            // this same funnel must NOT strip (its high bits are data).
+            let ok = self.asm.create_text_label();
+            self.asm.mov_reg_reg(Reg::R10, Reg::Rax); // field addr
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0); // colored value
+            self.asm.test_reg_reg(Reg::Rax, Reg::R15); // bad color?
+            self.asm.jcc_label(Condition::Equal, ok);
+            self.asm.call_label(self.gc_load_barrier_slow);
+            self.asm.bind_text_label(ok);
+            self.asm.and_reg_reg(Reg::Rax, Reg::R13); // strip -> raw
+        } else {
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        }
         self.pop_scope();
         Ok(result)
     }
@@ -14070,6 +14105,18 @@ impl NativeCodeGenerator {
         self.asm.load_rbp_slot(Reg::Rcx, base_slot.offset);
         self.asm.load_rbp_slot(Reg::Rdx, offset_slot.offset);
         self.asm.add_reg_reg(Reg::Rcx, Reg::Rdx); // rcx = base + offset
+        if matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
+            // ZGC color-on-store: a heap slot holds a COLORED pointer.
+            // Never color a null, though -- `0 | good_color` would be a
+            // bogus non-null pointer; a genuine null stays a raw 0 (which
+            // the load barrier passes through untouched). An Int/Double
+            // value stored through this same funnel is left uncolored.
+            let store_raw = self.asm.create_text_label();
+            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.jcc_label(Condition::Equal, store_raw);
+            self.asm.or_reg_reg(Reg::Rax, Reg::R14); // raw | good_color
+            self.asm.bind_text_label(store_raw);
+        }
         self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
         self.pop_scope();
         Ok(NativeValue::Unit)
@@ -37693,6 +37740,38 @@ impl NativeCodeGenerator {
         self.emit_exit_code(1);
     }
 
+    /// ZGC colored-pointer bits (in bits 60-62; mmap addresses are <= 47
+    /// bits, so these are free, and any pointer with one set is
+    /// non-canonical -- dereferencing a colored pointer without stripping
+    /// faults, which is the barrier-coverage guarantee).
+    const GC_COLOR_M0: u64 = 1 << 60;
+    const GC_COLOR_M1: u64 = 1 << 61;
+    const GC_COLOR_R: u64 = 1 << 62;
+    const GC_COLOR_MASK: u64 = 7 << 60;
+    /// Strip mask: clears the color bits, leaving the raw address.
+    const GC_COLOR_STRIP: u64 = !Self::GC_COLOR_MASK;
+    /// Bad-color test mask: a good (M0) pointer ANDs to zero; a poisoned
+    /// (M1) or relocation-flagged (R) pointer ANDs non-zero and takes the
+    /// load-barrier slow path.
+    const GC_COLOR_BAD_MASK: u64 = Self::GC_COLOR_M1 | Self::GC_COLOR_R;
+
+    /// Initialize the reserved color registers once, before any user
+    /// code or collector routine runs. r13 = strip mask, r14 = good
+    /// color (M1 under --gc-poison, so every stored pointer is bad and
+    /// exercises the slow path / faults if unbarriered), r15 = bad mask.
+    /// All three are callee-saved, so they survive every syscall and
+    /// Windows shim and never need reloading in M5 (no phase flips yet).
+    fn emit_initialize_color_registers(&mut self) {
+        self.asm.mov_imm64(Reg::R13, Self::GC_COLOR_STRIP);
+        let good_color = if self.gc_poison {
+            Self::GC_COLOR_M1
+        } else {
+            Self::GC_COLOR_M0
+        };
+        self.asm.mov_imm64(Reg::R14, good_color);
+        self.asm.mov_imm64(Reg::R15, Self::GC_COLOR_BAD_MASK);
+    }
+
     fn emit_initialize_gc_heap(&mut self) {
         // Reserve the whole region heap up front: one anonymous mapping
         // of GC_RESERVE_BYTES (64 MiB). Linux demand-pages it, so only
@@ -38128,6 +38207,11 @@ impl NativeCodeGenerator {
         self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
         self.asm.jcc_label(Condition::AboveOrEqual, trace_loop);
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
+        // Heap slots hold colored pointers; strip the color before
+        // gc_mark_visit dereferences the block header at [rdi-16]. (A
+        // no-op until color-on-store is turned on, since raw pointers
+        // AND with the strip mask unchanged.)
+        self.asm.and_reg_reg(Reg::Rdi, Reg::R13);
         self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
         self.asm.jcc_label(Condition::Equal, trace_skip_field);
         self.asm.call_label(self.gc_mark_visit);
@@ -38361,6 +38445,24 @@ impl NativeCodeGenerator {
         self.emit_exit_code(1);
     }
 
+    /// `gc_load_barrier_slow` (in: rax = bad-colored heap pointer,
+    /// r10 = the field address it was loaded from; out: rax = raw
+    /// stripped pointer). Heals the slot: strips the color, recolors to
+    /// the good color (r14), and stores the good-colored pointer back to
+    /// the slot (self-heal; a plain store, single mutator). Under M5's
+    /// STW non-moving collector this is the entire slow path -- no
+    /// marking, no relocation, no allocation, so it cannot recurse. Only
+    /// reached for a non-null pointer (a null slot ANDs to zero against
+    /// the bad mask and takes the fast path).
+    fn emit_gc_load_barrier_slow_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_load_barrier_slow);
+        self.asm.and_reg_reg(Reg::Rax, Reg::R13); // strip -> raw
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+        self.asm.or_reg_reg(Reg::R11, Reg::R14); // recolor to good
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11); // self-heal
+        self.asm.ret();
+    }
+
     /// `gc_deep_equal(a, b)` (rdi = a, rsi = b) compares two heap values
     /// structurally, returning rax = 1 when they are equal and rax = 0
     /// otherwise. It is the native counterpart of the evaluator's
@@ -38465,8 +38567,12 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::AboveOrEqual, equal);
         self.asm.load_rbp_slot(Reg::R11, 24);
         // rdi = a_slot = [cursor_a], rsi = b_slot = [cursor_b], recurse.
+        // Both slots hold colored pointers; strip before the recursive
+        // deep-equal dereferences them. (No-op until color-on-store.)
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
+        self.asm.and_reg_reg(Reg::Rdi, Reg::R13);
         self.asm.load_ptr_disp32(Reg::Rsi, Reg::R11, 0);
+        self.asm.and_reg_reg(Reg::Rsi, Reg::R13);
         self.asm.call_label(self.gc_deep_equal);
         self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
         self.asm.jcc_label(Condition::Equal, not_equal);
@@ -41174,6 +41280,14 @@ enum Reg {
     R9 = 9,
     R10 = 10,
     R11 = 11,
+    // R12 is intentionally omitted (unused; naming an unconstructed
+    // variant would trip the dead-code lint). R13-R15 are the ZGC
+    // reserved registers: r13 = color strip mask, r14 = good color,
+    // r15 = bad-color test mask. They are set once in the prologue and,
+    // being callee-saved, survive every syscall and Windows shim.
+    R13 = 13,
+    R14 = 14,
+    R15 = 15,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

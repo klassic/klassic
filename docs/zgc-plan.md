@@ -124,8 +124,9 @@ bumps a dedicated to-space region), so it cannot recurse or run a
 quantum.
 
 Color-on-store: the single heap-pointer store site ORs the current
-good color into pointer-typed values before the store (unconditional
-OR; coloring null is harmless).
+good color into pointer-typed values before the store, EXCEPT for a
+null (a null slot must stay a raw 0 -- `0 | good_color` would be a
+bogus non-null pointer, so the store guards on null).
 
 Phase machine (state in a `.data` qword):
 `Idle -> MarkStart (pause) -> Mark (quanta) -> MarkEnd (pause,
@@ -269,12 +270,28 @@ the semantic oracle everywhere (eval == native differential).
   not dropped (a leak that otherwise OOMs under `--gc-stress` with
   heavy turnover).
 - **M5 — Colored pointers + load barriers (collections still atomic) +
-  poison canary.** Color bits, reserved registers, the two barriers,
-  color-on-store, walker updates, a grep-audited coverage checklist in
-  the PR, and `--gc-poison` (leave bad colors set while idle so any
-  unbarriered dereference faults deterministically on a non-canonical
-  address — a missed barrier cannot silently work). The poison suite
-  gates every later milestone.
+  poison canary.** DONE. Color bits live in pointer bits 60-62 (M0=1<<60,
+  M1=1<<61, R=1<<62); a colored pointer is non-canonical, so any
+  unbarriered dereference faults. Reserved registers r13 = strip mask,
+  r14 = good color, r15 = bad-color test mask, set once in the prologue
+  (callee-saved, never reloaded in M5 since there is no phase flip yet).
+  Color-on-store at the single write funnel (`compile_gc_write`) colors
+  a heap-stored pointer with the good color, guarding NULL (a null slot
+  stays a raw 0 -- coloring it would make a bogus non-null). The load
+  barrier at the single read funnel (`compile_gc_read_qword`, only for
+  HeapPointer/HeapString reads) tests the color, runs a slow-path stub
+  on a bad color (strip + recolor + self-heal store), then strips to a
+  raw pointer. The GC walkers (mark trace, deep-equal) strip colors off
+  the slots they read. The `Map#keys`/`values` copy is a verbatim
+  colored memcpy. Collections stay fully STW non-moving; the slow path
+  does no marking/relocation/allocation, so it cannot recurse.
+  `--gc-poison` sets r14 to the BAD color, so every heap slot holds a
+  poisoned pointer, the slow path runs on every load, and any missed
+  barrier faults deterministically. Coverage is doubly guaranteed:
+  normal mode already faults on an unbarriered dereference (the good
+  color M0 is equally non-canonical), catching a missing fast-path
+  strip; poison catches a completely-missing barrier and exercises the
+  slow path on every load. The poison suite gates every later milestone.
 - **M6 — Incremental marking.** Phase machine, quanta, the two mark
   pauses (O(roots)), color alternation, allocate-black, worklist
   overflow degrading to logged STW. Pause metrics become real numbers.

@@ -32,6 +32,7 @@ cargo run -- --warn-trust path/to/program.kl         # report trusted proofs
 cargo run -- --deny-trust path/to/program.kl         # reject trusted proofs
 cargo run -- --gc-log build program.kl -o program    # GC stats to stderr at exit
 cargo run -- --gc-stress build program.kl -o program # collect before every alloc (bug-shaker)
+cargo run -- --gc-poison build program.kl -o program # bad-color heap ptrs; unbarriered deref faults
 ```
 
 ## Architecture

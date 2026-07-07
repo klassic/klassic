@@ -120,6 +120,7 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 warn_trust: command.config.warn_trust,
                 gc_log: command.config.gc_log,
                 gc_stress: command.config.gc_stress,
+                gc_poison: command.config.gc_poison,
             };
             let user_modules = user_modules_for(&input, &text)?;
             let bytes = match compile_source_with_prelude_and_modules_for_target(
