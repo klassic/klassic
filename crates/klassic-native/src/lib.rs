@@ -8446,7 +8446,21 @@ impl NativeCodeGenerator {
     ) -> Result<NativeValue, Diagnostic> {
         let mut staged_runtime_arguments = Vec::new();
         let mut staged_record_arguments = Vec::new();
-        let mut qword_arg_values = Vec::new();
+        // Each qword argument is spilled into a shadow-tracked stack slot
+        // (rbp offset + value type) rather than pinned by value and pushed
+        // raw. A heap-pointer slot is a real GC root the collector updates
+        // through its slot address, so a collection triggered while a
+        // later argument is being evaluated keeps every earlier heap
+        // argument live (and relocatable). The old gc_pin rooted by value
+        // -- relocation-hostile -- and the raw machine-stack push was
+        // invisible to the collector entirely.
+        let mut qword_arg_slots: Vec<(i32, NativeValue)> = Vec::new();
+        // Scope brackets the whole staging region so the argument slots
+        // (and their shadow roots) are freed after the call in one shot.
+        // Error paths below abort compilation, so they do not need to
+        // unwind the scope; the success path pops it after the return
+        // value is materialized.
+        self.push_scope();
         for (index, (argument, expected_value)) in arguments
             .iter()
             .zip(function.param_values.iter())
@@ -8552,6 +8566,7 @@ impl NativeCodeGenerator {
                             NativeValue::HeapString
                         }
                         _ => {
+                            self.pop_scope();
                             return Err(unsupported(
                                 span,
                                 "native function string argument for this value type",
@@ -8562,6 +8577,7 @@ impl NativeCodeGenerator {
                     value
                 };
                 if value != *expected_value {
+                    self.pop_scope();
                     return Err(unsupported(
                         span,
                         "native function argument for this value type",
@@ -8583,6 +8599,7 @@ impl NativeCodeGenerator {
                         argument_shape.as_ref(),
                     ) && !enum_shapes_compatible(actual_shape, expected_shape)
                     {
+                        self.pop_scope();
                         return Err(Diagnostic::compile(
                             argument.span(),
                             "native function argument is a generic enum whose payload shape \
@@ -8590,14 +8607,16 @@ impl NativeCodeGenerator {
                                 .to_string(),
                         ));
                     }
-                    self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-                    self.asm.call_label(self.gc_pin);
                 }
-                self.push_temp_reg(Reg::Rax);
-                qword_arg_values.push(*expected_value);
+                // Root the argument (heap slots become GC roots; Int/Bool
+                // slots are plain storage) and remember where it lives.
+                let slot = self.allocate_anonymous_slot(*expected_value);
+                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                qword_arg_slots.push((slot.offset, *expected_value));
                 continue;
             }
             if value != *expected_value {
+                self.pop_scope();
                 return Err(unsupported(
                     span,
                     "native function argument for this value type",
@@ -8621,31 +8640,41 @@ impl NativeCodeGenerator {
                 "function record argument exceeds 65536 bytes",
             )?;
         }
-        // Every argument is evaluated; nothing below allocates, so the
-        // staging pins can drop before the call. Peek each pinned
-        // pointer from its push slot (gc_unpin only clobbers rax / r10
-        // / r11, never the argument registers).
-        let qword_count = qword_arg_values.len();
-        for (index, value) in qword_arg_values.iter().enumerate() {
-            if matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
-                let disp = ((qword_count - 1 - index) * 8) as i32;
-                self.asm.mov_reg_reg(Reg::R10, Reg::Rsp);
-                self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, disp);
-                self.asm.call_label(self.gc_unpin);
-            }
-        }
+        // Materialize the argument registers / stack from the rooted
+        // slots. Every argument is already evaluated and rooted, so no
+        // allocation occurs between here and the call -- the raw
+        // register / stack copies below cannot be swept or relocated.
+        let qword_count = qword_arg_slots.len();
         let arg_regs = argument_registers(qword_count);
         let pass_on_stack = qword_count > arg_regs.len();
-        if !pass_on_stack {
-            for reg in arg_regs.into_iter().rev() {
-                self.pop_temp_reg(reg);
+        if pass_on_stack {
+            // Klassic passes every argument on the stack when there are
+            // more than six. Push arg0 deepest .. argN on top, matching
+            // the callee's frame layout. These are raw pushes:
+            // next_stack_offset is not bumped, so the scope's pop only
+            // reclaims the argument slots, and the explicit `add rsp`
+            // after the call removes these pushed copies.
+            for (offset, _) in &qword_arg_slots {
+                self.asm.load_rbp_slot(Reg::Rax, *offset);
+                self.asm.push_reg(Reg::Rax);
+            }
+        } else {
+            // rdi=arg0, rsi=arg1, ...: load each slot into its register.
+            // The slots are rbp-relative, so the load order is
+            // independent and nothing between the loads and the call
+            // clobbers an argument register.
+            for (reg, (offset, _)) in arg_regs.iter().zip(qword_arg_slots.iter()) {
+                self.asm.load_rbp_slot(*reg, *offset);
             }
         }
         self.asm.call_label(function.label);
         if pass_on_stack {
             self.asm.add_reg_imm32(Reg::Rsp, (qword_count * 8) as i32);
-            self.release_temp_stack(qword_count * 8);
         }
+        // Free the argument slots and their shadow roots before copying
+        // the return value (which uses fixed .data scratch, not the
+        // stack). pop_scope preserves rax, so a heap return survives.
+        self.pop_scope();
         let result = self.copy_function_return_to_call_site(function.return_value, span)?;
         if let Some(shape) = &function.return_enum_shape {
             self.pending_enum_shape = Some(shape.clone());

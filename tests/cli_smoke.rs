@@ -21059,6 +21059,79 @@ fn native_string_literal_pattern_then_other_arm_no_crash() {
     assert_eq!(stress, "1\n2\n0\n");
 }
 
+/// M3b: by-pointer function arguments are now rooted in shadow-tracked
+/// slots for the whole staging region rather than pinned by value and
+/// pushed raw. Here two heap (enum) arguments are each freshly built --
+/// constructing the second collects while the first is only reachable
+/// through its staging slot. Under --gc-stress (collect on every
+/// allocation) the equality must still match the evaluator's 50000.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_pointer_arg_staging_survives_collection() {
+    let program = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         def same(a: Tree, b: Tree): Boolean = a == b\n\
+         mutable i = 0\n\
+         mutable ok = 0\n\
+         while (i < 50000) {\n\
+           if (same(Branch(Leaf(i), Leaf(i)), Branch(Leaf(i), Leaf(i)))) {\n\
+             ok = ok + 1\n\
+           }\n\
+           i = i + 1\n\
+         }\n\
+         println(ok)\n";
+    let (plain, _e1) = build_and_run_gc_program(program, &[]);
+    assert_eq!(plain, "50000\n");
+    let (stress, _e2) = build_and_run_gc_program(program, &["--gc-stress"]);
+    assert_eq!(stress, "50000\n");
+}
+
+/// M3b: the >6-argument path passes every argument on the stack. Seven
+/// heap arguments, each a freshly built enum that allocates (and under
+/// stress collects), exercise the stack-passing materialization from
+/// rooted slots. Result must match the evaluator under stress.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_pointer_arg_staging_over_six_stack_passed() {
+    let program = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         def sz(t: Tree): Int = t match { case Leaf(v) => 1; case Branch(l, r) => sz(l) + sz(r) }\n\
+         def sum7(a: Tree, b: Tree, c: Tree, d: Tree, e: Tree, f: Tree, g: Tree): Int =\n\
+           sz(a) + sz(b) + sz(c) + sz(d) + sz(e) + sz(f) + sz(g)\n\
+         mutable i = 0\n\
+         mutable acc = 0\n\
+         while (i < 20000) {\n\
+           acc = acc + sum7(Leaf(i), Branch(Leaf(i), Leaf(i)), Leaf(i), Leaf(i), Leaf(i), Leaf(i), Leaf(i))\n\
+           i = i + 1\n\
+         }\n\
+         println(acc)\n";
+    let (plain, _e1) = build_and_run_gc_program(program, &[]);
+    assert_eq!(plain, "160000\n");
+    let (stress, _e2) = build_and_run_gc_program(program, &["--gc-stress"]);
+    assert_eq!(stress, "160000\n");
+}
+
+/// M3b: mixed Int/heap arguments in a >6-arg call, interleaved so an
+/// Int slot sits between rooted heap slots. Guards the slot value-type
+/// tagging (Int slots must NOT be shadow-rooted, heap slots must be).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_pointer_arg_staging_mixed_int_and_heap() {
+    let program = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         def sz(t: Tree): Int = t match { case Leaf(v) => 1; case Branch(l, r) => sz(l) + sz(r) }\n\
+         def mix(a: Int, t: Tree, b: Int, u: Tree, c: Int, v: Tree, d: Int, w: Tree): Int =\n\
+           a + sz(t) + b + sz(u) + c + sz(v) + d + sz(w)\n\
+         mutable i = 0\n\
+         mutable acc = 0\n\
+         while (i < 20000) {\n\
+           acc = acc + mix(1, Branch(Leaf(i), Leaf(i)), 2, Leaf(i), 3, Branch(Leaf(i), Leaf(i)), 4, Leaf(i))\n\
+           i = i + 1\n\
+         }\n\
+         println(acc)\n";
+    let (plain, _e1) = build_and_run_gc_program(program, &[]);
+    assert_eq!(plain, "320000\n");
+    let (stress, _e2) = build_and_run_gc_program(program, &["--gc-stress"]);
+    assert_eq!(stress, "320000\n");
+}
+
 /// Regression guard for a real use-after-free: `==` on two freshly
 /// constructed enums staged the lhs pointer with a raw machine-stack
 /// push (not a GC root) across the rhs compile. The lhs temporary's
