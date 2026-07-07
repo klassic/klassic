@@ -257,7 +257,17 @@ the semantic oracle everywhere (eval == native differential).
   null (fresh tail regions are already mmap-zero). Mark stays STW.
   Known temporary regression: mixed live/dead regions are not
   compacted until M7 (documented; bounded by the same 64 MiB cap as
-  today).
+  today). Two further notes: (1) `gc_alloc_large` (the >128 KiB
+  contiguous-run path) is implemented and verified by inspection but
+  currently unreachable — every native heap-object materialization
+  caps at 65 536 bytes, below the region size — so no
+  native-compilable program reaches it yet; it also only ever carves
+  fresh tail regions (never the single-region free pool), so reachable
+  large-object churn would grow `committed_count` monotonically until
+  M7. (2) The sweep seeds its free-region accumulator from the
+  existing pool head, not zero, so regions freed in earlier cycles are
+  not dropped (a leak that otherwise OOMs under `--gc-stress` with
+  heavy turnover).
 - **M5 — Colored pointers + load barriers (collections still atomic) +
   poison canary.** Color bits, reserved registers, the two barriers,
   color-on-store, walker updates, a grep-audited coverage checklist in

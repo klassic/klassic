@@ -38163,13 +38163,22 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax); // region_top[cur] = heap_top
 
-        // Cache committed bound, reset region index, clear free-region head.
+        // Cache committed bound, reset region index. Seed the free-region
+        // accumulator with the EXISTING pool head, not zero: regions that
+        // were already free at sweep entry are skipped by the walk (their
+        // watermark is base), so if we started from zero we would drop
+        // them from the list entirely -- leaking them (still committed,
+        // but unreachable to acquire, the tail-commit path, and
+        // gc_alloc_large). Seeding from the current head keeps the old
+        // chain intact (their [base] link qwords are untouched by the
+        // walk) and pushes this cycle's newly-dead regions on top.
         self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
         self.asm.store_rbp_slot(48, Reg::Rax);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.store_rbp_slot(40, Reg::Rax);
-        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
 
         let region_loop = self.asm.create_text_label();
         let region_done = self.asm.create_text_label();

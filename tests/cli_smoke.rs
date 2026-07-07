@@ -21004,24 +21004,29 @@ fn native_gc_stress_forces_a_collection_per_alloc_and_stays_correct() {
     assert!(allocs > 100_000, "churn should allocate many objects");
 }
 
-/// M4: a single object larger than one 128 KiB region is allocated as a
-/// contiguous run of regions (gc_alloc_large). It must round-trip and,
-/// when it dies and is re-allocated in a loop, the whole run must be
-/// reclaimed and re-carved -- verified against the evaluator under both
-/// normal and --gc-stress builds.
+/// M4: heavy region turnover under --gc-stress must not leak regions.
+/// The sweep seeds its free-region accumulator with the existing pool
+/// head, so regions freed in earlier cycles (skipped by the walk, since
+/// their watermark is base) stay on the free list rather than being
+/// dropped. Before that fix, this program exhausted the 64 MiB
+/// reservation and aborted with an out-of-memory error partway through,
+/// because every stress pre-collect replaced the pool with only that
+/// cycle's newly-dead regions. The all-live build(500) graph forces a
+/// collection with a non-empty pool on essentially every iteration.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn native_gc_large_object_region_run() {
-    let program = "val s = \"x\".repeat(200000)\n\
-         println(s.length())\n\
+fn native_gc_stress_churn_does_not_leak_regions() {
+    let program = "enum L { case Nil; case Full(n: Int, junk: L) }\n\
+         def build(n: Int): L = if (n <= 0) Nil else Full(n, build(n - 1))\n\
+         def sz(x: L): Int = x match { case Nil => 0; case Full(n, j) => 1 + sz(j) }\n\
          mutable i = 0\n\
          mutable acc = 0\n\
-         while (i < 5) { val t = \"y\".repeat(200000); acc = acc + t.length(); i = i + 1 }\n\
+         while (i < 1500) { acc = acc + sz(build(500)); i = i + 1 }\n\
          println(acc)\n";
-    let (plain, _e1) = build_and_run_gc_program(program, &[]);
-    assert_eq!(plain, "200000\n1000000\n");
-    let (stress, _e2) = build_and_run_gc_program(program, &["--gc-stress"]);
-    assert_eq!(stress, "200000\n1000000\n");
+    // 1500 * 500 = 750000. Turnover far exceeds the 512-region
+    // reservation, so a leak of freed regions would abort with OOM.
+    let (stress, _e) = build_and_run_gc_program(program, &["--gc-stress"]);
+    assert_eq!(stress, "750000\n");
 }
 
 /// M4: an all-live per-frame allocation graph deeper than the initial
