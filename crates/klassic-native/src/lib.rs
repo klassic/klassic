@@ -38834,11 +38834,27 @@ impl NativeCodeGenerator {
         // Self-heal: write the good-colored pointer back to the slot the
         // value was loaded from. r10 (the field address) is carried in
         // from the barrier fast path. M7 WARNING: this is only valid
-        // because M5 is non-moving, so the healed pointer's address is
-        // unchanged. Once relocation lands, the slow path must evacuate
-        // first and store the FORWARDED address, re-deriving the target
-        // -- do not simply carry r10 across a relocating heal.
+        // because M5/M6 are non-moving, so the healed pointer's address
+        // is unchanged. Once relocation lands, the slow path must
+        // evacuate first and store the FORWARDED address.
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11); // self-heal
+        // M6 phase branch. During Mark, the mutator has just loaded a raw
+        // pointer into a register, so it must be marked to keep the
+        // strong tricolor invariant (load-barrier-driven incremental
+        // update). During Idle, the slow path only heals (M5 behavior).
+        // Inert until the driver flips the phase to Mark. rax (the raw
+        // result) is preserved across the mark call; the only caller has
+        // just rax live, so the wider clobber set is safe.
+        let done = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::R11, Reg::R11);
+        self.asm.jcc_label(Condition::Equal, done);
+        self.asm.push_reg(Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+        self.asm.call_label(self.gc_mark_visit);
+        self.asm.pop_reg(Reg::Rax);
+        self.asm.bind_text_label(done);
         self.asm.ret();
     }
 
