@@ -4302,7 +4302,6 @@ struct NativeCodeGenerator {
     gc_heap_top: DataLabel,
     gc_heap_end: DataLabel,
     gc_free_list_head: DataLabel,
-    gc_root_table: DataLabel,
     gc_mark_worklist: DataLabel,
     gc_mark_worklist_top: DataLabel,
     gc_shadow_stack: DataLabel,
@@ -4332,14 +4331,11 @@ struct NativeCodeGenerator {
     gc_stress: bool,
     gc_alloc: TextLabel,
     gc_collect: TextLabel,
-    gc_pin: TextLabel,
-    gc_unpin: TextLabel,
     gc_mark_visit: TextLabel,
     gc_deep_equal: TextLabel,
     gc_grow_heap: TextLabel,
     gc_bounds_error: TextLabel,
     gc_oom_text: DataLabel,
-    gc_root_overflow_text: DataLabel,
     gc_worklist_overflow_text: DataLabel,
     gc_shadow_overflow_text: DataLabel,
     gc_segment_overflow_text: DataLabel,
@@ -4508,7 +4504,6 @@ impl NativeCodeGenerator {
         // The GC tables live in an anonymous mmap made at startup;
         // these .data qwords hold only each table's base pointer, so
         // binaries don't embed hundreds of KB of zeros.
-        let gc_root_table = asm.data_label_with_i64s(&[0]);
         let gc_mark_worklist = asm.data_label_with_i64s(&[0]);
         let gc_mark_worklist_top = asm.data_label_with_i64s(&[0]);
         let gc_shadow_stack = asm.data_label_with_i64s(&[0]);
@@ -4525,14 +4520,11 @@ impl NativeCodeGenerator {
         let random_state = asm.data_label_with_i64s(&[0]);
         let gc_alloc = asm.create_text_label();
         let gc_collect = asm.create_text_label();
-        let gc_pin = asm.create_text_label();
-        let gc_unpin = asm.create_text_label();
         let gc_mark_visit = asm.create_text_label();
         let gc_deep_equal = asm.create_text_label();
         let gc_grow_heap = asm.create_text_label();
         let gc_bounds_error = asm.create_text_label();
         let gc_oom_text = asm.data_label_with_bytes(b"klassic gc: out of memory\n");
-        let gc_root_overflow_text = asm.data_label_with_bytes(b"klassic gc: root table overflow\n");
         let gc_worklist_overflow_text =
             asm.data_label_with_bytes(b"klassic gc: mark worklist overflow\n");
         let gc_shadow_overflow_text =
@@ -4637,7 +4629,6 @@ impl NativeCodeGenerator {
             gc_heap_top,
             gc_heap_end,
             gc_free_list_head,
-            gc_root_table,
             gc_mark_worklist,
             gc_mark_worklist_top,
             gc_shadow_stack,
@@ -4655,14 +4646,11 @@ impl NativeCodeGenerator {
             gc_stress: false,
             gc_alloc,
             gc_collect,
-            gc_pin,
-            gc_unpin,
             gc_mark_visit,
             gc_deep_equal,
             gc_grow_heap,
             gc_bounds_error,
             gc_oom_text,
-            gc_root_overflow_text,
             gc_worklist_overflow_text,
             gc_shadow_overflow_text,
             gc_segment_overflow_text,
@@ -5259,8 +5247,6 @@ impl NativeCodeGenerator {
         self.emit_gc_deep_equal_runtime();
         self.emit_gc_alloc_runtime();
         self.emit_gc_collect_runtime();
-        self.emit_gc_pin_runtime();
-        self.emit_gc_unpin_runtime();
         self.emit_gc_grow_heap_runtime();
         self.emit_gc_bounds_error_runtime();
         if self.is_windows {
@@ -36523,15 +36509,10 @@ impl NativeCodeGenerator {
     /// Each segment is 1 MiB (or more for an oversized allocation), so the
     /// total reachable budget is GC_MAX_SEGMENTS * GC_GROW_SIZE = 64 MiB.
     const GC_MAX_SEGMENTS: usize = 64;
-    /// Number of pointer slots in the static GC root table. Each slot is
-    /// either zero (free) or holds a heap pointer pinned via `__gc_pin`.
-    const GC_ROOT_TABLE_LEN: usize = 4096;
-    /// Maximum number of objects that can be queued for tracing during a
-    /// single mark phase. Marking aborts with an error message if the
-    /// worklist overflows.
+    /// Total bytes for the single mmap backing the GC's runtime tables:
+    /// the shadow stack (the sole root source) and the mark worklist.
     const GC_TABLES_BYTES: u64 =
-        ((Self::GC_ROOT_TABLE_LEN + Self::GC_SHADOW_STACK_LEN + Self::GC_MARK_WORKLIST_LEN) * 8)
-            as u64;
+        ((Self::GC_SHADOW_STACK_LEN + Self::GC_MARK_WORKLIST_LEN) * 8) as u64;
     // The mark worklist must hold the breadth-first frontier of the
     // live object graph; deep recursion with per-frame heap values
     // makes the live set proportional to recursion depth.
@@ -37764,10 +37745,8 @@ impl NativeCodeGenerator {
         );
         self.emit_exit_code(1);
         self.asm.bind_text_label(tables_ok);
-        self.asm.mov_data_addr(Reg::R10, self.gc_root_table);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm
-            .add_reg_imm32(Reg::Rax, (Self::GC_ROOT_TABLE_LEN * 8) as i32);
+        // The single mmap now backs just two tables: the shadow stack
+        // (root source) at the base, then the mark worklist.
         self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         self.asm
@@ -38025,8 +38004,8 @@ impl NativeCodeGenerator {
         // Reserve six qword locals (rbp-relative addressing). The first
         // four are reused across phases; the last pair holds the segment
         // iteration state used by the sweep loop.
-        //   [rbp -  8]: root_cursor (current &gc_root_table[i])
-        //   [rbp - 16]: root_end    (sentinel = end of root table)
+        //   [rbp -  8]: root_cursor (current &gc_shadow_stack[i])
+        //   [rbp - 16]: root_end    (sentinel = end of shadow stack)
         //   [rbp - 24]: trace_cursor (current pointer into payload)
         //   [rbp - 32]: trace_end    (end of current payload)
         //   [rbp - 40]: sweep_segment_index
@@ -38038,32 +38017,10 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // Initialize the root cursor / end.
-        self.asm.mov_data_addr(Reg::R10, self.gc_root_table);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.store_rbp_slot(8, Reg::R10);
-        self.asm
-            .add_reg_imm32(Reg::R10, (Self::GC_ROOT_TABLE_LEN * 8) as i32);
-        self.asm.store_rbp_slot(16, Reg::R10);
-
-        let root_loop = self.asm.create_text_label();
-        let root_done = self.asm.create_text_label();
-        let root_skip = self.asm.create_text_label();
-        self.asm.bind_text_label(root_loop);
-        self.asm.load_rbp_slot(Reg::R10, 8);
-        self.asm.load_rbp_slot(Reg::R11, 16);
-        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, root_done);
-        self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
-        self.asm.jcc_label(Condition::Equal, root_skip);
-        self.asm.call_label(self.gc_mark_visit);
-        self.asm.bind_text_label(root_skip);
-        self.asm.load_rbp_slot(Reg::R10, 8);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.store_rbp_slot(8, Reg::R10);
-        self.asm.jmp_label(root_loop);
-        self.asm.bind_text_label(root_done);
+        // The GC shadow stack is the sole root source: every live
+        // heap-pointer stack slot is tracked there by address. (The old
+        // static pin root table -- scanned here first -- was retired
+        // once the argument-staging rewrite removed its last user.)
 
         // ---- Shadow stack walk: every entry is the address of a stack
         //      slot whose qword content is a tagged GC pointer. ----
@@ -38479,85 +38436,6 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(not_equal);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.bind_text_label(done);
-        self.asm.leave();
-        self.asm.ret();
-    }
-
-    /// `gc_pin(addr)` (rdi = addr): registers `addr` in the static root
-    /// table, returning the table index in rax. Aborts if the table is full.
-    fn emit_gc_pin_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_pin);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-
-        // r10 = &table[i], r11 = end-of-table sentinel
-        self.asm.mov_data_addr(Reg::R10, self.gc_root_table);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.mov_reg_reg(Reg::R11, Reg::R10);
-        self.asm
-            .add_reg_imm32(Reg::R11, (Self::GC_ROOT_TABLE_LEN * 8) as i32);
-
-        let scan = self.asm.create_text_label();
-        let next = self.asm.create_text_label();
-        let overflow = self.asm.create_text_label();
-        self.asm.bind_text_label(scan);
-        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, overflow);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::NotEqual, next);
-        // table[i] = rdi
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdi);
-        // return rdi (the address) so callers can chain reads through it.
-        self.asm.mov_reg_reg(Reg::Rax, Reg::Rdi);
-        self.asm.leave();
-        self.asm.ret();
-        self.asm.bind_text_label(next);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.jmp_label(scan);
-
-        self.asm.bind_text_label(overflow);
-        self.emit_write_data(
-            2,
-            self.gc_root_overflow_text,
-            b"klassic gc: root table overflow\n".len(),
-        );
-        self.emit_exit_code(1);
-    }
-
-    /// `gc_unpin(addr)` (rdi = addr): clears the first table slot whose
-    /// value matches `addr`. Returns rdi unchanged. A no-op when the
-    /// address is not currently pinned, so callers don't have to track
-    /// pinning state separately.
-    fn emit_gc_unpin_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_unpin);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-
-        self.asm.mov_data_addr(Reg::R10, self.gc_root_table);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.mov_reg_reg(Reg::R11, Reg::R10);
-        self.asm
-            .add_reg_imm32(Reg::R11, (Self::GC_ROOT_TABLE_LEN * 8) as i32);
-
-        let scan = self.asm.create_text_label();
-        let next = self.asm.create_text_label();
-        let done = self.asm.create_text_label();
-        self.asm.bind_text_label(scan);
-        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, done);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rdi);
-        self.asm.jcc_label(Condition::NotEqual, next);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.jmp_label(done);
-        self.asm.bind_text_label(next);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.jmp_label(scan);
-
-        self.asm.bind_text_label(done);
-        self.asm.mov_reg_reg(Reg::Rax, Reg::Rdi);
         self.asm.leave();
         self.asm.ret();
     }
