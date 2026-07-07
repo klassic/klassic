@@ -4298,16 +4298,29 @@ struct NativeCodeGenerator {
     command_line_argc: DataLabel,
     command_line_argv1_base: DataLabel,
     environment_base: DataLabel,
+    /// Base/bump/end of the CURRENT allocation region (128 KiB).
     gc_heap_base: DataLabel,
     gc_heap_top: DataLabel,
     gc_heap_end: DataLabel,
-    gc_free_list_head: DataLabel,
+    /// Head of the free-region list (regions reclaimed whole; the link to
+    /// the next free region is stored in a free region's first qword).
+    gc_free_region_head: DataLabel,
     gc_mark_worklist: DataLabel,
     gc_mark_worklist_top: DataLabel,
     gc_shadow_stack: DataLabel,
     gc_shadow_stack_top: DataLabel,
-    gc_segments: DataLabel,
-    gc_segment_count: DataLabel,
+    /// Per-region bump watermark, indexed by region number
+    /// (GC_RESERVE_REGIONS qwords). `top[i] == region_base(i)` means the
+    /// region is free/empty; `top[i] > base` means it is in use.
+    gc_region_top: DataLabel,
+    /// Base of the whole up-front reservation. Region i base =
+    /// gc_region_base + (i << GC_REGION_SHIFT).
+    gc_region_base: DataLabel,
+    /// High-water count of regions ever handed out from the reservation.
+    gc_committed_count: DataLabel,
+    /// Soft budget: regions the mutator may touch before a forced
+    /// collection. Doubles on stall, capped at GC_RESERVE_REGIONS.
+    gc_budget_regions: DataLabel,
     gc_collect_counter: DataLabel,
     /// `--gc-log` statistics cells (all `.data` i64, initialised 0):
     /// total allocations, total payload+header bytes handed out, and
@@ -4333,12 +4346,18 @@ struct NativeCodeGenerator {
     gc_collect: TextLabel,
     gc_mark_visit: TextLabel,
     gc_deep_equal: TextLabel,
-    gc_grow_heap: TextLabel,
+    /// Acquire a fresh empty region as the current bump target (from the
+    /// free-region pool, else the uncommitted tail within budget).
+    gc_acquire_region: TextLabel,
+    /// Allocate an object larger than one region as a contiguous run of
+    /// regions carved from the uncommitted tail.
+    gc_alloc_large: TextLabel,
+    /// Raise the soft region budget after an allocation stall.
+    gc_grow_budget: TextLabel,
     gc_bounds_error: TextLabel,
     gc_oom_text: DataLabel,
     gc_worklist_overflow_text: DataLabel,
     gc_shadow_overflow_text: DataLabel,
-    gc_segment_overflow_text: DataLabel,
     gc_bounds_error_text: DataLabel,
     /// Lowest rsp the program may reach before the prologue probe
     /// aborts: initial rsp minus RLIMIT_STACK plus a safety margin,
@@ -4500,7 +4519,7 @@ impl NativeCodeGenerator {
         let gc_heap_base = asm.data_label_with_i64s(&[0]);
         let gc_heap_top = asm.data_label_with_i64s(&[0]);
         let gc_heap_end = asm.data_label_with_i64s(&[0]);
-        let gc_free_list_head = asm.data_label_with_i64s(&[0]);
+        let gc_free_region_head = asm.data_label_with_i64s(&[0]);
         // The GC tables live in an anonymous mmap made at startup;
         // these .data qwords hold only each table's base pointer, so
         // binaries don't embed hundreds of KB of zeros.
@@ -4508,8 +4527,12 @@ impl NativeCodeGenerator {
         let gc_mark_worklist_top = asm.data_label_with_i64s(&[0]);
         let gc_shadow_stack = asm.data_label_with_i64s(&[0]);
         let gc_shadow_stack_top = asm.data_label_with_i64s(&[0]);
-        let gc_segments = asm.data_label_with_i64s(&vec![0; 3 * Self::GC_MAX_SEGMENTS]);
-        let gc_segment_count = asm.data_label_with_i64s(&[0]);
+        // Per-region watermark array (one qword per reservable region);
+        // this one is embedded rather than mmap'd (4 KiB of zeros).
+        let gc_region_top = asm.data_label_with_i64s(&vec![0; Self::GC_RESERVE_REGIONS as usize]);
+        let gc_region_base = asm.data_label_with_i64s(&[0]);
+        let gc_committed_count = asm.data_label_with_i64s(&[0]);
+        let gc_budget_regions = asm.data_label_with_i64s(&[0]);
         let gc_collect_counter = asm.data_label_with_i64s(&[0]);
         let gc_alloc_count = asm.data_label_with_i64s(&[0]);
         let gc_bytes_allocated = asm.data_label_with_i64s(&[0]);
@@ -4522,15 +4545,15 @@ impl NativeCodeGenerator {
         let gc_collect = asm.create_text_label();
         let gc_mark_visit = asm.create_text_label();
         let gc_deep_equal = asm.create_text_label();
-        let gc_grow_heap = asm.create_text_label();
+        let gc_acquire_region = asm.create_text_label();
+        let gc_alloc_large = asm.create_text_label();
+        let gc_grow_budget = asm.create_text_label();
         let gc_bounds_error = asm.create_text_label();
         let gc_oom_text = asm.data_label_with_bytes(b"klassic gc: out of memory\n");
         let gc_worklist_overflow_text =
             asm.data_label_with_bytes(b"klassic gc: mark worklist overflow\n");
         let gc_shadow_overflow_text =
             asm.data_label_with_bytes(b"klassic gc: shadow stack overflow\n");
-        let gc_segment_overflow_text =
-            asm.data_label_with_bytes(b"klassic gc: heap segment limit reached\n");
         let gc_bounds_error_text = asm.data_label_with_bytes(b"klassic gc: index out of bounds\n");
         let stack_floor = asm.data_label_with_i64s(&[0]);
         let stack_overflow_abort = asm.create_text_label();
@@ -4628,13 +4651,15 @@ impl NativeCodeGenerator {
             gc_heap_base,
             gc_heap_top,
             gc_heap_end,
-            gc_free_list_head,
+            gc_free_region_head,
             gc_mark_worklist,
             gc_mark_worklist_top,
             gc_shadow_stack,
             gc_shadow_stack_top,
-            gc_segments,
-            gc_segment_count,
+            gc_region_top,
+            gc_region_base,
+            gc_committed_count,
+            gc_budget_regions,
             gc_collect_counter,
             gc_alloc_count,
             gc_bytes_allocated,
@@ -4648,12 +4673,13 @@ impl NativeCodeGenerator {
             gc_collect,
             gc_mark_visit,
             gc_deep_equal,
-            gc_grow_heap,
+            gc_acquire_region,
+            gc_alloc_large,
+            gc_grow_budget,
             gc_bounds_error,
             gc_oom_text,
             gc_worklist_overflow_text,
             gc_shadow_overflow_text,
-            gc_segment_overflow_text,
             gc_bounds_error_text,
             stack_floor,
             stack_overflow_abort,
@@ -5247,7 +5273,9 @@ impl NativeCodeGenerator {
         self.emit_gc_deep_equal_runtime();
         self.emit_gc_alloc_runtime();
         self.emit_gc_collect_runtime();
-        self.emit_gc_grow_heap_runtime();
+        self.emit_gc_acquire_region_runtime();
+        self.emit_gc_alloc_large_runtime();
+        self.emit_gc_grow_budget_runtime();
         self.emit_gc_bounds_error_runtime();
         if self.is_windows {
             self.emit_win_init_runtime();
@@ -36499,16 +36527,20 @@ impl NativeCodeGenerator {
         self.asm.ret();
     }
 
-    /// Heap size used by the GC. Picked small so unit tests can exercise GC
-    /// reclamation without needing to allocate megabytes.
-    const GC_HEAP_SIZE: u64 = 1 << 20; // 1 MiB
-    /// Default size of each follow-on segment allocated when the initial
-    /// heap fills up after a collection.
-    const GC_GROW_SIZE: u64 = 1 << 20; // 1 MiB
-    /// Maximum number of distinct mmap'd segments the GC can ever own.
-    /// Each segment is 1 MiB (or more for an oversized allocation), so the
-    /// total reachable budget is GC_MAX_SEGMENTS * GC_GROW_SIZE = 64 MiB.
-    const GC_MAX_SEGMENTS: usize = 64;
+    /// Region granularity for the region-based heap. Objects bump-allocate
+    /// within a region; whole dead regions are the unit of reclamation.
+    const GC_REGION_SIZE: u64 = 1 << 17; // 128 KiB
+    const GC_REGION_SHIFT: u8 = 17;
+    /// The heap is one up-front virtual reservation of this many regions
+    /// (64 MiB, matching the old segment cap). Linux demand-pages it, so
+    /// only touched regions cost physical memory; the soft budget below
+    /// bounds how many the mutator may touch before a collection.
+    const GC_RESERVE_REGIONS: u64 = 512;
+    const GC_RESERVE_BYTES: u64 = Self::GC_REGION_SIZE * Self::GC_RESERVE_REGIONS;
+    /// Initial soft budget: 8 regions = 1 MiB, preserving the collection
+    /// cadence of the old 1 MiB initial heap. Doubles on allocation stall,
+    /// capped at GC_RESERVE_REGIONS.
+    const GC_INITIAL_BUDGET_REGIONS: u64 = 8;
     /// Total bytes for the single mmap backing the GC's runtime tables:
     /// the shadow stack (the sole root source) and the mark worklist.
     const GC_TABLES_BYTES: u64 =
@@ -37662,13 +37694,17 @@ impl NativeCodeGenerator {
     }
 
     fn emit_initialize_gc_heap(&mut self) {
-        // mmap(NULL, GC_HEAP_SIZE, PROT_READ | PROT_WRITE,
-        //      MAP_ANON | MAP_PRIVATE, -1, 0)
+        // Reserve the whole region heap up front: one anonymous mapping
+        // of GC_RESERVE_BYTES (64 MiB). Linux demand-pages it, so only
+        // regions the mutator actually touches cost physical memory; the
+        // soft budget (gc_budget_regions) bounds how many it may touch
+        // before a collection. On Windows win_mmap commits the range,
+        // which is pagefile-backed and zero-filled on touch.
         if !self.is_windows {
             self.emit_syscall_number(PlatformSyscall::Mmap);
         }
         self.asm.mov_imm64(Reg::Rdi, 0); // addr = NULL
-        self.asm.mov_imm64(Reg::Rsi, Self::GC_HEAP_SIZE);
+        self.asm.mov_imm64(Reg::Rsi, Self::GC_RESERVE_BYTES);
         self.asm
             .mov_imm64(Reg::Rdx, self.platform.mmap_prot_read_write());
         self.asm
@@ -37695,23 +37731,33 @@ impl NativeCodeGenerator {
         self.emit_exit_code(1);
         self.asm.bind_text_label(mmap_ok);
 
-        // heap_base = rax
+        // region_base = rax (base of the whole reservation).
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // Region 0 is the initial current region: heap_base = heap_top =
+        // rax, heap_end = rax + GC_REGION_SIZE.
         self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-
-        // heap_top = rax
         self.asm.mov_data_addr(Reg::R10, self.gc_heap_top);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-
-        // heap_end = rax + GC_HEAP_SIZE
-        self.asm.mov_imm64(Reg::Rcx, Self::GC_HEAP_SIZE);
+        // region_top[0] = rax (region 0 empty: top == base).
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rcx, Self::GC_REGION_SIZE);
         self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
         self.asm.mov_data_addr(Reg::R10, self.gc_heap_end);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
 
-        // free_list_head = 0 (already zero-initialized, but be explicit)
+        // free_region_head = 0; committed_count = 1; budget = initial.
         self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.mov_data_addr(Reg::R10, self.gc_free_list_head);
+        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm
+            .mov_imm64(Reg::Rax, Self::GC_INITIAL_BUDGET_REGIONS);
+        self.asm.mov_data_addr(Reg::R10, self.gc_budget_regions);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
 
         // Map the GC tables (shadow stack, mark worklist) in one
@@ -37753,24 +37799,9 @@ impl NativeCodeGenerator {
             .add_reg_imm32(Reg::Rax, (Self::GC_SHADOW_STACK_LEN * 8) as i32);
         self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-
-        // Record the initial segment in the segments table:
-        //   segments[0].base = gc_heap_base, .top = gc_heap_top, .end = gc_heap_end
-        // Each segment entry is three contiguous 8-byte words (base, top, end).
-        self.asm.mov_data_addr(Reg::R10, self.gc_segments);
-        self.asm.mov_data_addr(Reg::R8, self.gc_heap_base);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R8, self.gc_heap_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 8, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R8, self.gc_heap_end);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 16, Reg::Rax);
-        // gc_segment_count = 1
-        self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
-        self.asm.mov_imm64(Reg::Rax, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // The region heap needs no per-segment bookkeeping: region 0 is
+        // already installed as the current region and region_top[0] is
+        // its base (empty). Further regions are acquired on demand.
     }
 
     /// Subroutine signature: rdi = payload size in bytes, rsi = type tag.
@@ -37858,12 +37889,13 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(after_collect);
         self.emit_gc_alloc_attempt(do_grow, success);
 
-        // Collector did not free enough space — grow the heap and retry once
-        // more. gc_grow_heap returns rax = 1 on success and rax = 0 on hard
-        // failure (segment limit hit or mmap rejected the request).
+        // Collector freed no usable region — raise the soft budget and
+        // retry once more. gc_grow_budget returns rax = 1 on success and
+        // rax = 0 when even the full 64 MiB reservation cannot hold the
+        // request.
         self.asm.bind_text_label(do_grow);
         self.asm.load_rbp_slot(Reg::Rdi, 16);
-        self.asm.call_label(self.gc_grow_heap);
+        self.asm.call_label(self.gc_grow_budget);
         self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
         self.asm.jcc_label(Condition::Equal, oom);
         self.emit_gc_alloc_attempt(oom, success);
@@ -37898,66 +37930,27 @@ impl NativeCodeGenerator {
         self.asm.ret();
     }
 
-    /// Inline body of an allocation attempt: free-list first-fit, then bump.
-    /// Jumps to `fail` when neither path can satisfy the request and to
-    /// `success` (with rax holding the user pointer) on success.
+    /// Inline body of an allocation attempt: bump within the current
+    /// region, acquiring a new region on boundary, or the large-object
+    /// path for requests bigger than one region. Jumps to `fail` when no
+    /// region can satisfy the request and to `success` (rax = user
+    /// pointer) on success. No payload zeroing is needed: a region is
+    /// either fresh demand-paged (zero) memory or a whole-reclaimed
+    /// region whose stale bytes are overwritten by the bump header.
     fn emit_gc_alloc_attempt(&mut self, fail: TextLabel, success: TextLabel) {
-        // ---- Free list first-fit walk ----
-        // r10 = &prev_link (initially &free_list_head)
-        self.asm.mov_data_addr(Reg::R10, self.gc_free_list_head);
-        // r11 = current = *r10
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        let free_loop = self.asm.create_text_label();
-        let free_done = self.asm.create_text_label();
-        let too_small = self.asm.create_text_label();
-        self.asm.bind_text_label(free_loop);
-        self.asm.test_reg_reg(Reg::R11, Reg::R11);
-        self.asm.jcc_label(Condition::Equal, free_done);
-        // size = [r11]
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R11, 0);
-        // total = [rbp - 16]
-        self.asm.load_rbp_slot(Reg::Rdi, 16);
-        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rdi);
-        self.asm.jcc_label(Condition::Less, too_small);
-        // Hit. Unlink: *prev = [r11 + 16]
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R11, 16);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
-        // type tag = [rbp - 24]
-        self.asm.load_rbp_slot(Reg::Rsi, 24);
-        self.asm.store_ptr_disp32(Reg::R11, 8, Reg::Rsi);
-        // Zero the whole payload. First-fit reuse can hand out a block
-        // larger than the request without splitting it, and the mark
-        // trace walks header-size qwords — stale payload bytes from the
-        // block's previous life (old pointers, the free-list link)
-        // would be chased as heap pointers. The bump path skips this
-        // because fresh mmap memory is already zero.
-        let zero_loop = self.asm.create_text_label();
-        let zero_done = self.asm.create_text_label();
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R11, 0);
-        self.asm.sub_reg_imm8(Reg::Rcx, 16);
-        self.asm.mov_reg_reg(Reg::R10, Reg::R11);
-        self.asm.add_reg_imm32(Reg::R10, 16);
-        self.asm.mov_imm64(Reg::Rdi, 0);
-        self.asm.bind_text_label(zero_loop);
-        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
-        self.asm.jcc_label(Condition::Equal, zero_done);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdi);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.sub_reg_imm8(Reg::Rcx, 8);
-        self.asm.jmp_label(zero_loop);
-        self.asm.bind_text_label(zero_done);
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.add_reg_imm32(Reg::Rax, 16);
-        self.asm.jmp_label(success);
-        self.asm.bind_text_label(too_small);
-        // prev = &block.next_free (r11 + 16); current = [prev]
-        self.asm.mov_reg_reg(Reg::R10, Reg::R11);
-        self.asm.add_reg_imm32(Reg::R10, 16);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.jmp_label(free_loop);
-        self.asm.bind_text_label(free_done);
+        let large = self.asm.create_text_label();
+        let need_region = self.asm.create_text_label();
+        let do_bump = self.asm.create_text_label();
 
-        // ---- Bump allocate ----
+        // total = [rbp - 16]; requests larger than a region go the large
+        // path (a contiguous run of regions).
+        self.asm.load_rbp_slot(Reg::Rdi, 16);
+        self.asm.mov_imm64(Reg::Rcx, Self::GC_REGION_SIZE);
+        self.asm.cmp_reg_reg(Reg::Rdi, Reg::Rcx);
+        self.asm.jcc_label(Condition::Above, large);
+
+        // ---- Bump within the current region ----
+        self.asm.bind_text_label(do_bump);
         self.asm.mov_data_addr(Reg::R10, self.gc_heap_top);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
         self.asm.load_rbp_slot(Reg::Rdi, 16);
@@ -37966,13 +37959,30 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R8, self.gc_heap_end);
         self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
         self.asm.cmp_reg_reg(Reg::Rcx, Reg::R8);
-        self.asm.jcc_label(Condition::Above, fail);
+        self.asm.jcc_label(Condition::Above, need_region);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
         self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rdi);
         self.asm.load_rbp_slot(Reg::Rsi, 24);
         self.asm.store_ptr_disp32(Reg::R11, 8, Reg::Rsi);
         self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
         self.asm.add_reg_imm32(Reg::Rax, 16);
+        self.asm.jmp_label(success);
+
+        // Current region is full: acquire a fresh empty one and retry the
+        // bump (which is guaranteed to fit, since total <= region size).
+        self.asm.bind_text_label(need_region);
+        self.asm.call_label(self.gc_acquire_region);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, fail);
+        self.asm.jmp_label(do_bump);
+
+        // ---- Large object (> one region): contiguous region run. ----
+        self.asm.bind_text_label(large);
+        self.asm.load_rbp_slot(Reg::Rdi, 16);
+        self.asm.load_rbp_slot(Reg::Rsi, 24);
+        self.asm.call_label(self.gc_alloc_large);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, fail);
         self.asm.jmp_label(success);
     }
 
@@ -38001,16 +38011,19 @@ impl NativeCodeGenerator {
             self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
             self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         }
-        // Reserve six qword locals (rbp-relative addressing). The first
-        // four are reused across phases; the last pair holds the segment
-        // iteration state used by the sweep loop.
+        // Reserve eight qword locals (rbp-relative addressing). The first
+        // four are reused across phases; the sweep uses the rest for its
+        // region iteration state. 64 bytes keeps the frame 16-aligned so
+        // the mark phase's `gc_mark_visit` calls stay aligned.
         //   [rbp -  8]: root_cursor (current &gc_shadow_stack[i])
         //   [rbp - 16]: root_end    (sentinel = end of shadow stack)
         //   [rbp - 24]: trace_cursor (current pointer into payload)
         //   [rbp - 32]: trace_end    (end of current payload)
-        //   [rbp - 40]: sweep_segment_index
-        //   [rbp - 48]: sweep_segment_count
-        self.asm.sub_reg_imm8(Reg::Rsp, 48);
+        //   [rbp - 40]: sweep region index
+        //   [rbp - 48]: committed_count bound
+        //   [rbp - 56]: current region base (saved across the inner walk)
+        //   [rbp - 64]: spare
+        self.asm.sub_reg_imm8(Reg::Rsp, 64);
 
         // ---- Mark phase ----
         // Reset the worklist top pointer.
@@ -38125,96 +38138,139 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(trace_field_loop);
         self.asm.bind_text_label(trace_done);
 
-        // ---- Sweep phase ----
-        // Walk every segment that has been mmap'd, rebuilding the global
-        // free list from blocks whose mark bit is still clear after the
-        // mark phase. Marked blocks have their mark bit cleared in place.
+        // ---- Sweep phase (region-based) ----
+        // Walk every committed region. Within a region, walk its blocks
+        // from base to the region's watermark: clear the mark bit on live
+        // blocks, and note whether any block is live. A region with NO
+        // live block is reclaimed wholesale onto the free-region pool (a
+        // large object's contiguous run is reclaimed as a unit); a region
+        // with any live block is kept as-is, its dead space stranded until
+        // M7 compaction. r9 accumulates the free-region-list head across
+        // both loops (CALL-free, so it survives).
         //
-        // The currently-active segment's bump pointer (gc_heap_top) is
-        // ahead of segments[count-1].top because the bump path only
-        // updates the global. Sync it before iterating so the inner sweep
-        // covers everything that has been allocated since the previous
-        // collection.
-        self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
+        // First flush the current region's watermark (the bump path only
+        // updates the global gc_heap_top) so its objects are covered.
+        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.sub_reg_imm8(Reg::R11, 1);
-        self.asm.mov_imm64(Reg::Rcx, 24);
-        self.asm.imul_reg_reg(Reg::R11, Reg::Rcx);
-        self.asm.mov_data_addr(Reg::R10, self.gc_segments);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.sub_reg_reg(Reg::R11, Reg::R10); // offset = heap_base - region_base
+        self.asm.shr_reg_imm8(Reg::R11, Self::GC_REGION_SHIFT); // cur region index
+        self.asm.shl_reg_imm8(Reg::R11, 3); // * 8
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
         self.asm.add_reg_reg(Reg::R10, Reg::R11);
         self.asm.mov_data_addr(Reg::R8, self.gc_heap_top);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 8, Reg::Rax);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax); // region_top[cur] = heap_top
 
-        // Cache segment count, reset segment index, clear free list head.
-        self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
+        // Cache committed bound, reset region index, clear free-region head.
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
         self.asm.store_rbp_slot(48, Reg::Rax);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.store_rbp_slot(40, Reg::Rax);
-        // free_head accumulator survives in r9 across the inner block loop
-        // because nothing in the loop body issues a CALL.
         self.asm.mov_imm64(Reg::R9, 0);
 
-        let seg_loop = self.asm.create_text_label();
-        let seg_done = self.asm.create_text_label();
+        let region_loop = self.asm.create_text_label();
+        let region_done = self.asm.create_text_label();
         let inner_loop = self.asm.create_text_label();
         let inner_done = self.asm.create_text_label();
         let block_dead = self.asm.create_text_label();
+        let next_region = self.asm.create_text_label();
+        let reclaim_step = self.asm.create_text_label();
 
-        self.asm.bind_text_label(seg_loop);
+        self.asm.bind_text_label(region_loop);
         self.asm.load_rbp_slot(Reg::Rax, 40);
         self.asm.load_rbp_slot(Reg::Rcx, 48);
         self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.jcc_label(Condition::AboveOrEqual, seg_done);
+        self.asm.jcc_label(Condition::AboveOrEqual, region_done);
 
-        // r11 = segments[seg_index].base, r8 = segments[seg_index].top
-        self.asm.mov_imm64(Reg::Rcx, 24);
-        self.asm.imul_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.mov_data_addr(Reg::R10, self.gc_segments);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rax);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 8);
+        // rsi = region_base + (i << REGION_SHIFT); save it.
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.mov_reg_reg(Reg::Rsi, Reg::R10);
+        self.asm.store_rbp_slot(56, Reg::Rsi);
+        // r8 = region_top[i]
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
+        // Empty region (top == base): skip; it is already free.
+        self.asm.cmp_reg_reg(Reg::R8, Reg::Rsi);
+        self.asm.jcc_label(Condition::Equal, next_region);
 
+        // Inner block walk: r11 = cursor, rdx = any_live flag.
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rsi);
+        self.asm.xor_reg_reg(Reg::Rdx, Reg::Rdx);
         self.asm.bind_text_label(inner_loop);
         self.asm.cmp_reg_reg(Reg::R11, Reg::R8);
         self.asm.jcc_label(Condition::AboveOrEqual, inner_done);
-
-        // header_word = [ptr]
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R11, 0);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R11, 0); // header word0
         self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
         self.asm.mov_imm64(Reg::Rdi, !((1_u64) << 63));
-        self.asm.and_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.asm.and_reg_reg(Reg::Rcx, Reg::Rdi); // size
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::GreaterEqual, block_dead);
-        // Marked: clear mark bit and continue.
+        // Live (mark bit set => negative): clear mark, set any_live.
         self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rcx);
+        self.asm.mov_imm64(Reg::Rdx, 1);
         self.asm.add_reg_reg(Reg::R11, Reg::Rcx);
         self.asm.jmp_label(inner_loop);
-
         self.asm.bind_text_label(block_dead);
-        // Push block onto the free list:
-        //   [ptr]    = size (mark bit already clear)
-        //   [ptr+8]  = 0  (type tag = free)
-        //   [ptr+16] = free_head
-        //   free_head = ptr
-        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rcx);
-        self.asm.mov_imm64(Reg::Rdi, 0);
-        self.asm.store_ptr_disp32(Reg::R11, 8, Reg::Rdi);
-        self.asm.store_ptr_disp32(Reg::R11, 16, Reg::R9);
-        self.asm.mov_reg_reg(Reg::R9, Reg::R11);
+        // Dead: skip; whether the whole region is reclaimed is decided
+        // after the walk. Bump-only means holes are never refilled, so a
+        // stranded dead block just keeps its (mark-clear) header.
         self.asm.add_reg_reg(Reg::R11, Reg::Rcx);
         self.asm.jmp_label(inner_loop);
 
         self.asm.bind_text_label(inner_done);
+        self.asm.test_reg_reg(Reg::Rdx, Reg::Rdx);
+        self.asm.jcc_label(Condition::NotEqual, next_region); // any live: keep
+        self.asm.load_rbp_slot(Reg::Rsi, 56);
+        // Never reclaim the current bump region.
+        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.cmp_reg_reg(Reg::Rsi, Reg::R10);
+        self.asm.jcc_label(Condition::Equal, next_region);
+        // Fully dead: reclaim the run. rax = first block size (== the
+        // object size; for a large run it spans multiple regions, for a
+        // normal region it is <= REGION_SIZE so exactly one region).
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rsi, 0);
+        self.asm.mov_imm64(Reg::Rdi, !((1_u64) << 63));
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rsi); // rdi = m = run base
+        self.asm.bind_text_label(reclaim_step);
+        // Link this region into the free pool and mark it empty.
+        self.asm.store_ptr_disp32(Reg::Rdi, 0, Reg::R9);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rdi);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.sub_reg_reg(Reg::Rcx, Reg::R10);
+        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdi); // region_top[idx] = base
+        self.asm
+            .sub_reg_imm32(Reg::Rax, Self::GC_REGION_SIZE as i32);
+        self.asm
+            .add_reg_imm32(Reg::Rdi, Self::GC_REGION_SIZE as i32);
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Greater, reclaim_step);
+
+        self.asm.bind_text_label(next_region);
         self.asm.load_rbp_slot(Reg::Rax, 40);
         self.asm.add_reg_imm32(Reg::Rax, 1);
         self.asm.store_rbp_slot(40, Reg::Rax);
-        self.asm.jmp_label(seg_loop);
+        self.asm.jmp_label(region_loop);
 
-        self.asm.bind_text_label(seg_done);
-        // free_list_head = r9
-        self.asm.mov_data_addr(Reg::R10, self.gc_free_list_head);
+        self.asm.bind_text_label(region_done);
+        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
 
         // --gc-log pause timing epilogue: delta = now - start; total +=
@@ -38440,127 +38496,229 @@ impl NativeCodeGenerator {
         self.asm.ret();
     }
 
-    /// `gc_grow_heap(rdi = requested_total_bytes)` mmaps a fresh segment
-    /// when the existing heap cannot satisfy a request even after a full
-    /// collection. Returns rax = 1 on success (the new segment is now the
-    /// active bump target), rax = 0 on failure (mmap rejected the request
-    /// or the per-process segment limit was hit). The current segment's
-    /// bump pointer is frozen into the segments table so the next sweep
-    /// covers it.
-    fn emit_gc_grow_heap_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_grow_heap);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        // [rbp - 8] reserved for the page-aligned mmap length.
-        self.asm.sub_reg_imm8(Reg::Rsp, 16);
+    /// `gc_acquire_region` (no args): install a fresh empty region as the
+    /// current bump target and return rax = 1, or rax = 0 if none is
+    /// available (free pool empty and the committed count has reached the
+    /// soft budget). Leaf routine (no syscall, no call): touches only
+    /// caller-saved registers. First flushes the current region's
+    /// watermark so a subsequent sweep can walk it.
+    fn emit_gc_acquire_region_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_acquire_region);
+        let from_tail = self.asm.create_text_label();
+        let install = self.asm.create_text_label();
+        let fail = self.asm.create_text_label();
 
-        let too_many_segments = self.asm.create_text_label();
-        let mmap_failed = self.asm.create_text_label();
-        let alloc_size_ok = self.asm.create_text_label();
-        let epilogue = self.asm.create_text_label();
-
-        // Check segment_count < GC_MAX_SEGMENTS.
-        self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm
-            .cmp_reg_imm32(Reg::Rax, Self::GC_MAX_SEGMENTS as i32);
-        self.asm
-            .jcc_label(Condition::AboveOrEqual, too_many_segments);
-
-        // alloc_size = max(GC_GROW_SIZE, requested_total).
-        self.asm.mov_imm64(Reg::Rcx, Self::GC_GROW_SIZE);
-        self.asm.cmp_reg_reg(Reg::Rdi, Reg::Rcx);
-        self.asm.jcc_label(Condition::AboveOrEqual, alloc_size_ok);
-        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rcx);
-        self.asm.bind_text_label(alloc_size_ok);
-        // Round up to a 4 KiB page boundary.
-        self.asm.add_reg_imm32(Reg::Rdi, 4095);
-        self.asm.and_reg_imm32(Reg::Rdi, -4096);
-        self.asm.store_rbp_slot(8, Reg::Rdi);
-
-        // Freeze current segment's bump pointer into segments[count-1].top.
-        self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.sub_reg_imm8(Reg::Rax, 1);
-        self.asm.mov_imm64(Reg::Rcx, 24);
-        self.asm.imul_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.mov_data_addr(Reg::R10, self.gc_segments);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rax);
+        // region_top[cur] = gc_heap_top, where cur = (heap_base -
+        // region_base) >> REGION_SHIFT.
+        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.sub_reg_reg(Reg::Rcx, Reg::R11);
+        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
         self.asm.mov_data_addr(Reg::R8, self.gc_heap_top);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 8, Reg::Rax);
-
-        // mmap(NULL, alloc_size, PROT_READ|PROT_WRITE,
-        //      MAP_ANON|MAP_PRIVATE, -1, 0).
-        if !self.is_windows {
-            self.emit_syscall_number(PlatformSyscall::Mmap);
-        }
-        self.asm.mov_imm64(Reg::Rdi, 0);
-        self.asm.load_rbp_slot(Reg::Rsi, 8);
-        self.asm
-            .mov_imm64(Reg::Rdx, self.platform.mmap_prot_read_write());
-        self.asm
-            .mov_imm64(Reg::R10, self.platform.mmap_private_anonymous_flags());
-        self.asm
-            .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
-        self.asm.mov_imm64(Reg::R9, 0);
-        if self.is_windows {
-            self.asm.call_label(self.windows_runtime().win_mmap);
-        } else {
-            self.asm.syscall();
-        }
-        self.asm.cmp_reg_imm8(Reg::Rax, 0);
-        self.asm.jcc_label(Condition::Less, mmap_failed);
-
-        // rax now holds new_base. Append segments[count] = {base, top, end}.
-        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
-        self.asm.mov_imm64(Reg::Rdi, 24);
-        self.asm.imul_reg_reg(Reg::Rcx, Reg::Rdi);
-        self.asm.mov_data_addr(Reg::R10, self.gc_segments);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-        self.asm.store_ptr_disp32(Reg::R10, 8, Reg::R11);
-        self.asm.load_rbp_slot(Reg::Rdi, 8);
-        self.asm.mov_reg_reg(Reg::R8, Reg::R11);
-        self.asm.add_reg_reg(Reg::R8, Reg::Rdi);
-        self.asm.store_ptr_disp32(Reg::R10, 16, Reg::R8);
-
-        // Update active bump globals to point at the new segment.
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_top);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_end);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R8);
-
-        // count++.
-        self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
 
+        // (1) Free-region pool: rax = free_region_head; if non-null pop it.
+        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, from_tail);
+        // free_region_head = [rax] (link stored at the region base).
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
+        // Zero the reused region: unlike a fresh mmap'd tail region, a
+        // reclaimed region still holds its previous objects' bytes. The
+        // bump path does not clear an object's padding qwords (those
+        // within the 16-aligned block size that the constructor doesn't
+        // write), and the mark trace walks every payload qword of a
+        // pointer object -- so a stale non-null value there would be
+        // chased as a bogus pointer. Clearing the whole region once on
+        // reuse restores the "all bump memory reads as zero" invariant.
+        let zero_loop = self.asm.create_text_label();
+        let zero_done = self.asm.create_text_label();
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rax); // cursor
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+        self.asm
+            .add_reg_imm32(Reg::R11, Self::GC_REGION_SIZE as i32); // end
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.bind_text_label(zero_loop);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::R11);
+        self.asm.jcc_label(Condition::AboveOrEqual, zero_done);
+        self.asm.store_ptr_disp32(Reg::R8, 0, Reg::R9);
+        self.asm.add_reg_imm32(Reg::R8, 8);
+        self.asm.jmp_label(zero_loop);
+        self.asm.bind_text_label(zero_done);
+        self.asm.jmp_label(install);
+
+        // (2) Commit the next tail region if within budget.
+        self.asm.bind_text_label(from_tail);
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.mov_data_addr(Reg::R8, self.gc_budget_regions);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R8, 0);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::R11);
+        self.asm.jcc_label(Condition::AboveOrEqual, fail);
+        // new_base = region_base + (committed << REGION_SHIFT).
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        self.asm.mov_data_addr(Reg::R8, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
+        self.asm.add_reg_reg(Reg::R8, Reg::Rcx);
+        // committed_count = committed + 1.
+        self.asm.add_reg_imm32(Reg::Rax, 1);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+
+        // install: rax = new region base. Set the bump globals.
+        self.asm.bind_text_label(install);
+        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.gc_heap_top);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm
+            .add_reg_imm32(Reg::Rcx, Self::GC_REGION_SIZE as i32);
+        self.asm.mov_data_addr(Reg::R10, self.gc_heap_end);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
         self.asm.mov_imm64(Reg::Rax, 1);
-        self.asm.jmp_label(epilogue);
+        self.asm.ret();
 
-        self.asm.bind_text_label(too_many_segments);
-        // Hard cap reached: print a dedicated diagnostic and exit. The
-        // caller's "out of memory" path is the right wording for an mmap
-        // failure but not for a fixed table overflow.
-        self.emit_write_data(
-            2,
-            self.gc_segment_overflow_text,
-            b"klassic gc: heap segment limit reached\n".len(),
-        );
-        self.emit_exit_code(1);
-
-        self.asm.bind_text_label(mmap_failed);
+        self.asm.bind_text_label(fail);
         self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.ret();
+    }
 
-        self.asm.bind_text_label(epilogue);
-        self.asm.add_reg_imm32(Reg::Rsp, 16);
-        self.asm.leave();
+    /// `gc_alloc_large(rdi = total, rsi = tag)`: allocate an object bigger
+    /// than one region as a contiguous run of N = ceil(total / region)
+    /// regions carved from the uncommitted tail. Returns rax = user
+    /// pointer or 0 if the run does not fit under the budget. The run's
+    /// first region carries a watermark spanning the whole object so the
+    /// sweep reads exactly one block; member regions are left empty so
+    /// the sweep skips them. Leaf routine.
+    fn emit_gc_alloc_large_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_alloc_large);
+        let member_loop = self.asm.create_text_label();
+        let member_done = self.asm.create_text_label();
+        let fail = self.asm.create_text_label();
+
+        // rcx = N = ceil(total / REGION_SIZE) = (total + REGION_SIZE-1) >> SHIFT
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.asm
+            .add_reg_imm32(Reg::Rcx, (Self::GC_REGION_SIZE - 1) as i32);
+        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        // r8 = committed, r9 = committed + N (new committed). Check budget.
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
+        self.asm.mov_reg_reg(Reg::R9, Reg::R8);
+        self.asm.add_reg_reg(Reg::R9, Reg::Rcx);
+        self.asm.mov_data_addr(Reg::R11, self.gc_budget_regions);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R11, 0);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R11);
+        self.asm.jcc_label(Condition::Above, fail);
+        // base_f = region_base + (committed << REGION_SHIFT).
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.shl_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.add_reg_reg(Reg::Rax, Reg::R10); // rax = base_f
+        // committed_count = committed + N.
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
+        // Header at base_f: [base_f] = total, [base_f+8] = tag.
+        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rdi);
+        self.asm.store_ptr_disp32(Reg::Rax, 8, Reg::Rsi);
+        // region_top[f] = base_f + total (spans the whole run's object).
+        self.asm.mov_reg_reg(Reg::R11, Reg::R8);
+        self.asm.shl_reg_imm8(Reg::R11, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::R11);
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+        self.asm.add_reg_reg(Reg::R11, Reg::Rdi);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
+        // Member regions f+1 .. f+N-1: region_top[m] = its base (empty).
+        // r8 = m index (start f+1), r9 = f+N bound.
+        self.asm.add_reg_imm32(Reg::R8, 1);
+        self.asm.bind_text_label(member_loop);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
+        self.asm.jcc_label(Condition::AboveOrEqual, member_done);
+        // addr = region_base + (m << REGION_SHIFT).
+        self.asm.mov_reg_reg(Reg::R11, Reg::R8);
+        self.asm.shl_reg_imm8(Reg::R11, Self::GC_REGION_SHIFT);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.add_reg_reg(Reg::R11, Reg::R10); // r11 = member base
+        // region_top[m] = member base.
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R8);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
+        self.asm.add_reg_imm32(Reg::R8, 1);
+        self.asm.jmp_label(member_loop);
+        self.asm.bind_text_label(member_done);
+        // return rax = base_f + 16.
+        self.asm.add_reg_imm32(Reg::Rax, 16);
+        self.asm.ret();
+
+        self.asm.bind_text_label(fail);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.ret();
+    }
+
+    /// `gc_grow_budget(rdi = total)`: raise the soft region budget after
+    /// an allocation stall. Grows to max(2*budget, committed + N) capped
+    /// at GC_RESERVE_REGIONS, where N covers the pending request. Returns
+    /// rax = 1 if the budget could grow enough, rax = 0 if even the whole
+    /// reservation cannot hold the request. Leaf routine.
+    fn emit_gc_grow_budget_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_grow_budget);
+        let have = self.asm.create_text_label();
+        let set = self.asm.create_text_label();
+        let fail = self.asm.create_text_label();
+
+        // rcx = N = ceil(total / REGION_SIZE).
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.asm
+            .add_reg_imm32(Reg::Rcx, (Self::GC_REGION_SIZE - 1) as i32);
+        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        // r8 = committed + N (the minimum budget the request needs).
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
+        self.asm.add_reg_reg(Reg::R8, Reg::Rcx);
+        // rax = budget * 2.
+        self.asm.mov_data_addr(Reg::R10, self.gc_budget_regions);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.shl_reg_imm8(Reg::Rax, 1);
+        // rax = max(2*budget, committed+N).
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.jcc_label(Condition::AboveOrEqual, have);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.bind_text_label(have);
+        // Cap at GC_RESERVE_REGIONS (unsigned region counts).
+        let over_cap = self.asm.create_text_label();
+        self.asm
+            .cmp_reg_imm32(Reg::Rax, Self::GC_RESERVE_REGIONS as i32);
+        self.asm.jcc_label(Condition::Above, over_cap);
+        self.asm.jmp_label(set); // rax <= reserve: use it as-is
+        self.asm.bind_text_label(over_cap);
+        // Over the cap: the request fits only if committed+N <= reserve.
+        self.asm
+            .cmp_reg_imm32(Reg::R8, Self::GC_RESERVE_REGIONS as i32);
+        self.asm.jcc_label(Condition::Above, fail);
+        self.asm.mov_imm64(Reg::Rax, Self::GC_RESERVE_REGIONS);
+        self.asm.bind_text_label(set);
+        self.asm.mov_data_addr(Reg::R10, self.gc_budget_regions);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.ret();
+
+        self.asm.bind_text_label(fail);
+        self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.ret();
     }
 

@@ -20983,12 +20983,70 @@ fn native_gc_stress_forces_a_collection_per_alloc_and_stays_correct() {
         .and_then(|s| s.split_whitespace().next())
         .and_then(|s| s.parse::<u64>().ok())
         .expect("stats line should contain an allocs count");
-    // Every allocation collects, so collections == allocs.
-    assert_eq!(
-        collections, allocs,
-        "--gc-stress must collect once per allocation"
+    // Every allocation collects (the stress pre-collect), so there is at
+    // least one collection per allocation. The region heap may add a
+    // handful more while the soft budget ramps up: when the current
+    // region fills before the free-region pool has been replenished, the
+    // allocator's fail chain runs a second collection and doubles the
+    // budget. That warm-up overshoot is small and bounded (a few extra
+    // out of hundreds of thousands), so assert the invariant as a lower
+    // bound rather than exact equality.
+    assert!(
+        collections >= allocs,
+        "--gc-stress must collect at least once per allocation \
+         (collections={collections}, allocs={allocs})"
+    );
+    assert!(
+        collections <= allocs + 64,
+        "region-budget warm-up should add only a few extra collections \
+         (collections={collections}, allocs={allocs})"
     );
     assert!(allocs > 100_000, "churn should allocate many objects");
+}
+
+/// M4: a single object larger than one 128 KiB region is allocated as a
+/// contiguous run of regions (gc_alloc_large). It must round-trip and,
+/// when it dies and is re-allocated in a loop, the whole run must be
+/// reclaimed and re-carved -- verified against the evaluator under both
+/// normal and --gc-stress builds.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_large_object_region_run() {
+    let program = "val s = \"x\".repeat(200000)\n\
+         println(s.length())\n\
+         mutable i = 0\n\
+         mutable acc = 0\n\
+         while (i < 5) { val t = \"y\".repeat(200000); acc = acc + t.length(); i = i + 1 }\n\
+         println(acc)\n";
+    let (plain, _e1) = build_and_run_gc_program(program, &[]);
+    assert_eq!(plain, "200000\n1000000\n");
+    let (stress, _e2) = build_and_run_gc_program(program, &["--gc-stress"]);
+    assert_eq!(stress, "200000\n1000000\n");
+}
+
+/// M4: an all-live per-frame allocation graph deeper than the initial
+/// 8-region (1 MiB) budget forces the allocator's stall path -- the
+/// collector frees nothing, so gc_grow_budget doubles the soft budget
+/// and the retry commits a fresh tail region. The result must match the
+/// evaluator, confirming budget growth is sound (no premature OOM, no
+/// lost object).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_budget_grows_for_all_live_graph() {
+    let program = "enum L { case Nil; case Full(n: Int, junk: L) }\n\
+         def build(n: Int): L = if (n <= 0) Nil else Full(n, build(n - 1))\n\
+         def sz(x: L): Int = x match { case Nil => 0; case Full(n, j) => 1 + sz(j) }\n\
+         println(sz(build(40000)))\n";
+    let (plain, _e1) = build_and_run_gc_program(program, &[]);
+    assert_eq!(plain, "40000\n");
+    let (log_stdout, log_stderr) = build_and_run_gc_program(program, &["--gc-log"]);
+    assert_eq!(log_stdout, "40000\n");
+    // The all-live graph outlives every collection, so at least one must
+    // have run and then grown the budget rather than freeing space.
+    assert!(
+        log_stderr.starts_with("gc: collections="),
+        "expected a gc-log line, got: {log_stderr}"
+    );
 }
 
 /// `--gc-stress` re-runs the M1 use-after-free repro under maximal
