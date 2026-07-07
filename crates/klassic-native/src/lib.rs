@@ -4372,6 +4372,9 @@ struct NativeCodeGenerator {
     gc_sweep: TextLabel,
     gc_clear_all_marks: TextLabel,
     gc_stw_mark_complete: TextLabel,
+    gc_drain: TextLabel,
+    gc_mark_start: TextLabel,
+    gc_mark_end: TextLabel,
     gc_mark_visit: TextLabel,
     gc_deep_equal: TextLabel,
     /// ZGC load-barrier slow path: heals a bad-colored heap pointer
@@ -4590,6 +4593,9 @@ impl NativeCodeGenerator {
         let gc_sweep = asm.create_text_label();
         let gc_clear_all_marks = asm.create_text_label();
         let gc_stw_mark_complete = asm.create_text_label();
+        let gc_drain = asm.create_text_label();
+        let gc_mark_start = asm.create_text_label();
+        let gc_mark_end = asm.create_text_label();
         let gc_mark_visit = asm.create_text_label();
         let gc_deep_equal = asm.create_text_label();
         let gc_load_barrier_slow = asm.create_text_label();
@@ -4732,6 +4738,9 @@ impl NativeCodeGenerator {
             gc_sweep,
             gc_clear_all_marks,
             gc_stw_mark_complete,
+            gc_drain,
+            gc_mark_start,
+            gc_mark_end,
             gc_mark_visit,
             gc_deep_equal,
             gc_load_barrier_slow,
@@ -5342,6 +5351,9 @@ impl NativeCodeGenerator {
         self.emit_gc_sweep_runtime();
         self.emit_gc_clear_all_marks_runtime();
         self.emit_gc_stw_mark_complete_runtime();
+        self.emit_gc_drain_runtime();
+        self.emit_gc_mark_start_runtime();
+        self.emit_gc_mark_end_runtime();
         self.emit_gc_acquire_region_runtime();
         self.emit_gc_alloc_large_runtime();
         self.emit_gc_grow_budget_runtime();
@@ -37815,6 +37827,14 @@ impl NativeCodeGenerator {
     /// (M1) or relocation-flagged (R) pointer ANDs non-zero and takes the
     /// load-barrier slow path.
     const GC_COLOR_BAD_MASK: u64 = Self::GC_COLOR_M1 | Self::GC_COLOR_R;
+    /// M6 incremental-marking tuning. A mark quantum traces up to
+    /// GC_QUANTUM_POPS worklist objects; the driver runs one quantum per
+    /// GC_QUANTUM_BYTES allocated during the Mark phase. A cycle starts
+    /// proactively when live regions exceed 5/8 of the soft budget.
+    const GC_QUANTUM_POPS: u64 = 512;
+    const GC_QUANTUM_BYTES: u64 = 8192;
+    const GC_PHASE_IDLE: u64 = 0;
+    const GC_PHASE_MARK: u64 = 1;
 
     /// Initialize the reserved color registers once, before any user
     /// code or collector routine runs. r13 = strip mask, r14 = good
@@ -37837,7 +37857,17 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rax, good_color);
         self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rax, Self::GC_COLOR_BAD_MASK);
+        // Bad mask. Under --gc-poison it is COLOR_MASK -- every colored
+        // pointer stays "bad" regardless of which color the current cycle
+        // uses, so the slow path runs on every load and any unbarriered
+        // dereference faults. Otherwise it catches M1 | R (the non-good
+        // colors while good = M0); MarkStart maintains this on each flip.
+        let bad_mask = if self.gc_poison {
+            Self::GC_COLOR_MASK
+        } else {
+            Self::GC_COLOR_BAD_MASK
+        };
+        self.asm.mov_imm64(Reg::Rax, bad_mask);
         self.asm.mov_data_addr(Reg::R10, self.gc_bad_mask);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         self.asm.mov_data_addr(Reg::R14, self.gc_good_color);
@@ -38062,6 +38092,22 @@ impl NativeCodeGenerator {
         self.emit_exit_code(1);
 
         self.asm.bind_text_label(success);
+        // Allocate-black: an object allocated during the Mark phase is
+        // born live this cycle (its header mark bit is set), so the
+        // in-progress incremental mark -- which may already be past the
+        // point where this object would be discovered -- does not reclaim
+        // it at the coming sweep. rax = user pointer, header at [rax-16];
+        // rax must survive, so this uses r10/r11 only. Inert while Idle.
+        let skip_black = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::R11, Reg::R11);
+        self.asm.jcc_label(Condition::Equal, skip_black);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::Rax, -16);
+        self.asm.mov_imm64(Reg::R10, 1_u64 << 63);
+        self.asm.or_reg_reg(Reg::R11, Reg::R10);
+        self.asm.store_ptr_disp32(Reg::Rax, -16, Reg::R11);
+        self.asm.bind_text_label(skip_black);
         // --gc-log: count this allocation and its byte size (total,
         // header included, in slot 16). rax holds the user pointer and
         // must survive, so the counter bumps use r10/r11 only.
@@ -38143,10 +38189,9 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(self.gc_collect);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.asm.mov_data_addr(Reg::R10, self.gc_collect_counter);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // (The collection counter is bumped once per cycle inside
+        // gc_sweep, which every completed cycle -- sync or incremental --
+        // passes through exactly once.)
         // --gc-log pause timing (Linux only; the clock syscall path
         // panics on Windows). Capture the monotonic start before the
         // mark/sweep work; the delta is folded in at the epilogue.
@@ -38237,15 +38282,27 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
         self.asm.sub_reg_imm8(Reg::Rsp, 32);
+        // rdi = pop budget for this quantum; [rbp-8] holds the remaining
+        // budget, [rbp-24] the field cursor, [rbp-32] the field end.
+        self.asm.store_rbp_slot(8, Reg::Rdi);
         let trace_loop = self.asm.create_text_label();
         let trace_done = self.asm.create_text_label();
         let trace_field_loop = self.asm.create_text_label();
         let trace_skip_field = self.asm.create_text_label();
         self.asm.bind_text_label(trace_loop);
+        // Budget exhausted? (an incremental quantum stops here; the caller
+        // resumes next time. gc_drain passes a large budget per call and
+        // loops until the worklist empties, so it drains fully.)
+        self.asm.load_rbp_slot(Reg::Rax, 8);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, trace_done);
         self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
         self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
         self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
         self.asm.jcc_label(Condition::Equal, trace_done);
+        // We have work: spend one budget unit (rax still holds it).
+        self.asm.sub_reg_imm8(Reg::Rax, 1);
+        self.asm.store_rbp_slot(8, Reg::Rax);
         // top--, fetch worklist[top]
         self.asm.sub_reg_imm8(Reg::Rcx, 1);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
@@ -38294,12 +38351,19 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::AboveOrEqual, trace_loop);
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
         // Heap slots hold colored pointers; strip the color before
-        // gc_mark_visit dereferences the block header at [rdi-16]. (A
-        // no-op until color-on-store is turned on, since raw pointers
-        // AND with the strip mask unchanged.)
+        // gc_mark_visit dereferences the block header at [rdi-16].
         self.asm.and_reg_reg(Reg::Rdi, Reg::R13);
         self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
         self.asm.jcc_label(Condition::Equal, trace_skip_field);
+        // Recolor-on-trace: write the good-colored child back into this
+        // field slot (r10 = slot address) BEFORE marking, so a later
+        // barriered load of the same field takes the fast path instead
+        // of re-entering the slow path. Must precede the call, which
+        // clobbers r10; the cursor is reloaded afterward. Inert until the
+        // mark color flips (recoloring good->good is a no-op).
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rdi);
+        self.asm.or_reg_reg(Reg::R11, Reg::R14);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
         self.asm.call_label(self.gc_mark_visit);
         self.asm.bind_text_label(trace_skip_field);
         self.asm.load_rbp_slot(Reg::R10, 24);
@@ -38318,6 +38382,12 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
         self.asm.sub_reg_imm8(Reg::Rsp, 64);
+        // One completed collection cycle per sweep: bump the counter here
+        // so both the synchronous and incremental paths count once.
+        self.asm.mov_data_addr(Reg::R10, self.gc_collect_counter);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.add_reg_imm32(Reg::Rax, 1);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         // ---- Sweep phase (region-based) ----
         // Walk every committed region. Within a region, walk its blocks
         // from base to the region's watermark: clear the mark bit on live
@@ -38561,7 +38631,7 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         self.asm.call_label(self.gc_mark_roots);
-        self.asm.call_label(self.gc_trace);
+        self.asm.call_label(self.gc_drain);
         // If the flag is set again, the worklist overflowed even on the
         // from-scratch mark: genuine over-capacity, abort as before.
         self.asm
@@ -38577,6 +38647,112 @@ impl NativeCodeGenerator {
         );
         self.emit_exit_code(1);
         self.asm.bind_text_label(ok);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// Drain the mark worklist to fixpoint by running quanta back to
+    /// back. Used by the STW paths (gc_stw_mark_complete, gc_mark_end).
+    fn emit_gc_drain_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_drain);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        let drain_loop = self.asm.create_text_label();
+        self.asm.bind_text_label(drain_loop);
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_QUANTUM_POPS);
+        self.asm.call_label(self.gc_trace);
+        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::NotEqual, drain_loop);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// MarkStart (short STW pause): flip the mark color to the new cycle,
+    /// reload the reserved color-register caches, reset the worklist,
+    /// scan roots, and enter the Mark phase. O(roots).
+    fn emit_gc_mark_start_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_mark_start);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        // rax = old good color.
+        self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        // New bad mask. Under --gc-poison it is COLOR_MASK (every colored
+        // pointer stays "bad", so every load faults if unbarriered and
+        // the slow path runs every time). Otherwise it catches the OLD
+        // good color | R, so pointers left over from the previous cycle
+        // trigger the barrier (incremental-update marking).
+        if self.gc_poison {
+            self.asm.mov_imm64(Reg::Rcx, Self::GC_COLOR_MASK);
+        } else {
+            self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+            self.asm.mov_imm64(Reg::R11, Self::GC_COLOR_R);
+            self.asm.or_reg_reg(Reg::Rcx, Reg::R11);
+        }
+        self.asm.mov_data_addr(Reg::R11, self.gc_bad_mask);
+        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rcx);
+        // Flip good: new_good = old_good XOR (M0|M1) toggles M0<->M1.
+        self.asm
+            .mov_imm64(Reg::Rcx, Self::GC_COLOR_M0 | Self::GC_COLOR_M1);
+        self.asm.xor_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // Reload the caches from the cells.
+        self.asm.mov_data_addr(Reg::R14, self.gc_good_color);
+        self.asm.load_ptr_disp32(Reg::R14, Reg::R14, 0);
+        self.asm.mov_data_addr(Reg::R15, self.gc_bad_mask);
+        self.asm.load_ptr_disp32(Reg::R15, Reg::R15, 0);
+        // Reset the worklist and scan roots into it (marked new-color).
+        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.call_label(self.gc_mark_roots);
+        // Enter the Mark phase.
+        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
+        self.asm.mov_imm64(Reg::Rax, Self::GC_PHASE_MARK);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// MarkEnd (short STW pause): finish the cycle. If the worklist
+    /// overflowed during the incremental quanta, degrade to a
+    /// from-scratch STW re-mark; otherwise drain the remaining frontier
+    /// to fixpoint (a straggler may have been added by the barrier), and
+    /// if THAT overflows, degrade. Then sweep and return to Idle.
+    fn emit_gc_mark_end_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_mark_end);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        let do_degrade = self.asm.create_text_label();
+        let after_mark = self.asm.create_text_label();
+        self.asm
+            .mov_data_addr(Reg::R10, self.gc_stw_fallback_pending);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::NotEqual, do_degrade);
+        self.asm.call_label(self.gc_drain);
+        self.asm
+            .mov_data_addr(Reg::R10, self.gc_stw_fallback_pending);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, after_mark);
+        self.asm.bind_text_label(do_degrade);
+        self.asm.mov_data_addr(Reg::R10, self.gc_stw_fallbacks);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.add_reg_imm32(Reg::Rax, 1);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.call_label(self.gc_stw_mark_complete);
+        self.asm.bind_text_label(after_mark);
+        self.asm.call_label(self.gc_sweep);
+        // Back to Idle; reset the proactive-trigger byte counter.
+        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
+        self.asm.mov_imm64(Reg::Rax, Self::GC_PHASE_IDLE);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.gc_bytes_since_cycle);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         self.asm.leave();
         self.asm.ret();
     }
