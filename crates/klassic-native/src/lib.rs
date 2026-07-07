@@ -8415,15 +8415,15 @@ impl NativeCodeGenerator {
     }
 
     /// Call a non-inline function that takes at least one by-pointer
-    /// heap argument (a lowered enum). Qword arguments — scalar or heap
-    /// pointer — use the same balanced push/pop staging as the
-    /// scalar-only path, so enclosing expressions that pushed operands
-    /// before this call see an unchanged rsp. Each evaluated heap
-    /// pointer is additionally pinned in the GC root table so a
-    /// collection triggered while evaluating a later argument cannot
-    /// free it, and unpinned again just before the call — the callee
-    /// prologue roots its own per-frame copy before anything can
-    /// allocate.
+    /// heap argument (a lowered enum). Each qword argument — scalar or
+    /// heap pointer — is spilled into a shadow-tracked stack slot for
+    /// the duration of the remaining argument evaluations, so a
+    /// collection triggered while evaluating a later argument keeps
+    /// every earlier heap argument live (heap slots are real GC roots
+    /// the collector updates through the slot address). Argument
+    /// registers / stack are materialized from those slots only after
+    /// every argument is evaluated; the callee prologue then roots its
+    /// own per-frame copy before anything can allocate.
     fn compile_pointer_abi_function_call(
         &mut self,
         function: &NativeFunction,
@@ -37714,9 +37714,9 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R10, self.gc_free_list_head);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
 
-        // Map the GC tables (root table, shadow stack, mark worklist)
-        // in one anonymous mapping — mmap memory is zero-filled, which
-        // is exactly the tables' required initial state.
+        // Map the GC tables (shadow stack, mark worklist) in one
+        // anonymous mapping — mmap memory is zero-filled, which is
+        // exactly the tables' required initial state.
         if !self.is_windows {
             self.emit_syscall_number(PlatformSyscall::Mmap);
         }
