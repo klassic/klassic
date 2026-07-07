@@ -38055,6 +38055,61 @@ impl NativeCodeGenerator {
         let oom = self.asm.create_text_label();
         let after_collect = self.asm.create_text_label();
 
+        // ---- M6 incremental-mark driver ----
+        // Runs BEFORE the attempt so it observes only the mutator's
+        // already-rooted state: the previous allocation's object is
+        // rooted by now, and THIS allocation has not happened yet, so
+        // starting a cycle here cannot strand an unrooted register-only
+        // object (which the following attempt then makes allocate-black).
+        // None of the routines called here allocate, so gc_alloc is not
+        // re-entered.
+        let driver_mark = self.asm.create_text_label();
+        let driver_done = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::R11, Reg::R11);
+        self.asm.jcc_label(Condition::NotEqual, driver_mark);
+        // Idle: accumulate allocation pressure since the last cycle and,
+        // once it crosses half the soft budget, start a cycle
+        // proactively (so the incremental mark has slack to finish
+        // before exhaustion; the exhaustion path is the STW fallback).
+        self.asm.mov_data_addr(Reg::R10, self.gc_bytes_since_cycle);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.load_rbp_slot(Reg::R11, 16); // total block bytes
+        self.asm.add_reg_reg(Reg::Rax, Reg::R11);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // threshold = budget_regions * REGION_SIZE / 2 = budget << 16.
+        self.asm.mov_data_addr(Reg::R10, self.gc_budget_regions);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
+        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT - 1);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::Below, driver_done);
+        self.asm.call_label(self.gc_mark_start);
+        self.asm.jmp_label(driver_done);
+        // Mark: run one bounded quantum per GC_QUANTUM_BYTES allocated;
+        // when the worklist empties, the mark has reached fixpoint, so
+        // finish the cycle (MarkEnd sweeps and returns to Idle).
+        self.asm.bind_text_label(driver_mark);
+        self.asm
+            .mov_data_addr(Reg::R10, self.gc_bytes_since_quantum);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.load_rbp_slot(Reg::R11, 16);
+        self.asm.add_reg_reg(Reg::Rax, Reg::R11);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm
+            .cmp_reg_imm32(Reg::Rax, Self::GC_QUANTUM_BYTES as i32);
+        self.asm.jcc_label(Condition::Below, driver_done);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax); // reset counter
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_QUANTUM_POPS);
+        self.asm.call_label(self.gc_trace);
+        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::NotEqual, driver_done);
+        self.asm.call_label(self.gc_mark_end);
+        self.asm.bind_text_label(driver_done);
+
         // --gc-stress: collect before every allocation attempt. The
         // request's own object is allocated by the attempt that
         // follows, so collecting here only reclaims prior garbage --
@@ -38200,14 +38255,23 @@ impl NativeCodeGenerator {
             self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
             self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         }
-        // M6: a synchronous full collection = a from-scratch STW mark to
-        // fixpoint followed by the sweep. gc_stw_mark_complete clears all
-        // marks, resets the worklist, scans roots, and traces; the sweep
-        // reclaims. (The incremental phase machine will call the same
-        // pieces individually.) gc-log brackets the whole thing as one
-        // pause for now.
+        // M6: the synchronous collection entry (do_collect, --gc-stress).
+        // If a cycle is in progress (phase == Mark), finish it via
+        // gc_mark_end (which drains/degrades, sweeps, and returns to
+        // Idle). Otherwise run a full from-scratch STW mark + sweep.
+        // Either way exactly one sweep runs, so the counter bumps once.
+        let collect_mark = self.asm.create_text_label();
+        let collect_done = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::NotEqual, collect_mark);
         self.asm.call_label(self.gc_stw_mark_complete);
         self.asm.call_label(self.gc_sweep);
+        self.asm.jmp_label(collect_done);
+        self.asm.bind_text_label(collect_mark);
+        self.asm.call_label(self.gc_mark_end);
+        self.asm.bind_text_label(collect_done);
         // --gc-log pause timing epilogue: delta = now - start; total +=
         // delta; max = max(max, delta). All registers are dead here.
         if self.gc_log && !self.is_windows {
