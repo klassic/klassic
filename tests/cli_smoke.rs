@@ -21029,6 +21029,64 @@ fn native_gc_stress_churn_does_not_leak_regions() {
     assert_eq!(stress, "750000\n");
 }
 
+/// M5: --gc-poison colors every heap-stored pointer with the BAD color,
+/// so the load-barrier slow path runs on every heap-pointer load (and
+/// any unbarriered dereference would fault on a non-canonical address).
+/// The barrier must be transparent: every program's output under poison
+/// must match a normal build. This is the barrier-coverage guarantee --
+/// a missing barrier would SIGSEGV here, not silently diverge. Exercises
+/// enum construction/read, match, deep-equal (==), and heap strings.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_poison_is_transparent() {
+    // Enum churn + equality (deep-equal walker strips colored slots).
+    let churn = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         def same(a: Tree, b: Tree): Boolean = a == b\n\
+         mutable i = 0\n\
+         mutable ok = 0\n\
+         while (i < 20000) {\n\
+           if (same(Branch(Leaf(i), Leaf(i)), Branch(Leaf(i), Leaf(i)))) { ok = ok + 1 }\n\
+           i = i + 1\n\
+         }\n\
+         println(ok)\n";
+    let (plain, _e1) = build_and_run_gc_program(churn, &[]);
+    let (poison, _e2) = build_and_run_gc_program(churn, &["--gc-poison"]);
+    assert_eq!(plain, "20000\n");
+    assert_eq!(poison, plain, "poison must be transparent to output");
+
+    // Heap-string enum payloads with string-literal pattern matching.
+    let strings = "enum Tag { case Named(s: String); case Anon }\n\
+         def kind(t) = t match { case Named(\"x\") => 1; case Named(other) => 2; case Anon => 0 }\n\
+         println(kind(Named(\"x\")))\n\
+         println(kind(Named(\"y\")))\n\
+         println(kind(Anon))\n";
+    let (splain, _e3) = build_and_run_gc_program(strings, &[]);
+    let (spoison, _e4) = build_and_run_gc_program(strings, &["--gc-poison"]);
+    assert_eq!(splain, "1\n2\n0\n");
+    assert_eq!(spoison, splain);
+}
+
+/// M5: the most hostile configuration -- collect before every
+/// allocation (--gc-stress) AND poison every heap slot (--gc-poison).
+/// The collector's mark trace and deep-equal walker must strip colors
+/// off the slots they read, on top of the load barrier healing every
+/// mutator load. Output must still match a normal build.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_stress_poison_combined_stays_correct() {
+    let program = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         def sz(t: Tree): Int = t match { case Leaf(v) => 1; case Branch(l, r) => sz(l) + sz(r) }\n\
+         mutable i = 0\n\
+         mutable acc = 0\n\
+         while (i < 15000) {\n\
+           acc = acc + sz(Branch(Leaf(i), Branch(Leaf(i), Leaf(i))))\n\
+           i = i + 1\n\
+         }\n\
+         println(acc)\n";
+    let (combined, _e) = build_and_run_gc_program(program, &["--gc-stress", "--gc-poison"]);
+    assert_eq!(combined, "45000\n"); // 15000 * 3
+}
+
 /// M4: an all-live per-frame allocation graph deeper than the initial
 /// 8-region (1 MiB) budget forces the allocator's stall path -- the
 /// collector frees nothing, so gc_grow_budget doubles the soft budget

@@ -22,6 +22,10 @@ pub struct ExecutionConfig {
     /// allocation (deterministic detector for pointers left unrooted
     /// across an allocation).
     pub gc_stress: bool,
+    /// `--gc-poison`: heap-stored pointers are colored BAD, so any
+    /// unbarriered dereference faults on a non-canonical address and the
+    /// load-barrier slow path runs on every load.
+    pub gc_poison: bool,
 }
 
 impl ExecutionConfig {
@@ -34,6 +38,7 @@ impl ExecutionConfig {
             explicit_target: false,
             gc_log: false,
             gc_stress: false,
+            gc_poison: false,
         }
     }
 }
@@ -87,6 +92,7 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     let mut explicit_target = false;
     let mut gc_log = false;
     let mut gc_stress = false;
+    let mut gc_poison = false;
     let mut others = Vec::new();
     let mut script_args = Vec::new();
     let mut seen_separator = false;
@@ -117,6 +123,10 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
             }
             "--gc-stress" => {
                 gc_stress = true;
+                index += 1;
+            }
+            "--gc-poison" => {
+                gc_poison = true;
                 index += 1;
             }
             "--backend" => {
@@ -160,6 +170,7 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     config.explicit_target = explicit_target;
     config.gc_log = gc_log;
     config.gc_stress = gc_stress;
+    config.gc_poison = gc_poison;
     let action = match others.as_slice() {
         [command] if command == "targets" => RunAction::ListTargets,
         [flag] if flag == "--version" || flag == "-V" => RunAction::ShowVersion,
@@ -324,6 +335,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_gc_poison_flag() {
+        let args = vec![
+            "--gc-poison".to_string(),
+            "build".to_string(),
+            "sample.kl".to_string(),
+            "-o".to_string(),
+            "sample".to_string(),
+        ];
+        let parsed = parse_command_line(&args).expect("build command should parse");
+        assert!(parsed.config.gc_poison);
+        assert!(matches!(parsed.action, RunAction::BuildFile { .. }));
+    }
+
+    #[test]
     fn gc_flags_default_off() {
         let args = vec![
             "build".to_string(),
@@ -334,6 +359,7 @@ mod tests {
         let parsed = parse_command_line(&args).expect("build command should parse");
         assert!(!parsed.config.gc_log);
         assert!(!parsed.config.gc_stress);
+        assert!(!parsed.config.gc_poison);
     }
 
     #[test]
