@@ -20865,6 +20865,170 @@ fn native_build_survives_enum_allocation_churn_across_collections() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "50000\n");
 }
 
+/// Regression guard for a real use-after-free: `==` on two freshly
+/// constructed enums staged the lhs pointer with a raw machine-stack
+/// push (not a GC root) across the rhs compile. The lhs temporary's
+/// constructor-scope root is already popped at that point, so when the
+/// rhs construction triggered a collection the lhs was swept and its
+/// memory reused -- `P(i,i) == P(i,i)` silently returned false 14
+/// times in 100k iterations before the fix (the lhs is now rooted in a
+/// shadow-tracked slot across the rhs compile). The loop count is
+/// sized so collections inevitably strike during rhs construction.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_enum_equality_lhs_survives_collection_during_rhs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_eq_uaf_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_eq_uaf_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Pair { case P(a: Int, b: Int) }\n\
+         mutable i = 0\n\
+         mutable ok = 0\n\
+         while (i < 100000) {\n\
+           if (P(i, i) == P(i, i)) {\n\
+             ok = ok + 1\n\
+           }\n\
+           i = i + 1\n\
+         }\n\
+         println(ok)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "100000\n");
+}
+
+/// Same use-after-free class through `assertResult`: the expected
+/// value was staged with a raw push across the actual's compile.
+/// Before the fix this program aborted with "assertResult failed"
+/// (the evaluator passes).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_assert_result_expected_survives_collection_during_actual() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_assert_uaf_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_assert_uaf_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Pair { case P(a: Int, b: Int) }\n\
+         mutable i = 0\n\
+         while (i < 100000) {\n\
+           assertResult(P(i, i))(P(i, i))\n\
+           i = i + 1\n\
+         }\n\
+         println(\"all-passed\")\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        run_output.status.success(),
+        "assertResult must not fail across collections\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "all-passed\n");
+}
+
+/// Nested-payload variant of the equality use-after-free: a freed lhs
+/// tree makes `gc_deep_equal` walk reused memory, maximizing the
+/// chance of a wrong verdict (12/50k before the fix).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_deep_equal_walks_lhs_after_forced_collection() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_deep_uaf_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_deep_uaf_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         mutable i = 0\n\
+         mutable ok = 0\n\
+         while (i < 50000) {\n\
+           if (Branch(Leaf(i), Leaf(i + 1)) == Branch(Leaf(i), Leaf(i + 1))) {\n\
+             ok = ok + 1\n\
+           }\n\
+           i = i + 1\n\
+         }\n\
+         println(ok)\n",
+    )
+    .expect("temp source file should write");
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("source path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("output path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "50000\n");
+}
+
 /// Functions whose annotations name a lowered monomorphic enum now use a
 /// per-frame by-pointer calling convention: the enum's `__gc_record`
 /// pointer travels in a qword argument register (or caller stack push)

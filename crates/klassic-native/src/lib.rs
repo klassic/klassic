@@ -7161,7 +7161,16 @@ impl NativeCodeGenerator {
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && matches!(lhs_value, NativeValue::HeapPointer)
         {
-            self.push_temp_reg(Reg::Rax);
+            // Root the lhs in a shadow-tracked slot across the rhs
+            // compile. A raw machine-stack push here was a real
+            // use-after-free: the lhs temporary's constructor root has
+            // already been popped, so when the rhs construction
+            // triggered a collection the lhs was swept and its memory
+            // reused -- `P(i,i) == P(i,i)` returned false 14 times in
+            // 100k iterations.
+            self.push_scope();
+            let lhs_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+            self.asm.store_rbp_slot(lhs_slot.offset, Reg::Rax);
             let rhs_value = self.compile_expr(rhs)?;
             if !matches!(rhs_value, NativeValue::HeapPointer) {
                 return Err(unsupported(
@@ -7169,9 +7178,13 @@ impl NativeCodeGenerator {
                     "native equality for a heap value and this value type",
                 ));
             }
-            // rax = rhs pointer; restore lhs pointer into rdi.
-            self.pop_temp_reg(Reg::Rdi);
+            // rax = rhs pointer; reload the (possibly still live only
+            // through the slot) lhs pointer into rdi. gc_deep_equal
+            // never allocates, so the operands are safe unrooted once
+            // the scope pops.
             self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
+            self.asm.load_rbp_slot(Reg::Rdi, lhs_slot.offset);
+            self.pop_scope();
             self.asm.call_label(self.gc_deep_equal);
             if op == BinaryOp::NotEqual {
                 self.asm.cmp_reg_imm8(Reg::Rax, 0);
@@ -8942,8 +8955,15 @@ impl NativeCodeGenerator {
                 // same routine the `==` operator uses. The failure path
                 // reports a plain message rather than the raw pointers a
                 // value formatter would print for a heap value without a
-                // tracked shape.
-                self.push_temp_reg(Reg::Rax);
+                // tracked shape. The expected value is rooted in a
+                // shadow-tracked slot across the actual's compile -- a
+                // raw machine-stack push here was the same
+                // use-after-free the `==` operator had (the expected
+                // temporary was swept when the actual's construction
+                // collected).
+                self.push_scope();
+                let expected_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+                self.asm.store_rbp_slot(expected_slot.offset, Reg::Rax);
                 let actual = self.compile_expr(&actual_arguments[0])?;
                 if !matches!(actual, NativeValue::HeapPointer) {
                     return Err(unsupported(
@@ -8951,8 +8971,9 @@ impl NativeCodeGenerator {
                         "native assertResult for values with different types",
                     ));
                 }
-                self.pop_temp_reg(Reg::Rdi);
                 self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
+                self.asm.load_rbp_slot(Reg::Rdi, expected_slot.offset);
+                self.pop_scope();
                 self.asm.call_label(self.gc_deep_equal);
                 let ok = self.asm.create_text_label();
                 self.asm.cmp_reg_imm8(Reg::Rax, 0);
