@@ -13807,6 +13807,16 @@ impl NativeCodeGenerator {
         self.asm.load_rbp_slot(Reg::R10, m_slot.offset);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.add_reg_reg(Reg::R10, Reg::R8);
+        // Verbatim copy of a COLORED key/value slot into the new list:
+        // no load barrier, no re-color -- the color bits pass through
+        // untouched, and the result list is read back through the
+        // barriered read funnel later. This is sound only because rdi
+        // holds the colored pointer across just these two instructions
+        // with NO allocation, shadow-push, or collection point between
+        // them. M7 WARNING: once the collector moves objects, a colored
+        // pointer briefly live in a register here would be invisible to
+        // the root walk / relocation -- do not introduce a GC-triggering
+        // step between this load and the store below.
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
         // dst at new[i].
         self.asm.mov_reg_reg(Reg::R8, Reg::Rcx);
@@ -38459,6 +38469,13 @@ impl NativeCodeGenerator {
         self.asm.and_reg_reg(Reg::Rax, Reg::R13); // strip -> raw
         self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
         self.asm.or_reg_reg(Reg::R11, Reg::R14); // recolor to good
+        // Self-heal: write the good-colored pointer back to the slot the
+        // value was loaded from. r10 (the field address) is carried in
+        // from the barrier fast path. M7 WARNING: this is only valid
+        // because M5 is non-moving, so the healed pointer's address is
+        // unchanged. Once relocation lands, the slow path must evacuate
+        // first and store the FORWARDED address, re-deriving the target
+        // -- do not simply carry r10 across a relocating heal.
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11); // self-heal
         self.asm.ret();
     }
