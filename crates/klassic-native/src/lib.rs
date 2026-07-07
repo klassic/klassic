@@ -38032,8 +38032,43 @@ impl NativeCodeGenerator {
         self.emit_gc_log_field(b" bytes=", self.gc_bytes_allocated);
         self.emit_gc_log_field(b" max_pause_ns=", self.gc_pause_max_ns);
         self.emit_gc_log_field(b" total_pause_ns=", self.gc_pause_total_ns);
+        self.emit_gc_log_field(b" stw_fallbacks=", self.gc_stw_fallbacks);
         let newline = self.asm.data_label_with_bytes(b"\n");
         self.emit_write_data(self.platform.stderr_fd(), newline, 1);
+    }
+
+    /// Capture the monotonic clock into gc_pause_start_ns (Linux only;
+    /// the clock syscall path panics on Windows, and no cell is written
+    /// there, so a pause simply reads 0). Emitted at the start of each
+    /// STW pause (MarkStart, MarkEnd, and the synchronous full collect).
+    fn emit_gc_pause_start(&mut self) {
+        if self.gc_log && !self.is_windows {
+            self.emit_read_monotonic_ns_to_rax();
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        }
+    }
+
+    /// Fold the elapsed pause (now - gc_pause_start_ns) into the max and
+    /// total pause accumulators. Emitted at the end of each STW pause.
+    fn emit_gc_pause_end(&mut self) {
+        if self.gc_log && !self.is_windows {
+            self.emit_read_monotonic_ns_to_rax();
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.sub_reg_reg(Reg::Rax, Reg::R11); // rax = delta ns
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_total_ns);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.add_reg_reg(Reg::R11, Reg::Rax);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_max_ns);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.cmp_reg_reg(Reg::Rax, Reg::R11);
+            let keep_max = self.asm.create_text_label();
+            self.asm.jcc_label(Condition::LessEqual, keep_max);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.bind_text_label(keep_max);
+        }
     }
 
     fn emit_gc_alloc_runtime(&mut self) {
@@ -38245,54 +38280,25 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
         // (The collection counter is bumped once per cycle inside
-        // gc_sweep, which every completed cycle -- sync or incremental --
-        // passes through exactly once.)
-        // --gc-log pause timing (Linux only; the clock syscall path
-        // panics on Windows). Capture the monotonic start before the
-        // mark/sweep work; the delta is folded in at the epilogue.
-        if self.gc_log && !self.is_windows {
-            self.emit_read_monotonic_ns_to_rax();
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        }
-        // M6: the synchronous collection entry (do_collect, --gc-stress).
-        // If a cycle is in progress (phase == Mark), finish it via
-        // gc_mark_end (which drains/degrades, sweeps, and returns to
-        // Idle). Otherwise run a full from-scratch STW mark + sweep.
-        // Either way exactly one sweep runs, so the counter bumps once.
+        // gc_sweep.) M6: the synchronous collection entry (do_collect,
+        // --gc-stress). If a cycle is in progress (phase == Mark), finish
+        // it via gc_mark_end (which self-brackets its own pause);
+        // otherwise run a full from-scratch STW mark + sweep, bracketed
+        // as one pause here. Either way exactly one sweep runs.
         let collect_mark = self.asm.create_text_label();
         let collect_done = self.asm.create_text_label();
         self.asm.mov_data_addr(Reg::R10, self.gc_phase);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
         self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
         self.asm.jcc_label(Condition::NotEqual, collect_mark);
+        self.emit_gc_pause_start();
         self.asm.call_label(self.gc_stw_mark_complete);
         self.asm.call_label(self.gc_sweep);
+        self.emit_gc_pause_end();
         self.asm.jmp_label(collect_done);
         self.asm.bind_text_label(collect_mark);
         self.asm.call_label(self.gc_mark_end);
         self.asm.bind_text_label(collect_done);
-        // --gc-log pause timing epilogue: delta = now - start; total +=
-        // delta; max = max(max, delta). All registers are dead here.
-        if self.gc_log && !self.is_windows {
-            self.emit_read_monotonic_ns_to_rax();
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
-            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-            self.asm.sub_reg_reg(Reg::Rax, Reg::R11); // rax = delta ns
-            // total += delta
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_total_ns);
-            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-            self.asm.add_reg_reg(Reg::R11, Reg::Rax);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-            // max = max(max, delta)
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_max_ns);
-            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-            self.asm.cmp_reg_reg(Reg::Rax, Reg::R11);
-            let keep_max = self.asm.create_text_label();
-            self.asm.jcc_label(Condition::LessEqual, keep_max);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-            self.asm.bind_text_label(keep_max);
-        }
         self.asm.leave();
         self.asm.ret();
     }
@@ -38740,6 +38746,7 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(self.gc_mark_start);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_gc_pause_start(); // MarkStart is a short STW pause (O(roots)).
         // rax = old good color.
         self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
@@ -38776,6 +38783,7 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R10, self.gc_phase);
         self.asm.mov_imm64(Reg::Rax, Self::GC_PHASE_MARK);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.emit_gc_pause_end();
         self.asm.leave();
         self.asm.ret();
     }
@@ -38789,6 +38797,7 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(self.gc_mark_end);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_gc_pause_start(); // MarkEnd STW pause (final drain + sweep).
         let do_degrade = self.asm.create_text_label();
         let after_mark = self.asm.create_text_label();
         self.asm
@@ -38817,6 +38826,7 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R10, self.gc_bytes_since_cycle);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.emit_gc_pause_end();
         self.asm.leave();
         self.asm.ret();
     }

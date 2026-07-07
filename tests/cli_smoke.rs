@@ -21087,6 +21087,64 @@ fn native_gc_stress_poison_combined_stays_correct() {
     assert_eq!(combined, "45000\n"); // 15000 * 3
 }
 
+/// M6: a long-lived structure with a RARELY-READ pointer field, kept
+/// alive across many proactive incremental cycles (the mark color flips
+/// M0<->M1 each cycle), then read at the very end. This is the
+/// adversarial pattern for incremental marking: if the collector ever
+/// failed to keep the field's target marked across a color flip, or if
+/// recolor-on-trace / the load barrier mishandled the stale color, the
+/// read would return garbage or crash. The keeper's inner tree sums to
+/// 123 (100+20+3) and must survive ~100 cycles unchanged, under normal,
+/// --gc-stress, and --gc-poison.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_incremental_long_lived_field_survives_cycles() {
+    let program = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         enum Box { case B(inner: Tree) }\n\
+         def sz(t: Tree): Int = t match { case Leaf(v) => v; case Branch(l, r) => sz(l) + sz(r) }\n\
+         val keeper = B(Branch(Leaf(100), Branch(Leaf(20), Leaf(3))))\n\
+         mutable i = 0\n\
+         mutable junk = 0\n\
+         while (i < 200000) {\n\
+           val garbage = Branch(Leaf(i), Leaf(i))\n\
+           junk = junk + (garbage match { case Branch(l, r) => 1; case Leaf(v) => 0 })\n\
+           i = i + 1\n\
+         }\n\
+         println(keeper match { case B(t) => sz(t) })\n\
+         println(junk)\n";
+    for flags in [
+        vec![],
+        vec!["--gc-stress"],
+        vec!["--gc-poison"],
+        vec!["--gc-stress", "--gc-poison"],
+    ] {
+        let (out, _e) = build_and_run_gc_program(program, &flags);
+        assert_eq!(out, "123\n200000\n", "flags={flags:?}");
+    }
+}
+
+/// M6: --gc-log now drives proactive incremental cycles. A churn
+/// program crosses the proactive-start threshold many times, so the
+/// collection count is well above 1 and the output is correct. (Pause
+/// timing for the incremental MarkStart/MarkEnd is bracketed in a later
+/// step; here we only assert cycles happen and correctness holds.)
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_incremental_runs_many_cycles() {
+    let (stdout, stderr) = build_and_run_gc_program(GC_CHURN_PROGRAM, &["--gc-log"]);
+    assert_eq!(stdout, "50000\n");
+    let collections = stderr
+        .split("collections=")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("stats line should contain a collections count");
+    assert!(
+        collections >= 5,
+        "proactive incremental cycles should fire repeatedly, got {collections}"
+    );
+}
+
 /// M4: an all-live per-frame allocation graph deeper than the initial
 /// 8-region (1 MiB) budget forces the allocator's stall path -- the
 /// collector frees nothing, so gc_grow_budget doubles the soft budget
