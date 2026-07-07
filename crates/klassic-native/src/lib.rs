@@ -8931,6 +8931,14 @@ impl NativeCodeGenerator {
         let expected = self.compile_expr(&expected_arguments[0])?;
         match expected {
             NativeValue::HeapString => {
+                // Root the expected string and FREE the slot after the
+                // comparison (via the scope). An unfreed slot here is
+                // the same latent stack-imbalance class the M3a
+                // string-equality fix closed; assertResult is Unit-typed
+                // so it can't currently be a short-circuit operand, but
+                // M4+ adds allocation points to these paths, so keep the
+                // "anonymous slot => own scope bracket" invariant.
+                self.push_scope();
                 let expected_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
                 self.asm.store_rbp_slot(expected_slot.offset, Reg::Rax);
                 let actual = self.compile_expr(&actual_arguments[0])?;
@@ -8948,6 +8956,7 @@ impl NativeCodeGenerator {
                         )?;
                     }
                     _ => {
+                        self.pop_scope();
                         return Err(unsupported(
                             span,
                             "native assertResult for values with different types",
@@ -8969,6 +8978,7 @@ impl NativeCodeGenerator {
                 self.asm.mov_reg_reg(Reg::Rcx, Reg::R10);
                 self.emit_assert_result_failed_runtime(span, NativeValue::HeapString);
                 self.asm.bind_text_label(ok);
+                self.pop_scope();
                 Ok(NativeValue::Unit)
             }
             NativeValue::Int | NativeValue::Bool => {
@@ -9041,6 +9051,9 @@ impl NativeCodeGenerator {
                 // the actual, lift the expected fixed-buffer string to
                 // the heap, and compare pointers' contents.
                 if matches!(actual, NativeValue::HeapString) {
+                    // Same rooted-and-freed slot discipline as the
+                    // HeapString-expected arm above.
+                    self.push_scope();
                     let actual_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
                     self.asm.store_rbp_slot(actual_slot.offset, Reg::Rax);
                     self.emit_heap_string_concat_fragment(
@@ -9064,6 +9077,7 @@ impl NativeCodeGenerator {
                     self.asm.mov_reg_reg(Reg::Rcx, Reg::R10);
                     self.emit_assert_result_failed_runtime(span, NativeValue::HeapString);
                     self.asm.bind_text_label(ok);
+                    self.pop_scope();
                     return Ok(NativeValue::Unit);
                 }
                 let Some(actual_string) = self.native_string_ref(actual) else {
