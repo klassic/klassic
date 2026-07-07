@@ -4370,6 +4370,8 @@ struct NativeCodeGenerator {
     gc_mark_roots: TextLabel,
     gc_trace: TextLabel,
     gc_sweep: TextLabel,
+    gc_clear_all_marks: TextLabel,
+    gc_stw_mark_complete: TextLabel,
     gc_mark_visit: TextLabel,
     gc_deep_equal: TextLabel,
     /// ZGC load-barrier slow path: heals a bad-colored heap pointer
@@ -4586,6 +4588,8 @@ impl NativeCodeGenerator {
         let gc_mark_roots = asm.create_text_label();
         let gc_trace = asm.create_text_label();
         let gc_sweep = asm.create_text_label();
+        let gc_clear_all_marks = asm.create_text_label();
+        let gc_stw_mark_complete = asm.create_text_label();
         let gc_mark_visit = asm.create_text_label();
         let gc_deep_equal = asm.create_text_label();
         let gc_load_barrier_slow = asm.create_text_label();
@@ -4726,6 +4730,8 @@ impl NativeCodeGenerator {
             gc_mark_roots,
             gc_trace,
             gc_sweep,
+            gc_clear_all_marks,
+            gc_stw_mark_complete,
             gc_mark_visit,
             gc_deep_equal,
             gc_load_barrier_slow,
@@ -5334,6 +5340,8 @@ impl NativeCodeGenerator {
         self.emit_gc_mark_roots_runtime();
         self.emit_gc_trace_runtime();
         self.emit_gc_sweep_runtime();
+        self.emit_gc_clear_all_marks_runtime();
+        self.emit_gc_stw_mark_complete_runtime();
         self.emit_gc_acquire_region_runtime();
         self.emit_gc_alloc_large_runtime();
         self.emit_gc_grow_budget_runtime();
@@ -38147,14 +38155,13 @@ impl NativeCodeGenerator {
             self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
             self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         }
-        // M6: reset the worklist, then mark roots, trace to fixpoint,
-        // and sweep -- each a separately-callable STW routine. gc-log
-        // brackets the whole collection as one pause for now.
-        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.call_label(self.gc_mark_roots);
-        self.asm.call_label(self.gc_trace);
+        // M6: a synchronous full collection = a from-scratch STW mark to
+        // fixpoint followed by the sweep. gc_stw_mark_complete clears all
+        // marks, resets the worklist, scans roots, and traces; the sweep
+        // reclaims. (The incremental phase machine will call the same
+        // pieces individually.) gc-log brackets the whole thing as one
+        // pause for now.
+        self.asm.call_label(self.gc_stw_mark_complete);
         self.asm.call_label(self.gc_sweep);
         // --gc-log pause timing epilogue: delta = now - start; total +=
         // delta; max = max(max, delta). All registers are dead here.
@@ -38454,6 +38461,100 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(region_done);
         self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// Clear the mark bit on EVERY block of every committed region,
+    /// without reclaiming anything. Used by the STW-degrade path: an
+    /// incremental mark leaves marks partially set, so a from-scratch
+    /// STW re-mark must start from a fully-clear state. Own frame:
+    /// [rbp-8] = region index, [rbp-16] = committed bound.
+    fn emit_gc_clear_all_marks_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_clear_all_marks);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 16);
+        // Flush the current region's watermark so its blocks are covered.
+        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.sub_reg_reg(Reg::R11, Reg::R10);
+        self.asm.shr_reg_imm8(Reg::R11, Self::GC_REGION_SHIFT);
+        self.asm.shl_reg_imm8(Reg::R11, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::R11);
+        self.asm.mov_data_addr(Reg::R8, self.gc_heap_top);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // bound = committed_count; idx = 0.
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.store_rbp_slot(16, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_rbp_slot(8, Reg::Rax);
+
+        let region_loop = self.asm.create_text_label();
+        let region_done = self.asm.create_text_label();
+        let block_loop = self.asm.create_text_label();
+        let next_region = self.asm.create_text_label();
+        self.asm.bind_text_label(region_loop);
+        self.asm.load_rbp_slot(Reg::Rax, 8);
+        self.asm.load_rbp_slot(Reg::Rcx, 16);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::AboveOrEqual, region_done);
+        // base (rsi) = region_base + idx<<SHIFT; top (r8) = region_top[idx].
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.mov_reg_reg(Reg::Rsi, Reg::R10);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::Rsi);
+        self.asm.jcc_label(Condition::Equal, next_region);
+        // Walk blocks base..top, clearing bit63 on each header word0.
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rsi);
+        self.asm.bind_text_label(block_loop);
+        self.asm.cmp_reg_reg(Reg::R11, Reg::R8);
+        self.asm.jcc_label(Condition::AboveOrEqual, next_region);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R11, 0);
+        self.asm.mov_imm64(Reg::Rdi, !((1_u64) << 63));
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi); // size, mark cleared
+        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rax);
+        self.asm.add_reg_reg(Reg::R11, Reg::Rax);
+        self.asm.jmp_label(block_loop);
+        self.asm.bind_text_label(next_region);
+        self.asm.load_rbp_slot(Reg::Rax, 8);
+        self.asm.add_reg_imm32(Reg::Rax, 1);
+        self.asm.store_rbp_slot(8, Reg::Rax);
+        self.asm.jmp_label(region_loop);
+        self.asm.bind_text_label(region_done);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// From-scratch STW mark to fixpoint (the collector's IDLE-cycle and
+    /// degrade path). Clears all marks (an incremental cycle may have
+    /// set some), resets the worklist, scans roots, and traces to
+    /// fixpoint. Does NOT flip the mark color and does NOT sweep -- the
+    /// caller sweeps.
+    fn emit_gc_stw_mark_complete_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_stw_mark_complete);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.call_label(self.gc_clear_all_marks);
+        // Reset the worklist top.
+        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.call_label(self.gc_mark_roots);
+        self.asm.call_label(self.gc_trace);
         self.asm.leave();
         self.asm.ret();
     }
