@@ -292,9 +292,32 @@ the semantic oracle everywhere (eval == native differential).
   color M0 is equally non-canonical), catching a missing fast-path
   strip; poison catches a completely-missing barrier and exercises the
   slow path on every load. The poison suite gates every later milestone.
-- **M6 — Incremental marking.** Phase machine, quanta, the two mark
-  pauses (O(roots)), color alternation, allocate-black, worklist
-  overflow degrading to logged STW. Pause metrics become real numbers.
+- **M6 — Incremental marking.** DONE. The collector is now non-atomic:
+  the STW mark is split into a phase machine (Idle -> MarkStart ->
+  Mark -> MarkEnd -> Idle) driven from gc_alloc. MarkStart (a short STW
+  pause) flips the mark color (M0<->M1 each cycle; the reserved
+  registers r14/r15 become caches reloaded here from the gc_good_color/
+  gc_bad_mask cells), resets the worklist, and scans roots. The Mark
+  phase runs incrementally in bounded quanta (gc_trace of
+  GC_QUANTUM_POPS objects) once per GC_QUANTUM_BYTES allocated;
+  recolor-on-trace rewrites each traced field slot to the new good
+  color. A cycle starts proactively when bytes-since-cycle crosses half
+  the soft budget. MarkEnd (a short STW pause) drains the remaining
+  frontier to fixpoint and sweeps. allocate-black gives objects born
+  during Mark a set header mark bit so the in-progress mark cannot
+  reclaim them. The load-barrier slow path is phase-dependent: during
+  Mark it also marks the loaded target (load-barrier-driven incremental
+  update -- no store barrier, since every pointer the mutator can hold
+  during Mark comes from a root, a barriered load, or a fresh
+  allocation). Worklist overflow sets a flag that degrades the cycle to
+  a from-scratch STW re-mark (logged as stw_fallbacks); a genuine
+  over-capacity live frontier still aborts. The synchronous entry
+  (do_collect, --gc-stress) finishes an in-progress cycle via MarkEnd.
+  --gc-log pause timing now brackets the real O(roots)/O(heap-sweep)
+  MarkStart and MarkEnd pauses. The sweep stays STW (moving/relocation
+  is M7). Verified across ~100-cycle color-alternation runs with a
+  rarely-read long-lived field, under normal / --gc-stress /
+  --gc-poison / --gc-stress --gc-poison.
 - **M7 — Evacuation + forwarding + self-healing (highest value,
   highest risk).** Sparsest-first selection, in-object forwarding,
   RelocateStart root fixup through shadow-stack slot addresses,
