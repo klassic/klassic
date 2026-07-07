@@ -245,11 +245,29 @@ the semantic oracle everywhere (eval == native differential).
   failed on rsp imbalance).
 - **M3c — Delete gc_pin / gc_unpin / the pin table** once M3b removes
   the last user (kills the value-matched-unpin footgun permanently).
-- **M4 — Region heap, direct replacement.** Segments, free list, and
-  grow-ladder deleted; single reservation + region metadata + bump-only
-  + whole-dead-region reclamation. Mark stays STW. Known temporary
-  regression: mixed live/dead regions are not compacted until M7
-  (documented; bounded by the same 64 MiB cap as today).
+- **M4 — Region heap, direct replacement.** DONE. Segments, free list,
+  and grow-ladder deleted; a single 64 MiB reservation (512 x 128 KiB
+  regions, Linux demand-paged) + a per-region watermark array +
+  bump-only allocation + whole-dead-region reclamation onto a
+  free-region pool + a soft budget that starts at 8 regions (1 MiB, to
+  preserve the old collection cadence) and doubles on allocation stall,
+  capped at 512. Objects larger than a region take a contiguous region
+  run carved from the uncommitted tail. Reused regions are zeroed on
+  acquisition so object padding qwords the mark trace walks read as
+  null (fresh tail regions are already mmap-zero). Mark stays STW.
+  Known temporary regression: mixed live/dead regions are not
+  compacted until M7 (documented; bounded by the same 64 MiB cap as
+  today). Two further notes: (1) `gc_alloc_large` (the >128 KiB
+  contiguous-run path) is implemented and verified by inspection but
+  currently unreachable — every native heap-object materialization
+  caps at 65 536 bytes, below the region size — so no
+  native-compilable program reaches it yet; it also only ever carves
+  fresh tail regions (never the single-region free pool), so reachable
+  large-object churn would grow `committed_count` monotonically until
+  M7. (2) The sweep seeds its free-region accumulator from the
+  existing pool head, not zero, so regions freed in earlier cycles are
+  not dropped (a leak that otherwise OOMs under `--gc-stress` with
+  heavy turnover).
 - **M5 — Colored pointers + load barriers (collections still atomic) +
   poison canary.** Color bits, reserved registers, the two barriers,
   color-on-store, walker updates, a grep-audited coverage checklist in

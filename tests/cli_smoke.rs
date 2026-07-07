@@ -20983,12 +20983,75 @@ fn native_gc_stress_forces_a_collection_per_alloc_and_stays_correct() {
         .and_then(|s| s.split_whitespace().next())
         .and_then(|s| s.parse::<u64>().ok())
         .expect("stats line should contain an allocs count");
-    // Every allocation collects, so collections == allocs.
-    assert_eq!(
-        collections, allocs,
-        "--gc-stress must collect once per allocation"
+    // Every allocation collects (the stress pre-collect), so there is at
+    // least one collection per allocation. The region heap may add a
+    // handful more while the soft budget ramps up: when the current
+    // region fills before the free-region pool has been replenished, the
+    // allocator's fail chain runs a second collection and doubles the
+    // budget. That warm-up overshoot is small and bounded (a few extra
+    // out of hundreds of thousands), so assert the invariant as a lower
+    // bound rather than exact equality.
+    assert!(
+        collections >= allocs,
+        "--gc-stress must collect at least once per allocation \
+         (collections={collections}, allocs={allocs})"
+    );
+    assert!(
+        collections <= allocs + 64,
+        "region-budget warm-up should add only a few extra collections \
+         (collections={collections}, allocs={allocs})"
     );
     assert!(allocs > 100_000, "churn should allocate many objects");
+}
+
+/// M4: heavy region turnover under --gc-stress must not leak regions.
+/// The sweep seeds its free-region accumulator with the existing pool
+/// head, so regions freed in earlier cycles (skipped by the walk, since
+/// their watermark is base) stay on the free list rather than being
+/// dropped. Before that fix, this program exhausted the 64 MiB
+/// reservation and aborted with an out-of-memory error partway through,
+/// because every stress pre-collect replaced the pool with only that
+/// cycle's newly-dead regions. The all-live build(500) graph forces a
+/// collection with a non-empty pool on essentially every iteration.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_stress_churn_does_not_leak_regions() {
+    let program = "enum L { case Nil; case Full(n: Int, junk: L) }\n\
+         def build(n: Int): L = if (n <= 0) Nil else Full(n, build(n - 1))\n\
+         def sz(x: L): Int = x match { case Nil => 0; case Full(n, j) => 1 + sz(j) }\n\
+         mutable i = 0\n\
+         mutable acc = 0\n\
+         while (i < 1500) { acc = acc + sz(build(500)); i = i + 1 }\n\
+         println(acc)\n";
+    // 1500 * 500 = 750000. Turnover far exceeds the 512-region
+    // reservation, so a leak of freed regions would abort with OOM.
+    let (stress, _e) = build_and_run_gc_program(program, &["--gc-stress"]);
+    assert_eq!(stress, "750000\n");
+}
+
+/// M4: an all-live per-frame allocation graph deeper than the initial
+/// 8-region (1 MiB) budget forces the allocator's stall path -- the
+/// collector frees nothing, so gc_grow_budget doubles the soft budget
+/// and the retry commits a fresh tail region. The result must match the
+/// evaluator, confirming budget growth is sound (no premature OOM, no
+/// lost object).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_budget_grows_for_all_live_graph() {
+    let program = "enum L { case Nil; case Full(n: Int, junk: L) }\n\
+         def build(n: Int): L = if (n <= 0) Nil else Full(n, build(n - 1))\n\
+         def sz(x: L): Int = x match { case Nil => 0; case Full(n, j) => 1 + sz(j) }\n\
+         println(sz(build(40000)))\n";
+    let (plain, _e1) = build_and_run_gc_program(program, &[]);
+    assert_eq!(plain, "40000\n");
+    let (log_stdout, log_stderr) = build_and_run_gc_program(program, &["--gc-log"]);
+    assert_eq!(log_stdout, "40000\n");
+    // The all-live graph outlives every collection, so at least one must
+    // have run and then grown the budget rather than freeing space.
+    assert!(
+        log_stderr.starts_with("gc: collections="),
+        "expected a gc-log line, got: {log_stderr}"
+    );
 }
 
 /// `--gc-stress` re-runs the M1 use-after-free repro under maximal

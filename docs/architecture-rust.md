@@ -713,16 +713,23 @@ cargo run -- -e "1 + 2"
   result over 64KB is the remaining cap) or materialize into a fresh
   fixed buffer transitionally (`String#parseInt`, where an input past
   64KB cannot be a number anyway). The
-  caller unpins heap-string arguments exactly like enum pointers —
-  the pin/unpin pair must stay matched per argument or the root
-  table fills after a few thousand calls — and the GC tables (root
-  table, shadow stack, mark worklist) are sized so deep recursion
-  with per-frame heap values runs thousands of frames before the
-  clean overflow abort. The tables themselves come from one anonymous
-  mmap at startup (mmap memory is zero-filled, their required initial
-  state); only a base-pointer qword per table lives in .data, so the
-  ~824KB of table zeros never lands in the emitted binary — a trivial
-  executable is back to a few tens of KB.
+  every evaluated heap argument is spilled into a shadow-tracked stack
+  slot for the rest of the argument evaluation, so the GC shadow stack
+  is the collector's sole root source (there is no separate pin table).
+  The GC tables (shadow stack, mark worklist) are sized so deep
+  recursion with per-frame heap values runs thousands of frames before
+  the clean overflow abort. The tables come from one anonymous mmap at
+  startup (mmap memory is zero-filled, their required initial state);
+  only a base-pointer qword per table lives in .data, so the table
+  zeros never land in the emitted binary — a trivial executable is a
+  few tens of KB. The object heap is a separate up-front 64 MiB
+  reservation of 512 x 128 KiB regions: objects bump-allocate within
+  the current region, a full-dead region is reclaimed whole onto a
+  free-region pool (an oversized object takes a contiguous region run),
+  and a soft budget — 8 regions initially, doubling on allocation stall
+  up to 512 — bounds how many regions the mutator touches before a
+  collection. A reclaimed region is zeroed on reuse so an object's
+  padding qwords (walked by the mark trace) read as null.
   Annotations naming a *fully-applied* generic enum (`Option<Int>`,
   `Option<String>`, `Option<Option<Int>>`) ride the same ABI: the
   annotation text alone fixes every type parameter, so the parameter's
