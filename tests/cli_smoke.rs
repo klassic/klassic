@@ -21012,6 +21012,53 @@ fn native_gc_stress_equality_repro_stays_correct() {
     assert_eq!(stdout, "100000\n");
 }
 
+/// M3a: `__gc_write` no longer holds the interior pointer `base+offset`
+/// on the raw machine stack across the value compile. Here the field's
+/// value is a freshly built nested enum, whose construction allocates
+/// (and under `--gc-stress` collects) between the base and the store.
+/// The base is rooted and the interior pointer re-formed after the
+/// allocation, so the write lands in the live record.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_write_field_value_allocates_matches_evaluator() {
+    let program = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         enum Box { case B(t: Tree) }\n\
+         mutable i = 0\n\
+         mutable acc = 0\n\
+         while (i < 50000) {\n\
+           val b = B(Branch(Leaf(i), Leaf(i + 1)))\n\
+           acc = acc + (b match { case B(t) => (t match { case Branch(l, r) => 1; case Leaf(v) => 0 }) })\n\
+           i = i + 1\n\
+         }\n\
+         println(acc)\n";
+    let (plain, _e1) = build_and_run_gc_program(program, &[]);
+    assert_eq!(plain, "50000\n");
+    let (stress, _e2) = build_and_run_gc_program(program, &["--gc-stress"]);
+    assert_eq!(stress, "50000\n", "gc_write must be sound under stress");
+}
+
+/// M3a regression: a string-literal pattern arm (`case Named("x")`)
+/// followed by another arm used to crash on the non-matching input.
+/// The literal pattern compiles to a short-circuited `field == "x"`;
+/// `compile_heap_string_equality` leaked a stack slot, so on the
+/// short-circuit path the enclosing scope's `pop_scope` over-added rsp
+/// and corrupted the stack. Rooting the gc_read staging exposed it;
+/// balancing the equality's slot fixes it. `kind(Anon)` must return 0,
+/// not segfault.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_string_literal_pattern_then_other_arm_no_crash() {
+    let program = "enum Tag { case Named(s: String); case Anon }\n\
+         def kind(t) = t match { case Named(\"x\") => 1; case Named(other) => 2; case Anon => 0 }\n\
+         println(kind(Named(\"x\")))\n\
+         println(kind(Named(\"y\")))\n\
+         println(kind(Anon))\n";
+    let (plain, _e1) = build_and_run_gc_program(program, &[]);
+    assert_eq!(plain, "1\n2\n0\n");
+    let (stress, _e2) = build_and_run_gc_program(program, &["--gc-stress"]);
+    assert_eq!(stress, "1\n2\n0\n");
+}
+
 /// Regression guard for a real use-after-free: `==` on two freshly
 /// constructed enums staged the lhs pointer with a raw machine-stack
 /// push (not a GC root) across the rhs compile. The lhs temporary's
