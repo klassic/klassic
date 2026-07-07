@@ -13281,12 +13281,16 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_POINTER_RECORD);
         self.asm.call_label(self.gc_alloc);
-        // The payload arrives zeroed on both allocator paths: bump
-        // memory is fresh mmap, and the free-list hit path memsets the
-        // reused block's whole payload. (An earlier local memset here
-        // read rdi after the call, but gc_alloc rewrites rdi to the
-        // aligned total size — the loop overran the block and zeroed
-        // the next block's header.)
+        // The payload arrives zeroed: a fresh tail region is mmap-zero,
+        // and a region reused from the free pool is zeroed whole on
+        // acquisition (see gc_acquire_region). This is soundness-
+        // critical, not just hygiene: a record can be traced by the
+        // incremental collector mid-construction (it is rooted by its
+        // `val obj` before its fields are written), so its as-yet-
+        // unwritten fields MUST read as null rather than as stale
+        // colored pointers into freed memory. Do not remove the
+        // region-zeroing on the assumption that a per-block memset
+        // exists here -- there is none (and no free list since M4).
         Ok(NativeValue::HeapPointer)
     }
 
@@ -38134,6 +38138,10 @@ impl NativeCodeGenerator {
         self.asm
             .cmp_reg_imm32(Reg::Rax, Self::GC_QUANTUM_BYTES as i32);
         self.asm.jcc_label(Condition::Below, driver_done);
+        // Reset to 0 (discards the remainder over the threshold, and the
+        // counter is not carried across cycles) -- a pacing detail, not
+        // correctness; the first quantum of a new cycle may fire a little
+        // early. A tuning knob for M8.
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax); // reset counter
         self.asm.mov_imm64(Reg::Rdi, Self::GC_QUANTUM_POPS);
@@ -38223,9 +38231,12 @@ impl NativeCodeGenerator {
     /// region, acquiring a new region on boundary, or the large-object
     /// path for requests bigger than one region. Jumps to `fail` when no
     /// region can satisfy the request and to `success` (rax = user
-    /// pointer) on success. No payload zeroing is needed: a region is
-    /// either fresh demand-paged (zero) memory or a whole-reclaimed
-    /// region whose stale bytes are overwritten by the bump header.
+    /// pointer) on success. No per-object payload zeroing is emitted
+    /// here: a region is either fresh demand-paged (zero) memory, or a
+    /// reclaimed region that gc_acquire_region zeroed whole on reuse. So
+    /// an object's payload is always zero until its constructor writes
+    /// its fields (which the incremental collector relies on -- see
+    /// compile_gc_record).
     fn emit_gc_alloc_attempt(&mut self, fail: TextLabel, success: TextLabel) {
         let large = self.asm.create_text_label();
         let need_region = self.asm.create_text_label();
