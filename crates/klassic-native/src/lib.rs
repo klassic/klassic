@@ -4326,6 +4326,19 @@ struct NativeCodeGenerator {
     /// Soft budget: regions the mutator may touch before a forced
     /// collection. Doubles on stall, capped at GC_RESERVE_REGIONS.
     gc_budget_regions: DataLabel,
+    /// M6 incremental-marking state. `gc_phase`: 0 = Idle, 1 = Mark.
+    /// `gc_good_color` / `gc_bad_mask`: the current-cycle color and its
+    /// bad-color test mask (these flip each cycle, so the reserved
+    /// registers r14/r15 are caches reloaded from here at MarkStart).
+    /// The byte counters drive the proactive-cycle and per-quantum
+    /// triggers; the fallback cells track worklist-overflow degrades.
+    gc_phase: DataLabel,
+    gc_good_color: DataLabel,
+    gc_bad_mask: DataLabel,
+    gc_bytes_since_cycle: DataLabel,
+    gc_bytes_since_quantum: DataLabel,
+    gc_stw_fallback_pending: DataLabel,
+    gc_stw_fallbacks: DataLabel,
     gc_collect_counter: DataLabel,
     /// `--gc-log` statistics cells (all `.data` i64, initialised 0):
     /// total allocations, total payload+header bytes handed out, and
@@ -4546,6 +4559,16 @@ impl NativeCodeGenerator {
         let gc_region_base = asm.data_label_with_i64s(&[0]);
         let gc_committed_count = asm.data_label_with_i64s(&[0]);
         let gc_budget_regions = asm.data_label_with_i64s(&[0]);
+        // M6 cells. gc_good_color / gc_bad_mask are seeded at startup by
+        // emit_initialize_color_registers (they depend on --gc-poison),
+        // so they start at 0 here and are written before first use.
+        let gc_phase = asm.data_label_with_i64s(&[0]);
+        let gc_good_color = asm.data_label_with_i64s(&[0]);
+        let gc_bad_mask = asm.data_label_with_i64s(&[0]);
+        let gc_bytes_since_cycle = asm.data_label_with_i64s(&[0]);
+        let gc_bytes_since_quantum = asm.data_label_with_i64s(&[0]);
+        let gc_stw_fallback_pending = asm.data_label_with_i64s(&[0]);
+        let gc_stw_fallbacks = asm.data_label_with_i64s(&[0]);
         let gc_collect_counter = asm.data_label_with_i64s(&[0]);
         let gc_alloc_count = asm.data_label_with_i64s(&[0]);
         let gc_bytes_allocated = asm.data_label_with_i64s(&[0]);
@@ -4674,6 +4697,13 @@ impl NativeCodeGenerator {
             gc_region_base,
             gc_committed_count,
             gc_budget_regions,
+            gc_phase,
+            gc_good_color,
+            gc_bad_mask,
+            gc_bytes_since_cycle,
+            gc_bytes_since_quantum,
+            gc_stw_fallback_pending,
+            gc_stw_fallbacks,
             gc_collect_counter,
             gc_alloc_count,
             gc_bytes_allocated,
@@ -37772,14 +37802,27 @@ impl NativeCodeGenerator {
     /// All three are callee-saved, so they survive every syscall and
     /// Windows shim and never need reloading in M5 (no phase flips yet).
     fn emit_initialize_color_registers(&mut self) {
+        // r13 (strip mask) is a true constant. r14 (good color) and r15
+        // (bad-color test mask) FLIP each mark cycle (M6), so they are
+        // caches of the gc_good_color / gc_bad_mask cells, seeded here
+        // and reloaded only at MarkStart. Seed the cells first, then
+        // load the registers from them.
         self.asm.mov_imm64(Reg::R13, Self::GC_COLOR_STRIP);
         let good_color = if self.gc_poison {
             Self::GC_COLOR_M1
         } else {
             Self::GC_COLOR_M0
         };
-        self.asm.mov_imm64(Reg::R14, good_color);
-        self.asm.mov_imm64(Reg::R15, Self::GC_COLOR_BAD_MASK);
+        self.asm.mov_imm64(Reg::Rax, good_color);
+        self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rax, Self::GC_COLOR_BAD_MASK);
+        self.asm.mov_data_addr(Reg::R10, self.gc_bad_mask);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R14, self.gc_good_color);
+        self.asm.load_ptr_disp32(Reg::R14, Reg::R14, 0);
+        self.asm.mov_data_addr(Reg::R15, self.gc_bad_mask);
+        self.asm.load_ptr_disp32(Reg::R15, Reg::R15, 0);
     }
 
     fn emit_initialize_gc_heap(&mut self) {
