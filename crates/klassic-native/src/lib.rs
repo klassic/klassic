@@ -17,6 +17,16 @@ pub struct NativeCompilerConfig {
     pub target: NativeTarget,
     pub deny_trust: bool,
     pub warn_trust: bool,
+    /// `--gc-log`: the emitted program prints one line of GC statistics
+    /// to stderr at exit (collections, allocations, bytes, max/total
+    /// pause nanoseconds). Off by default; zero cost when off.
+    pub gc_log: bool,
+    /// `--gc-stress`: the emitted `gc_alloc` runs a full collection
+    /// before every allocation attempt. Turns any pointer left
+    /// unrooted across an allocation into a deterministic crash rather
+    /// than a size-dependent heisenbug — the standing bug-shaker for
+    /// the collector's staging invariants.
+    pub gc_stress: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -631,6 +641,8 @@ fn compile_internal(
             generator.mono_enum_variants = mono_enum_variants;
             generator.ext_method_enum_types = ext_registry;
             generator.variant_owner_enum = variant_owner_enum;
+            generator.gc_log = config.gc_log;
+            generator.gc_stress = config.gc_stress;
             let object = generator.compile(&expr).map_err(|diagnostic| {
                 NativeCompileError::with_view(source, user_view, diagnostic)
             })?;
@@ -4298,6 +4310,26 @@ struct NativeCodeGenerator {
     gc_segments: DataLabel,
     gc_segment_count: DataLabel,
     gc_collect_counter: DataLabel,
+    /// `--gc-log` statistics cells (all `.data` i64, initialised 0):
+    /// total allocations, total payload+header bytes handed out, and
+    /// the max / cumulative collection-pause nanoseconds measured via
+    /// the `clock_gettime` shim around each `gc_collect`.
+    gc_alloc_count: DataLabel,
+    gc_bytes_allocated: DataLabel,
+    gc_pause_max_ns: DataLabel,
+    gc_pause_total_ns: DataLabel,
+    /// Scratch `timespec` (two i64) for the pause-timing clock_gettime
+    /// calls; only touched when `gc_log` is set.
+    gc_pause_timespec: DataLabel,
+    /// Monotonic nanoseconds captured at a collection's entry, read
+    /// back at its exit to compute the pause. Single-threaded and
+    /// `gc_collect` never re-enters, so a global cell is safe.
+    gc_pause_start_ns: DataLabel,
+    /// `--gc-log` (report GC stats to stderr at exit) and `--gc-stress`
+    /// (collect before every allocation). Both compile-time; zero cost
+    /// when off.
+    gc_log: bool,
+    gc_stress: bool,
     gc_alloc: TextLabel,
     gc_collect: TextLabel,
     gc_pin: TextLabel,
@@ -4484,6 +4516,12 @@ impl NativeCodeGenerator {
         let gc_segments = asm.data_label_with_i64s(&vec![0; 3 * Self::GC_MAX_SEGMENTS]);
         let gc_segment_count = asm.data_label_with_i64s(&[0]);
         let gc_collect_counter = asm.data_label_with_i64s(&[0]);
+        let gc_alloc_count = asm.data_label_with_i64s(&[0]);
+        let gc_bytes_allocated = asm.data_label_with_i64s(&[0]);
+        let gc_pause_max_ns = asm.data_label_with_i64s(&[0]);
+        let gc_pause_total_ns = asm.data_label_with_i64s(&[0]);
+        let gc_pause_timespec = asm.data_label_with_i64s(&[0, 0]);
+        let gc_pause_start_ns = asm.data_label_with_i64s(&[0]);
         let random_state = asm.data_label_with_i64s(&[0]);
         let gc_alloc = asm.create_text_label();
         let gc_collect = asm.create_text_label();
@@ -4607,6 +4645,14 @@ impl NativeCodeGenerator {
             gc_segments,
             gc_segment_count,
             gc_collect_counter,
+            gc_alloc_count,
+            gc_bytes_allocated,
+            gc_pause_max_ns,
+            gc_pause_total_ns,
+            gc_pause_timespec,
+            gc_pause_start_ns,
+            gc_log: false,
+            gc_stress: false,
             gc_alloc,
             gc_collect,
             gc_pin,
@@ -5202,6 +5248,9 @@ impl NativeCodeGenerator {
         self.emit_initialize_gc_heap();
         self.compile_top_level(expr)?;
         self.emit_queued_threads()?;
+        if self.gc_log {
+            self.emit_gc_log_report();
+        }
         self.emit_exit_success();
         self.emit_functions()?;
         self.emit_stack_overflow_abort_runtime();
@@ -37667,6 +37716,46 @@ impl NativeCodeGenerator {
     ///   [rbp -  8]: saved rbx
     ///   [rbp - 16]: total block size (header + payload, 16-byte aligned)
     ///   [rbp - 24]: type tag
+    /// Read `CLOCK_MONOTONIC` into `gc_pause_timespec` and fold it to
+    /// nanoseconds in `rax` (`tv_sec * 1e9 + tv_nsec`). Clobbers
+    /// rax/rcx/rdi/rsi/r8/r11 (the clock_gettime syscall's registers
+    /// plus the fold). Linux-only — the syscall path panics on Windows,
+    /// so pause timing is gated `!is_windows` at every call site.
+    fn emit_read_monotonic_ns_to_rax(&mut self) {
+        self.emit_clock_gettime(self.gc_pause_timespec);
+        self.asm.mov_data_addr(Reg::Rcx, self.gc_pause_timespec);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rcx, 0); // tv_sec
+        self.asm.mov_imm64(Reg::R8, 1_000_000_000);
+        self.asm.imul_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::Rcx, 8); // tv_nsec
+        self.asm.add_reg_reg(Reg::Rax, Reg::R8);
+    }
+
+    /// One `<label><number>` field of the `--gc-log` exit report,
+    /// written to stderr. `print_i64` reloads all its inputs, so no
+    /// register is live across this helper.
+    fn emit_gc_log_field(&mut self, label: &[u8], cell: DataLabel) {
+        let text = self.asm.data_label_with_bytes(label);
+        self.emit_write_data(self.platform.stderr_fd(), text, label.len());
+        self.asm.mov_data_addr(Reg::Rdi, cell);
+        self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rdi, 0);
+        self.asm.mov_imm64(Reg::Rsi, self.platform.stderr_fd());
+        self.asm.mov_imm64(Reg::Rdx, 0); // no leading newline
+        self.asm.call_label(self.print_i64);
+    }
+
+    /// Emit the `--gc-log` statistics line to stderr. Called from the
+    /// normal exit path just before `exit(0)` when `gc_log` is set.
+    fn emit_gc_log_report(&mut self) {
+        self.emit_gc_log_field(b"gc: collections=", self.gc_collect_counter);
+        self.emit_gc_log_field(b" allocs=", self.gc_alloc_count);
+        self.emit_gc_log_field(b" bytes=", self.gc_bytes_allocated);
+        self.emit_gc_log_field(b" max_pause_ns=", self.gc_pause_max_ns);
+        self.emit_gc_log_field(b" total_pause_ns=", self.gc_pause_total_ns);
+        let newline = self.asm.data_label_with_bytes(b"\n");
+        self.emit_write_data(self.platform.stderr_fd(), newline, 1);
+    }
+
     fn emit_gc_alloc_runtime(&mut self) {
         self.asm.bind_text_label(self.gc_alloc);
         self.asm.push_reg(Reg::Rbp);
@@ -37685,6 +37774,16 @@ impl NativeCodeGenerator {
         let do_grow = self.asm.create_text_label();
         let oom = self.asm.create_text_label();
         let after_collect = self.asm.create_text_label();
+
+        // --gc-stress: collect before every allocation attempt. The
+        // request's own object is allocated by the attempt that
+        // follows, so collecting here only reclaims prior garbage --
+        // and turns any pointer left unrooted across an allocation into
+        // a deterministic crash. gc_collect makes its own frame and
+        // preserves this frame's rbp-relative slots.
+        if self.gc_stress {
+            self.asm.call_label(self.gc_collect);
+        }
 
         self.emit_gc_alloc_attempt(do_collect, success);
         // First attempt failed; run collector then retry.
@@ -37712,6 +37811,20 @@ impl NativeCodeGenerator {
         self.emit_exit_code(1);
 
         self.asm.bind_text_label(success);
+        // --gc-log: count this allocation and its byte size (total,
+        // header included, in slot 16). rax holds the user pointer and
+        // must survive, so the counter bumps use r10/r11 only.
+        if self.gc_log {
+            self.asm.mov_data_addr(Reg::R10, self.gc_alloc_count);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.add_reg_imm32(Reg::R11, 1);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
+            self.asm.load_rbp_slot(Reg::R11, 16); // total block bytes
+            self.asm.mov_data_addr(Reg::R10, self.gc_bytes_allocated);
+            self.asm.load_ptr_disp32(Reg::Rbx, Reg::R10, 0);
+            self.asm.add_reg_reg(Reg::Rbx, Reg::R11);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rbx);
+        }
         // Tear down locals and return.
         self.asm.add_reg_imm32(Reg::Rsp, 16);
         self.asm.pop_reg(Reg::Rbx);
@@ -37814,6 +37927,14 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
         self.asm.add_reg_imm32(Reg::Rax, 1);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // --gc-log pause timing (Linux only; the clock syscall path
+        // panics on Windows). Capture the monotonic start before the
+        // mark/sweep work; the delta is folded in at the epilogue.
+        if self.gc_log && !self.is_windows {
+            self.emit_read_monotonic_ns_to_rax();
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        }
         // Reserve six qword locals (rbp-relative addressing). The first
         // four are reused across phases; the last pair holds the segment
         // iteration state used by the sweep loop.
@@ -38051,6 +38172,28 @@ impl NativeCodeGenerator {
         // free_list_head = r9
         self.asm.mov_data_addr(Reg::R10, self.gc_free_list_head);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
+
+        // --gc-log pause timing epilogue: delta = now - start; total +=
+        // delta; max = max(max, delta). All registers are dead here.
+        if self.gc_log && !self.is_windows {
+            self.emit_read_monotonic_ns_to_rax();
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.sub_reg_reg(Reg::Rax, Reg::R11); // rax = delta ns
+            // total += delta
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_total_ns);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.add_reg_reg(Reg::R11, Reg::Rax);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
+            // max = max(max, delta)
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_max_ns);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.cmp_reg_reg(Reg::Rax, Reg::R11);
+            let keep_max = self.asm.create_text_label();
+            self.asm.jcc_label(Condition::LessEqual, keep_max);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.bind_text_label(keep_max);
+        }
 
         self.asm.leave();
         self.asm.ret();

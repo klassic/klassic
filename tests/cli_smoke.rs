@@ -20865,6 +20865,153 @@ fn native_build_survives_enum_allocation_churn_across_collections() {
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "50000\n");
 }
 
+/// A churn program that outlives the 1 MiB initial heap, used by the
+/// `--gc-log` / `--gc-stress` tests below.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const GC_CHURN_PROGRAM: &str = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+     mutable i = 0\n\
+     mutable acc = 0\n\
+     while (i < 50000) {\n\
+       val t = Branch(Leaf(7), Leaf(2))\n\
+       acc = acc + (t match { case Branch(l, r) => 1; case Leaf(v) => 0 })\n\
+       i = i + 1\n\
+     }\n\
+     println(acc)\n";
+
+/// Build the churn program with the given extra flags and return
+/// (stdout, stderr) of the compiled binary.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn build_and_run_gc_program(source: &str, flags: &[&str]) -> (String, String) {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_gc_flag_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_gc_flag_{stamp}.bin"));
+    fs::write(&source_path, source).expect("temp source file should write");
+    let mut args: Vec<&str> = flags.to_vec();
+    args.push("build");
+    let source_str = source_path
+        .to_str()
+        .expect("path should be utf-8")
+        .to_string();
+    let output_str = output_path
+        .to_str()
+        .expect("path should be utf-8")
+        .to_string();
+    args.push(&source_str);
+    args.push("-o");
+    args.push(&output_str);
+    let build_output = Command::new(klassic_bin())
+        .args(&args)
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        run_output.status.success(),
+        "compiled binary should exit cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    (
+        String::from_utf8_lossy(&run_output.stdout).into_owned(),
+        String::from_utf8_lossy(&run_output.stderr).into_owned(),
+    )
+}
+
+/// `--gc-log` reports collection statistics to stderr at exit while
+/// leaving stdout byte-identical to a build without the flag.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_log_reports_collections_on_churn() {
+    let (plain_stdout, plain_stderr) = build_and_run_gc_program(GC_CHURN_PROGRAM, &[]);
+    assert_eq!(plain_stdout, "50000\n");
+    assert_eq!(plain_stderr, "", "no --gc-log flag: stderr must be clean");
+
+    let (log_stdout, log_stderr) = build_and_run_gc_program(GC_CHURN_PROGRAM, &["--gc-log"]);
+    assert_eq!(log_stdout, "50000\n", "--gc-log must not disturb stdout");
+    assert!(
+        log_stderr.starts_with("gc: collections="),
+        "--gc-log stderr should start with the stats line, got:\n{log_stderr}"
+    );
+    // The churn exhausts the 1 MiB heap several times, so at least one
+    // collection must have run and the reported counters must be
+    // internally consistent (allocs > 0, bytes > 0).
+    let collections = log_stderr
+        .split("collections=")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("stats line should contain a collections count");
+    assert!(
+        collections >= 1,
+        "churn should force at least one collection"
+    );
+    assert!(log_stderr.contains(" allocs="));
+    assert!(log_stderr.contains(" bytes="));
+    assert!(log_stderr.contains(" max_pause_ns="));
+    assert!(log_stderr.contains(" total_pause_ns="));
+}
+
+/// `--gc-stress` collects before every allocation, so the same churn
+/// reports one collection per allocation and still produces the exact
+/// same output -- the deterministic proof that no pointer is left
+/// unrooted across an allocation (the M1 fix holds under maximal
+/// pressure).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_stress_forces_a_collection_per_alloc_and_stays_correct() {
+    let (stdout, stderr) = build_and_run_gc_program(GC_CHURN_PROGRAM, &["--gc-log", "--gc-stress"]);
+    assert_eq!(stdout, "50000\n", "stress mode must not change the result");
+    let collections = stderr
+        .split("collections=")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("stats line should contain a collections count");
+    let allocs = stderr
+        .split(" allocs=")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("stats line should contain an allocs count");
+    // Every allocation collects, so collections == allocs.
+    assert_eq!(
+        collections, allocs,
+        "--gc-stress must collect once per allocation"
+    );
+    assert!(allocs > 100_000, "churn should allocate many objects");
+}
+
+/// `--gc-stress` re-runs the M1 use-after-free repro under maximal
+/// collection pressure (a full collection before every allocation),
+/// removing any sizing luck: the equality must still match the
+/// evaluator's 100000.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_stress_equality_repro_stays_correct() {
+    let program = "enum Pair { case P(a: Int, b: Int) }\n\
+         mutable i = 0\n\
+         mutable ok = 0\n\
+         while (i < 100000) {\n\
+           if (P(i, i) == P(i, i)) {\n\
+             ok = ok + 1\n\
+           }\n\
+           i = i + 1\n\
+         }\n\
+         println(ok)\n";
+    let (stdout, _stderr) = build_and_run_gc_program(program, &["--gc-stress"]);
+    assert_eq!(stdout, "100000\n");
+}
+
 /// Regression guard for a real use-after-free: `==` on two freshly
 /// constructed enums staged the lhs pointer with a raw machine-stack
 /// push (not a GC root) across the rhs compile. The lhs temporary's

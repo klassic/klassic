@@ -30,6 +30,8 @@ cargo run -- --backend c build program.kl -o program.c  # portable C backend (su
 cargo run -- --target x86_64-unknown-linux-gnu build path/to/program.kl -o program
 cargo run -- --warn-trust path/to/program.kl         # report trusted proofs
 cargo run -- --deny-trust path/to/program.kl         # reject trusted proofs
+cargo run -- --gc-log build program.kl -o program    # GC stats to stderr at exit
+cargo run -- --gc-stress build program.kl -o program # collect before every alloc (bug-shaker)
 ```
 
 ## Architecture
