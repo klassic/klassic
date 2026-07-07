@@ -15,6 +15,13 @@ pub struct ExecutionConfig {
     /// `build` through the portable C backend instead of silently
     /// cross-building for the default Linux target.
     pub explicit_target: bool,
+    /// `--gc-log`: emitted programs print GC statistics to stderr at
+    /// exit.
+    pub gc_log: bool,
+    /// `--gc-stress`: emitted `gc_alloc` collects before every
+    /// allocation (deterministic detector for pointers left unrooted
+    /// across an allocation).
+    pub gc_stress: bool,
 }
 
 impl ExecutionConfig {
@@ -25,6 +32,8 @@ impl ExecutionConfig {
             native_target,
             c_backend: false,
             explicit_target: false,
+            gc_log: false,
+            gc_stress: false,
         }
     }
 }
@@ -76,6 +85,8 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     let mut warn_trust = false;
     let mut native_target = NativeTarget::default();
     let mut explicit_target = false;
+    let mut gc_log = false;
+    let mut gc_stress = false;
     let mut others = Vec::new();
     let mut script_args = Vec::new();
     let mut seen_separator = false;
@@ -98,6 +109,14 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
             }
             "--warn-trust" => {
                 warn_trust = true;
+                index += 1;
+            }
+            "--gc-log" => {
+                gc_log = true;
+                index += 1;
+            }
+            "--gc-stress" => {
+                gc_stress = true;
                 index += 1;
             }
             "--backend" => {
@@ -139,6 +158,8 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     let mut config = ExecutionConfig::new(deny_trust, warn_trust, native_target);
     config.c_backend = c_backend;
     config.explicit_target = explicit_target;
+    config.gc_log = gc_log;
+    config.gc_stress = gc_stress;
     let action = match others.as_slice() {
         [command] if command == "targets" => RunAction::ListTargets,
         [flag] if flag == "--version" || flag == "-V" => RunAction::ShowVersion,
@@ -284,6 +305,35 @@ mod tests {
             }
             other => panic!("unexpected action: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_gc_log_and_gc_stress_flags() {
+        let args = vec![
+            "--gc-log".to_string(),
+            "--gc-stress".to_string(),
+            "build".to_string(),
+            "sample.kl".to_string(),
+            "-o".to_string(),
+            "sample".to_string(),
+        ];
+        let parsed = parse_command_line(&args).expect("build command should parse");
+        assert!(parsed.config.gc_log);
+        assert!(parsed.config.gc_stress);
+        assert!(matches!(parsed.action, RunAction::BuildFile { .. }));
+    }
+
+    #[test]
+    fn gc_flags_default_off() {
+        let args = vec![
+            "build".to_string(),
+            "sample.kl".to_string(),
+            "-o".to_string(),
+            "sample".to_string(),
+        ];
+        let parsed = parse_command_line(&args).expect("build command should parse");
+        assert!(!parsed.config.gc_log);
+        assert!(!parsed.config.gc_stress);
     }
 
     #[test]
