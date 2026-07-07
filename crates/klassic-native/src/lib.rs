@@ -4366,6 +4366,10 @@ struct NativeCodeGenerator {
     gc_poison: bool,
     gc_alloc: TextLabel,
     gc_collect: TextLabel,
+    /// M6: the collector factored into separately-callable STW pieces.
+    gc_mark_roots: TextLabel,
+    gc_trace: TextLabel,
+    gc_sweep: TextLabel,
     gc_mark_visit: TextLabel,
     gc_deep_equal: TextLabel,
     /// ZGC load-barrier slow path: heals a bad-colored heap pointer
@@ -4579,6 +4583,9 @@ impl NativeCodeGenerator {
         let random_state = asm.data_label_with_i64s(&[0]);
         let gc_alloc = asm.create_text_label();
         let gc_collect = asm.create_text_label();
+        let gc_mark_roots = asm.create_text_label();
+        let gc_trace = asm.create_text_label();
+        let gc_sweep = asm.create_text_label();
         let gc_mark_visit = asm.create_text_label();
         let gc_deep_equal = asm.create_text_label();
         let gc_load_barrier_slow = asm.create_text_label();
@@ -4716,6 +4723,9 @@ impl NativeCodeGenerator {
             gc_poison: false,
             gc_alloc,
             gc_collect,
+            gc_mark_roots,
+            gc_trace,
+            gc_sweep,
             gc_mark_visit,
             gc_deep_equal,
             gc_load_barrier_slow,
@@ -5321,6 +5331,9 @@ impl NativeCodeGenerator {
         self.emit_gc_load_barrier_slow_runtime();
         self.emit_gc_alloc_runtime();
         self.emit_gc_collect_runtime();
+        self.emit_gc_mark_roots_runtime();
+        self.emit_gc_trace_runtime();
+        self.emit_gc_sweep_runtime();
         self.emit_gc_acquire_region_runtime();
         self.emit_gc_alloc_large_runtime();
         self.emit_gc_grow_budget_runtime();
@@ -38118,19 +38131,10 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(success);
     }
 
-    /// Stop-the-world mark-and-sweep.
-    ///
-    /// Phase 1 only honors statically-registered roots, of which there are
-    /// none yet — so a collection cycle frees every heap object that has
-    /// been allocated up to this point. Future phases will register stack
-    /// frame descriptors and per-type pointer-field tables.
     fn emit_gc_collect_runtime(&mut self) {
         self.asm.bind_text_label(self.gc_collect);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        // Increment the global collection counter so user code can
-        // observe how many cycles have run, e.g. for tests that need to
-        // confirm a forced collection actually happened.
         self.asm.mov_data_addr(Reg::R10, self.gc_collect_counter);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
         self.asm.add_reg_imm32(Reg::Rax, 1);
@@ -38143,34 +38147,48 @@ impl NativeCodeGenerator {
             self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
             self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         }
-        // Reserve eight qword locals (rbp-relative addressing). The first
-        // four are reused across phases; the sweep uses the rest for its
-        // region iteration state. 64 bytes keeps the frame 16-aligned so
-        // the mark phase's `gc_mark_visit` calls stay aligned.
-        //   [rbp -  8]: root_cursor (current &gc_shadow_stack[i])
-        //   [rbp - 16]: root_end    (sentinel = end of shadow stack)
-        //   [rbp - 24]: trace_cursor (current pointer into payload)
-        //   [rbp - 32]: trace_end    (end of current payload)
-        //   [rbp - 40]: sweep region index
-        //   [rbp - 48]: committed_count bound
-        //   [rbp - 56]: current region base (saved across the inner walk)
-        //   [rbp - 64]: spare
-        self.asm.sub_reg_imm8(Reg::Rsp, 64);
-
-        // ---- Mark phase ----
-        // Reset the worklist top pointer.
+        // M6: reset the worklist, then mark roots, trace to fixpoint,
+        // and sweep -- each a separately-callable STW routine. gc-log
+        // brackets the whole collection as one pause for now.
         self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // The GC shadow stack is the sole root source: every live
-        // heap-pointer stack slot is tracked there by address. (The old
-        // static pin root table -- scanned here first -- was retired
-        // once the argument-staging rewrite removed its last user.)
+        self.asm.call_label(self.gc_mark_roots);
+        self.asm.call_label(self.gc_trace);
+        self.asm.call_label(self.gc_sweep);
+        // --gc-log pause timing epilogue: delta = now - start; total +=
+        // delta; max = max(max, delta). All registers are dead here.
+        if self.gc_log && !self.is_windows {
+            self.emit_read_monotonic_ns_to_rax();
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.sub_reg_reg(Reg::Rax, Reg::R11); // rax = delta ns
+            // total += delta
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_total_ns);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.add_reg_reg(Reg::R11, Reg::Rax);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
+            // max = max(max, delta)
+            self.asm.mov_data_addr(Reg::R10, self.gc_pause_max_ns);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.cmp_reg_reg(Reg::Rax, Reg::R11);
+            let keep_max = self.asm.create_text_label();
+            self.asm.jcc_label(Condition::LessEqual, keep_max);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.bind_text_label(keep_max);
+        }
+        self.asm.leave();
+        self.asm.ret();
+    }
 
-        // ---- Shadow stack walk: every entry is the address of a stack
-        //      slot whose qword content is a tagged GC pointer. ----
-        // root_cursor (slot 8) reused: now & shadow stack; root_end (slot 16)
-        // reused as end pointer.
+    /// Mark roots: walk the GC shadow stack (the sole root source),
+    /// pushing each non-null root target onto the mark worklist via
+    /// gc_mark_visit. The caller resets the worklist top first.
+    fn emit_gc_mark_roots_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_mark_roots);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 16);
         self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack);
         self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
         self.asm.store_rbp_slot(8, Reg::R10);
@@ -38201,9 +38219,17 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(8, Reg::R10);
         self.asm.jmp_label(shadow_loop);
         self.asm.bind_text_label(shadow_done);
+        self.asm.leave();
+        self.asm.ret();
+    }
 
-        // ---- Trace loop: drain the worklist, recursing through
-        //      pointer-record fields. ----
+    /// Trace: drain the mark worklist, walking each pointer object's
+    /// payload and marking its children (the strong tricolor closure).
+    fn emit_gc_trace_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_trace);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 32);
         let trace_loop = self.asm.create_text_label();
         let trace_done = self.asm.create_text_label();
         let trace_field_loop = self.asm.create_text_label();
@@ -38274,7 +38300,17 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(24, Reg::R10);
         self.asm.jmp_label(trace_field_loop);
         self.asm.bind_text_label(trace_done);
+        self.asm.leave();
+        self.asm.ret();
+    }
 
+    /// Sweep: region-based reclamation -- clear mark bits and reclaim
+    /// whole-dead regions onto the free-region pool.
+    fn emit_gc_sweep_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_sweep);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 64);
         // ---- Sweep phase (region-based) ----
         // Walk every committed region. Within a region, walk its blocks
         // from base to the region's watermark: clear the mark bit on live
@@ -38418,29 +38454,6 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(region_done);
         self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
-
-        // --gc-log pause timing epilogue: delta = now - start; total +=
-        // delta; max = max(max, delta). All registers are dead here.
-        if self.gc_log && !self.is_windows {
-            self.emit_read_monotonic_ns_to_rax();
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
-            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-            self.asm.sub_reg_reg(Reg::Rax, Reg::R11); // rax = delta ns
-            // total += delta
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_total_ns);
-            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-            self.asm.add_reg_reg(Reg::R11, Reg::Rax);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-            // max = max(max, delta)
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_max_ns);
-            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-            self.asm.cmp_reg_reg(Reg::Rax, Reg::R11);
-            let keep_max = self.asm.create_text_label();
-            self.asm.jcc_label(Condition::LessEqual, keep_max);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-            self.asm.bind_text_label(keep_max);
-        }
-
         self.asm.leave();
         self.asm.ret();
     }
