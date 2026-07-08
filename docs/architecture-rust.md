@@ -1238,46 +1238,87 @@ cargo run -- -e "1 + 2"
   native-backend implementation on any target yet, so there is
   nothing Windows-specific to gate there.
 
-  The native runtime owns a dedicated GC heap that is separate from the
-  static `.data` buffers used by the rest of the codegen. At program
-  startup, the prologue invokes `mmap(NULL, 1 MiB,
-  PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0)` and stores the
-  returned base/top/end pointers in dedicated globals. Three emitted
-  subroutines back the heap:
-  - `gc_alloc(size, type_tag)` aligns the request up to a 16-byte
-    boundary, walks the singly-linked free list using a first-fit
-    policy, and falls back to a bump pointer when no free block fits.
-    Each block carries a 16-byte header — word 0 is the total block
-    size with the GC mark bit reused as the top bit, word 1 is the
-    type tag (0 marks a free block). A free-list hit zeroes the
-    reused block's entire payload before returning it: first-fit can
-    hand out a block larger than the request without splitting it,
-    and because the mark trace walks header-size qwords, stale bytes
-    from the block's previous life would otherwise be chased as heap
-    pointers (the bump path skips the memset — fresh mmap memory is
-    already zero). Callers must not assume `rdi` still holds the
-    requested size after the call; `gc_alloc` rewrites it to the
-    aligned total, which previously made `__gc_record`'s local
-    payload memset overrun into the next block's header and corrupt
-    the heap after the first collection.
-  - `gc_collect()` performs stop-the-world mark-and-sweep. The mark
-    phase walks compile-time-registered roots; the sweep phase walks
-    every active segment linearly using each header's size, clears
-    mark bits on survivors, and threads dead blocks onto a freshly
-    rebuilt free list. If `gc_alloc` cannot satisfy a request even
-    after a collection plus a heap growth it writes
-    `klassic gc: out of memory` to stderr and exits with status 1.
-  - `gc_grow_heap(requested_total)` is invoked by `gc_alloc` whenever
-    even a post-collection retry cannot satisfy the bump path. It
-    `mmap`s a fresh segment of at least 1 MiB (page-aligned, larger
-    when the request itself exceeds 1 MiB), appends `{base, top, end}`
-    to a fixed 64-entry segments table, repoints the active
-    `gc_heap_*` globals at the new region, and freezes the previous
-    segment's bump pointer so the next sweep covers it. Past 64
-    segments the runtime exits with `klassic gc: heap segment limit
-    reached`. Tracing handles type tag 2 (`pointer record`) and tag 3
-    (`pointer array`) identically; both walk the entire payload as a
-    packed array of heap pointers.
+  The native runtime owns a dedicated GC heap, a ZGC-style incremental,
+  region-based, moving collector (see `docs/zgc-plan.md` for the
+  milestone history; the earlier stop-the-world segment/free-list
+  collector was rewritten milestone by milestone). It is single-mutator
+  today, but every single-thread simplification is localized to a named
+  routine with a documented multi-thread upgrade path (the plan's
+  thread-readiness table) rather than baked into the codegen. x86_64
+  only for now; aarch64 has no collector yet.
+
+  Heap layout. At startup the prologue reserves the whole heap up front:
+  one `mmap` of 64 MiB (512 regions of 128 KiB). Linux demand-pages it,
+  so only touched regions cost physical memory; a soft budget
+  (`gc_budget_regions`, initially 8, doubling on stall up to 512) bounds
+  how many regions the mutator may touch before a collection. Allocation
+  is bump-only within the current region; a per-region watermark array
+  (`gc_region_top[512]`) records each region's fill, and whole regions
+  are the unit of reclamation. Objects carry a 16-byte header: word 0
+  low bits are `[FWD:1][mark0:1][mark1:1][pad:1]` and the rest is the
+  16-aligned block size (so the size is `word0 & -16`); word 1 is the
+  type tag (`RAW_BYTES`, `POINTER_RECORD`, `POINTER_LIST` — tags
+  `>= POINTER_RECORD` have an all-pointer payload). The two mark bits
+  alternate parity each cycle (the current parity lives in a
+  `gc_header_mark` cell), so a survivor is re-marked each cycle and the
+  sweep clears the stale parity. When an object is evacuated its word 0
+  becomes `new_user_ptr | FWD` (a forwarding pointer) and its word 1
+  holds the size for the relocation walk.
+
+  Colored pointers and the load barrier. Heap-slot pointers carry a
+  color in bits 60-62 (`M0`, `M1`, `R`); registers, rbp-slots, roots,
+  and the shadow stack always hold raw (stripped) pointers. Three
+  reserved callee-saved registers hold `r13` = strip mask, `r14` = the
+  current good color, `r15` = the bad-color test mask. Every
+  heap-pointer read compiles to a load-barrier fast path (`test
+  rax, r15; jz ok; call gc_load_barrier_slow; ok: and rax, r13`): a
+  pointer whose color is "bad" is non-canonical, so an unbarriered
+  dereference faults — the barrier-coverage guarantee. `--gc-poison`
+  forces every colored pointer bad so every load exercises the slow
+  path (a bug shaker). The slow path strips, follows any forwarding
+  word, evacuates-on-demand during Relocate, self-heals the slot to the
+  good-colored remapped address, and (during Mark) marks the target.
+
+  Phase machine. A cycle runs Idle -> MarkStart -> Mark -> MarkEnd ->
+  Relocate -> Idle, driven from `gc_alloc` (proactively when allocation
+  pressure crosses half the soft budget, and at exhaustion). MarkStart
+  and MarkEnd are the only stop-the-world pauses and are O(roots) plus
+  the (still stop-the-world) sweep; the Mark and Relocate phases run
+  incrementally in bounded quanta at allocation points. Marking needs no
+  store barrier: klassic performs no in-place heap mutation (assignment
+  rewrites a mutable local's shadow-stack slot, a root; the only
+  heap-pointer stores are during object construction), so every raw
+  pointer the mutator can hold during Mark comes from a fresh allocation
+  (allocate-black), a barriered load (marked by the slow path), or a
+  root (marked at MarkStart) — the strong tricolor invariant holds
+  directly.
+
+  Evacuation. After marking, `gc_relocate_start` selects the sparsest
+  non-current, non-large, non-empty regions as from-space, subject to a
+  headroom invariant (selected live bytes fit in the free regions even
+  at worst-case bump-packing), fixes up the roots to their to-space
+  copies, and enters Relocate. Evacuation copies each live block into a
+  dedicated to-space bump and installs the forwarding word; the load
+  barrier makes the mutator assist (a load into from-space evacuates on
+  demand and follows forwarding). The soundness linchpin is the R-color
+  scheme: Idle and Relocate use good = `R`, so any pointer still at a
+  mark color — hence possibly referencing a not-yet-freed ghost —
+  slow-paths and is remapped, while each Mark recolors every live slot
+  back to the mark color. From-space (ghost) regions are freed at the
+  *next* MarkEnd, after that cycle's mark reaches fixpoint, so no live
+  slot references them when they are reclaimed. If the mark worklist
+  overflows, the cycle degrades to a from-scratch stop-the-world re-mark
+  (logged); a genuine over-capacity live frontier still aborts. If even
+  a post-collection retry plus budget growth cannot satisfy an
+  allocation, the runtime writes `klassic gc: out of memory` and exits.
+
+  Observability. `--gc-log` prints a stats line at exit (collections,
+  allocations, bytes, max/total pause ns, stop-the-world fallbacks, peak
+  committed regions, live objects relocated); `--gc-stress` collects
+  before every allocation (turning any pointer left unrooted across an
+  allocation into a deterministic crash); `--gc-poison` is the barrier
+  bug-shaker above. An internal compile-time `gc_evac_off` switch
+  reproduces the non-moving mark-sweep collector for bisection.
 
   The allocator and collector are tagged into the language through
   a `NativeValue::HeapPointer` variant. `__gc_alloc(size)` and
@@ -1291,10 +1332,12 @@ cargo run -- -e "1 + 2"
   exactly that many entries on its way out, and
   `pop_scope_preserving_allocations` transfers the count up to the
   parent so entries belonging to slots whose stack memory survives
-  are never lost. The GC mark phase walks the shadow stack as a
-  second pass after the static root table, dereferencing each entry
-  to read the slot's current heap pointer and feeding it into the
-  shared `gc_mark_visit` worklist. Identifier loads, val/mutable
+  are never lost. The shadow stack is the collector's sole root
+  source (there is no separate static root table): the mark phase
+  walks it, dereferencing each entry to read the slot's current heap
+  pointer and feeding it into the shared `gc_mark_visit` worklist,
+  and RelocateStart walks it again to rewrite each root in place to
+  its to-space copy. Identifier loads, val/mutable
   bindings, function-argument binding sites, assertions, binary
   comparisons, and printing now all treat `HeapPointer` like `Int`
   so `val a = __gc_alloc(...); println(a > 0)` compiles cleanly.

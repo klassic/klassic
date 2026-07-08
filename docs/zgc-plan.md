@@ -348,10 +348,24 @@ the semantic oracle everywhere (eval == native differential).
   internal gc_evac_off degrade switch reproduces the M6 non-moving
   collector for bisection. The sweep is still stop-the-world (its
   incrementalization and the selection/threshold tuning are M8).
-- **M8 — Tuning + docs.** Quantum/budget/selection-threshold tuning,
-  final `--gc-log` fields, one generously-bounded pause assertion
-  (250 ms — regression tripwire, not a benchmark), an
-  architecture-rust.md section, and an issue for the aarch64 port.
+- **M8 — Tuning + docs. DONE.** The `--gc-log` line reports the final
+  field set (collections, allocs, bytes, max/total pause ns, STW
+  fallbacks, peak committed regions, objects relocated). A generously-
+  bounded pause tripwire (`native_gc_pause_stays_bounded`, 250 ms — a
+  regression assertion, not a benchmark; a churn workload actually
+  reports ~100 us) guards against an accidentally-stop-the-world mark or
+  a pause that scales with live data. The stale segment/free-list GC
+  description in `docs/architecture-rust.md` was replaced with an
+  accurate ZGC section (region heap, colored pointers + load barrier,
+  the phase machine, no-store-barrier marking, evacuation + the R-color
+  scheme, observability flags). The aarch64 port (no collector there
+  yet) is tracked as a separate epic. The current tuning constants
+  (quantum 512 pops / 8 KiB, proactive start at half the soft budget,
+  sparse-region threshold live &lt; REGION_SIZE/2, headroom cap at half
+  the free bytes) compact effectively on the churn/long-lived workloads
+  (peak committed stays at the initial budget across &gt; 1M
+  allocations); finer auto-tuning is left as future work rather than
+  hand-fit to microbenchmarks.
 
 ## Testing strategy
 
