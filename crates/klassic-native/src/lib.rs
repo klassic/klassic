@@ -489,6 +489,7 @@ pub fn compile_source_to_elf(
 
 #[allow(clippy::result_large_err)]
 mod cbackend;
+mod llvm;
 
 #[allow(clippy::result_large_err)]
 mod aarch64;
@@ -509,6 +510,21 @@ pub fn compile_source_to_c(name: &str, text: &str) -> Result<String, NativeCompi
     typecheck_program(&expr)
         .map_err(|diagnostic| NativeCompileError::with_view(source.clone(), None, diagnostic))?;
     cbackend::emit_c_program(&expr)
+        .map_err(|diagnostic| NativeCompileError::with_view(source, None, diagnostic))
+}
+
+/// Compile Klassic source to a textual LLVM IR module (migration plan
+/// `docs/llvm-backend-plan.md`). Shares the frontend with every other
+/// path; lowering coverage grows milestone by milestone.
+#[allow(clippy::result_large_err)]
+pub fn compile_source_to_llvm(name: &str, text: &str) -> Result<String, NativeCompileError> {
+    let source = SourceFile::new(name, text);
+    let expr = parse_source(&source)
+        .map_err(|diagnostic| NativeCompileError::with_view(source.clone(), None, diagnostic))?;
+    let expr = rewrite_expression(expr);
+    typecheck_program(&expr)
+        .map_err(|diagnostic| NativeCompileError::with_view(source.clone(), None, diagnostic))?;
+    llvm::emit_llvm_program(&expr)
         .map_err(|diagnostic| NativeCompileError::with_view(source, None, diagnostic))
 }
 

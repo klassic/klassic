@@ -12,7 +12,7 @@ use cli::{
 use klassic_eval::{Evaluator, EvaluatorConfig, set_script_args};
 use klassic_native::{
     NativeBackend, NativeCompilerConfig, NativeTarget, UserModuleSource, compile_source_to_c,
-    compile_source_with_prelude_and_modules_for_target,
+    compile_source_to_llvm, compile_source_with_prelude_and_modules_for_target,
 };
 use std::path::Path;
 
@@ -35,6 +35,31 @@ fn build_with_c_backend(input: &Path, text: &str, output: &Path) -> Result<(), u
         return Ok(());
     }
     link_c_program(&c_source, output)
+}
+
+/// Build through the LLVM backend: emit an LLVM IR module and, unless
+/// the output name ends in `.ll`, compile and link it with clang against
+/// the bundled runtime staticlib (migration plan
+/// `docs/llvm-backend-plan.md`).
+fn build_with_llvm_backend(input: &Path, text: &str, output: &Path) -> Result<(), u8> {
+    let ir = match compile_source_to_llvm(&input.display().to_string(), text) {
+        Ok(ir) => ir,
+        Err(error) => {
+            eprintln!("{error}");
+            return Err(1);
+        }
+    };
+    if output
+        .extension()
+        .is_some_and(|extension| extension == "ll")
+    {
+        if let Err(error) = fs::write(output, ir) {
+            eprintln!("{}: {error}", output.display());
+            return Err(1);
+        }
+        return Ok(());
+    }
+    link_llvm_program(&ir, output)
 }
 
 fn write_executable_output(output: &Path, bytes: &[u8]) -> Result<(), u8> {
@@ -101,6 +126,9 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
             };
             if command.config.c_backend {
                 return build_with_c_backend(&input, &text, &output);
+            }
+            if command.config.llvm_backend {
+                return build_with_llvm_backend(&input, &text, &output);
             }
             // The default target is the detected host (macOS arm64 →
             // the direct Mach-O backend, Linux x86_64 → direct ELF);
@@ -348,6 +376,76 @@ fn link_c_program(c_source: &str, output: &Path) -> Result<(), u8> {
         }
         Err(error) => {
             eprintln!("error: failed to run {compiler}: {error}");
+            Err(1)
+        }
+    }
+}
+
+/// Find a clang that accepts opaque-pointer LLVM IR (LLVM >= 15). The
+/// migration pins that floor; `KLASSIC_CLANG` overrides the search.
+fn find_opaque_pointer_clang() -> Option<String> {
+    if let Ok(explicit) = std::env::var("KLASSIC_CLANG") {
+        return Some(explicit);
+    }
+    ["clang-18", "clang-17", "clang-16", "clang-15", "clang"]
+        .into_iter()
+        .find(|name| {
+            std::process::Command::new(name)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+        .map(str::to_owned)
+}
+
+/// Compile a textual LLVM IR module with clang and link it against the
+/// bundled runtime staticlib (migration plan `docs/llvm-backend-plan.md`).
+fn link_llvm_program(ir: &str, output: &Path) -> Result<(), u8> {
+    let Some(runtime) = find_runtime_staticlib() else {
+        eprintln!(
+            "error: libklassic_runtime.a not found\n  help: set KLASSIC_RT_LIB to its path, or \
+             pass an output ending in .ll and compile it yourself"
+        );
+        return Err(1);
+    };
+    let Some(clang) = find_opaque_pointer_clang() else {
+        eprintln!(
+            "error: no clang found (tried clang-18..15, clang)\n  help: install clang >= 15, set \
+             KLASSIC_CLANG, or pass an output ending in .ll to get the IR and compile it yourself"
+        );
+        return Err(1);
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let ir_path = std::env::temp_dir().join(format!("klassic-llvm-{stamp}.ll"));
+    if let Err(error) = fs::write(&ir_path, ir) {
+        eprintln!("{}: {error}", ir_path.display());
+        return Err(1);
+    }
+    let mut command = std::process::Command::new(&clang);
+    command
+        .arg("-O2")
+        .arg("-o")
+        .arg(output)
+        .arg(&ir_path)
+        .arg(&runtime);
+    if std::env::consts::OS == "linux" {
+        command.args(["-lpthread", "-ldl", "-lm"]);
+    }
+    let status = command.status();
+    let _ = fs::remove_file(&ir_path);
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => {
+            eprintln!("error: {clang} failed to compile the generated LLVM IR");
+            Err(1)
+        }
+        Err(error) => {
+            eprintln!("error: failed to run {clang}: {error}");
             Err(1)
         }
     }
