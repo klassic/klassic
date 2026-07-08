@@ -4393,6 +4393,13 @@ struct NativeCodeGenerator {
     gc_clear_all_marks: TextLabel,
     gc_stw_mark_complete: TextLabel,
     gc_drain: TextLabel,
+    gc_evacuate: TextLabel,
+    gc_acquire_evac_region: TextLabel,
+    gc_relocate_start: TextLabel,
+    gc_relocate_quantum: TextLabel,
+    gc_relocate_finish: TextLabel,
+    gc_free_ghost_regions: TextLabel,
+    gc_relocate_fix_roots: TextLabel,
     gc_mark_start: TextLabel,
     gc_mark_end: TextLabel,
     gc_mark_visit: TextLabel,
@@ -4624,6 +4631,13 @@ impl NativeCodeGenerator {
         let gc_clear_all_marks = asm.create_text_label();
         let gc_stw_mark_complete = asm.create_text_label();
         let gc_drain = asm.create_text_label();
+        let gc_evacuate = asm.create_text_label();
+        let gc_acquire_evac_region = asm.create_text_label();
+        let gc_relocate_start = asm.create_text_label();
+        let gc_relocate_quantum = asm.create_text_label();
+        let gc_relocate_finish = asm.create_text_label();
+        let gc_free_ghost_regions = asm.create_text_label();
+        let gc_relocate_fix_roots = asm.create_text_label();
         let gc_mark_start = asm.create_text_label();
         let gc_mark_end = asm.create_text_label();
         let gc_mark_visit = asm.create_text_label();
@@ -4770,7 +4784,10 @@ impl NativeCodeGenerator {
             gc_log: false,
             gc_stress: false,
             gc_poison: false,
-            gc_evac_off: false,
+            // Evacuation stays off until the activation step wires the
+            // Relocate phase; until then the moving machinery is present
+            // but unreachable (M6-equivalent mark-sweep).
+            gc_evac_off: true,
             gc_alloc,
             gc_collect,
             gc_mark_roots,
@@ -4779,6 +4796,13 @@ impl NativeCodeGenerator {
             gc_clear_all_marks,
             gc_stw_mark_complete,
             gc_drain,
+            gc_evacuate,
+            gc_acquire_evac_region,
+            gc_relocate_start,
+            gc_relocate_quantum,
+            gc_relocate_finish,
+            gc_free_ghost_regions,
+            gc_relocate_fix_roots,
             gc_mark_start,
             gc_mark_end,
             gc_mark_visit,
@@ -5392,6 +5416,13 @@ impl NativeCodeGenerator {
         self.emit_gc_clear_all_marks_runtime();
         self.emit_gc_stw_mark_complete_runtime();
         self.emit_gc_drain_runtime();
+        self.emit_gc_evacuate_runtime();
+        self.emit_gc_acquire_evac_region_runtime();
+        self.emit_gc_relocate_start_runtime();
+        self.emit_gc_relocate_quantum_runtime();
+        self.emit_gc_relocate_finish_runtime();
+        self.emit_gc_free_ghost_regions_runtime();
+        self.emit_gc_relocate_fix_roots_runtime();
         self.emit_gc_mark_start_runtime();
         self.emit_gc_mark_end_runtime();
         self.emit_gc_acquire_region_runtime();
@@ -38165,11 +38196,15 @@ impl NativeCodeGenerator {
         // None of the routines called here allocate, so gc_alloc is not
         // re-entered.
         let driver_mark = self.asm.create_text_label();
+        let driver_reloc = self.asm.create_text_label();
         let driver_done = self.asm.create_text_label();
         self.asm.mov_data_addr(Reg::R10, self.gc_phase);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::R11, Reg::R11);
-        self.asm.jcc_label(Condition::NotEqual, driver_mark);
+        self.asm.cmp_reg_imm8(Reg::R11, Self::GC_PHASE_MARK as i8);
+        self.asm.jcc_label(Condition::Equal, driver_mark);
+        self.asm
+            .cmp_reg_imm8(Reg::R11, Self::GC_PHASE_RELOCATE as i8);
+        self.asm.jcc_label(Condition::Equal, driver_reloc);
         // Idle: accumulate allocation pressure since the last cycle and,
         // once it crosses half the soft budget, start a cycle
         // proactively (so the incremental mark has slack to finish
@@ -38213,6 +38248,25 @@ impl NativeCodeGenerator {
         self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
         self.asm.jcc_label(Condition::NotEqual, driver_done);
         self.asm.call_label(self.gc_mark_end);
+        self.asm.jmp_label(driver_done);
+        // Relocate: run one bounded evacuation quantum per GC_QUANTUM_BYTES
+        // allocated (unreachable until the activation step enters the
+        // Relocate phase). gc_relocate_quantum returns to Idle when all
+        // from-space is drained.
+        self.asm.bind_text_label(driver_reloc);
+        self.asm
+            .mov_data_addr(Reg::R10, self.gc_bytes_since_quantum);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.load_rbp_slot(Reg::R11, 16);
+        self.asm.add_reg_reg(Reg::Rax, Reg::R11);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm
+            .cmp_reg_imm32(Reg::Rax, Self::GC_QUANTUM_BYTES as i32);
+        self.asm.jcc_label(Condition::Below, driver_done);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_QUANTUM_BYTES);
+        self.asm.call_label(self.gc_relocate_quantum);
         self.asm.bind_text_label(driver_done);
 
         // --gc-stress: collect before every allocation attempt. The
@@ -38362,15 +38416,37 @@ impl NativeCodeGenerator {
         // otherwise run a full from-scratch STW mark + sweep, bracketed
         // as one pause here. Either way exactly one sweep runs.
         let collect_mark = self.asm.create_text_label();
+        let collect_reloc = self.asm.create_text_label();
         let collect_done = self.asm.create_text_label();
         self.asm.mov_data_addr(Reg::R10, self.gc_phase);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::NotEqual, collect_mark);
+        self.asm.cmp_reg_imm8(Reg::Rax, Self::GC_PHASE_MARK as i8);
+        self.asm.jcc_label(Condition::Equal, collect_mark);
+        self.asm
+            .cmp_reg_imm8(Reg::Rax, Self::GC_PHASE_RELOCATE as i8);
+        self.asm.jcc_label(Condition::Equal, collect_reloc);
+        // Idle: a full from-scratch STW mark + sweep, bracketed as one
+        // pause. Free the previous cycle's ghosts first (no-op until
+        // evacuation runs).
         self.emit_gc_pause_start();
         self.asm.call_label(self.gc_stw_mark_complete);
+        self.asm.call_label(self.gc_free_ghost_regions);
         self.asm.call_label(self.gc_sweep);
         self.emit_gc_pause_end();
+        self.asm.jmp_label(collect_done);
+        // Relocate in progress: drain the remaining evacuation
+        // synchronously (unbounded quanta) until the phase returns to
+        // Idle. Unreachable until the activation step.
+        self.asm.bind_text_label(collect_reloc);
+        let reloc_loop = self.asm.create_text_label();
+        self.asm.bind_text_label(reloc_loop);
+        self.asm.mov_imm64(Reg::Rdi, i64::MAX as u64);
+        self.asm.call_label(self.gc_relocate_quantum);
+        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm
+            .cmp_reg_imm8(Reg::Rax, Self::GC_PHASE_RELOCATE as i8);
+        self.asm.jcc_label(Condition::Equal, reloc_loop);
         self.asm.jmp_label(collect_done);
         self.asm.bind_text_label(collect_mark);
         self.asm.call_label(self.gc_mark_end);
@@ -38963,14 +39039,16 @@ impl NativeCodeGenerator {
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         self.asm.call_label(self.gc_stw_mark_complete);
         self.asm.bind_text_label(after_mark);
+        // Free the previous cycle's ghost (from-space) regions: the mark
+        // just reached fixpoint, so no live slot references them
+        // (soundness invariant III). A no-op until evacuation runs.
+        self.asm.call_label(self.gc_free_ghost_regions);
         self.asm.call_label(self.gc_sweep);
-        // Back to Idle; reset the proactive-trigger byte counter.
-        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
-        self.asm.mov_imm64(Reg::Rax, Self::GC_PHASE_IDLE);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_bytes_since_cycle);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // Close the cycle. gc_relocate_start selects from-space regions,
+        // fixes roots, and enters the Relocate phase when evacuation is
+        // active; until the activation step it just returns to Idle and
+        // resets the proactive-trigger counter.
+        self.asm.call_label(self.gc_relocate_start);
         self.emit_gc_pause_end();
         self.asm.leave();
         self.asm.ret();
@@ -39354,6 +39432,494 @@ impl NativeCodeGenerator {
 
         self.asm.bind_text_label(fail);
         self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.ret();
+    }
+
+    // ===================== M7 evacuation machinery =====================
+    // These routines implement the moving collector. They are emitted
+    // now but stay unreachable until the activation step flips
+    // gc_evac_off to false and rewrites gc_relocate_start to enter the
+    // Relocate phase. Kept together for locality.
+
+    /// Free every from-space (ghost) region back onto the free pool.
+    /// Called at MarkEnd, after the mark reaches fixpoint, so no live
+    /// slot still references a ghost (soundness invariant III). Freed
+    /// regions are zeroed on reuse, erasing stale forwarding words.
+    fn emit_gc_free_ghost_regions_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_free_ghost_regions);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 16);
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.store_rbp_slot(16, Reg::Rax); // bound
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_rbp_slot(8, Reg::Rax); // idx
+        let loop_l = self.asm.create_text_label();
+        let done_l = self.asm.create_text_label();
+        let next_l = self.asm.create_text_label();
+        self.asm.bind_text_label(loop_l);
+        self.asm.load_rbp_slot(Reg::Rax, 8);
+        self.asm.load_rbp_slot(Reg::Rcx, 16);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::AboveOrEqual, done_l);
+        // fromspace[idx]?
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_fromspace);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::R11, Reg::R11);
+        self.asm.jcc_label(Condition::Equal, next_l);
+        // base = region_base + (idx << SHIFT)
+        self.asm.load_rbp_slot(Reg::Rax, 8);
+        self.asm.shl_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.add_reg_reg(Reg::Rax, Reg::R10); // rax = base
+        // push onto free pool: [base] = free_head; free_head = base
+        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::R11);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // idx*8 in rcx for the three arrays.
+        self.asm.load_rbp_slot(Reg::Rcx, 8);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        // region_top[idx] = base (empty)
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // fromspace[idx] = 0 ; live[idx] = 0
+        self.asm.mov_imm64(Reg::R11, 0);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_fromspace);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_live);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
+        self.asm.bind_text_label(next_l);
+        self.asm.load_rbp_slot(Reg::Rax, 8);
+        self.asm.add_reg_imm32(Reg::Rax, 1);
+        self.asm.store_rbp_slot(8, Reg::Rax);
+        self.asm.jmp_label(loop_l);
+        self.asm.bind_text_label(done_l);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// Acquire a fresh to-space region into the dedicated evacuation bump
+    /// (gc_evac_*), NOT the mutator's bump (gc_heap_*). rdi = size needed
+    /// (<= REGION_SIZE). Flushes the previous evac region's watermark
+    /// first. Never fails: the headroom invariant guarantees a region.
+    fn emit_gc_acquire_evac_region_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_acquire_evac_region);
+        let no_flush = self.asm.create_text_label();
+        let from_tail = self.asm.create_text_label();
+        let install = self.asm.create_text_label();
+        // Flush the previous evac region's watermark, if any.
+        self.asm.mov_data_addr(Reg::R10, self.gc_evac_region_base);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, no_flush);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.sub_reg_reg(Reg::Rax, Reg::R11);
+        self.asm.shr_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
+        self.asm.shl_reg_imm8(Reg::Rax, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R8, self.gc_evac_top);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::R8, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdx);
+        self.asm.bind_text_label(no_flush);
+        // (1) Free-region pool.
+        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, from_tail);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx); // pop
+        // Zero the reused region.
+        let zero_loop = self.asm.create_text_label();
+        let zero_done = self.asm.create_text_label();
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+        self.asm
+            .add_reg_imm32(Reg::R11, Self::GC_REGION_SIZE as i32);
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.bind_text_label(zero_loop);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::R11);
+        self.asm.jcc_label(Condition::AboveOrEqual, zero_done);
+        self.asm.store_ptr_disp32(Reg::R8, 0, Reg::R9);
+        self.asm.add_reg_imm32(Reg::R8, 8);
+        self.asm.jmp_label(zero_loop);
+        self.asm.bind_text_label(zero_done);
+        self.asm.jmp_label(install);
+        // (2) Commit the next tail region.
+        self.asm.bind_text_label(from_tail);
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        self.asm.mov_data_addr(Reg::R8, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
+        self.asm.add_reg_reg(Reg::R8, Reg::Rcx);
+        self.asm.add_reg_imm32(Reg::Rax, 1);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8); // rax = new base
+        // install: set the evac bump globals (NOT the mutator's).
+        self.asm.bind_text_label(install);
+        self.asm.mov_data_addr(Reg::R10, self.gc_evac_region_base);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.gc_evac_top);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm
+            .add_reg_imm32(Reg::Rcx, Self::GC_REGION_SIZE as i32);
+        self.asm.mov_data_addr(Reg::R10, self.gc_evac_end);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
+        // region_top[newidx] = base (empty until the watermark is flushed).
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.sub_reg_reg(Reg::Rcx, Reg::R10);
+        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.ret();
+    }
+
+    /// Evacuate one object: rdi = user pointer. Returns rax = to-space
+    /// user pointer. Idempotent (follows an existing forwarding word).
+    /// Copies the block into the evacuation bump, installs a forwarding
+    /// word (new_user | FWD) in the old header, and stashes the size in
+    /// the old word1 for the linear relocate walk. Non-recursive: it
+    /// only copies, never allocates through gc_alloc. Preserves the
+    /// reserved color registers.
+    fn emit_gc_evacuate_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_evacuate);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 16); // [rbp-8]=oldP, [rbp-16]=size
+        let copy = self.asm.create_text_label();
+        let epilogue = self.asm.create_text_label();
+        let retry = self.asm.create_text_label();
+        let fits = self.asm.create_text_label();
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdi, -16);
+        // Already forwarded? rax & FWD.
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.and_reg_imm32(Reg::Rcx, Self::GC_FWD as i32);
+        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
+        self.asm.jcc_label(Condition::Equal, copy);
+        self.asm.and_reg_imm32(Reg::Rax, -16); // to-space user ptr
+        self.asm.jmp_label(epilogue);
+        self.asm.bind_text_label(copy);
+        self.asm.store_rbp_slot(8, Reg::Rdi); // oldP
+        self.asm.and_reg_imm32(Reg::Rax, -16); // size S
+        self.asm.store_rbp_slot(16, Reg::Rax);
+        let need_refill = self.asm.create_text_label();
+        self.asm.bind_text_label(retry);
+        self.asm.mov_data_addr(Reg::R10, self.gc_evac_top);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0); // dst = evac_top
+        self.asm.load_rbp_slot(Reg::Rdx, 16); // S
+        self.asm.mov_reg_reg(Reg::R9, Reg::R8);
+        self.asm.add_reg_reg(Reg::R9, Reg::Rdx); // new_top = dst + S
+        self.asm.mov_data_addr(Reg::R10, self.gc_evac_end);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R11);
+        self.asm.jcc_label(Condition::Above, need_refill); // new_top > end
+        self.asm.jmp_label(fits);
+        // Refill to-space (never fails: headroom invariant).
+        self.asm.bind_text_label(need_refill);
+        self.asm.load_rbp_slot(Reg::Rdi, 16); // size
+        self.asm.call_label(self.gc_acquire_evac_region);
+        self.asm.jmp_label(retry);
+        self.asm.bind_text_label(fits);
+        self.asm.mov_data_addr(Reg::R10, self.gc_evac_top);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9); // bump
+        // memcpy S bytes: rsi = oldP-16, rdi = dst (r8), rcx = S.
+        self.asm.load_rbp_slot(Reg::Rsi, 8);
+        self.asm.sub_reg_imm8(Reg::Rsi, 16);
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::R8);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdx);
+        self.asm.rep_movsb(); // clobbers rsi/rdi/rcx; r8 survives
+        // n_user = dst + 16.
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.add_reg_imm32(Reg::Rax, 16);
+        // Install forwarding in the OLD header: [oldP-16] = n_user | FWD.
+        self.asm.load_rbp_slot(Reg::R11, 8); // oldP
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rdx, Self::GC_FWD);
+        self.asm.or_reg_reg(Reg::Rcx, Reg::Rdx);
+        self.asm.store_ptr_disp32(Reg::R11, -16, Reg::Rcx);
+        // [oldP-8] = S (word1, size for the relocate walk).
+        self.asm.load_rbp_slot(Reg::Rcx, 16);
+        self.asm.store_ptr_disp32(Reg::R11, -8, Reg::Rcx);
+        self.asm.bind_text_label(epilogue);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// Fix up all roots at RelocateStart: walk the shadow stack and, for
+    /// each root pointing into a from-space region, evacuate-or-follow so
+    /// the root points at the to-space copy. Roots are raw (uncolored);
+    /// the shadow stack holds slot ADDRESSES, so the rewrite is in place.
+    fn emit_gc_relocate_fix_roots_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_relocate_fix_roots);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 16); // [rbp-8]=cursor, [rbp-16]=end
+        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.store_rbp_slot(8, Reg::R10);
+        self.asm.mov_data_addr(Reg::R8, self.gc_shadow_stack_top);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R8, 0);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.store_rbp_slot(16, Reg::R10);
+        let loop_l = self.asm.create_text_label();
+        let done_l = self.asm.create_text_label();
+        let next_l = self.asm.create_text_label();
+        let do_evac = self.asm.create_text_label();
+        let store_root = self.asm.create_text_label();
+        self.asm.bind_text_label(loop_l);
+        self.asm.load_rbp_slot(Reg::R10, 8);
+        self.asm.load_rbp_slot(Reg::R11, 16);
+        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
+        self.asm.jcc_label(Condition::AboveOrEqual, done_l);
+        // slotaddr = [cursor]; val = [slotaddr].
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rax, 0);
+        self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
+        self.asm.jcc_label(Condition::Equal, next_l);
+        // idx = (val - region_base) >> SHIFT ; from-space?
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.sub_reg_reg(Reg::Rcx, Reg::R10);
+        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_fromspace);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::R11, Reg::R11);
+        self.asm.jcc_label(Condition::Equal, next_l);
+        // val in from-space: new = (word0 & FWD) ? word0 & -16 : evacuate(val)
+        self.asm.load_ptr_disp32(Reg::R11, Reg::Rdi, -16);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R11);
+        self.asm.and_reg_imm32(Reg::Rcx, Self::GC_FWD as i32);
+        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
+        self.asm.jcc_label(Condition::Equal, do_evac);
+        self.asm.and_reg_imm32(Reg::R11, -16);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R11); // new
+        self.asm.jmp_label(store_root);
+        self.asm.bind_text_label(do_evac);
+        self.asm.call_label(self.gc_evacuate); // rdi = val -> rax = to-space
+        self.asm.bind_text_label(store_root);
+        // [slotaddr] = new. slotaddr was clobbered by the call; reload it.
+        self.asm.load_rbp_slot(Reg::R10, 8);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0); // slotaddr
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.bind_text_label(next_l);
+        self.asm.load_rbp_slot(Reg::R10, 8);
+        self.asm.add_reg_imm32(Reg::R10, 8);
+        self.asm.store_rbp_slot(8, Reg::R10);
+        self.asm.jmp_label(loop_l);
+        self.asm.bind_text_label(done_l);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// One incremental relocation quantum: rdi = byte budget. Linearly
+    /// walks the from-space regions (cursor in gc_reloc_scan_idx/block),
+    /// evacuating each live, not-yet-forwarded block, until the budget is
+    /// spent or all from-space is drained -> gc_relocate_finish.
+    fn emit_gc_relocate_quantum_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_relocate_quantum);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 32); // 8=budget,16=cur,24=top
+        self.asm.store_rbp_slot(8, Reg::Rdi);
+        let region_scan = self.asm.create_text_label();
+        let block_loop = self.asm.create_text_label();
+        let advance_region = self.asm.create_text_label();
+        let not_fwd = self.asm.create_text_label();
+        let after_block = self.asm.create_text_label();
+        let saved_cur = self.asm.create_text_label();
+        self.asm.bind_text_label(region_scan);
+        // idx = gc_reloc_scan_idx; if idx >= committed -> finish.
+        self.asm.mov_data_addr(Reg::R10, self.gc_reloc_scan_idx);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::R11);
+        self.asm.jcc_label(Condition::AboveOrEqual, saved_cur);
+        // fromspace[idx]? if not, advance to next region.
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_fromspace);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::R11, Reg::R11);
+        self.asm.jcc_label(Condition::Equal, advance_region);
+        // base = region_base + (idx << SHIFT) ; top = region_top[idx].
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.add_reg_reg(Reg::Rcx, Reg::R10); // base
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::R8, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::R8);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0); // top
+        self.asm.store_rbp_slot(24, Reg::R8);
+        // cur = gc_reloc_block; if 0 use base.
+        self.asm.mov_data_addr(Reg::R10, self.gc_reloc_block);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        let have_cur = self.asm.create_text_label();
+        self.asm.jcc_label(Condition::NotEqual, have_cur);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rcx); // cur = base
+        self.asm.bind_text_label(have_cur);
+        self.asm.store_rbp_slot(16, Reg::Rax);
+        self.asm.bind_text_label(block_loop);
+        self.asm.load_rbp_slot(Reg::Rax, 16); // cur
+        self.asm.load_rbp_slot(Reg::R8, 24); // top
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.jcc_label(Condition::AboveOrEqual, advance_region);
+        // budget <= 0 ? save cur and return.
+        self.asm.load_rbp_slot(Reg::Rcx, 8);
+        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
+        self.asm.jcc_label(Condition::Equal, saved_cur);
+        self.asm.cmp_reg_imm8(Reg::Rcx, 0);
+        self.asm.jcc_label(Condition::Less, saved_cur);
+        // word0 = [cur].
+        self.asm.load_ptr_disp32(Reg::R11, Reg::Rax, 0);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R11);
+        self.asm.and_reg_imm32(Reg::Rcx, Self::GC_FWD as i32);
+        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
+        self.asm.jcc_label(Condition::Equal, not_fwd);
+        // Forwarded: size from word1 = [cur+8].
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rax, 8);
+        self.asm.jmp_label(after_block);
+        self.asm.bind_text_label(not_fwd);
+        // size = word0 & -16.
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R11);
+        self.asm.and_reg_imm32(Reg::Rcx, -16);
+        // live? (word0 & current mark bit)
+        self.asm.mov_data_addr(Reg::R10, self.gc_header_mark);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::R11, Reg::R8);
+        self.asm.jcc_label(Condition::Equal, after_block);
+        // Live: evacuate(cur+16). Preserve cur/size in slots; the call
+        // clobbers rax/rcx/etc. budget -= size.
+        self.asm.store_rbp_slot(16, Reg::Rax); // (cur unchanged, keep)
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+        self.asm.add_reg_imm32(Reg::Rdi, 16); // user ptr
+        // stash size in a callee-preserved-ish slot before the call.
+        self.asm.push_reg(Reg::Rcx); // size (16-byte align: one push, then call — realign)
+        self.asm.push_reg(Reg::Rcx); // pad to keep rsp 16-aligned
+        self.asm.call_label(self.gc_evacuate);
+        self.asm.pop_reg(Reg::Rcx);
+        self.asm.pop_reg(Reg::Rcx); // rcx = size
+        // budget -= size
+        self.asm.load_rbp_slot(Reg::Rax, 8);
+        self.asm.sub_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.store_rbp_slot(8, Reg::Rax);
+        self.asm.bind_text_label(after_block);
+        // cur += size (rcx). Reload cur, advance, store.
+        self.asm.load_rbp_slot(Reg::Rax, 16);
+        self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.store_rbp_slot(16, Reg::Rax);
+        self.asm.jmp_label(block_loop);
+        self.asm.bind_text_label(advance_region);
+        // gc_reloc_scan_idx++ ; gc_reloc_block = 0 ; rescan.
+        self.asm.mov_data_addr(Reg::R10, self.gc_reloc_scan_idx);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.add_reg_imm32(Reg::Rax, 1);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.gc_reloc_block);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.jmp_label(region_scan);
+        self.asm.bind_text_label(saved_cur);
+        // Save the block cursor for resumption. If we fell here from the
+        // region-scan-done path (idx>=committed), cur slot may be stale;
+        // gc_relocate_finish is called only when idx>=committed.
+        self.asm.mov_data_addr(Reg::R10, self.gc_reloc_scan_idx);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::R11);
+        let just_save = self.asm.create_text_label();
+        self.asm.jcc_label(Condition::Below, just_save);
+        self.asm.call_label(self.gc_relocate_finish);
+        self.asm.leave();
+        self.asm.ret();
+        self.asm.bind_text_label(just_save);
+        self.asm.load_rbp_slot(Reg::Rax, 16);
+        self.asm.mov_data_addr(Reg::R10, self.gc_reloc_block);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// Finish relocation: flush the final evacuation watermark and return
+    /// to Idle. From-space regions stay flagged (freed at the next
+    /// MarkEnd, once the next mark confirms nothing references them).
+    fn emit_gc_relocate_finish_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_relocate_finish);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        // Flush the final to-space region's watermark.
+        self.asm.mov_data_addr(Reg::R10, self.gc_evac_region_base);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        let no_flush = self.asm.create_text_label();
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, no_flush);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.sub_reg_reg(Reg::Rax, Reg::R11);
+        self.asm.shr_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
+        self.asm.shl_reg_imm8(Reg::Rax, 3);
+        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+        self.asm.add_reg_reg(Reg::R10, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R8, self.gc_evac_top);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::R8, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdx);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.mov_data_addr(Reg::R10, self.gc_evac_region_base);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.bind_text_label(no_flush);
+        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
+        self.asm.mov_imm64(Reg::Rax, Self::GC_PHASE_IDLE);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.gc_bytes_since_cycle);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// RelocateStart. STEP 2: evacuation is not yet activated, so this
+    /// just closes the collection cycle exactly as MarkEnd did in M6
+    /// (phase -> Idle, reset the proactive counter). The activation step
+    /// rewrites this to select from-space regions, fix up roots, and
+    /// enter the Relocate phase.
+    fn emit_gc_relocate_start_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_relocate_start);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
+        self.asm.mov_imm64(Reg::Rax, Self::GC_PHASE_IDLE);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.gc_bytes_since_cycle);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.leave();
         self.asm.ret();
     }
 
