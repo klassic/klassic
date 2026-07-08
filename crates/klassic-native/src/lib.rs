@@ -39139,28 +39139,71 @@ impl NativeCodeGenerator {
     /// the bad mask and takes the fast path).
     fn emit_gc_load_barrier_slow_runtime(&mut self) {
         self.asm.bind_text_label(self.gc_load_barrier_slow);
-        self.asm.and_reg_reg(Reg::Rax, Reg::R13); // strip -> raw
+        self.asm.and_reg_reg(Reg::Rax, Reg::R13); // strip -> raw P
+        let healed = self.asm.create_text_label();
+        let not_fwd = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        // Follow forwarding: if P's header is a forwarding word, P is a
+        // ghost -- redirect rax to the to-space copy. Covers a load that
+        // reaches a not-yet-freed ghost in any phase. Inert while evac is
+        // off (FWD never set). Uses `bt` so the FWD test needs no scratch
+        // register -- the slow path must preserve every caller-saved
+        // register in the Idle path (its M5/M6 clobber set was rax/r10/
+        // r11 only), or callers holding a live value across an
+        // Idle-phase barriered load would be corrupted.
+        self.asm.load_ptr_disp32(Reg::R11, Reg::Rax, -16);
+        self.asm.bt_reg_imm8(Reg::R11, 0); // CF = FWD bit
+        self.asm.jcc_label(Condition::AboveOrEqual, not_fwd); // CF clear
+        self.asm.and_reg_imm32(Reg::R11, -16); // to-space user ptr
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
+        self.asm.jmp_label(healed);
+        self.asm.bind_text_label(not_fwd);
+        // Relocate: evacuate-on-demand. If P is in a from-space region,
+        // copy it now and follow the fresh forwarding word. Non-recursive
+        // (gc_evacuate only copies into the to-space bump). r10 (the field
+        // address) must be preserved through the self-heal, so the phase
+        // is read via r11 -- NOT r10, which still holds the field address.
+        self.asm.mov_data_addr(Reg::R11, self.gc_phase);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R11, 0);
+        self.asm
+            .cmp_reg_imm8(Reg::R11, Self::GC_PHASE_RELOCATE as i8);
+        self.asm.jcc_label(Condition::NotEqual, healed);
+        // idx = (P - region_base) >> SHIFT ; from-space?
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R11, self.gc_region_base);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R11, 0);
+        self.asm.sub_reg_reg(Reg::Rcx, Reg::R11);
+        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+        self.asm.shl_reg_imm8(Reg::Rcx, 3);
+        self.asm.mov_data_addr(Reg::R11, self.gc_region_fromspace);
+        self.asm.add_reg_reg(Reg::R11, Reg::Rcx);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R11, 0);
+        self.asm.test_reg_reg(Reg::R11, Reg::R11);
+        self.asm.jcc_label(Condition::Equal, healed);
+        // Preserve the field address r10 across the evacuation call
+        // (16-byte aligned: two pushes).
+        self.asm.push_reg(Reg::R10);
+        self.asm.push_reg(Reg::R10);
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+        self.asm.call_label(self.gc_evacuate); // rax = to-space
+        self.asm.pop_reg(Reg::R10);
+        self.asm.pop_reg(Reg::R10);
+        self.asm.bind_text_label(healed);
+        // Self-heal: write the good-colored (remapped) pointer back to the
+        // slot. r10 = the field address, carried from the barrier fast
+        // path (and preserved across gc_evacuate above).
         self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
         self.asm.or_reg_reg(Reg::R11, Reg::R14); // recolor to good
-        // Self-heal: write the good-colored pointer back to the slot the
-        // value was loaded from. r10 (the field address) is carried in
-        // from the barrier fast path. M7 WARNING: this is only valid
-        // because M5/M6 are non-moving, so the healed pointer's address
-        // is unchanged. Once relocation lands, the slow path must
-        // evacuate first and store the FORWARDED address.
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11); // self-heal
-        // M6 phase branch. During Mark, the mutator has just loaded a raw
-        // pointer into a register, so it must be marked to keep the
-        // strong tricolor invariant (load-barrier-driven incremental
-        // update). During Idle, the slow path only heals (M5 behavior).
-        // Inert until the driver flips the phase to Mark. rax (the raw
+        // During Mark, the mutator has just loaded a raw pointer into a
+        // register, so it must be marked to keep the strong tricolor
+        // invariant (load-barrier-driven incremental update). rax (the raw
         // result) is preserved across the mark call; the only caller has
         // just rax live, so the wider clobber set is safe.
-        let done = self.asm.create_text_label();
         self.asm.mov_data_addr(Reg::R10, self.gc_phase);
         self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::R11, Reg::R11);
-        self.asm.jcc_label(Condition::Equal, done);
+        self.asm.cmp_reg_imm8(Reg::R11, Self::GC_PHASE_MARK as i8);
+        self.asm.jcc_label(Condition::NotEqual, done);
         self.asm.push_reg(Reg::Rax);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.call_label(self.gc_mark_visit);
@@ -42935,6 +42978,18 @@ impl Assembler {
         self.rex_w(Reg::Rbx, reg);
         self.byte(0xf7);
         self.modrm(3, reg as u8);
+    }
+
+    /// `bt reg, imm8` -- copy bit `imm` of `reg` into CF, leaving every
+    /// general register unchanged (only flags move). Encoded as
+    /// REX.W 0F BA /4 ib. Use with jcc(Below)=CF set / jcc(AboveOrEqual)=
+    /// CF clear to branch on a single bit without a scratch register.
+    fn bt_reg_imm8(&mut self, reg: Reg, bit: u8) {
+        self.rex_w(Reg::Rax, reg); // reg-field placeholder (no REX.R); REX.B if reg>=8
+        self.byte(0x0f);
+        self.byte(0xba);
+        self.modrm(4, reg as u8); // /4 opcode extension
+        self.byte(bit);
     }
 
     fn cmp_reg_reg(&mut self, lhs: Reg, rhs: Reg) {
