@@ -10,6 +10,10 @@ pub struct ExecutionConfig {
     /// `--backend c`: `build` emits a portable C translation unit at
     /// the output path instead of a direct ELF executable.
     pub c_backend: bool,
+    /// `--backend llvm`: `build` emits LLVM IR and compiles it with
+    /// clang (migration plan `docs/llvm-backend-plan.md`). An output
+    /// ending in `.ll` writes the IR instead of an executable.
+    pub llvm_backend: bool,
     /// True when `--target` was given on the command line. Hosts with
     /// no direct native backend (e.g. macOS) route a target-less
     /// `build` through the portable C backend instead of silently
@@ -35,6 +39,7 @@ impl ExecutionConfig {
             warn_trust,
             native_target,
             c_backend: false,
+            llvm_backend: false,
             explicit_target: false,
             gc_log: false,
             gc_stress: false,
@@ -87,6 +92,7 @@ pub enum CommandLineError {
 pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineError> {
     let mut deny_trust = false;
     let mut c_backend = false;
+    let mut llvm_backend = false;
     let mut warn_trust = false;
     let mut native_target = NativeTarget::default();
     let mut explicit_target = false;
@@ -133,10 +139,11 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
                 let Some(backend) = args.get(index + 1) else {
                     return Err(CommandLineError::UnknownBackend(String::new()));
                 };
-                if backend != "c" {
-                    return Err(CommandLineError::UnknownBackend(backend.clone()));
+                match backend.as_str() {
+                    "c" => c_backend = true,
+                    "llvm" => llvm_backend = true,
+                    _ => return Err(CommandLineError::UnknownBackend(backend.clone())),
                 }
-                c_backend = true;
                 index += 2;
             }
             "--target" => {
@@ -167,6 +174,7 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
 
     let mut config = ExecutionConfig::new(deny_trust, warn_trust, native_target);
     config.c_backend = c_backend;
+    config.llvm_backend = llvm_backend;
     config.explicit_target = explicit_target;
     config.gc_log = gc_log;
     config.gc_stress = gc_stress;
@@ -209,6 +217,7 @@ pub fn usage() -> String {
        --warn-trust       : warn when trusted proofs are used\n\
        --target <target>  : native build target (supported: {})\n\
        --backend c        : `build` emits a portable C translation unit instead of an ELF executable\n\
+       --backend llvm     : `build` emits LLVM IR and compiles it with clang (>= 15); an .ll output writes the IR\n\
        <fileName>         : read a program from <fileName> and execute it\n\
        run <fileName>     : same as <fileName>; pairs naturally with `-- <args>`\n\
        -e <expression>    : evaluate <expression>\n\
