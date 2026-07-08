@@ -6,6 +6,80 @@ collector in C (clang-compiled). This is the M0 survey + complete plan;
 it contains no implementation code and plays the same role
 `docs/zgc-plan.md` played for the GC work.
 
+## Progress
+
+- **M0 (this plan)** — merged (#585).
+- **M1 (toolchain + skeleton)** — merged (#586). `--backend llvm` emits
+  textual LLVM IR (opaque-pointer, LLVM >= 15) and drives it through
+  clang, reusing the C backend's link machinery; a minimal emitter
+  lowers `println(<integer expression>)` end-to-end (byte-identical to
+  the evaluator). Dev toolchain bumped to clang-15.
+- **M2 (barrier feasibility spike)** — DONE (see findings below). The #1
+  technical risk is resolved: the ZGC load barrier is expressible in
+  LLVM IR, tight, and correct under `clang -O2`, using `dso_local` global
+  mask cells instead of reserved registers.
+
+## M2 findings — the barrier is feasible in LLVM IR
+
+The spike (`spikes/m2-barrier/`, re-runnable via `run.sh`) hand-writes the
+barrier fast path in `.ll`, links it against a C GC stub, and drives it
+with an adversarial test that produces wrong output if `clang -O2` breaks
+the barrier. Results (clang 15.0.7):
+
+- **Correctness holds under -O2.** The raw pointer returned by strip is
+  always correct; the self-heal store sticks (a repeated load of the same
+  slot fast-paths after the first heal — `slow_calls == 1`, so no illegal
+  CSE of the slot load across the slow-path call); `--gc-poison`-style
+  `bad_mask = COLOR_MASK` forces every load through the slow path
+  (`slow_calls == 3`, no fast-path hoist).
+- **Moving is safe.** With a forwarding slow path (returns the to-space
+  address and self-heals the slot to it), two barriered loads of the same
+  slot in ONE function return the to-space address on the second load —
+  clang does not CSE the load back to the stale from-space pointer. (This
+  held even when the slow path was wrongly marked `readnone`, but the
+  emitted IR will use the default memory semantics to *guarantee* it
+  rather than rely on the optimizer's choice.)
+- **The fast path is tight with `dso_local` masks.** Emitting the mask
+  cells as `dso_local` globals (klassic owns them in its module) makes
+  clang fold the bad-mask load into the test as a RIP-relative memory
+  operand: `movq (%rdi),%rax; testq %rax, gc_bad_mask(%rip); je`. That is
+  essentially the reserved-register version's `test rax,r15; jz`, at L1
+  cost — so **the `-ffixed-r13/r14/r15` reserved-register optimization is
+  unnecessary** (dropped; it was arch-specific and fragile). Strip stays
+  a `dso_local` global too (folds into `andq mask(%rip),%rax`, tighter
+  than materializing the 64-bit immediate).
+- **`addrspace(1)` provenance compiles clean** with `ptrtoint`/`inttoptr`
+  around the i64 mask math (colored pointers are non-canonical i64, so
+  heap slots are carried as i64 and only `inttoptr`'d at deref).
+
+**Decisions locked for M7 (heap + barrier):** mask cells are `dso_local`
+globals loaded in the fast path (no reserved registers); the barrier fast
+path is `load; test&mask; br slow/ok; phi; strip`; the slow-path call
+keeps default (read/write) memory semantics so CSE across it is
+forbidden; GC pointers are `addrspace(1)` carried as i64 for mask math.
+
+## Validated barrier IR pattern
+
+```llvm
+@gc_bad_mask   = dso_local global i64 0
+@gc_strip_mask = dso_local global i64 0
+declare i64 @gc_load_barrier_slow(i64, ptr)   ; default memory semantics — NOT readnone
+
+; %slot is the field address; returns the raw (stripped, remapped) pointer as i64.
+%v   = load i64, ptr %slot
+%bm  = load i64, ptr @gc_bad_mask
+%bad = and i64 %v, %bm
+%isb = icmp ne i64 %bad, 0
+br i1 %isb, label %slow, label %ok
+slow:
+  %healed = call i64 @gc_load_barrier_slow(i64 %v, ptr %slot)
+  br label %ok
+ok:
+  %val = phi i64 [ %v, %prev ], [ %healed, %slow ]
+  %sm  = load i64, ptr @gc_strip_mask
+  %raw = and i64 %val, %sm
+```
+
 ## Motivation
 
 The just-completed ZGC-style collector (`docs/zgc-plan.md`, milestones
