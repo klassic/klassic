@@ -21218,6 +21218,32 @@ fn native_gc_pointer_identity_survives_move() {
     }
 }
 
+/// M8: pause-time regression tripwire. The incremental collector's
+/// stop-the-world pauses (MarkStart's root scan, MarkEnd's final drain +
+/// sweep) are meant to stay small and roughly independent of heap size.
+/// This is NOT a benchmark: it asserts only a generous upper bound so a
+/// gross regression (e.g. an accidentally-stop-the-world mark, or a pause
+/// that scales with live data) trips it, while normal timing variation on
+/// slow CI does not. A churn workload over hundreds of thousands of
+/// allocations here reports a max pause on the order of 100us; the bound
+/// is 250ms.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_pause_stays_bounded() {
+    let (stdout, stderr) = build_and_run_gc_program(GC_CHURN_PROGRAM, &["--gc-log"]);
+    assert_eq!(stdout, "50000\n");
+    let max_pause = stderr
+        .split(" max_pause_ns=")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("stats line should contain a max_pause_ns");
+    assert!(
+        max_pause < 250_000_000,
+        "GC pause regressed past the 250ms tripwire (max_pause_ns={max_pause})"
+    );
+}
+
 /// M4: an all-live per-frame allocation graph deeper than the initial
 /// 8-region (1 MiB) budget forces the allocator's stall path -- the
 /// collector frees nothing, so gc_grow_budget doubles the soft budget
