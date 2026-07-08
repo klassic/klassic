@@ -39225,13 +39225,21 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::R11, Reg::R11, 0);
         self.asm.test_reg_reg(Reg::R11, Reg::R11);
         self.asm.jcc_label(Condition::Equal, healed);
-        // Preserve the field address r10 across the evacuation call
-        // (16-byte aligned: two pushes).
+        // Preserve across the evacuation call the registers the Idle/Mark
+        // slow path leaves untouched but gc_evacuate clobbers: r10 (the
+        // field address, needed for the self-heal), and rdx/rsi (which a
+        // pointer-typed barriered read preserves in every other phase, so
+        // a caller may hold a live value in them). Four pushes keep rsp
+        // 16-aligned; r11 is a throwaway pad (recomputed at the self-heal).
         self.asm.push_reg(Reg::R10);
-        self.asm.push_reg(Reg::R10);
+        self.asm.push_reg(Reg::Rdx);
+        self.asm.push_reg(Reg::Rsi);
+        self.asm.push_reg(Reg::R11);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.call_label(self.gc_evacuate); // rax = to-space
-        self.asm.pop_reg(Reg::R10);
+        self.asm.pop_reg(Reg::R11);
+        self.asm.pop_reg(Reg::Rsi);
+        self.asm.pop_reg(Reg::Rdx);
         self.asm.pop_reg(Reg::R10);
         self.asm.bind_text_label(healed);
         // Self-heal: write the good-colored (remapped) pointer back to the
@@ -39643,10 +39651,24 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(zero_loop);
         self.asm.bind_text_label(zero_done);
         self.asm.jmp_label(install);
-        // (2) Commit the next tail region.
+        // (2) Commit the next tail region. Hard safety net: never commit
+        // past the reservation. The headroom cap in gc_relocate_start
+        // makes this unreachable (selected live bytes fit in
+        // free_regions-2 even at ~50% packing), but an out-of-bounds
+        // to-space write would be silent memory corruption, so abort
+        // cleanly instead if the accounting is ever wrong.
         self.asm.bind_text_label(from_tail);
         self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        let evac_ok = self.asm.create_text_label();
+        self.asm
+            .cmp_reg_imm32(Reg::Rax, Self::GC_RESERVE_REGIONS as i32);
+        self.asm.jcc_label(Condition::Below, evac_ok);
+        let msg = b"klassic gc: evacuation exhausted the heap reservation\n";
+        let txt = self.asm.data_label_with_bytes(msg);
+        self.emit_write_data(self.platform.stderr_fd(), txt, msg.len());
+        self.emit_exit_code(1);
+        self.asm.bind_text_label(evac_ok);
         self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
         self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
         self.asm.mov_data_addr(Reg::R8, self.gc_region_base);
@@ -39707,6 +39729,23 @@ impl NativeCodeGenerator {
         self.asm.store_rbp_slot(8, Reg::Rdi); // oldP
         self.asm.and_reg_imm32(Reg::Rax, -16); // size S
         self.asm.store_rbp_slot(16, Reg::Rax);
+        // An object that does not fit one to-space region can never be
+        // evacuated (the refill loop below would spin forever). Selection
+        // guarantees this never happens (large objects are excluded and
+        // from-space objects are < REGION_SIZE/2), so treat it as an
+        // invariant violation and abort cleanly rather than hang.
+        let evac_size_ok = self.asm.create_text_label();
+        let evac_oversized = self.asm.create_text_label();
+        self.asm
+            .cmp_reg_imm32(Reg::Rax, Self::GC_REGION_SIZE as i32);
+        self.asm.jcc_label(Condition::Above, evac_oversized);
+        self.asm.jmp_label(evac_size_ok);
+        self.asm.bind_text_label(evac_oversized);
+        let msg = b"klassic gc: evacuation object exceeds a region\n";
+        let txt = self.asm.data_label_with_bytes(msg);
+        self.emit_write_data(self.platform.stderr_fd(), txt, msg.len());
+        self.emit_exit_code(1);
+        self.asm.bind_text_label(evac_size_ok);
         let need_refill = self.asm.create_text_label();
         self.asm.bind_text_label(retry);
         self.asm.mov_data_addr(Reg::R10, self.gc_evac_top);
@@ -40049,7 +40088,15 @@ impl NativeCodeGenerator {
             self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
             self.asm.sub_reg_reg(Reg::Rax, Reg::R11);
             self.asm.add_reg_reg(Reg::Rax, Reg::Rcx); // rax = free_regions
-            // cap_bytes = (free_regions >= 2) ? (free_regions-2)<<SHIFT : 0
+            // cap_bytes = (free_regions >= 2) ? (free_regions-2)<<(SHIFT-1)
+            // : 0. The cap bounds evacuated LIVE BYTES, but evacuation
+            // consumes whole to-space REGIONS by bump-packing, and packing
+            // sparse mid-size objects wastes space (an object just over
+            // REGION_SIZE/3 packs 2 per region ~= 67% efficiency). Using
+            // half the free bytes as the cap keeps the region count within
+            // free_regions-2 even at ~50% packing, so gc_acquire_evac_
+            // region can always satisfy an evacuation without running past
+            // the reservation.
             let have_cap = self.asm.create_text_label();
             let store_cap = self.asm.create_text_label();
             self.asm.cmp_reg_imm8(Reg::Rax, 2);
@@ -40058,7 +40105,7 @@ impl NativeCodeGenerator {
             self.asm.jmp_label(store_cap);
             self.asm.bind_text_label(have_cap);
             self.asm.sub_reg_imm8(Reg::Rax, 2);
-            self.asm.shl_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
+            self.asm.shl_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT - 1);
             self.asm.bind_text_label(store_cap);
             self.asm.store_rbp_slot(24, Reg::Rax); // cap_bytes
             // cur_bump_idx = (heap_base - region_base) >> SHIFT.
