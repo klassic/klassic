@@ -23,49 +23,86 @@ it contains no implementation code and plays the same role
 
 The spike (`spikes/m2-barrier/`, re-runnable via `run.sh`) hand-writes the
 barrier fast path in `.ll`, links it against a C GC stub, and drives it
-with an adversarial test that produces wrong output if `clang -O2` breaks
-the barrier. Results (clang 15.0.7):
+with adversarial tests that produce wrong output if `clang -O2` breaks the
+barrier. Results (clang 15.0.7). An independent review sharpened these —
+the IR *pattern* is sound, but the moving-safety *guarantee* rests on four
+emission disciplines the pattern alone does not encode.
 
-- **Correctness holds under -O2.** The raw pointer returned by strip is
-  always correct; the self-heal store sticks (a repeated load of the same
-  slot fast-paths after the first heal — `slow_calls == 1`, so no illegal
-  CSE of the slot load across the slow-path call); `--gc-poison`-style
-  `bad_mask = COLOR_MASK` forces every load through the slow path
-  (`slow_calls == 3`, no fast-path hoist).
-- **Moving is safe.** With a forwarding slow path (returns the to-space
-  address and self-heals the slot to it), two barriered loads of the same
-  slot in ONE function return the to-space address on the second load —
-  clang does not CSE the load back to the stale from-space pointer. (This
-  held even when the slow path was wrongly marked `readnone`, but the
-  emitted IR will use the default memory semantics to *guarantee* it
-  rather than rely on the optimizer's choice.)
-- **The fast path is tight with `dso_local` masks.** Emitting the mask
-  cells as `dso_local` globals (klassic owns them in its module) makes
-  clang fold the bad-mask load into the test as a RIP-relative memory
-  operand: `movq (%rdi),%rax; testq %rax, gc_bad_mask(%rip); je`. That is
-  essentially the reserved-register version's `test rax,r15; jz`, at L1
-  cost — so **the `-ffixed-r13/r14/r15` reserved-register optimization is
-  unnecessary** (dropped; it was arch-specific and fragile). Strip stays
-  a `dso_local` global too (folds into `andq mask(%rip),%rax`, tighter
-  than materializing the 64-bit immediate).
+- **The fast path is tight, and the `-ffixed` reserved-register trick is
+  unnecessary.** With the mask cells `dso_local`, clang folds the bad-mask
+  load into the test as a RIP-relative memory operand:
+  `movq (%rdi),%rax; testq %rax, gc_bad_mask(%rip); je` — essentially the
+  reserved-register `test rax,r15; jz` at L1 cost. Verified to survive PIE
+  (the distro default) and static linking; **plain `external` without
+  `dso_local` silently degrades to a GOT-indirected load** (still correct,
+  one extra indirection). So masks are emitted `external dso_local`.
+- **Correctness holds under -O2.** Strip always returns the right raw
+  pointer; the self-heal store sticks (a repeated load fast-paths after
+  the first heal, `slow_calls == 1`); `--gc-poison`-style
+  `bad_mask = COLOR_MASK` forces every load slow (`slow_calls == 3`).
+- **Moving safety needs a codegen discipline, not just an attribute.** The
+  review's key catch: two-barriered-loads tests that re-remap to the SAME
+  to-space address cannot fail regardless of CSE, so they prove nothing
+  about the guarantee. The discriminating test (`reuse_wrong.ll` vs
+  `reuse_correct.ll`) is: **reuse a stripped pointer across a relocating
+  safepoint.** Reusing it returns the stale from-space address (a UAF once
+  the ghost is freed); re-barriering the field read after the safepoint
+  returns the to-space address. No memory attribute prevents the reuse
+  case — the IR literally says "use the old value" — so this is a frontend
+  obligation (the LLVM form of `zgc-plan.md`'s "no raw temporaries across
+  GC points").
 - **`addrspace(1)` provenance compiles clean** with `ptrtoint`/`inttoptr`
-  around the i64 mask math (colored pointers are non-canonical i64, so
-  heap slots are carried as i64 and only `inttoptr`'d at deref).
+  around the i64 mask math, but colored pointers are non-canonical, so
+  heap slots are carried as **plain i64** and an `addrspace(1)` pointer is
+  formed only from a stripped/canonical value at the actual deref — never
+  tagged while colored (which could invite a dereferenceability/speculation
+  miscompile).
 
-**Decisions locked for M7 (heap + barrier):** mask cells are `dso_local`
-globals loaded in the fast path (no reserved registers); the barrier fast
-path is `load; test&mask; br slow/ok; phi; strip`; the slow-path call
-keeps default (read/write) memory semantics so CSE across it is
-forbidden; GC pointers are `addrspace(1)` carried as i64 for mask math.
+### Four disciplines M7 must follow (the guarantee lives here, not in the pattern)
+
+1. **Default `memory(readwrite)` on every GC-triggering runtime function**
+   — `gc_load_barrier_slow` AND `gc_alloc` AND anything that can collect or
+   relocate. Never `readonly`/`readnone`/`memory(none)`, and never
+   `argmemonly` for `gc_alloc` (it is not passed the slots it relocates, so
+   argmemonly would let clang CSE loads across it). This forbids CSE of a
+   slot load across a safepoint.
+2. **One barriered load per source-level heap-field read; never reuse a
+   stripped pointer across a call/alloc/safepoint.** This is the frontend
+   codegen obligation above — invisible to every optimizer knob. The
+   hand-emitted backend gets it for free by re-emitting load+barrier at
+   each field read; the LLVM emitter must preserve exactly that.
+   `--gc-stress` (collect on every alloc) turns any violation deterministic
+   and is the M7 audit tool.
+3. **Masks `external dso_local` in generated modules, defined once in the C
+   GC** (`libklassic_gc.a` seeds and flips them each phase). Defining them
+   in the `.ll` too is a multiple-definition link error.
+4. **No `!invariant.load` / `!dereferenceable` / `!nonnull` on barriered
+   loads** (that metadata re-licenses the CSE/speculation the discipline
+   prevents), and **keep the self-heal store inside the C
+   `gc_load_barrier_slow`** — do not open-code it into the IR — so the
+   multi-thread store→CAS upgrade (`zgc-plan.md` thread-readiness) stays
+   localized to the C runtime.
+
+**Strip mask:** `~COLOR_MASK` never changes; emit it as a compile-time
+immediate (`and i64 %val, -8070450532247928833`), or as a const-initialized
+`dso_local` global — never a zero-then-seeded cell (an early barrier would
+strip to null). **CI (before M7 emits the real barrier):** run the
+discriminating `reuse` test — not a same-address two-load test — across
+each pinned clang major (15/16/17/18), at `-O2` and `-O3`, and under
+`-flto` if the C runtime is LTO'd (LTO is where the barrier/alloc bodies
+become inline-visible and CSE hazards are most likely).
 
 ## Validated barrier IR pattern
 
 ```llvm
-@gc_bad_mask   = dso_local global i64 0
-@gc_strip_mask = dso_local global i64 0
+; Masks are DECLARED external here and DEFINED once in libklassic_gc.a.
+@gc_bad_mask   = external dso_local global i64
+@gc_strip_mask = external dso_local global i64
 declare i64 @gc_load_barrier_slow(i64, ptr)   ; default memory semantics — NOT readnone
 
 ; %slot is the field address; returns the raw (stripped, remapped) pointer as i64.
+; Re-emit this whole sequence at EACH source-level field read — never cache %raw
+; across a call/alloc/safepoint (discipline 2).
 %v   = load i64, ptr %slot
 %bm  = load i64, ptr @gc_bad_mask
 %bad = and i64 %v, %bm
@@ -224,18 +261,20 @@ slow:
   br label %ok
 ok:
   %val = phi i64 [ %v, %e ], [ %healed, %slow ]
-  %raw = and i64 %val, -16140901064495857665   ; strip = ~COLOR_MASK, an immediate
+  %raw = and i64 %val, -8070450532247928833   ; strip = ~COLOR_MASK (~(7<<60)), an immediate
 ```
 
+(This sketch predates the M2 spike; see "M2 findings" above for the
+validated pattern and the four disciplines — masks `external dso_local`
+defined once in the C GC, strip as the immediate shown here.)
 `@gc_strip_mask` is a true constant → an IR immediate; only the bad mask
-needs a load. Attribute `@gc_bad_mask` so clang cannot illegally hoist/CSE
-the load or the color test across the self-healing slow-path call (the
-call is not `readnone`; the slot store clobbers). **Optional perf lever
-(measure, don't assume):** compile both the `.ll` and the C runtime with
-`-ffixed-r13/-r14/-r15` and access masks via named-register globals,
-restoring the reserved-register fast path — x86_64-specific and fragile,
-kept behind the global-cell baseline and decided by the M2 measurement,
-never a correctness dependency.
+needs a load. The slow-path call keeps default (read/write) memory
+semantics so clang cannot illegally hoist/CSE the load or the color test
+across the self-healing store. **The `-ffixed-r13/-r14/-r15`
+reserved-register lever was considered but dropped:** M2 showed the
+`dso_local` global-cell fast path already folds the bad-mask load into the
+`testq` memory operand, matching the reserved-register version at L1 cost,
+without the arch-specific fragility.
 
 **LLVM GC infrastructure — surveyed and mostly rejected.** `gc.statepoint`
 / `gc.relocate` / `RewriteStatepointsForGC` is LLVM's real relocating-GC
