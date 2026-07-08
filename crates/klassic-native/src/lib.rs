@@ -4355,6 +4355,7 @@ struct NativeCodeGenerator {
     gc_evac_end: DataLabel,
     gc_reloc_scan_idx: DataLabel,
     gc_reloc_block: DataLabel,
+    gc_relocated_count: DataLabel,
     gc_collect_counter: DataLabel,
     /// `--gc-log` statistics cells (all `.data` i64, initialised 0):
     /// total allocations, total payload+header bytes handed out, and
@@ -4615,6 +4616,7 @@ impl NativeCodeGenerator {
         let gc_evac_end = asm.data_label_with_i64s(&[0]);
         let gc_reloc_scan_idx = asm.data_label_with_i64s(&[0]);
         let gc_reloc_block = asm.data_label_with_i64s(&[0]);
+        let gc_relocated_count = asm.data_label_with_i64s(&[0]);
         let gc_collect_counter = asm.data_label_with_i64s(&[0]);
         let gc_alloc_count = asm.data_label_with_i64s(&[0]);
         let gc_bytes_allocated = asm.data_label_with_i64s(&[0]);
@@ -4774,6 +4776,7 @@ impl NativeCodeGenerator {
             gc_evac_end,
             gc_reloc_scan_idx,
             gc_reloc_block,
+            gc_relocated_count,
             gc_collect_counter,
             gc_alloc_count,
             gc_bytes_allocated,
@@ -4784,10 +4787,10 @@ impl NativeCodeGenerator {
             gc_log: false,
             gc_stress: false,
             gc_poison: false,
-            // Evacuation stays off until the activation step wires the
-            // Relocate phase; until then the moving machinery is present
-            // but unreachable (M6-equivalent mark-sweep).
-            gc_evac_off: true,
+            // Evacuation is ON: the collector moves live objects out of
+            // sparse regions (heap compaction). Set true to degrade to
+            // the M6 non-moving mark-sweep for bisection.
+            gc_evac_off: false,
             gc_alloc,
             gc_collect,
             gc_mark_roots,
@@ -37937,23 +37940,37 @@ impl NativeCodeGenerator {
         // and reloaded only at MarkStart. Seed the cells first, then
         // load the registers from them.
         self.asm.mov_imm64(Reg::R13, Self::GC_COLOR_STRIP);
+        // Idle good/bad. With the moving collector (evac on) the Idle and
+        // Relocate phases use good = R, bad = M0|M1: any pointer NOT
+        // colored R (i.e. left at a mark color, hence possibly pointing at
+        // a ghost) is "bad" and takes the slow path, which follows
+        // forwarding. Without moving (evac off) this stays the M6 scheme
+        // (good = M0, bad = M1|R), where Idle keeps the last mark color
+        // good so Idle loads stay on the fast path.
         let good_color = if self.gc_poison {
-            Self::GC_COLOR_M1
-        } else {
+            if self.gc_evac_off {
+                Self::GC_COLOR_M1
+            } else {
+                Self::GC_COLOR_R
+            }
+        } else if self.gc_evac_off {
             Self::GC_COLOR_M0
+        } else {
+            Self::GC_COLOR_R
         };
         self.asm.mov_imm64(Reg::Rax, good_color);
         self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // Bad mask. Under --gc-poison it is COLOR_MASK -- every colored
-        // pointer stays "bad" regardless of which color the current cycle
-        // uses, so the slow path runs on every load and any unbarriered
-        // dereference faults. Otherwise it catches M1 | R (the non-good
-        // colors while good = M0); MarkStart maintains this on each flip.
+        // Bad mask. Under --gc-poison it is COLOR_MASK (every colored
+        // pointer is bad -> every load slow-paths / unbarriered deref
+        // faults). Otherwise: evac off -> M1|R (M6); evac on -> M0|M1
+        // (the non-R colors, so unremapped pointers slow-path in Idle).
         let bad_mask = if self.gc_poison {
             Self::GC_COLOR_MASK
-        } else {
+        } else if self.gc_evac_off {
             Self::GC_COLOR_BAD_MASK
+        } else {
+            Self::GC_COLOR_M0 | Self::GC_COLOR_M1
         };
         self.asm.mov_imm64(Reg::Rax, bad_mask);
         self.asm.mov_data_addr(Reg::R10, self.gc_bad_mask);
@@ -38130,6 +38147,11 @@ impl NativeCodeGenerator {
         self.emit_gc_log_field(b" max_pause_ns=", self.gc_pause_max_ns);
         self.emit_gc_log_field(b" total_pause_ns=", self.gc_pause_total_ns);
         self.emit_gc_log_field(b" stw_fallbacks=", self.gc_stw_fallbacks);
+        // Peak committed regions (heap high-water) and the number of live
+        // objects the moving collector has evacuated (relocated > 0 proves
+        // compaction actually ran).
+        self.emit_gc_log_field(b" committed=", self.gc_committed_count);
+        self.emit_gc_log_field(b" relocated=", self.gc_relocated_count);
         let newline = self.asm.data_label_with_bytes(b"\n");
         self.emit_write_data(self.platform.stderr_fd(), newline, 1);
     }
@@ -38968,28 +38990,51 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::R11, Self::GC_HMARK_BOTH);
         self.asm.xor_reg_reg(Reg::Rax, Reg::R11);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // rax = old good color.
-        self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        // New bad mask. Under --gc-poison it is COLOR_MASK (every colored
-        // pointer stays "bad", so every load faults if unbarriered and
-        // the slow path runs every time). Otherwise it catches the OLD
-        // good color | R, so pointers left over from the previous cycle
-        // trigger the barrier (incremental-update marking).
-        if self.gc_poison {
-            self.asm.mov_imm64(Reg::Rcx, Self::GC_COLOR_MASK);
+        // Enter the Mark phase's color config. The mark color toggles
+        // M0<->M1 each cycle. Good becomes the new mark color; bad catches
+        // the other two colors so any pointer NOT at the new mark color
+        // (an R-colored Idle pointer, or a stale old-mark-color pointer)
+        // slow-paths and is remapped + marked (incremental update).
+        if self.gc_evac_off {
+            // M6 scheme: good flips M0<->M1 directly via gc_good_color.
+            self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0); // old good
+            if self.gc_poison {
+                self.asm.mov_imm64(Reg::Rcx, Self::GC_COLOR_MASK);
+            } else {
+                self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+                self.asm.mov_imm64(Reg::R11, Self::GC_COLOR_R);
+                self.asm.or_reg_reg(Reg::Rcx, Reg::R11); // old_good | R
+            }
+            self.asm.mov_data_addr(Reg::R11, self.gc_bad_mask);
+            self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rcx);
+            self.asm
+                .mov_imm64(Reg::Rcx, Self::GC_COLOR_M0 | Self::GC_COLOR_M1);
+            self.asm.xor_reg_reg(Reg::Rax, Reg::Rcx);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         } else {
-            self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-            self.asm.mov_imm64(Reg::R11, Self::GC_COLOR_R);
-            self.asm.or_reg_reg(Reg::Rcx, Reg::R11);
+            // R scheme: toggle the persistent mark color, then good =
+            // mark color, bad = (M0|M1|R) ^ mark color.
+            self.asm.mov_data_addr(Reg::R10, self.gc_mark_color);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+            self.asm
+                .mov_imm64(Reg::Rcx, Self::GC_COLOR_M0 | Self::GC_COLOR_M1);
+            self.asm.xor_reg_reg(Reg::Rax, Reg::Rcx); // new mark color
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax); // good = mark color
+            if self.gc_poison {
+                self.asm.mov_imm64(Reg::Rcx, Self::GC_COLOR_MASK);
+            } else {
+                self.asm.mov_imm64(
+                    Reg::Rcx,
+                    Self::GC_COLOR_M0 | Self::GC_COLOR_M1 | Self::GC_COLOR_R,
+                );
+                self.asm.xor_reg_reg(Reg::Rcx, Reg::Rax); // (M0|M1|R) ^ mark
+            }
+            self.asm.mov_data_addr(Reg::R11, self.gc_bad_mask);
+            self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rcx);
         }
-        self.asm.mov_data_addr(Reg::R11, self.gc_bad_mask);
-        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rcx);
-        // Flip good: new_good = old_good XOR (M0|M1) toggles M0<->M1.
-        self.asm
-            .mov_imm64(Reg::Rcx, Self::GC_COLOR_M0 | Self::GC_COLOR_M1);
-        self.asm.xor_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
         // Reload the caches from the cells.
         self.asm.mov_data_addr(Reg::R14, self.gc_good_color);
         self.asm.load_ptr_disp32(Reg::R14, Reg::R14, 0);
@@ -39700,6 +39745,11 @@ impl NativeCodeGenerator {
         // [oldP-8] = S (word1, size for the relocate walk).
         self.asm.load_rbp_slot(Reg::Rcx, 16);
         self.asm.store_ptr_disp32(Reg::R11, -8, Reg::Rcx);
+        // Count this evacuation (--gc-log). rax = n_user must survive.
+        self.asm.mov_data_addr(Reg::R10, self.gc_relocated_count);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.add_reg_imm32(Reg::R11, 1);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
         self.asm.bind_text_label(epilogue);
         self.asm.leave();
         self.asm.ret();
@@ -39947,15 +39997,180 @@ impl NativeCodeGenerator {
         self.asm.ret();
     }
 
-    /// RelocateStart. STEP 2: evacuation is not yet activated, so this
-    /// just closes the collection cycle exactly as MarkEnd did in M6
-    /// (phase -> Idle, reset the proactive counter). The activation step
-    /// rewrites this to select from-space regions, fix up roots, and
-    /// enter the Relocate phase.
+    /// RelocateStart (fused into the MarkEnd pause). Selects the sparsest
+    /// non-current regions as from-space (subject to the headroom
+    /// invariant), fixes up the roots to their to-space copies, switches
+    /// to the Idle/Relocate color config (good = R), and enters the
+    /// Relocate phase. If evacuation is compiled off, or nothing worth
+    /// evacuating is selected, it just closes the cycle to Idle (M6).
     fn emit_gc_relocate_start_runtime(&mut self) {
         self.asm.bind_text_label(self.gc_relocate_start);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        let mark_only = self.asm.create_text_label();
+        if !self.gc_evac_off {
+            // slots: 8=idx, 16=committed, 24=cap_bytes, 32=selected_live,
+            // 40=cur_bump_idx.
+            self.asm.sub_reg_imm8(Reg::Rsp, 48);
+            // Idle/Relocate color config: good = R, bad = M0|M1 (or
+            // COLOR_MASK under poison). Applies to both the Relocate entry
+            // and the mark-only fallback (both end at good = R).
+            self.asm.mov_imm64(Reg::Rax, Self::GC_COLOR_R);
+            self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            if self.gc_poison {
+                self.asm.mov_imm64(Reg::Rax, Self::GC_COLOR_MASK);
+            } else {
+                self.asm
+                    .mov_imm64(Reg::Rax, Self::GC_COLOR_M0 | Self::GC_COLOR_M1);
+            }
+            self.asm.mov_data_addr(Reg::R10, self.gc_bad_mask);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.mov_data_addr(Reg::R14, self.gc_good_color);
+            self.asm.load_ptr_disp32(Reg::R14, Reg::R14, 0);
+            self.asm.mov_data_addr(Reg::R15, self.gc_bad_mask);
+            self.asm.load_ptr_disp32(Reg::R15, Reg::R15, 0);
+            // free_regions = (budget - committed) + free-pool count.
+            self.asm.mov_imm64(Reg::Rcx, 0);
+            self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+            let fp_loop = self.asm.create_text_label();
+            let fp_done = self.asm.create_text_label();
+            self.asm.bind_text_label(fp_loop);
+            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.jcc_label(Condition::Equal, fp_done);
+            self.asm.add_reg_imm32(Reg::Rcx, 1);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+            self.asm.jmp_label(fp_loop);
+            self.asm.bind_text_label(fp_done);
+            self.asm.mov_data_addr(Reg::R10, self.gc_budget_regions);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+            self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.sub_reg_reg(Reg::Rax, Reg::R11);
+            self.asm.add_reg_reg(Reg::Rax, Reg::Rcx); // rax = free_regions
+            // cap_bytes = (free_regions >= 2) ? (free_regions-2)<<SHIFT : 0
+            let have_cap = self.asm.create_text_label();
+            let store_cap = self.asm.create_text_label();
+            self.asm.cmp_reg_imm8(Reg::Rax, 2);
+            self.asm.jcc_label(Condition::AboveOrEqual, have_cap);
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.jmp_label(store_cap);
+            self.asm.bind_text_label(have_cap);
+            self.asm.sub_reg_imm8(Reg::Rax, 2);
+            self.asm.shl_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
+            self.asm.bind_text_label(store_cap);
+            self.asm.store_rbp_slot(24, Reg::Rax); // cap_bytes
+            // cur_bump_idx = (heap_base - region_base) >> SHIFT.
+            self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+            self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+            self.asm.sub_reg_reg(Reg::Rax, Reg::R11);
+            self.asm.shr_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
+            self.asm.store_rbp_slot(40, Reg::Rax);
+            self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+            self.asm.store_rbp_slot(16, Reg::Rax); // committed bound
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.store_rbp_slot(8, Reg::Rax); // idx
+            self.asm.store_rbp_slot(32, Reg::Rax); // selected_live
+            let sel_loop = self.asm.create_text_label();
+            let sel_next = self.asm.create_text_label();
+            let sel_done = self.asm.create_text_label();
+            self.asm.bind_text_label(sel_loop);
+            self.asm.load_rbp_slot(Reg::Rax, 8);
+            self.asm.load_rbp_slot(Reg::Rcx, 16);
+            self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+            self.asm.jcc_label(Condition::AboveOrEqual, sel_done);
+            // skip the current bump region.
+            self.asm.load_rbp_slot(Reg::Rcx, 40);
+            self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+            self.asm.jcc_label(Condition::Equal, sel_next);
+            // base = region_base + idx<<SHIFT ; top = region_top[idx].
+            self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+            self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
+            self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
+            self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+            self.asm.add_reg_reg(Reg::Rcx, Reg::R10); // base (rcx)
+            self.asm.load_rbp_slot(Reg::R8, 8);
+            self.asm.shl_reg_imm8(Reg::R8, 3);
+            self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
+            self.asm.add_reg_reg(Reg::R10, Reg::R8);
+            self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0); // top (r8)
+            // empty (top == base)?
+            self.asm.cmp_reg_reg(Reg::R8, Reg::Rcx);
+            self.asm.jcc_label(Condition::Equal, sel_next);
+            // large (top - base > REGION_SIZE)?
+            self.asm.sub_reg_reg(Reg::R8, Reg::Rcx); // used bytes
+            self.asm.cmp_reg_imm32(Reg::R8, Self::GC_REGION_SIZE as i32);
+            self.asm.jcc_label(Condition::Above, sel_next);
+            // live = gc_region_live[idx].
+            self.asm.load_rbp_slot(Reg::R8, 8);
+            self.asm.shl_reg_imm8(Reg::R8, 3);
+            self.asm.mov_data_addr(Reg::R10, self.gc_region_live);
+            self.asm.add_reg_reg(Reg::R10, Reg::R8);
+            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0); // live (r11)
+            // not sparse (live >= REGION_SIZE/2)?
+            self.asm
+                .cmp_reg_imm32(Reg::R11, (Self::GC_REGION_SIZE / 2) as i32);
+            self.asm.jcc_label(Condition::AboveOrEqual, sel_next);
+            // headroom (selected_live + live > cap)?
+            self.asm.load_rbp_slot(Reg::Rax, 32);
+            self.asm.add_reg_reg(Reg::Rax, Reg::R11);
+            self.asm.load_rbp_slot(Reg::Rcx, 24);
+            self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+            self.asm.jcc_label(Condition::Above, sel_next);
+            // select: fromspace[idx] = 1 ; selected_live += live.
+            self.asm.store_rbp_slot(32, Reg::Rax); // selected_live += live
+            self.asm.load_rbp_slot(Reg::R8, 8);
+            self.asm.shl_reg_imm8(Reg::R8, 3);
+            self.asm.mov_data_addr(Reg::R10, self.gc_region_fromspace);
+            self.asm.add_reg_reg(Reg::R10, Reg::R8);
+            self.asm.mov_imm64(Reg::Rax, 1);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.bind_text_label(sel_next);
+            self.asm.load_rbp_slot(Reg::Rax, 8);
+            self.asm.add_reg_imm32(Reg::Rax, 1);
+            self.asm.store_rbp_slot(8, Reg::Rax);
+            self.asm.jmp_label(sel_loop);
+            self.asm.bind_text_label(sel_done);
+            // Nothing selected -> mark-only close.
+            self.asm.load_rbp_slot(Reg::Rax, 32);
+            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.jcc_label(Condition::Equal, mark_only);
+            // Reset the evacuation bump so the first copy acquires a fresh
+            // to-space region -- gc_relocate_finish only clears
+            // gc_evac_region_base, so gc_evac_top/end would otherwise be
+            // stale from the previous cycle and the first gc_evacuate
+            // would write into that (now freed/reused) region.
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.mov_data_addr(Reg::R10, self.gc_evac_region_base);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.mov_data_addr(Reg::R10, self.gc_evac_top);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.mov_data_addr(Reg::R10, self.gc_evac_end);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            // Fix roots, reset the relocate cursor + quantum pacer, enter
+            // the Relocate phase.
+            self.asm.call_label(self.gc_relocate_fix_roots);
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.mov_data_addr(Reg::R10, self.gc_reloc_scan_idx);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.mov_data_addr(Reg::R10, self.gc_reloc_block);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm
+                .mov_data_addr(Reg::R10, self.gc_bytes_since_quantum);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.mov_data_addr(Reg::R10, self.gc_phase);
+            self.asm.mov_imm64(Reg::Rax, Self::GC_PHASE_RELOCATE);
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+            self.asm.leave();
+            self.asm.ret();
+        }
+        // Mark-only close (evac off, or nothing selected): back to Idle,
+        // reset the proactive counter.
+        self.asm.bind_text_label(mark_only);
         self.asm.mov_data_addr(Reg::R10, self.gc_phase);
         self.asm.mov_imm64(Reg::Rax, Self::GC_PHASE_IDLE);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);

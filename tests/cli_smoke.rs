@@ -20983,17 +20983,17 @@ fn native_gc_stress_forces_a_collection_per_alloc_and_stays_correct() {
         .and_then(|s| s.split_whitespace().next())
         .and_then(|s| s.parse::<u64>().ok())
         .expect("stats line should contain an allocs count");
-    // Every allocation collects (the stress pre-collect), so there is at
-    // least one collection per allocation. The region heap may add a
-    // handful more while the soft budget ramps up: when the current
-    // region fills before the free-region pool has been replenished, the
-    // allocator's fail chain runs a second collection and doubles the
-    // budget. That warm-up overshoot is small and bounded (a few extra
-    // out of hundreds of thousands), so assert the invariant as a lower
-    // bound rather than exact equality.
+    // Every allocation collects (the stress pre-collect). The collection
+    // counter is bumped once per sweep, so it tracks allocs very closely
+    // -- but the moving collector adds a non-sweeping Relocate phase: a
+    // stress collect that lands while a cycle is in Relocate drains the
+    // evacuation instead of sweeping, so it does not bump the counter.
+    // Those are rare (roughly one per relocation cycle), so assert that
+    // collections stay within a small margin of allocs rather than a hard
+    // >= (which would ignore the moving collector's phase structure).
     assert!(
-        collections >= allocs,
-        "--gc-stress must collect at least once per allocation \
+        collections + 1000 >= allocs,
+        "--gc-stress must collect about once per allocation \
          (collections={collections}, allocs={allocs})"
     );
     assert!(
@@ -21143,6 +21143,79 @@ fn native_gc_incremental_runs_many_cycles() {
         collections >= 5,
         "proactive incremental cycles should fire repeatedly, got {collections}"
     );
+}
+
+/// M7: the moving collector actually evacuates live objects. A long-run
+/// churn with a long-lived survivor crosses many relocation cycles;
+/// --gc-log must report relocated > 0 (objects were copied out of sparse
+/// regions and their references remapped) and the output must stay
+/// correct in every mode -- proving the moves are sound, not just that
+/// they happen.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_evacuation_moves_objects() {
+    let program = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         enum Box { case B(inner: Tree) }\n\
+         def sz(t: Tree): Int = t match { case Leaf(v) => v; case Branch(l, r) => sz(l) + sz(r) }\n\
+         val keeper = B(Branch(Leaf(100), Branch(Leaf(20), Leaf(3))))\n\
+         mutable i = 0\n\
+         while (i < 200000) {\n\
+           val garbage = Branch(Leaf(i), Leaf(i))\n\
+           i = i + 1\n\
+         }\n\
+         println(keeper match { case B(t) => sz(t) })\n";
+    let (stdout, stderr) = build_and_run_gc_program(program, &["--gc-log"]);
+    assert_eq!(
+        stdout, "123\n",
+        "moving collector must preserve the survivor"
+    );
+    let relocated = stderr
+        .split(" relocated=")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("stats line should contain a relocated count");
+    assert!(
+        relocated > 0,
+        "evacuation should move live objects out of sparse regions, got {relocated}"
+    );
+    // Correct in every mode (poison forces every load through the barrier,
+    // so a mis-remap after a move faults immediately).
+    for flags in [
+        vec![],
+        vec!["--gc-stress"],
+        vec!["--gc-poison"],
+        vec!["--gc-stress", "--gc-poison"],
+    ] {
+        let (out, _e) = build_and_run_gc_program(program, &flags);
+        assert_eq!(out, "123\n", "flags={flags:?}");
+    }
+}
+
+/// M7: pointer identity survives a move. A heap value is captured in a
+/// long-lived binding, then heavy churn evacuates its region; comparing
+/// it (structural `==`) against a freshly built equal value must still
+/// hold after the move -- exercises gc_deep_equal following forwarding
+/// and the barrier remapping the compared operands.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_pointer_identity_survives_move() {
+    let program = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         val a = Branch(Leaf(1), Branch(Leaf(2), Leaf(3)))\n\
+         mutable i = 0\n\
+         while (i < 200000) {\n\
+           val garbage = Branch(Leaf(i), Leaf(i))\n\
+           i = i + 1\n\
+         }\n\
+         val b = Branch(Leaf(1), Branch(Leaf(2), Leaf(3)))\n\
+         println(if (a == b) 1 else 0)\n";
+    for flags in [vec![], vec!["--gc-poison"]] {
+        let (out, _e) = build_and_run_gc_program(program, &flags);
+        assert_eq!(
+            out, "1\n",
+            "structural equality must survive a move, flags={flags:?}"
+        );
+    }
 }
 
 /// M4: an all-live per-frame allocation graph deeper than the initial
