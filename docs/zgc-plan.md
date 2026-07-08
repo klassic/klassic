@@ -319,12 +319,35 @@ the semantic oracle everywhere (eval == native differential).
   rarely-read long-lived field, under normal / --gc-stress /
   --gc-poison / --gc-stress --gc-poison.
 - **M7 — Evacuation + forwarding + self-healing (highest value,
-  highest risk).** Sparsest-first selection, in-object forwarding,
-  RelocateStart root fixup through shadow-stack slot addresses,
-  mutator-assisted evacuation, ghost reclamation at next MarkEnd.
-  Gated on M5's poison suite and M6 green under stress. An internal
-  evacuation-off degrade switch is kept for one milestone as a
-  bisection aid.
+  highest risk). DONE.** The collector now moves objects. Added a
+  Relocate phase after MarkEnd: gc_relocate_start selects the sparsest
+  non-current, non-large, non-empty regions as from-space subject to a
+  headroom invariant (selected live bytes <= half of (free_regions-2)
+  region-bytes, covering ~50% bump-packing efficiency), fixes up the
+  roots to their to-space copies (through shadow-stack slot addresses),
+  and enters Relocate. Evacuation runs in incremental quanta from
+  gc_alloc: a linear from-space walk copies each live block into a
+  dedicated to-space bump and installs an in-object forwarding word
+  (word0 = new_ptr | FWD; the old word1 keeps the size for the walk).
+  The load-barrier slow path is mutator-assisted: during Relocate a
+  load into from-space evacuates on demand and follows forwarding,
+  self-healing the slot to the remapped to-space address.
+  gc_trace/gc_mark_visit/gc_deep_equal follow forwarding. Soundness
+  rests on the R-color scheme -- Idle/Relocate use good = R, so any
+  pointer still at a mark color (possibly referencing a ghost)
+  slow-paths and is remapped; each Mark recolors every live slot back to
+  the mark color, so no unremapped survivor can fast-path a from-space
+  pointer. From-space (ghost) regions are freed at the NEXT MarkEnd,
+  after that cycle's mark reaches fixpoint, so no live slot references
+  them. An independent review proved no live object is lost or left
+  dangling; two safety issues it found (unbounded to-space commit;
+  rdx/rsi clobber in the Relocate barrier) are fixed. The mark bit moved
+  to header parity bits so word0 can hold a forwarding pointer. Verified
+  across --gc-stress / --gc-poison and long relocation runs (relocated >
+  0 with correct survivors and structural equality across moves). The
+  internal gc_evac_off degrade switch reproduces the M6 non-moving
+  collector for bisection. The sweep is still stop-the-world (its
+  incrementalization and the selection/threshold tuning are M8).
 - **M8 — Tuning + docs.** Quantum/budget/selection-threshold tuning,
   final `--gc-log` fields, one generously-bounded pause assertion
   (250 ms — regression tripwire, not a benchmark), an
