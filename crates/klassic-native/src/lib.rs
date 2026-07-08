@@ -4339,6 +4339,22 @@ struct NativeCodeGenerator {
     gc_bytes_since_quantum: DataLabel,
     gc_stw_fallback_pending: DataLabel,
     gc_stw_fallbacks: DataLabel,
+    /// M7 evacuation state. gc_region_live[512]: live bytes per region
+    /// (filled by the sweep, drives sparsest-first selection).
+    /// gc_region_fromspace[512]: 1 = region is from-space/ghost this
+    /// cycle. gc_header_mark: the current-parity header mark bit (toggles
+    /// each MarkStart). gc_mark_color: the persistent pointer mark-color
+    /// parity. gc_evac_*: the dedicated to-space bump for evacuation (not
+    /// the mutator's). gc_reloc_*: the incremental relocate walk cursor.
+    gc_region_live: DataLabel,
+    gc_region_fromspace: DataLabel,
+    gc_header_mark: DataLabel,
+    gc_mark_color: DataLabel,
+    gc_evac_region_base: DataLabel,
+    gc_evac_top: DataLabel,
+    gc_evac_end: DataLabel,
+    gc_reloc_scan_idx: DataLabel,
+    gc_reloc_block: DataLabel,
     gc_collect_counter: DataLabel,
     /// `--gc-log` statistics cells (all `.data` i64, initialised 0):
     /// total allocations, total payload+header bytes handed out, and
@@ -4364,6 +4380,10 @@ struct NativeCodeGenerator {
     /// unbarriered dereference faults on a non-canonical address and the
     /// load-barrier slow path is exercised on every load.
     gc_poison: bool,
+    /// M7 degrade switch: when true, evacuation is disabled and the
+    /// collector behaves exactly as M6 (mark-sweep, non-moving). A
+    /// bisection anchor for the moving-GC milestone.
+    gc_evac_off: bool,
     gc_alloc: TextLabel,
     gc_collect: TextLabel,
     /// M6: the collector factored into separately-callable STW pieces.
@@ -4578,6 +4598,16 @@ impl NativeCodeGenerator {
         let gc_bytes_since_quantum = asm.data_label_with_i64s(&[0]);
         let gc_stw_fallback_pending = asm.data_label_with_i64s(&[0]);
         let gc_stw_fallbacks = asm.data_label_with_i64s(&[0]);
+        let gc_region_live = asm.data_label_with_i64s(&vec![0; Self::GC_RESERVE_REGIONS as usize]);
+        let gc_region_fromspace =
+            asm.data_label_with_i64s(&vec![0; Self::GC_RESERVE_REGIONS as usize]);
+        let gc_header_mark = asm.data_label_with_i64s(&[0]);
+        let gc_mark_color = asm.data_label_with_i64s(&[0]);
+        let gc_evac_region_base = asm.data_label_with_i64s(&[0]);
+        let gc_evac_top = asm.data_label_with_i64s(&[0]);
+        let gc_evac_end = asm.data_label_with_i64s(&[0]);
+        let gc_reloc_scan_idx = asm.data_label_with_i64s(&[0]);
+        let gc_reloc_block = asm.data_label_with_i64s(&[0]);
         let gc_collect_counter = asm.data_label_with_i64s(&[0]);
         let gc_alloc_count = asm.data_label_with_i64s(&[0]);
         let gc_bytes_allocated = asm.data_label_with_i64s(&[0]);
@@ -4721,6 +4751,15 @@ impl NativeCodeGenerator {
             gc_bytes_since_quantum,
             gc_stw_fallback_pending,
             gc_stw_fallbacks,
+            gc_region_live,
+            gc_region_fromspace,
+            gc_header_mark,
+            gc_mark_color,
+            gc_evac_region_base,
+            gc_evac_top,
+            gc_evac_end,
+            gc_reloc_scan_idx,
+            gc_reloc_block,
             gc_collect_counter,
             gc_alloc_count,
             gc_bytes_allocated,
@@ -4731,6 +4770,7 @@ impl NativeCodeGenerator {
             gc_log: false,
             gc_stress: false,
             gc_poison: false,
+            gc_evac_off: false,
             gc_alloc,
             gc_collect,
             gc_mark_roots,
@@ -37839,6 +37879,19 @@ impl NativeCodeGenerator {
     const GC_QUANTUM_BYTES: u64 = 8192;
     const GC_PHASE_IDLE: u64 = 0;
     const GC_PHASE_MARK: u64 = 1;
+    /// M7 relocation phase: live objects are evacuated out of the sparsest
+    /// regions so those regions can be freed (heap compaction).
+    const GC_PHASE_RELOCATE: u64 = 2;
+    /// M7 object-header low bits (the size is 16-aligned, so bits 0-3 of
+    /// header word0 are free). bit0 = forwarded (word0 then holds the new
+    /// user pointer | GC_FWD); bits 1-2 = the two alternating mark bits
+    /// (which parity is "current" this cycle lives in the gc_header_mark
+    /// cell). The mark bit moved off bit 63 so word0 can hold a
+    /// forwarding pointer. Size is recovered with `and reg, -16`.
+    const GC_FWD: u64 = 1;
+    const GC_HMARK0: u64 = 1 << 1;
+    const GC_HMARK1: u64 = 1 << 2;
+    const GC_HMARK_BOTH: u64 = Self::GC_HMARK0 | Self::GC_HMARK1;
 
     /// Initialize the reserved color registers once, before any user
     /// code or collector routine runs. r13 = strip mask, r14 = good
