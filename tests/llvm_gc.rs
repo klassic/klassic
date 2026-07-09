@@ -12,17 +12,19 @@ fn find_cc() -> Option<String> {
     if let Ok(explicit) = std::env::var("KLASSIC_CLANG") {
         return Some(explicit);
     }
-    ["clang-18", "clang-17", "clang-16", "clang-15", "clang", "cc"]
-        .into_iter()
-        .find(|name| {
-            Command::new(name)
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        })
-        .map(str::to_owned)
+    [
+        "clang-18", "clang-17", "clang-16", "clang-15", "clang", "cc",
+    ]
+    .into_iter()
+    .find(|name| {
+        Command::new(name)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+    .map(str::to_owned)
 }
 
 #[test]
