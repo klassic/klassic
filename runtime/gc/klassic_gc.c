@@ -151,7 +151,10 @@ static int g_cycle_request;   /* a cycle has been asked for (under g_wake_lock) 
 static int g_cycle_running;   /* a cycle is in progress (under g_wake_lock) */
 static uint64_t g_cycle_done; /* completed-cycle counter, for wait predicates */
 static pthread_t g_gc_thread;
-static int g_gc_thread_started;
+static int g_gc_thread_started; /* set once in gc_init_once */
+/* There is no teardown path: the GC thread is detached and runs until the
+ * process exits, so g_gc_shutdown is never set (the gc_worker loop reads it to
+ * keep a clean shutdown hook available for a future embedding API). */
 static int g_gc_shutdown;
 static void *gc_worker(void *arg);
 
@@ -484,6 +487,14 @@ uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
 }
 
 void *klassic_gc_read(void **slot) {
+    /* A thread that touches the heap must be a registered mutator, or its poll
+     * below would increment the parked count for a rendezvous that never
+     * counted it (breaking the all-mutator handshake), and its barrier work
+     * would evacuate/heal with no shadow stack to root its own pointers.
+     * Uniform with klassic_gc_alloc / klassic_gc_shadow_push. */
+    if (!g_self) {
+        klassic_gc_register_thread();
+    }
     /* Safepoint: the compiled backend polls at loop back-edges (M3), so a
      * read-only loop parks for the GC thread's handshakes even when it never
      * allocates. This C entry point (used by the runtime and the unit tests)
@@ -1102,6 +1113,11 @@ static void gc_request_and_wait(void) {
 void klassic_gc_collect(void) {
     if (!__atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE)) {
         return;
+    }
+    /* Must be a registered mutator before we poll in gc_request_and_wait, so
+     * this thread parks for -- and is counted in -- the cycle's handshakes. */
+    if (!g_self) {
+        klassic_gc_register_thread();
     }
     gc_request_and_wait();
 }

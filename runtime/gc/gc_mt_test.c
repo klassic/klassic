@@ -53,7 +53,9 @@ static void **pair_of_leaves(int64_t av, int64_t bv) {
 
 static void *mutator_main(void *arg) {
     int tid = (int)(intptr_t)arg;
-    klassic_gc_register_thread();
+    /* Deliberately do NOT call klassic_gc_register_thread() -- rely on the
+     * auto-registration a mutator gets on its first allocation, the way
+     * compiled code (which never registers explicitly) behaves. */
     /* A survivor unique to this thread; its two leaves carry known values. */
     int64_t av = (int64_t)tid * 1000 + 1;
     int64_t bv = (int64_t)tid * 1000 + 2;
@@ -81,18 +83,40 @@ static void *mutator_main(void *arg) {
     return NULL;
 }
 
+/* A thread whose first heap interaction is klassic_gc_collect(), never an
+ * allocation -- it exercises the registration that collect (and read) must do
+ * before polling, so an unregistered thread can never corrupt the parked-count
+ * rendezvous. It forces synchronous cycles while the mutators churn. */
+static volatile int g_ticks_done;
+static void *ticker_main(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 40; i++) {
+        klassic_gc_collect(); /* first call registers this thread */
+    }
+    g_ticks_done = 1;
+    klassic_gc_unregister_thread();
+    return NULL;
+}
+
 int main(void) {
     pthread_t th[MUTATORS];
+    pthread_t ticker;
     for (int i = 0; i < MUTATORS; i++) {
         if (pthread_create(&th[i], NULL, mutator_main, (void *)(intptr_t)i) != 0) {
             fprintf(stderr, "cannot spawn mutator %d\n", i);
             return 1;
         }
     }
+    if (pthread_create(&ticker, NULL, ticker_main, NULL) != 0) {
+        fprintf(stderr, "cannot spawn ticker\n");
+        return 1;
+    }
     for (int i = 0; i < MUTATORS; i++) {
         pthread_join(th[i], NULL);
     }
-    printf("MT: %d mutators x %d iters, survivors intact\n", MUTATORS, ITERS);
+    pthread_join(ticker, NULL);
+    printf("MT: %d mutators x %d iters + collect ticker, survivors intact\n",
+           MUTATORS, ITERS);
     printf("ALL GC MT TESTS PASSED\n");
     return 0;
 }
