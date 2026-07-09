@@ -8,15 +8,18 @@
  * ASan/UBSan/Valgrind/gdb -- the point of the migration.
  *
  * Object layout: a 16-byte header precedes each user pointer.
- *   word0 = [ size | flags ]  where the size is 16-aligned so the low 4
- *           bits are flags: bit0 = FWD (forwarded), bits 1-2 = the two
- *           alternating mark bits. size = word0 & -16 -- kept intact even
- *           when forwarded, so the from-space stays linearly walkable.
- *   word1 = type tag (KLASSIC_GC_RAW_BYTES / _POINTER_RECORD /
- *           _POINTER_LIST), OR, once the object is forwarded, the new user
- *           pointer (the tag is dead by then). Tags >= POINTER_RECORD have
- *           an all-pointer payload; a POINTER_LIST skips a leading length
- *           qword.
+ *   word0 = [ size | mark bits ]  the size is 16-aligned; bits 1-2 are the
+ *           two alternating mark bits. size = word0 & -16, always intact
+ *           (forwarding does not touch word0), so a from-space region stays
+ *           linearly walkable even mid-relocation.
+ *   word1 = the type tag (KLASSIC_GC_RAW_BYTES / _POINTER_RECORD /
+ *           _POINTER_LIST -- all small integers) while the object is live,
+ *           OR its new user pointer (an address inside the reservation) once
+ *           forwarded. The two are told apart by the reservation range, so a
+ *           single CAS on word1 installs forwarding atomically -- no flag bit
+ *           and no two-word publish race. The tag is dead once forwarded.
+ *           Tags >= POINTER_RECORD have an all-pointer payload; a
+ *           POINTER_LIST skips a leading length qword.
  * The user pointer is block + 16.
  *
  * The collector is a ZGC-style region heap with colored pointers + a load
@@ -26,11 +29,11 @@
  * and an R (remapped) color that, together with the two alternating mark
  * colors, drives a phase-dependent load barrier -- mark during Mark,
  * evacuate-on-demand + follow-forwarding during Relocate, remap ghosts
- * during Idle. Forwarding is in-object (word0 keeps the size + the FWD bit,
- * word1 holds the new pointer); a fully-evacuated "ghost" region is freed
- * at the next MarkEnd, once marking has remapped every live pointer off it.
- * Still single-threaded and non-atomic; a background GC thread with atomic
- * barriers is the next milestone (docs/true-zgc-plan.md).
+ * during Idle. A fully-evacuated "ghost" region is freed at the next
+ * MarkEnd, once marking has remapped every live pointer off it. The shared
+ * header operations are atomic (CAS forwarding install, atomic mark set)
+ * so a background GC thread (docs/true-zgc-plan.md M4) can run concurrently
+ * with the mutators; the driver is still single-threaded until then.
  */
 #ifndef KLASSIC_GC_H
 #define KLASSIC_GC_H
@@ -43,8 +46,8 @@
 #define KLASSIC_GC_POINTER_RECORD 2
 #define KLASSIC_GC_POINTER_LIST 4
 
-/* Header flag bits (low 4 bits of word0; size is 16-aligned). */
-#define KLASSIC_GC_FWD 1u
+/* Header mark bits (low bits of word0; size is 16-aligned so bits 1-2 are
+ * free). Forwarding is not a word0 flag -- it lives in word1 (see above). */
 #define KLASSIC_GC_HMARK0 2u
 #define KLASSIC_GC_HMARK1 4u
 #define KLASSIC_GC_HMARK_BOTH (KLASSIC_GC_HMARK0 | KLASSIC_GC_HMARK1)
