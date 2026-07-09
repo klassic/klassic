@@ -911,17 +911,22 @@ static void gc_request_cycle(void) {
     pthread_mutex_unlock(&g_wake_lock);
 }
 
-/* Mutator: request a cycle and block until one completes, polling meanwhile so
- * it can park for the GC thread's handshakes (which is how the cycle makes
- * progress). Used for explicit collect and heap-exhaustion fallback. */
+/* Mutator: request a *fresh* cycle and block until it completes, polling
+ * meanwhile so it can park for the GC thread's handshakes (which is how the
+ * cycle makes progress). Used for explicit collect and heap-exhaustion
+ * fallback, both of which need every object dead as of the call to be
+ * reclaimed. A cycle already in flight may have snapshotted the heap before
+ * this call (its sweep predates our latest allocations), so if one is running
+ * we wait it out and then run one more; otherwise a single fresh cycle
+ * suffices. Re-request once the in-flight cycle ends so the fresh one starts. */
 static void gc_request_and_wait(void) {
     pthread_mutex_lock(&g_wake_lock);
-    uint64_t target = g_cycle_done + 1;
-    if (!g_cycle_request && !g_cycle_running) {
-        g_cycle_request = 1;
-        pthread_cond_signal(&g_wake_cond);
-    }
+    uint64_t target = g_cycle_done + (g_cycle_running ? 2 : 1);
     while (g_cycle_done < target) {
+        if (!g_cycle_request && !g_cycle_running) {
+            g_cycle_request = 1;
+            pthread_cond_signal(&g_wake_cond);
+        }
         pthread_mutex_unlock(&g_wake_lock);
         gc_poll();
         sched_yield();
