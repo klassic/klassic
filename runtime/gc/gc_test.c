@@ -160,6 +160,58 @@ static void test_garbage_is_reclaimed(void) {
     printf("test_garbage_is_reclaimed OK (live_regions=%llu)\n", (unsigned long long)live);
 }
 
+/* Compaction physically moves a rooted survivor: its address changes,
+ * yet its payload and the root that points at it stay consistent. */
+static void test_survivor_is_relocated_and_intact(void) {
+    void **keeper = pair_of_leaves(314, 271);
+    klassic_gc_shadow_push((void **)&keeper);
+    void *before = (void *)keeper;
+    uint64_t relocs_before = klassic_gc_relocation_count();
+    for (int i = 0; i < 300000; i++) {
+        void **garbage = pair_of_leaves(i, i);
+        (void)garbage;
+    }
+    klassic_gc_collect();
+    /* Objects were physically evacuated, and the rooted survivor is one of
+     * them (its sparse region is a relocation target). */
+    assert(klassic_gc_relocation_count() > relocs_before);
+    assert((void *)keeper != before); /* the root was updated to to-space */
+    /* Payload survived the copy; the leaves moved too but read back intact. */
+    assert(((int64_t *)pair_field(keeper, 0))[0] == 314);
+    assert(((int64_t *)pair_field(keeper, 1))[0] == 271);
+    klassic_gc_shadow_pop_n(1);
+    printf("test_survivor_is_relocated_and_intact OK (relocs=%llu)\n",
+           (unsigned long long)(klassic_gc_relocation_count() - relocs_before));
+}
+
+/* A linked structure stays fully connected across compaction: every node
+ * and edge is rewritten to the moved locations with no dangling pointer. */
+static void test_linked_structure_survives_compaction(void) {
+    void **list = 0;
+    klassic_gc_shadow_push((void **)&list);
+    for (int i = 0; i < 300; i++) {
+        list = cons(i, list);
+    }
+    uint64_t relocs_before = klassic_gc_relocation_count();
+    for (int i = 0; i < 300000; i++) {
+        void **garbage = pair_of_leaves(i, i);
+        (void)garbage;
+    }
+    klassic_gc_collect();
+    assert(klassic_gc_relocation_count() > relocs_before);
+    int64_t sum = 0;
+    int count = 0;
+    for (void **node = list; node; node = (void **)pair_field(node, 1)) {
+        sum += ((int64_t *)pair_field(node, 0))[0];
+        count++;
+    }
+    assert(count == 300);
+    assert(sum == 44850); /* 0+1+...+299 */
+    klassic_gc_shadow_pop_n(1);
+    printf("test_linked_structure_survives_compaction OK (nodes=%d sum=%lld)\n", count,
+           (long long)sum);
+}
+
 int main(void) {
     klassic_gc_init();
     test_load_barrier_strips_and_heals();
@@ -167,6 +219,8 @@ int main(void) {
     test_survivor_kept_and_intact();
     test_linked_structure_survives_churn();
     test_garbage_is_reclaimed();
+    test_survivor_is_relocated_and_intact();
+    test_linked_structure_survives_compaction();
     printf("ALL GC TESTS PASSED\n");
     return 0;
 }

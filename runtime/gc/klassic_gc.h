@@ -17,10 +17,12 @@
  *           payload; a POINTER_LIST skips a leading length qword.
  * The user pointer is block + 16.
  *
- * This header tracks the collector's growth milestone by milestone; the
- * current file implements the non-moving region mark-sweep foundation
- * (ZGC plan M4 equivalent). Colored pointers + load barrier, incremental
- * marking, and moving evacuation land in later commits.
+ * The collector is a ZGC-style region heap with colored pointers + a load
+ * barrier (M6b), incremental marking (M6c), and stop-the-world compacting
+ * evacuation with in-object forwarding (M6d): sparse regions are copied
+ * into a fresh to-space and every root and live field is rewritten to the
+ * moved location. Lazy/concurrent relocation via the R-color barrier is a
+ * later refinement (see docs/zgc-plan.md).
  */
 #ifndef KLASSIC_GC_H
 #define KLASSIC_GC_H
@@ -87,5 +89,6 @@ void klassic_gc_write(void **slot, void *value);
 /* Test/observability hooks. */
 uint64_t klassic_gc_collection_count(void);
 uint64_t klassic_gc_live_region_count(void);
+uint64_t klassic_gc_relocation_count(void); /* objects evacuated so far */
 
 #endif /* KLASSIC_GC_H */

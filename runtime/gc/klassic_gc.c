@@ -1,8 +1,7 @@
-/* klassic_gc.c -- non-moving region mark-sweep foundation (ZGC plan M4
- * equivalent), in C. See klassic_gc.h for the object layout and the
- * migration context. Colored pointers + load barrier, incremental
- * marking, and moving evacuation land in later commits; this file is the
- * base they build on.
+/* klassic_gc.c -- ZGC-style region collector in C: colored pointers + load
+ * barrier, incremental marking, and stop-the-world compacting evacuation
+ * with in-object forwarding. See klassic_gc.h for the object layout and
+ * the migration context.
  */
 #define _DEFAULT_SOURCE /* for MAP_ANONYMOUS under -std=c11 */
 
@@ -29,11 +28,20 @@ static uint64_t g_region_top[RESERVE_REGIONS]; /* per-region bump watermark */
 static uint64_t g_committed;                   /* high-water committed regions */
 static uint64_t g_budget = 8;                  /* soft budget, doubles on stall */
 static uint8_t *g_free_head;                    /* free-region pool, linked via base qword */
+static uint64_t g_region_live[RESERVE_REGIONS]; /* live bytes per region (set by sweep) */
+static uint8_t g_from_set[RESERVE_REGIONS];     /* 1 if region is in the relocation set */
 
 /* The current bump region. */
 static uint8_t *g_heap_base;
 static uint8_t *g_heap_top;
 static uint8_t *g_heap_end;
+
+/* A dedicated to-space bump for evacuation, separate from the mutator's
+ * current region so compaction never disturbs in-progress allocation. */
+static uint8_t *g_to_base;
+static uint8_t *g_to_top;
+static uint8_t *g_to_end;
+static uint64_t g_relocations; /* objects evacuated (observability) */
 
 /* Precise roots and the mark worklist. */
 static void **g_shadow[SHADOW_MAX];
@@ -296,24 +304,223 @@ static void gc_sweep(void) {
     for (uint64_t idx = 0; idx < g_committed; idx++) {
         uint8_t *base = region_at(idx);
         uint8_t *top = (uint8_t *)(uintptr_t)g_region_top[idx];
+        g_region_live[idx] = 0;
         if (top == base) {
             continue;
         }
         int any_live = 0;
+        uint64_t live = 0;
         for (uint8_t *cur = base; cur < top;) {
             uint64_t *b = (uint64_t *)cur;
             uint64_t sz = block_size(b[0]);
             if (b[0] & g_header_mark) {
                 b[0] &= stale_clear;
                 any_live = 1;
+                live += sz;
             }
             cur += sz;
         }
+        g_region_live[idx] = live;
         if (!any_live && base != g_heap_base) {
             *(uint8_t **)base = g_free_head;
             g_free_head = base;
             g_region_top[idx] = (uint64_t)(uintptr_t)base;
+            g_region_live[idx] = 0;
         }
+    }
+}
+
+/* --- Stop-the-world compacting evacuation (moving GC) ------------ *
+ * Called at MarkEnd after sweep, so marking is complete (live == marked)
+ * and -- being a safepoint reached from gc_alloc/collect -- no mutator
+ * pointer is live in a register outside the shadow stack. Sparse regions
+ * are evacuated into a fresh to-space, each vacated object left with an
+ * in-object forwarding word (word0 = new_user | FWD), then every root and
+ * live heap field is rewritten to the new location and the from-space
+ * regions are freed. The mutator's colored-pointer model is unchanged;
+ * lazy/concurrent relocation via the R-color barrier is a later
+ * refinement (see docs/zgc-plan.md). */
+
+/* Acquire a fresh zeroed region for the to-space bump (free pool first,
+ * then a committed tail region), without disturbing the mutator's current
+ * region. Returns 0 if none available. */
+static int to_acquire(void) {
+    uint8_t *base;
+    if (g_free_head) {
+        base = g_free_head;
+        g_free_head = *(uint8_t **)base;
+        memset(base, 0, REGION_SIZE);
+    } else if (g_committed < g_budget) {
+        base = region_at(g_committed);
+        g_committed++;
+    } else {
+        return 0;
+    }
+    g_to_base = base;
+    g_to_top = base;
+    g_to_end = base + REGION_SIZE;
+    g_region_top[region_index(base)] = (uint64_t)(uintptr_t)base;
+    return 1;
+}
+
+/* Bump `total` bytes in to-space, switching to a fresh region when the
+ * current one cannot fit the block. Returns NULL if to-space is exhausted
+ * (the headroom invariant makes this unreachable in practice). */
+static uint8_t *to_bump(uint64_t total) {
+    if (!g_to_base || (uint64_t)(g_to_end - g_to_top) < total) {
+        if (g_to_base) {
+            g_region_top[region_index(g_to_base)] = (uint64_t)(uintptr_t)g_to_top;
+        }
+        if (!to_acquire()) {
+            return NULL;
+        }
+    }
+    uint8_t *dst = g_to_top;
+    g_to_top += total;
+    return dst;
+}
+
+/* Rewrite one colored heap-pointer slot to follow forwarding, if its
+ * target has been evacuated. */
+static void fixup_field(void **slot) {
+    uint64_t raw = (uint64_t)*slot & gc_strip_mask;
+    if (!raw) {
+        return;
+    }
+    uint64_t w0 = *(uint64_t *)(raw - 16);
+    if (w0 & KLASSIC_GC_FWD) {
+        uint64_t nw = w0 & ~(uint64_t)15u; /* new user pointer (16-aligned) */
+        *slot = (void *)(nw | gc_good_color);
+    }
+}
+
+/* Rewrite a raw root slot to follow forwarding (roots hold raw pointers). */
+static void fixup_root(void **slot) {
+    uint64_t raw = (uint64_t)*slot;
+    if (!raw) {
+        return;
+    }
+    uint64_t w0 = *(uint64_t *)(raw - 16);
+    if (w0 & KLASSIC_GC_FWD) {
+        *slot = (void *)(w0 & ~(uint64_t)15u);
+    }
+}
+
+/* Rewrite the pointer fields of every live block in a kept region. */
+static void fixup_region(uint8_t *base, uint8_t *top) {
+    for (uint8_t *cur = base; cur < top;) {
+        uint64_t *b = (uint64_t *)cur;
+        uint64_t sz = block_size(b[0]);
+        if (b[0] & g_header_mark) {
+            uint64_t tag = b[1];
+            if (tag >= KLASSIC_GC_POINTER_RECORD) {
+                void **fields = (void **)(cur + 16);
+                uint64_t slots = (sz - 16) / 8;
+                uint64_t start = (tag == KLASSIC_GC_POINTER_LIST) ? 1 : 0;
+                for (uint64_t k = start; k < slots; k++) {
+                    fixup_field(&fields[k]);
+                }
+            }
+        }
+        cur += sz;
+    }
+}
+
+static void gc_relocate(void) {
+    /* Free capacity, in regions: the free pool plus the still-uncommitted
+     * budget tail. Reserve one region of headroom so evacuation (which
+     * wastes at most a partial region to fragmentation) cannot deadlock. */
+    uint64_t free_regions = 0;
+    for (uint8_t *p = g_free_head; p; p = *(uint8_t **)p) {
+        free_regions++;
+    }
+    if (g_committed < g_budget) {
+        free_regions += g_budget - g_committed;
+    }
+    if (free_regions <= 1) {
+        return; /* no room for a to-space -> mark-only cycle */
+    }
+    uint64_t budget_left = (free_regions - 1) * REGION_SIZE;
+
+    /* Select the relocation set: non-current, non-empty regions that are
+     * less than half full, capped by the headroom budget. */
+    uint64_t selected = 0;
+    for (uint64_t idx = 0; idx < g_committed; idx++) {
+        g_from_set[idx] = 0;
+        uint8_t *base = region_at(idx);
+        if (base == g_heap_base) {
+            continue;
+        }
+        uint64_t live = g_region_live[idx];
+        if (live == 0 || live * 2 >= REGION_SIZE || live > budget_left) {
+            continue;
+        }
+        g_from_set[idx] = 1;
+        budget_left -= live;
+        selected++;
+    }
+    if (selected == 0) {
+        return;
+    }
+
+    /* Evacuate: copy each live block into to-space, then overwrite its old
+     * header word0 with the forwarding pointer. Size is read before the
+     * overwrite, so the linear walk stays valid. */
+    g_to_base = g_to_top = g_to_end = NULL;
+    for (uint64_t idx = 0; idx < g_committed; idx++) {
+        if (!g_from_set[idx]) {
+            continue;
+        }
+        uint8_t *base = region_at(idx);
+        uint8_t *top = (uint8_t *)(uintptr_t)g_region_top[idx];
+        for (uint8_t *cur = base; cur < top;) {
+            uint64_t *b = (uint64_t *)cur;
+            uint64_t sz = block_size(b[0]);
+            if (b[0] & g_header_mark) {
+                uint8_t *dst = to_bump(sz);
+                if (!dst) {
+                    fprintf(stderr, "klassic gc: evacuation overran to-space\n");
+                    exit(1);
+                }
+                memcpy(dst, cur, sz);
+                b[0] = (uint64_t)(uintptr_t)(dst + 16) | KLASSIC_GC_FWD;
+                g_relocations++;
+            }
+            cur += sz;
+        }
+    }
+    if (g_to_base) {
+        g_region_top[region_index(g_to_base)] = (uint64_t)(uintptr_t)g_to_top;
+    }
+
+    /* Fix every reference to a moved object: roots, then the live fields of
+     * every kept region (the from-space regions are about to be freed, so
+     * their -- now stale -- contents are skipped). */
+    for (uint64_t i = 0; i < g_shadow_top; i++) {
+        fixup_root(g_shadow[i]);
+    }
+    for (uint64_t idx = 0; idx < g_committed; idx++) {
+        if (g_from_set[idx]) {
+            continue;
+        }
+        uint8_t *base = region_at(idx);
+        uint8_t *top = (uint8_t *)(uintptr_t)g_region_top[idx];
+        if (top == base) {
+            continue;
+        }
+        fixup_region(base, top);
+    }
+
+    /* Free the vacated (now fully forwarded) from-space regions. */
+    for (uint64_t idx = 0; idx < g_committed; idx++) {
+        if (!g_from_set[idx]) {
+            continue;
+        }
+        uint8_t *base = region_at(idx);
+        *(uint8_t **)base = g_free_head;
+        g_free_head = base;
+        g_region_top[idx] = (uint64_t)(uintptr_t)base;
+        g_region_live[idx] = 0;
     }
 }
 
@@ -331,10 +538,12 @@ static void gc_mark_start(void) {
     g_phase = GC_PHASE_MARK;
 }
 
-/* MarkEnd: drain the frontier to fixpoint, sweep, return to Idle. */
+/* MarkEnd: drain the frontier to fixpoint, sweep, compact sparse regions,
+ * return to Idle. */
 static void gc_mark_end(void) {
     gc_drain();
     gc_sweep();
+    gc_relocate();
     g_phase = GC_PHASE_IDLE;
     g_bytes_since_cycle = 0;
 }
@@ -374,6 +583,7 @@ static void gc_driver(uint64_t total) {
 }
 
 uint64_t klassic_gc_collection_count(void) { return g_collections; }
+uint64_t klassic_gc_relocation_count(void) { return g_relocations; }
 
 uint64_t klassic_gc_live_region_count(void) {
     uint64_t live = 0;
