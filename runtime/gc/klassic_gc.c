@@ -403,9 +403,11 @@ static void fixup_field(void **slot) {
     }
 }
 
-/* Rewrite a raw root slot to follow forwarding (roots hold raw pointers). */
+/* Rewrite a raw root slot to follow forwarding. Roots hold raw pointers by
+ * contract; strip defensively anyway so this agrees with mark_visit and
+ * stays correct even if codegen ever stages a colored pointer in a slot. */
 static void fixup_root(void **slot) {
-    uint64_t raw = (uint64_t)*slot;
+    uint64_t raw = (uint64_t)*slot & gc_strip_mask;
     if (!raw) {
         return;
     }
