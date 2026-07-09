@@ -365,6 +365,10 @@ static int to_acquire(void) {
     g_to_top = base;
     g_to_end = base + REGION_SIZE;
     g_region_top[region_index(base)] = (uint64_t)(uintptr_t)base;
+    /* A to-space region is a survivor destination, never from-space: mark it
+     * so the fixup walk visits it and the free walk spares it, even for a
+     * tail region committed after the selection loop already ran. */
+    g_from_set[region_index(base)] = 0;
     return 1;
 }
 
