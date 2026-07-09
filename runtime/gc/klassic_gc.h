@@ -9,12 +9,14 @@
  *
  * Object layout: a 16-byte header precedes each user pointer.
  *   word0 = [ size | flags ]  where the size is 16-aligned so the low 4
- *           bits are flags: bit0 = FWD (forwarded; word0 then holds the
- *           new user pointer | FWD), bits 1-2 = the two alternating mark
- *           bits. size = word0 & -16.
+ *           bits are flags: bit0 = FWD (forwarded), bits 1-2 = the two
+ *           alternating mark bits. size = word0 & -16 -- kept intact even
+ *           when forwarded, so the from-space stays linearly walkable.
  *   word1 = type tag (KLASSIC_GC_RAW_BYTES / _POINTER_RECORD /
- *           _POINTER_LIST). Tags >= POINTER_RECORD have an all-pointer
- *           payload; a POINTER_LIST skips a leading length qword.
+ *           _POINTER_LIST), OR, once the object is forwarded, the new user
+ *           pointer (the tag is dead by then). Tags >= POINTER_RECORD have
+ *           an all-pointer payload; a POINTER_LIST skips a leading length
+ *           qword.
  * The user pointer is block + 16.
  *
  * The collector is a ZGC-style region heap with colored pointers + a load

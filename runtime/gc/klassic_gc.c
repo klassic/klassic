@@ -390,16 +390,19 @@ static uint8_t *to_bump(uint64_t total) {
 }
 
 /* Rewrite one colored heap-pointer slot to follow forwarding, if its
- * target has been evacuated. */
+ * target has been evacuated. A forwarded object keeps its size in word0
+ * (only the FWD bit is set) and holds the new user pointer in word1, so the
+ * from-space stays linearly walkable even after the object is forwarded --
+ * the invariant incremental relocation needs (a barrier may evacuate an
+ * object out of order with the relocate walk). */
 static void fixup_field(void **slot) {
     uint64_t raw = (uint64_t)*slot & gc_strip_mask;
     if (!raw) {
         return;
     }
-    uint64_t w0 = *(uint64_t *)(raw - 16);
-    if (w0 & KLASSIC_GC_FWD) {
-        uint64_t nw = w0 & ~(uint64_t)15u; /* new user pointer (16-aligned) */
-        *slot = (void *)(nw | gc_good_color);
+    uint64_t *block = (uint64_t *)(raw - 16);
+    if (block[0] & KLASSIC_GC_FWD) {
+        *slot = (void *)(block[1] | gc_good_color);
     }
 }
 
@@ -411,9 +414,9 @@ static void fixup_root(void **slot) {
     if (!raw) {
         return;
     }
-    uint64_t w0 = *(uint64_t *)(raw - 16);
-    if (w0 & KLASSIC_GC_FWD) {
-        *slot = (void *)(w0 & ~(uint64_t)15u);
+    uint64_t *block = (uint64_t *)(raw - 16);
+    if (block[0] & KLASSIC_GC_FWD) {
+        *slot = (void *)block[1];
     }
 }
 
@@ -498,7 +501,14 @@ static void gc_relocate(void) {
                     exit(1);
                 }
                 memcpy(dst, cur, sz);
-                b[0] = (uint64_t)(uintptr_t)(dst + 16) | KLASSIC_GC_FWD;
+                /* Install forwarding: keep the size in word0 (set only the
+                 * FWD bit), stash the new user pointer in word1. word1 (the
+                 * type tag) was already copied to `dst` by the memcpy above,
+                 * and a forwarded from-space object is never read as a tag
+                 * again. Size-preserving forwarding keeps the from-space
+                 * linearly walkable for incremental relocation. */
+                b[1] = (uint64_t)(uintptr_t)(dst + 16);
+                b[0] |= KLASSIC_GC_FWD;
                 g_relocations++;
             }
             cur += sz;
