@@ -190,13 +190,34 @@ verify on main. The evaluator stays the differential oracle for the LLVM path.
     word1 forwarding become atomic; `gc_relocate_step` bounds its walk by a
     `g_relocate_limit` snapshot rather than the racing `g_committed`. Verified
     clean across 48 ASan + 48 TSan parallel runs and the full `cargo test`.
-- **M5 — Concurrency correctness: TSan + multi-thread stress.** ThreadSanitizer-
-  clean under **several mutator threads** churning records while the GC thread
-  relocates. Nail the races: two mutators (or a mutator and the GC thread)
-  loading/healing the same field, both racing to install a forwarding word (CAS,
-  first toucher wins), a handshake landing inside `gc_alloc`, TLAB/region
-  acquisition contention, thread register/deregister vs an in-flight handshake.
-  `gc_stress` (tiny trigger) run under TSan and ASan with N mutator pthreads.
+- **M5 — N mutators: thread table + all-mutator handshake, TSan stress.**
+  This is the milestone that turns the single-mutator M4 rendezvous into a
+  real N-mutator one; the independent M4 review named it the load-bearing
+  boundary. Concrete work, from that review:
+  - **Handshake stops *all* mutators, not one.** `g_hs_parked` (an `int`)
+    becomes a *parked count* compared against a *registered-mutator count*;
+    `gc_rendezvous` runs `action()` only when every registered mutator has
+    parked. Each mutator scans *its own* shadow stack at the handshake
+    (avoids a cross-thread stack walk).
+  - **Thread table.** Each mutator registers on start / deregisters on exit:
+    its shadow-stack base+top, its active TLAB region, its mask cache. The
+    global `g_shadow`/`g_shadow_top` and the single `g_heap_top` bump pointer
+    become per-mutator (two mutators bumping one shared `g_heap_top` today
+    would hand out overlapping objects).
+  - **Publish masks atomically.** `gc_set_good` writes `gc_good_color` then
+    `gc_bad_mask` as two stores; a running mutator's barrier fast path must
+    never read a half-updated pair. Make the flip atomic (or double-buffer
+    and swap a single pointer/epoch), and have each mutator reload its mask
+    cache only at a handshake. Masks/`g_header_mark`/bump fields are mutated
+    only inside a parked rendezvous, so single-mutator M4 is safe; N mutators
+    need the atomic publish.
+  - **Race targets (TSan-driven):** two mutators (or a mutator and the GC)
+    loading/healing the same field, racing a forwarding CAS (first toucher
+    wins), a handshake landing inside `gc_alloc`, TLAB/region acquisition
+    contention, thread register/deregister vs an in-flight handshake. Also
+    make the observability readers (`klassic_gc_live_region_count`,
+    `klassic_gc_collection_count`) atomic. `gc_stress` (tiny trigger) run
+    under TSan and ASan with N mutator pthreads until clean.
 - **M6 — Pauses + observability.** Confirm pauses are O(roots) all-mutator
   handshakes (measure with the clock shim); `--gc-log` reports collections,
   bytes, and max/total handshake pause at exit. Tune the trigger and
