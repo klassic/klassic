@@ -20,11 +20,17 @@
  * The user pointer is block + 16.
  *
  * The collector is a ZGC-style region heap with colored pointers + a load
- * barrier (M6b), incremental marking (M6c), and stop-the-world compacting
- * evacuation with in-object forwarding (M6d): sparse regions are copied
- * into a fresh to-space and every root and live field is rewritten to the
- * moved location. Lazy/concurrent relocation via the R-color barrier is a
- * later refinement (see docs/zgc-plan.md).
+ * barrier (M6b), incremental marking (M6c), and incremental compacting
+ * relocation (true-zgc M1): both marking and evacuation run in bounded
+ * quanta from the allocator, with an Idle -> Mark -> Relocate phase machine
+ * and an R (remapped) color that, together with the two alternating mark
+ * colors, drives a phase-dependent load barrier -- mark during Mark,
+ * evacuate-on-demand + follow-forwarding during Relocate, remap ghosts
+ * during Idle. Forwarding is in-object (word0 keeps the size + the FWD bit,
+ * word1 holds the new pointer); a fully-evacuated "ghost" region is freed
+ * at the next MarkEnd, once marking has remapped every live pointer off it.
+ * Still single-threaded and non-atomic; a background GC thread with atomic
+ * barriers is the next milestone (docs/true-zgc-plan.md).
  */
 #ifndef KLASSIC_GC_H
 #define KLASSIC_GC_H
