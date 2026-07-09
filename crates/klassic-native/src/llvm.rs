@@ -100,6 +100,9 @@ struct Emitter {
     scope_roots: Vec<u32>,
     /// interned record field layouts: shape id -> [(field name, field type)].
     shapes: Vec<Vec<(String, LType)>>,
+    /// whether to emit GC safepoint polls (only for heap-using programs,
+    /// which link the collector); scalar programs get none.
+    emit_polls: bool,
 }
 
 impl Emitter {
@@ -187,6 +190,26 @@ impl Emitter {
         self.next_temp += 1;
         self.allocas.push_str(&format!("  {slot} = alloca ptr\n"));
         slot
+    }
+
+    /// Emit a GC safepoint poll: if a handshake is pending, call the collector
+    /// to scan this thread's roots and ack. On the hot path this is a single
+    /// load + not-taken branch. No-op for scalar programs (no collector).
+    fn emit_poll(&mut self) {
+        if !self.emit_polls {
+            return;
+        }
+        let flag = self.fresh();
+        self.emit(&format!("{flag} = load i64, ptr @gc_handshake_requested"));
+        let need = self.fresh();
+        self.emit(&format!("{need} = icmp ne i64 {flag}, 0"));
+        let call = self.fresh_label("hscall");
+        let cont = self.fresh_label("hscont");
+        self.emit(&format!("br i1 {need}, label %{call}, label %{cont}"));
+        self.bind(&call);
+        self.emit("call void @klassic_gc_handshake()");
+        self.emit(&format!("br label %{cont}"));
+        self.bind(&cont);
     }
 
     /// Intern a record field layout, returning its shape id.
@@ -696,6 +719,7 @@ impl Emitter {
                 ));
                 self.bind(&body_label);
                 self.statement(body)?;
+                self.emit_poll(); /* safepoint at the loop back-edge */
                 self.emit(&format!("br label %{cond_label}"));
                 self.bind(&after_label);
                 Ok(())
@@ -816,10 +840,107 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) -> Result<(), Diagnosti
     Ok(())
 }
 
+/// Emit every user function and `main` into an IR code string. Run once to
+/// detect heap use, then again with `emitter.emit_polls` set if the program
+/// allocates (so safepoint polls land in every function of a GC program).
+fn emit_functions_and_main(emitter: &mut Emitter, expr: &Expr) -> Result<String, Diagnostic> {
+    let mut code = String::new();
+    let function_count = emitter.functions.len();
+    for index in 0..function_count {
+        let (name, params, ret, body) = {
+            let function = &emitter.functions[index];
+            (
+                function.name.clone(),
+                function.params.clone(),
+                function.ret,
+                function.body.clone(),
+            )
+        };
+        emitter.allocas.clear();
+        emitter.body.clear();
+        emitter.next_temp = 0;
+        emitter.next_label = 0;
+        emitter.scopes.clear();
+        emitter.scope_roots.clear();
+        emitter.open_scope();
+        emitter.current_block = "entry".to_owned();
+        let mut param_sig = Vec::with_capacity(params.len());
+        for (param, ty) in &params {
+            let incoming = format!("%arg_{param}");
+            param_sig.push(format!("{} {incoming}", ty.llvm()));
+            let ptr = emitter.declare_local(param, *ty);
+            if *ty != LType::Unit {
+                emitter
+                    .body
+                    .push_str(&format!("  store {} {incoming}, ptr {ptr}\n", ty.llvm()));
+            }
+        }
+        emitter.emit_poll(); // safepoint at function entry
+        let value = emitter.expr(&body)?;
+        if value.ty != ret {
+            return Err(unsupported(
+                body.span(),
+                "a function body of a different type than its return annotation",
+            ));
+        }
+        emitter.close_scope();
+        let mangled = format!("klassic_{name}");
+        code.push_str(&format!(
+            "define {} @{mangled}({}) {{\nentry:\n",
+            ret.llvm(),
+            param_sig.join(", ")
+        ));
+        code.push_str(&emitter.allocas);
+        code.push_str(&emitter.body);
+        if ret == LType::Unit {
+            code.push_str("  ret void\n");
+        } else {
+            code.push_str(&format!("  ret {} {}\n", ret.llvm(), value.operand));
+        }
+        code.push_str("}\n\n");
+    }
+
+    // main: every non-def top-level statement, in order.
+    emitter.allocas.clear();
+    emitter.body.clear();
+    emitter.next_temp = 0;
+    emitter.next_label = 0;
+    emitter.scopes.clear();
+    emitter.scope_roots.clear();
+    emitter.open_scope();
+    emitter.current_block = "entry".to_owned();
+    emitter.emit_poll(); // safepoint at program entry
+    let statements: Vec<&Expr> = match expr {
+        Expr::Block { expressions, .. } => expressions.iter().collect(),
+        other => vec![other],
+    };
+    for statement in statements {
+        emitter.statement(statement)?;
+    }
+    emitter.close_scope();
+    code.push_str("define i32 @main() {\nentry:\n");
+    code.push_str(&emitter.allocas);
+    code.push_str(&emitter.body);
+    code.push_str("  ret i32 0\n}\n");
+    Ok(code)
+}
+
 /// Emit the whole program as an LLVM IR module.
 pub(crate) fn emit_llvm_program(expr: &Expr) -> Result<String, Diagnostic> {
     let mut emitter = Emitter::default();
     collect_functions(expr, &mut emitter)?;
+
+    // First pass with no polls detects whether the program allocates; if so,
+    // re-emit with safepoint polls (which reference the collector's handshake
+    // symbols, only linked for heap programs).
+    let code = emit_functions_and_main(&mut emitter, expr)?;
+    let uses_heap = code.contains("call ptr @klassic_gc_alloc(");
+    let code = if uses_heap {
+        emitter.emit_polls = true;
+        emit_functions_and_main(&mut emitter, expr)?
+    } else {
+        code
+    };
 
     let mut out = String::new();
     out.push_str("; generated by klassic --backend llvm\n");
@@ -838,88 +959,13 @@ pub(crate) fn emit_llvm_program(expr: &Expr) -> Result<String, Diagnostic> {
     out.push_str("declare void @klassic_gc_shadow_push(ptr)\n");
     out.push_str("declare void @klassic_gc_shadow_pop_n(i64)\n");
     out.push_str("declare void @klassic_gc_write(ptr, ptr)\n");
-    out.push_str("declare i64 @klassic_gc_load_barrier_slow(i64, ptr)\n\n");
-
-    // User functions. The subset treats a function body as a single
-    // expression returned to the caller.
-    let function_count = emitter.functions.len();
-    for index in 0..function_count {
-        let (name, params, ret, body) = {
-            let function = &emitter.functions[index];
-            (
-                function.name.clone(),
-                function.params.clone(),
-                function.ret,
-                // clone the body so the emitter can borrow &mut self
-                function.body.clone(),
-            )
-        };
-        emitter.allocas.clear();
-        emitter.body.clear();
-        emitter.next_temp = 0;
-        emitter.next_label = 0;
-        emitter.scopes.clear();
-        emitter.scope_roots.clear();
-        emitter.open_scope();
-        emitter.current_block = "entry".to_owned();
-        // Bind parameters: alloca + store the incoming SSA value.
-        let mut param_sig = Vec::with_capacity(params.len());
-        for (param, ty) in &params {
-            let incoming = format!("%arg_{param}");
-            param_sig.push(format!("{} {incoming}", ty.llvm()));
-            let ptr = emitter.declare_local(param, *ty);
-            if *ty != LType::Unit {
-                emitter
-                    .body
-                    .push_str(&format!("  store {} {incoming}, ptr {ptr}\n", ty.llvm()));
-            }
-        }
-        let value = emitter.expr(&body)?;
-        if value.ty != ret {
-            return Err(unsupported(
-                body.span(),
-                "a function body of a different type than its return annotation",
-            ));
-        }
-        emitter.close_scope();
-        let mangled = format!("klassic_{name}");
-        out.push_str(&format!(
-            "define {} @{mangled}({}) {{\nentry:\n",
-            ret.llvm(),
-            param_sig.join(", ")
-        ));
-        out.push_str(&emitter.allocas);
-        out.push_str(&emitter.body);
-        if ret == LType::Unit {
-            out.push_str("  ret void\n");
-        } else {
-            out.push_str(&format!("  ret {} {}\n", ret.llvm(), value.operand));
-        }
-        out.push_str("}\n\n");
+    out.push_str("declare i64 @klassic_gc_load_barrier_slow(i64, ptr)\n");
+    if uses_heap {
+        out.push_str("@gc_handshake_requested = external dso_local global i64\n");
+        out.push_str("declare void @klassic_gc_handshake()\n");
     }
-
-    // main: every non-def top-level statement, in order.
-    emitter.allocas.clear();
-    emitter.body.clear();
-    emitter.next_temp = 0;
-    emitter.next_label = 0;
-    emitter.scopes.clear();
-    emitter.scope_roots.clear();
-    emitter.open_scope();
-    emitter.current_block = "entry".to_owned();
-    let statements: Vec<&Expr> = match expr {
-        Expr::Block { expressions, .. } => expressions.iter().collect(),
-        other => vec![other],
-    };
-    for statement in statements {
-        emitter.statement(statement)?;
-    }
-    emitter.close_scope();
-    out.push_str("define i32 @main() {\nentry:\n");
-    out.push_str(&emitter.allocas);
-    out.push_str(&emitter.body);
-    out.push_str("  ret i32 0\n}\n");
-
+    out.push('\n');
+    out.push_str(&code);
     Ok(out)
 }
 

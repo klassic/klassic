@@ -191,6 +191,26 @@ fn record_with_bool_and_varied_arities() {
 }
 
 #[test]
+fn record_allocating_function_in_a_loop() {
+    // A function that allocates a record, called from a loop: exercises the
+    // GC safepoint polls emitted at the function entry and the loop back-edge
+    // (dormant here -- no handshake pending -- so output must be unchanged).
+    assert_llvm_matches_evaluator(
+        "def sumRec(a: Int, b: Int): Int = {\n\
+           val r = record { x: a; y: b }\n\
+           r.x + r.y\n\
+         }\n\
+         mutable total = 0\n\
+         mutable i = 0\n\
+         while (i < 1000) {\n\
+           total = total + sumRec(i, 1)\n\
+           i = i + 1\n\
+         }\n\
+         println(total)\n",
+    );
+}
+
+#[test]
 fn record_survives_moving_collection() {
     // Churn enough short-lived records to force many moving collections while
     // a rooted survivor is kept; its fields must read back intact after being
