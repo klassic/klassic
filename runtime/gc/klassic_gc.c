@@ -103,6 +103,20 @@ static void gc_set_good(uint64_t good) {
 static uint64_t align16(uint64_t n) { return (n + 15u) & ~(uint64_t)15u; }
 static uint64_t block_size(uint64_t word0) { return word0 & ~(uint64_t)15u; }
 
+/* Forwarding is encoded in word1: a not-yet-forwarded object holds its small
+ * type tag there (all tags are heap addresses' worth below the reservation),
+ * a forwarded one holds its to-space user pointer -- an address inside the
+ * reservation. So a single CAS on word1 installs forwarding atomically (no
+ * FWD flag bit, no two-word publish race), and word0 keeps size + mark bits
+ * untouched. `gc_forwarded` distinguishes the two by the reservation range. */
+static int gc_forwarded(uint64_t word1) {
+    const uint8_t *p = (const uint8_t *)word1;
+    /* Inclusive upper bound: a zero-payload object in the last qword of the
+     * reservation has user pointer == base + RESERVE_BYTES. Tags (1/2/4) are
+     * far below g_region_base, so this never misclassifies a tag. */
+    return p >= g_region_base && p <= g_region_base + RESERVE_BYTES;
+}
+
 void klassic_gc_init(void) {
     if (g_initialized) {
         return;
@@ -196,9 +210,11 @@ void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
             *(uint64_t *)block = total;          /* word0 = size, flags clear */
             *(uint64_t *)(block + 8) = type_tag; /* word1 = type tag */
             /* Allocate-black: an object born during Mark is live this
-             * cycle, so the in-progress mark does not reclaim it. */
+             * cycle, so the in-progress mark does not reclaim it. (Atomic OR
+             * for uniformity with mark_visit, though the block is still
+             * private to this thread here.) */
             if (g_phase == GC_PHASE_MARK) {
-                *(uint64_t *)block |= g_header_mark;
+                __atomic_fetch_or((uint64_t *)block, g_header_mark, __ATOMIC_RELAXED);
             }
             return block + 16;
         }
@@ -248,9 +264,9 @@ uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
     if (raw) {
         uint64_t *block = (uint64_t *)(raw - 16);
         if (g_phase == GC_PHASE_RELOCATE && in_from_set(raw)
-            && !(block[0] & KLASSIC_GC_FWD)) {
+            && !gc_forwarded(block[1])) {
             raw = gc_evacuate_object(raw); /* evacuate on demand + follow */
-        } else if (block[0] & KLASSIC_GC_FWD) {
+        } else if (gc_forwarded(block[1])) {
             raw = block[1]; /* follow forwarding */
         }
         *slot = (void *)(raw | gc_good_color);
@@ -284,14 +300,17 @@ static void mark_visit(void *user) {
         return;
     }
     uint64_t *block = (uint64_t *)(raw - 16);
-    if (block[0] & KLASSIC_GC_FWD) {
+    if (gc_forwarded(block[1])) {
         raw = block[1];
         block = (uint64_t *)(raw - 16);
     }
-    if (block[0] & g_header_mark) {
+    /* Atomic test-and-set of the mark bit: concurrent markers (mutator
+     * barriers + the GC thread) race here, and exactly the one that flips the
+     * bit takes ownership and pushes the object. */
+    uint64_t old = __atomic_fetch_or(&block[0], g_header_mark, __ATOMIC_RELAXED);
+    if (old & g_header_mark) {
         return; /* already marked this cycle */
     }
-    block[0] |= g_header_mark;
     if (g_worklist_top >= WORKLIST_MAX) {
         fprintf(stderr, "klassic gc: mark worklist overflow\n");
         exit(1);
@@ -318,7 +337,7 @@ static void gc_trace(uint64_t budget) {
             uint64_t raw = (uint64_t)fields[i] & gc_strip_mask;
             if (raw) {
                 uint64_t *fb = (uint64_t *)(raw - 16);
-                if (fb[0] & KLASSIC_GC_FWD) {
+                if (gc_forwarded(fb[1])) {
                     raw = fb[1]; /* remap a ghost pointer to to-space */
                 }
                 /* Recolor-on-trace: rewrite the field to the (remapped)
@@ -391,11 +410,13 @@ static void gc_sweep(void) {
  * slow-paths, and remaps the roots. Evacuation then runs in quanta from the
  * allocator (gc_relocate_step) alongside the mutator's own barrier, which
  * evacuates a from-set object on demand when the mutator loads a pointer to
- * it. A vacated object keeps its size in word0 (FWD bit set) with the new
- * pointer in word1, so the from-space stays walkable; the fully-evacuated
- * from-set regions become ghosts, freed at the next MarkEnd once marking
- * has remapped every live pointer off them. Single mutator, non-atomic for
- * now (docs/true-zgc-plan.md M2 makes the shared state thread-safe). */
+ * it. A vacated object keeps its size in word0 and stashes its new user
+ * pointer in word1 (installed by a single CAS, see gc_evacuate_object), so
+ * the from-space stays linearly walkable; the fully-evacuated from-set
+ * regions become ghosts, freed at the next MarkEnd once marking has remapped
+ * every live pointer off them. The header operations are atomic (M2); a
+ * background GC thread that drives this concurrently is M4
+ * (docs/true-zgc-plan.md). */
 
 /* Acquire a fresh zeroed region for the to-space bump (free pool first,
  * then a committed tail region), without disturbing the mutator's current
@@ -459,14 +480,17 @@ static int in_from_set(uint64_t raw) {
 }
 
 /* Evacuate a from-set object to to-space unless already forwarded; return
- * its to-space user pointer. The copy is taken before forwarding is
- * installed; size stays in word0 (FWD bit only) and the new pointer goes in
- * word1, so the from-space remains linearly walkable and a second toucher
- * (relocate walk or barrier) reads the winner's address. */
+ * its to-space user pointer. Copy-then-CAS: copy the object (which carries
+ * its tag in word1), then atomically install the forwarding by CASing word1
+ * from the tag to the new user pointer. First toucher wins; a loser abandons
+ * its copy (un-bumping if it was the last allocation) and returns the
+ * winner's pointer. Size stays in word0, so the from-space remains linearly
+ * walkable throughout. */
 static uint64_t gc_evacuate_object(uint64_t user) {
     uint64_t *block = (uint64_t *)(user - 16);
-    if (block[0] & KLASSIC_GC_FWD) {
-        return block[1];
+    uint64_t w1 = __atomic_load_n(&block[1], __ATOMIC_ACQUIRE);
+    if (gc_forwarded(w1)) {
+        return w1;
     }
     uint64_t sz = block_size(block[0]);
     uint8_t *dst = to_bump(sz);
@@ -475,10 +499,19 @@ static uint64_t gc_evacuate_object(uint64_t user) {
         exit(1);
     }
     memcpy(dst, block, sz);
-    block[1] = (uint64_t)(uintptr_t)(dst + 16);
-    block[0] |= KLASSIC_GC_FWD;
-    g_relocations++;
-    return (uint64_t)(uintptr_t)(dst + 16);
+    uint64_t newuser = (uint64_t)(uintptr_t)(dst + 16);
+    uint64_t expected = w1; /* the tag we loaded */
+    if (__atomic_compare_exchange_n(&block[1], &expected, newuser, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        g_relocations++;
+        return newuser;
+    }
+    /* Lost the race: reclaim the copy if it is still the top of to-space,
+     * then take the winner's pointer (CAS wrote it into `expected`). */
+    if (g_to_top == dst + sz) {
+        g_to_top = dst;
+    }
+    return expected;
 }
 
 /* Remap a raw root slot at RelocateStart: evacuate its target on demand if
@@ -490,9 +523,9 @@ static void relocate_root(void **slot) {
         return;
     }
     uint64_t *block = (uint64_t *)(raw - 16);
-    if (in_from_set(raw) && !(block[0] & KLASSIC_GC_FWD)) {
+    if (in_from_set(raw) && !gc_forwarded(block[1])) {
         raw = gc_evacuate_object(raw);
-    } else if (block[0] & KLASSIC_GC_FWD) {
+    } else if (gc_forwarded(block[1])) {
         raw = block[1];
     }
     *slot = (void *)raw;
@@ -563,7 +596,7 @@ static void gc_relocate_end(void) {
 }
 
 /* Evacuate up to `budget` live bytes from the from-set, resuming the linear
- * walk via the cursor. Objects the barrier already evacuated (FWD set) are
+ * walk via the cursor. Objects the barrier already evacuated (forwarded) are
  * skipped; when the whole from-set is drained, finish the phase. */
 static void gc_relocate_step(uint64_t budget) {
     for (;;) {
@@ -581,7 +614,7 @@ static void gc_relocate_step(uint64_t budget) {
         while (g_relocate_ptr < top) {
             uint64_t *b = (uint64_t *)g_relocate_ptr;
             uint64_t sz = block_size(b[0]);
-            if ((b[0] & g_header_mark) && !(b[0] & KLASSIC_GC_FWD)) {
+            if ((b[0] & g_header_mark) && !gc_forwarded(b[1])) {
                 gc_evacuate_object((uint64_t)(uintptr_t)(g_relocate_ptr + 16));
                 budget = (budget > sz) ? budget - sz : 0;
             }
