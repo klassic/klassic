@@ -97,6 +97,17 @@ void *klassic_gc_read(void **slot);
 /* Store a heap pointer into a slot, coloring it good (null stays null). */
 void klassic_gc_write(void **slot, void *value);
 
+/* --- Safepoint handshake (true-zgc M3) --------------------------- *
+ * The generated code polls `gc_handshake_requested` at loop back-edges and
+ * function entries (a dso_local global, so the poll is a single
+ * `cmpq $0, gc_handshake_requested(%rip); jne` and predicts not-taken).
+ * When a background GC thread (M4) needs a consistent root set at a phase
+ * transition it raises the flag; each mutator, at its next poll, calls
+ * klassic_gc_handshake() to scan its own roots and ack. Until the GC thread
+ * lands the flag is never set, so polls are no-ops. */
+extern uint64_t gc_handshake_requested;
+void klassic_gc_handshake(void);
+
 /* Test/observability hooks. */
 uint64_t klassic_gc_collection_count(void);
 uint64_t klassic_gc_live_region_count(void);

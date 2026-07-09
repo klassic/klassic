@@ -94,6 +94,11 @@ uint64_t gc_bad_mask = GC_COLOR_M0 | GC_COLOR_M1;
 uint64_t gc_strip_mask = ~GC_COLOR_MASK;
 static uint64_t g_mark_color = GC_COLOR_M0; /* alternates M0<->M1 each mark */
 
+/* Safepoint handshake flag (dso_local: the emitted poll reads it). Raised by
+ * the background GC thread (M4) at a phase transition; each mutator acks at
+ * its next poll. Never set until the GC thread lands, so polls are no-ops. */
+uint64_t gc_handshake_requested = 0;
+
 /* Set the good color and derive the bad mask (the two other color bits). */
 static void gc_set_good(uint64_t good) {
     gc_good_color = good;
@@ -684,6 +689,26 @@ void klassic_gc_collect(void) {
         gc_mark_end(); /* -> Relocate or Idle */
     }
     gc_relocate_drain();
+}
+
+/* Safepoint handshake: called from a mutator's poll when gc_handshake_requested
+ * is set. Scans this thread's roots into the collector per the current phase
+ * (mark them during Mark, remap them during Relocate) -- the O(roots) work a
+ * phase transition needs from each mutator -- then acks by clearing the flag.
+ * Dormant until the GC thread (M4) raises the flag; M4 also makes the roots
+ * per-thread and the ack a barrier across all registered mutators. */
+void klassic_gc_handshake(void) {
+    uint64_t phase = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
+    if (phase == GC_PHASE_MARK) {
+        for (uint64_t i = 0; i < g_shadow_top; i++) {
+            mark_visit(*g_shadow[i]);
+        }
+    } else if (phase == GC_PHASE_RELOCATE) {
+        for (uint64_t i = 0; i < g_shadow_top; i++) {
+            relocate_root(g_shadow[i]);
+        }
+    }
+    __atomic_store_n(&gc_handshake_requested, 0, __ATOMIC_RELEASE); /* ack */
 }
 
 /* Poll the phase machine from an allocation point: proactively start a cycle
