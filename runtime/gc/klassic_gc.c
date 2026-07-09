@@ -8,6 +8,7 @@
 
 #include "klassic_gc.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,9 +96,25 @@ uint64_t gc_strip_mask = ~GC_COLOR_MASK;
 static uint64_t g_mark_color = GC_COLOR_M0; /* alternates M0<->M1 each mark */
 
 /* Safepoint handshake flag (dso_local: the emitted poll reads it). Raised by
- * the background GC thread (M4) at a phase transition; each mutator acks at
- * its next poll. Never set until the GC thread lands, so polls are no-ops. */
+ * the background GC thread at a phase transition; the mutator parks at its
+ * next poll while the GC thread runs. */
 uint64_t gc_handshake_requested = 0;
+
+/* --- Background GC thread (true-zgc M4) --------------------------- *
+ * A single background thread runs the collection. M4a (this step) parks the
+ * triggering mutator for the whole cycle -- correct and trivially race-free;
+ * M4b/M4c release the mutator to run concurrently during mark/relocate. The
+ * wake lock hands cycle requests to the GC thread and blocks the mutator
+ * until the cycle it asked for finishes. */
+static pthread_mutex_t g_wake_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_wake_cond = PTHREAD_COND_INITIALIZER;  /* mutator -> GC */
+static pthread_cond_t g_idle_cond = PTHREAD_COND_INITIALIZER;  /* GC -> mutator */
+static int g_cycle_request; /* a cycle has been asked for / is running */
+static uint64_t g_cycle_done; /* completed-cycle counter, for wait predicates */
+static pthread_t g_gc_thread;
+static int g_gc_thread_started;
+static int g_gc_shutdown;
+static void *gc_worker(void *arg);
 
 /* Set the good color and derive the bad mask (the two other color bits). */
 static void gc_set_good(uint64_t good) {
@@ -140,6 +157,15 @@ void klassic_gc_init(void) {
     g_header_mark = KLASSIC_GC_HMARK1;
     g_collections = 0;
     g_initialized = 1;
+    /* Spawn the background GC thread that runs collections. */
+    if (!g_gc_thread_started) {
+        if (pthread_create(&g_gc_thread, NULL, gc_worker, NULL) != 0) {
+            fprintf(stderr, "klassic gc: cannot start the GC thread\n");
+            exit(1);
+        }
+        pthread_detach(g_gc_thread);
+        g_gc_thread_started = 1;
+    }
 }
 
 static uint8_t *region_at(uint64_t index) {
@@ -190,7 +216,7 @@ static int grow_budget(void) {
     return 1;
 }
 
-static void gc_driver(uint64_t total); /* forward decl: incremental driver */
+static void gc_trigger_and_wait(void); /* forward decl: request a GC cycle */
 
 void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
     if (!g_initialized) {
@@ -203,11 +229,14 @@ void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
         fprintf(stderr, "klassic gc: object larger than a region is unsupported\n");
         exit(1);
     }
-    /* Drive the phase machine BEFORE the bump, so it observes only the
-     * mutator's already-rooted state (the object about to be allocated is
-     * not yet reachable from a root). None of the routines it calls
-     * allocate, so gc_alloc is not re-entered. */
-    gc_driver(total);
+    /* Under memory pressure, ask the GC thread for a cycle before the bump
+     * (so it sees only already-rooted state -- the object about to be
+     * allocated is not yet reachable). M4a parks here until the cycle
+     * finishes; M4b/M4c let the mutator keep running during it. */
+    if (g_bytes_since_cycle + total >= (g_budget << REGION_SHIFT) / 2) {
+        gc_trigger_and_wait();
+    }
+    g_bytes_since_cycle += total;
     for (;;) {
         if (g_heap_base && (uint64_t)(g_heap_end - g_heap_top) >= total) {
             uint8_t *block = g_heap_top;
@@ -676,12 +705,10 @@ static void gc_mark_end(void) {
     gc_relocate_start();
 }
 
-/* Synchronous full collection (exhaustion / explicit): drive the phase
- * machine all the way back to Idle. */
-void klassic_gc_collect(void) {
-    if (!g_initialized) {
-        return;
-    }
+/* Run one full collection cycle (Idle -> ... -> Idle). M4a runs this on the
+ * GC thread with the mutator parked, so it needs no locking; M4b/M4c release
+ * the mutator during mark/relocate and add the data lock. */
+static void gc_run_full_cycle(void) {
     if (g_phase == GC_PHASE_IDLE) {
         gc_mark_start();
     }
@@ -689,6 +716,50 @@ void klassic_gc_collect(void) {
         gc_mark_end(); /* -> Relocate or Idle */
     }
     gc_relocate_drain();
+}
+
+/* The background GC thread: sleep until a cycle is requested, run it, then
+ * wake the parked mutator(s). */
+static void *gc_worker(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_wake_lock);
+    for (;;) {
+        while (!g_cycle_request && !g_gc_shutdown) {
+            pthread_cond_wait(&g_wake_cond, &g_wake_lock);
+        }
+        if (g_gc_shutdown) {
+            break;
+        }
+        g_cycle_request = 0;
+        pthread_mutex_unlock(&g_wake_lock);
+        gc_run_full_cycle();
+        pthread_mutex_lock(&g_wake_lock);
+        g_cycle_done++;
+        pthread_cond_broadcast(&g_idle_cond);
+    }
+    pthread_mutex_unlock(&g_wake_lock);
+    return NULL;
+}
+
+/* Mutator: ask the GC thread for a cycle and park until one completes. */
+static void gc_trigger_and_wait(void) {
+    pthread_mutex_lock(&g_wake_lock);
+    uint64_t target = g_cycle_done + 1;
+    g_cycle_request = 1;
+    pthread_cond_signal(&g_wake_cond);
+    while (g_cycle_done < target) {
+        pthread_cond_wait(&g_idle_cond, &g_wake_lock);
+    }
+    pthread_mutex_unlock(&g_wake_lock);
+}
+
+/* Synchronous full collection (exhaustion / explicit): hand it to the GC
+ * thread and park until it finishes. */
+void klassic_gc_collect(void) {
+    if (!g_initialized) {
+        return;
+    }
+    gc_trigger_and_wait();
 }
 
 /* Safepoint handshake: called from a mutator's poll when gc_handshake_requested
@@ -709,35 +780,6 @@ void klassic_gc_handshake(void) {
         }
     }
     __atomic_store_n(&gc_handshake_requested, 0, __ATOMIC_RELEASE); /* ack */
-}
-
-/* Poll the phase machine from an allocation point: proactively start a cycle
- * under memory pressure, run a mark quantum during Mark, and a relocate
- * quantum during Relocate. */
-static void gc_driver(uint64_t total) {
-    if (g_phase == GC_PHASE_MARK) {
-        g_bytes_since_quantum += total;
-        if (g_bytes_since_quantum >= GC_QUANTUM_BYTES) {
-            g_bytes_since_quantum = 0;
-            gc_trace(GC_QUANTUM_POPS);
-            if (g_worklist_top == 0) {
-                gc_mark_end(); /* -> Relocate or Idle */
-            }
-        }
-        return;
-    }
-    if (g_phase == GC_PHASE_RELOCATE) {
-        g_bytes_since_quantum += total;
-        if (g_bytes_since_quantum >= GC_QUANTUM_BYTES) {
-            g_bytes_since_quantum = 0;
-            gc_relocate_step(GC_RELOCATE_BYTES); /* -> Idle when drained */
-        }
-        return;
-    }
-    g_bytes_since_cycle += total;
-    if (g_bytes_since_cycle >= (g_budget << REGION_SHIFT) / 2) {
-        gc_mark_start();
-    }
 }
 
 uint64_t klassic_gc_collection_count(void) { return g_collections; }
