@@ -66,6 +66,7 @@ static uint64_t g_collections;
 #define GC_PHASE_RELOCATE 2
 #define GC_QUANTUM_POPS 512    /* objects traced per mark quantum */
 #define GC_QUANTUM_BYTES 8192  /* allocation between quanta */
+#define GC_RELOCATE_QUANTUM 8192 /* live bytes evacuated per relocate quantum */
 #define GC_RELOCATE_BYTES 8192 /* live bytes evacuated per relocate quantum */
 static uint64_t g_phase = GC_PHASE_IDLE;
 static uint64_t g_bytes_since_cycle;   /* drives the proactive cycle start */
@@ -74,6 +75,12 @@ static uint64_t g_bytes_since_quantum; /* drives a mark/relocate quantum */
  * evacuated and the position within it. */
 static uint64_t g_relocate_ridx;
 static uint8_t *g_relocate_ptr;
+/* Region-count snapshot taken in the RelocateStart pause. The concurrent
+ * relocate walk bounds itself by this instead of the live g_committed (which
+ * the mutator grows under g_gc_lock during the phase): any region committed
+ * after selection is by construction not in the from-set, so stopping at the
+ * snapshot is both correct and free of a racy read of g_committed. */
+static uint64_t g_relocate_limit;
 
 static int g_initialized;
 
@@ -218,7 +225,7 @@ static int acquire_region(void) {
     /* A mutator bump region is never in the relocation set; clear the flag
      * defensively (symmetric with to_acquire) so no future path can let the
      * mutator bump into a phantom from-set region. */
-    g_from_set[region_index(base)] = 0;
+    __atomic_store_n(&g_from_set[region_index(base)], 0, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -330,11 +337,15 @@ uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
     uint64_t raw = value & gc_strip_mask;
     if (raw) {
         uint64_t *block = (uint64_t *)(raw - 16);
+        /* Acquire-load word1: during a concurrent Relocate the GC thread (or
+         * another mutator) may CAS-install forwarding into it; the acquire
+         * pairs with the release-CAS in gc_evacuate_object. */
+        uint64_t w1 = __atomic_load_n(&block[1], __ATOMIC_ACQUIRE);
         if (__atomic_load_n(&g_phase, __ATOMIC_RELAXED) == GC_PHASE_RELOCATE
-            && in_from_set(raw) && !gc_forwarded(block[1])) {
+            && in_from_set(raw) && !gc_forwarded(w1)) {
             raw = gc_evacuate_object(raw); /* evacuate on demand + follow */
-        } else if (gc_forwarded(block[1])) {
-            raw = block[1]; /* follow forwarding */
+        } else if (gc_forwarded(w1)) {
+            raw = w1; /* follow forwarding */
         }
         /* Atomic self-heal: the GC thread may recolor the same field
          * concurrently during a concurrent mark. */
@@ -548,7 +559,7 @@ static int to_acquire(void) {
     /* A to-space region is a survivor destination, never from-space: mark it
      * so the fixup walk visits it and the free walk spares it, even for a
      * tail region committed after the selection loop already ran. */
-    g_from_set[region_index(base)] = 0;
+    __atomic_store_n(&g_from_set[region_index(base)], 0, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -576,7 +587,7 @@ static int in_from_set(uint64_t raw) {
     if (p < g_region_base || p >= g_region_base + RESERVE_BYTES) {
         return 0;
     }
-    return g_from_set[region_index(p)];
+    return __atomic_load_n(&g_from_set[region_index(p)], __ATOMIC_RELAXED);
 }
 
 /* Evacuate a from-set object to to-space unless already forwarded; return
@@ -593,24 +604,45 @@ static uint64_t gc_evacuate_object(uint64_t user) {
         return w1;
     }
     uint64_t sz = block_size(block[0]);
+    /* Reserve the to-space slot under the data lock: the GC thread's
+     * gc_relocate_step and any mutator's evacuate-on-demand bump the same
+     * to-space during a concurrent Relocate. The copy and the forwarding CAS
+     * run outside the lock (dst is private once reserved; the CAS is atomic). */
+    pthread_mutex_lock(&g_gc_lock);
     uint8_t *dst = to_bump(sz);
+    pthread_mutex_unlock(&g_gc_lock);
     if (!dst) {
         fprintf(stderr, "klassic gc: out of memory during relocation\n");
         exit(1);
     }
-    memcpy(dst, block, sz);
+    /* Copy word0 (size|mark, stable during Relocate) and the immutable payload,
+     * but set the destination's word1 from the tag we already loaded rather
+     * than reading the source's word1 with memcpy: a concurrent evacuator (the
+     * GC thread and a mutator can both reach the same from-object) may be
+     * CAS-installing forwarding into the source's word1 right now, and a plain
+     * memcpy read of it would race that atomic write. klassic heap objects are
+     * immutable, so word0 and the payload are race-free to copy. dst is private
+     * until the CAS publishes it, so its plain writes are safe. */
+    uint64_t *d = (uint64_t *)dst;
+    d[0] = block[0];
+    d[1] = w1;
+    if (sz > 16) {
+        memcpy(dst + 16, (const uint8_t *)block + 16, sz - 16);
+    }
     uint64_t newuser = (uint64_t)(uintptr_t)(dst + 16);
     uint64_t expected = w1; /* the tag we loaded */
     if (__atomic_compare_exchange_n(&block[1], &expected, newuser, 0,
                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        g_relocations++;
+        __atomic_fetch_add(&g_relocations, 1, __ATOMIC_RELAXED);
         return newuser;
     }
     /* Lost the race: reclaim the copy if it is still the top of to-space,
      * then take the winner's pointer (CAS wrote it into `expected`). */
+    pthread_mutex_lock(&g_gc_lock);
     if (g_to_top == dst + sz) {
         g_to_top = dst;
     }
+    pthread_mutex_unlock(&g_gc_lock);
     return expected;
 }
 
@@ -653,7 +685,7 @@ static void gc_relocate_start(void) {
     uint64_t max_from = (free_regions > 1) ? free_regions - 1 : 0;
     uint64_t selected = 0;
     for (uint64_t idx = 0; idx < g_committed; idx++) {
-        g_from_set[idx] = 0;
+        __atomic_store_n(&g_from_set[idx], 0, __ATOMIC_RELAXED);
         if (selected >= max_from) {
             continue;
         }
@@ -665,7 +697,7 @@ static void gc_relocate_start(void) {
         if (live == 0 || live * 2 >= REGION_SIZE) {
             continue;
         }
-        g_from_set[idx] = 1;
+        __atomic_store_n(&g_from_set[idx], 1, __ATOMIC_RELAXED);
         selected++;
     }
     gc_set_good(GC_COLOR_R);
@@ -681,6 +713,7 @@ static void gc_relocate_start(void) {
     }
     g_relocate_ridx = 0;
     g_relocate_ptr = NULL;
+    g_relocate_limit = g_committed; /* snapshot: from-set lives below this */
     g_bytes_since_quantum = 0;
 }
 
@@ -701,10 +734,12 @@ static void gc_relocate_end(void) {
 static void gc_relocate_step(uint64_t budget) {
     for (;;) {
         if (!g_relocate_ptr) {
-            while (g_relocate_ridx < g_committed && !g_from_set[g_relocate_ridx]) {
+            while (g_relocate_ridx < g_relocate_limit
+                   && !__atomic_load_n(&g_from_set[g_relocate_ridx],
+                                       __ATOMIC_RELAXED)) {
                 g_relocate_ridx++;
             }
-            if (g_relocate_ridx >= g_committed) {
+            if (g_relocate_ridx >= g_relocate_limit) {
                 gc_relocate_end();
                 return;
             }
@@ -714,7 +749,10 @@ static void gc_relocate_step(uint64_t budget) {
         while (g_relocate_ptr < top) {
             uint64_t *b = (uint64_t *)g_relocate_ptr;
             uint64_t sz = block_size(b[0]);
-            if ((b[0] & g_header_mark) && !gc_forwarded(b[1])) {
+            /* Acquire-load word1: a mutator's evacuate-on-demand may have
+             * already forwarded this object; skip it if so. */
+            uint64_t bw1 = __atomic_load_n(&b[1], __ATOMIC_ACQUIRE);
+            if ((b[0] & g_header_mark) && !gc_forwarded(bw1)) {
                 gc_evacuate_object((uint64_t)(uintptr_t)(g_relocate_ptr + 16));
                 budget = (budget > sz) ? budget - sz : 0;
             }
@@ -725,13 +763,6 @@ static void gc_relocate_step(uint64_t budget) {
         }
         g_relocate_ridx++;
         g_relocate_ptr = NULL;
-    }
-}
-
-/* Drive relocation to completion (synchronous collect). */
-static void gc_relocate_drain(void) {
-    while (g_phase == GC_PHASE_RELOCATE) {
-        gc_relocate_step(REGION_SIZE);
     }
 }
 
@@ -758,13 +789,13 @@ static void gc_mark_end(void) {
      * live pointer off them, so none is referenced. Freeing them before the
      * sweep also keeps the sweep from walking their forwarding words. */
     for (uint64_t idx = 0; idx < g_committed; idx++) {
-        if (g_from_set[idx]) {
+        if (__atomic_load_n(&g_from_set[idx], __ATOMIC_RELAXED)) {
             uint8_t *base = region_at(idx);
             *(uint8_t **)base = g_free_head;
             g_free_head = base;
             g_region_top[idx] = (uint64_t)(uintptr_t)base;
             g_region_live[idx] = 0;
-            g_from_set[idx] = 0;
+            __atomic_store_n(&g_from_set[idx], 0, __ATOMIC_RELAXED);
         }
     }
     gc_sweep();
@@ -816,23 +847,33 @@ static void gc_rendezvous(void (*action)(void)) {
     pthread_mutex_unlock(&g_hs_lock);
 }
 
-/* The MarkEnd + relocate transition, run in one rendezvous pause. M4b keeps
- * relocation stop-the-world (mutator parked); M4c makes it concurrent. */
-static void gc_finish_cycle_action(void) {
-    gc_mark_roots();     /* re-scan roots: catch anything grayed since MarkStart */
-    gc_mark_end();       /* drain to fixpoint + free ghosts + sweep + relocate_start */
-    gc_relocate_drain(); /* finish relocation (STW for M4b) */
+/* The MarkEnd transition, run in one O(roots) rendezvous pause: re-scan roots,
+ * drain to fixpoint, free last cycle's ghosts, sweep, select the from-set and
+ * fix the roots into it (gc_relocate_start leaves phase = Relocate, or Idle if
+ * nothing is worth moving). Evacuation itself then runs concurrently -- only
+ * the sweep + selection + root fixup happen in the pause. */
+static void gc_finish_mark_action(void) {
+    gc_mark_roots(); /* re-scan roots: catch anything grayed since MarkStart */
+    gc_mark_end();   /* drain + free ghosts + sweep + relocate_start */
 }
 
-/* One concurrent collection cycle (M4b): a MarkStart pause flips to Mark and
- * scans roots; the mutator then runs while the GC thread drains the worklist
- * its barriers feed; a MarkEnd+relocate pause finishes the cycle. */
+/* One concurrent collection cycle (M4c): both expensive phases run with the
+ * mutator live, bracketed by two O(roots) pauses.
+ *   rendezvous(mark_start)  -- park: flip masks, scan roots, phase = Mark
+ *   drain worklist          -- CONCURRENT mark: mutator's barriers push
+ *   rendezvous(finish_mark) -- park: re-scan, sweep, select from-set, fix roots
+ *   evacuate from-set quanta -- CONCURRENT relocate: mutator evacuates on demand
+ * The relocate loop ends when gc_relocate_step drains the from-set and flips
+ * back to Idle. */
 static void gc_run_concurrent_cycle(void) {
-    gc_rendezvous(gc_mark_start); /* park: flip masks, scan roots, phase=MARK */
+    gc_rendezvous(gc_mark_start);
     while (!worklist_empty()) {
-        gc_trace(GC_QUANTUM_POPS); /* concurrent mark: mutator running */
+        gc_trace(GC_QUANTUM_POPS); /* concurrent mark */
     }
-    gc_rendezvous(gc_finish_cycle_action); /* park: re-scan + drain + sweep + relocate */
+    gc_rendezvous(gc_finish_mark_action);
+    while (__atomic_load_n(&g_phase, __ATOMIC_RELAXED) == GC_PHASE_RELOCATE) {
+        gc_relocate_step(GC_RELOCATE_QUANTUM); /* concurrent relocate */
+    }
 }
 
 /* The background GC thread: sleep until a cycle is requested, run it. */
@@ -898,7 +939,11 @@ void klassic_gc_collect(void) {
 }
 
 uint64_t klassic_gc_collection_count(void) { return g_collections; }
-uint64_t klassic_gc_relocation_count(void) { return g_relocations; }
+uint64_t klassic_gc_relocation_count(void) {
+    /* Incremented atomically by evacuators on both threads during a concurrent
+     * relocate, so read it atomically. */
+    return __atomic_load_n(&g_relocations, __ATOMIC_RELAXED);
+}
 
 uint64_t klassic_gc_live_region_count(void) {
     uint64_t live = 0;
