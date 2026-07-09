@@ -200,7 +200,14 @@ impl Emitter {
             return;
         }
         let flag = self.fresh();
-        self.emit(&format!("{flag} = load i64, ptr @gc_handshake_requested"));
+        // Atomic (relaxed) load: the GC thread raises/clears this flag with an
+        // atomic release store, so a plain load would be a data race (UB) once
+        // that thread exists -- worst case the poll never observes the request
+        // and the handshake deadlocks. `monotonic` suffices for the flag test;
+        // the handshake itself re-reads the phase with acquire ordering.
+        self.emit(&format!(
+            "{flag} = load atomic i64, ptr @gc_handshake_requested monotonic, align 8"
+        ));
         let need = self.fresh();
         self.emit(&format!("{need} = icmp ne i64 {flag}, 0"));
         let call = self.fresh_label("hscall");
