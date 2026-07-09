@@ -225,3 +225,65 @@ fn record_survives_moving_collection() {
          println(keeper.x + keeper.y)\n",
     );
 }
+
+#[test]
+fn gc_log_reports_pause_statistics() {
+    // --gc-log builds the C collector with its statistics + at-exit report
+    // compiled in (true-zgc M6). The churn forces collections; the program's
+    // stdout must be unchanged and a single stats line must appear on stderr
+    // reporting the collection count and the O(roots) handshake pauses.
+    let Some(clang) = find_clang() else {
+        eprintln!("skipping: no clang >= 15 found");
+        return;
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let src = dir.join(format!("klassic_gclog_{stamp}.kl"));
+    let bin = dir.join(format!("klassic_gclog_{stamp}.bin"));
+    let source = "val keeper = record { x: 1; y: 2 }\n\
+                  mutable i = 0\n\
+                  while (i < 100000) {\n\
+                    val garbage = record { x: i; y: i }\n\
+                    i = i + 1\n\
+                  }\n\
+                  println(keeper.x + keeper.y)\n";
+    std::fs::write(&src, source).expect("write temp source");
+
+    let build = Command::new(klassic_bin())
+        .env("KLASSIC_CLANG", &clang)
+        .args(["--backend", "llvm", "--gc-log", "build"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("llvm --gc-log build runs");
+    assert!(
+        build.status.success(),
+        "--backend llvm --gc-log build failed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&bin).output().expect("compiled binary runs");
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&bin);
+    assert!(
+        run.status.success(),
+        "compiled binary crashed\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "3\n",
+        "stdout unchanged"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("klassic gc:")
+            && stderr.contains("collections=")
+            && stderr.contains("pause_max="),
+        "expected a GC stats line on stderr, got:\n{stderr}"
+    );
+}

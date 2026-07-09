@@ -41,7 +41,12 @@ fn build_with_c_backend(input: &Path, text: &str, output: &Path) -> Result<(), u
 /// the output name ends in `.ll`, compile and link it with clang against
 /// the bundled runtime staticlib (migration plan
 /// `docs/llvm-backend-plan.md`).
-fn build_with_llvm_backend(input: &Path, text: &str, output: &Path) -> Result<(), u8> {
+fn build_with_llvm_backend(
+    input: &Path,
+    text: &str,
+    output: &Path,
+    gc_log: bool,
+) -> Result<(), u8> {
     let ir = match compile_source_to_llvm(&input.display().to_string(), text) {
         Ok(ir) => ir,
         Err(error) => {
@@ -59,7 +64,7 @@ fn build_with_llvm_backend(input: &Path, text: &str, output: &Path) -> Result<()
         }
         return Ok(());
     }
-    link_llvm_program(&ir, output)
+    link_llvm_program(&ir, output, gc_log)
 }
 
 fn write_executable_output(output: &Path, bytes: &[u8]) -> Result<(), u8> {
@@ -129,20 +134,19 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
             }
             if command.config.llvm_backend {
                 // Gate the GC tuning flags rather than silently ignore them.
-                // The C collector always stores colored (non-canonical) heap
-                // pointers, so an unbarriered dereference already faults --
-                // --gc-poison is inherent. --gc-log / --gc-stress are not yet
-                // ported to the C collector.
-                if command.config.gc_log || command.config.gc_stress || command.config.gc_poison {
+                // --gc-log is supported (below); the C collector always stores
+                // colored (non-canonical) heap pointers, so an unbarriered
+                // dereference already faults -- --gc-poison is inherent. Only
+                // --gc-stress is not yet ported to the C collector.
+                if command.config.gc_stress || command.config.gc_poison {
                     eprintln!(
-                        "error: --gc-log / --gc-stress / --gc-poison are not accepted with \
-                         --backend llvm\n  note: the C collector always colors heap pointers, so \
-                         barrier coverage (the --gc-poison guarantee) is inherent; logging and \
-                         stress modes are not yet ported"
+                        "error: --gc-stress / --gc-poison are not accepted with --backend llvm\n  \
+                         note: the C collector always colors heap pointers, so barrier coverage \
+                         (the --gc-poison guarantee) is inherent; --gc-stress is not yet ported"
                     );
                     return Err(1);
                 }
-                return build_with_llvm_backend(&input, &text, &output);
+                return build_with_llvm_backend(&input, &text, &output, command.config.gc_log);
             }
             // The default target is the detected host (macOS arm64 →
             // the direct Mach-O backend, Linux x86_64 → direct ELF);
@@ -440,7 +444,7 @@ fn find_opaque_pointer_clang() -> Option<String> {
 
 /// Compile a textual LLVM IR module with clang and link it against the
 /// bundled runtime staticlib (migration plan `docs/llvm-backend-plan.md`).
-fn link_llvm_program(ir: &str, output: &Path) -> Result<(), u8> {
+fn link_llvm_program(ir: &str, output: &Path, gc_log: bool) -> Result<(), u8> {
     let Some(runtime) = find_runtime_staticlib() else {
         eprintln!(
             "error: libklassic_runtime.a not found\n  help: set KLASSIC_RT_LIB to its path, or \
@@ -485,6 +489,11 @@ fn link_llvm_program(ir: &str, output: &Path) -> Result<(), u8> {
             return Err(1);
         };
         command.arg(&gc_src);
+        // --gc-log compiles the collector's statistics + at-exit report in
+        // (zero cost otherwise: the timing lives behind this define).
+        if gc_log {
+            command.arg("-DKLASSIC_GC_LOG=1");
+        }
     }
     if std::env::consts::OS == "linux" {
         command.args(["-lpthread", "-ldl", "-lm"]);
