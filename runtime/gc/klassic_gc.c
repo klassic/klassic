@@ -131,7 +131,6 @@ static pthread_cond_t g_hs_cond = PTHREAD_COND_INITIALIZER;
 static int g_hs_parked; /* mutator is parked in the handshake (under g_hs_lock) */
 static pthread_mutex_t g_wake_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_wake_cond = PTHREAD_COND_INITIALIZER;  /* mutator -> GC */
-static pthread_cond_t g_idle_cond = PTHREAD_COND_INITIALIZER;  /* GC -> mutator */
 static int g_cycle_request;   /* a cycle has been asked for (under g_wake_lock) */
 static int g_cycle_running;   /* a cycle is in progress (under g_wake_lock) */
 static uint64_t g_cycle_done; /* completed-cycle counter, for wait predicates */
@@ -894,7 +893,9 @@ static void *gc_worker(void *arg) {
         pthread_mutex_lock(&g_wake_lock);
         g_cycle_running = 0;
         g_cycle_done++;
-        pthread_cond_broadcast(&g_idle_cond);
+        /* Waiters (gc_request_and_wait) poll g_cycle_done directly rather than
+         * blocking on a condvar -- they must stay at their safepoint polls so
+         * the cycle's handshakes can land -- so there is nothing to signal. */
     }
     pthread_mutex_unlock(&g_wake_lock);
     return NULL;
