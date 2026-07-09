@@ -148,3 +148,45 @@ fn function_with_multiple_params_and_double() {
          println(avg(3.0, 4.0))\n",
     );
 }
+
+// --- Heap records through the garbage collector (M7) ------------------
+
+#[test]
+fn record_construct_and_field_access() {
+    assert_llvm_matches_evaluator(
+        "val r = record { x: 10; y: 20 }\n\
+         println(r.x + r.y)\n\
+         val p = record { a: 3.5; b: 1.25 }\n\
+         println(p.a + p.b)\n",
+    );
+}
+
+#[test]
+fn record_field_read_after_reassignment() {
+    // Fields are read through the load barrier; exercise several reads and
+    // arithmetic on a record held in a local.
+    assert_llvm_matches_evaluator(
+        "val point = record { x: 7; y: 11 }\n\
+         mutable sum = 0\n\
+         sum = sum + point.x\n\
+         sum = sum + point.y\n\
+         sum = sum + point.x * point.y\n\
+         println(sum)\n",
+    );
+}
+
+#[test]
+fn record_survives_moving_collection() {
+    // Churn enough short-lived records to force many moving collections while
+    // a rooted survivor is kept; its fields must read back intact after being
+    // relocated (the whole point of precise roots + the load barrier).
+    assert_llvm_matches_evaluator(
+        "val keeper = record { x: 314; y: 271 }\n\
+         mutable i = 0\n\
+         while (i < 200000) {\n\
+           val garbage = record { x: i; y: i }\n\
+           i = i + 1\n\
+         }\n\
+         println(keeper.x + keeper.y)\n",
+    );
+}

@@ -128,6 +128,20 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 return build_with_c_backend(&input, &text, &output);
             }
             if command.config.llvm_backend {
+                // Gate the GC tuning flags rather than silently ignore them.
+                // The C collector always stores colored (non-canonical) heap
+                // pointers, so an unbarriered dereference already faults --
+                // --gc-poison is inherent. --gc-log / --gc-stress are not yet
+                // ported to the C collector.
+                if command.config.gc_log || command.config.gc_stress || command.config.gc_poison {
+                    eprintln!(
+                        "error: --gc-log / --gc-stress / --gc-poison are not accepted with \
+                         --backend llvm\n  note: the C collector always colors heap pointers, so \
+                         barrier coverage (the --gc-poison guarantee) is inherent; logging and \
+                         stress modes are not yet ported"
+                    );
+                    return Err(1);
+                }
                 return build_with_llvm_backend(&input, &text, &output);
             }
             // The default target is the detected host (macOS arm64 →
@@ -304,6 +318,30 @@ fn collect_user_modules(
 /// executable (release tarballs ship the library beside the binary,
 /// and a cargo build leaves it in the same `target/<profile>/`
 /// directory).
+/// Locate the C garbage collector's source (`runtime/gc/klassic_gc.c`) so
+/// clang can compile and link it into a heap-using program. `KLASSIC_GC_SRC`
+/// overrides; otherwise it is found relative to the source tree.
+fn find_gc_source() -> Option<std::path::PathBuf> {
+    if let Ok(explicit) = std::env::var("KLASSIC_GC_SRC") {
+        let path = std::path::PathBuf::from(explicit);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/gc/klassic_gc.c");
+    if manifest.is_file() {
+        return Some(manifest);
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [
+        dir.join("runtime/gc/klassic_gc.c"),
+        dir.join("../../runtime/gc/klassic_gc.c"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
 fn find_runtime_staticlib() -> Option<std::path::PathBuf> {
     if let Ok(explicit) = std::env::var("KLASSIC_RT_LIB") {
         let path = std::path::PathBuf::from(explicit);
@@ -433,6 +471,20 @@ fn link_llvm_program(ir: &str, output: &Path) -> Result<(), u8> {
         .arg(output)
         .arg(&ir_path)
         .arg(&runtime);
+    // Programs that touch the heap call the C garbage collector; compile and
+    // link it in alongside the IR (clang builds the .c). Scalar programs never
+    // reference it, so it is only added when needed.
+    if ir.contains("@klassic_gc_alloc") {
+        let Some(gc_src) = find_gc_source() else {
+            eprintln!(
+                "error: runtime/gc/klassic_gc.c not found\n  help: set KLASSIC_GC_SRC to its \
+                 path, or pass an output ending in .ll and compile it yourself"
+            );
+            let _ = fs::remove_file(&ir_path);
+            return Err(1);
+        };
+        command.arg(&gc_src);
+    }
     if std::env::consts::OS == "linux" {
         command.args(["-lpthread", "-ldl", "-lm"]);
     }

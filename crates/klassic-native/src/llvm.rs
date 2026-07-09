@@ -9,8 +9,16 @@
 //! comparison / logical operators, `val` / `mutable` / assignment,
 //! `if` / `while`, `println` of a scalar, and annotated top-level `def`s
 //! (including recursion). Locals become `alloca`s that clang's mem2reg
-//! promotes to SSA; control flow lowers to basic blocks. Strings, the
-//! heap, enums, closures, and the stdlib are later milestones.
+//! promotes to SSA; control flow lowers to basic blocks.
+//!
+//! M7 (heap): structural records go on the GC heap. A record is the
+//! uniform "every slot is a heap pointer" `POINTER_RECORD` the collector
+//! walks -- scalar fields are boxed into `RAW_BYTES` leaves -- allocated
+//! through `klassic_gc_alloc`, with fields stored colored
+//! (`klassic_gc_write`) and read through the inline load-barrier fast path
+//! (the M2 spike). Heap locals and construction intermediates are kept on
+//! the shadow stack so a moving collection updates them precisely. Enums,
+//! closures, strings, and the stdlib are later milestones.
 
 use klassic_span::{Diagnostic, Span};
 use klassic_syntax::{BinaryOp, Expr, UnaryOp};
@@ -28,6 +36,9 @@ enum LType {
     F64,
     I1,
     Unit,
+    /// A heap record pointer; the `usize` indexes `Emitter::shapes` for the
+    /// field layout. Its LLVM type is an opaque `ptr`.
+    Record(usize),
 }
 
 impl LType {
@@ -37,7 +48,13 @@ impl LType {
             LType::F64 => "double",
             LType::I1 => "i1",
             LType::Unit => "void",
+            LType::Record(_) => "ptr",
         }
+    }
+
+    /// A heap pointer whose barriered loads/stores go through the GC.
+    fn is_heap(self) -> bool {
+        matches!(self, LType::Record(_))
     }
 }
 
@@ -79,6 +96,10 @@ struct Emitter {
     current_block: String,
     /// lexical scopes: name -> (alloca pointer operand, type).
     scopes: Vec<Vec<(String, String, LType)>>,
+    /// per-scope count of shadow-stack roots pushed, popped on scope exit.
+    scope_roots: Vec<u32>,
+    /// interned record field layouts: shape id -> [(field name, field type)].
+    shapes: Vec<Vec<(String, LType)>>,
 }
 
 impl Emitter {
@@ -130,6 +151,51 @@ impl Emitter {
             }
         }
         None
+    }
+
+    /// Open a lexical scope with its own root count.
+    fn open_scope(&mut self) {
+        self.scopes.push(Vec::new());
+        self.scope_roots.push(0);
+    }
+
+    /// Close a lexical scope, emitting the paired shadow-stack pop for the
+    /// heap roots it declared. Must run on the block that reaches the scope
+    /// exit (control flow re-converges before a scope closes).
+    fn close_scope(&mut self) {
+        let count = self.scope_roots.pop().unwrap_or(0);
+        if count > 0 {
+            self.emit(&format!("call void @klassic_gc_shadow_pop_n(i64 {count})"));
+        }
+        self.scopes.pop();
+    }
+
+    /// Root a heap pointer held at `slot` (a `ptr` alloca) for the rest of
+    /// the current scope, so a collection during a later allocation updates
+    /// it in place.
+    fn push_root(&mut self, slot: &str) {
+        self.emit(&format!("call void @klassic_gc_shadow_push(ptr {slot})"));
+        if let Some(count) = self.scope_roots.last_mut() {
+            *count += 1;
+        }
+    }
+
+    /// A fresh entry-block `ptr` alloca for a transient shadow-stack slot
+    /// (staging a value across an allocation during record construction).
+    fn fresh_slot(&mut self) -> String {
+        let slot = format!("%s{}", self.next_temp);
+        self.next_temp += 1;
+        self.allocas.push_str(&format!("  {slot} = alloca ptr\n"));
+        slot
+    }
+
+    /// Intern a record field layout, returning its shape id.
+    fn intern_shape(&mut self, shape: Vec<(String, LType)>) -> usize {
+        if let Some(index) = self.shapes.iter().position(|existing| *existing == shape) {
+            return index;
+        }
+        self.shapes.push(shape);
+        self.shapes.len() - 1
     }
 
     /// Lower an expression to a value, appending any instructions.
@@ -205,12 +271,12 @@ impl Emitter {
                 let Some((last, leading)) = expressions.split_last() else {
                     return Err(unsupported(*span, "an empty block expression"));
                 };
-                self.scopes.push(Vec::new());
+                self.open_scope();
                 for statement in leading {
                     self.statement(statement)?;
                 }
                 let value = self.expr(last)?;
-                self.scopes.pop();
+                self.close_scope();
                 Ok(value)
             }
             Expr::Call {
@@ -218,6 +284,12 @@ impl Emitter {
                 arguments,
                 span,
             } => self.call(callee, arguments, *span),
+            Expr::RecordLiteral { fields, span } => self.record_literal(fields, *span),
+            Expr::FieldAccess {
+                target,
+                field,
+                span,
+            } => self.field_access(target, field, *span),
             other => Err(unsupported(other.span(), "expression")),
         }
     }
@@ -382,14 +454,177 @@ impl Emitter {
     }
 
     /// Lower a statement (value discarded).
+    /// Lower a structural record literal to a heap `POINTER_RECORD`: every
+    /// field is boxed into an 8-byte `RAW_BYTES` leaf (the uniform
+    /// all-pointers layout the collector walks), staged on the shadow stack
+    /// across the record allocation, then stored coloured. Returns a heap
+    /// pointer tagged with the record's interned shape.
+    fn record_literal(
+        &mut self,
+        fields: &[(String, Expr)],
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        if fields.is_empty() {
+            return Err(unsupported(span, "an empty record"));
+        }
+        let n = fields.len();
+        let mut shape = Vec::with_capacity(n);
+        let mut slots = Vec::with_capacity(n);
+        for (name, value_expr) in fields {
+            let value = self.expr(value_expr)?;
+            let leaf = self.fresh();
+            self.emit(&format!(
+                "{leaf} = call ptr @klassic_gc_alloc(i64 8, i64 1)"
+            ));
+            match value.ty {
+                LType::I64 | LType::F64 => self.emit(&format!(
+                    "store {} {}, ptr {leaf}",
+                    value.ty.llvm(),
+                    value.operand
+                )),
+                LType::I1 => {
+                    let widened = self.fresh();
+                    self.emit(&format!("{widened} = zext i1 {} to i64", value.operand));
+                    self.emit(&format!("store i64 {widened}, ptr {leaf}"));
+                }
+                LType::Unit => {
+                    return Err(unsupported(value_expr.span(), "a unit record field"));
+                }
+                LType::Record(_) => {
+                    return Err(unsupported(
+                        value_expr.span(),
+                        "a record field that is itself a heap value",
+                    ));
+                }
+            }
+            let slot = self.fresh_slot();
+            self.emit(&format!("store ptr {leaf}, ptr {slot}"));
+            self.emit(&format!("call void @klassic_gc_shadow_push(ptr {slot})"));
+            shape.push((name.clone(), value.ty));
+            slots.push(slot);
+        }
+        let record = self.fresh();
+        self.emit(&format!(
+            "{record} = call ptr @klassic_gc_alloc(i64 {}, i64 2)",
+            8 * n
+        ));
+        for (index, slot) in slots.iter().enumerate() {
+            let leaf = self.fresh();
+            self.emit(&format!("{leaf} = load ptr, ptr {slot}"));
+            let field_addr = self.fresh();
+            self.emit(&format!(
+                "{field_addr} = getelementptr i8, ptr {record}, i64 {}",
+                8 * index
+            ));
+            self.emit(&format!(
+                "call void @klassic_gc_write(ptr {field_addr}, ptr {leaf})"
+            ));
+        }
+        self.emit(&format!("call void @klassic_gc_shadow_pop_n(i64 {n})"));
+        let shape_id = self.intern_shape(shape);
+        Ok(Value {
+            operand: record,
+            ty: LType::Record(shape_id),
+        })
+    }
+
+    /// Lower `target.field` to a barriered load of the record slot followed
+    /// by an unbox of the leaf it points at.
+    fn field_access(
+        &mut self,
+        target: &Expr,
+        field: &str,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        let target_value = self.expr(target)?;
+        let LType::Record(shape_id) = target_value.ty else {
+            return Err(unsupported(span, "a field access on a non-record value"));
+        };
+        let shape = self.shapes[shape_id].clone();
+        let mut found = None;
+        for (index, (name, ty)) in shape.iter().enumerate() {
+            if name == field {
+                found = Some((index, *ty));
+                break;
+            }
+        }
+        let Some((index, field_ty)) = found else {
+            return Err(unsupported(
+                span,
+                &format!("no field `{field}` on this record"),
+            ));
+        };
+        let field_addr = self.fresh();
+        self.emit(&format!(
+            "{field_addr} = getelementptr i8, ptr {}, i64 {}",
+            target_value.operand,
+            8 * index
+        ));
+        let raw = self.barrier_load(&field_addr);
+        let raw_ptr = self.fresh();
+        self.emit(&format!("{raw_ptr} = inttoptr i64 {raw} to ptr"));
+        let result = self.fresh();
+        match field_ty {
+            LType::I64 => self.emit(&format!("{result} = load i64, ptr {raw_ptr}")),
+            LType::F64 => self.emit(&format!("{result} = load double, ptr {raw_ptr}")),
+            LType::I1 => {
+                let widened = self.fresh();
+                self.emit(&format!("{widened} = load i64, ptr {raw_ptr}"));
+                self.emit(&format!("{result} = trunc i64 {widened} to i1"));
+            }
+            LType::Unit | LType::Record(_) => {
+                return Err(unsupported(span, "a field of an unsupported type"));
+            }
+        }
+        Ok(Value {
+            operand: result,
+            ty: field_ty,
+        })
+    }
+
+    /// Emit the inline load-barrier fast path for a colored heap-pointer slot
+    /// (validated in the M2 spike): load, test the bad-color mask, take the
+    /// out-of-line slow path if bad, then strip the color. Returns the raw
+    /// (stripped) pointer as an `i64` operand.
+    fn barrier_load(&mut self, slot: &str) -> String {
+        let value = self.fresh();
+        self.emit(&format!("{value} = load i64, ptr {slot}"));
+        let bad_mask = self.fresh();
+        self.emit(&format!("{bad_mask} = load i64, ptr @gc_bad_mask"));
+        let bad = self.fresh();
+        self.emit(&format!("{bad} = and i64 {value}, {bad_mask}"));
+        let is_bad = self.fresh();
+        self.emit(&format!("{is_bad} = icmp ne i64 {bad}, 0"));
+        let pred = self.current_block.clone();
+        let slow = self.fresh_label("bslow");
+        let ok = self.fresh_label("bok");
+        self.emit(&format!("br i1 {is_bad}, label %{slow}, label %{ok}"));
+        self.bind(&slow);
+        let healed = self.fresh();
+        self.emit(&format!(
+            "{healed} = call i64 @klassic_gc_load_barrier_slow(i64 {value}, ptr {slot})"
+        ));
+        self.emit(&format!("br label %{ok}"));
+        self.bind(&ok);
+        let merged = self.fresh();
+        self.emit(&format!(
+            "{merged} = phi i64 [ {value}, %{pred} ], [ {healed}, %{slow} ]"
+        ));
+        let strip_mask = self.fresh();
+        self.emit(&format!("{strip_mask} = load i64, ptr @gc_strip_mask"));
+        let raw = self.fresh();
+        self.emit(&format!("{raw} = and i64 {merged}, {strip_mask}"));
+        raw
+    }
+
     fn statement(&mut self, expr: &Expr) -> Result<(), Diagnostic> {
         match expr {
             Expr::Block { expressions, .. } => {
-                self.scopes.push(Vec::new());
+                self.open_scope();
                 for statement in expressions {
                     self.statement(statement)?;
                 }
-                self.scopes.pop();
+                self.close_scope();
                 Ok(())
             }
             Expr::VarDecl { name, value, .. } => {
@@ -401,6 +636,11 @@ impl Emitter {
                         value.ty.llvm(),
                         value.operand
                     ));
+                }
+                // A heap local is a precise root for the rest of its scope, so
+                // a collection during a later allocation updates it in place.
+                if value.ty.is_heap() {
+                    self.push_root(&ptr);
                 }
                 Ok(())
             }
@@ -502,6 +742,9 @@ impl Emitter {
                         ));
                     }
                     LType::Unit => return Err(unsupported(expr.span(), "printing unit")),
+                    LType::Record(_) => {
+                        return Err(unsupported(expr.span(), "printing a record"));
+                    }
                 }
                 Ok(())
             }
@@ -568,6 +811,18 @@ pub(crate) fn emit_llvm_program(expr: &Expr) -> Result<String, Diagnostic> {
     out.push_str("declare void @klassic_rt_println_f64(double)\n");
     out.push_str("declare void @klassic_rt_println_bool(i64)\n\n");
 
+    // Garbage collector ABI (runtime/gc/klassic_gc.c). The colour mask cells
+    // are `dso_local` globals so the emitted barrier fast path folds the
+    // bad-mask load into a single `testq` memory operand (the M2 spike);
+    // they are defined once in the C collector.
+    out.push_str("@gc_bad_mask   = external dso_local global i64\n");
+    out.push_str("@gc_strip_mask = external dso_local global i64\n");
+    out.push_str("declare ptr @klassic_gc_alloc(i64, i64)\n");
+    out.push_str("declare void @klassic_gc_shadow_push(ptr)\n");
+    out.push_str("declare void @klassic_gc_shadow_pop_n(i64)\n");
+    out.push_str("declare void @klassic_gc_write(ptr, ptr)\n");
+    out.push_str("declare i64 @klassic_gc_load_barrier_slow(i64, ptr)\n\n");
+
     // User functions. The subset treats a function body as a single
     // expression returned to the caller.
     let function_count = emitter.functions.len();
@@ -587,7 +842,8 @@ pub(crate) fn emit_llvm_program(expr: &Expr) -> Result<String, Diagnostic> {
         emitter.next_temp = 0;
         emitter.next_label = 0;
         emitter.scopes.clear();
-        emitter.scopes.push(Vec::new());
+        emitter.scope_roots.clear();
+        emitter.open_scope();
         emitter.current_block = "entry".to_owned();
         // Bind parameters: alloca + store the incoming SSA value.
         let mut param_sig = Vec::with_capacity(params.len());
@@ -608,6 +864,7 @@ pub(crate) fn emit_llvm_program(expr: &Expr) -> Result<String, Diagnostic> {
                 "a function body of a different type than its return annotation",
             ));
         }
+        emitter.close_scope();
         let mangled = format!("klassic_{name}");
         out.push_str(&format!(
             "define {} @{mangled}({}) {{\nentry:\n",
@@ -630,7 +887,8 @@ pub(crate) fn emit_llvm_program(expr: &Expr) -> Result<String, Diagnostic> {
     emitter.next_temp = 0;
     emitter.next_label = 0;
     emitter.scopes.clear();
-    emitter.scopes.push(Vec::new());
+    emitter.scope_roots.clear();
+    emitter.open_scope();
     emitter.current_block = "entry".to_owned();
     let statements: Vec<&Expr> = match expr {
         Expr::Block { expressions, .. } => expressions.iter().collect(),
@@ -639,6 +897,7 @@ pub(crate) fn emit_llvm_program(expr: &Expr) -> Result<String, Diagnostic> {
     for statement in statements {
         emitter.statement(statement)?;
     }
+    emitter.close_scope();
     out.push_str("define i32 @main() {\nentry:\n");
     out.push_str(&emitter.allocas);
     out.push_str(&emitter.body);
