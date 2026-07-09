@@ -22,6 +22,7 @@
 #define RESERVE_BYTES ((size_t)RESERVE_REGIONS * REGION_SIZE) /* 64 MiB */
 #define SHADOW_MAX (1u << 20)
 #define WORKLIST_MAX (1u << 18)
+#define MAX_MUTATORS 64 /* registered mutator threads (thread table capacity) */
 
 /* The whole heap is one up-front reservation; Linux demand-pages it. A
  * soft budget bounds how many regions the mutator touches before a
@@ -34,10 +35,27 @@ static uint8_t *g_free_head;                    /* free-region pool, linked via 
 static uint64_t g_region_live[RESERVE_REGIONS]; /* live bytes per region (set by sweep) */
 static uint8_t g_from_set[RESERVE_REGIONS];     /* 1 if region is in the relocation set */
 
-/* The current bump region. */
-static uint8_t *g_heap_base;
-static uint8_t *g_heap_top;
-static uint8_t *g_heap_end;
+/* Per-mutator state: the precise-root shadow stack and the active bump region
+ * (TLAB). klassic compiled programs are single-threaded -- one mutator,
+ * registered at init -- but the collector is built for N: each thread that
+ * touches the heap registers a Mutator in the table and deregisters on exit,
+ * and the GC thread walks the table (roots, active regions) at handshakes.
+ * The shadow stack is heap-allocated per thread so idle table slots cost
+ * nothing. */
+typedef struct Mutator {
+    void ***shadow;     /* SHADOW_MAX slot addresses (heap-allocated) */
+    uint64_t shadow_top;
+    uint8_t *heap_base; /* active bump region (TLAB) */
+    uint8_t *heap_top;
+    uint8_t *heap_end;
+    int parked;  /* parked at a handshake (N-mutator rendezvous) */
+    int in_use;  /* table slot occupied */
+} Mutator;
+static Mutator g_mutators[MAX_MUTATORS];
+static uint64_t g_mutator_hi;    /* 1 + highest in-use slot index (walk bound) */
+static uint64_t g_mutator_count; /* number of in-use slots (registered threads) */
+static __thread Mutator *g_self; /* the calling thread's mutator */
+static pthread_mutex_t g_thread_lock = PTHREAD_MUTEX_INITIALIZER; /* table */
 
 /* A dedicated to-space bump for evacuation, separate from the mutator's
  * current region so compaction never disturbs in-progress allocation. */
@@ -46,9 +64,7 @@ static uint8_t *g_to_top;
 static uint8_t *g_to_end;
 static uint64_t g_relocations; /* objects evacuated (observability) */
 
-/* Precise roots and the mark worklist. */
-static void **g_shadow[SHADOW_MAX];
-static uint64_t g_shadow_top;
+/* The mark worklist (shared across all mutators + the GC thread). */
 static void *g_worklist[WORKLIST_MAX];
 static uint64_t g_worklist_top;
 
@@ -173,11 +189,11 @@ void klassic_gc_init(void) {
     g_region_base = (uint8_t *)base;
     g_committed = 0;
     g_free_head = NULL;
-    g_heap_base = g_heap_top = g_heap_end = NULL;
-    g_shadow_top = 0;
     g_header_mark = KLASSIC_GC_HMARK1;
     g_collections = 0;
     g_initialized = 1;
+    /* Register the calling thread (the main mutator) in the thread table. */
+    klassic_gc_register_thread();
     /* Spawn the background GC thread that runs collections. */
     if (!g_gc_thread_started) {
         if (pthread_create(&g_gc_thread, NULL, gc_worker, NULL) != 0) {
@@ -196,12 +212,77 @@ static uint64_t region_index(const uint8_t *p) {
     return (uint64_t)((p - g_region_base) >> REGION_SHIFT);
 }
 
+/* Register the calling thread as a mutator: claim a table slot and allocate
+ * its shadow stack. Idempotent per thread. The main thread is registered from
+ * klassic_gc_init; extra threads are auto-registered on their first alloc (and
+ * may also call this explicitly). Serialized with the thread table lock. */
+void klassic_gc_register_thread(void) {
+    if (g_self) {
+        return;
+    }
+    pthread_mutex_lock(&g_thread_lock);
+    uint64_t i = 0;
+    while (i < MAX_MUTATORS && g_mutators[i].in_use) {
+        i++;
+    }
+    if (i == MAX_MUTATORS) {
+        fprintf(stderr, "klassic gc: too many mutator threads\n");
+        exit(1);
+    }
+    Mutator *m = &g_mutators[i];
+    m->shadow = (void ***)malloc((size_t)SHADOW_MAX * sizeof(void **));
+    if (!m->shadow) {
+        fprintf(stderr, "klassic gc: cannot allocate a shadow stack\n");
+        exit(1);
+    }
+    m->shadow_top = 0;
+    m->heap_base = m->heap_top = m->heap_end = NULL;
+    m->parked = 0;
+    m->in_use = 1;
+    g_mutator_count++;
+    if (i + 1 > g_mutator_hi) {
+        g_mutator_hi = i + 1;
+    }
+    g_self = m;
+    pthread_mutex_unlock(&g_thread_lock);
+}
+
+/* Deregister the calling thread on exit: flush its active region watermark,
+ * free its shadow stack, release the table slot. */
+void klassic_gc_unregister_thread(void) {
+    if (!g_self) {
+        return;
+    }
+    pthread_mutex_lock(&g_thread_lock);
+    Mutator *m = g_self;
+    if (m->heap_base) {
+        g_region_top[region_index(m->heap_base)] = (uint64_t)(uintptr_t)m->heap_top;
+    }
+    free(m->shadow);
+    m->shadow = NULL;
+    m->shadow_top = 0;
+    m->heap_base = m->heap_top = m->heap_end = NULL;
+    m->parked = 0;
+    m->in_use = 0;
+    g_mutator_count--;
+    uint64_t hi = 0;
+    for (uint64_t i = 0; i < MAX_MUTATORS; i++) {
+        if (g_mutators[i].in_use) {
+            hi = i + 1;
+        }
+    }
+    g_mutator_hi = hi;
+    g_self = NULL;
+    pthread_mutex_unlock(&g_thread_lock);
+}
+
 /* Acquire a fresh, zeroed bump region: reuse from the free pool, else
  * commit the next tail region within the budget. Returns 0 on failure. */
 static int acquire_region(void) {
-    /* Flush the current region's watermark before switching. */
-    if (g_heap_base) {
-        g_region_top[region_index(g_heap_base)] = (uint64_t)(uintptr_t)g_heap_top;
+    Mutator *m = g_self;
+    /* Flush this thread's current region watermark before switching. */
+    if (m->heap_base) {
+        g_region_top[region_index(m->heap_base)] = (uint64_t)(uintptr_t)m->heap_top;
     }
     uint8_t *base;
     if (g_free_head) {
@@ -215,9 +296,9 @@ static int acquire_region(void) {
     } else {
         return 0;
     }
-    g_heap_base = base;
-    g_heap_top = base;
-    g_heap_end = base + REGION_SIZE;
+    m->heap_base = base;
+    m->heap_top = base;
+    m->heap_end = base + REGION_SIZE;
     g_region_top[region_index(base)] = (uint64_t)(uintptr_t)base;
     /* A mutator bump region is never in the relocation set; clear the flag
      * defensively (symmetric with to_acquire) so no future path can let the
@@ -245,6 +326,9 @@ void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
     if (!g_initialized) {
         klassic_gc_init();
     }
+    if (!g_self) {
+        klassic_gc_register_thread(); /* a thread allocating before registering */
+    }
     uint64_t total = align16(size + 16);
     if (total > REGION_SIZE) {
         /* Large objects (contiguous region runs) are a later addition;
@@ -262,13 +346,14 @@ void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
     if (since >= (g_budget << REGION_SHIFT) / 2) {
         gc_request_cycle();
     }
+    Mutator *m = g_self;
     for (;;) {
-        /* The current bump region is owned by this (mutator) thread; the GC
-         * thread reads its watermark only while the mutator is parked at a
-         * handshake, so the bump needs no lock. */
-        if (g_heap_base && (uint64_t)(g_heap_end - g_heap_top) >= total) {
-            uint8_t *block = g_heap_top;
-            g_heap_top += total;
+        /* This thread's bump region (TLAB) is private to it; the GC thread
+         * reads its watermark only while the thread is parked at a handshake,
+         * so the bump needs no lock. */
+        if (m->heap_base && (uint64_t)(m->heap_end - m->heap_top) >= total) {
+            uint8_t *block = m->heap_top;
+            m->heap_top += total;
             *(uint64_t *)block = total;          /* word0 = size, flags clear */
             *(uint64_t *)(block + 8) = type_tag; /* word1 = type tag */
             /* Allocate-black: an object born during Mark is live this cycle.
@@ -306,16 +391,18 @@ void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
 }
 
 void klassic_gc_shadow_push(void **slot_addr) {
-    if (g_shadow_top >= SHADOW_MAX) {
+    if (!g_self) {
+        klassic_gc_register_thread();
+    }
+    Mutator *m = g_self;
+    if (m->shadow_top >= SHADOW_MAX) {
         fprintf(stderr, "klassic gc: shadow stack overflow\n");
         exit(1);
     }
-    g_shadow[g_shadow_top++] = slot_addr;
+    m->shadow[m->shadow_top++] = slot_addr;
 }
 
-void klassic_gc_shadow_pop_n(uint64_t count) {
-    g_shadow_top -= count;
-}
+void klassic_gc_shadow_pop_n(uint64_t count) { g_self->shadow_top -= count; }
 
 static void mark_visit(void *user);       /* forward decl */
 static int in_from_set(uint64_t raw);     /* forward decl */
@@ -465,9 +552,42 @@ static void gc_drain(void) {
     }
 }
 
+/* Mark every registered mutator's roots. Called only inside a rendezvous
+ * pause, so each parked thread's shadow stack is stable to walk. */
 static void gc_mark_roots(void) {
-    for (uint64_t i = 0; i < g_shadow_top; i++) {
-        mark_visit(*g_shadow[i]);
+    for (uint64_t t = 0; t < g_mutator_hi; t++) {
+        Mutator *m = &g_mutators[t];
+        if (!m->in_use) {
+            continue;
+        }
+        for (uint64_t i = 0; i < m->shadow_top; i++) {
+            mark_visit(*m->shadow[i]);
+        }
+    }
+}
+
+/* Is `base` any registered mutator's active TLAB region? Such a region is
+ * spared by the sweep and excluded from the relocation set -- its owner is
+ * still bumping into it. Called inside a pause, so the TLAB pointers are
+ * stable. */
+static int is_active_region(const uint8_t *base) {
+    for (uint64_t t = 0; t < g_mutator_hi; t++) {
+        if (g_mutators[t].in_use && g_mutators[t].heap_base == base) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Flush every mutator's active-region watermark into g_region_top so the
+ * sweep and relocate walks see the true fill. Called inside a pause. */
+static void flush_all_tlabs(void) {
+    for (uint64_t t = 0; t < g_mutator_hi; t++) {
+        Mutator *m = &g_mutators[t];
+        if (m->in_use && m->heap_base) {
+            g_region_top[region_index(m->heap_base)] =
+                (uint64_t)(uintptr_t)m->heap_top;
+        }
     }
 }
 
@@ -478,9 +598,7 @@ static void gc_mark_roots(void) {
  * cycles later (a resurrection/leak). */
 static void gc_sweep(void) {
     g_collections++;
-    if (g_heap_base) {
-        g_region_top[region_index(g_heap_base)] = (uint64_t)(uintptr_t)g_heap_top;
-    }
+    flush_all_tlabs();
     uint64_t stale_clear = ~(uint64_t)(KLASSIC_GC_HMARK_BOTH ^ g_header_mark);
     for (uint64_t idx = 0; idx < g_committed; idx++) {
         uint8_t *base = region_at(idx);
@@ -503,7 +621,7 @@ static void gc_sweep(void) {
             cur += sz;
         }
         g_region_live[idx] = live;
-        if (!any_live && base != g_heap_base) {
+        if (!any_live && !is_active_region(base)) {
             *(uint8_t **)base = g_free_head;
             g_free_head = base;
             g_region_top[idx] = (uint64_t)(uintptr_t)base;
@@ -687,7 +805,7 @@ static void gc_relocate_start(void) {
             continue;
         }
         uint8_t *base = region_at(idx);
-        if (base == g_heap_base) {
+        if (is_active_region(base)) {
             continue;
         }
         uint64_t live = g_region_live[idx];
@@ -705,8 +823,14 @@ static void gc_relocate_start(void) {
     }
     g_to_base = g_to_top = g_to_end = NULL;
     __atomic_store_n(&g_phase, GC_PHASE_RELOCATE, __ATOMIC_RELAXED);
-    for (uint64_t i = 0; i < g_shadow_top; i++) {
-        relocate_root(g_shadow[i]);
+    for (uint64_t t = 0; t < g_mutator_hi; t++) {
+        Mutator *m = &g_mutators[t];
+        if (!m->in_use) {
+            continue;
+        }
+        for (uint64_t i = 0; i < m->shadow_top; i++) {
+            relocate_root(m->shadow[i]);
+        }
     }
     g_relocate_ridx = 0;
     g_relocate_ptr = NULL;
