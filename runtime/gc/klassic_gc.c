@@ -440,23 +440,27 @@ static void gc_relocate(void) {
     if (free_regions <= 1) {
         return; /* no room for a to-space -> mark-only cycle */
     }
-    uint64_t budget_left = (free_regions - 1) * REGION_SIZE;
-
-    /* Select the relocation set: non-current, non-empty regions that are
-     * less than half full, capped by the headroom budget. */
+    /* Select the relocation set: non-current, non-empty regions less than
+     * half full. A region under half live packs (blocks are then each
+     * under half a region, so >=50% dense) into at most one to-space
+     * region, so capping the count at free_regions - 1 keeps a headroom
+     * region and makes to-space exhaustion impossible. */
+    uint64_t max_from = free_regions - 1;
     uint64_t selected = 0;
     for (uint64_t idx = 0; idx < g_committed; idx++) {
         g_from_set[idx] = 0;
+        if (selected >= max_from) {
+            continue; /* keep clearing the rest of the set */
+        }
         uint8_t *base = region_at(idx);
         if (base == g_heap_base) {
             continue;
         }
         uint64_t live = g_region_live[idx];
-        if (live == 0 || live * 2 >= REGION_SIZE || live > budget_left) {
+        if (live == 0 || live * 2 >= REGION_SIZE) {
             continue;
         }
         g_from_set[idx] = 1;
-        budget_left -= live;
         selected++;
     }
     if (selected == 0) {
