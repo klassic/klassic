@@ -176,6 +176,21 @@ fn record_field_read_after_reassignment() {
 }
 
 #[test]
+fn record_with_bool_and_varied_arities() {
+    // A boolean field (boxed as i64, read back with a trunc), a single-field
+    // record, and a wider record exercise the box/unbox paths and slot
+    // indexing.
+    assert_llvm_matches_evaluator(
+        "val r = record { flag: true; n: 5 }\n\
+         println(if (r.flag) r.n else 99)\n\
+         val s = record { v: 42 }\n\
+         println(s.v)\n\
+         val big = record { a: 1; b: 2; c: 3; d: 4; e: 5 }\n\
+         println(big.a + big.c + big.e)\n",
+    );
+}
+
+#[test]
 fn record_survives_moving_collection() {
     // Churn enough short-lived records to force many moving collections while
     // a rooted survivor is kept; its fields must read back intact after being
