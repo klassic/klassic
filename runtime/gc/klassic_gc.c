@@ -101,11 +101,20 @@ static uint64_t g_mark_color = GC_COLOR_M0; /* alternates M0<->M1 each mark */
 uint64_t gc_handshake_requested = 0;
 
 /* --- Background GC thread (true-zgc M4) --------------------------- *
- * A single background thread runs the collection. M4a (this step) parks the
- * triggering mutator for the whole cycle -- correct and trivially race-free;
- * M4b/M4c release the mutator to run concurrently during mark/relocate. The
- * wake lock hands cycle requests to the GC thread and blocks the mutator
- * until the cycle it asked for finishes. */
+ * A single background thread runs the collection concurrently with the
+ * mutator. Locks, ordered to stay deadlock-free (a holder of g_gc_lock never
+ * blocks on g_wake_lock/g_hs_lock, and the GC thread never holds g_gc_lock
+ * while waiting for the mutator to park):
+ *   g_gc_lock guards the mutable collector data raced between the GC thread
+ *             and the mutator's barrier -- the worklist and (M4c) the
+ *             to-space bump. Short critical sections only; the mutator takes
+ *             it on the barrier SLOW path, never the fast path.
+ *   g_wake_lock hands cycle requests to the GC thread and blocks the mutator
+ *             until the cycle it asked for finishes.
+ * Heap fields raced between the two threads are accessed atomically
+ * (relaxed) so a concurrent trace/recolor and a mutator barrier load don't
+ * race; mask/phase change only while the mutator is parked at a handshake. */
+static pthread_mutex_t g_gc_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_wake_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_wake_cond = PTHREAD_COND_INITIALIZER;  /* mutator -> GC */
 static pthread_cond_t g_idle_cond = PTHREAD_COND_INITIALIZER;  /* GC -> mutator */
@@ -303,8 +312,10 @@ uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
         } else if (gc_forwarded(block[1])) {
             raw = block[1]; /* follow forwarding */
         }
-        *slot = (void *)(raw | gc_good_color);
-        if (g_phase == GC_PHASE_MARK) {
+        /* Atomic self-heal: the GC thread may recolor the same field
+         * concurrently during a concurrent mark. */
+        __atomic_store_n((uint64_t *)slot, raw | gc_good_color, __ATOMIC_RELAXED);
+        if (__atomic_load_n(&g_phase, __ATOMIC_RELAXED) == GC_PHASE_MARK) {
             mark_visit((void *)raw);
         }
     }
@@ -312,7 +323,7 @@ uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
 }
 
 void *klassic_gc_read(void **slot) {
-    uint64_t value = (uint64_t)*slot;
+    uint64_t value = __atomic_load_n((uint64_t *)slot, __ATOMIC_RELAXED);
     if (value & gc_bad_mask) {
         return (void *)klassic_gc_load_barrier_slow(value, slot);
     }
@@ -321,13 +332,44 @@ void *klassic_gc_read(void **slot) {
 
 void klassic_gc_write(void **slot, void *value) {
     uint64_t raw = (uint64_t)value;
-    *slot = raw ? (void *)(raw | gc_good_color) : NULL;
+    /* Atomic store: a concurrent trace may recolor this field. */
+    __atomic_store_n((uint64_t *)slot, raw ? (raw | gc_good_color) : 0,
+                     __ATOMIC_RELAXED);
 }
 
-/* Mark `user` if unmarked this cycle, pushing it for tracing. A pointer
- * into a ghost region (forwarded from the last cycle's relocate) is
- * remapped to its to-space copy first, so we only ever mark live to-space
- * objects. */
+/* Worklist push/pop/empty under the data lock -- the worklist is raced
+ * between the GC thread's trace and the mutator barrier's mark. Short
+ * critical sections; no other lock is held across them, and gc_trace never
+ * holds the lock while calling mark_visit (which re-takes it to push). */
+static void worklist_push(void *user) {
+    pthread_mutex_lock(&g_gc_lock);
+    if (g_worklist_top >= WORKLIST_MAX) {
+        fprintf(stderr, "klassic gc: mark worklist overflow\n");
+        exit(1);
+    }
+    g_worklist[g_worklist_top++] = user;
+    pthread_mutex_unlock(&g_gc_lock);
+}
+static void *worklist_pop(void) {
+    void *user = NULL;
+    pthread_mutex_lock(&g_gc_lock);
+    if (g_worklist_top) {
+        user = g_worklist[--g_worklist_top];
+    }
+    pthread_mutex_unlock(&g_gc_lock);
+    return user;
+}
+static int worklist_empty(void) {
+    pthread_mutex_lock(&g_gc_lock);
+    int empty = (g_worklist_top == 0);
+    pthread_mutex_unlock(&g_gc_lock);
+    return empty;
+}
+
+/* Mark `user` if unmarked this cycle, pushing it for tracing. A pointer into
+ * a ghost region (forwarded last cycle) is remapped to its to-space copy
+ * first. Concurrent markers (mutator barriers + the GC thread) race on the
+ * atomic mark bit; exactly the one that flips it takes ownership and pushes. */
 static void mark_visit(void *user) {
     uint64_t raw = (uint64_t)user & gc_strip_mask; /* defensive: raw */
     if (!raw) {
@@ -338,26 +380,20 @@ static void mark_visit(void *user) {
         raw = block[1];
         block = (uint64_t *)(raw - 16);
     }
-    /* Atomic test-and-set of the mark bit: concurrent markers (mutator
-     * barriers + the GC thread) race here, and exactly the one that flips the
-     * bit takes ownership and pushes the object. */
     uint64_t old = __atomic_fetch_or(&block[0], g_header_mark, __ATOMIC_RELAXED);
     if (old & g_header_mark) {
         return; /* already marked this cycle */
     }
-    if (g_worklist_top >= WORKLIST_MAX) {
-        fprintf(stderr, "klassic gc: mark worklist overflow\n");
-        exit(1);
-    }
-    g_worklist[g_worklist_top++] = (void *)raw;
+    worklist_push((void *)raw);
 }
 
-/* Drain the worklist, marking every reachable pointer. */
-/* Trace up to `budget` worklist objects (a bounded mark quantum). */
+/* Trace up to `budget` worklist objects (a bounded mark quantum). Field
+ * loads/stores are atomic (relaxed) because the mutator's barrier may load or
+ * self-heal the same field concurrently during a concurrent mark. */
 static void gc_trace(uint64_t budget) {
-    while (budget && g_worklist_top) {
+    void *user;
+    while (budget && (user = worklist_pop()) != NULL) {
         budget--;
-        void *user = g_worklist[--g_worklist_top];
         uint64_t *block = (uint64_t *)((uint8_t *)user - 16);
         uint64_t tag = block[1];
         if (tag < KLASSIC_GC_POINTER_RECORD) {
@@ -368,25 +404,26 @@ static void gc_trace(uint64_t budget) {
         uint64_t slots = payload / 8;
         uint64_t start = (tag == KLASSIC_GC_POINTER_LIST) ? 1 : 0; /* skip length */
         for (uint64_t i = start; i < slots; i++) {
-            uint64_t raw = (uint64_t)fields[i] & gc_strip_mask;
+            uint64_t v = __atomic_load_n((uint64_t *)&fields[i], __ATOMIC_RELAXED);
+            uint64_t raw = v & gc_strip_mask;
             if (raw) {
                 uint64_t *fb = (uint64_t *)(raw - 16);
                 if (gc_forwarded(fb[1])) {
                     raw = fb[1]; /* remap a ghost pointer to to-space */
                 }
-                /* Recolor-on-trace: rewrite the field to the (remapped)
-                 * good-colored pointer so a later barriered load fast-paths
-                 * and no live field is left referencing a ghost. */
-                fields[i] = (void *)(raw | gc_good_color);
+                /* Recolor-on-trace so a later barriered load fast-paths and no
+                 * live field is left referencing a ghost. */
+                __atomic_store_n((uint64_t *)&fields[i], raw | gc_good_color,
+                                 __ATOMIC_RELAXED);
                 mark_visit((void *)raw);
             }
         }
     }
 }
 
-/* Drain the worklist to fixpoint. */
+/* Drain the worklist to fixpoint (used on the synchronous / parked path). */
 static void gc_drain(void) {
-    while (g_worklist_top) {
+    while (!worklist_empty()) {
         gc_trace(GC_QUANTUM_POPS);
     }
 }

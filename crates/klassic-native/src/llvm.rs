@@ -635,7 +635,11 @@ impl Emitter {
     /// (stripped) pointer as an `i64` operand.
     fn barrier_load(&mut self, slot: &str) -> String {
         let value = self.fresh();
-        self.emit(&format!("{value} = load i64, ptr {slot}"));
+        // Atomic (relaxed): the background GC thread may recolor this field
+        // concurrently during a concurrent mark, so a plain load would race.
+        self.emit(&format!(
+            "{value} = load atomic i64, ptr {slot} monotonic, align 8"
+        ));
         let bad_mask = self.fresh();
         self.emit(&format!("{bad_mask} = load i64, ptr @gc_bad_mask"));
         let bad = self.fresh();
