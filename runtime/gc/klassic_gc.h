@@ -55,6 +55,14 @@
 /* Initialize the heap (idempotent). Reserves the region address space. */
 void klassic_gc_init(void);
 
+/* Thread table: every thread that touches the heap runs as a registered
+ * "mutator" with its own shadow stack and TLAB. The main thread is registered
+ * by klassic_gc_init and extra threads are auto-registered on their first
+ * allocation, so single-threaded programs need call neither; a thread that
+ * spawns mutators and later exits should deregister them. */
+void klassic_gc_register_thread(void);
+void klassic_gc_unregister_thread(void);
+
 /* Allocate `size` payload bytes for an object of `type_tag`; returns the
  * user pointer (past the 16-byte header). Never returns NULL: on
  * exhaustion it prints an error and exits. */

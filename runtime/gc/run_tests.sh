@@ -9,12 +9,21 @@ here="$(cd "$(dirname "$0")" && pwd)"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # Build under AddressSanitizer+UBSan and (since the collector runs a
 # background GC thread, true-zgc M4) ThreadSanitizer. -pthread for the thread.
+# gc_test.c is the single-mutator suite; gc_mt_test.c drives several mutator
+# threads concurrently with the GC thread (true-zgc M5), which is what makes
+# the N-mutator handshake and the shared-state atomics worth their weight.
 "$CC" -std=c11 -O1 -g -pthread -Wall -Wextra -Werror \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
   "$here/klassic_gc.c" "$here/gc_test.c" -o "$tmp/gc_test_asan"
 "$CC" -std=c11 -O1 -g -pthread -Wall -Wextra -Werror \
   -fsanitize=thread -fno-omit-frame-pointer \
   "$here/klassic_gc.c" "$here/gc_test.c" -o "$tmp/gc_test_tsan"
+"$CC" -std=c11 -O1 -g -pthread -Wall -Wextra -Werror \
+  -fsanitize=address,undefined -fno-omit-frame-pointer \
+  "$here/klassic_gc.c" "$here/gc_mt_test.c" -o "$tmp/gc_mt_test_asan"
+"$CC" -std=c11 -O1 -g -pthread -Wall -Wextra -Werror \
+  -fsanitize=thread -fno-omit-frame-pointer \
+  "$here/klassic_gc.c" "$here/gc_mt_test.c" -o "$tmp/gc_mt_test_tsan"
 
 # Run with ASLR disabled. On some kernels (notably WSL2) a sanitizer binary's
 # shadow-memory setup nondeterministically faults during startup -- before
@@ -32,3 +41,5 @@ run() {
 }
 ASAN_OPTIONS=detect_leaks=0 run "$tmp/gc_test_asan"
 run "$tmp/gc_test_tsan"
+ASAN_OPTIONS=detect_leaks=0 run "$tmp/gc_mt_test_asan"
+run "$tmp/gc_mt_test_tsan"

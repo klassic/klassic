@@ -22,6 +22,7 @@
 #define RESERVE_BYTES ((size_t)RESERVE_REGIONS * REGION_SIZE) /* 64 MiB */
 #define SHADOW_MAX (1u << 20)
 #define WORKLIST_MAX (1u << 18)
+#define MAX_MUTATORS 64 /* registered mutator threads (thread table capacity) */
 
 /* The whole heap is one up-front reservation; Linux demand-pages it. A
  * soft budget bounds how many regions the mutator touches before a
@@ -34,10 +35,27 @@ static uint8_t *g_free_head;                    /* free-region pool, linked via 
 static uint64_t g_region_live[RESERVE_REGIONS]; /* live bytes per region (set by sweep) */
 static uint8_t g_from_set[RESERVE_REGIONS];     /* 1 if region is in the relocation set */
 
-/* The current bump region. */
-static uint8_t *g_heap_base;
-static uint8_t *g_heap_top;
-static uint8_t *g_heap_end;
+/* Per-mutator state: the precise-root shadow stack and the active bump region
+ * (TLAB). klassic compiled programs are single-threaded -- one mutator,
+ * registered at init -- but the collector is built for N: each thread that
+ * touches the heap registers a Mutator in the table and deregisters on exit,
+ * and the GC thread walks the table (roots, active regions) at handshakes.
+ * The shadow stack is heap-allocated per thread so idle table slots cost
+ * nothing. */
+typedef struct Mutator {
+    void ***shadow;     /* SHADOW_MAX slot addresses (heap-allocated) */
+    uint64_t shadow_top;
+    uint8_t *heap_base; /* active bump region (TLAB) */
+    uint8_t *heap_top;
+    uint8_t *heap_end;
+    int in_use; /* table slot occupied */
+} Mutator;
+static Mutator g_mutators[MAX_MUTATORS];
+static uint64_t g_mutator_hi;    /* 1 + highest in-use slot index (walk bound) */
+static uint64_t g_mutator_count; /* number of in-use slots (registered threads) */
+static __thread Mutator *g_self; /* the calling thread's mutator */
+/* The thread table is guarded by g_hs_lock (declared below), so registration
+ * and a phase-transition rendezvous are mutually exclusive. */
 
 /* A dedicated to-space bump for evacuation, separate from the mutator's
  * current region so compaction never disturbs in-progress allocation. */
@@ -46,9 +64,7 @@ static uint8_t *g_to_top;
 static uint8_t *g_to_end;
 static uint64_t g_relocations; /* objects evacuated (observability) */
 
-/* Precise roots and the mark worklist. */
-static void **g_shadow[SHADOW_MAX];
-static uint64_t g_shadow_top;
+/* The mark worklist (shared across all mutators + the GC thread). */
 static void *g_worklist[WORKLIST_MAX];
 static uint64_t g_worklist_top;
 
@@ -66,7 +82,6 @@ static uint64_t g_collections;
 #define GC_PHASE_RELOCATE 2
 #define GC_QUANTUM_POPS 512    /* objects traced per mark quantum */
 #define GC_RELOCATE_QUANTUM 8192 /* live bytes evacuated per relocate quantum */
-#define GC_RELOCATE_BYTES 8192 /* live bytes evacuated per relocate quantum */
 static uint64_t g_phase = GC_PHASE_IDLE;
 static uint64_t g_bytes_since_cycle;   /* drives the proactive cycle start */
 /* Relocate walk cursor (resumed across quanta): the from-set region being
@@ -121,19 +136,25 @@ uint64_t gc_handshake_requested = 0;
  * (relaxed) so a concurrent trace/recolor and a mutator barrier load don't
  * race; mask/phase change only while the mutator is parked at a handshake. */
 static pthread_mutex_t g_gc_lock = PTHREAD_MUTEX_INITIALIZER;
-/* Phase-transition rendezvous: the GC thread parks the mutator here to flip
- * masks / scan its roots / sweep while it touches no heap. Separate from
- * g_gc_lock (a barrier holding g_gc_lock must still reach its poll). */
+/* Phase-transition rendezvous: the GC thread parks EVERY registered mutator
+ * here to flip masks / scan roots / sweep while none touches the heap.
+ * Separate from g_gc_lock (a barrier holding g_gc_lock must still reach its
+ * poll). g_hs_lock also guards the thread table (register/deregister), so a
+ * mask/phase flip and a thread joining/leaving are serialized. */
 static pthread_mutex_t g_hs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_hs_cond = PTHREAD_COND_INITIALIZER;
-static int g_hs_parked; /* mutator is parked in the handshake (under g_hs_lock) */
+static uint64_t g_hs_parked_cnt; /* mutators parked in the current round */
+static uint64_t g_hs_gen;        /* rendezvous generation, bumped each round */
 static pthread_mutex_t g_wake_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_wake_cond = PTHREAD_COND_INITIALIZER;  /* mutator -> GC */
 static int g_cycle_request;   /* a cycle has been asked for (under g_wake_lock) */
 static int g_cycle_running;   /* a cycle is in progress (under g_wake_lock) */
 static uint64_t g_cycle_done; /* completed-cycle counter, for wait predicates */
 static pthread_t g_gc_thread;
-static int g_gc_thread_started;
+static int g_gc_thread_started; /* set once in gc_init_once */
+/* There is no teardown path: the GC thread is detached and runs until the
+ * process exits, so g_gc_shutdown is never set (the gc_worker loop reads it to
+ * keep a clean shutdown hook available for a future embedding API). */
 static int g_gc_shutdown;
 static void *gc_worker(void *arg);
 
@@ -160,10 +181,15 @@ static int gc_forwarded(uint64_t word1) {
     return p >= g_region_base && p <= g_region_base + RESERVE_BYTES;
 }
 
-void klassic_gc_init(void) {
-    if (g_initialized) {
-        return;
-    }
+/* The heap-wide, once-only part of initialization: reserve the address space
+ * and spawn the GC thread. Run through pthread_once so that when several
+ * threads race to allocate for the first time (each triggering init), the
+ * reservation and the GC-thread spawn happen exactly once and their writes are
+ * published to every thread with a happens-before edge -- otherwise the init
+ * stores race the first allocators' reads of g_region_base / g_committed /
+ * g_free_head / g_budget. */
+static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+static void gc_init_once(void) {
     void *base = mmap(NULL, RESERVE_BYTES, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) {
@@ -173,20 +199,20 @@ void klassic_gc_init(void) {
     g_region_base = (uint8_t *)base;
     g_committed = 0;
     g_free_head = NULL;
-    g_heap_base = g_heap_top = g_heap_end = NULL;
-    g_shadow_top = 0;
     g_header_mark = KLASSIC_GC_HMARK1;
     g_collections = 0;
-    g_initialized = 1;
-    /* Spawn the background GC thread that runs collections. */
-    if (!g_gc_thread_started) {
-        if (pthread_create(&g_gc_thread, NULL, gc_worker, NULL) != 0) {
-            fprintf(stderr, "klassic gc: cannot start the GC thread\n");
-            exit(1);
-        }
-        pthread_detach(g_gc_thread);
-        g_gc_thread_started = 1;
+    __atomic_store_n(&g_initialized, 1, __ATOMIC_RELEASE);
+    if (pthread_create(&g_gc_thread, NULL, gc_worker, NULL) != 0) {
+        fprintf(stderr, "klassic gc: cannot start the GC thread\n");
+        exit(1);
     }
+    pthread_detach(g_gc_thread);
+    g_gc_thread_started = 1;
+}
+
+void klassic_gc_init(void) {
+    /* Registration runs the once-init and adds the caller to the table. */
+    klassic_gc_register_thread();
 }
 
 static uint8_t *region_at(uint64_t index) {
@@ -196,12 +222,108 @@ static uint64_t region_index(const uint8_t *p) {
     return (uint64_t)((p - g_region_base) >> REGION_SHIFT);
 }
 
+/* Park the calling thread for whatever rendezvous is in flight. Assumes
+ * g_hs_lock is held. Counts the thread as parked for the current generation
+ * and waits until the GC clears the request; if a *new* round starts before
+ * this thread resumes, it re-counts for that round (the N-mutator form of the
+ * single-mutator "re-assert parked on every wait" rule). On return no
+ * handshake is pending, so the caller may touch the heap or leave the table. */
+static void hs_park_locked(void) {
+    while (__atomic_load_n(&gc_handshake_requested, __ATOMIC_ACQUIRE)) {
+        uint64_t my_gen = g_hs_gen;
+        g_hs_parked_cnt++;
+        pthread_cond_broadcast(&g_hs_cond); /* tell the GC we parked */
+        while (__atomic_load_n(&gc_handshake_requested, __ATOMIC_ACQUIRE)
+               && g_hs_gen == my_gen) {
+            pthread_cond_wait(&g_hs_cond, &g_hs_lock);
+        }
+    }
+}
+
+/* Register the calling thread as a mutator: claim a table slot and give it a
+ * shadow stack. Idempotent per thread. The main thread is registered from
+ * klassic_gc_init; extra threads auto-register on their first alloc/push (and
+ * may also call this explicitly). Under g_hs_lock so it serializes with the
+ * rendezvous: a joining thread waits out any in-flight handshake (it is not
+ * yet counted, so it does not park) before it appears in the table, so the
+ * GC's current round never waits on a thread it did not count. */
+void klassic_gc_register_thread(void) {
+    if (g_self) {
+        return;
+    }
+    /* A thread cannot run as a mutator before the heap exists, and it may
+     * register (explicitly or via a first shadow push) before it ever
+     * allocates, so ensure the once-init here rather than only in gc_alloc. */
+    pthread_once(&g_init_once, gc_init_once);
+    void ***shadow = (void ***)malloc((size_t)SHADOW_MAX * sizeof(void **));
+    if (!shadow) {
+        fprintf(stderr, "klassic gc: cannot allocate a shadow stack\n");
+        exit(1);
+    }
+    pthread_mutex_lock(&g_hs_lock);
+    while (__atomic_load_n(&gc_handshake_requested, __ATOMIC_ACQUIRE)) {
+        pthread_cond_wait(&g_hs_cond, &g_hs_lock);
+    }
+    uint64_t i = 0;
+    while (i < MAX_MUTATORS && g_mutators[i].in_use) {
+        i++;
+    }
+    if (i == MAX_MUTATORS) {
+        fprintf(stderr, "klassic gc: too many mutator threads\n");
+        exit(1);
+    }
+    Mutator *m = &g_mutators[i];
+    m->shadow = shadow;
+    m->shadow_top = 0;
+    m->heap_base = m->heap_top = m->heap_end = NULL;
+    m->in_use = 1;
+    g_mutator_count++;
+    if (i + 1 > g_mutator_hi) {
+        g_mutator_hi = i + 1;
+    }
+    g_self = m;
+    pthread_mutex_unlock(&g_hs_lock);
+}
+
+/* Deregister the calling thread on exit: flush its active region watermark,
+ * free its shadow stack, release the table slot. Under g_hs_lock, and it
+ * first parks for any in-flight rendezvous (the GC's current round still
+ * counts this thread), then leaves the table once the request is clear, so
+ * the count the next round snapshots no longer includes it. */
+void klassic_gc_unregister_thread(void) {
+    if (!g_self) {
+        return;
+    }
+    pthread_mutex_lock(&g_hs_lock);
+    hs_park_locked();
+    Mutator *m = g_self;
+    if (m->heap_base) {
+        g_region_top[region_index(m->heap_base)] = (uint64_t)(uintptr_t)m->heap_top;
+    }
+    free(m->shadow);
+    m->shadow = NULL;
+    m->shadow_top = 0;
+    m->heap_base = m->heap_top = m->heap_end = NULL;
+    m->in_use = 0;
+    g_mutator_count--;
+    uint64_t hi = 0;
+    for (uint64_t i = 0; i < MAX_MUTATORS; i++) {
+        if (g_mutators[i].in_use) {
+            hi = i + 1;
+        }
+    }
+    g_mutator_hi = hi;
+    g_self = NULL;
+    pthread_mutex_unlock(&g_hs_lock);
+}
+
 /* Acquire a fresh, zeroed bump region: reuse from the free pool, else
  * commit the next tail region within the budget. Returns 0 on failure. */
 static int acquire_region(void) {
-    /* Flush the current region's watermark before switching. */
-    if (g_heap_base) {
-        g_region_top[region_index(g_heap_base)] = (uint64_t)(uintptr_t)g_heap_top;
+    Mutator *m = g_self;
+    /* Flush this thread's current region watermark before switching. */
+    if (m->heap_base) {
+        g_region_top[region_index(m->heap_base)] = (uint64_t)(uintptr_t)m->heap_top;
     }
     uint8_t *base;
     if (g_free_head) {
@@ -215,9 +337,9 @@ static int acquire_region(void) {
     } else {
         return 0;
     }
-    g_heap_base = base;
-    g_heap_top = base;
-    g_heap_end = base + REGION_SIZE;
+    m->heap_base = base;
+    m->heap_top = base;
+    m->heap_end = base + REGION_SIZE;
     g_region_top[region_index(base)] = (uint64_t)(uintptr_t)base;
     /* A mutator bump region is never in the relocation set; clear the flag
      * defensively (symmetric with to_acquire) so no future path can let the
@@ -226,14 +348,18 @@ static int acquire_region(void) {
     return 1;
 }
 
+/* Grow the soft budget (called under g_gc_lock). The store is atomic because
+ * the allocation-pressure check in gc_alloc reads g_budget without the lock. */
 static int grow_budget(void) {
-    if (g_budget >= RESERVE_REGIONS) {
+    uint64_t b = g_budget;
+    if (b >= RESERVE_REGIONS) {
         return 0;
     }
-    g_budget *= 2;
-    if (g_budget > RESERVE_REGIONS) {
-        g_budget = RESERVE_REGIONS;
+    b *= 2;
+    if (b > RESERVE_REGIONS) {
+        b = RESERVE_REGIONS;
     }
+    __atomic_store_n(&g_budget, b, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -242,8 +368,10 @@ static void gc_request_cycle(void);   /* forward decl: async cycle request */
 static void gc_request_and_wait(void); /* forward decl: request + block for a cycle */
 
 void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
-    if (!g_initialized) {
-        klassic_gc_init();
+    /* Per-thread fast check: g_self is set only after this thread has both run
+     * the once-init and registered, so a single test covers both. */
+    if (!g_self) {
+        klassic_gc_init(); /* pthread_once heap init + register this thread */
     }
     uint64_t total = align16(size + 16);
     if (total > REGION_SIZE) {
@@ -259,16 +387,18 @@ void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
     gc_poll();
     uint64_t since =
         __atomic_add_fetch(&g_bytes_since_cycle, total, __ATOMIC_RELAXED);
-    if (since >= (g_budget << REGION_SHIFT) / 2) {
+    uint64_t budget = __atomic_load_n(&g_budget, __ATOMIC_RELAXED);
+    if (since >= (budget << REGION_SHIFT) / 2) {
         gc_request_cycle();
     }
+    Mutator *m = g_self;
     for (;;) {
-        /* The current bump region is owned by this (mutator) thread; the GC
-         * thread reads its watermark only while the mutator is parked at a
-         * handshake, so the bump needs no lock. */
-        if (g_heap_base && (uint64_t)(g_heap_end - g_heap_top) >= total) {
-            uint8_t *block = g_heap_top;
-            g_heap_top += total;
+        /* This thread's bump region (TLAB) is private to it; the GC thread
+         * reads its watermark only while the thread is parked at a handshake,
+         * so the bump needs no lock. */
+        if (m->heap_base && (uint64_t)(m->heap_end - m->heap_top) >= total) {
+            uint8_t *block = m->heap_top;
+            m->heap_top += total;
             *(uint64_t *)block = total;          /* word0 = size, flags clear */
             *(uint64_t *)(block + 8) = type_tag; /* word1 = type tag */
             /* Allocate-black: an object born during Mark is live this cycle.
@@ -306,16 +436,18 @@ void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
 }
 
 void klassic_gc_shadow_push(void **slot_addr) {
-    if (g_shadow_top >= SHADOW_MAX) {
+    if (!g_self) {
+        klassic_gc_register_thread();
+    }
+    Mutator *m = g_self;
+    if (m->shadow_top >= SHADOW_MAX) {
         fprintf(stderr, "klassic gc: shadow stack overflow\n");
         exit(1);
     }
-    g_shadow[g_shadow_top++] = slot_addr;
+    m->shadow[m->shadow_top++] = slot_addr;
 }
 
-void klassic_gc_shadow_pop_n(uint64_t count) {
-    g_shadow_top -= count;
-}
+void klassic_gc_shadow_pop_n(uint64_t count) { g_self->shadow_top -= count; }
 
 static void mark_visit(void *user);       /* forward decl */
 static int in_from_set(uint64_t raw);     /* forward decl */
@@ -355,6 +487,14 @@ uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
 }
 
 void *klassic_gc_read(void **slot) {
+    /* A thread that touches the heap must be a registered mutator, or its poll
+     * below would increment the parked count for a rendezvous that never
+     * counted it (breaking the all-mutator handshake), and its barrier work
+     * would evacuate/heal with no shadow stack to root its own pointers.
+     * Uniform with klassic_gc_alloc / klassic_gc_shadow_push. */
+    if (!g_self) {
+        klassic_gc_register_thread();
+    }
     /* Safepoint: the compiled backend polls at loop back-edges (M3), so a
      * read-only loop parks for the GC thread's handshakes even when it never
      * allocates. This C entry point (used by the runtime and the unit tests)
@@ -465,9 +605,42 @@ static void gc_drain(void) {
     }
 }
 
+/* Mark every registered mutator's roots. Called only inside a rendezvous
+ * pause, so each parked thread's shadow stack is stable to walk. */
 static void gc_mark_roots(void) {
-    for (uint64_t i = 0; i < g_shadow_top; i++) {
-        mark_visit(*g_shadow[i]);
+    for (uint64_t t = 0; t < g_mutator_hi; t++) {
+        Mutator *m = &g_mutators[t];
+        if (!m->in_use) {
+            continue;
+        }
+        for (uint64_t i = 0; i < m->shadow_top; i++) {
+            mark_visit(*m->shadow[i]);
+        }
+    }
+}
+
+/* Is `base` any registered mutator's active TLAB region? Such a region is
+ * spared by the sweep and excluded from the relocation set -- its owner is
+ * still bumping into it. Called inside a pause, so the TLAB pointers are
+ * stable. */
+static int is_active_region(const uint8_t *base) {
+    for (uint64_t t = 0; t < g_mutator_hi; t++) {
+        if (g_mutators[t].in_use && g_mutators[t].heap_base == base) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Flush every mutator's active-region watermark into g_region_top so the
+ * sweep and relocate walks see the true fill. Called inside a pause. */
+static void flush_all_tlabs(void) {
+    for (uint64_t t = 0; t < g_mutator_hi; t++) {
+        Mutator *m = &g_mutators[t];
+        if (m->in_use && m->heap_base) {
+            g_region_top[region_index(m->heap_base)] =
+                (uint64_t)(uintptr_t)m->heap_top;
+        }
     }
 }
 
@@ -478,9 +651,7 @@ static void gc_mark_roots(void) {
  * cycles later (a resurrection/leak). */
 static void gc_sweep(void) {
     g_collections++;
-    if (g_heap_base) {
-        g_region_top[region_index(g_heap_base)] = (uint64_t)(uintptr_t)g_heap_top;
-    }
+    flush_all_tlabs();
     uint64_t stale_clear = ~(uint64_t)(KLASSIC_GC_HMARK_BOTH ^ g_header_mark);
     for (uint64_t idx = 0; idx < g_committed; idx++) {
         uint8_t *base = region_at(idx);
@@ -503,7 +674,7 @@ static void gc_sweep(void) {
             cur += sz;
         }
         g_region_live[idx] = live;
-        if (!any_live && base != g_heap_base) {
+        if (!any_live && !is_active_region(base)) {
             *(uint8_t **)base = g_free_head;
             g_free_head = base;
             g_region_top[idx] = (uint64_t)(uintptr_t)base;
@@ -687,7 +858,7 @@ static void gc_relocate_start(void) {
             continue;
         }
         uint8_t *base = region_at(idx);
-        if (base == g_heap_base) {
+        if (is_active_region(base)) {
             continue;
         }
         uint64_t live = g_region_live[idx];
@@ -705,8 +876,14 @@ static void gc_relocate_start(void) {
     }
     g_to_base = g_to_top = g_to_end = NULL;
     __atomic_store_n(&g_phase, GC_PHASE_RELOCATE, __ATOMIC_RELAXED);
-    for (uint64_t i = 0; i < g_shadow_top; i++) {
-        relocate_root(g_shadow[i]);
+    for (uint64_t t = 0; t < g_mutator_hi; t++) {
+        Mutator *m = &g_mutators[t];
+        if (!m->in_use) {
+            continue;
+        }
+        for (uint64_t i = 0; i < m->shadow_top; i++) {
+            relocate_root(m->shadow[i]);
+        }
     }
     g_relocate_ridx = 0;
     g_relocate_ptr = NULL;
@@ -804,23 +981,12 @@ static void gc_mark_end(void) {
 }
 
 /* Safepoint handshake: the mutator, at a poll, parks here until the GC thread
- * (which raised gc_handshake_requested and does the phase transition while the
- * mutator is stopped) releases it. The mutator touches no heap while parked,
- * so the GC thread can flip masks / scan its roots / sweep safely. */
+ * (which raised gc_handshake_requested and does the phase transition while
+ * every mutator is stopped) releases it. Touches no heap while parked, so the
+ * GC can flip masks / scan every thread's roots / sweep safely. */
 void klassic_gc_handshake(void) {
     pthread_mutex_lock(&g_hs_lock);
-    /* Re-assert "parked" on every wait, not just once. Consecutive rendezvous
-     * reuse g_hs_parked (the GC clears it at the end of each), so if this
-     * mutator wakes from one rendezvous to find a *new* request already
-     * pending, it must announce itself again -- otherwise the GC's next
-     * rendezvous waits forever for a parked flag that a single up-front
-     * assignment cleared. Publishing inside the loop makes the flag current
-     * for whichever request we are actually waiting on. */
-    while (__atomic_load_n(&gc_handshake_requested, __ATOMIC_ACQUIRE)) {
-        g_hs_parked = 1;
-        pthread_cond_broadcast(&g_hs_cond); /* tell the GC thread we are parked */
-        pthread_cond_wait(&g_hs_cond, &g_hs_lock);
-    }
+    hs_park_locked();
     pthread_mutex_unlock(&g_hs_lock);
 }
 
@@ -831,18 +997,23 @@ static void gc_poll(void) {
     }
 }
 
-/* GC thread: raise the handshake, wait for the mutator to park, run `action`
- * (a phase transition -- safe while the mutator is stopped), release. The GC
- * thread must not hold g_gc_lock here, or a mutator blocked on g_gc_lock in a
- * barrier could never reach its poll to park. */
+/* GC thread: raise the handshake, wait for EVERY registered mutator to park,
+ * run `action` (a phase transition -- safe while all mutators are stopped),
+ * release. The expected count is snapshotted under g_hs_lock; register and
+ * deregister take g_hs_lock and wait out an in-flight request, so no thread
+ * joins or leaves the table between the snapshot and the release -- the count
+ * cannot drift mid-rendezvous. The GC thread must not hold g_gc_lock here, or
+ * a mutator blocked on g_gc_lock in a barrier could never reach its poll. */
 static void gc_rendezvous(void (*action)(void)) {
     pthread_mutex_lock(&g_hs_lock);
+    uint64_t expected = g_mutator_count;
+    g_hs_parked_cnt = 0;
+    g_hs_gen++;
     __atomic_store_n(&gc_handshake_requested, 1, __ATOMIC_RELEASE);
-    while (!g_hs_parked) {
+    while (g_hs_parked_cnt < expected) {
         pthread_cond_wait(&g_hs_cond, &g_hs_lock);
     }
     action();
-    g_hs_parked = 0;
     __atomic_store_n(&gc_handshake_requested, 0, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_hs_cond);
     pthread_mutex_unlock(&g_hs_lock);
@@ -940,8 +1111,13 @@ static void gc_request_and_wait(void) {
 
 /* Explicit full collection: request a cycle and block until it finishes. */
 void klassic_gc_collect(void) {
-    if (!g_initialized) {
+    if (!__atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE)) {
         return;
+    }
+    /* Must be a registered mutator before we poll in gc_request_and_wait, so
+     * this thread parks for -- and is counted in -- the cycle's handshakes. */
+    if (!g_self) {
+        klassic_gc_register_thread();
     }
     gc_request_and_wait();
 }
