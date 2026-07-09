@@ -116,19 +116,53 @@ verify on main. The evaluator stays the differential oracle for the LLVM path.
   (eval == --backend llvm) must stay green and the hot-path cost must be a
   single predictable-not-taken branch. (Elide the poll only where provably no
   allocation/handshake can occur; otherwise poll on every back-edge.)
-- **M4 — The GC thread + all-mutator handshake protocol.** `klassic_gc_init`
-  spawns a background GC thread. Its loop: block until allocation pressure
-  crosses the trigger → request the MarkStart handshake and **wait for every
-  registered mutator to ack** (each scans its own roots) → mark concurrently
-  (GC thread drains the worklist while all mutators' barriers push) → MarkEnd
-  handshake (re-scan every mutator to fixpoint) → sweep → RelocateStart
-  handshake (fix every mutator's roots, flip to R) → relocate concurrently (GC
-  thread evacuates while every mutator's barrier evacuates-on-demand) → Idle.
-  `gc_alloc` no longer runs quanta; it bumps in the calling thread's TLAB and
-  blocks (fallback) only if the heap is exhausted mid-cycle. First TSan run
-  here — with a genuinely multi-threaded C test harness (several pthreads
-  churning while the GC thread cycles), since the mutator threads are what the
-  concurrency protocol must handle.
+- **M4 — The GC thread + handshake protocol.** `klassic_gc_init` spawns a
+  background GC thread. Its loop: block until allocation pressure crosses the
+  trigger → MarkStart handshake → mark concurrently → MarkEnd handshake →
+  sweep → RelocateStart handshake → relocate concurrently → Idle → signal
+  waiting allocators. `gc_alloc` no longer runs quanta; it bumps and blocks
+  (fallback) only if the heap is exhausted mid-cycle. First TSan run here.
+
+  *Concrete design (worked out; deadlock-free lock ordering is the crux):*
+  - **Two locks.** `g_gc_lock` guards the mutable collector data (worklist,
+    to-space bump, region table, relocate cursor) and is taken only in short
+    critical sections — the mutator takes it on the barrier SLOW path
+    (mark_visit's worklist push, gc_evacuate's to-space bump), never the fast
+    path — and by the GC thread. `g_hs_lock`/`g_hs_cond` is the phase-transition
+    rendezvous, *separate* from `g_gc_lock` so the GC thread never holds the
+    data lock while waiting for a mutator to park (which would wedge a mutator
+    blocked on the data lock inside a barrier). The GC thread releases
+    `g_gc_lock` before every handshake.
+  - **Rendezvous handshake (O(roots) pause).** For a phase transition the GC
+    thread raises `gc_handshake_requested` and waits on `g_hs_cond`. Each
+    mutator, at its next poll, enters `klassic_gc_handshake`, signals "parked",
+    and waits; the GC thread — now that the mutator is parked and touching no
+    heap — performs the transition (atomic mask/phase flip; scan the parked
+    mutator's shadow stack with mark_visit at MarkStart / re-scan at MarkEnd /
+    relocate_root at RelocateStart), then releases the mutator, which reloads
+    its mask view and resumes. Single mutator today; the parked-mutator model
+    extends to N via a per-thread parked count and an ack barrier (thread
+    table). This keeps mask/phase changes off the mutator's concurrent path —
+    they happen only while it is parked.
+  - **Concurrent mark/relocate.** Between handshakes the mutator runs; the GC
+    thread drains the worklist (mark) / evacuates from-set quanta (relocate)
+    under `g_gc_lock`, while the mutator's barrier pushes / evacuates-on-demand
+    under the same lock. The M2 atomics (CAS forwarding, atomic mark bit) mean
+    the header ops need no lock; the lock only serializes the worklist and
+    to-space bump. Mark terminates when the worklist is empty AND a MarkEnd
+    re-scan grays nothing new (fixpoint).
+  - **M2 forward-looking fixes land here:** the follow-forwarding `block[1]`
+    reads become acquire loads (paired with the release-CAS install), the
+    evacuate un-bump becomes atomic, and `g_phase`/masks become atomic
+    load/store (relaxed; the handshake supplies the ordering).
+  - **First-version simplification (documented, not a shortcut to hide):**
+    sweep + ghost-free + from-set selection run inside the MarkEnd pause (an
+    O(heap) pause) to start; making the sweep concurrent is a follow-up. Mark
+    and relocate — the expensive phases — are concurrent from the start.
+  - **TSan is the driver:** a multi-threaded C harness (mutator pthread(s)
+    churning records while the GC thread cycles on a tiny trigger) run under
+    `-fsanitize=thread` (with `setarch -R` for the WSL2 ASLR quirk); every race
+    TSan reports is fixed until clean, then ASan separately.
 - **M5 — Concurrency correctness: TSan + multi-thread stress.** ThreadSanitizer-
   clean under **several mutator threads** churning records while the GC thread
   relocates. Nail the races: two mutators (or a mutator and the GC thread)
