@@ -111,7 +111,10 @@ static uint64_t block_size(uint64_t word0) { return word0 & ~(uint64_t)15u; }
  * untouched. `gc_forwarded` distinguishes the two by the reservation range. */
 static int gc_forwarded(uint64_t word1) {
     const uint8_t *p = (const uint8_t *)word1;
-    return p >= g_region_base && p < g_region_base + RESERVE_BYTES;
+    /* Inclusive upper bound: a zero-payload object in the last qword of the
+     * reservation has user pointer == base + RESERVE_BYTES. Tags (1/2/4) are
+     * far below g_region_base, so this never misclassifies a tag. */
+    return p >= g_region_base && p <= g_region_base + RESERVE_BYTES;
 }
 
 void klassic_gc_init(void) {
@@ -407,11 +410,13 @@ static void gc_sweep(void) {
  * slow-paths, and remaps the roots. Evacuation then runs in quanta from the
  * allocator (gc_relocate_step) alongside the mutator's own barrier, which
  * evacuates a from-set object on demand when the mutator loads a pointer to
- * it. A vacated object keeps its size in word0 (FWD bit set) with the new
- * pointer in word1, so the from-space stays walkable; the fully-evacuated
- * from-set regions become ghosts, freed at the next MarkEnd once marking
- * has remapped every live pointer off them. Single mutator, non-atomic for
- * now (docs/true-zgc-plan.md M2 makes the shared state thread-safe). */
+ * it. A vacated object keeps its size in word0 and stashes its new user
+ * pointer in word1 (installed by a single CAS, see gc_evacuate_object), so
+ * the from-space stays linearly walkable; the fully-evacuated from-set
+ * regions become ghosts, freed at the next MarkEnd once marking has remapped
+ * every live pointer off them. The header operations are atomic (M2); a
+ * background GC thread that drives this concurrently is M4
+ * (docs/true-zgc-plan.md). */
 
 /* Acquire a fresh zeroed region for the to-space bump (free pool first,
  * then a committed tail region), without disturbing the mutator's current
@@ -591,7 +596,7 @@ static void gc_relocate_end(void) {
 }
 
 /* Evacuate up to `budget` live bytes from the from-set, resuming the linear
- * walk via the cursor. Objects the barrier already evacuated (FWD set) are
+ * walk via the cursor. Objects the barrier already evacuated (forwarded) are
  * skipped; when the whole from-set is drained, finish the phase. */
 static void gc_relocate_step(uint64_t budget) {
     for (;;) {
