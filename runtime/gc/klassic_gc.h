@@ -56,6 +56,34 @@ void klassic_gc_shadow_pop_n(uint64_t count);
 /* Force a collection (stop-the-world mark-sweep for now). */
 void klassic_gc_collect(void);
 
+/* --- Colored pointers + load barrier ----------------------------- *
+ * Heap-object SLOTS hold color-tagged pointers (bits 60-62); registers,
+ * roots, and the shadow stack hold raw (stripped) pointers. The mask
+ * cells are dso_local globals so the LLVM-emitted fast path folds the
+ * bad-mask load into a `testq` memory operand (see the M2 spike). A
+ * pointer whose color is "bad" is non-canonical, so an unbarriered
+ * dereference faults -- the barrier-coverage guarantee. These are the
+ * values the LLVM codegen's inline fast path reads; the slow path here
+ * is a normal C function (default memory semantics, never readnone, so
+ * clang cannot CSE a slot load across it). */
+extern uint64_t gc_good_color;  /* the good color stored pointers carry */
+extern uint64_t gc_bad_mask;    /* a pointer is "bad" iff (color & bad) != 0 */
+extern uint64_t gc_strip_mask;  /* AND with this to strip a color -> raw */
+
+/* Slow path: in: `value` = the bad-colored slot value, `slot` = the
+ * field address it was loaded from. Returns the raw (stripped, and in
+ * later milestones remapped) pointer, self-healing the slot to the good
+ * color. */
+uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot);
+
+/* Read a heap pointer slot through the barrier (fast path inline, slow
+ * path out of line). The LLVM backend emits the fast path directly; this
+ * C entry point exists for the runtime and the tests. */
+void *klassic_gc_read(void **slot);
+
+/* Store a heap pointer into a slot, coloring it good (null stays null). */
+void klassic_gc_write(void **slot, void *value);
+
 /* Test/observability hooks. */
 uint64_t klassic_gc_collection_count(void);
 uint64_t klassic_gc_live_region_count(void);

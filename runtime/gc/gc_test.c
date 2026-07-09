@@ -17,13 +17,17 @@ static int64_t *make_leaf(int64_t v) {
     return p;
 }
 
-/* A pair record: two pointer fields. */
+/* A pair record: two pointer fields, stored through the write barrier so
+ * the slots carry the good color (as the codegen will emit). */
 static void **make_pair(void *a, void *b) {
     void **p = (void **)klassic_gc_alloc(16, KLASSIC_GC_POINTER_RECORD);
-    p[0] = a;
-    p[1] = b;
+    klassic_gc_write(&p[0], a);
+    klassic_gc_write(&p[1], b);
     return p;
 }
+
+/* Read a pointer field through the load barrier (strips the color). */
+static void *pair_field(void **p, int i) { return klassic_gc_read(&p[i]); }
 
 /* A cons cell: [int value][pointer to next]. Modeled as a pointer record
  * whose first field is a leaf (so it is traced uniformly). */
@@ -41,8 +45,8 @@ static void test_survivor_kept_and_intact(void) {
         (void)garbage; /* unrooted -> collectible */
     }
     klassic_gc_collect();
-    int64_t *a = (int64_t *)keeper[0];
-    int64_t *b = (int64_t *)keeper[1];
+    int64_t *a = (int64_t *)pair_field(keeper, 0);
+    int64_t *b = (int64_t *)pair_field(keeper, 1);
     assert(a[0] == 100 && b[0] == 23);
     assert(klassic_gc_collection_count() > 0);
     klassic_gc_shadow_pop_n(1);
@@ -66,8 +70,8 @@ static void test_linked_structure_survives_churn(void) {
     /* Walk the chain: values 499,498,...,0. Sum = 499*500/2 = 124750. */
     int64_t sum = 0;
     int count = 0;
-    for (void **node = list; node; node = (void **)node[1]) {
-        int64_t *value = (int64_t *)node[0];
+    for (void **node = list; node; node = (void **)pair_field(node, 1)) {
+        int64_t *value = (int64_t *)pair_field(node, 0);
         sum += value[0];
         count++;
     }
@@ -94,8 +98,28 @@ static void test_garbage_is_reclaimed(void) {
     printf("test_garbage_is_reclaimed OK (live_regions=%llu)\n", (unsigned long long)live);
 }
 
+/* The load barrier strips a color and heals a bad-colored slot. */
+static void test_load_barrier_strips_and_heals(void) {
+    void **cell = (void **)klassic_gc_alloc(8, KLASSIC_GC_POINTER_RECORD);
+    int64_t *target = make_leaf(777);
+    /* Simulate a stale bad-colored slot (as if left by a previous cycle):
+     * store the raw target OR'd with a bad color directly. */
+    extern uint64_t gc_bad_mask;
+    cell[0] = (void *)((uint64_t)target | (gc_bad_mask & (7ull << 60)));
+    /* A barriered read must return the raw pointer and heal the slot. */
+    void *got = klassic_gc_read(&cell[0]);
+    assert(got == (void *)target);
+    /* After healing, the slot is good-colored -> a second read fast-paths
+     * to the same raw pointer. */
+    void *again = klassic_gc_read(&cell[0]);
+    assert(again == (void *)target);
+    assert(((int64_t *)got)[0] == 777);
+    printf("test_load_barrier_strips_and_heals OK\n");
+}
+
 int main(void) {
     klassic_gc_init();
+    test_load_barrier_strips_and_heals();
     test_survivor_kept_and_intact();
     test_linked_structure_survives_churn();
     test_garbage_is_reclaimed();

@@ -47,6 +47,19 @@ static uint64_t g_collections;
 
 static int g_initialized;
 
+/* --- Colored pointers -------------------------------------------- */
+#define GC_COLOR_M0 (1ull << 60)
+#define GC_COLOR_M1 (1ull << 61)
+#define GC_COLOR_R (1ull << 62)
+#define GC_COLOR_MASK (7ull << 60)
+
+/* Mask cells (dso_local: defined here, referenced by the emitted fast
+ * path). good = M0, bad catches the other colors; strip clears the color
+ * bits. The moving milestone flips these; here they are static. */
+uint64_t gc_good_color = GC_COLOR_M0;
+uint64_t gc_bad_mask = GC_COLOR_M1 | GC_COLOR_R;
+uint64_t gc_strip_mask = ~GC_COLOR_MASK;
+
 static uint64_t align16(uint64_t n) { return (n + 15u) & ~(uint64_t)15u; }
 static uint64_t block_size(uint64_t word0) { return word0 & ~(uint64_t)15u; }
 
@@ -161,8 +174,33 @@ void klassic_gc_shadow_pop_n(uint64_t count) {
     g_shadow_top -= count;
 }
 
+uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
+    uint64_t raw = value & gc_strip_mask;
+    /* Self-heal: store the good-colored pointer back so later barriered
+     * loads of this slot take the fast path. (The moving milestone will
+     * remap here first.) A plain store -- single mutator. */
+    if (raw) {
+        *slot = (void *)(raw | gc_good_color);
+    }
+    return raw;
+}
+
+void *klassic_gc_read(void **slot) {
+    uint64_t value = (uint64_t)*slot;
+    if (value & gc_bad_mask) {
+        return (void *)klassic_gc_load_barrier_slow(value, slot);
+    }
+    return (void *)(value & gc_strip_mask);
+}
+
+void klassic_gc_write(void **slot, void *value) {
+    uint64_t raw = (uint64_t)value;
+    *slot = raw ? (void *)(raw | gc_good_color) : NULL;
+}
+
 /* Mark `user` if unmarked this cycle, pushing it for tracing. */
 static void mark_visit(void *user) {
+    user = (void *)((uint64_t)user & gc_strip_mask); /* defensive: raw */
     if (!user) {
         return;
     }
@@ -192,7 +230,13 @@ static void trace(void) {
         uint64_t slots = payload / 8;
         uint64_t start = (tag == KLASSIC_GC_POINTER_LIST) ? 1 : 0; /* skip length */
         for (uint64_t i = start; i < slots; i++) {
-            mark_visit(fields[i]);
+            uint64_t raw = (uint64_t)fields[i] & gc_strip_mask;
+            if (raw) {
+                /* Recolor-on-trace: rewrite the field to the good color so
+                 * a later barriered load fast-paths. */
+                fields[i] = (void *)(raw | gc_good_color);
+                mark_visit((void *)raw);
+            }
         }
     }
 }
