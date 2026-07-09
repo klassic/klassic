@@ -153,6 +153,10 @@ static int acquire_region(void) {
     g_heap_top = base;
     g_heap_end = base + REGION_SIZE;
     g_region_top[region_index(base)] = (uint64_t)(uintptr_t)base;
+    /* A mutator bump region is never in the relocation set; clear the flag
+     * defensively (symmetric with to_acquire) so no future path can let the
+     * mutator bump into a phantom from-set region. */
+    g_from_set[region_index(base)] = 0;
     return 1;
 }
 
@@ -395,18 +399,26 @@ static void gc_sweep(void) {
 
 /* Acquire a fresh zeroed region for the to-space bump (free pool first,
  * then a committed tail region), without disturbing the mutator's current
- * region. Returns 0 if none available. */
+ * region. Grows the soft budget as a fallback -- the mutator allocates
+ * during the concurrent Relocate phase and can race the free pool away, so
+ * relocation must be able to grow the heap rather than deadlock. Returns 0
+ * only on genuine reservation exhaustion. */
 static int to_acquire(void) {
     uint8_t *base;
     if (g_free_head) {
         base = g_free_head;
         g_free_head = *(uint8_t **)base;
         memset(base, 0, REGION_SIZE);
-    } else if (g_committed < g_budget) {
-        base = region_at(g_committed);
-        g_committed++;
     } else {
-        return 0;
+        if (g_committed >= g_budget) {
+            grow_budget(); /* may fail at the reservation cap */
+        }
+        if (g_committed < g_budget) {
+            base = region_at(g_committed);
+            g_committed++;
+        } else {
+            return 0;
+        }
     }
     g_to_base = base;
     g_to_top = base;
@@ -420,8 +432,9 @@ static int to_acquire(void) {
 }
 
 /* Bump `total` bytes in to-space, switching to a fresh region when the
- * current one cannot fit the block. Returns NULL if to-space is exhausted
- * (the headroom invariant makes this unreachable in practice). */
+ * current one cannot fit the block. Returns NULL only when to_acquire cannot
+ * even grow the budget -- i.e. the whole reservation is committed (true
+ * out-of-memory). */
 static uint8_t *to_bump(uint64_t total) {
     if (!g_to_base || (uint64_t)(g_to_end - g_to_top) < total) {
         if (g_to_base) {
@@ -458,7 +471,7 @@ static uint64_t gc_evacuate_object(uint64_t user) {
     uint64_t sz = block_size(block[0]);
     uint8_t *dst = to_bump(sz);
     if (!dst) {
-        fprintf(stderr, "klassic gc: evacuation overran to-space\n");
+        fprintf(stderr, "klassic gc: out of memory during relocation\n");
         exit(1);
     }
     memcpy(dst, block, sz);
@@ -500,8 +513,10 @@ static void gc_relocate_start(void) {
         free_regions += g_budget - g_committed;
     }
     /* A region under half live packs into at most one to-space region, so
-     * capping the set at free_regions - 1 keeps a headroom region and makes
-     * to-space exhaustion impossible. */
+     * capping the set at free_regions - 1 keeps a headroom region. That bounds
+     * to-space itself, but the mutator also allocates during the concurrent
+     * Relocate phase and competes for the same free pool, so to_acquire grows
+     * the budget as a backstop rather than relying on this headroom alone. */
     uint64_t max_from = (free_regions > 1) ? free_regions - 1 : 0;
     uint64_t selected = 0;
     for (uint64_t idx = 0; idx < g_committed; idx++) {
