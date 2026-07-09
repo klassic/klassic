@@ -294,7 +294,11 @@ static void gc_mark_roots(void) {
     }
 }
 
-/* Reclaim whole-dead regions; on a live block clear the stale mark bit. */
+/* Reclaim whole-dead regions and clear the stale (previous-cycle) mark bit
+ * on every block. Clearing it on dead blocks too -- not just live ones --
+ * is essential: the two mark bits alternate, so a dead block that kept its
+ * old bit would be misread as live when that bit becomes current again two
+ * cycles later (a resurrection/leak). */
 static void gc_sweep(void) {
     g_collections++;
     if (g_heap_base) {
@@ -313,8 +317,9 @@ static void gc_sweep(void) {
         for (uint8_t *cur = base; cur < top;) {
             uint64_t *b = (uint64_t *)cur;
             uint64_t sz = block_size(b[0]);
-            if (b[0] & g_header_mark) {
-                b[0] &= stale_clear;
+            int is_live = (b[0] & g_header_mark) != 0;
+            b[0] &= stale_clear; /* drop the stale bit on live AND dead blocks */
+            if (is_live) {
                 any_live = 1;
                 live += sz;
             }
