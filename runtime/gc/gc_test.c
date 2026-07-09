@@ -212,6 +212,32 @@ static void test_linked_structure_survives_compaction(void) {
            (long long)sum);
 }
 
+/* Read a rooted survivor's fields *during* heavy churn, so some reads land
+ * while the collector is in the Relocate phase and the survivor's leaves are
+ * still in the from-set: the load barrier must then evacuate on demand and
+ * return the to-space copy, keeping the values intact. Exercises the
+ * incremental-relocation barrier path the STW collector never had. */
+static void test_reads_during_relocation(void) {
+    void **keeper = pair_of_leaves(1000, 2000);
+    klassic_gc_shadow_push((void **)&keeper);
+    int64_t witness = 0;
+    for (int i = 0; i < 400000; i++) {
+        void **garbage = pair_of_leaves(i, i);
+        (void)garbage;
+        if ((i & 31) == 0) {
+            /* barriered reads, some during Relocate -> evacuate-on-demand */
+            witness += ((int64_t *)pair_field(keeper, 0))[0];
+            witness += ((int64_t *)pair_field(keeper, 1))[0];
+        }
+    }
+    assert(((int64_t *)pair_field(keeper, 0))[0] == 1000);
+    assert(((int64_t *)pair_field(keeper, 1))[0] == 2000);
+    assert(witness > 0);
+    klassic_gc_shadow_pop_n(1);
+    printf("test_reads_during_relocation OK (relocs=%llu)\n",
+           (unsigned long long)klassic_gc_relocation_count());
+}
+
 int main(void) {
     klassic_gc_init();
     test_load_barrier_strips_and_heals();
@@ -221,6 +247,7 @@ int main(void) {
     test_garbage_is_reclaimed();
     test_survivor_is_relocated_and_intact();
     test_linked_structure_survives_compaction();
+    test_reads_during_relocation();
     printf("ALL GC TESTS PASSED\n");
     return 0;
 }

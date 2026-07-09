@@ -1,7 +1,8 @@
-/* klassic_gc.c -- ZGC-style region collector in C: colored pointers + load
- * barrier, incremental marking, and stop-the-world compacting evacuation
- * with in-object forwarding. See klassic_gc.h for the object layout and
- * the migration context.
+/* klassic_gc.c -- ZGC-style region collector in C: colored pointers + a
+ * phase-dependent load barrier, incremental marking, and incremental
+ * compacting relocation (evacuate-on-demand + in-object forwarding), all
+ * driven in bounded quanta from the allocator. See klassic_gc.h for the
+ * object layout, the color/phase model, and the migration context.
  */
 #define _DEFAULT_SOURCE /* for MAP_ANONYMOUS under -std=c11 */
 
@@ -53,14 +54,24 @@ static uint64_t g_worklist_top;
 static uint64_t g_header_mark = KLASSIC_GC_HMARK1;
 static uint64_t g_collections;
 
-/* --- Incremental phase machine ----------------------------------- */
+/* --- Incremental phase machine ----------------------------------- *
+ * Idle -> MarkStart -> Mark (quanta) -> MarkEnd -> Relocate (quanta) ->
+ * Idle. Mark and Relocate both run in bounded quanta driven from
+ * gc_alloc, so pauses are O(roots) at the phase transitions, not
+ * O(heap). */
 #define GC_PHASE_IDLE 0
 #define GC_PHASE_MARK 1
-#define GC_QUANTUM_POPS 512   /* objects traced per mark quantum */
-#define GC_QUANTUM_BYTES 8192 /* allocation between mark quanta */
+#define GC_PHASE_RELOCATE 2
+#define GC_QUANTUM_POPS 512    /* objects traced per mark quantum */
+#define GC_QUANTUM_BYTES 8192  /* allocation between quanta */
+#define GC_RELOCATE_BYTES 8192 /* live bytes evacuated per relocate quantum */
 static uint64_t g_phase = GC_PHASE_IDLE;
 static uint64_t g_bytes_since_cycle;   /* drives the proactive cycle start */
-static uint64_t g_bytes_since_quantum; /* drives a mark quantum */
+static uint64_t g_bytes_since_quantum; /* drives a mark/relocate quantum */
+/* Relocate walk cursor (resumed across quanta): the from-set region being
+ * evacuated and the position within it. */
+static uint64_t g_relocate_ridx;
+static uint8_t *g_relocate_ptr;
 
 static int g_initialized;
 
@@ -71,11 +82,23 @@ static int g_initialized;
 #define GC_COLOR_MASK (7ull << 60)
 
 /* Mask cells (dso_local: defined here, referenced by the emitted fast
- * path). good = M0, bad catches the other colors; strip clears the color
- * bits. The moving milestone flips these; here they are static. */
-uint64_t gc_good_color = GC_COLOR_M0;
-uint64_t gc_bad_mask = GC_COLOR_M1 | GC_COLOR_R;
+ * path). A stored pointer carries exactly one color bit -- the "good"
+ * color at store time. `good` is R in Idle/Relocate and the current mark
+ * color (M0 or M1, alternating) during Mark; `bad` is the two non-good
+ * bits, so a load whose color is not current slow-paths. strip clears the
+ * color. Normalizing every idle/relocate pointer to R means a single mark
+ * color would let a stale pointer from two cycles ago fast-path wrongly;
+ * alternating M0/M1 (with R between) closes that. */
+uint64_t gc_good_color = GC_COLOR_R;
+uint64_t gc_bad_mask = GC_COLOR_M0 | GC_COLOR_M1;
 uint64_t gc_strip_mask = ~GC_COLOR_MASK;
+static uint64_t g_mark_color = GC_COLOR_M0; /* alternates M0<->M1 each mark */
+
+/* Set the good color and derive the bad mask (the two other color bits). */
+static void gc_set_good(uint64_t good) {
+    gc_good_color = good;
+    gc_bad_mask = GC_COLOR_MASK ^ good;
+}
 
 static uint64_t align16(uint64_t n) { return (n + 15u) & ~(uint64_t)15u; }
 static uint64_t block_size(uint64_t word0) { return word0 & ~(uint64_t)15u; }
@@ -130,6 +153,10 @@ static int acquire_region(void) {
     g_heap_top = base;
     g_heap_end = base + REGION_SIZE;
     g_region_top[region_index(base)] = (uint64_t)(uintptr_t)base;
+    /* A mutator bump region is never in the relocation set; clear the flag
+     * defensively (symmetric with to_acquire) so no future path can let the
+     * mutator bump into a phantom from-set region. */
+    g_from_set[region_index(base)] = 0;
     return 1;
 }
 
@@ -203,22 +230,33 @@ void klassic_gc_shadow_pop_n(uint64_t count) {
     g_shadow_top -= count;
 }
 
-static void mark_visit(void *user); /* forward decl */
+static void mark_visit(void *user);       /* forward decl */
+static int in_from_set(uint64_t raw);     /* forward decl */
+static uint64_t gc_evacuate_object(uint64_t user); /* forward decl */
 
+/* The load barrier's out-of-line slow path (a bad-colored slot loaded).
+ * Phase-dependent, and self-healing so later loads of the slot fast-path:
+ *   Relocate: if the target is in the from-set, evacuate it on demand;
+ *             else follow any forwarding (a ghost from the last cycle).
+ *   Mark:     follow forwarding, then mark the target (load-barrier-driven
+ *             incremental marking -- no store barrier, klassic has no
+ *             in-place heap mutation).
+ *   Idle:     follow forwarding (lazily remap the last cycle's ghosts).
+ * In every phase the healed slot is recolored to the current good color. */
 uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
     uint64_t raw = value & gc_strip_mask;
-    /* Self-heal: store the good-colored pointer back so later barriered
-     * loads of this slot take the fast path. (The moving milestone will
-     * remap here first.) A plain store -- single mutator. */
     if (raw) {
+        uint64_t *block = (uint64_t *)(raw - 16);
+        if (g_phase == GC_PHASE_RELOCATE && in_from_set(raw)
+            && !(block[0] & KLASSIC_GC_FWD)) {
+            raw = gc_evacuate_object(raw); /* evacuate on demand + follow */
+        } else if (block[0] & KLASSIC_GC_FWD) {
+            raw = block[1]; /* follow forwarding */
+        }
         *slot = (void *)(raw | gc_good_color);
-    }
-    /* During Mark, the mutator has just pulled a raw pointer into a
-     * register, so it must be marked to keep the strong tricolor
-     * invariant (load-barrier-driven incremental update -- no store
-     * barrier, since klassic has no in-place heap mutation). */
-    if (g_phase == GC_PHASE_MARK) {
-        mark_visit((void *)raw);
+        if (g_phase == GC_PHASE_MARK) {
+            mark_visit((void *)raw);
+        }
     }
     return raw;
 }
@@ -236,13 +274,20 @@ void klassic_gc_write(void **slot, void *value) {
     *slot = raw ? (void *)(raw | gc_good_color) : NULL;
 }
 
-/* Mark `user` if unmarked this cycle, pushing it for tracing. */
+/* Mark `user` if unmarked this cycle, pushing it for tracing. A pointer
+ * into a ghost region (forwarded from the last cycle's relocate) is
+ * remapped to its to-space copy first, so we only ever mark live to-space
+ * objects. */
 static void mark_visit(void *user) {
-    user = (void *)((uint64_t)user & gc_strip_mask); /* defensive: raw */
-    if (!user) {
+    uint64_t raw = (uint64_t)user & gc_strip_mask; /* defensive: raw */
+    if (!raw) {
         return;
     }
-    uint64_t *block = (uint64_t *)((uint8_t *)user - 16);
+    uint64_t *block = (uint64_t *)(raw - 16);
+    if (block[0] & KLASSIC_GC_FWD) {
+        raw = block[1];
+        block = (uint64_t *)(raw - 16);
+    }
     if (block[0] & g_header_mark) {
         return; /* already marked this cycle */
     }
@@ -251,7 +296,7 @@ static void mark_visit(void *user) {
         fprintf(stderr, "klassic gc: mark worklist overflow\n");
         exit(1);
     }
-    g_worklist[g_worklist_top++] = user;
+    g_worklist[g_worklist_top++] = (void *)raw;
 }
 
 /* Drain the worklist, marking every reachable pointer. */
@@ -272,8 +317,13 @@ static void gc_trace(uint64_t budget) {
         for (uint64_t i = start; i < slots; i++) {
             uint64_t raw = (uint64_t)fields[i] & gc_strip_mask;
             if (raw) {
-                /* Recolor-on-trace: rewrite the field to the good color so
-                 * a later barriered load fast-paths. */
+                uint64_t *fb = (uint64_t *)(raw - 16);
+                if (fb[0] & KLASSIC_GC_FWD) {
+                    raw = fb[1]; /* remap a ghost pointer to to-space */
+                }
+                /* Recolor-on-trace: rewrite the field to the (remapped)
+                 * good-colored pointer so a later barriered load fast-paths
+                 * and no live field is left referencing a ghost. */
                 fields[i] = (void *)(raw | gc_good_color);
                 mark_visit((void *)raw);
             }
@@ -335,31 +385,40 @@ static void gc_sweep(void) {
     }
 }
 
-/* --- Stop-the-world compacting evacuation (moving GC) ------------ *
- * Called at MarkEnd after sweep, so marking is complete (live == marked)
- * and -- being a safepoint reached from gc_alloc/collect -- no mutator
- * pointer is live in a register outside the shadow stack. Sparse regions
- * are evacuated into a fresh to-space, each vacated object left with an
- * in-object forwarding word (word0 = new_user | FWD), then every root and
- * live heap field is rewritten to the new location and the from-space
- * regions are freed. The mutator's colored-pointer model is unchanged;
- * lazy/concurrent relocation via the R-color barrier is a later
- * refinement (see docs/zgc-plan.md). */
+/* --- Incremental compacting relocation (moving GC) --------------- *
+ * RelocateStart (an O(roots) pause at MarkEnd) selects the sparsest regions
+ * as the from-set, flips the good color to R so every mark-colored pointer
+ * slow-paths, and remaps the roots. Evacuation then runs in quanta from the
+ * allocator (gc_relocate_step) alongside the mutator's own barrier, which
+ * evacuates a from-set object on demand when the mutator loads a pointer to
+ * it. A vacated object keeps its size in word0 (FWD bit set) with the new
+ * pointer in word1, so the from-space stays walkable; the fully-evacuated
+ * from-set regions become ghosts, freed at the next MarkEnd once marking
+ * has remapped every live pointer off them. Single mutator, non-atomic for
+ * now (docs/true-zgc-plan.md M2 makes the shared state thread-safe). */
 
 /* Acquire a fresh zeroed region for the to-space bump (free pool first,
  * then a committed tail region), without disturbing the mutator's current
- * region. Returns 0 if none available. */
+ * region. Grows the soft budget as a fallback -- the mutator allocates
+ * during the concurrent Relocate phase and can race the free pool away, so
+ * relocation must be able to grow the heap rather than deadlock. Returns 0
+ * only on genuine reservation exhaustion. */
 static int to_acquire(void) {
     uint8_t *base;
     if (g_free_head) {
         base = g_free_head;
         g_free_head = *(uint8_t **)base;
         memset(base, 0, REGION_SIZE);
-    } else if (g_committed < g_budget) {
-        base = region_at(g_committed);
-        g_committed++;
     } else {
-        return 0;
+        if (g_committed >= g_budget) {
+            grow_budget(); /* may fail at the reservation cap */
+        }
+        if (g_committed < g_budget) {
+            base = region_at(g_committed);
+            g_committed++;
+        } else {
+            return 0;
+        }
     }
     g_to_base = base;
     g_to_top = base;
@@ -373,8 +432,9 @@ static int to_acquire(void) {
 }
 
 /* Bump `total` bytes in to-space, switching to a fresh region when the
- * current one cannot fit the block. Returns NULL if to-space is exhausted
- * (the headroom invariant makes this unreachable in practice). */
+ * current one cannot fit the block. Returns NULL only when to_acquire cannot
+ * even grow the budget -- i.e. the whole reservation is committed (true
+ * out-of-memory). */
 static uint8_t *to_bump(uint64_t total) {
     if (!g_to_base || (uint64_t)(g_to_end - g_to_top) < total) {
         if (g_to_base) {
@@ -389,58 +449,62 @@ static uint8_t *to_bump(uint64_t total) {
     return dst;
 }
 
-/* Rewrite one colored heap-pointer slot to follow forwarding, if its
- * target has been evacuated. */
-static void fixup_field(void **slot) {
+/* Is user pointer `raw` inside a region currently in the relocation set? */
+static int in_from_set(uint64_t raw) {
+    const uint8_t *p = (const uint8_t *)raw;
+    if (p < g_region_base || p >= g_region_base + RESERVE_BYTES) {
+        return 0;
+    }
+    return g_from_set[region_index(p)];
+}
+
+/* Evacuate a from-set object to to-space unless already forwarded; return
+ * its to-space user pointer. The copy is taken before forwarding is
+ * installed; size stays in word0 (FWD bit only) and the new pointer goes in
+ * word1, so the from-space remains linearly walkable and a second toucher
+ * (relocate walk or barrier) reads the winner's address. */
+static uint64_t gc_evacuate_object(uint64_t user) {
+    uint64_t *block = (uint64_t *)(user - 16);
+    if (block[0] & KLASSIC_GC_FWD) {
+        return block[1];
+    }
+    uint64_t sz = block_size(block[0]);
+    uint8_t *dst = to_bump(sz);
+    if (!dst) {
+        fprintf(stderr, "klassic gc: out of memory during relocation\n");
+        exit(1);
+    }
+    memcpy(dst, block, sz);
+    block[1] = (uint64_t)(uintptr_t)(dst + 16);
+    block[0] |= KLASSIC_GC_FWD;
+    g_relocations++;
+    return (uint64_t)(uintptr_t)(dst + 16);
+}
+
+/* Remap a raw root slot at RelocateStart: evacuate its target on demand if
+ * still in the from-set, else follow any forwarding. Roots hold raw
+ * pointers (strip defensively). */
+static void relocate_root(void **slot) {
     uint64_t raw = (uint64_t)*slot & gc_strip_mask;
     if (!raw) {
         return;
     }
-    uint64_t w0 = *(uint64_t *)(raw - 16);
-    if (w0 & KLASSIC_GC_FWD) {
-        uint64_t nw = w0 & ~(uint64_t)15u; /* new user pointer (16-aligned) */
-        *slot = (void *)(nw | gc_good_color);
+    uint64_t *block = (uint64_t *)(raw - 16);
+    if (in_from_set(raw) && !(block[0] & KLASSIC_GC_FWD)) {
+        raw = gc_evacuate_object(raw);
+    } else if (block[0] & KLASSIC_GC_FWD) {
+        raw = block[1];
     }
+    *slot = (void *)raw;
 }
 
-/* Rewrite a raw root slot to follow forwarding. Roots hold raw pointers by
- * contract; strip defensively anyway so this agrees with mark_visit and
- * stays correct even if codegen ever stages a colored pointer in a slot. */
-static void fixup_root(void **slot) {
-    uint64_t raw = (uint64_t)*slot & gc_strip_mask;
-    if (!raw) {
-        return;
-    }
-    uint64_t w0 = *(uint64_t *)(raw - 16);
-    if (w0 & KLASSIC_GC_FWD) {
-        *slot = (void *)(w0 & ~(uint64_t)15u);
-    }
-}
-
-/* Rewrite the pointer fields of every live block in a kept region. */
-static void fixup_region(uint8_t *base, uint8_t *top) {
-    for (uint8_t *cur = base; cur < top;) {
-        uint64_t *b = (uint64_t *)cur;
-        uint64_t sz = block_size(b[0]);
-        if (b[0] & g_header_mark) {
-            uint64_t tag = b[1];
-            if (tag >= KLASSIC_GC_POINTER_RECORD) {
-                void **fields = (void **)(cur + 16);
-                uint64_t slots = (sz - 16) / 8;
-                uint64_t start = (tag == KLASSIC_GC_POINTER_LIST) ? 1 : 0;
-                for (uint64_t k = start; k < slots; k++) {
-                    fixup_field(&fields[k]);
-                }
-            }
-        }
-        cur += sz;
-    }
-}
-
-static void gc_relocate(void) {
-    /* Free capacity, in regions: the free pool plus the still-uncommitted
-     * budget tail. Reserve one region of headroom so evacuation (which
-     * wastes at most a partial region to fragmentation) cannot deadlock. */
+/* RelocateStart (O(roots) pause): choose the sparsest regions as the
+ * relocation set, flip good to R so every mark-colored pointer now
+ * slow-paths, and remap the roots (evacuating their targets on demand).
+ * The bulk of evacuation then runs in quanta; the from-set regions become
+ * ghosts -- kept flagged in g_from_set -- freed at the next MarkEnd. If
+ * nothing is worth relocating, return straight to Idle (good is still R). */
+static void gc_relocate_start(void) {
     uint64_t free_regions = 0;
     for (uint8_t *p = g_free_head; p; p = *(uint8_t **)p) {
         free_regions++;
@@ -448,20 +512,17 @@ static void gc_relocate(void) {
     if (g_committed < g_budget) {
         free_regions += g_budget - g_committed;
     }
-    if (free_regions <= 1) {
-        return; /* no room for a to-space -> mark-only cycle */
-    }
-    /* Select the relocation set: non-current, non-empty regions less than
-     * half full. A region under half live packs (blocks are then each
-     * under half a region, so >=50% dense) into at most one to-space
-     * region, so capping the count at free_regions - 1 keeps a headroom
-     * region and makes to-space exhaustion impossible. */
-    uint64_t max_from = free_regions - 1;
+    /* A region under half live packs into at most one to-space region, so
+     * capping the set at free_regions - 1 keeps a headroom region. That bounds
+     * to-space itself, but the mutator also allocates during the concurrent
+     * Relocate phase and competes for the same free pool, so to_acquire grows
+     * the budget as a backstop rather than relying on this headroom alone. */
+    uint64_t max_from = (free_regions > 1) ? free_regions - 1 : 0;
     uint64_t selected = 0;
     for (uint64_t idx = 0; idx < g_committed; idx++) {
         g_from_set[idx] = 0;
         if (selected >= max_from) {
-            continue; /* keep clearing the rest of the set */
+            continue;
         }
         uint8_t *base = region_at(idx);
         if (base == g_heap_base) {
@@ -474,68 +535,70 @@ static void gc_relocate(void) {
         g_from_set[idx] = 1;
         selected++;
     }
+    gc_set_good(GC_COLOR_R);
     if (selected == 0) {
+        g_phase = GC_PHASE_IDLE;
+        g_bytes_since_cycle = 0;
         return;
     }
-
-    /* Evacuate: copy each live block into to-space, then overwrite its old
-     * header word0 with the forwarding pointer. Size is read before the
-     * overwrite, so the linear walk stays valid. */
     g_to_base = g_to_top = g_to_end = NULL;
-    for (uint64_t idx = 0; idx < g_committed; idx++) {
-        if (!g_from_set[idx]) {
-            continue;
-        }
-        uint8_t *base = region_at(idx);
-        uint8_t *top = (uint8_t *)(uintptr_t)g_region_top[idx];
-        for (uint8_t *cur = base; cur < top;) {
-            uint64_t *b = (uint64_t *)cur;
-            uint64_t sz = block_size(b[0]);
-            if (b[0] & g_header_mark) {
-                uint8_t *dst = to_bump(sz);
-                if (!dst) {
-                    fprintf(stderr, "klassic gc: evacuation overran to-space\n");
-                    exit(1);
-                }
-                memcpy(dst, cur, sz);
-                b[0] = (uint64_t)(uintptr_t)(dst + 16) | KLASSIC_GC_FWD;
-                g_relocations++;
-            }
-            cur += sz;
-        }
+    g_phase = GC_PHASE_RELOCATE;
+    for (uint64_t i = 0; i < g_shadow_top; i++) {
+        relocate_root(g_shadow[i]);
     }
+    g_relocate_ridx = 0;
+    g_relocate_ptr = NULL;
+    g_bytes_since_quantum = 0;
+}
+
+/* RelocateEnd: flush the last to-space region's watermark and return to
+ * Idle. The from-set regions stay flagged (ghosts) and are freed at the
+ * next MarkEnd. */
+static void gc_relocate_end(void) {
     if (g_to_base) {
         g_region_top[region_index(g_to_base)] = (uint64_t)(uintptr_t)g_to_top;
     }
+    g_phase = GC_PHASE_IDLE;
+    g_bytes_since_cycle = 0;
+}
 
-    /* Fix every reference to a moved object: roots, then the live fields of
-     * every kept region (the from-space regions are about to be freed, so
-     * their -- now stale -- contents are skipped). */
-    for (uint64_t i = 0; i < g_shadow_top; i++) {
-        fixup_root(g_shadow[i]);
-    }
-    for (uint64_t idx = 0; idx < g_committed; idx++) {
-        if (g_from_set[idx]) {
-            continue;
+/* Evacuate up to `budget` live bytes from the from-set, resuming the linear
+ * walk via the cursor. Objects the barrier already evacuated (FWD set) are
+ * skipped; when the whole from-set is drained, finish the phase. */
+static void gc_relocate_step(uint64_t budget) {
+    for (;;) {
+        if (!g_relocate_ptr) {
+            while (g_relocate_ridx < g_committed && !g_from_set[g_relocate_ridx]) {
+                g_relocate_ridx++;
+            }
+            if (g_relocate_ridx >= g_committed) {
+                gc_relocate_end();
+                return;
+            }
+            g_relocate_ptr = region_at(g_relocate_ridx);
         }
-        uint8_t *base = region_at(idx);
-        uint8_t *top = (uint8_t *)(uintptr_t)g_region_top[idx];
-        if (top == base) {
-            continue;
+        uint8_t *top = (uint8_t *)(uintptr_t)g_region_top[g_relocate_ridx];
+        while (g_relocate_ptr < top) {
+            uint64_t *b = (uint64_t *)g_relocate_ptr;
+            uint64_t sz = block_size(b[0]);
+            if ((b[0] & g_header_mark) && !(b[0] & KLASSIC_GC_FWD)) {
+                gc_evacuate_object((uint64_t)(uintptr_t)(g_relocate_ptr + 16));
+                budget = (budget > sz) ? budget - sz : 0;
+            }
+            g_relocate_ptr += sz;
+            if (budget == 0) {
+                return; /* resume here next quantum */
+            }
         }
-        fixup_region(base, top);
+        g_relocate_ridx++;
+        g_relocate_ptr = NULL;
     }
+}
 
-    /* Free the vacated (now fully forwarded) from-space regions. */
-    for (uint64_t idx = 0; idx < g_committed; idx++) {
-        if (!g_from_set[idx]) {
-            continue;
-        }
-        uint8_t *base = region_at(idx);
-        *(uint8_t **)base = g_free_head;
-        g_free_head = base;
-        g_region_top[idx] = (uint64_t)(uintptr_t)base;
-        g_region_live[idx] = 0;
+/* Drive relocation to completion (synchronous collect). */
+static void gc_relocate_drain(void) {
+    while (g_phase == GC_PHASE_RELOCATE) {
+        gc_relocate_step(REGION_SIZE);
     }
 }
 
@@ -544,41 +607,55 @@ static void gc_relocate(void) {
  * so pointers left from the previous cycle slow-path and are re-marked
  * (incremental-update marking). */
 static void gc_mark_start(void) {
-    uint64_t old_good = gc_good_color;
-    gc_bad_mask = old_good | GC_COLOR_R;
-    gc_good_color = old_good ^ (GC_COLOR_M0 | GC_COLOR_M1);
+    g_mark_color ^= (GC_COLOR_M0 | GC_COLOR_M1); /* alternate M0<->M1 */
+    gc_set_good(g_mark_color);
     g_header_mark ^= KLASSIC_GC_HMARK_BOTH;
     g_worklist_top = 0;
     gc_mark_roots();
     g_phase = GC_PHASE_MARK;
+    g_bytes_since_quantum = 0;
 }
 
-/* MarkEnd: drain the frontier to fixpoint, sweep, compact sparse regions,
- * return to Idle. */
+/* MarkEnd (O(roots) pause): drain the mark frontier to fixpoint -- which
+ * remaps every live pointer off the last cycle's ghosts -- free those
+ * ghosts, sweep, and start relocation. */
 static void gc_mark_end(void) {
     gc_drain();
+    /* Free last cycle's ghost regions: the just-finished mark remapped every
+     * live pointer off them, so none is referenced. Freeing them before the
+     * sweep also keeps the sweep from walking their forwarding words. */
+    for (uint64_t idx = 0; idx < g_committed; idx++) {
+        if (g_from_set[idx]) {
+            uint8_t *base = region_at(idx);
+            *(uint8_t **)base = g_free_head;
+            g_free_head = base;
+            g_region_top[idx] = (uint64_t)(uintptr_t)base;
+            g_region_live[idx] = 0;
+            g_from_set[idx] = 0;
+        }
+    }
     gc_sweep();
-    gc_relocate();
-    g_phase = GC_PHASE_IDLE;
-    g_bytes_since_cycle = 0;
+    gc_relocate_start();
 }
 
-/* Synchronous full collection (exhaustion / explicit). If a cycle is in
- * progress, finish it; otherwise a from-scratch stop-the-world mark. */
+/* Synchronous full collection (exhaustion / explicit): drive the phase
+ * machine all the way back to Idle. */
 void klassic_gc_collect(void) {
     if (!g_initialized) {
         return;
     }
-    if (g_phase == GC_PHASE_MARK) {
-        gc_mark_end();
-        return;
+    if (g_phase == GC_PHASE_IDLE) {
+        gc_mark_start();
     }
-    gc_mark_start();
-    gc_mark_end();
+    if (g_phase == GC_PHASE_MARK) {
+        gc_mark_end(); /* -> Relocate or Idle */
+    }
+    gc_relocate_drain();
 }
 
-/* Poll the phase machine from an allocation point: proactively start a
- * cycle under memory pressure, and run a mark quantum during Mark. */
+/* Poll the phase machine from an allocation point: proactively start a cycle
+ * under memory pressure, run a mark quantum during Mark, and a relocate
+ * quantum during Relocate. */
 static void gc_driver(uint64_t total) {
     if (g_phase == GC_PHASE_MARK) {
         g_bytes_since_quantum += total;
@@ -586,8 +663,16 @@ static void gc_driver(uint64_t total) {
             g_bytes_since_quantum = 0;
             gc_trace(GC_QUANTUM_POPS);
             if (g_worklist_top == 0) {
-                gc_mark_end();
+                gc_mark_end(); /* -> Relocate or Idle */
             }
+        }
+        return;
+    }
+    if (g_phase == GC_PHASE_RELOCATE) {
+        g_bytes_since_quantum += total;
+        if (g_bytes_since_quantum >= GC_QUANTUM_BYTES) {
+            g_bytes_since_quantum = 0;
+            gc_relocate_step(GC_RELOCATE_BYTES); /* -> Idle when drained */
         }
         return;
     }
