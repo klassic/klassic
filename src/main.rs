@@ -472,9 +472,10 @@ fn link_llvm_program(ir: &str, output: &Path) -> Result<(), u8> {
         .arg(&ir_path)
         .arg(&runtime);
     // Programs that touch the heap call the C garbage collector; compile and
-    // link it in alongside the IR (clang builds the .c). Scalar programs never
-    // reference it, so it is only added when needed.
-    if ir.contains("@klassic_gc_alloc") {
+    // link it in alongside the IR (clang builds the .c). Key on an actual call
+    // site, not the (unconditional) declaration, so a scalar program is not
+    // forced to find the collector source it never uses.
+    if ir.contains("call ptr @klassic_gc_alloc(") {
         let Some(gc_src) = find_gc_source() else {
             eprintln!(
                 "error: runtime/gc/klassic_gc.c not found\n  help: set KLASSIC_GC_SRC to its \

@@ -508,22 +508,39 @@ impl Emitter {
             "{record} = call ptr @klassic_gc_alloc(i64 {}, i64 2)",
             8 * n
         ));
+        // Root the record itself across the color-on-store loop, and reload
+        // it (and each leaf) from its slot before every store. Today
+        // klassic_gc_write is a plain store, but rooting keeps the record
+        // relocatable if the store path ever becomes a safepoint -- the
+        // returned value is the record's final (post-move) location.
+        let record_slot = self.fresh_slot();
+        self.emit(&format!("store ptr {record}, ptr {record_slot}"));
+        self.emit(&format!(
+            "call void @klassic_gc_shadow_push(ptr {record_slot})"
+        ));
         for (index, slot) in slots.iter().enumerate() {
             let leaf = self.fresh();
             self.emit(&format!("{leaf} = load ptr, ptr {slot}"));
+            let base = self.fresh();
+            self.emit(&format!("{base} = load ptr, ptr {record_slot}"));
             let field_addr = self.fresh();
             self.emit(&format!(
-                "{field_addr} = getelementptr i8, ptr {record}, i64 {}",
+                "{field_addr} = getelementptr i8, ptr {base}, i64 {}",
                 8 * index
             ));
             self.emit(&format!(
                 "call void @klassic_gc_write(ptr {field_addr}, ptr {leaf})"
             ));
         }
-        self.emit(&format!("call void @klassic_gc_shadow_pop_n(i64 {n})"));
+        let result = self.fresh();
+        self.emit(&format!("{result} = load ptr, ptr {record_slot}"));
+        self.emit(&format!(
+            "call void @klassic_gc_shadow_pop_n(i64 {})",
+            n + 1
+        ));
         let shape_id = self.intern_shape(shape);
         Ok(Value {
-            operand: record,
+            operand: result,
             ty: LType::Record(shape_id),
         })
     }
