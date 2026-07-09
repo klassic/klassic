@@ -117,9 +117,29 @@ static void test_load_barrier_strips_and_heals(void) {
     printf("test_load_barrier_strips_and_heals OK\n");
 }
 
+/* The proactive incremental driver keeps a rooted survivor intact across
+ * many cycles WITHOUT any explicit collection -- exercising allocate-
+ * black, the Mark-phase barrier, and recolor-on-trace across color flips. */
+static void test_incremental_driver_keeps_survivor(void) {
+    void **keeper = make_pair(make_leaf(555), make_leaf(444));
+    klassic_gc_shadow_push((void **)&keeper);
+    uint64_t before = klassic_gc_collection_count();
+    for (int i = 0; i < 400000; i++) {
+        void **garbage = make_pair(make_leaf(i), make_leaf(i));
+        (void)garbage;
+    }
+    assert(klassic_gc_collection_count() > before); /* cycles ran on their own */
+    assert(((int64_t *)pair_field(keeper, 0))[0] == 555);
+    assert(((int64_t *)pair_field(keeper, 1))[0] == 444);
+    klassic_gc_shadow_pop_n(1);
+    printf("test_incremental_driver_keeps_survivor OK (cycles=%llu)\n",
+           (unsigned long long)(klassic_gc_collection_count() - before));
+}
+
 int main(void) {
     klassic_gc_init();
     test_load_barrier_strips_and_heals();
+    test_incremental_driver_keeps_survivor();
     test_survivor_kept_and_intact();
     test_linked_structure_survives_churn();
     test_garbage_is_reclaimed();

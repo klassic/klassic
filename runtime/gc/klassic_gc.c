@@ -45,6 +45,15 @@ static uint64_t g_worklist_top;
 static uint64_t g_header_mark = KLASSIC_GC_HMARK1;
 static uint64_t g_collections;
 
+/* --- Incremental phase machine ----------------------------------- */
+#define GC_PHASE_IDLE 0
+#define GC_PHASE_MARK 1
+#define GC_QUANTUM_POPS 512   /* objects traced per mark quantum */
+#define GC_QUANTUM_BYTES 8192 /* allocation between mark quanta */
+static uint64_t g_phase = GC_PHASE_IDLE;
+static uint64_t g_bytes_since_cycle;   /* drives the proactive cycle start */
+static uint64_t g_bytes_since_quantum; /* drives a mark quantum */
+
 static int g_initialized;
 
 /* --- Colored pointers -------------------------------------------- */
@@ -127,6 +136,8 @@ static int grow_budget(void) {
     return 1;
 }
 
+static void gc_driver(uint64_t total); /* forward decl: incremental driver */
+
 void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
     if (!g_initialized) {
         klassic_gc_init();
@@ -138,12 +149,22 @@ void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
         fprintf(stderr, "klassic gc: object larger than a region is unsupported\n");
         exit(1);
     }
+    /* Drive the phase machine BEFORE the bump, so it observes only the
+     * mutator's already-rooted state (the object about to be allocated is
+     * not yet reachable from a root). None of the routines it calls
+     * allocate, so gc_alloc is not re-entered. */
+    gc_driver(total);
     for (;;) {
         if (g_heap_base && (uint64_t)(g_heap_end - g_heap_top) >= total) {
             uint8_t *block = g_heap_top;
             g_heap_top += total;
-            *(uint64_t *)block = total;           /* word0 = size, flags clear */
-            *(uint64_t *)(block + 8) = type_tag;  /* word1 = type tag */
+            *(uint64_t *)block = total;          /* word0 = size, flags clear */
+            *(uint64_t *)(block + 8) = type_tag; /* word1 = type tag */
+            /* Allocate-black: an object born during Mark is live this
+             * cycle, so the in-progress mark does not reclaim it. */
+            if (g_phase == GC_PHASE_MARK) {
+                *(uint64_t *)block |= g_header_mark;
+            }
             return block + 16;
         }
         if (acquire_region()) {
@@ -174,6 +195,8 @@ void klassic_gc_shadow_pop_n(uint64_t count) {
     g_shadow_top -= count;
 }
 
+static void mark_visit(void *user); /* forward decl */
+
 uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
     uint64_t raw = value & gc_strip_mask;
     /* Self-heal: store the good-colored pointer back so later barriered
@@ -181,6 +204,13 @@ uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
      * remap here first.) A plain store -- single mutator. */
     if (raw) {
         *slot = (void *)(raw | gc_good_color);
+    }
+    /* During Mark, the mutator has just pulled a raw pointer into a
+     * register, so it must be marked to keep the strong tricolor
+     * invariant (load-barrier-driven incremental update -- no store
+     * barrier, since klassic has no in-place heap mutation). */
+    if (g_phase == GC_PHASE_MARK) {
+        mark_visit((void *)raw);
     }
     return raw;
 }
@@ -217,8 +247,10 @@ static void mark_visit(void *user) {
 }
 
 /* Drain the worklist, marking every reachable pointer. */
-static void trace(void) {
-    while (g_worklist_top) {
+/* Trace up to `budget` worklist objects (a bounded mark quantum). */
+static void gc_trace(uint64_t budget) {
+    while (budget && g_worklist_top) {
+        budget--;
         void *user = g_worklist[--g_worklist_top];
         uint64_t *block = (uint64_t *)((uint8_t *)user - 16);
         uint64_t tag = block[1];
@@ -241,53 +273,103 @@ static void trace(void) {
     }
 }
 
-void klassic_gc_collect(void) {
-    if (!g_initialized) {
-        return;
+/* Drain the worklist to fixpoint. */
+static void gc_drain(void) {
+    while (g_worklist_top) {
+        gc_trace(GC_QUANTUM_POPS);
     }
-    g_collections++;
-    /* Flip the mark parity: this cycle marks with the other bit, and the
-     * sweep clears the now-stale parity, so liveness stays clean across
-     * cycles. */
-    g_header_mark ^= KLASSIC_GC_HMARK_BOTH;
-    uint64_t stale_clear = ~(uint64_t)(KLASSIC_GC_HMARK_BOTH ^ g_header_mark);
+}
 
-    /* Mark from the shadow-stack roots. */
-    g_worklist_top = 0;
+static void gc_mark_roots(void) {
     for (uint64_t i = 0; i < g_shadow_top; i++) {
         mark_visit(*g_shadow[i]);
     }
-    trace();
+}
 
-    /* Flush the current bump region's watermark so the sweep covers it. */
+/* Reclaim whole-dead regions; on a live block clear the stale mark bit. */
+static void gc_sweep(void) {
+    g_collections++;
     if (g_heap_base) {
         g_region_top[region_index(g_heap_base)] = (uint64_t)(uintptr_t)g_heap_top;
     }
-
-    /* Sweep: reclaim whole-dead regions; on a live block clear the stale
-     * mark bit (keep the current one). */
+    uint64_t stale_clear = ~(uint64_t)(KLASSIC_GC_HMARK_BOTH ^ g_header_mark);
     for (uint64_t idx = 0; idx < g_committed; idx++) {
         uint8_t *base = region_at(idx);
         uint8_t *top = (uint8_t *)(uintptr_t)g_region_top[idx];
         if (top == base) {
-            continue; /* empty / already free */
+            continue;
         }
         int any_live = 0;
         for (uint8_t *cur = base; cur < top;) {
             uint64_t *b = (uint64_t *)cur;
             uint64_t sz = block_size(b[0]);
             if (b[0] & g_header_mark) {
-                b[0] &= stale_clear; /* keep current mark, clear stale */
+                b[0] &= stale_clear;
                 any_live = 1;
             }
             cur += sz;
         }
         if (!any_live && base != g_heap_base) {
-            /* Reclaim: push onto the free pool, mark the region empty. */
             *(uint8_t **)base = g_free_head;
             g_free_head = base;
             g_region_top[idx] = (uint64_t)(uintptr_t)base;
         }
+    }
+}
+
+/* MarkStart: flip the mark color (M0<->M1) and header parity, scan roots,
+ * enter the Mark phase. The new bad mask catches the OLD good color | R,
+ * so pointers left from the previous cycle slow-path and are re-marked
+ * (incremental-update marking). */
+static void gc_mark_start(void) {
+    uint64_t old_good = gc_good_color;
+    gc_bad_mask = old_good | GC_COLOR_R;
+    gc_good_color = old_good ^ (GC_COLOR_M0 | GC_COLOR_M1);
+    g_header_mark ^= KLASSIC_GC_HMARK_BOTH;
+    g_worklist_top = 0;
+    gc_mark_roots();
+    g_phase = GC_PHASE_MARK;
+}
+
+/* MarkEnd: drain the frontier to fixpoint, sweep, return to Idle. */
+static void gc_mark_end(void) {
+    gc_drain();
+    gc_sweep();
+    g_phase = GC_PHASE_IDLE;
+    g_bytes_since_cycle = 0;
+}
+
+/* Synchronous full collection (exhaustion / explicit). If a cycle is in
+ * progress, finish it; otherwise a from-scratch stop-the-world mark. */
+void klassic_gc_collect(void) {
+    if (!g_initialized) {
+        return;
+    }
+    if (g_phase == GC_PHASE_MARK) {
+        gc_mark_end();
+        return;
+    }
+    gc_mark_start();
+    gc_mark_end();
+}
+
+/* Poll the phase machine from an allocation point: proactively start a
+ * cycle under memory pressure, and run a mark quantum during Mark. */
+static void gc_driver(uint64_t total) {
+    if (g_phase == GC_PHASE_MARK) {
+        g_bytes_since_quantum += total;
+        if (g_bytes_since_quantum >= GC_QUANTUM_BYTES) {
+            g_bytes_since_quantum = 0;
+            gc_trace(GC_QUANTUM_POPS);
+            if (g_worklist_top == 0) {
+                gc_mark_end();
+            }
+        }
+        return;
+    }
+    g_bytes_since_cycle += total;
+    if (g_bytes_since_cycle >= (g_budget << REGION_SHIFT) / 2) {
+        gc_mark_start();
     }
 }
 
