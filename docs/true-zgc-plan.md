@@ -1,10 +1,16 @@
 # Concurrent ZGC for klassic (the "true ZGC" plan)
 
-Status: **M0 (this document).** Owner decision (2026-07-09): go all the way
-to a *truly concurrent* collector — a background GC thread that marks and
-relocates while the compiled program keeps running, with O(roots) pauses
-only at phase-transition handshakes. This is the execution model that makes
-ZGC ZGC, and it is what the earlier work (the merged C collector,
+Status: **M4 landed — the collector is now genuinely concurrent.** M1
+(incremental relocation), M2 (thread-safe shared state), and M3 (thread
+table + safepoint polls) merged first; M4 adds the background GC thread and
+the handshake protocol, so both the Mark and Relocate phases run with the
+mutator live and pauses are O(roots) at the two phase-transition handshakes.
+Remaining: M5 (several mutator threads under TSan) and M6 (pause measurement
++ `--gc-log`). Owner decision (2026-07-09): go all the way to a *truly
+concurrent* collector — a background GC thread that marks and relocates while
+the compiled program keeps running, with O(roots) pauses only at
+phase-transition handshakes. This is the execution model that makes ZGC ZGC,
+and it is what the earlier work (the merged C collector,
 `docs/llvm-backend-plan.md` M6) deliberately stopped short of.
 
 Read `docs/zgc-plan.md` first: it is the algorithm spec, and its
@@ -163,6 +169,27 @@ verify on main. The evaluator stays the differential oracle for the LLVM path.
     churning records while the GC thread cycles on a tiny trigger) run under
     `-fsanitize=thread` (with `setarch -R` for the WSL2 ASLR quirk); every race
     TSan reports is fixed until clean, then ASan separately.
+  - **Landed as (what was actually built):** a cycle is two O(roots)
+    rendezvous pauses -- `gc_rendezvous(gc_mark_start)` then, after concurrent
+    marking, `gc_rendezvous(gc_finish_mark_action)` (re-scan roots, drain,
+    free ghosts, sweep, select from-set, fix roots) -- with concurrent mark
+    between them and concurrent relocation (`gc_relocate_step` quanta) after
+    the second. `g_gc_lock` guards the worklist + to-space bump + region
+    table; `g_hs_lock`/`g_hs_cond` is the rendezvous; `g_wake_lock` the cycle
+    requests. Three subtleties the implementation had to get right: (1)
+    `klassic_gc_handshake` re-asserts `g_hs_parked` on *every* wait iteration,
+    since consecutive rendezvous reuse the flag and a mutator waking into a
+    fresh request must re-announce itself (a lost-park deadlock otherwise);
+    (2) two evacuators can copy the same from-object, so `gc_evacuate_object`
+    copies word0 + the immutable payload but sets the destination's word1 from
+    the tag it already loaded rather than memcpy-ing the source's word1 (which
+    a concurrent forwarding CAS is writing); (3) `klassic_gc_collect` waits for
+    a *fresh* cycle (one that starts after the call) so it reclaims everything
+    dead as of the call, not whatever an in-flight cycle happened to snapshot.
+    `g_phase` / `g_from_set` / `g_bytes_since_cycle` / `g_relocations` and the
+    word1 forwarding become atomic; `gc_relocate_step` bounds its walk by a
+    `g_relocate_limit` snapshot rather than the racing `g_committed`. Verified
+    clean across 48 ASan + 48 TSan parallel runs and the full `cargo test`.
 - **M5 — Concurrency correctness: TSan + multi-thread stress.** ThreadSanitizer-
   clean under **several mutator threads** churning records while the GC thread
   relocates. Nail the races: two mutators (or a mutator and the GC thread)
