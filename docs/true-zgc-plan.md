@@ -1,12 +1,12 @@
 # Concurrent ZGC for klassic (the "true ZGC" plan)
 
-Status: **M4 landed — the collector is now genuinely concurrent.** M1
-(incremental relocation), M2 (thread-safe shared state), and M3 (thread
-table + safepoint polls) merged first; M4 adds the background GC thread and
-the handshake protocol, so both the Mark and Relocate phases run with the
-mutator live and pauses are O(roots) at the two phase-transition handshakes.
-Remaining: M5 (several mutator threads under TSan) and M6 (pause measurement
-+ `--gc-log`). Owner decision (2026-07-09): go all the way to a *truly
+Status: **M5 landed — genuinely concurrent AND multi-mutator.** M1
+(incremental relocation), M2 (thread-safe shared state), M3 (safepoint polls),
+and M4 (background GC thread + concurrent mark/relocate) merged first; M5 makes
+the collector correct for N mutator threads: per-thread shadow stacks + TLABs
+(a thread table), a parked-count all-mutator handshake, and thread-safe init,
+verified under ThreadSanitizer with several mutator threads churning while the
+GC thread cycles. Remaining: M6 (pause measurement + `--gc-log`). Owner decision (2026-07-09): go all the way to a *truly
 concurrent* collector — a background GC thread that marks and relocates while
 the compiled program keeps running, with O(roots) pauses only at
 phase-transition handshakes. This is the execution model that makes ZGC ZGC,
@@ -218,6 +218,26 @@ verify on main. The evaluator stays the differential oracle for the LLVM path.
     make the observability readers (`klassic_gc_live_region_count`,
     `klassic_gc_collection_count`) atomic. `gc_stress` (tiny trigger) run
     under TSan and ASan with N mutator pthreads until clean.
+  - **Landed as (what was actually built):** a `Mutator` table (`g_mutators`,
+    a `__thread g_self`) with a per-thread heap-allocated shadow stack and a
+    per-thread TLAB; the main thread is registered by init, extra threads
+    auto-register on first alloc/push and deregister on exit. The counted
+    handshake uses `g_hs_parked_cnt` vs a `g_mutator_count` snapshot with a
+    `g_hs_gen` generation; register/deregister take `g_hs_lock` and wait out
+    an in-flight request (join) or park then leave (exit), so the snapshot
+    never drifts. Two deviations from the sketch, both simplifying: (1) the GC
+    thread scans every parked mutator's shadow stack itself (all are stopped,
+    so no cross-thread stack race) rather than each mutator scanning its own;
+    (2) `gc_set_good`'s two-store mask flip is left non-atomic because the
+    counted handshake stops *every* mutator before the flip, so no barrier
+    ever reads a half-updated pair -- the hazard the atomic-publish note
+    guarded against cannot arise. Concurrent first-allocation init moved
+    behind `pthread_once` (fixing a SEGV + the init-vs-first-alloc races), and
+    `g_budget`'s unlocked pressure read + `grow_budget`'s write became
+    relaxed-atomic. `runtime/gc/gc_mt_test.c` (several mutators, each rooting
+    and re-reading its own survivor across concurrent moves) is wired into
+    `run_tests.sh`; clean under ASan+UBSan and TSan, including 12x parallel
+    (48 concurrent mutators + 12 GC threads) with zero races or deadlocks.
 - **M6 — Pauses + observability.** Confirm pauses are O(roots) all-mutator
   handshakes (measure with the clock shim); `--gc-log` reports collections,
   bytes, and max/total handshake pause at exit. Tune the trigger and
