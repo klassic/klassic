@@ -65,12 +65,10 @@ static uint64_t g_collections;
 #define GC_PHASE_MARK 1
 #define GC_PHASE_RELOCATE 2
 #define GC_QUANTUM_POPS 512    /* objects traced per mark quantum */
-#define GC_QUANTUM_BYTES 8192  /* allocation between quanta */
 #define GC_RELOCATE_QUANTUM 8192 /* live bytes evacuated per relocate quantum */
 #define GC_RELOCATE_BYTES 8192 /* live bytes evacuated per relocate quantum */
 static uint64_t g_phase = GC_PHASE_IDLE;
 static uint64_t g_bytes_since_cycle;   /* drives the proactive cycle start */
-static uint64_t g_bytes_since_quantum; /* drives a mark/relocate quantum */
 /* Relocate walk cursor (resumed across quanta): the from-set region being
  * evacuated and the position within it. */
 static uint64_t g_relocate_ridx;
@@ -713,16 +711,21 @@ static void gc_relocate_start(void) {
     g_relocate_ridx = 0;
     g_relocate_ptr = NULL;
     g_relocate_limit = g_committed; /* snapshot: from-set lives below this */
-    g_bytes_since_quantum = 0;
 }
 
 /* RelocateEnd: flush the last to-space region's watermark and return to
  * Idle. The from-set regions stay flagged (ghosts) and are freed at the
- * next MarkEnd. */
+ * next MarkEnd. Flush under g_gc_lock: a mutator that raced the GC to
+ * evacuate the very last from-object and lost the CAS un-bumps g_to_top
+ * under the same lock, so reading g_to_base/g_to_top here without it is a
+ * data race (harmless in practice -- an aligned pointer, worst case a stale
+ * watermark leaving one dead hole -- but cheap to make correct). */
 static void gc_relocate_end(void) {
+    pthread_mutex_lock(&g_gc_lock);
     if (g_to_base) {
         g_region_top[region_index(g_to_base)] = (uint64_t)(uintptr_t)g_to_top;
     }
+    pthread_mutex_unlock(&g_gc_lock);
     __atomic_store_n(&g_phase, GC_PHASE_IDLE, __ATOMIC_RELAXED);
     __atomic_store_n(&g_bytes_since_cycle, 0, __ATOMIC_RELAXED);
 }
@@ -776,7 +779,6 @@ static void gc_mark_start(void) {
     g_worklist_top = 0;
     gc_mark_roots();
     __atomic_store_n(&g_phase, GC_PHASE_MARK, __ATOMIC_RELAXED);
-    g_bytes_since_quantum = 0;
 }
 
 /* MarkEnd (O(roots) pause): drain the mark frontier to fixpoint -- which
