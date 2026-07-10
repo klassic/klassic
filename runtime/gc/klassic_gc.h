@@ -99,11 +99,37 @@ uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot);
 
 /* Read a heap pointer slot through the barrier (fast path inline, slow
  * path out of line). The LLVM backend emits the fast path directly; this
- * C entry point exists for the runtime and the tests. */
+ * C entry point exists for the runtime and the tests. NOT a safepoint:
+ * `slot` is derived from a raw heap pointer that a safepoint would
+ * invalidate, so this call must stay poll-free (see the safepoint
+ * contract below). */
 void *klassic_gc_read(void **slot);
 
-/* Store a heap pointer into a slot, coloring it good (null stays null). */
+/* Store a heap pointer into a slot, coloring it good (null stays null).
+ * NOT a safepoint (same contract as klassic_gc_read). */
 void klassic_gc_write(void **slot, void *value);
+
+/* --- The safepoint contract (a MOVING, CONCURRENT collector) ------ *
+ * The GC thread relocates objects while mutators run. At a safepoint a
+ * mutator may park for one or more whole collection cycles, during which
+ * objects move and their old regions are freed and reused. The collector
+ * updates ROOTED slots (registered with klassic_gc_shadow_push); it cannot
+ * see copies in registers, parameters, or unrooted locals. Therefore every
+ * raw heap pointer a mutator holds is invalidated by every safepoint, and
+ * must be re-derived from a rooted slot after it.
+ *
+ * Safepoints: klassic_gc_alloc (entry), klassic_gc_collect,
+ * klassic_gc_safepoint, and -- in compiled code -- the polls the backend
+ * emits at function entries and loop back-edges.
+ * NOT safepoints: klassic_gc_read, klassic_gc_write,
+ * klassic_gc_shadow_push/pop_n.
+ *
+ * The compiled backend obeys this by construction (every klassic value
+ * lives in a slot and is reloaded after each call/poll). Hand-written C
+ * mutators (the test harnesses) must do the same: root every live heap
+ * pointer, poll at loop tops via klassic_gc_safepoint(), and never carry a
+ * pre-safepoint copy across one. */
+void klassic_gc_safepoint(void);
 
 /* --- Safepoint handshake (true-zgc M3) --------------------------- *
  * The generated code polls `gc_handshake_requested` at loop back-edges and
