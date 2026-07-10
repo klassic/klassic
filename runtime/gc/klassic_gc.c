@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h> /* clock_gettime for --gc-log pause measurement */
 
 /* --- Region heap geometry ---------------------------------------- */
 #define REGION_SHIFT 17
@@ -71,6 +72,40 @@ static uint64_t g_worklist_top;
 /* The current-cycle header mark bit (alternates each collection). */
 static uint64_t g_header_mark = KLASSIC_GC_HMARK1;
 static uint64_t g_collections;
+
+/* --- Optional statistics (--gc-log; compiled only with -DKLASSIC_GC_LOG) --- *
+ * The point of a concurrent collector is O(roots) pauses: the mutators are
+ * stopped only for a phase-transition handshake (mask flip + root scan +
+ * sweep/select), never for the whole mark or relocate. We time each such
+ * stop-the-world window (the GC-side action, entered only once every mutator
+ * has parked) and, at exit, report the collection count, bytes allocated, and
+ * the max / total pause -- the evidence that the pauses are small and bounded.
+ * Guarded so a normal build carries no clock_gettime on the transition path. */
+#ifdef KLASSIC_GC_LOG
+static uint64_t g_stat_bytes;         /* total bytes handed out by gc_alloc */
+static uint64_t g_stat_pause_ns_max;  /* longest single STW handshake (ns) */
+static uint64_t g_stat_pause_ns_total; /* summed STW handshake time (ns) */
+static uint64_t g_stat_pauses;        /* number of STW handshakes */
+
+static uint64_t gc_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void gc_log_atexit(void) {
+    fprintf(stderr,
+            "klassic gc: collections=%llu relocations=%llu bytes=%llu "
+            "pauses=%llu pause_max=%lluns pause_total=%lluns\n",
+            (unsigned long long)__atomic_load_n(&g_collections, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_relocations, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_stat_bytes, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_stat_pauses, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_stat_pause_ns_max, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_stat_pause_ns_total,
+                                                __ATOMIC_RELAXED));
+}
+#endif
 
 /* --- Incremental phase machine ----------------------------------- *
  * Idle -> MarkStart -> Mark (quanta) -> MarkEnd -> Relocate (quanta) ->
@@ -201,6 +236,9 @@ static void gc_init_once(void) {
     g_free_head = NULL;
     g_header_mark = KLASSIC_GC_HMARK1;
     g_collections = 0;
+#ifdef KLASSIC_GC_LOG
+    atexit(gc_log_atexit); /* report collection/pause stats when the program ends */
+#endif
     __atomic_store_n(&g_initialized, 1, __ATOMIC_RELEASE);
     if (pthread_create(&g_gc_thread, NULL, gc_worker, NULL) != 0) {
         fprintf(stderr, "klassic gc: cannot start the GC thread\n");
@@ -380,6 +418,9 @@ void *klassic_gc_alloc(uint64_t size, uint64_t type_tag) {
         fprintf(stderr, "klassic gc: object larger than a region is unsupported\n");
         exit(1);
     }
+#ifdef KLASSIC_GC_LOG
+    __atomic_add_fetch(&g_stat_bytes, total, __ATOMIC_RELAXED);
+#endif
     /* Park if the GC thread is waiting for a safepoint, then -- under memory
      * pressure -- ask it (asynchronously) for a cycle and keep running: the
      * mutator marks via its barrier and parks at polls while the GC thread
@@ -668,7 +709,7 @@ static void flush_all_tlabs(void) {
  * old bit would be misread as live when that bit becomes current again two
  * cycles later (a resurrection/leak). */
 static void gc_sweep(void) {
-    g_collections++;
+    __atomic_fetch_add(&g_collections, 1, __ATOMIC_RELAXED);
     flush_all_tlabs();
     uint64_t stale_clear = ~(uint64_t)(KLASSIC_GC_HMARK_BOTH ^ g_header_mark);
     for (uint64_t idx = 0; idx < g_committed; idx++) {
@@ -1031,7 +1072,20 @@ static void gc_rendezvous(void (*action)(void)) {
     while (g_hs_parked_cnt < expected) {
         pthread_cond_wait(&g_hs_cond, &g_hs_lock);
     }
+    /* Every mutator is now parked: the stop-the-world window is exactly the
+     * phase-transition action (O(roots): mask flip + root scan + sweep/select). */
+#ifdef KLASSIC_GC_LOG
+    uint64_t t0 = gc_now_ns();
+#endif
     action();
+#ifdef KLASSIC_GC_LOG
+    uint64_t ns = gc_now_ns() - t0;
+    __atomic_add_fetch(&g_stat_pause_ns_total, ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_stat_pauses, 1, __ATOMIC_RELAXED);
+    if (ns > __atomic_load_n(&g_stat_pause_ns_max, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&g_stat_pause_ns_max, ns, __ATOMIC_RELAXED);
+    }
+#endif
     __atomic_store_n(&gc_handshake_requested, 0, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_hs_cond);
     pthread_mutex_unlock(&g_hs_lock);
