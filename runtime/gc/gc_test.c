@@ -28,40 +28,52 @@ static int64_t *make_leaf(int64_t v) {
     return p;
 }
 
-/* A pair record with two pointer fields. `a` and `b` must already be live
- * in the caller's rooted slots (they must survive this allocation);
- * stored through the write barrier so the slots carry the good color. */
+/* A pair record with two pointer fields. The pair's own allocation is a
+ * safepoint: with a MOVING collector the GC may relocate a and b's targets
+ * during it and update every ROOTED slot -- but not these parameter copies.
+ * So the parameters are rooted across the allocation and re-read from their
+ * (GC-updated) slots afterwards, the discipline the compiled backend follows
+ * (record_literal reloads each staged value from its shadow slot after the
+ * record's allocation). */
 static void **make_pair(void *a, void *b) {
+    klassic_gc_shadow_push(&a);
+    klassic_gc_shadow_push(&b);
     void **p = (void **)klassic_gc_alloc(16, KLASSIC_GC_POINTER_RECORD);
-    klassic_gc_write(&p[0], a);
-    klassic_gc_write(&p[1], b);
+    klassic_gc_write(&p[0], *(void *volatile *)&a); /* reload after safepoint */
+    klassic_gc_write(&p[1], *(void *volatile *)&b);
+    klassic_gc_shadow_pop_n(2);
     return p;
 }
 
-/* Read a pointer field through the load barrier (strips the color). */
+/* Read a pointer field through the load barrier (strips the color).
+ * klassic_gc_read is NOT a safepoint, so `p` (and the returned pointer, until
+ * the caller's next safepoint) stays valid across the call. */
 static void *pair_field(void **p, int i) { return klassic_gc_read(&p[i]); }
 
 /* Build a pair of two fresh int leaves, staging each intermediate in a
- * rooted slot so a collection mid-construction cannot strand it. */
+ * rooted slot so a collection mid-construction cannot strand it (and so the
+ * slots track relocation: a and b are re-read from them after each alloc). */
 static void **pair_of_leaves(int64_t av, int64_t bv) {
     void *a = 0, *b = 0;
     klassic_gc_shadow_push(&a);
     klassic_gc_shadow_push(&b);
-    a = make_leaf(av); /* a rooted; survives b's allocation */
+    a = make_leaf(av); /* a rooted; survives (and tracks) b's allocation */
     b = make_leaf(bv); /* b rooted; a still rooted */
     void **p = make_pair(a, b);
     klassic_gc_shadow_pop_n(2);
     return p;
 }
 
-/* A cons cell [leaf(head)][tail]. `tail` must be live in the caller's
- * rooted slot; the fresh head leaf is staged in a rooted slot here. */
+/* A cons cell [leaf(head)][tail]. `tail` is rooted here across the two
+ * allocations (the caller's rooted slot keeps the LIST alive, but this copy
+ * must also track relocation), and the fresh head leaf is staged likewise. */
 static void **cons(int64_t head, void **tail) {
     void *leaf = 0;
+    klassic_gc_shadow_push((void **)&tail);
     klassic_gc_shadow_push(&leaf);
     leaf = make_leaf(head);
-    void **p = make_pair(leaf, tail);
-    klassic_gc_shadow_pop_n(1);
+    void **p = make_pair(leaf, tail); /* both re-read from rooted slots */
+    klassic_gc_shadow_pop_n(2);
     return p;
 }
 

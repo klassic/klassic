@@ -30,10 +30,23 @@ static int64_t *make_leaf(int64_t v) {
     p[0] = v;
     return p;
 }
+/* The pair's own allocation is a safepoint: with a MOVING collector the GC
+ * may relocate a and b's targets during it and update every ROOTED slot --
+ * but not unrooted copies. So the parameters themselves must be rooted across
+ * the allocation and re-read from their (GC-updated) slots afterwards. This is
+ * exactly the discipline the compiled backend follows: record_literal stages
+ * every field value in a shadow slot and reloads it from that slot after the
+ * record's allocation. Holding a pre-safepoint copy instead is a
+ * precise-rooting violation that leaves a stale from-space pointer in the new
+ * record's field -- an allocate-black record is never traced, so nothing would
+ * ever remap it, and the from-space region is later freed under it. */
 static void **make_pair(void *a, void *b) {
+    klassic_gc_shadow_push(&a);
+    klassic_gc_shadow_push(&b);
     void **p = (void **)klassic_gc_alloc(16, KLASSIC_GC_POINTER_RECORD);
-    klassic_gc_write(&p[0], a);
-    klassic_gc_write(&p[1], b);
+    klassic_gc_write(&p[0], *(void *volatile *)&a); /* reload after safepoint */
+    klassic_gc_write(&p[1], *(void *volatile *)&b);
+    klassic_gc_shadow_pop_n(2);
     return p;
 }
 static void *pair_field(void **p, int i) { return klassic_gc_read(&p[i]); }
@@ -43,6 +56,10 @@ static void **pair_of_leaves(int64_t av, int64_t bv) {
     klassic_gc_shadow_push(&b);
     a = make_leaf(av);
     b = make_leaf(bv);
+    /* a and b are re-read from their rooted slots here (their addresses
+     * escaped via shadow_push, so the compiler reloads them after the
+     * make_leaf calls); make_pair then roots its own copies across the pair's
+     * allocation. */
     void **p = make_pair(a, b);
     klassic_gc_shadow_pop_n(2);
     return p;
@@ -62,6 +79,13 @@ static void *mutator_main(void *arg) {
     void **keeper = pair_of_leaves(av, bv);
     klassic_gc_shadow_push((void **)&keeper); /* root it in this thread's stack */
     for (int i = 0; i < ITERS; i++) {
+        /* Explicit safepoint at the loop top (the hand-written analogue of the
+         * back-edge poll the backend emits). Every raw heap pointer is
+         * re-derived from a rooted slot below it: `keeper` is reloaded from its
+         * shadow-pushed slot (its address escaped, so the compiler re-reads it
+         * after any call), and la/lb are derived and dereferenced with no
+         * safepoint in between -- klassic_gc_read is poll-free by contract. */
+        klassic_gc_safepoint();
         void **garbage = pair_of_leaves(i, i);
         (void)garbage;
         if ((i & 1023) == 0) {

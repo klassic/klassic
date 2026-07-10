@@ -487,24 +487,41 @@ uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot) {
 }
 
 void *klassic_gc_read(void **slot) {
-    /* A thread that touches the heap must be a registered mutator, or its poll
-     * below would increment the parked count for a rendezvous that never
-     * counted it (breaking the all-mutator handshake), and its barrier work
-     * would evacuate/heal with no shadow stack to root its own pointers.
-     * Uniform with klassic_gc_alloc / klassic_gc_shadow_push. */
+    /* A thread that touches the heap must be a registered mutator (its barrier
+     * work may evacuate/heal, which needs its shadow stack; and only registered
+     * threads may park). Uniform with klassic_gc_alloc / klassic_gc_shadow_push. */
     if (!g_self) {
         klassic_gc_register_thread();
     }
-    /* Safepoint: the compiled backend polls at loop back-edges (M3), so a
-     * read-only loop parks for the GC thread's handshakes even when it never
-     * allocates. This C entry point (used by the runtime and the unit tests)
-     * polls here so a hand-written read loop behaves the same. */
-    gc_poll();
+    /* NOT a safepoint -- deliberately. With a moving collector, `slot` was
+     * computed by the caller from a heap pointer that is only valid until the
+     * next safepoint; polling here (between the caller deriving `slot` and this
+     * load using it) would let the GC relocate the underlying object and free
+     * its region mid-call, making both the load and the self-heal below write
+     * into reused memory. The emitted code has the same shape: its polls sit at
+     * function entries and loop back-edges, and every heap address is re-derived
+     * from a rooted slot after each poll, with the inline barrier fast path and
+     * the slow-path call poll-free in between. Hand-written mutators poll via
+     * klassic_gc_alloc or an explicit klassic_gc_safepoint() at their loop tops
+     * and must re-derive heap pointers from rooted slots afterwards. */
     uint64_t value = __atomic_load_n((uint64_t *)slot, __ATOMIC_RELAXED);
     if (value & gc_bad_mask) {
         return (void *)klassic_gc_load_barrier_slow(value, slot);
     }
     return (void *)(value & gc_strip_mask);
+}
+
+/* Explicit safepoint for hand-written mutators (the C analogue of the polls
+ * the backend emits at function entries and loop back-edges). Call it at loop
+ * tops so a read-only loop still parks for the GC thread's handshakes -- and
+ * treat every raw heap pointer as invalidated across it: re-derive them from
+ * rooted (shadow-pushed) slots afterwards, because a rendezvous may have
+ * relocated their targets and updated only the rooted slots. */
+void klassic_gc_safepoint(void) {
+    if (!g_self) {
+        klassic_gc_register_thread();
+    }
+    gc_poll();
 }
 
 void klassic_gc_write(void **slot, void *value) {
@@ -643,6 +660,7 @@ static void flush_all_tlabs(void) {
         }
     }
 }
+
 
 /* Reclaim whole-dead regions and clear the stale (previous-cycle) mark bit
  * on every block. Clearing it on dead blocks too -- not just live ones --
