@@ -5603,7 +5603,34 @@ impl NativeCodeGenerator {
         }
     }
 
+    // `compile_expr` is native codegen's central dispatch: every construct
+    // that recurses into a sub-expression (binary/unary operators, calls,
+    // blocks, conditionals, ...) goes through here, mostly by calling
+    // `compile_expr` again on its own operands, one native Rust frame per
+    // AST level. Constant-folding operators like `+`/`-` on int literals
+    // bypass this entirely by resolving through `static_value_from_expr`
+    // (guarded separately) without ever calling `compile_expr` on their
+    // operands, but non-folding operators do not: a flat, left-leaning
+    // chain of `&&`/`||` (`true&&true&&...&&true`) still emits real
+    // branching code for every level via `compile_logical`, which calls
+    // `compile_expr(lhs)` directly — recursing here through the chain's
+    // full depth and overflowing a debug-profile stack at a few hundred
+    // terms, the same shape of problem as everywhere else in this
+    // pipeline. `stacker::maybe_grow` adds a fresh stack segment on
+    // demand, mirroring the guard `klassic-eval::eval_expr` already uses
+    // for the same shape of problem.
+    const COMPILE_EXPR_STACK_RED_ZONE: usize = 512 * 1024;
+    const COMPILE_EXPR_STACK_GROW_SIZE: usize = 8 * 1024 * 1024;
+
     fn compile_expr(&mut self, expr: &Expr) -> Result<NativeValue, Diagnostic> {
+        stacker::maybe_grow(
+            Self::COMPILE_EXPR_STACK_RED_ZONE,
+            Self::COMPILE_EXPR_STACK_GROW_SIZE,
+            || self.compile_expr_inner(expr),
+        )
+    }
+
+    fn compile_expr_inner(&mut self, expr: &Expr) -> Result<NativeValue, Diagnostic> {
         // A pending generic-enum shape is only valid for the slot binding
         // that immediately follows its construction; clear any leftover so
         // it never attaches to an unrelated value.
@@ -40369,7 +40396,27 @@ fn collect_assigned_names(expr: &Expr, names: &mut HashSet<String>) {
     }
 }
 
+// Same shape of problem as the other guarded recursive walkers in this
+// file: a flat, left-leaning operator chain (`true&&true&&...&&true`,
+// `1+1+1+...+1`, ...) makes this recurse one native Rust frame per
+// operator via its `Expr::Binary` arm. Called from many places across
+// native codegen (`compile_logical`'s effect-preview path in particular,
+// on every level of a logical-operator chain), each independently
+// unguarded, so it can overflow even once its callers are guarded, if the
+// caller's already-grown segment doesn't happen to leave enough headroom
+// for this walk on its own.
+const STATIC_EXPR_IS_PURE_STACK_RED_ZONE: usize = 512 * 1024;
+const STATIC_EXPR_IS_PURE_STACK_GROW_SIZE: usize = 8 * 1024 * 1024;
+
 fn static_expr_is_pure(expr: &Expr) -> bool {
+    stacker::maybe_grow(
+        STATIC_EXPR_IS_PURE_STACK_RED_ZONE,
+        STATIC_EXPR_IS_PURE_STACK_GROW_SIZE,
+        || static_expr_is_pure_inner(expr),
+    )
+}
+
+fn static_expr_is_pure_inner(expr: &Expr) -> bool {
     match expr {
         Expr::StringInterpolation { parts, .. } => parts.iter().all(|part| match part {
             StringPart::Literal(_) => true,

@@ -28743,3 +28743,59 @@ fn native_build_handles_long_flat_operator_chain() {
     );
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "2001\n");
 }
+
+/// Companion to `native_build_handles_long_flat_operator_chain` for a
+/// *non-folding* flat chain: unlike `1+1+1+...+1`, which resolves entirely
+/// through `static_value_from_expr` without ever emitting branches, a flat
+/// `&&` chain never constant-folds away (`compile_binary` dispatches
+/// `LogicalAnd`/`LogicalOr` straight to `compile_logical`, which emits real
+/// conditional-jump code) and recurses through `compile_expr` itself —
+/// native codegen's central dispatch — once per level. That, and the
+/// `static_expr_is_pure` helper `compile_logical` calls on every level to
+/// decide whether short-circuiting is safe to skip, both overflowed a
+/// debug-profile stack at a few hundred terms before being fixed with
+/// their own `stacker::maybe_grow`.
+#[test]
+fn native_build_handles_long_flat_logical_chain() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_flat_logical_chain_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_flat_logical_chain_{stamp}.bin"));
+
+    let mut source = String::from("println(true");
+    for _ in 0..2000 {
+        source.push_str("&&true");
+    }
+    source.push_str(")\n");
+    fs::write(&source_path, &source).expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "a long flat logical chain should compile natively, not crash\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        run_output.status.success(),
+        "compiled flat-logical-chain binary should run cleanly, not crash\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "true\n");
+}
