@@ -2364,6 +2364,16 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             ensure_arity(name, arguments, 0, span)?;
             Ok(Value::Int(1))
         }
+        "__native_thread_safe_alloc_test" => {
+            // Native-only (see __native_thread_spawn_test above); stub
+            // reports 2n, matching what the native implementation
+            // returns on success, so eval-mode programs written against
+            // it still run without claiming to test anything real.
+            ensure_arity(name, arguments, 1, span)?;
+            let count =
+                expect_non_negative_int(&arguments[0], "__native_thread_safe_alloc_test", span)?;
+            Ok(Value::Int(count.saturating_mul(2) as i64))
+        }
         "__gc_list_ptr" => {
             ensure_arity(name, arguments, 1, span)?;
             let _ = expect_non_negative_int(&arguments[0], "__gc_list_ptr", span)?;

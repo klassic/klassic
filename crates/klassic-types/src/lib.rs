@@ -2918,6 +2918,11 @@ impl TypeChecker {
             Type::Function(vec![], Box::new(Type::Int)),
         );
         self.declare_poly(
+            "__native_thread_safe_alloc_test".to_string(),
+            false,
+            Type::Function(vec![Type::Int], Box::new(Type::Int)),
+        );
+        self.declare_poly(
             "__gc_list_ptr".to_string(),
             false,
             Type::Function(vec![Type::Int], Box::new(Type::Int)),

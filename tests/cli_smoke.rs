@@ -28940,3 +28940,77 @@ fn native_build_thread_spawn_test_succeeds_repeatedly() {
     }
     let _ = fs::remove_file(&output_path);
 }
+
+/// `__native_thread_safe_alloc_test(n)` proves the `gc_alloc_lock`
+/// spinlock (docs/superpowers/specs/2026-07-24-precise-concurrent-gc-
+/// design.md) actually makes `gc_alloc` safe under real concurrent
+/// callers: a real child thread and the parent thread each independently
+/// call `gc_alloc` `n` times and atomically count successes. A race on
+/// the shared bump pointer or free-list head would corrupt the heap
+/// and/or under-count; the only way to reliably observe exactly `2n` is
+/// for every one of the `2n` allocations across both threads to complete
+/// without stepping on another thread's in-progress allocation.
+///
+/// Runs at two scales (10 and 5,000 per thread) and repeats the smaller
+/// one several times in-process, since a race is a timing-dependent bug
+/// that a single run could get lucky and not observe.
+#[test]
+fn native_build_thread_safe_alloc_test_is_race_free() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+
+    for (label, n, repeats) in [("small", 10, 15), ("stress", 5000, 3)] {
+        let source_path = std::env::temp_dir().join(format!(
+            "klassic_native_thread_safe_alloc_test_{label}_{stamp}.kl"
+        ));
+        let output_path = std::env::temp_dir().join(format!(
+            "klassic_native_thread_safe_alloc_test_{label}_{stamp}.bin"
+        ));
+        fs::write(
+            &source_path,
+            format!("println(__native_thread_safe_alloc_test({n}))\n"),
+        )
+        .expect("temp source file should write");
+
+        let build_output = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_str().expect("path should be utf-8"),
+                "-o",
+                output_path.to_str().expect("path should be utf-8"),
+            ])
+            .output()
+            .expect("binary should run");
+        let _ = fs::remove_file(&source_path);
+        assert!(
+            build_output.status.success(),
+            "{label}: __native_thread_safe_alloc_test should compile natively\nstderr:\n{}",
+            String::from_utf8_lossy(&build_output.stderr)
+        );
+
+        let expected = format!("{}\n", 2 * n);
+        for attempt in 0..repeats {
+            let run_output = Command::new(&output_path)
+                .output()
+                .expect("compiled binary should run");
+            assert!(
+                run_output.status.success(),
+                "{label} attempt {attempt}: compiled binary should run cleanly, not crash or hang\nstderr:\n{}",
+                String::from_utf8_lossy(&run_output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&run_output.stdout),
+                expected,
+                "{label} attempt {attempt}: expected both threads' allocations \
+                 to be counted exactly once each (2*{n}); a lower count means \
+                 the spinlock let two threads race the bump pointer or \
+                 free-list; -1/-2/-3 are the mmap/clone/join-timeout \
+                 sentinels; got:\n{}",
+                String::from_utf8_lossy(&run_output.stdout)
+            );
+        }
+        let _ = fs::remove_file(&output_path);
+    }
+}

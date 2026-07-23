@@ -4009,6 +4009,31 @@ struct NativeCodeGenerator {
     /// one thread becomes visible to a plain load in another (true on
     /// x86's TSO memory model without any extra fence).
     thread_done_flag: DataLabel,
+    /// Spinlock guarding the entire body of `gc_alloc` (free-list walk,
+    /// bump-pointer bump, and any `gc_collect`/`gc_grow_heap` call it
+    /// makes along the way) so two real OS threads calling `gc_alloc`
+    /// concurrently cannot race the same bump pointer / free-list head.
+    /// Acquired via `xchg` (implicitly locked test-and-set), released
+    /// via a plain store (safe on x86's TSO — no other memory operation
+    /// in the critical section can be reordered past it). This makes
+    /// concurrent *allocation* safe; it does not by itself make
+    /// concurrent *collection* safe against a second thread that is
+    /// mutating live objects or pushing/popping the (still-global,
+    /// still-single) shadow stack outside an allocation call — that
+    /// needs the safepoint mechanism from a later phase of
+    /// docs/superpowers/specs/2026-07-24-precise-concurrent-gc-design.md.
+    gc_alloc_lock: DataLabel,
+    /// Shared counter incremented (via `lock xadd`) once per successful
+    /// `gc_alloc` call by `__native_thread_safe_alloc_test`, from both
+    /// the parent and the child thread. Its final value (checked by the
+    /// test, not this backend) must equal exactly twice the requested
+    /// count for `gc_alloc_lock` to be proven correct under real
+    /// concurrent callers -- a race would under-count.
+    alloc_test_count: DataLabel,
+    /// Set by the child thread in `__native_thread_safe_alloc_test`
+    /// after it finishes its own allocation loop; polled by the
+    /// parent's join spin-loop, same pattern as `thread_done_flag`.
+    alloc_test_child_done: DataLabel,
     /// Per-scope counter parallel to scope_base_offsets — number of GC
     /// pointer slots pushed onto the shadow stack in this scope.
     scope_gc_root_counts: Vec<usize>,
@@ -4203,6 +4228,9 @@ impl NativeCodeGenerator {
         let atomic_test_cell = asm.data_label_with_i64s(&[0]);
         let atomic_test_results = asm.data_label_with_i64s(&[0; 7]);
         let thread_done_flag = asm.data_label_with_i64s(&[0]);
+        let gc_alloc_lock = asm.data_label_with_i64s(&[0]);
+        let alloc_test_count = asm.data_label_with_i64s(&[0]);
+        let alloc_test_child_done = asm.data_label_with_i64s(&[0]);
         let mut record_schemas = HashMap::new();
         record_schemas.insert(
             "Point".to_string(),
@@ -4273,6 +4301,9 @@ impl NativeCodeGenerator {
             atomic_test_cell,
             atomic_test_results,
             thread_done_flag,
+            gc_alloc_lock,
+            alloc_test_count,
+            alloc_test_child_done,
             scope_gc_root_counts: vec![0],
             scopes: vec![HashMap::new()],
             static_scopes: vec![HashMap::new()],
@@ -7057,6 +7088,9 @@ impl NativeCodeGenerator {
             "__gc_collect_count" => self.compile_gc_collect_count(arguments, span),
             "__native_atomic_self_test" => self.compile_native_atomic_self_test(arguments, span),
             "__native_thread_spawn_test" => self.compile_native_thread_spawn_test(arguments, span),
+            "__native_thread_safe_alloc_test" => {
+                self.compile_native_thread_safe_alloc_test(arguments, span)
+            }
             "__gc_list_int" => self.compile_gc_list_int(arguments, span),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span),
             "__gc_list_int_set" => self.compile_gc_list_int_set(arguments, span),
@@ -8082,6 +8116,9 @@ impl NativeCodeGenerator {
                 .map(Some),
             "__native_thread_spawn_test" => self
                 .compile_native_thread_spawn_test(arguments, span)
+                .map(Some),
+            "__native_thread_safe_alloc_test" => self
+                .compile_native_thread_safe_alloc_test(arguments, span)
                 .map(Some),
             "__gc_list_int" => self.compile_gc_list_int(arguments, span).map(Some),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span).map(Some),
@@ -13881,6 +13918,183 @@ impl NativeCodeGenerator {
         self.asm.lock_xadd_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
         // exit(0) -- terminates only this thread (CLONE_THREAD keeps the
         // process and the parent thread alive), never returns.
+        self.emit_syscall_number(PlatformSyscall::Exit);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.syscall();
+
+        self.asm.bind_text_label(done);
+        Ok(NativeValue::Int)
+    }
+
+    /// `__native_thread_safe_alloc_test(n)` proves the `gc_alloc_lock`
+    /// spinlock actually makes concurrent `gc_alloc` calls safe (see
+    /// docs/superpowers/specs/2026-07-24-precise-concurrent-gc-design.md):
+    /// it spawns a real child thread (same `clone()` machinery as
+    /// `__native_thread_spawn_test`), and *both* the parent and the child
+    /// independently call `gc_alloc` `n` times each, atomically bumping a
+    /// shared counter (`lock xadd`) after every successful allocation. If
+    /// the lock is race-free, the final count is exactly `2n` regardless
+    /// of how the two threads' allocations happen to interleave; a race
+    /// on the bump pointer or free-list head would corrupt the heap and/or
+    /// under-count. `n` should stay small enough that neither thread's
+    /// loop pushes the shared 1 MiB heap into a real `gc_collect`/
+    /// `gc_grow_heap` cycle -- this test proves allocation is race-free,
+    /// not (yet) that collection is safe with another thread live, which
+    /// needs the safepoint mechanism from a later phase of the same
+    /// design doc.
+    ///
+    /// Each allocation is a bare 16-byte `GC_TYPE_RAW_BYTES` block with no
+    /// pointer fields, made via a direct `call_label(self.gc_alloc)`
+    /// rather than through normal expression codegen, so this test never
+    /// touches the (still-global, still-single, not yet thread-safe)
+    /// shadow stack -- keeping it a narrow test of the allocator alone.
+    ///
+    /// Returns the observed final count (`2n` on success), or the same
+    /// negative sentinels as `__native_thread_spawn_test` (`-1` stack
+    /// mmap failed, `-2` clone failed, `-3` join spin-loop timed out).
+    fn compile_native_thread_safe_alloc_test(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 1 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__native_thread_safe_alloc_test expects 1 argument but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let count_value = self.compile_expr(&arguments[0])?;
+        if count_value != NativeValue::Int {
+            return Err(unsupported(
+                span,
+                "native __native_thread_safe_alloc_test for non-Int argument",
+            ));
+        }
+        // rbx = n, the per-thread allocation count. gc_alloc explicitly
+        // saves/restores rbx around its own body, and rbx (like every
+        // general-purpose register except rax/rsp) survives both the
+        // mmap/clone syscalls and the fork point unchanged and
+        // independently in each thread's own register file -- so setting
+        // it once here gives both the parent's and the child's copies of
+        // the loop below their own correct starting count.
+        self.asm.mov_reg_reg(Reg::Rbx, Reg::Rax);
+
+        const THREAD_STACK_SIZE: i32 = 2 * 1024 * 1024;
+        const CLONE_FLAGS: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x4_0000;
+        const JOIN_SPIN_BUDGET: u64 = 100_000_000;
+        const GC_TYPE_RAW_BYTES: u64 = 1;
+
+        let done = self.asm.create_text_label();
+        let mmap_ok = self.asm.create_text_label();
+        let clone_ok = self.asm.create_text_label();
+        let child_label = self.asm.create_text_label();
+
+        // Reset shared state before spawning.
+        self.asm.mov_data_addr(Reg::R10, self.alloc_test_count);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.alloc_test_child_done);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        // mmap a fresh stack for the child (identical to
+        // __native_thread_spawn_test).
+        self.emit_syscall_number(PlatformSyscall::Mmap);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.mov_imm64(Reg::Rsi, THREAD_STACK_SIZE as u64);
+        self.asm
+            .mov_imm64(Reg::Rdx, self.platform.mmap_prot_read_write());
+        self.asm
+            .mov_imm64(Reg::R10, self.platform.mmap_private_anonymous_flags());
+        self.asm
+            .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.syscall();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, mmap_ok);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(mmap_ok);
+
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+        self.asm.add_reg_imm32(Reg::R11, THREAD_STACK_SIZE);
+
+        self.emit_syscall_number(PlatformSyscall::Clone);
+        self.asm.mov_imm64(Reg::Rdi, CLONE_FLAGS);
+        self.asm.mov_reg_reg(Reg::Rsi, Reg::R11);
+        self.asm.mov_imm64(Reg::Rdx, 0);
+        self.asm.mov_imm64(Reg::R10, 0);
+        self.asm.mov_imm64(Reg::R8, 0);
+        self.asm.syscall();
+
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, child_label);
+
+        // ---- parent path ----
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Greater, clone_ok);
+        self.asm.mov_imm64(Reg::Rax, (-2i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(clone_ok);
+
+        let parent_loop = self.asm.create_text_label();
+        let parent_loop_done = self.asm.create_text_label();
+        self.asm.bind_text_label(parent_loop);
+        self.asm.test_reg_reg(Reg::Rbx, Reg::Rbx);
+        self.asm.jcc_label(Condition::Equal, parent_loop_done);
+        self.asm.mov_imm64(Reg::Rdi, 16);
+        self.asm.mov_imm64(Reg::Rsi, GC_TYPE_RAW_BYTES);
+        self.asm.call_label(self.gc_alloc);
+        self.asm.mov_data_addr(Reg::R10, self.alloc_test_count);
+        self.asm.mov_imm64(Reg::Rcx, 1);
+        self.asm.lock_xadd_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
+        self.asm.sub_reg_imm32(Reg::Rbx, 1);
+        self.asm.jmp_label(parent_loop);
+        self.asm.bind_text_label(parent_loop_done);
+
+        let spin_top = self.asm.create_text_label();
+        let spin_done = self.asm.create_text_label();
+        let spin_timeout = self.asm.create_text_label();
+        self.asm.mov_imm64(Reg::Rcx, JOIN_SPIN_BUDGET);
+        self.asm.bind_text_label(spin_top);
+        self.asm.mov_data_addr(Reg::R10, self.alloc_test_child_done);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::NotEqual, spin_done);
+        self.asm.sub_reg_imm32(Reg::Rcx, 1);
+        self.asm.cmp_reg_imm8(Reg::Rcx, 0);
+        self.asm.jcc_label(Condition::Equal, spin_timeout);
+        self.asm.pause();
+        self.asm.jmp_label(spin_top);
+        self.asm.bind_text_label(spin_timeout);
+        self.asm.mov_imm64(Reg::Rax, (-3i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(spin_done);
+        self.asm.mov_data_addr(Reg::R10, self.alloc_test_count);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.jmp_label(done);
+
+        // ---- child path ----
+        self.asm.bind_text_label(child_label);
+        let child_loop = self.asm.create_text_label();
+        let child_loop_done = self.asm.create_text_label();
+        self.asm.bind_text_label(child_loop);
+        self.asm.test_reg_reg(Reg::Rbx, Reg::Rbx);
+        self.asm.jcc_label(Condition::Equal, child_loop_done);
+        self.asm.mov_imm64(Reg::Rdi, 16);
+        self.asm.mov_imm64(Reg::Rsi, GC_TYPE_RAW_BYTES);
+        self.asm.call_label(self.gc_alloc);
+        self.asm.mov_data_addr(Reg::R10, self.alloc_test_count);
+        self.asm.mov_imm64(Reg::Rcx, 1);
+        self.asm.lock_xadd_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
+        self.asm.sub_reg_imm32(Reg::Rbx, 1);
+        self.asm.jmp_label(child_loop);
+        self.asm.bind_text_label(child_loop_done);
+        self.asm.mov_data_addr(Reg::R10, self.alloc_test_child_done);
+        self.asm.mov_imm64(Reg::Rcx, 1);
+        self.asm.lock_xadd_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
         self.emit_syscall_number(PlatformSyscall::Exit);
         self.asm.mov_imm64(Reg::Rdi, 0);
         self.asm.syscall();
@@ -38882,6 +39096,24 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
         self.asm.push_reg(Reg::Rbx);
+
+        // Acquire gc_alloc_lock: xchg-based spin (implicitly locked, no
+        // explicit `lock` prefix needed for xchg). Every exit path below
+        // (success, oom) releases it before leaving; nothing between here
+        // and there may `return`/jump out without going through one of
+        // those releases, or a second thread would spin forever.
+        let lock_acquire_loop = self.asm.create_text_label();
+        let lock_acquired = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.gc_alloc_lock);
+        self.asm.bind_text_label(lock_acquire_loop);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.xchg_mem_disp32_reg(Reg::R10, 0, Reg::Rax);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, lock_acquired);
+        self.asm.pause();
+        self.asm.jmp_label(lock_acquire_loop);
+        self.asm.bind_text_label(lock_acquired);
+
         // Reserve two qwords for locals.
         self.asm.sub_reg_imm8(Reg::Rsp, 16);
         // total = align_up(rdi + 16, 16)
@@ -38914,6 +39146,13 @@ impl NativeCodeGenerator {
         self.emit_gc_alloc_attempt(oom, success);
 
         self.asm.bind_text_label(oom);
+        // Release the lock before the fatal exit: harmless for this
+        // thread (which is terminating either way), but leaves the lock
+        // in a sane state if a future caller ever recovers from OOM
+        // instead of exiting the process outright.
+        self.asm.mov_data_addr(Reg::R10, self.gc_alloc_lock);
+        self.asm.mov_imm64(Reg::R11, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
         self.emit_write_data(
             self.platform.stderr_fd(),
             self.gc_oom_text,
@@ -38922,6 +39161,12 @@ impl NativeCodeGenerator {
         self.emit_exit_code(1);
 
         self.asm.bind_text_label(success);
+        // Release gc_alloc_lock before returning. rax holds the
+        // allocated pointer -- this function's return value -- and must
+        // not be clobbered, so the release uses r10/r11 only.
+        self.asm.mov_data_addr(Reg::R10, self.gc_alloc_lock);
+        self.asm.mov_imm64(Reg::R11, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
         // Tear down locals and return.
         self.asm.add_reg_imm32(Reg::Rsp, 16);
         self.asm.pop_reg(Reg::Rbx);
@@ -42535,6 +42780,15 @@ impl Assembler {
 
     fn syscall(&mut self) {
         self.bytes(&[0x0f, 0x05]);
+    }
+
+    /// `pause` (`F3 90`) — spin-wait hint for a tight retry loop (e.g. a
+    /// spinlock's contended path). Not required for correctness, but
+    /// standard practice on x86: without it a tight `xchg`-retry loop can
+    /// trigger a memory-order misprediction penalty on exit and wastes
+    /// more power/bus bandwidth under contention than necessary.
+    fn pause(&mut self) {
+        self.bytes(&[0xf3, 0x90]);
     }
 
     /// `rep movsb` — copy `rcx` bytes from `[rsi]` to `[rdi]`, advancing
