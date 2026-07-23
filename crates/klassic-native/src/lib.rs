@@ -3750,6 +3750,7 @@ const LINUX_X86_64_PLATFORM_CONSTANTS: PlatformConstants = PlatformConstants {
         262, // newfstatat
         60,  // exit
         97,  // getrlimit
+        56,  // clone
     ],
     stdin_fd: 0,
     stdout_fd: 1,
@@ -3893,7 +3894,7 @@ impl NativeTargetContext {
     }
 }
 
-const PLATFORM_SYSCALL_COUNT: usize = 18;
+const PLATFORM_SYSCALL_COUNT: usize = 19;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -3916,6 +3917,15 @@ enum PlatformSyscall {
     Newfstatat,
     Exit,
     Getrlimit,
+    /// Linux `clone(2)`, used to start a genuine second OS thread (see
+    /// docs/superpowers/specs/2026-07-24-precise-concurrent-gc-design.md).
+    /// Unlike every other syscall in this backend, its return path is
+    /// special: with `CLONE_VM` the child resumes at the *same*
+    /// instruction pointer as the parent (right after this `syscall`),
+    /// sharing the same code, distinguished only by `rax` (0 in the
+    /// child, the child's tid in the parent) and `rsp` (whatever `rsi`
+    /// was set to before the call).
+    Clone,
 }
 
 struct NativeCodeGenerator {
@@ -3991,6 +4001,14 @@ struct NativeCodeGenerator {
     /// the builtin's return value is their sum, so 7 means every check
     /// passed and anything less pinpoints how many did not.
     atomic_test_results: DataLabel,
+    /// Set via `lock xadd` by the child thread spawned in
+    /// `__native_thread_spawn_test`, polled (plain load) by the parent's
+    /// join spin-loop. The first genuinely cross-thread-shared cell in
+    /// this backend — proves both that `clone()` actually starts a
+    /// second thread of execution and that a `lock`-prefixed store in
+    /// one thread becomes visible to a plain load in another (true on
+    /// x86's TSO memory model without any extra fence).
+    thread_done_flag: DataLabel,
     /// Per-scope counter parallel to scope_base_offsets — number of GC
     /// pointer slots pushed onto the shadow stack in this scope.
     scope_gc_root_counts: Vec<usize>,
@@ -4184,6 +4202,7 @@ impl NativeCodeGenerator {
         let stack_overflow_text = asm.data_label_with_bytes(b"klassic: stack overflow\n");
         let atomic_test_cell = asm.data_label_with_i64s(&[0]);
         let atomic_test_results = asm.data_label_with_i64s(&[0; 7]);
+        let thread_done_flag = asm.data_label_with_i64s(&[0]);
         let mut record_schemas = HashMap::new();
         record_schemas.insert(
             "Point".to_string(),
@@ -4253,6 +4272,7 @@ impl NativeCodeGenerator {
             stack_overflow_text,
             atomic_test_cell,
             atomic_test_results,
+            thread_done_flag,
             scope_gc_root_counts: vec![0],
             scopes: vec![HashMap::new()],
             static_scopes: vec![HashMap::new()],
@@ -7036,6 +7056,7 @@ impl NativeCodeGenerator {
             "__gc_segment_count" => self.compile_gc_segment_count(arguments, span),
             "__gc_collect_count" => self.compile_gc_collect_count(arguments, span),
             "__native_atomic_self_test" => self.compile_native_atomic_self_test(arguments, span),
+            "__native_thread_spawn_test" => self.compile_native_thread_spawn_test(arguments, span),
             "__gc_list_int" => self.compile_gc_list_int(arguments, span),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span),
             "__gc_list_int_set" => self.compile_gc_list_int_set(arguments, span),
@@ -8058,6 +8079,9 @@ impl NativeCodeGenerator {
             "__gc_collect_count" => self.compile_gc_collect_count(arguments, span).map(Some),
             "__native_atomic_self_test" => self
                 .compile_native_atomic_self_test(arguments, span)
+                .map(Some),
+            "__native_thread_spawn_test" => self
+                .compile_native_thread_spawn_test(arguments, span)
                 .map(Some),
             "__gc_list_int" => self.compile_gc_list_int(arguments, span).map(Some),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span).map(Some),
@@ -13727,6 +13751,141 @@ impl NativeCodeGenerator {
             self.asm.load_ptr_disp32(Reg::Rcx, Reg::R11, offset);
             self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
         }
+        Ok(NativeValue::Int)
+    }
+
+    /// `__native_thread_spawn_test()` is the first real `clone(2)`-based OS
+    /// thread this backend has ever started (see docs/superpowers/specs/
+    /// 2026-07-24-precise-concurrent-gc-design.md). It mmaps a 2 MiB stack,
+    /// clones a child onto it with `CLONE_VM|FS|FILES|SIGHAND|THREAD|
+    /// SYSVSEM` (share address space and thread group, no TLS — this
+    /// backend has none), has the child atomically set `thread_done_flag`
+    /// via `lock xadd` then exit *itself only* (`exit`, not `exit_group`),
+    /// and has the parent spin-poll that flag (bounded — see below) before
+    /// returning the value it observed.
+    ///
+    /// Returns: `1` on success (child ran, flag observed set — also proves
+    /// the child's atomic store became visible to the parent's plain load,
+    /// i.e. real inter-thread memory visibility, not just "clone didn't
+    /// crash"), `-1` if the stack `mmap` failed, `-2` if `clone` failed,
+    /// `-3` if the join spin-loop's iteration budget (100,000,000) was
+    /// exhausted without observing the flag — a hard bound exists
+    /// specifically so a bug here (e.g. the child never actually running)
+    /// produces a wrong-but-terminating answer instead of hanging the
+    /// process forever.
+    ///
+    /// This intentionally does the least possible amount of work in the
+    /// child (one atomic store, then exit) to isolate "does real thread
+    /// creation work at all" from every other piece of the design (GC
+    /// safepoints, per-thread shadow stacks, thread-safe allocation) that
+    /// depends on it and is built in later phases.
+    fn compile_native_thread_spawn_test(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if !arguments.is_empty() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__native_thread_spawn_test expects 0 arguments but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+
+        const THREAD_STACK_SIZE: i32 = 2 * 1024 * 1024;
+        const CLONE_FLAGS: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x4_0000; // VM|FS|FILES|SIGHAND|THREAD|SYSVSEM
+        const JOIN_SPIN_BUDGET: u64 = 100_000_000;
+
+        let done = self.asm.create_text_label();
+        let mmap_ok = self.asm.create_text_label();
+        let clone_ok = self.asm.create_text_label();
+        let child_label = self.asm.create_text_label();
+        let spin_top = self.asm.create_text_label();
+        let spin_done = self.asm.create_text_label();
+        let spin_timeout = self.asm.create_text_label();
+
+        // Reset the shared flag before spawning.
+        self.asm.mov_data_addr(Reg::R10, self.thread_done_flag);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        // mmap a fresh stack for the child.
+        self.emit_syscall_number(PlatformSyscall::Mmap);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.mov_imm64(Reg::Rsi, THREAD_STACK_SIZE as u64);
+        self.asm
+            .mov_imm64(Reg::Rdx, self.platform.mmap_prot_read_write());
+        self.asm
+            .mov_imm64(Reg::R10, self.platform.mmap_private_anonymous_flags());
+        self.asm
+            .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.syscall();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, mmap_ok);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(mmap_ok);
+
+        // r11 = child stack top (stack grows down; base is page-aligned
+        // and THREAD_STACK_SIZE is a power of two, so the top stays
+        // 16-byte aligned as the SysV ABI expects at a call boundary).
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+        self.asm.add_reg_imm32(Reg::R11, THREAD_STACK_SIZE);
+
+        // clone(CLONE_FLAGS, r11, NULL, NULL, NULL). With CLONE_VM set,
+        // the child resumes at the *same* instruction pointer as the
+        // parent right after this `syscall` -- both threads execute the
+        // branch below, distinguished only by rax (0 in the child) and
+        // rsp (now r11's value, in the child).
+        self.emit_syscall_number(PlatformSyscall::Clone);
+        self.asm.mov_imm64(Reg::Rdi, CLONE_FLAGS);
+        self.asm.mov_reg_reg(Reg::Rsi, Reg::R11);
+        self.asm.mov_imm64(Reg::Rdx, 0);
+        self.asm.mov_imm64(Reg::R10, 0);
+        self.asm.mov_imm64(Reg::R8, 0);
+        self.asm.syscall();
+
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, child_label);
+
+        // ---- parent path: rax = child tid (or a negative errno) ----
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Greater, clone_ok);
+        self.asm.mov_imm64(Reg::Rax, (-2i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(clone_ok);
+
+        self.asm.mov_imm64(Reg::Rcx, JOIN_SPIN_BUDGET);
+        self.asm.bind_text_label(spin_top);
+        self.asm.mov_data_addr(Reg::R10, self.thread_done_flag);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::NotEqual, spin_done);
+        self.asm.sub_reg_imm32(Reg::Rcx, 1);
+        self.asm.cmp_reg_imm8(Reg::Rcx, 0);
+        self.asm.jcc_label(Condition::Equal, spin_timeout);
+        self.asm.jmp_label(spin_top);
+        self.asm.bind_text_label(spin_timeout);
+        self.asm.mov_imm64(Reg::Rax, (-3i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(spin_done);
+        self.asm.jmp_label(done);
+
+        // ---- child path ----
+        self.asm.bind_text_label(child_label);
+        self.asm.mov_data_addr(Reg::R10, self.thread_done_flag);
+        self.asm.mov_imm64(Reg::Rcx, 1);
+        self.asm.lock_xadd_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
+        // exit(0) -- terminates only this thread (CLONE_THREAD keeps the
+        // process and the parent thread alive), never returns.
+        self.emit_syscall_number(PlatformSyscall::Exit);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.syscall();
+
+        self.asm.bind_text_label(done);
         Ok(NativeValue::Int)
     }
 
@@ -42772,6 +42931,8 @@ mod tests {
         assert_eq!(platform.syscall_number(PlatformSyscall::ClockGettime), 228);
         assert_eq!(platform.syscall_number(PlatformSyscall::Newfstatat), 262);
         assert_eq!(platform.syscall_number(PlatformSyscall::Exit), 60);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Getrlimit), 97);
+        assert_eq!(platform.syscall_number(PlatformSyscall::Clone), 56);
         assert_eq!(platform.stdin_fd(), 0);
         assert_eq!(platform.stdout_fd(), 1);
         assert_eq!(platform.stderr_fd(), 2);

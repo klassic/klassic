@@ -28872,3 +28872,71 @@ fn evaluator_stubs_native_atomic_self_test() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n()\n");
 }
+
+/// `__native_thread_spawn_test()` is the first `clone(2)`-based real OS
+/// thread this backend has ever started (see docs/superpowers/specs/
+/// 2026-07-24-precise-concurrent-gc-design.md) -- previously `thread(...)`
+/// was purely a compile-time trick that inlined its body into the single
+/// main-thread instruction stream (see
+/// `builds_native_executable_for_thread_block_local_mutable_capture`
+/// elsewhere in this file for that older, still-current `thread()`
+/// behavior, which this new builtin does not change). The child thread
+/// atomically sets a shared flag via `lock xadd`; the parent spin-polls it
+/// (with a bounded iteration budget so a regression here fails fast
+/// instead of hanging the test) and returns the observed value. A `1`
+/// result proves both that `clone()` actually started a second thread of
+/// execution and that the child's atomic store became visible to the
+/// parent's plain load across threads.
+///
+/// Run repeatedly in-process (not just once) since thread-creation bugs
+/// can be timing-dependent; every run must independently converge to 1,
+/// not just "usually".
+#[test]
+fn native_build_thread_spawn_test_succeeds_repeatedly() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_thread_spawn_test_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_thread_spawn_test_{stamp}.bin"));
+    fs::write(&source_path, "println(__native_thread_spawn_test())\n")
+        .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    assert!(
+        build_output.status.success(),
+        "__native_thread_spawn_test should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    for attempt in 0..20 {
+        let run_output = Command::new(&output_path)
+            .output()
+            .expect("compiled binary should run");
+        assert!(
+            run_output.status.success(),
+            "attempt {attempt}: compiled thread-spawn-test binary should run cleanly, not crash or hang\nstderr:\n{}",
+            String::from_utf8_lossy(&run_output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run_output.stdout),
+            "1\n",
+            "attempt {attempt}: expected the child thread to run and its atomic \
+             flag write to be observed by the parent (1); -1 = stack mmap \
+             failed, -2 = clone() failed, -3 = join spin-loop timed out; got:\n{}",
+            String::from_utf8_lossy(&run_output.stdout)
+        );
+    }
+    let _ = fs::remove_file(&output_path);
+}

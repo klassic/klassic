@@ -30,6 +30,7 @@ pub(crate) fn builtin_name(name: &str) -> Option<&'static str> {
         "__gc_segment_count" => Some("__gc_segment_count"),
         "__gc_collect_count" => Some("__gc_collect_count"),
         "__native_atomic_self_test" => Some("__native_atomic_self_test"),
+        "__native_thread_spawn_test" => Some("__native_thread_spawn_test"),
         "__gc_list_int" => Some("__gc_list_int"),
         "__gc_list_int_len" => Some("__gc_list_int_len"),
         "__gc_list_int_set" => Some("__gc_list_int_set"),
@@ -118,7 +119,8 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         | "__gc_segment_count"
         | "__gc_collect_count"
         | "__gc_smap_new"
-        | "__native_atomic_self_test" => Some(0),
+        | "__native_atomic_self_test"
+        | "__native_thread_spawn_test" => Some(0),
         "__gc_read"
         | "__gc_read_ptr"
         | "__gc_read_string"
