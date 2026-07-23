@@ -67,6 +67,7 @@ dependencies = [
  "klassic-span",
  "klassic-syntax",
  "klassic-types",
+ "stacker",
 ]
 
 [[package]]
@@ -75,6 +76,7 @@ version = "0.1.0"
 dependencies = [
  "klassic-span",
  "klassic-syntax",
+ "stacker",
 ]
 
 [[package]]
@@ -102,6 +104,7 @@ dependencies = [
  "klassic-runtime",
  "klassic-span",
  "klassic-syntax",
+ "stacker",
 ]
 
 [[package]]

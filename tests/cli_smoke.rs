@@ -28658,3 +28658,88 @@ fn native_build_runs_annotated_mutual_recursion() {
         String::from_utf8_lossy(&deep_run_output.stderr)
     );
 }
+
+/// A flat, left-leaning operator chain (`1+1+1+...+1`) parses without
+/// recursing (the parser's precedence-climbing loop is iterative), so
+/// `MAX_NESTING_DEPTH` (added to cap nested parens/unary chains/match
+/// patterns) never sees it — the parser hands every downstream pass a
+/// perfectly ordinary, if deep, left-leaning `Binary` AST. Each of
+/// `klassic-rewrite::rewrite` and `klassic-types::infer_expr` walks that
+/// AST with one native Rust stack frame per `+`, and both overflowed a
+/// debug-profile stack (the profile `cargo test` exercises) at a few
+/// hundred terms before being fixed with `stacker::maybe_grow`. 5,000
+/// terms stayed well beyond the reach of either crate's old unguarded
+/// recursion.
+#[test]
+fn evaluator_handles_long_flat_operator_chain() {
+    let mut source = String::from("println(1");
+    for _ in 0..5000 {
+        source.push_str("+1");
+    }
+    source.push_str(")\n");
+
+    let output = Command::new(klassic_bin())
+        .args(["-e", &source])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "a long flat operator chain should evaluate cleanly, not crash\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "5001\n()\n");
+}
+
+/// Companion to `evaluator_handles_long_flat_operator_chain` for the
+/// native backend: a flat operator chain that survives `rewrite` and
+/// `infer_expr` still recurses through several more unguarded native-only
+/// passes (`EnumLowering::lower`, `desugar_extensions_with`,
+/// `static_value_from_expr`, `static_value_from_expr_with_bindings`,
+/// `expr_may_yield_static_string`) before it ever reaches machine code —
+/// every one of those walks the whole AST during `klassic build`, even for
+/// a program with no enums, extensions, or strings at all, and each
+/// overflowed a debug-profile stack independently before being fixed with
+/// its own `stacker::maybe_grow`. 2,000 terms is comfortably inside the
+/// range verified fast and crash-free after those fixes.
+#[test]
+fn native_build_handles_long_flat_operator_chain() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_native_flat_chain_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_native_flat_chain_{stamp}.bin"));
+
+    let mut source = String::from("println(1");
+    for _ in 0..2000 {
+        source.push_str("+1");
+    }
+    source.push_str(")\n");
+    fs::write(&source_path, &source).expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "a long flat operator chain should compile natively, not crash\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        run_output.status.success(),
+        "compiled flat-chain binary should run cleanly, not crash\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), "2001\n");
+}

@@ -1441,7 +1441,32 @@ impl TypeChecker {
         }
     }
 
+    // A flat, left-leaning operator chain (`1+1+1+...+1`) makes `infer_expr`
+    // recurse one native Rust frame per `+`, since `Expr::Binary`'s case
+    // infers `lhs` before it can unify the whole node — there is no
+    // trampoline here, same as `klassic-rewrite::rewrite` and
+    // `klassic-eval::eval_expr`. A chain of a few thousand terms is
+    // ordinary user code and must type-check, not be rejected, but plain
+    // recursion overflowed a 2 MiB debug test-thread stack at roughly 50-60
+    // terms (`infer_expr`'s frame is large: HM inference threads a
+    // `RefCell`-backed substitution table, constraint list, and scope stack
+    // through every call, plus this match arm alone unifies both operand
+    // types and builds diagnostics inline). `stacker::maybe_grow` adds a
+    // fresh stack segment on demand, mirroring the guard already used for
+    // `eval_expr` (added for #435) and `rewrite` (added alongside this
+    // fix). The knobs reuse `klassic-eval`'s: 512 KiB red zone comfortably
+    // exceeds a single `infer_expr` frame, and 8 MiB growth keeps segment
+    // allocations infrequent for very long chains (100k+ terms).
+    const STACK_RED_ZONE: usize = 512 * 1024;
+    const STACK_GROW_SIZE: usize = 8 * 1024 * 1024;
+
     fn infer_expr(&mut self, expr: &Expr) -> Result<Type, Diagnostic> {
+        stacker::maybe_grow(Self::STACK_RED_ZONE, Self::STACK_GROW_SIZE, || {
+            self.infer_expr_inner(expr)
+        })
+    }
+
+    fn infer_expr_inner(&mut self, expr: &Expr) -> Result<Type, Diagnostic> {
         match expr {
             Expr::Int { kind, .. } => Ok(match kind {
                 IntLiteralKind::Byte => Type::Byte,

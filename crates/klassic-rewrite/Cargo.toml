@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 klassic-span = { path = "../klassic-span" }
 klassic-syntax = { path = "../klassic-syntax" }
+stacker = "0.1"
 
 [lib]
 path = "src/lib.rs"

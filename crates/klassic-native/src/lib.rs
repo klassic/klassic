@@ -2234,7 +2234,27 @@ fn en_pattern_binds_shaped(
 }
 
 impl EnumLowering {
+    // Same shape of problem as `klassic-rewrite::rewrite` and
+    // `klassic-types::infer_expr`: a flat, left-leaning operator chain
+    // (`1+1+1+...+1`) makes `lower` recurse one native Rust frame per `+`
+    // (its `Expr::Binary` arm, further down, lowers `lhs` before it can
+    // finish rebuilding the node), with no trampoline. Every native build
+    // runs this pass — even programs with no enums at all — since it walks
+    // the whole AST looking for constructor calls/patterns to rewrite.
+    // `stacker::maybe_grow` adds a fresh stack segment on demand, mirroring
+    // the guards already used for `rewrite` and `infer_expr` earlier in the
+    // same native-build pipeline; a chain that survives those two stages
+    // unguarded would otherwise overflow here instead.
+    const STACK_RED_ZONE: usize = 512 * 1024;
+    const STACK_GROW_SIZE: usize = 8 * 1024 * 1024;
+
     fn lower(&mut self, expr: Expr) -> Expr {
+        stacker::maybe_grow(Self::STACK_RED_ZONE, Self::STACK_GROW_SIZE, || {
+            self.lower_inner(expr)
+        })
+    }
+
+    fn lower_inner(&mut self, expr: Expr) -> Expr {
         match expr {
             Expr::EnumDeclaration {
                 name,
@@ -3055,7 +3075,28 @@ fn is_native_builtin_method_name(name: &str) -> bool {
     )
 }
 
+// Same shape of problem as `EnumLowering::lower`, `klassic-rewrite::rewrite`,
+// and `klassic-types::infer_expr`: a flat, left-leaning operator chain
+// (`1+1+1+...+1`) makes this recurse one native Rust frame per `+` (its
+// `Expr::Binary` arm, further down, desugars `lhs` before it can finish
+// rebuilding the node), with no trampoline. Every native build runs this
+// pass, even programs with no extension methods at all, since it walks the
+// whole AST looking for `ExtensionDeclaration`s to lower. `stacker::maybe_grow`
+// adds a fresh stack segment on demand, mirroring the guards already used
+// earlier in the same native-build pipeline (`rewrite`, `infer_expr`,
+// `EnumLowering::lower`).
+const DESUGAR_EXTENSIONS_STACK_RED_ZONE: usize = 512 * 1024;
+const DESUGAR_EXTENSIONS_STACK_GROW_SIZE: usize = 8 * 1024 * 1024;
+
 fn desugar_extensions_with(expr: Expr, registry: &HashMap<String, Vec<String>>) -> Expr {
+    stacker::maybe_grow(
+        DESUGAR_EXTENSIONS_STACK_RED_ZONE,
+        DESUGAR_EXTENSIONS_STACK_GROW_SIZE,
+        || desugar_extensions_with_inner(expr, registry),
+    )
+}
+
+fn desugar_extensions_with_inner(expr: Expr, registry: &HashMap<String, Vec<String>>) -> Expr {
     match expr {
         Expr::ExtensionDeclaration {
             this_name,
@@ -26147,7 +26188,27 @@ impl NativeCodeGenerator {
         }
     }
 
+    // Same shape of problem as `EnumLowering::lower`, `desugar_extensions_with`,
+    // `klassic-rewrite::rewrite`, and `klassic-types::infer_expr`: a flat,
+    // left-leaning operator chain (`1+1+1+...+1`) makes this recurse one
+    // native Rust frame per `+` (its `Expr::Binary` arm evaluates `lhs`
+    // before it can fold the whole node), with no trampoline. Constant
+    // folding a long chain of literals is ordinary user code and must
+    // succeed, not crash. `stacker::maybe_grow` adds a fresh stack segment
+    // on demand, mirroring the guards already used elsewhere in the native
+    // codegen pipeline.
+    const STATIC_VALUE_STACK_RED_ZONE: usize = 512 * 1024;
+    const STATIC_VALUE_STACK_GROW_SIZE: usize = 8 * 1024 * 1024;
+
     fn static_value_from_expr(&mut self, expr: &Expr) -> Option<StaticValue> {
+        stacker::maybe_grow(
+            Self::STATIC_VALUE_STACK_RED_ZONE,
+            Self::STATIC_VALUE_STACK_GROW_SIZE,
+            || self.static_value_from_expr_inner(expr),
+        )
+    }
+
+    fn static_value_from_expr_inner(&mut self, expr: &Expr) -> Option<StaticValue> {
         match expr {
             Expr::Int { value, .. } => Some(StaticValue::Int(*value)),
             Expr::Double { value, kind, .. } => match kind {
@@ -26317,11 +26378,6 @@ impl NativeCodeGenerator {
                 Some(StaticValue::Bool(!value))
             }
             Expr::Binary { lhs, op, rhs, .. } => {
-                if *op == BinaryOp::Add
-                    && let Some(value) = self.static_string_concat_text(lhs, rhs)
-                {
-                    return Some(self.static_string_value(value));
-                }
                 if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
                     let StaticValue::Bool(lhs) = self.static_value_from_expr(lhs)? else {
                         return None;
@@ -26336,8 +26392,41 @@ impl NativeCodeGenerator {
                     };
                     return Some(StaticValue::Bool(rhs));
                 }
+                // A flat, left-leaning chain of `+` (`1+1+1+...+1`) makes
+                // this arm recurse one native Rust frame per operator. The
+                // string-concat fast path used to be tried via
+                // `static_string_concat_text(lhs, rhs)`, which independently
+                // re-derives `self.static_value_from_expr(lhs)` internally,
+                // and — since that fast path only ever early-returns on a
+                // *successful* string fold — every non-string `+` (e.g. this
+                // whole int chain) fell through to the plain numeric path
+                // just below, which evaluated `lhs` a *second* time. That
+                // doubles the work at every one of the chain's `n` levels:
+                // T(n) = 2*T(n-1) + O(1) = O(2^n), so what looks like an `n`
+                // deep walk was actually exponential in `n` and hung for
+                // even a few dozen terms well before any stack-depth guard
+                // could matter. Evaluating `lhs`/`rhs` exactly once and
+                // reusing the results for both the string-concat check and
+                // the numeric fallback restores the intended O(n).
+                let lhs_pure = static_expr_is_pure(lhs);
+                let rhs_pure = static_expr_is_pure(rhs);
                 let lhs = self.static_value_from_expr(lhs)?;
                 let rhs = self.static_value_from_expr(rhs)?;
+                if *op == BinaryOp::Add
+                    && lhs_pure
+                    && rhs_pure
+                    && (matches!(lhs, StaticValue::StaticString { .. })
+                        || matches!(rhs, StaticValue::StaticString { .. }))
+                    && !self.static_value_has_conditional_builtin_display(&lhs)
+                    && !self.static_value_has_conditional_builtin_display(&rhs)
+                {
+                    let value = format!(
+                        "{}{}",
+                        self.static_value_display_string(&lhs),
+                        self.static_value_display_string(&rhs)
+                    );
+                    return Some(self.static_string_value(value));
+                }
                 match (lhs, op, rhs) {
                     (StaticValue::Int(lhs), BinaryOp::Add, StaticValue::Int(rhs)) => {
                         lhs.checked_add(rhs).map(StaticValue::Int)
@@ -27558,7 +27647,30 @@ impl NativeCodeGenerator {
         String::from_utf8(self.asm.data_bytes_for_label(*label, *len).to_vec()).ok()
     }
 
+    // Same shape of problem as `static_value_from_expr` (fixed separately):
+    // a flat, left-leaning operator chain (`1+1+1+...+1`) makes this
+    // recurse one native Rust frame per `+`, with no trampoline. Reached
+    // from `expr_may_yield_static_string`, which runs on every `+`
+    // considered for native codegen, so even an int-only chain (no
+    // strings, no bindings in play) drives this to the chain's full depth.
+    // `stacker::maybe_grow` adds a fresh stack segment on demand, mirroring
+    // the guard on `static_value_from_expr`.
+    const STATIC_VALUE_BINDINGS_STACK_RED_ZONE: usize = 512 * 1024;
+    const STATIC_VALUE_BINDINGS_STACK_GROW_SIZE: usize = 8 * 1024 * 1024;
+
     fn static_value_from_expr_with_bindings(
+        &mut self,
+        expr: &Expr,
+        bindings: &[(&str, StaticValue)],
+    ) -> Option<StaticValue> {
+        stacker::maybe_grow(
+            Self::STATIC_VALUE_BINDINGS_STACK_RED_ZONE,
+            Self::STATIC_VALUE_BINDINGS_STACK_GROW_SIZE,
+            || self.static_value_from_expr_with_bindings_inner(expr, bindings),
+        )
+    }
+
+    fn static_value_from_expr_with_bindings_inner(
         &mut self,
         expr: &Expr,
         bindings: &[(&str, StaticValue)],
@@ -31542,7 +31654,24 @@ impl NativeCodeGenerator {
         }
     }
 
+    // Same shape of problem as `static_value_from_expr` and
+    // `static_value_from_expr_with_bindings` (fixed separately): a flat,
+    // left-leaning operator chain (`1+1+1+...+1`) makes this recurse one
+    // native Rust frame per `+`. `compile_binary` calls this on every `+`
+    // it considers, so an int-only chain drives it to the chain's full
+    // depth even though no string is ever involved.
+    const MAY_YIELD_STATIC_STRING_STACK_RED_ZONE: usize = 512 * 1024;
+    const MAY_YIELD_STATIC_STRING_STACK_GROW_SIZE: usize = 8 * 1024 * 1024;
+
     fn expr_may_yield_static_string(&mut self, expr: &Expr) -> bool {
+        stacker::maybe_grow(
+            Self::MAY_YIELD_STATIC_STRING_STACK_RED_ZONE,
+            Self::MAY_YIELD_STATIC_STRING_STACK_GROW_SIZE,
+            || self.expr_may_yield_static_string_inner(expr),
+        )
+    }
+
+    fn expr_may_yield_static_string_inner(&mut self, expr: &Expr) -> bool {
         if matches!(
             self.static_value_from_expr_with_bindings_preserving_static_scopes(expr, &[]),
             Some(StaticValue::StaticString { .. })

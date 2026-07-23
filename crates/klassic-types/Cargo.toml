@@ -7,6 +7,7 @@ edition = "2024"
 klassic-span = { path = "../klassic-span" }
 klassic-syntax = { path = "../klassic-syntax" }
 klassic-runtime = { path = "../klassic-runtime" }
+stacker = "0.1"
 
 [lib]
 path = "src/lib.rs"
