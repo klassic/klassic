@@ -11,6 +11,58 @@ If the intent was literally colored pointers / load barriers / concurrent
 relocation, that is a much larger, different project — see "Rejected scope"
 below for why it was set aside for now.
 
+**Progress as of 2026-07-24 (commits 33b8aea, 76af88c, 5ee3b43 on
+`integrate/segfault-fixes`), each independently built, tested, and
+verified before moving to the next:**
+
+- Phase 1 (Assembler atomics) — DONE. `xchg_mem_disp32_reg`,
+  `lock_cmpxchg_mem_disp32_reg`, `lock_xadd_mem_disp32_reg` added and
+  proven correct via `__native_atomic_self_test()`, a 7-point check of
+  their documented ISA semantics (all 7 pass).
+- Phase 2 (`clone()` + per-thread stack + smoke test) — DONE.
+  `PlatformSyscall::Clone` (56, verified against system headers, not
+  memory) plus `__native_thread_spawn_test()`: mmaps a 2 MiB child
+  stack, clones with `CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM`, the
+  child atomically signals completion, the parent spin-joins (bounded)
+  and observes it — genuine first real multi-threaded execution in
+  this backend's history. 20/20 repeated runs succeeded.
+- Phase 3 (thread-safe allocation) — DONE. `gc_alloc_lock` spinlock
+  wraps the whole of `emit_gc_alloc_runtime`; full existing test suite
+  (500+ tests) stayed green through the change. New
+  `__native_thread_safe_alloc_test(n)` has a real child thread and the
+  parent both call `gc_alloc` concurrently and atomically count
+  successes — verified race-free at n=10 (15 repeats) and n=5,000 (3
+  repeats, 10,000 total concurrent allocations, exact count every time).
+- Phase 4 (safepoint stop-the-world collection + per-thread shadow
+  stacks) — NOT STARTED. This is qualitatively riskier than phases
+  1-3: those added new, self-contained, opt-in test builtins that
+  don't touch any code path existing programs exercise. Phase 4
+  requires changing `emit_gc_shadow_push`/`emit_gc_shadow_pop_n` — the
+  hottest, most pervasively-used codegen path in the whole backend,
+  invoked by ordinary record/string-holding code in *every* existing
+  program — to be per-thread instead of global. Attempting it without
+  the same careful, independently-verified, one-step-at-a-time
+  discipline used for phases 1-3 would risk a much larger and harder
+  to isolate regression. Deliberately paused here to report status
+  rather than rush it.
+- Phase 5 (per-thread stack-overflow floor), Phase 6/language-surface
+  (whether `thread()` itself starts using real threads) — NOT STARTED,
+  blocked behind Phase 4.
+
+**What is proven, concretely:** klassic-native can start a real second
+OS thread, and that thread can safely allocate on the shared GC heap
+concurrently with the spawning thread, with correct atomic
+synchronization — none of which was true before this session. **What
+is NOT yet proven:** that a full mark-and-sweep collection cycle is
+safe to run while a second real thread is live and touching the heap
+(shadow-stack roots are still a single global, unsynchronized array
+outside of allocation), and `thread()` itself still does not use any
+of this — it remains the pre-existing compile-time-inline mechanism.
+"Precise ZGC... works in multi-thread environment" is therefore
+**partially, not fully, satisfied**: precise tracing was already true,
+concurrent-safe allocation is now true and verified, concurrent-safe
+*collection* is not yet true.
+
 ## Problem
 
 The goal is "precise ZGC implementation (works in multi-thread environment)"
