@@ -28799,3 +28799,76 @@ fn native_build_handles_long_flat_logical_chain() {
     );
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "true\n");
 }
+
+/// `__native_atomic_self_test()` exercises the hand-encoded `xchg` /
+/// `lock cmpxchg` / `lock xadd` instructions added for the multi-thread-
+/// safe GC work (docs/superpowers/specs/2026-07-24-precise-concurrent-gc-
+/// design.md) against their documented x86-64 semantics, entirely on one
+/// thread, and returns how many of its 7 checks passed. This does not
+/// prove cross-thread atomicity (that needs real concurrent OS threads,
+/// a later phase of the same design) — only that the instructions are
+/// encoded correctly and behave as the ISA specifies, which is the
+/// necessary foundation underneath any lock/spinlock built from them.
+#[test]
+fn native_build_atomic_instructions_pass_self_test() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_atomic_self_test_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_atomic_self_test_{stamp}.bin"));
+    fs::write(&source_path, "println(__native_atomic_self_test())\n")
+        .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "__native_atomic_self_test should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&output_path)
+        .output()
+        .expect("compiled binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        run_output.status.success(),
+        "compiled atomic-self-test binary should run cleanly\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "7\n",
+        "all 7 xchg/cmpxchg/xadd checks should pass; got:\n{}",
+        String::from_utf8_lossy(&run_output.stdout)
+    );
+}
+
+/// Companion to the native test: the evaluator has no machine-code
+/// atomics to exercise, so `__native_atomic_self_test` is a stub there
+/// (see `crates/klassic-eval/src/lib.rs`) that reports success without
+/// testing anything real. This just confirms the stub exists and doesn't
+/// crash — the actual encoding is only proven by the native test above.
+#[test]
+fn evaluator_stubs_native_atomic_self_test() {
+    let output = Command::new(klassic_bin())
+        .args(["-e", "println(__native_atomic_self_test())"])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "__native_atomic_self_test should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n()\n");
+}

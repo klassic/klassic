@@ -3979,6 +3979,18 @@ struct NativeCodeGenerator {
     stack_floor: DataLabel,
     stack_overflow_abort: TextLabel,
     stack_overflow_text: DataLabel,
+    /// Scratch memory cell reused by `__native_atomic_self_test` to drive
+    /// `xchg`/`lock cmpxchg`/`lock xadd` through their documented
+    /// behavior. Single-threaded by construction (this builtin is a
+    /// unit test of the *encoding*, not a concurrency test — real
+    /// cross-thread atomicity needs actual OS threads, which this
+    /// backend does not have yet; see docs/superpowers/specs/
+    /// 2026-07-24-precise-concurrent-gc-design.md).
+    atomic_test_cell: DataLabel,
+    /// One 0/1 flag per sub-check in `__native_atomic_self_test` (7 slots);
+    /// the builtin's return value is their sum, so 7 means every check
+    /// passed and anything less pinpoints how many did not.
+    atomic_test_results: DataLabel,
     /// Per-scope counter parallel to scope_base_offsets — number of GC
     /// pointer slots pushed onto the shadow stack in this scope.
     scope_gc_root_counts: Vec<usize>,
@@ -4170,6 +4182,8 @@ impl NativeCodeGenerator {
         let stack_floor = asm.data_label_with_i64s(&[0]);
         let stack_overflow_abort = asm.create_text_label();
         let stack_overflow_text = asm.data_label_with_bytes(b"klassic: stack overflow\n");
+        let atomic_test_cell = asm.data_label_with_i64s(&[0]);
+        let atomic_test_results = asm.data_label_with_i64s(&[0; 7]);
         let mut record_schemas = HashMap::new();
         record_schemas.insert(
             "Point".to_string(),
@@ -4237,6 +4251,8 @@ impl NativeCodeGenerator {
             stack_floor,
             stack_overflow_abort,
             stack_overflow_text,
+            atomic_test_cell,
+            atomic_test_results,
             scope_gc_root_counts: vec![0],
             scopes: vec![HashMap::new()],
             static_scopes: vec![HashMap::new()],
@@ -7019,6 +7035,7 @@ impl NativeCodeGenerator {
             "__gc_pointer_count" => self.compile_gc_pointer_count(arguments, span),
             "__gc_segment_count" => self.compile_gc_segment_count(arguments, span),
             "__gc_collect_count" => self.compile_gc_collect_count(arguments, span),
+            "__native_atomic_self_test" => self.compile_native_atomic_self_test(arguments, span),
             "__gc_list_int" => self.compile_gc_list_int(arguments, span),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span),
             "__gc_list_int_set" => self.compile_gc_list_int_set(arguments, span),
@@ -8039,6 +8056,9 @@ impl NativeCodeGenerator {
             "__gc_pointer_count" => self.compile_gc_pointer_count(arguments, span).map(Some),
             "__gc_segment_count" => self.compile_gc_segment_count(arguments, span).map(Some),
             "__gc_collect_count" => self.compile_gc_collect_count(arguments, span).map(Some),
+            "__native_atomic_self_test" => self
+                .compile_native_atomic_self_test(arguments, span)
+                .map(Some),
             "__gc_list_int" => self.compile_gc_list_int(arguments, span).map(Some),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span).map(Some),
             "__gc_list_int_set" => self.compile_gc_list_int_set(arguments, span).map(Some),
@@ -13586,6 +13606,127 @@ impl NativeCodeGenerator {
         }
         self.asm.mov_data_addr(Reg::Rax, self.gc_collect_counter);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+        Ok(NativeValue::Int)
+    }
+
+    /// `__native_atomic_self_test()` drives `xchg_mem_disp32_reg` /
+    /// `lock_cmpxchg_mem_disp32_reg` / `lock_xadd_mem_disp32_reg` (the
+    /// atomic primitives added for the multi-thread-safe GC work; see
+    /// docs/superpowers/specs/2026-07-24-precise-concurrent-gc-design.md)
+    /// through 7 checks of their documented semantics, entirely on one
+    /// thread. It returns the number of checks that passed (7 = fully
+    /// correct encoding); it does NOT prove cross-thread atomicity, which
+    /// needs real concurrent OS threads (a later phase of the same design)
+    /// to observe — this only proves the instructions are encoded
+    /// correctly and behave as the ISA documents.
+    ///
+    /// Checks, in order: (1) `xchg` returns the memory operand's old value
+    /// into the register; (2) `xchg` leaves the register's old value in
+    /// memory; (3) `lock cmpxchg` swaps memory when `rax` matches; (4)
+    /// `lock cmpxchg` leaves memory unchanged when `rax` does not match;
+    /// (5) `lock cmpxchg` updates `rax` to memory's actual value on a
+    /// failed compare; (6) `lock xadd` returns memory's pre-add value into
+    /// the register; (7) `lock xadd` leaves the summed value in memory.
+    fn compile_native_atomic_self_test(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if !arguments.is_empty() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__native_atomic_self_test expects 0 arguments but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+
+        // xchg: cell := 5, then xchg(cell, 7).
+        self.asm.mov_data_addr(Reg::R10, self.atomic_test_cell);
+        self.asm.mov_imm64(Reg::Rax, 5);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rcx, 7);
+        self.asm.xchg_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
+        // Check 1: rcx now holds the old memory value (5).
+        self.asm.cmp_reg_imm8(Reg::Rcx, 5);
+        self.asm.setcc_al(Condition::Equal);
+        self.asm.movzx_rax_al();
+        self.asm.mov_data_addr(Reg::R11, self.atomic_test_results);
+        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rax);
+        // Check 2: memory now holds the new value (7).
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.cmp_reg_imm8(Reg::Rax, 7);
+        self.asm.setcc_al(Condition::Equal);
+        self.asm.movzx_rax_al();
+        self.asm.mov_data_addr(Reg::R11, self.atomic_test_results);
+        self.asm.store_ptr_disp32(Reg::R11, 8, Reg::Rax);
+
+        // lock cmpxchg, matching case: cell := 10, cmpxchg(cell, rax=10, 20)
+        // should swap (10 == 10).
+        self.asm.mov_data_addr(Reg::R10, self.atomic_test_cell);
+        self.asm.mov_imm64(Reg::Rax, 10);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rax, 10);
+        self.asm.mov_imm64(Reg::Rcx, 20);
+        self.asm.lock_cmpxchg_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
+        // Check 3: memory now holds the swapped-in value (20).
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.cmp_reg_imm8(Reg::Rax, 20);
+        self.asm.setcc_al(Condition::Equal);
+        self.asm.movzx_rax_al();
+        self.asm.mov_data_addr(Reg::R11, self.atomic_test_results);
+        self.asm.store_ptr_disp32(Reg::R11, 16, Reg::Rax);
+
+        // lock cmpxchg, non-matching case: rax=10 is now stale (memory is
+        // 20), so cmpxchg(cell, rax=10, 30) must NOT swap.
+        self.asm.mov_imm64(Reg::Rax, 10);
+        self.asm.mov_imm64(Reg::Rcx, 30);
+        self.asm.lock_cmpxchg_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
+        // Save the hardware-updated rax (should be memory's actual value,
+        // 20) before the next check's setcc/movzx clobbers it.
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+        // Check 4: memory is unchanged (still 20) after the failed swap.
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.cmp_reg_imm8(Reg::Rax, 20);
+        self.asm.setcc_al(Condition::Equal);
+        self.asm.movzx_rax_al();
+        self.asm.mov_data_addr(Reg::R10, self.atomic_test_results);
+        self.asm.store_ptr_disp32(Reg::R10, 24, Reg::Rax);
+        // Check 5: rax was auto-updated to memory's actual value (20).
+        self.asm.cmp_reg_imm8(Reg::R11, 20);
+        self.asm.setcc_al(Condition::Equal);
+        self.asm.movzx_rax_al();
+        self.asm.mov_data_addr(Reg::R10, self.atomic_test_results);
+        self.asm.store_ptr_disp32(Reg::R10, 32, Reg::Rax);
+
+        // lock xadd: cell := 100, xadd(cell, 5).
+        self.asm.mov_data_addr(Reg::R10, self.atomic_test_cell);
+        self.asm.mov_imm64(Reg::Rax, 100);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rcx, 5);
+        self.asm.lock_xadd_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
+        // Check 6: rcx now holds memory's pre-add value (100).
+        self.asm.cmp_reg_imm8(Reg::Rcx, 100);
+        self.asm.setcc_al(Condition::Equal);
+        self.asm.movzx_rax_al();
+        self.asm.mov_data_addr(Reg::R11, self.atomic_test_results);
+        self.asm.store_ptr_disp32(Reg::R11, 40, Reg::Rax);
+        // Check 7: memory now holds the summed value (105).
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.cmp_reg_imm8(Reg::Rax, 105);
+        self.asm.setcc_al(Condition::Equal);
+        self.asm.movzx_rax_al();
+        self.asm.mov_data_addr(Reg::R11, self.atomic_test_results);
+        self.asm.store_ptr_disp32(Reg::R11, 48, Reg::Rax);
+
+        // Sum all 7 flags into the return value.
+        self.asm.mov_data_addr(Reg::R11, self.atomic_test_results);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        for offset in (0..7).map(|index| index * 8) {
+            self.asm.load_ptr_disp32(Reg::Rcx, Reg::R11, offset);
+            self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
+        }
         Ok(NativeValue::Int)
     }
 
@@ -41942,6 +42083,49 @@ impl Assembler {
         self.rex_w(src, base);
         self.byte(0x89);
         self.byte(0x80 | (((src as u8) & 7) << 3) | ((base as u8) & 7));
+        self.text.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `xchg [base+disp32], reg` (`87 /r`) — atomically swaps `reg` with the
+    /// 64-bit memory operand: memory receives `reg`'s old value, `reg`
+    /// receives memory's old value. A memory-operand `xchg` implicitly
+    /// asserts the CPU's LOCK signal (no explicit `F0` prefix needed — this
+    /// is one of the few x86 instructions that is atomic by default), so
+    /// this is safe to use for a spinlock's test-and-set acquire without any
+    /// extra encoding. `base` must not be `Rsp`/`R12` (no SIB byte emitted
+    /// here — same limitation as `load_ptr_disp32`/`store_ptr_disp32`).
+    fn xchg_mem_disp32_reg(&mut self, base: Reg, disp: i32, reg: Reg) {
+        self.rex_w(reg, base);
+        self.byte(0x87);
+        self.byte(0x80 | (((reg as u8) & 7) << 3) | ((base as u8) & 7));
+        self.text.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `lock cmpxchg [base+disp32], reg` (`F0 REX.W 0F B1 /r`) — atomic
+    /// compare-and-swap: compares `rax` against the 64-bit memory operand;
+    /// if equal, stores `reg` into memory and sets ZF; otherwise loads the
+    /// memory operand's actual current value into `rax` and clears ZF.
+    /// Unlike `xchg`, CMPXCHG is not implicitly locked, so the explicit
+    /// `lock` prefix is required for atomicity across threads. Same `base`
+    /// restriction as `xchg_mem_disp32_reg`.
+    fn lock_cmpxchg_mem_disp32_reg(&mut self, base: Reg, disp: i32, reg: Reg) {
+        self.byte(0xf0);
+        self.rex_w(reg, base);
+        self.bytes(&[0x0f, 0xb1]);
+        self.byte(0x80 | (((reg as u8) & 7) << 3) | ((base as u8) & 7));
+        self.text.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `lock xadd [base+disp32], reg` (`F0 REX.W 0F C1 /r`) — atomic
+    /// fetch-and-add: adds `reg` into the 64-bit memory operand, and
+    /// overwrites `reg` with the memory operand's value *before* the add.
+    /// Requires the explicit `lock` prefix (not implicitly locked). Same
+    /// `base` restriction as `xchg_mem_disp32_reg`.
+    fn lock_xadd_mem_disp32_reg(&mut self, base: Reg, disp: i32, reg: Reg) {
+        self.byte(0xf0);
+        self.rex_w(reg, base);
+        self.bytes(&[0x0f, 0xc1]);
+        self.byte(0x80 | (((reg as u8) & 7) << 3) | ((base as u8) & 7));
         self.text.extend_from_slice(&disp.to_le_bytes());
     }
 

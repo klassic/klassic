@@ -2348,6 +2348,15 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             ensure_arity(name, arguments, 0, span)?;
             Ok(Value::Int(0))
         }
+        "__native_atomic_self_test" => {
+            // The evaluator has no machine-code atomics to exercise; this
+            // stub reports "all 7 checks passed" so eval-mode programs
+            // written against this native-only test builtin still run
+            // (matching the __gc_* stub convention above), without
+            // claiming to test anything real here.
+            ensure_arity(name, arguments, 0, span)?;
+            Ok(Value::Int(7))
+        }
         "__gc_list_ptr" => {
             ensure_arity(name, arguments, 1, span)?;
             let _ = expect_non_negative_int(&arguments[0], "__gc_list_ptr", span)?;
