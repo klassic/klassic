@@ -717,3 +717,35 @@ test suite exercises re-relocating the same object, so this hasn't
 mattered yet, but it would need either a looping barrier or self-healing
 writes-back-on-resolve before double relocation of the same object could
 be trusted.
+
+**Addendum (same session, commits a273f68, 21d6d42): recommended increments 1-2 (partially) done, coverage measured twice more.**
+
+- Increment 1 (enum construction/field access) done: `compile_gc_read_qword`
+  (backs every enum field read) and `compile_gc_write` now resolve the base
+  address through the barrier *before* combining it with the byte offset —
+  the forwarding table is keyed by an object's own address, not
+  address+offset. `compile_gc_string` had the same gc_alloc-return-write
+  gap as `zgc_relocate_object` (phase 9's first commit); fixed the same
+  way, in both its branches. Coverage: 388 -> 423 passing (essentially
+  every plain-value/scalar-payload enum test moved from fail to pass).
+- Increment 2 (started): the string family's three widest shared choke
+  points now covered — `emit_heap_string_concat_from_slots` (resolves both
+  operand slots and writes the resolved value back so every later read in
+  the function needs no further change; also had the same gc_alloc-return
+  gap, fixed), `emit_heap_string_equality_from_regs` (resolves both
+  operands; callers always pass R10/R11, never rax, and since the barrier
+  clobbers r11 the second operand has to be stashed across the first
+  resolve), and `emit_append_heap_string_to_runtime_buffer_offset_label`
+  plus `emit_print_value_fragment`'s `HeapString` case (both already take
+  their pointer in rax, so no register shuffling needed). Coverage: 423 ->
+  428 passing. Remaining ~90 failures are now mostly (a) the ~20
+  independent `__gc_string_*` builtins that don't share a loader (repeat,
+  split, replace, substring, trim/case, index_of, etc.) and (b) the list/
+  map family (~24 distinct functions, audited as the most fragmented
+  area) — both explicitly anticipated as the next slices, not a surprise.
+
+Net progression across this session's three measurements: 386 -> 388 ->
+423 -> 428 passing (132 -> 130 -> 95 -> 90 failing) against the full
+518-test suite under temporarily-forced universal coloring. Real
+(committed) state is unchanged at every step: 518/518 green, `gc_alloc`
+still returns uncolored pointers.
