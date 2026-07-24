@@ -1621,6 +1621,160 @@ pub fn emit_gc_acquire_region<E: PortableAsm>(
     out.ret();
 }
 
+/// The resumable-cursor and mark cells the relocate quantum reads.
+#[derive(Clone, Copy)]
+pub struct RelocQuantumCells<D: Copy> {
+    pub reloc_scan_idx: D,
+    pub reloc_block: D,
+    pub header_mark: D,
+}
+
+/// Portable version of `gc_relocate_quantum` (V7/rdi = byte budget):
+/// linearly walk the from-space regions (resumable cursor in
+/// reloc_scan_idx / reloc_block), evacuating each live block until the
+/// budget is spent or all from-space is drained. On drain, call
+/// relocate_finish; otherwise save the block cursor for the next quantum.
+/// Frame: 8 = budget, 16 = cur, 24 = top. Reuses `RegionTables` for
+/// committed_count / region_base / region_top / region_fromspace.
+pub fn emit_gc_relocate_quantum<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    t: RegionTables<E::DataLabel>,
+    c: RelocQuantumCells<E::DataLabel>,
+    evacuate: E::TextLabel,
+    relocate_finish: E::TextLabel,
+) {
+    use crate::gc_layout::{GC_FWD, GC_REGION_SHIFT};
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    out.sub_reg_imm8(Reg::V4, 32); // 8=budget,16=cur,24=top
+    out.store_rbp_slot(8, Reg::V7);
+    let region_scan = out.create_text_label();
+    let block_loop = out.create_text_label();
+    let advance_region = out.create_text_label();
+    let not_fwd = out.create_text_label();
+    let after_block = out.create_text_label();
+    let saved_cur = out.create_text_label();
+    out.bind_text_label(region_scan);
+    // idx = gc_reloc_scan_idx; if idx >= committed -> finish.
+    out.mov_data_addr(Reg::V10, c.reloc_scan_idx);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.mov_data_addr(Reg::V10, t.committed_count);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.cmp_reg_reg(Reg::V0, Reg::V11);
+    out.jcc_label(Condition::AboveOrEqual, saved_cur);
+    // fromspace[idx]? if not, advance to next region.
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.mov_data_addr(Reg::V10, t.region_fromspace);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.test_reg_reg(Reg::V11, Reg::V11);
+    out.jcc_label(Condition::Equal, advance_region);
+    // base = region_base + (idx << SHIFT) ; top = region_top[idx].
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.shl_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.add_reg_reg(Reg::V1, Reg::V10); // base
+    out.mov_reg_reg(Reg::V8, Reg::V0);
+    out.shl_reg_imm8(Reg::V8, 3);
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V8);
+    out.load_ptr_disp32(Reg::V8, Reg::V10, 0); // top
+    out.store_rbp_slot(24, Reg::V8);
+    // cur = gc_reloc_block; if 0 use base.
+    out.mov_data_addr(Reg::V10, c.reloc_block);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    let have_cur = out.create_text_label();
+    out.jcc_label(Condition::NotEqual, have_cur);
+    out.mov_reg_reg(Reg::V0, Reg::V1); // cur = base
+    out.bind_text_label(have_cur);
+    out.store_rbp_slot(16, Reg::V0);
+    out.bind_text_label(block_loop);
+    out.load_rbp_slot(Reg::V0, 16); // cur
+    out.load_rbp_slot(Reg::V8, 24); // top
+    out.cmp_reg_reg(Reg::V0, Reg::V8);
+    out.jcc_label(Condition::AboveOrEqual, advance_region);
+    // budget <= 0 ? save cur and return.
+    out.load_rbp_slot(Reg::V1, 8);
+    out.test_reg_reg(Reg::V1, Reg::V1);
+    out.jcc_label(Condition::Equal, saved_cur);
+    out.cmp_reg_imm8(Reg::V1, 0);
+    out.jcc_label(Condition::Less, saved_cur);
+    // word0 = [cur].
+    out.load_ptr_disp32(Reg::V11, Reg::V0, 0);
+    out.mov_reg_reg(Reg::V1, Reg::V11);
+    out.and_reg_imm32(Reg::V1, GC_FWD as i32);
+    out.test_reg_reg(Reg::V1, Reg::V1);
+    out.jcc_label(Condition::Equal, not_fwd);
+    // Forwarded: size from word1 = [cur+8].
+    out.load_ptr_disp32(Reg::V1, Reg::V0, 8);
+    out.jmp_label(after_block);
+    out.bind_text_label(not_fwd);
+    // size = word0 & -16.
+    out.mov_reg_reg(Reg::V1, Reg::V11);
+    out.and_reg_imm32(Reg::V1, -16);
+    // live? (word0 & current mark bit)
+    out.mov_data_addr(Reg::V10, c.header_mark);
+    out.load_ptr_disp32(Reg::V8, Reg::V10, 0);
+    out.test_reg_reg(Reg::V11, Reg::V8);
+    out.jcc_label(Condition::Equal, after_block);
+    // Live: evacuate(cur+16). Preserve cur/size in slots; the call
+    // clobbers rax/rcx/etc. budget -= size.
+    out.store_rbp_slot(16, Reg::V0); // (cur unchanged, keep)
+    out.mov_reg_reg(Reg::V7, Reg::V0);
+    out.add_reg_imm32(Reg::V7, 16); // user ptr
+    // stash size in a callee-preserved-ish slot before the call.
+    out.push_reg(Reg::V1); // size (one push, then call — realign)
+    out.push_reg(Reg::V1); // pad to keep rsp 16-aligned
+    out.call_label(evacuate);
+    out.pop_reg(Reg::V1);
+    out.pop_reg(Reg::V1); // rcx = size
+    // budget -= size
+    out.load_rbp_slot(Reg::V0, 8);
+    out.sub_reg_reg(Reg::V0, Reg::V1);
+    out.store_rbp_slot(8, Reg::V0);
+    out.bind_text_label(after_block);
+    // cur += size (rcx). Reload cur, advance, store.
+    out.load_rbp_slot(Reg::V0, 16);
+    out.add_reg_reg(Reg::V0, Reg::V1);
+    out.store_rbp_slot(16, Reg::V0);
+    out.jmp_label(block_loop);
+    out.bind_text_label(advance_region);
+    // gc_reloc_scan_idx++ ; gc_reloc_block = 0 ; rescan.
+    out.mov_data_addr(Reg::V10, c.reloc_scan_idx);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.add_reg_imm32(Reg::V0, 1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.mov_data_addr(Reg::V10, c.reloc_block);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.jmp_label(region_scan);
+    out.bind_text_label(saved_cur);
+    // Save the block cursor for resumption. gc_relocate_finish is called
+    // only when idx >= committed.
+    out.mov_data_addr(Reg::V10, c.reloc_scan_idx);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.mov_data_addr(Reg::V10, t.committed_count);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.cmp_reg_reg(Reg::V0, Reg::V11);
+    let just_save = out.create_text_label();
+    out.jcc_label(Condition::Below, just_save);
+    out.call_label(relocate_finish);
+    out.leave();
+    out.ret();
+    out.bind_text_label(just_save);
+    out.load_rbp_slot(Reg::V0, 16);
+    out.mov_data_addr(Reg::V10, c.reloc_block);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.leave();
+    out.ret();
+}
+
 /// The evacuation bump cursor cells plus the relocated-object counter.
 #[derive(Clone, Copy)]
 pub struct EvacBumpCells<D: Copy> {
