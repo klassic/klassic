@@ -1762,10 +1762,7 @@ impl Emitter {
 
         self.asm.push(Reg::X5); // scratch buffer ptr
         self.asm.push(Reg::X2); // bytes_read
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc(); // x5 = result object
+        self.emit_alloc_raw_string(Reg::X2); // x5 = result object
         self.asm.pop(Reg::X2); // bytes_read
         self.asm.pop(Reg::X6); // scratch buffer ptr
 
@@ -2203,6 +2200,33 @@ impl Emitter {
         self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
     }
 
+    /// Allocate a GC-shaped heap string whose payload is `[len][bytes...]`,
+    /// with the character count in `len` (a caller register that is not x4,
+    /// x5 or x6). Reserves a 16-byte header `[size|mark][RAW_BYTES]` in
+    /// front and leaves the *user* pointer (block + 16) in x5, so callers
+    /// keep writing the length at `[x5 + 0]` and the bytes at `[x5 + 8]`
+    /// exactly as before -- the only visible change is the header the
+    /// collector reads once it goes live (M7). A string carries no inner
+    /// pointers, hence RAW_BYTES. `len` is preserved across the call
+    /// (emit_alloc keeps x0-x5 over a heap grow, and this only writes x4/
+    /// x5/x6).
+    fn emit_alloc_raw_string(&mut self, len: Reg) {
+        // payload = align8(len + 8): the 8-byte length field plus the bytes.
+        self.asm.add_reg_imm(Reg::X4, len, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        // block = align16(payload + 16 header).
+        self.asm.add_reg_imm(Reg::X4, Reg::X4, 16 + 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 4);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 4);
+        self.emit_alloc(); // x5 = block base, x4 = block size preserved
+        self.asm.str_imm(Reg::X4, Reg::X5, 0); // [block] = size|mark(0)
+        self.asm
+            .mov_imm64(Reg::X6, crate::gc_layout::GC_TYPE_RAW_BYTES);
+        self.asm.str_imm(Reg::X6, Reg::X5, 8); // [block + 8] = type_tag
+        self.asm.add_reg_imm(Reg::X5, Reg::X5, 16); // x5 = user pointer
+    }
+
     /// Copy `[count]` bytes between the byte pointers in `src`/`dst`;
     /// `count` reaches zero, `src`/`dst` advance, `scratch` clobbered.
     fn emit_copy_bytes(&mut self, count: Reg, src: Reg, dst: Reg, scratch: Reg) {
@@ -2224,10 +2248,7 @@ impl Emitter {
         self.asm.ldr_imm(Reg::X3, Reg::X1, 0);
         self.asm.add_reg(Reg::X2, Reg::X2, Reg::X3);
         // size = align8(total + 8 header)
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
@@ -2334,10 +2355,7 @@ impl Emitter {
     fn emit_str_ascii_case(&mut self, to_upper: bool) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
         self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X6, Reg::X5, 8);
         self.asm.mov_reg(Reg::X7, Reg::X2);
@@ -2375,10 +2393,7 @@ impl Emitter {
     fn emit_str_reverse(&mut self) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
         self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X6, Reg::X5, 8);
         self.asm.mov_reg(Reg::X8, Reg::X2);
@@ -2474,10 +2489,7 @@ impl Emitter {
         // and lost it to a heap-grow mmap when the bump allocator's
         // segment was full).
         self.asm.push(Reg::X9);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.pop(Reg::X9);
         self.asm.add_reg(Reg::X6, Reg::X3, Reg::X9);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
@@ -2525,10 +2537,7 @@ impl Emitter {
         // emit_str_trim fix for why this matters once a heap-grow
         // mmap actually fires).
         self.asm.push(Reg::X9);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.pop(Reg::X9);
 
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
@@ -2660,10 +2669,7 @@ impl Emitter {
 
         self.asm.push(Reg::X6);
         self.asm.push(Reg::X0); // total_content_len
-        self.asm.add_reg_imm(Reg::X4, Reg::X0, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc(); // x5 = result object
+        self.emit_alloc_raw_string(Reg::X0); // x5 = result object user pointer
         self.asm.pop(Reg::X12); // total_content_len
         self.asm.pop(Reg::X6); // scratch struct ptr
 
@@ -2736,10 +2742,7 @@ impl Emitter {
         self.asm.push(Reg::X12);
         self.asm.push(Reg::X2); // len
         self.asm.push(start);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc(); // x5 = new segment string object
+        self.emit_alloc_raw_string(Reg::X2); // x5 = new segment string object
         self.asm.pop(Reg::X0); // start offset
         self.asm.pop(Reg::X2); // len
         self.asm.pop(Reg::X12);
@@ -3014,10 +3017,7 @@ impl Emitter {
         self.emit_skip_chars();
         // Slice byte length, then allocate and copy.
         self.asm.sub_reg(Reg::X2, Reg::X3, Reg::X0);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
         self.emit_copy_bytes(Reg::X2, Reg::X0, Reg::X7, Reg::X3);
@@ -3030,10 +3030,7 @@ impl Emitter {
         self.asm.emit_int_digits(false);
         self.asm.add_reg_sp_imm(Reg::X2, 32);
         self.asm.sub_reg(Reg::X2, Reg::X2, Reg::X1);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
         self.emit_copy_bytes(Reg::X2, Reg::X1, Reg::X7, Reg::X3);
