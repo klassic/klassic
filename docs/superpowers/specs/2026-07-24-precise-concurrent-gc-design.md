@@ -345,3 +345,112 @@ regression instead of being flaky.
 
 All new codegen is Linux x86_64 (`DirectX86_64` backend) only — `aarch64.rs`,
 `macho.rs`, `cbackend.rs` are untouched by this design.
+
+## Phase 6 scoping: `thread()` on real threads (not started, investigated)
+
+Phases 1-5 are complete (see "Status" above). This section scopes the one
+remaining piece — investigated but deliberately **not implemented** in the
+same session, because it is qualitatively different in kind from phases
+1-5, not just in size.
+
+### Why this is a separate undertaking, not "phase 6 of the same work"
+
+Phases 1-5 each added a **new, self-contained, opt-in capability** (a new
+`__native_*_test` builtin, or a change to an internal-only codegen helper)
+that either doesn't touch any path ordinary programs exercise, or — for
+phases 4a/4b/5, which do touch the hottest paths in the backend — is
+designed so the *existing* behavior is completely unchanged unless a
+program actually calls `clone()`. Every one of those changes could be
+verified in isolation and rolled back independently if wrong.
+
+Wiring `thread(f)` itself to spawn a real OS thread is different: it
+changes the compiled output of **existing, shipped, tested Klassic
+programs** the moment they use `thread(...)` at all — there's no "opt-in"
+version of this, and it cannot be developed as an inert, unreachable
+addition the way phases 1-5 were.
+
+### What `thread()` does today (`compile_thread`, `lib.rs:18264-18297`)
+
+- Takes a zero-argument lambda. `compile_zero_arg_lambda_argument` extracts
+  its `body`, `captures` (compile-time capture list), and
+  `runtime_captures`.
+- Pushes a `QueuedThread { body, captures, runtime_captures }` onto
+  `self.queued_threads` — **no code is emitted at the call site at all.**
+- `emit_queued_threads` (called once, after top-level code, before
+  `emit_functions`) drains the queue: for each queued thread, it
+  `push_scope()`s, calls `bind_queued_thread_captures` (which — since the
+  body is about to be compiled **inline, into the same instruction
+  stream, on the same stack frame** as the surrounding code — just makes
+  the captured variables' *existing* stack slots visible under their
+  captured names; no copying, no heap boxing, no cross-thread anything),
+  `compile_expr`s the body, then `pop_scope()`s.
+- The net effect: a `thread(...)` body's captures are "free" today only
+  because it never actually leaves the enclosing stack frame. This is the
+  entire reason `tests/cli_smoke.rs::builds_native_executable_for_thread_block_local_mutable_capture`
+  can assert **exact deterministic output** ("0\n2\n5\n") from two
+  `thread()` calls sharing a mutable capture — they run in program order,
+  on one thread, with no synchronization needed because there is no
+  concurrency to synchronize.
+
+### What changes if `thread(f)` spawns a real thread
+
+1. **The body can no longer be inlined into the caller's stack frame.**
+   It must become its own standalone, `clone()`-callable entry point
+   (own prologue, own `2 MiB` mmap'd stack per phase 2/3's pattern) —
+   this part reuses phases 1-5's infrastructure directly.
+2. **Captures can no longer be "the same stack slots."** The child runs
+   on a different stack; every captured variable must be marshaled
+   somewhere both threads can reach:
+   - A captured value that's *already* a GC heap pointer (record, string,
+     enum) can be passed by pointer — cheap, and the phase 4a/4b work
+     already makes the heap and shadow-stack machinery safe for a second
+     thread to hold and trace such a pointer.
+   - A captured **scalar** (Int, Bool, Double) needs a small heap-boxed
+     cell (or a slot in a new per-spawn "capture block" allocated via
+     `gc_alloc`) so both threads read/write the same memory — this is new
+     codegen with no existing precedent to reuse.
+   - A captured **mutable** variable shared by the parent after spawning
+     (the exact case the existing determinism test exercises) needs that
+     cell to be **read/written under a lock or via `lock`-prefixed
+     atomics**, not a plain load/store — eval's `Arc<Mutex<ThreadValueSnapshot>>`
+     (`crates/klassic-eval/src/environment.rs:10-74`) is the reference
+     design for the *semantics* wanted here, but native has no equivalent
+     mechanism today and would need one built from the phase 1 atomics
+     primitives, generalized to arbitrary captured types (not just the
+     fixed-shape test data phases 1-5's builtins used).
+3. **Program exit must track outstanding threads.** Eval's
+   `ACTIVE_THREADS`/`join_active_threads` (`crates/klassic-eval/src/lib.rs:804`,
+   `577-582`) is the reference: something has to record every spawned
+   thread and join all of them before the process's final exit, or a
+   `thread(...)` body could still be mid-flight when `main` returns.
+   This also finally requires the `Exit`-vs-`ExitGroup` split noted in
+   §7 above (still not implemented) — today's plain `Exit`(60) only
+   terminates the calling thread, so main returning while a child is
+   still running would leave the child orphaned rather than terminating
+   the whole process.
+4. **The existing determinism test must change.** Two `thread()` calls
+   sharing a mutable capture, run as real concurrent threads, no longer
+   have a single well-defined output — the test needs to change from
+   asserting exact output to asserting an **invariant** that holds
+   regardless of interleaving (e.g. final value is one of a known set, or
+   the program doesn't crash and each thread's own prints appear in each
+   thread's own program order). This is a real, visible behavior change
+   to a shipped, documented language feature, not an internal-only
+   addition — it is the one piece of this whole design that is a product
+   decision as much as an engineering one, and is why it was left for
+   Kota rather than assumed.
+
+### Recommended approach for a future session
+
+Given the above, phase 6 should be its own `superpowers:brainstorming` →
+`superpowers:writing-plans` cycle (not a direct continuation of this
+document), because point 4 above is a genuine design question ("what
+should `thread()` mean now that it's real?") with more than one
+reasonable answer — e.g. keep `thread()` fire-and-forget with implicit
+join-at-exit (closest to today's surface behavior), or introduce an
+explicit handle/join primitive (a bigger language addition, but avoids
+silently changing what a very common existing pattern means). Phases
+1-5's primitives (real `clone()`, thread-safe alloc, per-thread shadow
+stacks, collection safety, disabled floor probe) are all reusable
+building blocks for whichever answer is chosen; none of that work needs
+to be redone.
