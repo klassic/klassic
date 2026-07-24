@@ -837,6 +837,55 @@ pub fn emit_gc_mark_end<E: PortableAsm>(
     out.ret();
 }
 
+/// Portable version of `gc_relocate_finish`: flush the final to-space
+/// region's watermark back into `region_top`, clear the evac cursor, then
+/// return the collector to Idle and reset the proactive-cycle byte
+/// counter. Reuses `RegionTables` for region_base / region_top; the four
+/// evac/phase labels beyond that set are passed individually.
+pub fn emit_gc_relocate_finish<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    t: RegionTables<E::DataLabel>,
+    evac_region_base: E::DataLabel,
+    evac_top: E::DataLabel,
+    phase: E::DataLabel,
+    bytes_since_cycle: E::DataLabel,
+) {
+    use crate::gc_layout::{GC_PHASE_IDLE, GC_REGION_SHIFT};
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    // Flush the final to-space region's watermark.
+    out.mov_data_addr(Reg::V10, evac_region_base);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    let no_flush = out.create_text_label();
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, no_flush);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.sub_reg_reg(Reg::V0, Reg::V11);
+    out.shr_reg_imm8(Reg::V0, GC_REGION_SHIFT);
+    out.shl_reg_imm8(Reg::V0, 3);
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V0);
+    out.mov_data_addr(Reg::V8, evac_top);
+    out.load_ptr_disp32(Reg::V2, Reg::V8, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V2);
+    out.mov_imm64(Reg::V0, 0);
+    out.mov_data_addr(Reg::V10, evac_region_base);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.bind_text_label(no_flush);
+    out.mov_data_addr(Reg::V10, phase);
+    out.mov_imm64(Reg::V0, GC_PHASE_IDLE);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.mov_data_addr(Reg::V10, bytes_since_cycle);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.leave();
+    out.ret();
+}
+
 /// Data cells the MarkStart color/phase setup writes and reloads.
 #[derive(Clone, Copy)]
 pub struct MarkStartCells<D: Copy> {

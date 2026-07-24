@@ -39722,37 +39722,26 @@ impl NativeCodeGenerator {
     /// to Idle. From-space regions stay flagged (freed at the next
     /// MarkEnd, once the next mark confirms nothing references them).
     fn emit_gc_relocate_finish_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_relocate_finish);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        // Flush the final to-space region's watermark.
-        self.asm.mov_data_addr(Reg::R10, self.gc_evac_region_base);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        let no_flush = self.asm.create_text_label();
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, no_flush);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.sub_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.shr_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
-        self.asm.shl_reg_imm8(Reg::Rax, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R8, self.gc_evac_top);
-        self.asm.load_ptr_disp32(Reg::Rdx, Reg::R8, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdx);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.mov_data_addr(Reg::R10, self.gc_evac_region_base);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.bind_text_label(no_flush);
-        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
-        self.asm.mov_imm64(Reg::Rax, Self::GC_PHASE_IDLE);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_bytes_since_cycle);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_relocate_finish;
+        let tables = portable_asm::RegionTables {
+            heap_base: self.gc_heap_base,
+            heap_top: self.gc_heap_top,
+            region_base: self.gc_region_base,
+            region_top: self.gc_region_top,
+            committed_count: self.gc_committed_count,
+            region_fromspace: self.gc_region_fromspace,
+        };
+        portable_asm::emit_gc_relocate_finish(
+            self,
+            entry,
+            tables,
+            self.gc_evac_region_base,
+            self.gc_evac_top,
+            self.gc_phase,
+            self.gc_bytes_since_cycle,
+        );
     }
 
     /// RelocateStart (fused into the MarkEnd pause). Selects the sparsest
