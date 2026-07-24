@@ -36749,7 +36749,7 @@ impl NativeCodeGenerator {
     // aliases keep the `Self::GC_*` call sites throughout this file
     // unchanged.
     const GC_REGION_SIZE: u64 = crate::gc_layout::GC_REGION_SIZE;
-    const GC_REGION_SHIFT: u8 = crate::gc_layout::GC_REGION_SHIFT;
+    // GC_REGION_SHIFT's last `Self::` user moved to the portable emitter.
     const GC_RESERVE_REGIONS: u64 = crate::gc_layout::GC_RESERVE_REGIONS;
     const GC_RESERVE_BYTES: u64 = crate::gc_layout::GC_RESERVE_BYTES;
     const GC_INITIAL_BUDGET_REGIONS: u64 = crate::gc_layout::GC_INITIAL_BUDGET_REGIONS;
@@ -37889,12 +37889,10 @@ impl NativeCodeGenerator {
     const GC_COLOR_MASK: u64 = crate::gc_layout::GC_COLOR_MASK;
     const GC_COLOR_STRIP: u64 = crate::gc_layout::GC_COLOR_STRIP;
     const GC_COLOR_BAD_MASK: u64 = crate::gc_layout::GC_COLOR_BAD_MASK;
-    const GC_QUANTUM_POPS: u64 = crate::gc_layout::GC_QUANTUM_POPS;
-    const GC_QUANTUM_BYTES: u64 = crate::gc_layout::GC_QUANTUM_BYTES;
-    // GC_PHASE_IDLE's last lib.rs user moved to the portable emitter;
-    // reference crate::gc_layout::GC_PHASE_IDLE directly if needed here.
-    const GC_PHASE_MARK: u64 = crate::gc_layout::GC_PHASE_MARK;
-    const GC_PHASE_RELOCATE: u64 = crate::gc_layout::GC_PHASE_RELOCATE;
+    // The GC phase tags and mark quantum sizes (GC_PHASE_IDLE/MARK/RELOCATE,
+    // GC_QUANTUM_POPS/BYTES) have no `Self::` users left in this file: every
+    // GC routine that referenced them moved to the portable emitter, which
+    // reads them from crate::gc_layout directly.
     // GC_FWD's last lib.rs user moved to the portable emitter; reference
     // crate::gc_layout::GC_FWD directly if needed here again.
     // GC_HMARK0 / GC_HMARK_BOTH have no direct `Self::` use left in this
@@ -38153,240 +38151,48 @@ impl NativeCodeGenerator {
     }
 
     fn emit_gc_alloc_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_alloc);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.asm.push_reg(Reg::Rbx);
-        // Reserve two qwords for locals.
-        self.asm.sub_reg_imm8(Reg::Rsp, 16);
-        // total = align_up(rdi + 16, 16)
-        self.asm.add_reg_imm32(Reg::Rdi, 16 + 15);
-        self.asm.and_reg_imm32(Reg::Rdi, -16);
-        self.asm.store_rbp_slot(16, Reg::Rdi);
-        self.asm.store_rbp_slot(24, Reg::Rsi);
-
-        let success = self.asm.create_text_label();
-        let do_collect = self.asm.create_text_label();
-        let do_grow = self.asm.create_text_label();
-        let oom = self.asm.create_text_label();
-        let after_collect = self.asm.create_text_label();
-
-        // ---- M6 incremental-mark driver ----
-        // Runs BEFORE the attempt so it observes only the mutator's
-        // already-rooted state: the previous allocation's object is
-        // rooted by now, and THIS allocation has not happened yet, so
-        // starting a cycle here cannot strand an unrooted register-only
-        // object (which the following attempt then makes allocate-black).
-        // None of the routines called here allocate, so gc_alloc is not
-        // re-entered.
-        let driver_mark = self.asm.create_text_label();
-        let driver_reloc = self.asm.create_text_label();
-        let driver_done = self.asm.create_text_label();
-        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.cmp_reg_imm8(Reg::R11, Self::GC_PHASE_MARK as i8);
-        self.asm.jcc_label(Condition::Equal, driver_mark);
-        self.asm
-            .cmp_reg_imm8(Reg::R11, Self::GC_PHASE_RELOCATE as i8);
-        self.asm.jcc_label(Condition::Equal, driver_reloc);
-        // Idle: accumulate allocation pressure since the last cycle and,
-        // once it crosses half the soft budget, start a cycle
-        // proactively (so the incremental mark has slack to finish
-        // before exhaustion; the exhaustion path is the STW fallback).
-        self.asm.mov_data_addr(Reg::R10, self.gc_bytes_since_cycle);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.load_rbp_slot(Reg::R11, 16); // total block bytes
-        self.asm.add_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // threshold = budget_regions * REGION_SIZE / 2 = budget << 16.
-        self.asm.mov_data_addr(Reg::R10, self.gc_budget_regions);
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
-        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT - 1);
-        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.jcc_label(Condition::Below, driver_done);
-        self.asm.call_label(self.gc_mark_start);
-        self.asm.jmp_label(driver_done);
-        // Mark: run one bounded quantum per GC_QUANTUM_BYTES allocated;
-        // when the worklist empties, the mark has reached fixpoint, so
-        // finish the cycle (MarkEnd sweeps and returns to Idle).
-        self.asm.bind_text_label(driver_mark);
-        self.asm
-            .mov_data_addr(Reg::R10, self.gc_bytes_since_quantum);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.load_rbp_slot(Reg::R11, 16);
-        self.asm.add_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm
-            .cmp_reg_imm32(Reg::Rax, Self::GC_QUANTUM_BYTES as i32);
-        self.asm.jcc_label(Condition::Below, driver_done);
-        // Reset to 0 (discards the remainder over the threshold, and the
-        // counter is not carried across cycles) -- a pacing detail, not
-        // correctness; the first quantum of a new cycle may fire a little
-        // early. A tuning knob for M8.
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax); // reset counter
-        self.asm.mov_imm64(Reg::Rdi, Self::GC_QUANTUM_POPS);
-        self.asm.call_label(self.gc_trace);
-        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::NotEqual, driver_done);
-        self.asm.call_label(self.gc_mark_end);
-        self.asm.jmp_label(driver_done);
-        // Relocate: run one bounded evacuation quantum per GC_QUANTUM_BYTES
-        // allocated (unreachable until the activation step enters the
-        // Relocate phase). gc_relocate_quantum returns to Idle when all
-        // from-space is drained.
-        self.asm.bind_text_label(driver_reloc);
-        self.asm
-            .mov_data_addr(Reg::R10, self.gc_bytes_since_quantum);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.load_rbp_slot(Reg::R11, 16);
-        self.asm.add_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm
-            .cmp_reg_imm32(Reg::Rax, Self::GC_QUANTUM_BYTES as i32);
-        self.asm.jcc_label(Condition::Below, driver_done);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rdi, Self::GC_QUANTUM_BYTES);
-        self.asm.call_label(self.gc_relocate_quantum);
-        self.asm.bind_text_label(driver_done);
-
-        // --gc-stress: collect before every allocation attempt. The
-        // request's own object is allocated by the attempt that
-        // follows, so collecting here only reclaims prior garbage --
-        // and turns any pointer left unrooted across an allocation into
-        // a deterministic crash. gc_collect makes its own frame and
-        // preserves this frame's rbp-relative slots.
-        if self.gc_stress {
-            self.asm.call_label(self.gc_collect);
-        }
-
-        self.emit_gc_alloc_attempt(do_collect, success);
-        // First attempt failed; run collector then retry.
-        self.asm.bind_text_label(do_collect);
-        self.asm.call_label(self.gc_collect);
-        self.asm.bind_text_label(after_collect);
-        self.emit_gc_alloc_attempt(do_grow, success);
-
-        // Collector freed no usable region — raise the soft budget and
-        // retry once more. gc_grow_budget returns rax = 1 on success and
-        // rax = 0 when even the full 64 MiB reservation cannot hold the
-        // request.
-        self.asm.bind_text_label(do_grow);
-        self.asm.load_rbp_slot(Reg::Rdi, 16);
-        self.asm.call_label(self.gc_grow_budget);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, oom);
-        self.emit_gc_alloc_attempt(oom, success);
-
-        self.asm.bind_text_label(oom);
-        self.emit_write_data(
-            self.platform.stderr_fd(),
-            self.gc_oom_text,
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper). The
+        // gc_stress / gc_log codegen flags and the oom diagnostic are
+        // resolved here and passed in.
+        let entry = self.gc_alloc;
+        let cells = portable_asm::AllocCells {
+            phase: self.gc_phase,
+            bytes_since_cycle: self.gc_bytes_since_cycle,
+            budget_regions: self.gc_budget_regions,
+            bytes_since_quantum: self.gc_bytes_since_quantum,
+            mark_worklist_top: self.gc_mark_worklist_top,
+            header_mark: self.gc_header_mark,
+            alloc_count: self.gc_alloc_count,
+            bytes_allocated: self.gc_bytes_allocated,
+            heap_top: self.gc_heap_top,
+            heap_end: self.gc_heap_end,
+            oom_text: self.gc_oom_text,
+        };
+        let targets = portable_asm::AllocTargets {
+            mark_start: self.gc_mark_start,
+            trace: self.gc_trace,
+            mark_end: self.gc_mark_end,
+            relocate_quantum: self.gc_relocate_quantum,
+            collect: self.gc_collect,
+            grow_budget: self.gc_grow_budget,
+            acquire_region: self.gc_acquire_region,
+            alloc_large: self.gc_alloc_large,
+        };
+        let flags = portable_asm::AllocFlags {
+            stress: self.gc_stress,
+            log: self.gc_log,
+        };
+        let stderr_fd = self.platform.stderr_fd();
+        portable_asm::emit_gc_alloc(
+            self,
+            entry,
+            cells,
+            targets,
+            flags,
             b"klassic gc: out of memory\n".len(),
+            stderr_fd,
         );
-        self.emit_exit_code(1);
-
-        self.asm.bind_text_label(success);
-        // Allocate-black: an object allocated during the Mark phase is
-        // born live this cycle (its current-parity header mark bit is
-        // set), so the in-progress incremental mark -- which may already
-        // be past the point where this object would be discovered -- does
-        // not reclaim it at the coming sweep. rax = user pointer, header
-        // at [rax-16]; rax must survive, so this uses r10/r11 only. Only
-        // during Mark (not Relocate: new objects go into the mutator's
-        // current region, never a from-space region).
-        let skip_black = self.asm.create_text_label();
-        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.cmp_reg_imm8(Reg::R11, Self::GC_PHASE_MARK as i8);
-        self.asm.jcc_label(Condition::NotEqual, skip_black);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::Rax, -16);
-        self.asm.mov_data_addr(Reg::R10, self.gc_header_mark);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.or_reg_reg(Reg::R11, Reg::R10);
-        self.asm.store_ptr_disp32(Reg::Rax, -16, Reg::R11);
-        self.asm.bind_text_label(skip_black);
-        // --gc-log: count this allocation and its byte size (total,
-        // header included, in slot 16). rax holds the user pointer and
-        // must survive, so the counter bumps use r10/r11 only.
-        if self.gc_log {
-            self.asm.mov_data_addr(Reg::R10, self.gc_alloc_count);
-            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-            self.asm.add_reg_imm32(Reg::R11, 1);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-            self.asm.load_rbp_slot(Reg::R11, 16); // total block bytes
-            self.asm.mov_data_addr(Reg::R10, self.gc_bytes_allocated);
-            self.asm.load_ptr_disp32(Reg::Rbx, Reg::R10, 0);
-            self.asm.add_reg_reg(Reg::Rbx, Reg::R11);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rbx);
-        }
-        // Tear down locals and return.
-        self.asm.add_reg_imm32(Reg::Rsp, 16);
-        self.asm.pop_reg(Reg::Rbx);
-        self.asm.leave();
-        self.asm.ret();
-    }
-
-    /// Inline body of an allocation attempt: bump within the current
-    /// region, acquiring a new region on boundary, or the large-object
-    /// path for requests bigger than one region. Jumps to `fail` when no
-    /// region can satisfy the request and to `success` (rax = user
-    /// pointer) on success. No per-object payload zeroing is emitted
-    /// here: a region is either fresh demand-paged (zero) memory, or a
-    /// reclaimed region that gc_acquire_region zeroed whole on reuse. So
-    /// an object's payload is always zero until its constructor writes
-    /// its fields (which the incremental collector relies on -- see
-    /// compile_gc_record).
-    fn emit_gc_alloc_attempt(&mut self, fail: TextLabel, success: TextLabel) {
-        let large = self.asm.create_text_label();
-        let need_region = self.asm.create_text_label();
-        let do_bump = self.asm.create_text_label();
-
-        // total = [rbp - 16]; requests larger than a region go the large
-        // path (a contiguous run of regions).
-        self.asm.load_rbp_slot(Reg::Rdi, 16);
-        self.asm.mov_imm64(Reg::Rcx, Self::GC_REGION_SIZE);
-        self.asm.cmp_reg_reg(Reg::Rdi, Reg::Rcx);
-        self.asm.jcc_label(Condition::Above, large);
-
-        // ---- Bump within the current region ----
-        self.asm.bind_text_label(do_bump);
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_top);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.load_rbp_slot(Reg::Rdi, 16);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::R11);
-        self.asm.add_reg_reg(Reg::Rcx, Reg::Rdi);
-        self.asm.mov_data_addr(Reg::R8, self.gc_heap_end);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
-        self.asm.cmp_reg_reg(Reg::Rcx, Reg::R8);
-        self.asm.jcc_label(Condition::Above, need_region);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
-        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rdi);
-        self.asm.load_rbp_slot(Reg::Rsi, 24);
-        self.asm.store_ptr_disp32(Reg::R11, 8, Reg::Rsi);
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.add_reg_imm32(Reg::Rax, 16);
-        self.asm.jmp_label(success);
-
-        // Current region is full: acquire a fresh empty one and retry the
-        // bump (which is guaranteed to fit, since total <= region size).
-        self.asm.bind_text_label(need_region);
-        self.asm.call_label(self.gc_acquire_region);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, fail);
-        self.asm.jmp_label(do_bump);
-
-        // ---- Large object (> one region): contiguous region run. ----
-        self.asm.bind_text_label(large);
-        self.asm.load_rbp_slot(Reg::Rdi, 16);
-        self.asm.load_rbp_slot(Reg::Rsi, 24);
-        self.asm.call_label(self.gc_alloc_large);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, fail);
-        self.asm.jmp_label(success);
     }
 
     fn emit_gc_collect_runtime(&mut self) {

@@ -1580,6 +1580,293 @@ pub fn emit_gc_relocate_finish<E: PortableAsm>(
     out.ret();
 }
 
+/// Data cells the mutator allocation entry reads/writes.
+#[derive(Clone, Copy)]
+pub struct AllocCells<D: Copy> {
+    pub phase: D,
+    pub bytes_since_cycle: D,
+    pub budget_regions: D,
+    pub bytes_since_quantum: D,
+    pub mark_worklist_top: D,
+    pub header_mark: D,
+    pub alloc_count: D,
+    pub bytes_allocated: D,
+    pub heap_top: D,
+    pub heap_end: D,
+    pub oom_text: D,
+}
+
+/// Text labels the mutator allocation entry dispatches to.
+#[derive(Clone, Copy)]
+pub struct AllocTargets<T: Copy> {
+    pub mark_start: T,
+    pub trace: T,
+    pub mark_end: T,
+    pub relocate_quantum: T,
+    pub collect: T,
+    pub grow_budget: T,
+    pub acquire_region: T,
+    pub alloc_large: T,
+}
+
+/// Host-config flags that gate mutator-allocation codegen.
+#[derive(Clone, Copy)]
+pub struct AllocFlags {
+    /// `--gc-stress`: collect before every allocation attempt.
+    pub stress: bool,
+    /// `--gc-log`: count allocations and bytes.
+    pub log: bool,
+}
+
+/// One allocation attempt: bump within the current region (acquiring a
+/// fresh one on the boundary), or the large-object run for requests
+/// bigger than one region. Jumps to `fail` when no region can satisfy the
+/// request and to `success` (V0 = user pointer) on success. Reads the
+/// aligned total from frame slot 16 and the type tag from slot 24 (set by
+/// the caller). Emitted inline three times by `emit_gc_alloc`.
+pub fn emit_gc_alloc_attempt<E: PortableAsm>(
+    out: &mut E,
+    fail: E::TextLabel,
+    success: E::TextLabel,
+    heap_top: E::DataLabel,
+    heap_end: E::DataLabel,
+    acquire_region: E::TextLabel,
+    alloc_large: E::TextLabel,
+) {
+    use crate::gc_layout::GC_REGION_SIZE;
+
+    let large = out.create_text_label();
+    let need_region = out.create_text_label();
+    let do_bump = out.create_text_label();
+
+    // total = [rbp - 16]; requests larger than a region go the large path.
+    out.load_rbp_slot(Reg::V7, 16);
+    out.mov_imm64(Reg::V1, GC_REGION_SIZE);
+    out.cmp_reg_reg(Reg::V7, Reg::V1);
+    out.jcc_label(Condition::Above, large);
+
+    // ---- Bump within the current region ----
+    out.bind_text_label(do_bump);
+    out.mov_data_addr(Reg::V10, heap_top);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.load_rbp_slot(Reg::V7, 16);
+    out.mov_reg_reg(Reg::V1, Reg::V11);
+    out.add_reg_reg(Reg::V1, Reg::V7);
+    out.mov_data_addr(Reg::V8, heap_end);
+    out.load_ptr_disp32(Reg::V8, Reg::V8, 0);
+    out.cmp_reg_reg(Reg::V1, Reg::V8);
+    out.jcc_label(Condition::Above, need_region);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V1);
+    out.store_ptr_disp32(Reg::V11, 0, Reg::V7);
+    out.load_rbp_slot(Reg::V6, 24);
+    out.store_ptr_disp32(Reg::V11, 8, Reg::V6);
+    out.mov_reg_reg(Reg::V0, Reg::V11);
+    out.add_reg_imm32(Reg::V0, 16);
+    out.jmp_label(success);
+
+    // Current region is full: acquire a fresh empty one and retry the bump
+    // (guaranteed to fit, since total <= region size).
+    out.bind_text_label(need_region);
+    out.call_label(acquire_region);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, fail);
+    out.jmp_label(do_bump);
+
+    // ---- Large object (> one region): contiguous region run. ----
+    out.bind_text_label(large);
+    out.load_rbp_slot(Reg::V7, 16);
+    out.load_rbp_slot(Reg::V6, 24);
+    out.call_label(alloc_large);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, fail);
+    out.jmp_label(success);
+}
+
+/// Portable version of `gc_alloc` (V7/rdi = payload size, V6/rsi = type
+/// tag -> V0/rax = user pointer). The mutator's allocation entry: runs the
+/// incremental-mark driver (proactive cycle start / one mark or relocate
+/// quantum), optionally `--gc-stress`-collects, then attempts the bump,
+/// retrying after a collect and a budget grow before OOM. Sets the
+/// allocate-black mark during Mark and bumps the `--gc-log` counters.
+/// Frame: pushes rbx, slot 16 = aligned total, slot 24 = type tag.
+pub fn emit_gc_alloc<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    c: AllocCells<E::DataLabel>,
+    t: AllocTargets<E::TextLabel>,
+    flags: AllocFlags,
+    oom_len: usize,
+    stderr_fd: u64,
+) {
+    use crate::gc_layout::{
+        GC_PHASE_MARK, GC_PHASE_RELOCATE, GC_QUANTUM_BYTES, GC_QUANTUM_POPS, GC_REGION_SHIFT,
+    };
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    out.push_reg(Reg::V3); // rbx
+    // Reserve two qwords for locals.
+    out.sub_reg_imm8(Reg::V4, 16);
+    // total = align_up(rdi + 16, 16)
+    out.add_reg_imm32(Reg::V7, 16 + 15);
+    out.and_reg_imm32(Reg::V7, -16);
+    out.store_rbp_slot(16, Reg::V7);
+    out.store_rbp_slot(24, Reg::V6);
+
+    let success = out.create_text_label();
+    let do_collect = out.create_text_label();
+    let do_grow = out.create_text_label();
+    let oom = out.create_text_label();
+    let after_collect = out.create_text_label();
+
+    // ---- M6 incremental-mark driver (before the attempt, so it observes
+    // only the mutator's already-rooted state). None of the routines here
+    // allocate, so gc_alloc is not re-entered.
+    let driver_mark = out.create_text_label();
+    let driver_reloc = out.create_text_label();
+    let driver_done = out.create_text_label();
+    out.mov_data_addr(Reg::V10, c.phase);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.cmp_reg_imm8(Reg::V11, GC_PHASE_MARK as i8);
+    out.jcc_label(Condition::Equal, driver_mark);
+    out.cmp_reg_imm8(Reg::V11, GC_PHASE_RELOCATE as i8);
+    out.jcc_label(Condition::Equal, driver_reloc);
+    // Idle: accumulate allocation pressure and start a cycle proactively
+    // once it crosses half the soft budget.
+    out.mov_data_addr(Reg::V10, c.bytes_since_cycle);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.load_rbp_slot(Reg::V11, 16); // total block bytes
+    out.add_reg_reg(Reg::V0, Reg::V11);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    // threshold = budget_regions * REGION_SIZE / 2 = budget << (SHIFT-1).
+    out.mov_data_addr(Reg::V10, c.budget_regions);
+    out.load_ptr_disp32(Reg::V1, Reg::V10, 0);
+    out.shl_reg_imm8(Reg::V1, GC_REGION_SHIFT - 1);
+    out.cmp_reg_reg(Reg::V0, Reg::V1);
+    out.jcc_label(Condition::Below, driver_done);
+    out.call_label(t.mark_start);
+    out.jmp_label(driver_done);
+    // Mark: run one bounded quantum per GC_QUANTUM_BYTES allocated; when
+    // the worklist empties finish the cycle via MarkEnd.
+    out.bind_text_label(driver_mark);
+    out.mov_data_addr(Reg::V10, c.bytes_since_quantum);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.load_rbp_slot(Reg::V11, 16);
+    out.add_reg_reg(Reg::V0, Reg::V11);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.cmp_reg_imm32(Reg::V0, GC_QUANTUM_BYTES as i32);
+    out.jcc_label(Condition::Below, driver_done);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0); // reset counter
+    out.mov_imm64(Reg::V7, GC_QUANTUM_POPS);
+    out.call_label(t.trace);
+    out.mov_data_addr(Reg::V10, c.mark_worklist_top);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::NotEqual, driver_done);
+    out.call_label(t.mark_end);
+    out.jmp_label(driver_done);
+    // Relocate: run one bounded evacuation quantum per GC_QUANTUM_BYTES.
+    out.bind_text_label(driver_reloc);
+    out.mov_data_addr(Reg::V10, c.bytes_since_quantum);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.load_rbp_slot(Reg::V11, 16);
+    out.add_reg_reg(Reg::V0, Reg::V11);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.cmp_reg_imm32(Reg::V0, GC_QUANTUM_BYTES as i32);
+    out.jcc_label(Condition::Below, driver_done);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.mov_imm64(Reg::V7, GC_QUANTUM_BYTES);
+    out.call_label(t.relocate_quantum);
+    out.bind_text_label(driver_done);
+
+    // --gc-stress: collect before every allocation attempt.
+    if flags.stress {
+        out.call_label(t.collect);
+    }
+
+    emit_gc_alloc_attempt(
+        out,
+        do_collect,
+        success,
+        c.heap_top,
+        c.heap_end,
+        t.acquire_region,
+        t.alloc_large,
+    );
+    // First attempt failed; run collector then retry.
+    out.bind_text_label(do_collect);
+    out.call_label(t.collect);
+    out.bind_text_label(after_collect);
+    emit_gc_alloc_attempt(
+        out,
+        do_grow,
+        success,
+        c.heap_top,
+        c.heap_end,
+        t.acquire_region,
+        t.alloc_large,
+    );
+
+    // Collector freed no usable region -- raise the soft budget and retry
+    // once more. gc_grow_budget returns 1 on success, 0 when even the full
+    // reservation cannot hold the request.
+    out.bind_text_label(do_grow);
+    out.load_rbp_slot(Reg::V7, 16);
+    out.call_label(t.grow_budget);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, oom);
+    emit_gc_alloc_attempt(
+        out,
+        oom,
+        success,
+        c.heap_top,
+        c.heap_end,
+        t.acquire_region,
+        t.alloc_large,
+    );
+
+    out.bind_text_label(oom);
+    out.plat_write_data(stderr_fd, c.oom_text, oom_len);
+    out.plat_exit(1);
+
+    out.bind_text_label(success);
+    // Allocate-black: an object allocated during Mark is born live this
+    // cycle (its current-parity header mark bit is set). rax = user
+    // pointer must survive, so this uses r10/r11 only. Only during Mark.
+    let skip_black = out.create_text_label();
+    out.mov_data_addr(Reg::V10, c.phase);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.cmp_reg_imm8(Reg::V11, GC_PHASE_MARK as i8);
+    out.jcc_label(Condition::NotEqual, skip_black);
+    out.load_ptr_disp32(Reg::V11, Reg::V0, -16);
+    out.mov_data_addr(Reg::V10, c.header_mark);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.or_reg_reg(Reg::V11, Reg::V10);
+    out.store_ptr_disp32(Reg::V0, -16, Reg::V11);
+    out.bind_text_label(skip_black);
+    // --gc-log: count this allocation and its byte size. rax holds the
+    // user pointer and must survive, so the counter bumps use r10/r11/rbx.
+    if flags.log {
+        out.mov_data_addr(Reg::V10, c.alloc_count);
+        out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+        out.add_reg_imm32(Reg::V11, 1);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V11);
+        out.load_rbp_slot(Reg::V11, 16); // total block bytes
+        out.mov_data_addr(Reg::V10, c.bytes_allocated);
+        out.load_ptr_disp32(Reg::V3, Reg::V10, 0);
+        out.add_reg_reg(Reg::V3, Reg::V11);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V3);
+    }
+    // Tear down locals and return.
+    out.add_reg_imm32(Reg::V4, 16);
+    out.pop_reg(Reg::V3);
+    out.leave();
+    out.ret();
+}
+
 /// Portable version of `gc_alloc_large` (V7/rdi = total size, V6/rsi =
 /// type tag -> V0/rax = user pointer, or 0 on budget exhaustion). Commits
 /// a contiguous run of `N = ceil(total / REGION_SIZE)` tail regions, lays
