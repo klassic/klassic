@@ -550,6 +550,55 @@ pub fn emit_gc_clear_all_marks<E: PortableAsm>(
     out.ret();
 }
 
+/// Portable version of `gc_mark_roots`: walk every shadow-stack root
+/// slot and, for each non-null pointer, call `gc_mark_visit` to mark it
+/// and push it onto the trace worklist. The sole root source for the
+/// mark. Uses two frame slots (`[rbp-8]` = cursor, `[rbp-16]` = end).
+pub fn emit_gc_mark_roots<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    shadow_stack: E::DataLabel,
+    shadow_stack_top: E::DataLabel,
+    mark_visit: E::TextLabel,
+) {
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    out.sub_reg_imm8(Reg::V4, 16);
+    out.mov_data_addr(Reg::V10, shadow_stack);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.store_rbp_slot(8, Reg::V10);
+    // end = base + top * 8
+    out.mov_data_addr(Reg::V8, shadow_stack_top);
+    out.load_ptr_disp32(Reg::V1, Reg::V8, 0);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.store_rbp_slot(16, Reg::V10);
+
+    let shadow_loop = out.create_text_label();
+    let shadow_done = out.create_text_label();
+    let shadow_skip = out.create_text_label();
+    out.bind_text_label(shadow_loop);
+    out.load_rbp_slot(Reg::V10, 8);
+    out.load_rbp_slot(Reg::V11, 16);
+    out.cmp_reg_reg(Reg::V10, Reg::V11);
+    out.jcc_label(Condition::AboveOrEqual, shadow_done);
+    // entry = [r10] is the address of a slot; deref to read the pointer.
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.load_ptr_disp32(Reg::V7, Reg::V0, 0);
+    out.test_reg_reg(Reg::V7, Reg::V7);
+    out.jcc_label(Condition::Equal, shadow_skip);
+    out.call_label(mark_visit);
+    out.bind_text_label(shadow_skip);
+    out.load_rbp_slot(Reg::V10, 8);
+    out.add_reg_imm32(Reg::V10, 8);
+    out.store_rbp_slot(8, Reg::V10);
+    out.jmp_label(shadow_loop);
+    out.bind_text_label(shadow_done);
+    out.leave();
+    out.ret();
+}
+
 /// Text labels for the subroutines `gc_stw_mark_complete` calls.
 #[derive(Clone, Copy)]
 pub struct StwMarkTargets<T: Copy> {

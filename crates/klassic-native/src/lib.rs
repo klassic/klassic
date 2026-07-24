@@ -38451,42 +38451,16 @@ impl NativeCodeGenerator {
     /// pushing each non-null root target onto the mark worklist via
     /// gc_mark_visit. The caller resets the worklist top first.
     fn emit_gc_mark_roots_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_mark_roots);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.asm.sub_reg_imm8(Reg::Rsp, 16);
-        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.store_rbp_slot(8, Reg::R10);
-        // end = base + top * 8
-        self.asm.mov_data_addr(Reg::R8, self.gc_shadow_stack_top);
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R8, 0);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.store_rbp_slot(16, Reg::R10);
-
-        let shadow_loop = self.asm.create_text_label();
-        let shadow_done = self.asm.create_text_label();
-        let shadow_skip = self.asm.create_text_label();
-        self.asm.bind_text_label(shadow_loop);
-        self.asm.load_rbp_slot(Reg::R10, 8);
-        self.asm.load_rbp_slot(Reg::R11, 16);
-        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, shadow_done);
-        // entry = [r10] is the address of a slot; deref to read the pointer.
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rax, 0);
-        self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
-        self.asm.jcc_label(Condition::Equal, shadow_skip);
-        self.asm.call_label(self.gc_mark_visit);
-        self.asm.bind_text_label(shadow_skip);
-        self.asm.load_rbp_slot(Reg::R10, 8);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.store_rbp_slot(8, Reg::R10);
-        self.asm.jmp_label(shadow_loop);
-        self.asm.bind_text_label(shadow_done);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_mark_roots;
+        portable_asm::emit_gc_mark_roots(
+            self,
+            entry,
+            self.gc_shadow_stack,
+            self.gc_shadow_stack_top,
+            self.gc_mark_visit,
+        );
     }
 
     /// Trace: drain the mark worklist, walking each pointer object's
