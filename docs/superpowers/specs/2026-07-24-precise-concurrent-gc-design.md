@@ -794,3 +794,73 @@ Coverage progression across five measurements this session: 386 -> 388
 of 518, all under the same temporarily-forced-universal-coloring probe.
 Real (committed) state stays 518/518 green and `gc_alloc` uncolored at
 every step.
+
+## Phase 10: the flip -- gc_alloc colors for real, retrofit complete
+
+**Done this session, commit d7c8c0f.** Finished routing the pointer-list/
+map family (~24 functions: `__gc_list_int_*`, `__gc_list_ptr_*`,
+`__gc_smap_*`) through the barrier, following the same per-function
+liveness-tracing discipline established in the previous phase-9 addendum
+-- one genuine near-miss avoided again (a candidate-key resolution inside
+`emit_smap_scan` needed careful tracing, though it turned out safe with
+no stack-save needed this time, unlike `__gc_list_ptr_join`'s loop).
+
+**Re-running the coverage probe after that batch found 449/518 -- big
+jump, but re-auditing every remaining `gc_alloc` call site (not just the
+ones in functions this phase touched) turned up several real gaps the
+earlier, more targeted passes had missed:**
+- `__gc_list_int` (the raw int-list constructor -- never touched before
+  this) and `__gc_list_concat` (int-list concat) had the standard
+  missing-mask / missing-resolve gaps.
+- `emit_static_string_to_heap_string` / `emit_runtime_string_to_heap_string`
+  (feeding `emit_heap_string_concat_fragment`, one of the widest-reach
+  helpers in the whole file) had the masking gap.
+- `compile_gc_pointer_count` dereferenced its argument's header with
+  zero barrier coverage.
+- The generic `Int`/`HeapPointer` arithmetic-and-comparison fallback
+  (backs low-level patterns like `__gc_alloc(n) > 0` as a null/OOM
+  check) compared a `HeapPointer`'s **raw bits** against a plain `Int`
+  -- a colored pointer's bit 63 makes it read as a large *negative*
+  number under a signed compare, so a perfectly valid, freshly
+  allocated object would fail `> 0`. Confirmed by hand with a throwaway
+  `.kl` file before fixing: `println(__gc_alloc(100) > 0)` printed
+  `false`. Fixed by resolving any `HeapPointer`-typed operand through
+  the barrier before the comparison/arithmetic, without touching the
+  (much hotter) plain-`Int` path.
+
+After fixing all of the above, the coverage probe measured **515/518**,
+then **518/518** once `compile_gc_pointer_count` (found via the last 3
+failures) was fixed too. **Every test in the existing suite passes with
+every heap allocation in the whole backend colored.**
+
+**Given that result, made the coloring permanent** (`emit_gc_alloc_runtime`
+now always sets bit 63 on its return value -- no longer a revertible
+probe). This is the actual completion of the retrofit Kota asked for:
+colored pointers and barrier-mediated dereferencing are now the default
+behavior of ordinary `gc_alloc`, not a side demo or an opt-in scheme.
+
+**Verification, matched to the stakes of this specific change:**
+- Full 518-test suite green, 3 consecutive `cargo test` runs, coloring
+  permanent (not a temporary probe).
+- Every thread/zgc/collect-tagged test (36 tests, each internally
+  looping its compiled binary ~20x) green across 5 repeated runs.
+- A fresh, hand-written `.kl` program -- not copied from the existing
+  suite -- exercising enum construction, `match`, structural equality
+  (`Circle(7) == Circle(7)` / `== Circle(8)`), string `join`/
+  `toUpperCase`, and map `get`/`size`, produced correct, byte-identical
+  output across 5 runs.
+- `cargo fmt --check` and `cargo clippy --all-targets --all-features
+  -- -D warnings` both clean.
+
+**Honest scope boundary, stated plainly:** "every heap dereference is
+barrier-safe by default" is done. "The collector automatically decides
+to relocate live objects during an ordinary collection cycle" is a
+*different*, larger, not-yet-built feature -- `gc_collect` today is
+still non-moving mark-sweep; `zgc_relocate_object` is a real, general,
+tested primitive that relocates *any* object it's explicitly handed,
+but nothing calls it automatically yet. Building an actual
+self-triggered compacting cycle (choosing a relocation set, running it
+concurrently with mutators touching real program objects rather than
+test-harness-only ones, reclaiming the vacated space) is the natural
+next phase if this campaign continues, and is scoped separately from
+"the retrofit" this phase completes.
