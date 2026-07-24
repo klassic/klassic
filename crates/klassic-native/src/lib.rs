@@ -14889,6 +14889,11 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rdi, 16);
         self.asm.mov_imm64(Reg::Rsi, GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload: gc_alloc's
+        // return isn't colored today, but this must stay correct once
+        // it is (a fresh allocation is never itself stale).
+        self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
         self.asm.mov_imm64(Reg::Rcx, MAGIC as u64);
         self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rcx);
         self.asm.mov_imm64(Reg::Rcx, COLOR_BIT);
@@ -15118,6 +15123,10 @@ impl NativeCodeGenerator {
         self.asm.add_reg_reg(Reg::Rdi, Reg::Rdx); // 16 or 32
         self.asm.mov_imm64(Reg::Rsi, GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc); // rax = new object; rbx preserved
+        // Mask defensively before writing the payload -- see the same
+        // comment in __native_zgc_relocation_test above.
+        self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
 
         self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rbx); // marker = i
         self.asm.mov_imm64(Reg::Rcx, COLOR_BIT);
@@ -40805,6 +40814,20 @@ impl NativeCodeGenerator {
         // Null check.
         self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
         self.asm.jcc_label(Condition::Equal, bail);
+        // Resolve rdi through the load barrier before treating it as a
+        // header address: a colored pointer (bit 63 set) may have been
+        // relocated since whichever caller read it from a root, a
+        // shadow-stack slot, or another object's field during trace.
+        // Every one of those call sites funnels through this one
+        // function, so resolving here once covers all of them. The
+        // worklist below is pushed with the *resolved* address, so the
+        // trace loop's own header reads (in emit_gc_collect_runtime)
+        // need no barrier of their own -- and two stale colored
+        // references to the same relocated object correctly collapse
+        // onto the same mark-bit check after resolution.
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rdi);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         // header_word = [rdi - 16]
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdi, -16);
         // Already marked? (top bit set)
@@ -40885,6 +40908,20 @@ impl NativeCodeGenerator {
         let slot_loop = self.asm.create_text_label();
         let raw_have_min = self.asm.create_text_label();
         let ptr_have_min = self.asm.create_text_label();
+
+        // Resolve both operands through the load barrier first: without
+        // this, a stale colored reference to a relocated object and the
+        // plain resolved address of that *same* object would compare
+        // unequal by raw bit pattern below, despite being the same
+        // logical value. Recursive calls (below) re-resolve their own
+        // operands the same way, so this is the only place this needs
+        // to happen.
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rdi);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rsi);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
 
         // Identical pointers (including both null) are trivially equal.
         self.asm.cmp_reg_reg(Reg::Rdi, Reg::Rsi);
@@ -40994,6 +41031,15 @@ impl NativeCodeGenerator {
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
 
+        // Resolve rdi first so the root table always holds a canonical
+        // (uncolored, current) address -- gc_unpin's identity compare
+        // below relies on that, and gc_mark_visit resolves again
+        // defensively regardless, so storing the resolved form here
+        // costs nothing and keeps the invariant simple.
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rdi);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
+
         // r10 = &table[i], r11 = end-of-table sentinel
         self.asm.mov_data_addr(Reg::R10, self.gc_root_table);
         self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
@@ -41037,6 +41083,14 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(self.gc_unpin);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+
+        // Resolve rdi to match whatever gc_pin stored (see its doc
+        // comment) -- otherwise a caller that re-derives a colored vs.
+        // resolved representation of the same address between pin and
+        // unpin would fail to find its own entry.
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rdi);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
 
         self.asm.mov_data_addr(Reg::R10, self.gc_root_table);
         self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
@@ -41581,7 +41635,15 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rbx, -16);
         self.asm.load_ptr_disp32(Reg::Rsi, Reg::Rbx, -8);
         self.asm.sub_reg_imm32(Reg::Rdi, 16);
-        self.asm.call_label(self.gc_alloc); // rax = new_addr
+        self.asm.call_label(self.gc_alloc);
+        // Mask unconditionally: gc_alloc's return value is not colored
+        // today, but this function must stay correct once it is (a
+        // fresh allocation can never itself be a stale reference, so
+        // masking -- not a full barrier resolve -- is exactly right
+        // here). The forwarding table's "new" column must hold the
+        // real, dereferenceable address either way.
+        self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rcx); // rax = new_addr
 
         // memcpy total_size - 16 bytes, one qword at a time (always a
         // multiple of 8, since total_size is 16-aligned).
