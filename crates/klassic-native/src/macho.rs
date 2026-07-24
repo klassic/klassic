@@ -13,13 +13,23 @@
 //! — and no external `codesign` / `cc` / `ld` is involved, keeping
 //! the no-toolchain policy of the direct backends.
 
-/// An `adrp`+`add` pair in `code` that must be patched to address a
-/// byte in `rodata` once the final image layout is known.
+/// Which segment a `DataFixup` addresses: the read-only `__TEXT,__const`
+/// (constants, strings) or the writable `__DATA,__bss` (the GC's cells).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FixupSection {
+    Rodata,
+    Data,
+}
+
+/// An `adrp`+`add` pair in `code` that must be patched to address a byte
+/// in `section` (at `data_offset` within it) once the final image layout
+/// is known.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DataFixup {
     pub adrp_offset: usize,
     pub add_offset: usize,
     pub data_offset: usize,
+    pub section: FixupSection,
 }
 
 const PAGE_SIZE: u64 = 16384;
@@ -42,7 +52,14 @@ const LC_BUILD_VERSION: u32 = 0x32;
 const LC_CODE_SIGNATURE: u32 = 0x1d;
 
 const VM_PROT_READ: u32 = 0x1;
+const VM_PROT_WRITE: u32 = 0x2;
 const VM_PROT_EXECUTE: u32 = 0x4;
+
+/// `S_ZEROFILL` section type: no file backing, zeroed at map time. The
+/// GC's mutable global cells live in a `__DATA,__bss` section of this
+/// type, so they add no on-disk bytes and fall outside the code
+/// signature's `codeLimit`.
+const S_ZEROFILL: u32 = 0x1;
 
 const SEGMENT_COMMAND_SIZE: u32 = 72;
 const SECTION_SIZE: u32 = 80;
@@ -104,9 +121,23 @@ pub(crate) fn write_executable(
     rodata: Vec<u8>,
     fixups: &[DataFixup],
     identifier: &str,
+    bss_size: u64,
 ) -> Vec<u8> {
+    // A writable `__DATA` segment (one zero-fill `__bss` section) is
+    // emitted only when the codegen requested mutable global cells (the
+    // GC's). It carries no on-disk bytes, so it shifts nothing in the
+    // payload or the signature — only the two extra load commands grow
+    // `sizeofcmds`, which cascades through the file offsets. When
+    // `bss_size == 0` the layout is byte-for-byte the pre-GC image.
+    let has_data = bss_size > 0;
+    let data_cmd_size = if has_data {
+        SEGMENT_COMMAND_SIZE + SECTION_SIZE
+    } else {
+        0
+    };
     let sizeofcmds = SEGMENT_COMMAND_SIZE          // __PAGEZERO
         + SEGMENT_COMMAND_SIZE + 2 * SECTION_SIZE  // __TEXT (__text, __const)
+        + data_cmd_size                            // __DATA (__bss), if any
         + SEGMENT_COMMAND_SIZE                     // __LINKEDIT
         + LOAD_DYLINKER_COMMAND_SIZE
         + MAIN_COMMAND_SIZE
@@ -114,15 +145,32 @@ pub(crate) fn write_executable(
         + DYSYMTAB_COMMAND_SIZE
         + BUILD_VERSION_COMMAND_SIZE
         + CODE_SIGNATURE_COMMAND_SIZE;
-    let ncmds = 9u32;
+    let ncmds = if has_data { 10u32 } else { 9u32 };
     let header_end = 32 + u64::from(sizeofcmds);
     let code_offset = align_to(header_end, 16);
     let rodata_offset = align_to(code_offset + code.len() as u64, 8);
     let text_filesize = align_to(rodata_offset + rodata.len() as u64, PAGE_SIZE);
+    // The zero-fill __bss adds no file bytes, so the signature still
+    // begins at the end of __TEXT regardless of the data segment.
     let signature_offset = text_filesize;
+    // __DATA maps in VM immediately after __TEXT; __LINKEDIT then moves
+    // past __DATA's (page-rounded) vm size.
+    let data_vmaddr = TEXT_BASE + text_filesize;
+    let data_vmsize = align_to(bss_size, PAGE_SIZE);
+    let linkedit_vmaddr = if has_data {
+        data_vmaddr + data_vmsize
+    } else {
+        TEXT_BASE + text_filesize
+    };
 
     for fixup in fixups {
-        patch_data_fixup(&mut code, code_offset, rodata_offset, fixup);
+        let section_base = match fixup.section {
+            FixupSection::Rodata => TEXT_BASE + rodata_offset,
+            // __DATA maps right after __TEXT; the zero-fill __bss shares
+            // the segment's vmaddr (its file offset is meaningless).
+            FixupSection::Data => data_vmaddr,
+        };
+        patch_data_fixup(&mut code, code_offset, section_base, fixup);
     }
 
     let identifier_bytes = identifier.as_bytes();
@@ -200,11 +248,42 @@ pub(crate) fn write_executable(
     out.u32(0);
     out.u32(0);
 
+    // __DATA: the GC's writable globals. One zero-fill __bss section, so
+    // the segment has no on-disk bytes (fileoff points just past __TEXT,
+    // filesize 0) and dyld zeroes the whole vm range at map time.
+    if has_data {
+        out.u32(LC_SEGMENT_64);
+        out.u32(SEGMENT_COMMAND_SIZE + SECTION_SIZE);
+        out.name16("__DATA");
+        out.u64(data_vmaddr);
+        out.u64(data_vmsize);
+        out.u64(text_filesize); // fileoff (filesize 0, so unmapped from file)
+        out.u64(0); // filesize
+        out.u32(VM_PROT_READ | VM_PROT_WRITE);
+        out.u32(VM_PROT_READ | VM_PROT_WRITE);
+        out.u32(1); // nsects
+        out.u32(0);
+
+        // __DATA,__bss
+        out.name16("__bss");
+        out.name16("__DATA");
+        out.u64(data_vmaddr);
+        out.u64(bss_size);
+        out.u32(0); // offset: S_ZEROFILL has no file backing
+        out.u32(3); // 2^3 alignment
+        out.u32(0);
+        out.u32(0);
+        out.u32(S_ZEROFILL);
+        out.u32(0);
+        out.u32(0);
+        out.u32(0);
+    }
+
     // __LINKEDIT: holds exactly the code signature.
     out.u32(LC_SEGMENT_64);
     out.u32(SEGMENT_COMMAND_SIZE);
     out.name16("__LINKEDIT");
-    out.u64(TEXT_BASE + text_filesize);
+    out.u64(linkedit_vmaddr);
     out.u64(align_to(signature_size, PAGE_SIZE));
     out.u64(signature_offset);
     out.u64(signature_size);
@@ -276,9 +355,9 @@ pub(crate) fn write_executable(
     out.bytes
 }
 
-fn patch_data_fixup(code: &mut [u8], code_offset: u64, rodata_offset: u64, fixup: &DataFixup) {
+fn patch_data_fixup(code: &mut [u8], code_offset: u64, section_base: u64, fixup: &DataFixup) {
     let place = TEXT_BASE + code_offset + fixup.adrp_offset as u64;
-    let target = TEXT_BASE + rodata_offset + fixup.data_offset as u64;
+    let target = section_base + fixup.data_offset as u64;
     let page_delta = ((target >> 12) as i64 - (place >> 12) as i64) as u64;
     let immlo = (page_delta & 0x3) as u32;
     let immhi = ((page_delta >> 2) & 0x7_ffff) as u32;
@@ -466,7 +545,7 @@ mod tests {
     fn executable_layout_is_structurally_sound() {
         let code = vec![0xd2, 0x80, 0x00, 0x40]; // mov x0, #2
         let rodata = b"hi\n".to_vec();
-        let image = write_executable(code, rodata, &[], "klassic");
+        let image = write_executable(code, rodata, &[], "klassic", 0);
 
         assert_eq!(&image[0..4], &MH_MAGIC_64.to_le_bytes());
         assert_eq!(&image[4..8], &CPU_TYPE_ARM64.to_le_bytes());
@@ -500,6 +579,82 @@ mod tests {
         assert_eq!(first_hash, &sha256(&image[..SIGN_PAGE_SIZE]));
     }
 
+    /// Walk the load commands and return the file offset of the
+    /// `LC_SEGMENT_64` whose segname matches, or `None`.
+    fn find_segment(image: &[u8], ncmds: u32, segname: &str) -> Option<usize> {
+        let mut off = 32usize;
+        for _ in 0..ncmds {
+            let cmd = u32::from_le_bytes(image[off..off + 4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(image[off + 4..off + 8].try_into().unwrap()) as usize;
+            if cmd == LC_SEGMENT_64 {
+                let name_end = image[off + 8..off + 24]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(16);
+                if &image[off + 8..off + 8 + name_end] == segname.as_bytes() {
+                    return Some(off);
+                }
+            }
+            off += cmdsize;
+        }
+        None
+    }
+
+    #[test]
+    fn writable_data_segment_is_gated_and_structurally_sound() {
+        let code = vec![0xd2, 0x80, 0x00, 0x40]; // mov x0, #2
+        let bss_size = 30 * 8; // ~30 zero-init GC cells
+        let image = write_executable(code, b"hi\n".to_vec(), &[], "klassic", bss_size);
+
+        // The data segment bumps the command count.
+        let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap());
+        assert_eq!(ncmds, 10);
+
+        // __TEXT gives us its (page-aligned) vmsize = text_filesize.
+        let text = find_segment(&image, ncmds, "__TEXT").expect("__TEXT present");
+        let text_filesize = u64::from_le_bytes(image[text + 32..text + 40].try_into().unwrap());
+
+        // __DATA: writable, one section, mapped right after __TEXT.
+        let data = find_segment(&image, ncmds, "__DATA").expect("__DATA present");
+        let data_vmaddr = u64::from_le_bytes(image[data + 24..data + 32].try_into().unwrap());
+        let data_vmsize = u64::from_le_bytes(image[data + 32..data + 40].try_into().unwrap());
+        let data_filesize = u64::from_le_bytes(image[data + 48..data + 56].try_into().unwrap());
+        let initprot = u32::from_le_bytes(image[data + 60..data + 64].try_into().unwrap());
+        let nsects = u32::from_le_bytes(image[data + 64..data + 68].try_into().unwrap());
+        assert_eq!(data_vmaddr, TEXT_BASE + text_filesize);
+        assert_eq!(data_vmsize, align_to(bss_size, PAGE_SIZE));
+        assert_eq!(data_filesize, 0, "zero-fill: no on-disk bytes");
+        assert_eq!(initprot, VM_PROT_READ | VM_PROT_WRITE);
+        assert_eq!(nsects, 1);
+
+        // __DATA,__bss section: S_ZEROFILL, no file offset, correct size.
+        let sect = data + SEGMENT_COMMAND_SIZE as usize;
+        assert_eq!(&image[sect..sect + 5], b"__bss");
+        let sect_size = u64::from_le_bytes(image[sect + 40..sect + 48].try_into().unwrap());
+        let sect_offset = u32::from_le_bytes(image[sect + 48..sect + 52].try_into().unwrap());
+        let sect_flags = u32::from_le_bytes(image[sect + 64..sect + 68].try_into().unwrap());
+        assert_eq!(sect_size, bss_size);
+        assert_eq!(sect_offset, 0);
+        assert_eq!(sect_flags, S_ZEROFILL);
+
+        // __LINKEDIT moves past __DATA in the address space.
+        let linkedit = find_segment(&image, ncmds, "__LINKEDIT").expect("__LINKEDIT present");
+        let le_vmaddr = u64::from_le_bytes(image[linkedit + 24..linkedit + 32].try_into().unwrap());
+        assert_eq!(le_vmaddr, data_vmaddr + data_vmsize);
+
+        // The zero-fill segment adds no file bytes, so the signature still
+        // begins at text_filesize and its first-page hash is valid.
+        let signature_offset = text_filesize as usize;
+        assert_eq!(
+            &image[signature_offset..signature_offset + 4],
+            &CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes()
+        );
+        let directory = &image[signature_offset + 20..];
+        let hash_offset = u32::from_be_bytes(directory[16..20].try_into().unwrap()) as usize;
+        let first_hash = &directory[hash_offset..hash_offset + SHA256_SIZE];
+        assert_eq!(first_hash, &sha256(&image[..SIGN_PAGE_SIZE]));
+    }
+
     #[test]
     fn data_fixups_resolve_page_and_offset() {
         // adrp x1, <data>; add x1, x1, #<pageoff> with the data only a
@@ -513,8 +668,9 @@ mod tests {
             adrp_offset: 0,
             add_offset: 4,
             data_offset: 0,
+            section: FixupSection::Rodata,
         }];
-        let image = write_executable(code, b"x".to_vec(), &fixups, "klassic");
+        let image = write_executable(code, b"x".to_vec(), &fixups, "klassic", 0);
         // Locate the code from the layout formula: header (32) +
         // sizeofcmds, aligned to 16.
         let sizeofcmds = u32::from_le_bytes(image[20..24].try_into().unwrap()) as u64;
@@ -524,5 +680,50 @@ mod tests {
         let add = u32::from_le_bytes(image[code_offset + 4..code_offset + 8].try_into().unwrap());
         let rodata_offset = align_to(code_offset as u64 + 8, 8) as u32;
         assert_eq!(add, 0x9100_0021 | (rodata_offset << 10));
+    }
+
+    /// Decode an `adrp xd, <page>` + `add xd, xd, #<off>` pair back to the
+    /// absolute address it computes, independent of the writer's formula.
+    fn decode_adrp_add(image: &[u8], adrp_at: usize) -> u64 {
+        let adrp = u32::from_le_bytes(image[adrp_at..adrp_at + 4].try_into().unwrap());
+        let add = u32::from_le_bytes(image[adrp_at + 4..adrp_at + 8].try_into().unwrap());
+        let immlo = ((adrp >> 29) & 0x3) as u64;
+        let immhi = ((adrp >> 5) & 0x7_ffff) as u64;
+        let mut page_delta = (immhi << 2) | immlo; // 21-bit signed
+        if page_delta & (1 << 20) != 0 {
+            page_delta |= !0 << 21; // sign-extend
+        }
+        let place = TEXT_BASE + adrp_at as u64;
+        let target_page = (place & !0xfff).wrapping_add(page_delta.wrapping_shl(12));
+        let imm12 = ((add >> 10) & 0xfff) as u64;
+        target_page + imm12
+    }
+
+    #[test]
+    fn data_section_fixups_resolve_against_data_segment() {
+        // adrp/add addressing the second GC cell (byte offset 8) in
+        // __DATA,__bss. Its target is a full segment away from the code,
+        // so the adrp page delta is non-zero (unlike the rodata case).
+        let code = vec![
+            0x01, 0x00, 0x00, 0x90, // adrp x1, 0 (placeholder)
+            0x21, 0x00, 0x00, 0x91, // add x1, x1, #0 (placeholder)
+        ];
+        let fixups = [DataFixup {
+            adrp_offset: 0,
+            add_offset: 4,
+            data_offset: 8,
+            section: FixupSection::Data,
+        }];
+        let image = write_executable(code, b"x".to_vec(), &fixups, "klassic", 16);
+
+        let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap());
+        let text = find_segment(&image, ncmds, "__TEXT").unwrap();
+        let text_filesize = u64::from_le_bytes(image[text + 32..text + 40].try_into().unwrap());
+        let data_vmaddr = TEXT_BASE + text_filesize;
+
+        let sizeofcmds = u32::from_le_bytes(image[20..24].try_into().unwrap()) as u64;
+        let code_offset = align_to(32 + sizeofcmds, 16) as usize;
+        let resolved = decode_adrp_add(&image, code_offset);
+        assert_eq!(resolved, data_vmaddr + 8);
     }
 }
