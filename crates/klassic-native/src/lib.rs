@@ -38135,33 +38135,22 @@ impl NativeCodeGenerator {
     /// there, so a pause simply reads 0). Emitted at the start of each
     /// STW pause (MarkStart, MarkEnd, and the synchronous full collect).
     fn emit_gc_pause_start(&mut self) {
-        if self.gc_log && !self.is_windows {
-            self.emit_read_monotonic_ns_to_rax();
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        }
+        // Delegated to the portable emitter; the `--gc-log`-and-not-Windows
+        // gate stays here (it is host-config state, not codegen), and the
+        // clock read is a `PortableAsm` platform primitive. Byte-identical.
+        let timing = self.gc_log && !self.is_windows;
+        let start = self.gc_pause_start_ns;
+        portable_asm::emit_gc_pause_start(self, timing, start);
     }
 
     /// Fold the elapsed pause (now - gc_pause_start_ns) into the max and
     /// total pause accumulators. Emitted at the end of each STW pause.
     fn emit_gc_pause_end(&mut self) {
-        if self.gc_log && !self.is_windows {
-            self.emit_read_monotonic_ns_to_rax();
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_start_ns);
-            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-            self.asm.sub_reg_reg(Reg::Rax, Reg::R11); // rax = delta ns
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_total_ns);
-            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-            self.asm.add_reg_reg(Reg::R11, Reg::Rax);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-            self.asm.mov_data_addr(Reg::R10, self.gc_pause_max_ns);
-            self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-            self.asm.cmp_reg_reg(Reg::Rax, Reg::R11);
-            let keep_max = self.asm.create_text_label();
-            self.asm.jcc_label(Condition::LessEqual, keep_max);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-            self.asm.bind_text_label(keep_max);
-        }
+        let timing = self.gc_log && !self.is_windows;
+        let start = self.gc_pause_start_ns;
+        let total = self.gc_pause_total_ns;
+        let max = self.gc_pause_max_ns;
+        portable_asm::emit_gc_pause_end(self, timing, start, total, max);
     }
 
     fn emit_gc_alloc_runtime(&mut self) {

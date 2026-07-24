@@ -131,6 +131,12 @@ pub trait PortableAsm {
     fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize);
     /// Terminate the process with status `code` (does not return).
     fn plat_exit(&mut self, code: u64);
+    /// Read the monotonic clock in nanoseconds into `V0`. The clock
+    /// source and its timespec ABI are platform-specific (a Linux/macOS
+    /// `clock_gettime` syscall here), so the whole read is one primitive
+    /// rather than a syscall op plus portable arithmetic. Clobbers scratch
+    /// registers (V0/V1/V8 on x86-64) like any subroutine-free helper.
+    fn plat_read_monotonic_ns(&mut self);
 }
 
 impl From<Reg> for crate::Reg {
@@ -270,6 +276,55 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
     fn plat_exit(&mut self, code: u64) {
         self.emit_exit_code(code);
+    }
+    fn plat_read_monotonic_ns(&mut self) {
+        self.emit_read_monotonic_ns_to_rax();
+    }
+}
+
+/// Portable version of the `gc_pause_start` STW-pause helper: when
+/// `timing` is set (the `--gc-log` build on a platform whose clock the
+/// backend supports), capture the monotonic clock into `pause_start_ns`;
+/// otherwise emit nothing. Inlined at the start of every STW pause.
+pub fn emit_gc_pause_start<E: PortableAsm>(
+    out: &mut E,
+    timing: bool,
+    pause_start_ns: E::DataLabel,
+) {
+    if timing {
+        out.plat_read_monotonic_ns();
+        out.mov_data_addr(Reg::V10, pause_start_ns);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    }
+}
+
+/// Portable version of the `gc_pause_end` STW-pause helper: when `timing`
+/// is set, fold the elapsed pause (`now - pause_start_ns`) into the total
+/// and max accumulators; otherwise emit nothing. Inlined at the end of
+/// every STW pause.
+pub fn emit_gc_pause_end<E: PortableAsm>(
+    out: &mut E,
+    timing: bool,
+    pause_start_ns: E::DataLabel,
+    pause_total_ns: E::DataLabel,
+    pause_max_ns: E::DataLabel,
+) {
+    if timing {
+        out.plat_read_monotonic_ns();
+        out.mov_data_addr(Reg::V10, pause_start_ns);
+        out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+        out.sub_reg_reg(Reg::V0, Reg::V11); // rax = delta ns
+        out.mov_data_addr(Reg::V10, pause_total_ns);
+        out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+        out.add_reg_reg(Reg::V11, Reg::V0);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V11);
+        out.mov_data_addr(Reg::V10, pause_max_ns);
+        out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+        out.cmp_reg_reg(Reg::V0, Reg::V11);
+        let keep_max = out.create_text_label();
+        out.jcc_label(Condition::LessEqual, keep_max);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        out.bind_text_label(keep_max);
     }
 }
 
