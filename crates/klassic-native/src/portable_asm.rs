@@ -1431,6 +1431,89 @@ pub fn emit_gc_relocate_finish<E: PortableAsm>(
     out.ret();
 }
 
+/// Portable version of `gc_alloc_large` (V7/rdi = total size, V6/rsi =
+/// type tag -> V0/rax = user pointer, or 0 on budget exhaustion). Commits
+/// a contiguous run of `N = ceil(total / REGION_SIZE)` tail regions, lays
+/// the object's header into the first, sets the first region's watermark
+/// to span the whole object, marks the member regions empty, and returns
+/// `base + 16`. Leaf (no frame). Reuses `RegionTables` for committed_count
+/// / region_base / region_top; budget_regions is the extra label.
+pub fn emit_gc_alloc_large<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    t: RegionTables<E::DataLabel>,
+    budget_regions: E::DataLabel,
+) {
+    use crate::gc_layout::{GC_REGION_SHIFT, GC_REGION_SIZE};
+
+    out.bind_text_label(entry);
+    let member_loop = out.create_text_label();
+    let member_done = out.create_text_label();
+    let fail = out.create_text_label();
+
+    // rcx = N = ceil(total / REGION_SIZE) = (total + REGION_SIZE-1) >> SHIFT
+    out.mov_reg_reg(Reg::V1, Reg::V7);
+    out.add_reg_imm32(Reg::V1, (GC_REGION_SIZE - 1) as i32);
+    out.shr_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    // r8 = committed, r9 = committed + N (new committed). Check budget.
+    out.mov_data_addr(Reg::V10, t.committed_count);
+    out.load_ptr_disp32(Reg::V8, Reg::V10, 0);
+    out.mov_reg_reg(Reg::V9, Reg::V8);
+    out.add_reg_reg(Reg::V9, Reg::V1);
+    out.mov_data_addr(Reg::V11, budget_regions);
+    out.load_ptr_disp32(Reg::V11, Reg::V11, 0);
+    out.cmp_reg_reg(Reg::V9, Reg::V11);
+    out.jcc_label(Condition::Above, fail);
+    // base_f = region_base + (committed << REGION_SHIFT).
+    out.mov_reg_reg(Reg::V0, Reg::V8);
+    out.shl_reg_imm8(Reg::V0, GC_REGION_SHIFT);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.add_reg_reg(Reg::V0, Reg::V10); // rax = base_f
+    // committed_count = committed + N.
+    out.mov_data_addr(Reg::V10, t.committed_count);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V9);
+    // Header at base_f: [base_f] = total, [base_f+8] = tag.
+    out.store_ptr_disp32(Reg::V0, 0, Reg::V7);
+    out.store_ptr_disp32(Reg::V0, 8, Reg::V6);
+    // region_top[f] = base_f + total (spans the whole run's object).
+    out.mov_reg_reg(Reg::V11, Reg::V8);
+    out.shl_reg_imm8(Reg::V11, 3);
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V11);
+    out.mov_reg_reg(Reg::V11, Reg::V0);
+    out.add_reg_reg(Reg::V11, Reg::V7);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V11);
+    // Member regions f+1 .. f+N-1: region_top[m] = its base (empty).
+    // r8 = m index (start f+1), r9 = f+N bound.
+    out.add_reg_imm32(Reg::V8, 1);
+    out.bind_text_label(member_loop);
+    out.cmp_reg_reg(Reg::V8, Reg::V9);
+    out.jcc_label(Condition::AboveOrEqual, member_done);
+    // addr = region_base + (m << REGION_SHIFT).
+    out.mov_reg_reg(Reg::V11, Reg::V8);
+    out.shl_reg_imm8(Reg::V11, GC_REGION_SHIFT);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.add_reg_reg(Reg::V11, Reg::V10); // r11 = member base
+    // region_top[m] = member base.
+    out.mov_reg_reg(Reg::V1, Reg::V8);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V11);
+    out.add_reg_imm32(Reg::V8, 1);
+    out.jmp_label(member_loop);
+    out.bind_text_label(member_done);
+    // return rax = base_f + 16.
+    out.add_reg_imm32(Reg::V0, 16);
+    out.ret();
+
+    out.bind_text_label(fail);
+    out.mov_imm64(Reg::V0, 0);
+    out.ret();
+}
+
 /// Portable version of `gc_acquire_region`: obtain a fresh mutator
 /// region -- first flushing the current region's watermark, then popping
 /// the free-region pool (zeroing the reused region so stale bytes never

@@ -39284,73 +39284,18 @@ impl NativeCodeGenerator {
     /// sweep reads exactly one block; member regions are left empty so
     /// the sweep skips them. Leaf routine.
     fn emit_gc_alloc_large_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_alloc_large);
-        let member_loop = self.asm.create_text_label();
-        let member_done = self.asm.create_text_label();
-        let fail = self.asm.create_text_label();
-
-        // rcx = N = ceil(total / REGION_SIZE) = (total + REGION_SIZE-1) >> SHIFT
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
-        self.asm
-            .add_reg_imm32(Reg::Rcx, (Self::GC_REGION_SIZE - 1) as i32);
-        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
-        // r8 = committed, r9 = committed + N (new committed). Check budget.
-        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
-        self.asm.mov_reg_reg(Reg::R9, Reg::R8);
-        self.asm.add_reg_reg(Reg::R9, Reg::Rcx);
-        self.asm.mov_data_addr(Reg::R11, self.gc_budget_regions);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R11, 0);
-        self.asm.cmp_reg_reg(Reg::R9, Reg::R11);
-        self.asm.jcc_label(Condition::Above, fail);
-        // base_f = region_base + (committed << REGION_SHIFT).
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
-        self.asm.shl_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.add_reg_reg(Reg::Rax, Reg::R10); // rax = base_f
-        // committed_count = committed + N.
-        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
-        // Header at base_f: [base_f] = total, [base_f+8] = tag.
-        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rdi);
-        self.asm.store_ptr_disp32(Reg::Rax, 8, Reg::Rsi);
-        // region_top[f] = base_f + total (spans the whole run's object).
-        self.asm.mov_reg_reg(Reg::R11, Reg::R8);
-        self.asm.shl_reg_imm8(Reg::R11, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::R11);
-        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
-        self.asm.add_reg_reg(Reg::R11, Reg::Rdi);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-        // Member regions f+1 .. f+N-1: region_top[m] = its base (empty).
-        // r8 = m index (start f+1), r9 = f+N bound.
-        self.asm.add_reg_imm32(Reg::R8, 1);
-        self.asm.bind_text_label(member_loop);
-        self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
-        self.asm.jcc_label(Condition::AboveOrEqual, member_done);
-        // addr = region_base + (m << REGION_SHIFT).
-        self.asm.mov_reg_reg(Reg::R11, Reg::R8);
-        self.asm.shl_reg_imm8(Reg::R11, Self::GC_REGION_SHIFT);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.add_reg_reg(Reg::R11, Reg::R10); // r11 = member base
-        // region_top[m] = member base.
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::R8);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-        self.asm.add_reg_imm32(Reg::R8, 1);
-        self.asm.jmp_label(member_loop);
-        self.asm.bind_text_label(member_done);
-        // return rax = base_f + 16.
-        self.asm.add_reg_imm32(Reg::Rax, 16);
-        self.asm.ret();
-
-        self.asm.bind_text_label(fail);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_alloc_large;
+        let tables = portable_asm::RegionTables {
+            heap_base: self.gc_heap_base,
+            heap_top: self.gc_heap_top,
+            region_base: self.gc_region_base,
+            region_top: self.gc_region_top,
+            committed_count: self.gc_committed_count,
+            region_fromspace: self.gc_region_fromspace,
+        };
+        portable_asm::emit_gc_alloc_large(self, entry, tables, self.gc_budget_regions);
     }
 
     /// `gc_grow_budget(rdi = total)`: raise the soft region budget after
