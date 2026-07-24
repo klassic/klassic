@@ -38881,89 +38881,27 @@ impl NativeCodeGenerator {
     /// only copies, never allocates through gc_alloc. Preserves the
     /// reserved color registers.
     fn emit_gc_evacuate_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_evacuate);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.asm.sub_reg_imm8(Reg::Rsp, 16); // [rbp-8]=oldP, [rbp-16]=size
-        let copy = self.asm.create_text_label();
-        let epilogue = self.asm.create_text_label();
-        let retry = self.asm.create_text_label();
-        let fits = self.asm.create_text_label();
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdi, -16);
-        // Already forwarded? rax & FWD.
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.and_reg_imm32(Reg::Rcx, Self::GC_FWD as i32);
-        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
-        self.asm.jcc_label(Condition::Equal, copy);
-        self.asm.and_reg_imm32(Reg::Rax, -16); // to-space user ptr
-        self.asm.jmp_label(epilogue);
-        self.asm.bind_text_label(copy);
-        self.asm.store_rbp_slot(8, Reg::Rdi); // oldP
-        self.asm.and_reg_imm32(Reg::Rax, -16); // size S
-        self.asm.store_rbp_slot(16, Reg::Rax);
-        // An object that does not fit one to-space region can never be
-        // evacuated (the refill loop below would spin forever). Selection
-        // guarantees this never happens (large objects are excluded and
-        // from-space objects are < REGION_SIZE/2), so treat it as an
-        // invariant violation and abort cleanly rather than hang.
-        let evac_size_ok = self.asm.create_text_label();
-        let evac_oversized = self.asm.create_text_label();
-        self.asm
-            .cmp_reg_imm32(Reg::Rax, Self::GC_REGION_SIZE as i32);
-        self.asm.jcc_label(Condition::Above, evac_oversized);
-        self.asm.jmp_label(evac_size_ok);
-        self.asm.bind_text_label(evac_oversized);
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper). The
+        // oversized-diagnostic label and stderr fd are resolved here.
+        let entry = self.gc_evacuate;
         let msg = b"klassic gc: evacuation object exceeds a region\n";
         let txt = self.asm.data_label_with_bytes(msg);
-        self.emit_write_data(self.platform.stderr_fd(), txt, msg.len());
-        self.emit_exit_code(1);
-        self.asm.bind_text_label(evac_size_ok);
-        let need_refill = self.asm.create_text_label();
-        self.asm.bind_text_label(retry);
-        self.asm.mov_data_addr(Reg::R10, self.gc_evac_top);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0); // dst = evac_top
-        self.asm.load_rbp_slot(Reg::Rdx, 16); // S
-        self.asm.mov_reg_reg(Reg::R9, Reg::R8);
-        self.asm.add_reg_reg(Reg::R9, Reg::Rdx); // new_top = dst + S
-        self.asm.mov_data_addr(Reg::R10, self.gc_evac_end);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.cmp_reg_reg(Reg::R9, Reg::R11);
-        self.asm.jcc_label(Condition::Above, need_refill); // new_top > end
-        self.asm.jmp_label(fits);
-        // Refill to-space (never fails: headroom invariant).
-        self.asm.bind_text_label(need_refill);
-        self.asm.load_rbp_slot(Reg::Rdi, 16); // size
-        self.asm.call_label(self.gc_acquire_evac_region);
-        self.asm.jmp_label(retry);
-        self.asm.bind_text_label(fits);
-        self.asm.mov_data_addr(Reg::R10, self.gc_evac_top);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9); // bump
-        // memcpy S bytes: rsi = oldP-16, rdi = dst (r8), rcx = S.
-        self.asm.load_rbp_slot(Reg::Rsi, 8);
-        self.asm.sub_reg_imm8(Reg::Rsi, 16);
-        self.asm.mov_reg_reg(Reg::Rdi, Reg::R8);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdx);
-        self.asm.rep_movsb(); // clobbers rsi/rdi/rcx; r8 survives
-        // n_user = dst + 16.
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
-        self.asm.add_reg_imm32(Reg::Rax, 16);
-        // Install forwarding in the OLD header: [oldP-16] = n_user | FWD.
-        self.asm.load_rbp_slot(Reg::R11, 8); // oldP
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rdx, Self::GC_FWD);
-        self.asm.or_reg_reg(Reg::Rcx, Reg::Rdx);
-        self.asm.store_ptr_disp32(Reg::R11, -16, Reg::Rcx);
-        // [oldP-8] = S (word1, size for the relocate walk).
-        self.asm.load_rbp_slot(Reg::Rcx, 16);
-        self.asm.store_ptr_disp32(Reg::R11, -8, Reg::Rcx);
-        // Count this evacuation (--gc-log). rax = n_user must survive.
-        self.asm.mov_data_addr(Reg::R10, self.gc_relocated_count);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.add_reg_imm32(Reg::R11, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-        self.asm.bind_text_label(epilogue);
-        self.asm.leave();
-        self.asm.ret();
+        let stderr_fd = self.platform.stderr_fd();
+        let cells = portable_asm::EvacBumpCells {
+            evac_top: self.gc_evac_top,
+            evac_end: self.gc_evac_end,
+            relocated_count: self.gc_relocated_count,
+        };
+        portable_asm::emit_gc_evacuate(
+            self,
+            entry,
+            cells,
+            self.gc_acquire_evac_region,
+            txt,
+            msg.len(),
+            stderr_fd,
+        );
     }
 
     /// Fix up all roots at RelocateStart: walk the shadow stack and, for

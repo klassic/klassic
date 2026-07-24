@@ -129,6 +129,10 @@ pub trait PortableAsm {
     /// so a following Below/AboveOrEqual jump branches on it without a
     /// scratch register.
     fn bt_reg_imm8(&mut self, r: Reg, bit: u8);
+    /// Block copy of V1 (rcx) bytes from [V6/rsi] to [V7/rdi] (x86-64
+    /// `rep movsb`); clobbers V1/V6/V7. A byte memcpy primitive; a future
+    /// backend lowers it to its own copy loop/instruction.
+    fn rep_movsb(&mut self);
 
     // Platform primitives. These are the genuinely platform-DEPENDENT
     // operations the collector needs -- the OS interface, not an
@@ -296,6 +300,9 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
     fn bt_reg_imm8(&mut self, r: Reg, bit: u8) {
         self.asm.bt_reg_imm8(r.into(), bit);
+    }
+    fn rep_movsb(&mut self) {
+        self.asm.rep_movsb();
     }
 
     fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize) {
@@ -1528,6 +1535,113 @@ pub fn emit_gc_acquire_region<E: PortableAsm>(
 
     out.bind_text_label(fail);
     out.mov_imm64(Reg::V0, 0);
+    out.ret();
+}
+
+/// The evacuation bump cursor cells plus the relocated-object counter.
+#[derive(Clone, Copy)]
+pub struct EvacBumpCells<D: Copy> {
+    pub evac_top: D,
+    pub evac_end: D,
+    pub relocated_count: D,
+}
+
+/// Portable version of `gc_evacuate` (V7/rdi = user pointer -> V0/rax =
+/// to-space user pointer). Idempotent: follows an existing forwarding
+/// word. Otherwise copies the whole block into the evacuation bump
+/// (refilling the to-space region as needed, aborting on an oversized
+/// object that selection should have excluded), installs a forwarding
+/// word `new_user | FWD` in the old header, stashes the size in the old
+/// word1 for the relocate walk, and bumps the --gc-log relocated counter.
+/// Non-recursive (only copies). Frame: [rbp-8] = oldP, [rbp-16] = size.
+pub fn emit_gc_evacuate<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    c: EvacBumpCells<E::DataLabel>,
+    acquire_evac_region: E::TextLabel,
+    oversized_msg: E::DataLabel,
+    oversized_len: usize,
+    stderr_fd: u64,
+) {
+    use crate::gc_layout::{GC_FWD, GC_REGION_SIZE};
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    out.sub_reg_imm8(Reg::V4, 16); // [rbp-8]=oldP, [rbp-16]=size
+    let copy = out.create_text_label();
+    let epilogue = out.create_text_label();
+    let retry = out.create_text_label();
+    let fits = out.create_text_label();
+    out.load_ptr_disp32(Reg::V0, Reg::V7, -16);
+    // Already forwarded? rax & FWD.
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.and_reg_imm32(Reg::V1, GC_FWD as i32);
+    out.test_reg_reg(Reg::V1, Reg::V1);
+    out.jcc_label(Condition::Equal, copy);
+    out.and_reg_imm32(Reg::V0, -16); // to-space user ptr
+    out.jmp_label(epilogue);
+    out.bind_text_label(copy);
+    out.store_rbp_slot(8, Reg::V7); // oldP
+    out.and_reg_imm32(Reg::V0, -16); // size S
+    out.store_rbp_slot(16, Reg::V0);
+    // An object that does not fit one to-space region can never be
+    // evacuated (the refill loop would spin forever). Selection guarantees
+    // this never happens; treat it as an invariant violation and abort.
+    let evac_size_ok = out.create_text_label();
+    let evac_oversized = out.create_text_label();
+    out.cmp_reg_imm32(Reg::V0, GC_REGION_SIZE as i32);
+    out.jcc_label(Condition::Above, evac_oversized);
+    out.jmp_label(evac_size_ok);
+    out.bind_text_label(evac_oversized);
+    out.plat_write_data(stderr_fd, oversized_msg, oversized_len);
+    out.plat_exit(1);
+    out.bind_text_label(evac_size_ok);
+    let need_refill = out.create_text_label();
+    out.bind_text_label(retry);
+    out.mov_data_addr(Reg::V10, c.evac_top);
+    out.load_ptr_disp32(Reg::V8, Reg::V10, 0); // dst = evac_top
+    out.load_rbp_slot(Reg::V2, 16); // S
+    out.mov_reg_reg(Reg::V9, Reg::V8);
+    out.add_reg_reg(Reg::V9, Reg::V2); // new_top = dst + S
+    out.mov_data_addr(Reg::V10, c.evac_end);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.cmp_reg_reg(Reg::V9, Reg::V11);
+    out.jcc_label(Condition::Above, need_refill); // new_top > end
+    out.jmp_label(fits);
+    // Refill to-space (never fails: headroom invariant).
+    out.bind_text_label(need_refill);
+    out.load_rbp_slot(Reg::V7, 16); // size
+    out.call_label(acquire_evac_region);
+    out.jmp_label(retry);
+    out.bind_text_label(fits);
+    out.mov_data_addr(Reg::V10, c.evac_top);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V9); // bump
+    // memcpy S bytes: rsi = oldP-16, rdi = dst (r8), rcx = S.
+    out.load_rbp_slot(Reg::V6, 8);
+    out.sub_reg_imm8(Reg::V6, 16);
+    out.mov_reg_reg(Reg::V7, Reg::V8);
+    out.mov_reg_reg(Reg::V1, Reg::V2);
+    out.rep_movsb(); // clobbers rsi/rdi/rcx; r8 survives
+    // n_user = dst + 16.
+    out.mov_reg_reg(Reg::V0, Reg::V8);
+    out.add_reg_imm32(Reg::V0, 16);
+    // Install forwarding in the OLD header: [oldP-16] = n_user | FWD.
+    out.load_rbp_slot(Reg::V11, 8); // oldP
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.mov_imm64(Reg::V2, GC_FWD);
+    out.or_reg_reg(Reg::V1, Reg::V2);
+    out.store_ptr_disp32(Reg::V11, -16, Reg::V1);
+    // [oldP-8] = S (word1, size for the relocate walk).
+    out.load_rbp_slot(Reg::V1, 16);
+    out.store_ptr_disp32(Reg::V11, -8, Reg::V1);
+    // Count this evacuation (--gc-log). rax = n_user must survive.
+    out.mov_data_addr(Reg::V10, c.relocated_count);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.add_reg_imm32(Reg::V11, 1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V11);
+    out.bind_text_label(epilogue);
+    out.leave();
     out.ret();
 }
 
