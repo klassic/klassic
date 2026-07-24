@@ -37895,11 +37895,12 @@ impl NativeCodeGenerator {
     const GC_PHASE_MARK: u64 = crate::gc_layout::GC_PHASE_MARK;
     const GC_PHASE_RELOCATE: u64 = crate::gc_layout::GC_PHASE_RELOCATE;
     const GC_FWD: u64 = crate::gc_layout::GC_FWD;
-    // GC_HMARK0 has no direct `Self::` use in this file (its only prior
-    // reference was inside GC_HMARK_BOTH's definition, now in gc_layout);
-    // reference it via `crate::gc_layout::GC_HMARK0` if ever needed.
+    // GC_HMARK0 / GC_HMARK_BOTH have no direct `Self::` use left in this
+    // file: HMARK0's only reference was inside HMARK_BOTH's definition
+    // (now in gc_layout), and HMARK_BOTH's last user (gc_mark_start) moved
+    // to the portable emitter. Reference them via `crate::gc_layout::` if
+    // ever needed here again.
     const GC_HMARK1: u64 = crate::gc_layout::GC_HMARK1;
-    const GC_HMARK_BOTH: u64 = crate::gc_layout::GC_HMARK_BOTH;
 
     /// Initialize the reserved color registers once, before any user
     /// code or collector routine runs. r13 = strip mask, r14 = good
@@ -38856,82 +38857,34 @@ impl NativeCodeGenerator {
     /// reload the reserved color-register caches, reset the worklist,
     /// scan roots, and enter the Mark phase. O(roots).
     fn emit_gc_mark_start_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_mark_start);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.emit_gc_pause_start(); // MarkStart is a short STW pause (O(roots)).
-        // M7: toggle the header mark parity (bits 1-2) so this cycle marks
-        // with the OTHER bit than the last cycle -- a live object surviving
-        // multiple cycles is thus re-marked each cycle, and the sweep
-        // clears the now-stale parity. Must precede gc_mark_roots (which
-        // sets the current mark bit on roots).
-        self.asm.mov_data_addr(Reg::R10, self.gc_header_mark);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.mov_imm64(Reg::R11, Self::GC_HMARK_BOTH);
-        self.asm.xor_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // Enter the Mark phase's color config. The mark color toggles
-        // M0<->M1 each cycle. Good becomes the new mark color; bad catches
-        // the other two colors so any pointer NOT at the new mark color
-        // (an R-colored Idle pointer, or a stale old-mark-color pointer)
-        // slow-paths and is remapped + marked (incremental update).
-        if self.gc_evac_off {
-            // M6 scheme: good flips M0<->M1 directly via gc_good_color.
-            self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
-            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0); // old good
-            if self.gc_poison {
-                self.asm.mov_imm64(Reg::Rcx, Self::GC_COLOR_MASK);
-            } else {
-                self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-                self.asm.mov_imm64(Reg::R11, Self::GC_COLOR_R);
-                self.asm.or_reg_reg(Reg::Rcx, Reg::R11); // old_good | R
-            }
-            self.asm.mov_data_addr(Reg::R11, self.gc_bad_mask);
-            self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rcx);
-            self.asm
-                .mov_imm64(Reg::Rcx, Self::GC_COLOR_M0 | Self::GC_COLOR_M1);
-            self.asm.xor_reg_reg(Reg::Rax, Reg::Rcx);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        } else {
-            // R scheme: toggle the persistent mark color, then good =
-            // mark color, bad = (M0|M1|R) ^ mark color.
-            self.asm.mov_data_addr(Reg::R10, self.gc_mark_color);
-            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-            self.asm
-                .mov_imm64(Reg::Rcx, Self::GC_COLOR_M0 | Self::GC_COLOR_M1);
-            self.asm.xor_reg_reg(Reg::Rax, Reg::Rcx); // new mark color
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-            self.asm.mov_data_addr(Reg::R10, self.gc_good_color);
-            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax); // good = mark color
-            if self.gc_poison {
-                self.asm.mov_imm64(Reg::Rcx, Self::GC_COLOR_MASK);
-            } else {
-                self.asm.mov_imm64(
-                    Reg::Rcx,
-                    Self::GC_COLOR_M0 | Self::GC_COLOR_M1 | Self::GC_COLOR_R,
-                );
-                self.asm.xor_reg_reg(Reg::Rcx, Reg::Rax); // (M0|M1|R) ^ mark
-            }
-            self.asm.mov_data_addr(Reg::R11, self.gc_bad_mask);
-            self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rcx);
-        }
-        // Reload the caches from the cells.
-        self.asm.mov_data_addr(Reg::R14, self.gc_good_color);
-        self.asm.load_ptr_disp32(Reg::R14, Reg::R14, 0);
-        self.asm.mov_data_addr(Reg::R15, self.gc_bad_mask);
-        self.asm.load_ptr_disp32(Reg::R15, Reg::R15, 0);
-        // Reset the worklist and scan roots into it (marked new-color).
-        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.call_label(self.gc_mark_roots);
-        // Enter the Mark phase.
-        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
-        self.asm.mov_imm64(Reg::Rax, Self::GC_PHASE_MARK);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.emit_gc_pause_end();
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper). The two
+        // host-config flags that selected inline `if` branches -- evac_off
+        // and poison -- are passed through so the same code is chosen.
+        let entry = self.gc_mark_start;
+        let timing = self.gc_log && !self.is_windows;
+        let pause = self.gc_pause_cells();
+        let cells = portable_asm::MarkStartCells {
+            header_mark: self.gc_header_mark,
+            good_color: self.gc_good_color,
+            bad_mask: self.gc_bad_mask,
+            mark_color: self.gc_mark_color,
+            worklist_top: self.gc_mark_worklist_top,
+            phase: self.gc_phase,
+        };
+        let mode = portable_asm::MarkColorMode {
+            evac_off: self.gc_evac_off,
+            poison: self.gc_poison,
+        };
+        portable_asm::emit_gc_mark_start(
+            self,
+            entry,
+            timing,
+            pause,
+            cells,
+            self.gc_mark_roots,
+            mode,
+        );
     }
 
     /// MarkEnd (short STW pause): finish the cycle. If the worklist

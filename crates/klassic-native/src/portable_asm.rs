@@ -111,6 +111,7 @@ pub trait PortableAsm {
     fn add_reg_reg(&mut self, dst: Reg, src: Reg);
     fn sub_reg_reg(&mut self, dst: Reg, src: Reg);
     fn or_reg_reg(&mut self, dst: Reg, src: Reg);
+    fn xor_reg_reg(&mut self, dst: Reg, src: Reg);
     fn cmp_reg_reg(&mut self, a: Reg, b: Reg);
     /// Compare `a & b` against zero, setting flags (x86-64 `test`).
     fn test_reg_reg(&mut self, a: Reg, b: Reg);
@@ -245,6 +246,9 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
     fn or_reg_reg(&mut self, dst: Reg, src: Reg) {
         self.asm.or_reg_reg(dst.into(), src.into());
+    }
+    fn xor_reg_reg(&mut self, dst: Reg, src: Reg) {
+        self.asm.xor_reg_reg(dst.into(), src.into());
     }
     fn cmp_reg_reg(&mut self, a: Reg, b: Reg) {
         self.asm.cmp_reg_reg(a.into(), b.into());
@@ -828,6 +832,127 @@ pub fn emit_gc_mark_end<E: PortableAsm>(
     // until the activation step it just returns to Idle and resets the
     // proactive-trigger counter.
     out.call_label(targets.relocate_start);
+    emit_gc_pause_end(out, timing, pause);
+    out.leave();
+    out.ret();
+}
+
+/// Data cells the MarkStart color/phase setup writes and reloads.
+#[derive(Clone, Copy)]
+pub struct MarkStartCells<D: Copy> {
+    pub header_mark: D,
+    pub good_color: D,
+    pub bad_mask: D,
+    pub mark_color: D,
+    pub worklist_top: D,
+    pub phase: D,
+}
+
+/// Host-config flags that select which MarkStart color scheme is emitted.
+/// Both are compile-time constants for a given build, so they pick a code
+/// path exactly as the original inline `if`s did.
+#[derive(Clone, Copy)]
+pub struct MarkColorMode {
+    /// M6 scheme (good flips M0<->M1 directly) instead of the R scheme.
+    pub evac_off: bool,
+    /// `--gc-poison`: force `bad = COLOR_MASK` so every non-good pointer
+    /// slow-paths (the barrier-coverage canary).
+    pub poison: bool,
+}
+
+/// Portable version of `gc_mark_start` (short STW pause): flip the header
+/// mark parity and the collector's color config to the new cycle, reload
+/// the reserved color-register caches (GoodColor / BadMask), reset the
+/// worklist, scan roots, and enter the Mark phase. O(roots).
+///
+/// `evac_off` selects the M6 scheme (good flips M0<->M1 directly) vs the
+/// R scheme (a persistent mark color toggles and good/bad derive from
+/// it). `poison` forces `bad = COLOR_MASK` so every non-good pointer
+/// slow-paths (the `--gc-poison` barrier-coverage canary). Both are host
+/// config, passed in as flags so the emitted code is chosen the same way
+/// the original inline `if` did.
+pub fn emit_gc_mark_start<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    timing: bool,
+    pause: PauseCells<E::DataLabel>,
+    cells: MarkStartCells<E::DataLabel>,
+    mark_roots: E::TextLabel,
+    mode: MarkColorMode,
+) {
+    use crate::gc_layout::{
+        GC_COLOR_M0, GC_COLOR_M1, GC_COLOR_MASK, GC_COLOR_R, GC_HMARK_BOTH, GC_PHASE_MARK,
+    };
+    let MarkColorMode { evac_off, poison } = mode;
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    emit_gc_pause_start(out, timing, pause); // MarkStart is a short STW pause (O(roots)).
+    // M7: toggle the header mark parity (bits 1-2) so this cycle marks
+    // with the OTHER bit than the last cycle -- a live object surviving
+    // multiple cycles is thus re-marked each cycle, and the sweep clears
+    // the now-stale parity. Must precede gc_mark_roots (which sets the
+    // current mark bit on roots).
+    out.mov_data_addr(Reg::V10, cells.header_mark);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.mov_imm64(Reg::V11, GC_HMARK_BOTH);
+    out.xor_reg_reg(Reg::V0, Reg::V11);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    // Enter the Mark phase's color config. The mark color toggles M0<->M1
+    // each cycle. Good becomes the new mark color; bad catches the other
+    // two colors so any pointer NOT at the new mark color (an R-colored
+    // Idle pointer, or a stale old-mark-color pointer) slow-paths and is
+    // remapped + marked (incremental update).
+    if evac_off {
+        // M6 scheme: good flips M0<->M1 directly via gc_good_color.
+        out.mov_data_addr(Reg::V10, cells.good_color);
+        out.load_ptr_disp32(Reg::V0, Reg::V10, 0); // old good
+        if poison {
+            out.mov_imm64(Reg::V1, GC_COLOR_MASK);
+        } else {
+            out.mov_reg_reg(Reg::V1, Reg::V0);
+            out.mov_imm64(Reg::V11, GC_COLOR_R);
+            out.or_reg_reg(Reg::V1, Reg::V11); // old_good | R
+        }
+        out.mov_data_addr(Reg::V11, cells.bad_mask);
+        out.store_ptr_disp32(Reg::V11, 0, Reg::V1);
+        out.mov_imm64(Reg::V1, GC_COLOR_M0 | GC_COLOR_M1);
+        out.xor_reg_reg(Reg::V0, Reg::V1);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    } else {
+        // R scheme: toggle the persistent mark color, then good = mark
+        // color, bad = (M0|M1|R) ^ mark color.
+        out.mov_data_addr(Reg::V10, cells.mark_color);
+        out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+        out.mov_imm64(Reg::V1, GC_COLOR_M0 | GC_COLOR_M1);
+        out.xor_reg_reg(Reg::V0, Reg::V1); // new mark color
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        out.mov_data_addr(Reg::V10, cells.good_color);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0); // good = mark color
+        if poison {
+            out.mov_imm64(Reg::V1, GC_COLOR_MASK);
+        } else {
+            out.mov_imm64(Reg::V1, GC_COLOR_M0 | GC_COLOR_M1 | GC_COLOR_R);
+            out.xor_reg_reg(Reg::V1, Reg::V0); // (M0|M1|R) ^ mark
+        }
+        out.mov_data_addr(Reg::V11, cells.bad_mask);
+        out.store_ptr_disp32(Reg::V11, 0, Reg::V1);
+    }
+    // Reload the caches from the cells.
+    out.mov_data_addr(Reg::GoodColor, cells.good_color);
+    out.load_ptr_disp32(Reg::GoodColor, Reg::GoodColor, 0);
+    out.mov_data_addr(Reg::BadMask, cells.bad_mask);
+    out.load_ptr_disp32(Reg::BadMask, Reg::BadMask, 0);
+    // Reset the worklist and scan roots into it (marked new-color).
+    out.mov_data_addr(Reg::V10, cells.worklist_top);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.call_label(mark_roots);
+    // Enter the Mark phase.
+    out.mov_data_addr(Reg::V10, cells.phase);
+    out.mov_imm64(Reg::V0, GC_PHASE_MARK);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
     emit_gc_pause_end(out, timing, pause);
     out.leave();
     out.ret();
