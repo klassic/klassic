@@ -979,6 +979,155 @@ pub fn emit_gc_load_barrier_slow<E: PortableAsm>(
     out.ret();
 }
 
+/// Portable version of `gc_deep_equal(V7/rdi = a, V6/rsi = b -> V0/rax =
+/// 1 if structurally equal, else 0)`. Follows an M7 forwarding word on
+/// each operand, checks the type tags match, then compares only the
+/// shared-prefix payload: raw-bytes qword by qword, pointer records/lists
+/// slot by slot by recursing (the list tag first checking the two leading
+/// lengths). Recursive -- calls itself via `entry`. Frame slots: 8 =
+/// cursor_a, 16 = end_a, 24 = cursor_b. Uses ColorStrip (R13).
+pub fn emit_gc_deep_equal<E: PortableAsm>(out: &mut E, entry: E::TextLabel) {
+    use crate::gc_layout::{
+        GC_FWD, GC_TYPE_POINTER_LIST, GC_TYPE_POINTER_RECORD, GC_TYPE_RAW_BYTES,
+    };
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    // Locals: [rbp-8] = cursor_a, [rbp-16] = end_a, [rbp-24] = cursor_b.
+    out.sub_reg_imm8(Reg::V4, 32);
+
+    let equal = out.create_text_label();
+    let not_equal = out.create_text_label();
+    let done = out.create_text_label();
+    let raw_bytes = out.create_text_label();
+    let raw_loop = out.create_text_label();
+    let ptr_setup = out.create_text_label();
+    let slot_loop = out.create_text_label();
+    let raw_have_min = out.create_text_label();
+    let ptr_have_min = out.create_text_label();
+
+    // Identical pointers (including both null) are trivially equal.
+    out.cmp_reg_reg(Reg::V7, Reg::V6);
+    out.jcc_label(Condition::Equal, equal);
+    // A null on exactly one side has no header to dereference.
+    out.test_reg_reg(Reg::V7, Reg::V7);
+    out.jcc_label(Condition::Equal, not_equal);
+    out.test_reg_reg(Reg::V6, Reg::V6);
+    out.jcc_label(Condition::Equal, not_equal);
+    // M7: follow forwarding on each operand before dereferencing its
+    // header. Inert while evac is off. rax is scratch.
+    let deq_a_not_fwd = out.create_text_label();
+    out.load_ptr_disp32(Reg::V0, Reg::V7, -16);
+    out.and_reg_imm32(Reg::V0, GC_FWD as i32);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, deq_a_not_fwd);
+    out.load_ptr_disp32(Reg::V0, Reg::V7, -16);
+    out.and_reg_imm32(Reg::V0, -16);
+    out.mov_reg_reg(Reg::V7, Reg::V0);
+    out.bind_text_label(deq_a_not_fwd);
+    let deq_b_not_fwd = out.create_text_label();
+    out.load_ptr_disp32(Reg::V0, Reg::V6, -16);
+    out.and_reg_imm32(Reg::V0, GC_FWD as i32);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, deq_b_not_fwd);
+    out.load_ptr_disp32(Reg::V0, Reg::V6, -16);
+    out.and_reg_imm32(Reg::V0, -16);
+    out.mov_reg_reg(Reg::V6, Reg::V0);
+    out.bind_text_label(deq_b_not_fwd);
+    // Type tags must match: type_a = [rdi-8], type_b = [rsi-8].
+    out.load_ptr_disp32(Reg::V0, Reg::V7, -8);
+    out.load_ptr_disp32(Reg::V1, Reg::V6, -8);
+    out.cmp_reg_reg(Reg::V0, Reg::V1);
+    out.jcc_label(Condition::NotEqual, not_equal);
+    // payload_a = ([rdi-16] & -16) - 16 in r8, payload_b in r9.
+    out.load_ptr_disp32(Reg::V8, Reg::V7, -16);
+    out.load_ptr_disp32(Reg::V9, Reg::V6, -16);
+    out.and_reg_imm32(Reg::V8, -16);
+    out.and_reg_imm32(Reg::V9, -16);
+    out.sub_reg_imm8(Reg::V8, 16);
+    out.sub_reg_imm8(Reg::V9, 16);
+    // rax still holds the shared type tag.
+    out.cmp_reg_imm8(Reg::V0, GC_TYPE_RAW_BYTES as i8);
+    out.jcc_label(Condition::Equal, raw_bytes);
+    out.cmp_reg_imm8(Reg::V0, GC_TYPE_POINTER_RECORD as i8);
+    out.jcc_label(Condition::Below, not_equal);
+    // Pointer record / array / list: a packed run of heap-pointer slots,
+    // optionally led by an integer length for the list tag.
+    out.cmp_reg_imm8(Reg::V0, GC_TYPE_POINTER_LIST as i8);
+    out.jcc_label(Condition::NotEqual, ptr_setup);
+    // List: the two lengths must match, then skip past the length word.
+    out.load_ptr_disp32(Reg::V10, Reg::V7, 0);
+    out.load_ptr_disp32(Reg::V11, Reg::V6, 0);
+    out.cmp_reg_reg(Reg::V10, Reg::V11);
+    out.jcc_label(Condition::NotEqual, not_equal);
+    out.add_reg_imm32(Reg::V7, 8);
+    out.add_reg_imm32(Reg::V6, 8);
+    out.sub_reg_imm8(Reg::V8, 8);
+    out.sub_reg_imm8(Reg::V9, 8);
+    out.bind_text_label(ptr_setup);
+    // r8 = min(payload_a, payload_b): compare only the shared prefix.
+    out.cmp_reg_reg(Reg::V8, Reg::V9);
+    out.jcc_label(Condition::Below, ptr_have_min);
+    out.mov_reg_reg(Reg::V8, Reg::V9);
+    out.bind_text_label(ptr_have_min);
+    // cursor_a = rdi, end_a = rdi + min, cursor_b = rsi.
+    out.mov_reg_reg(Reg::V10, Reg::V7);
+    out.add_reg_reg(Reg::V10, Reg::V8);
+    out.store_rbp_slot(8, Reg::V7);
+    out.store_rbp_slot(16, Reg::V10);
+    out.store_rbp_slot(24, Reg::V6);
+    out.bind_text_label(slot_loop);
+    out.load_rbp_slot(Reg::V10, 8);
+    out.load_rbp_slot(Reg::V11, 16);
+    out.cmp_reg_reg(Reg::V10, Reg::V11);
+    out.jcc_label(Condition::AboveOrEqual, equal);
+    out.load_rbp_slot(Reg::V11, 24);
+    // rdi = a_slot = [cursor_a], rsi = b_slot = [cursor_b], recurse. Both
+    // slots hold colored pointers; strip before the recursive deep-equal
+    // dereferences them.
+    out.load_ptr_disp32(Reg::V7, Reg::V10, 0);
+    out.and_reg_reg(Reg::V7, Reg::ColorStrip);
+    out.load_ptr_disp32(Reg::V6, Reg::V11, 0);
+    out.and_reg_reg(Reg::V6, Reg::ColorStrip);
+    out.call_label(entry);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, not_equal);
+    // Advance both cursors one slot and continue.
+    out.load_rbp_slot(Reg::V10, 8);
+    out.add_reg_imm32(Reg::V10, 8);
+    out.store_rbp_slot(8, Reg::V10);
+    out.load_rbp_slot(Reg::V10, 24);
+    out.add_reg_imm32(Reg::V10, 8);
+    out.store_rbp_slot(24, Reg::V10);
+    out.jmp_label(slot_loop);
+    // Raw bytes: compare the shared-prefix payload qword by qword.
+    out.bind_text_label(raw_bytes);
+    out.cmp_reg_reg(Reg::V8, Reg::V9);
+    out.jcc_label(Condition::Below, raw_have_min);
+    out.mov_reg_reg(Reg::V8, Reg::V9);
+    out.bind_text_label(raw_have_min);
+    out.bind_text_label(raw_loop);
+    out.test_reg_reg(Reg::V8, Reg::V8);
+    out.jcc_label(Condition::Equal, equal);
+    out.load_ptr_disp32(Reg::V10, Reg::V7, 0);
+    out.load_ptr_disp32(Reg::V11, Reg::V6, 0);
+    out.cmp_reg_reg(Reg::V10, Reg::V11);
+    out.jcc_label(Condition::NotEqual, not_equal);
+    out.add_reg_imm32(Reg::V7, 8);
+    out.add_reg_imm32(Reg::V6, 8);
+    out.sub_reg_imm8(Reg::V8, 8);
+    out.jmp_label(raw_loop);
+    out.bind_text_label(equal);
+    out.mov_imm64(Reg::V0, 1);
+    out.jmp_label(done);
+    out.bind_text_label(not_equal);
+    out.mov_imm64(Reg::V0, 0);
+    out.bind_text_label(done);
+    out.leave();
+    out.ret();
+}
+
 /// Portable version of `gc_mark_roots`: walk every shadow-stack root
 /// slot and, for each non-null pointer, call `gc_mark_visit` to mark it
 /// and push it onto the trace worklist. The sole root source for the

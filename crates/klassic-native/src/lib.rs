@@ -37895,7 +37895,8 @@ impl NativeCodeGenerator {
     // reference crate::gc_layout::GC_PHASE_IDLE directly if needed here.
     const GC_PHASE_MARK: u64 = crate::gc_layout::GC_PHASE_MARK;
     const GC_PHASE_RELOCATE: u64 = crate::gc_layout::GC_PHASE_RELOCATE;
-    const GC_FWD: u64 = crate::gc_layout::GC_FWD;
+    // GC_FWD's last lib.rs user moved to the portable emitter; reference
+    // crate::gc_layout::GC_FWD directly if needed here again.
     // GC_HMARK0 / GC_HMARK_BOTH have no direct `Self::` use left in this
     // file: HMARK0's only reference was inside HMARK_BOTH's definition
     // (now in gc_layout), and HMARK_BOTH's last user (gc_mark_start) moved
@@ -38648,146 +38649,11 @@ impl NativeCodeGenerator {
     /// distinct variants fall out at the first slot. The recursion depth
     /// tracks the nesting depth of the compared values, not the heap size.
     fn emit_gc_deep_equal_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_deep_equal);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        // Locals: [rbp-8] = cursor_a, [rbp-16] = end_a, [rbp-24] = cursor_b.
-        self.asm.sub_reg_imm8(Reg::Rsp, 32);
-
-        let equal = self.asm.create_text_label();
-        let not_equal = self.asm.create_text_label();
-        let done = self.asm.create_text_label();
-        let raw_bytes = self.asm.create_text_label();
-        let raw_loop = self.asm.create_text_label();
-        let ptr_setup = self.asm.create_text_label();
-        let slot_loop = self.asm.create_text_label();
-        let raw_have_min = self.asm.create_text_label();
-        let ptr_have_min = self.asm.create_text_label();
-
-        // Identical pointers (including both null) are trivially equal.
-        self.asm.cmp_reg_reg(Reg::Rdi, Reg::Rsi);
-        self.asm.jcc_label(Condition::Equal, equal);
-        // A null on exactly one side has no header to dereference.
-        self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
-        self.asm.jcc_label(Condition::Equal, not_equal);
-        self.asm.test_reg_reg(Reg::Rsi, Reg::Rsi);
-        self.asm.jcc_label(Condition::Equal, not_equal);
-        // M7: follow forwarding on each operand before dereferencing its
-        // header -- during a moving cycle a value may be a ghost whose
-        // word0 is a forwarding word (garbage as a size/type). Inert while
-        // evac is off (FWD never set). rax is scratch.
-        let deq_a_not_fwd = self.asm.create_text_label();
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdi, -16);
-        self.asm.and_reg_imm32(Reg::Rax, Self::GC_FWD as i32);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, deq_a_not_fwd);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdi, -16);
-        self.asm.and_reg_imm32(Reg::Rax, -16);
-        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        self.asm.bind_text_label(deq_a_not_fwd);
-        let deq_b_not_fwd = self.asm.create_text_label();
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rsi, -16);
-        self.asm.and_reg_imm32(Reg::Rax, Self::GC_FWD as i32);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, deq_b_not_fwd);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rsi, -16);
-        self.asm.and_reg_imm32(Reg::Rax, -16);
-        self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
-        self.asm.bind_text_label(deq_b_not_fwd);
-        // Type tags must match: type_a = [rdi-8], type_b = [rsi-8].
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdi, -8);
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rsi, -8);
-        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.jcc_label(Condition::NotEqual, not_equal);
-        // payload_a = ([rdi-16] & -16) - 16 in r8, payload_b in r9.
-        self.asm.load_ptr_disp32(Reg::R8, Reg::Rdi, -16);
-        self.asm.load_ptr_disp32(Reg::R9, Reg::Rsi, -16);
-        self.asm.and_reg_imm32(Reg::R8, -16);
-        self.asm.and_reg_imm32(Reg::R9, -16);
-        self.asm.sub_reg_imm8(Reg::R8, 16);
-        self.asm.sub_reg_imm8(Reg::R9, 16);
-        // rax still holds the shared type tag.
-        self.asm
-            .cmp_reg_imm8(Reg::Rax, Self::GC_TYPE_RAW_BYTES as i8);
-        self.asm.jcc_label(Condition::Equal, raw_bytes);
-        self.asm
-            .cmp_reg_imm8(Reg::Rax, Self::GC_TYPE_POINTER_RECORD as i8);
-        self.asm.jcc_label(Condition::Below, not_equal);
-        // Pointer record / array / list: a packed run of heap-pointer
-        // slots, optionally led by an integer length for the list tag.
-        self.asm
-            .cmp_reg_imm8(Reg::Rax, Self::GC_TYPE_POINTER_LIST as i8);
-        self.asm.jcc_label(Condition::NotEqual, ptr_setup);
-        // List: the two lengths must match, then skip past the length word.
-        self.asm.load_ptr_disp32(Reg::R10, Reg::Rdi, 0);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::Rsi, 0);
-        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
-        self.asm.jcc_label(Condition::NotEqual, not_equal);
-        self.asm.add_reg_imm32(Reg::Rdi, 8);
-        self.asm.add_reg_imm32(Reg::Rsi, 8);
-        self.asm.sub_reg_imm8(Reg::R8, 8);
-        self.asm.sub_reg_imm8(Reg::R9, 8);
-        self.asm.bind_text_label(ptr_setup);
-        // r8 = min(payload_a, payload_b): compare only the shared prefix.
-        self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
-        self.asm.jcc_label(Condition::Below, ptr_have_min);
-        self.asm.mov_reg_reg(Reg::R8, Reg::R9);
-        self.asm.bind_text_label(ptr_have_min);
-        // cursor_a = rdi, end_a = rdi + min, cursor_b = rsi.
-        self.asm.mov_reg_reg(Reg::R10, Reg::Rdi);
-        self.asm.add_reg_reg(Reg::R10, Reg::R8);
-        self.asm.store_rbp_slot(8, Reg::Rdi);
-        self.asm.store_rbp_slot(16, Reg::R10);
-        self.asm.store_rbp_slot(24, Reg::Rsi);
-        self.asm.bind_text_label(slot_loop);
-        self.asm.load_rbp_slot(Reg::R10, 8);
-        self.asm.load_rbp_slot(Reg::R11, 16);
-        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, equal);
-        self.asm.load_rbp_slot(Reg::R11, 24);
-        // rdi = a_slot = [cursor_a], rsi = b_slot = [cursor_b], recurse.
-        // Both slots hold colored pointers; strip before the recursive
-        // deep-equal dereferences them. (No-op until color-on-store.)
-        self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
-        self.asm.and_reg_reg(Reg::Rdi, Reg::R13);
-        self.asm.load_ptr_disp32(Reg::Rsi, Reg::R11, 0);
-        self.asm.and_reg_reg(Reg::Rsi, Reg::R13);
-        self.asm.call_label(self.gc_deep_equal);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, not_equal);
-        // Advance both cursors one slot and continue.
-        self.asm.load_rbp_slot(Reg::R10, 8);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.store_rbp_slot(8, Reg::R10);
-        self.asm.load_rbp_slot(Reg::R10, 24);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.store_rbp_slot(24, Reg::R10);
-        self.asm.jmp_label(slot_loop);
-        // Raw bytes: compare the shared-prefix payload qword by qword.
-        self.asm.bind_text_label(raw_bytes);
-        self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
-        self.asm.jcc_label(Condition::Below, raw_have_min);
-        self.asm.mov_reg_reg(Reg::R8, Reg::R9);
-        self.asm.bind_text_label(raw_have_min);
-        self.asm.bind_text_label(raw_loop);
-        self.asm.test_reg_reg(Reg::R8, Reg::R8);
-        self.asm.jcc_label(Condition::Equal, equal);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::Rdi, 0);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::Rsi, 0);
-        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
-        self.asm.jcc_label(Condition::NotEqual, not_equal);
-        self.asm.add_reg_imm32(Reg::Rdi, 8);
-        self.asm.add_reg_imm32(Reg::Rsi, 8);
-        self.asm.sub_reg_imm8(Reg::R8, 8);
-        self.asm.jmp_label(raw_loop);
-        self.asm.bind_text_label(equal);
-        self.asm.mov_imm64(Reg::Rax, 1);
-        self.asm.jmp_label(done);
-        self.asm.bind_text_label(not_equal);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.bind_text_label(done);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper). Recursive:
+        // the entry label is also the self-call target.
+        let entry = self.gc_deep_equal;
+        portable_asm::emit_gc_deep_equal(self, entry);
     }
 
     /// `gc_acquire_region` (no args): install a fresh empty region as the
