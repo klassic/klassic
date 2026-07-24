@@ -95,6 +95,7 @@ pub trait PortableAsm {
     fn leave(&mut self);
 
     fn push_reg(&mut self, r: Reg);
+    fn pop_reg(&mut self, r: Reg);
     fn mov_reg_reg(&mut self, dst: Reg, src: Reg);
     fn mov_imm64(&mut self, dst: Reg, imm: u64);
     fn mov_data_addr(&mut self, dst: Reg, label: Self::DataLabel);
@@ -124,6 +125,10 @@ pub trait PortableAsm {
     fn cmp_reg_imm32(&mut self, r: Reg, imm: i32);
     fn shl_reg_imm8(&mut self, r: Reg, imm: u8);
     fn shr_reg_imm8(&mut self, r: Reg, imm: u8);
+    /// Bit-test: copy bit `bit` of `r` into the carry flag (x86-64 `bt`),
+    /// so a following Below/AboveOrEqual jump branches on it without a
+    /// scratch register.
+    fn bt_reg_imm8(&mut self, r: Reg, bit: u8);
 
     // Platform primitives. These are the genuinely platform-DEPENDENT
     // operations the collector needs -- the OS interface, not an
@@ -220,6 +225,9 @@ impl PortableAsm for crate::NativeCodeGenerator {
     fn push_reg(&mut self, r: Reg) {
         self.asm.push_reg(r.into());
     }
+    fn pop_reg(&mut self, r: Reg) {
+        self.asm.pop_reg(r.into());
+    }
     fn mov_reg_reg(&mut self, dst: Reg, src: Reg) {
         self.asm.mov_reg_reg(dst.into(), src.into());
     }
@@ -285,6 +293,9 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
     fn shr_reg_imm8(&mut self, r: Reg, imm: u8) {
         self.asm.shr_reg_imm8(r.into(), imm);
+    }
+    fn bt_reg_imm8(&mut self, r: Reg, bit: u8) {
+        self.asm.bt_reg_imm8(r.into(), bit);
     }
 
     fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize) {
@@ -865,6 +876,99 @@ pub fn emit_gc_sweep<E: PortableAsm>(
     out.mov_data_addr(Reg::V10, free_region_head);
     out.store_ptr_disp32(Reg::V10, 0, Reg::V9);
     out.leave();
+    out.ret();
+}
+
+/// Portable version of `gc_load_barrier_slow` (V0/rax = bad-colored heap
+/// pointer, V10/r10 = the field address it was loaded from; out: V0 = raw
+/// remapped pointer). Strips the color, follows an M7 forwarding word
+/// (via `bt` so no scratch register is needed), evacuates on demand
+/// during Relocate, self-heals the slot to the good-colored pointer, and
+/// marks the result during Mark. Preserves the caller-saved registers a
+/// pointer-typed barriered read must keep live across the evacuate/mark
+/// calls. Not a framed routine -- bind ... ret. Uses ColorStrip (R13) and
+/// GoodColor (R14).
+pub fn emit_gc_load_barrier_slow<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    phase: E::DataLabel,
+    region_base: E::DataLabel,
+    region_fromspace: E::DataLabel,
+    evacuate: E::TextLabel,
+    mark_visit: E::TextLabel,
+) {
+    use crate::gc_layout::{GC_PHASE_MARK, GC_PHASE_RELOCATE, GC_REGION_SHIFT};
+
+    out.bind_text_label(entry);
+    out.and_reg_reg(Reg::V0, Reg::ColorStrip); // strip -> raw P
+    let healed = out.create_text_label();
+    let not_fwd = out.create_text_label();
+    let done = out.create_text_label();
+    // Follow forwarding: if P's header is a forwarding word, P is a ghost
+    // -- redirect rax to the to-space copy. Inert while evac is off. Uses
+    // `bt` so the FWD test needs no scratch register -- the slow path must
+    // preserve every caller-saved register in the Idle path (its M5/M6
+    // clobber set was rax/r10/r11 only).
+    out.load_ptr_disp32(Reg::V11, Reg::V0, -16);
+    out.bt_reg_imm8(Reg::V11, 0); // CF = FWD bit
+    out.jcc_label(Condition::AboveOrEqual, not_fwd); // CF clear
+    out.and_reg_imm32(Reg::V11, -16); // to-space user ptr
+    out.mov_reg_reg(Reg::V0, Reg::V11);
+    out.jmp_label(healed);
+    out.bind_text_label(not_fwd);
+    // Relocate: evacuate-on-demand. r10 (the field address) must be
+    // preserved through the self-heal, so the phase is read via r11.
+    out.mov_data_addr(Reg::V11, phase);
+    out.load_ptr_disp32(Reg::V11, Reg::V11, 0);
+    out.cmp_reg_imm8(Reg::V11, GC_PHASE_RELOCATE as i8);
+    out.jcc_label(Condition::NotEqual, healed);
+    // idx = (P - region_base) >> SHIFT ; from-space?
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.mov_data_addr(Reg::V11, region_base);
+    out.load_ptr_disp32(Reg::V11, Reg::V11, 0);
+    out.sub_reg_reg(Reg::V1, Reg::V11);
+    out.shr_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.mov_data_addr(Reg::V11, region_fromspace);
+    out.add_reg_reg(Reg::V11, Reg::V1);
+    out.load_ptr_disp32(Reg::V11, Reg::V11, 0);
+    out.test_reg_reg(Reg::V11, Reg::V11);
+    out.jcc_label(Condition::Equal, healed);
+    // Preserve across the evacuation call the registers the Idle/Mark slow
+    // path leaves untouched but gc_evacuate clobbers: r10 (field address),
+    // and rdx/rsi (a pointer-typed barriered read preserves them in every
+    // other phase). Four pushes keep rsp 16-aligned; r11 is a throwaway
+    // pad (recomputed at the self-heal).
+    out.push_reg(Reg::V10);
+    out.push_reg(Reg::V2);
+    out.push_reg(Reg::V6);
+    out.push_reg(Reg::V11);
+    out.mov_reg_reg(Reg::V7, Reg::V0);
+    out.call_label(evacuate); // rax = to-space
+    out.pop_reg(Reg::V11);
+    out.pop_reg(Reg::V6);
+    out.pop_reg(Reg::V2);
+    out.pop_reg(Reg::V10);
+    out.bind_text_label(healed);
+    // Self-heal: write the good-colored (remapped) pointer back to the
+    // slot. r10 = the field address, carried from the barrier fast path
+    // (and preserved across gc_evacuate above).
+    out.mov_reg_reg(Reg::V11, Reg::V0);
+    out.or_reg_reg(Reg::V11, Reg::GoodColor); // recolor to good
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V11); // self-heal
+    // During Mark, the mutator has just loaded a raw pointer into a
+    // register, so it must be marked to keep the strong tricolor invariant
+    // (load-barrier-driven incremental update). rax (the raw result) is
+    // preserved across the mark call.
+    out.mov_data_addr(Reg::V10, phase);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.cmp_reg_imm8(Reg::V11, GC_PHASE_MARK as i8);
+    out.jcc_label(Condition::NotEqual, done);
+    out.push_reg(Reg::V0);
+    out.mov_reg_reg(Reg::V7, Reg::V0);
+    out.call_label(mark_visit);
+    out.pop_reg(Reg::V0);
+    out.bind_text_label(done);
     out.ret();
 }
 
