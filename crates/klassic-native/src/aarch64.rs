@@ -1230,6 +1230,14 @@ struct RecordInfo {
 }
 
 /// The value type of one list element of element type `elem`.
+/// A scalar value held directly in a GP register (not a heap pointer).
+/// The GC's uniform pointer representation requires these to be boxed
+/// into a single-slot RAW_BYTES object when stored in a POINTER_RECORD
+/// slot (a record field or a cons-cell value), and unboxed on read.
+fn is_boxed_scalar(ty: ValueType) -> bool {
+    matches!(ty, ValueType::Int | ValueType::Double | ValueType::Bool)
+}
+
 fn elem_value_type(elem: ListElem) -> ValueType {
     match elem {
         ListElem::Int => ValueType::Int,
@@ -1465,6 +1473,9 @@ impl Emitter {
                     if !assignable(ty, *expected) {
                         return Err(unsupported(argument.span(), "a record field of this type"));
                     }
+                    if is_boxed_scalar(ty) {
+                        self.emit_box_scalar();
+                    }
                     self.asm.push(Reg::X0);
                 }
                 self.emit_record_object(arguments.len());
@@ -1480,6 +1491,9 @@ impl Emitter {
                         return Err(unsupported(value.span(), "a record field of this type"));
                     }
                     typed.push((field_name.clone(), ty));
+                    if is_boxed_scalar(ty) {
+                        self.emit_box_scalar();
+                    }
                     self.asm.push(Reg::X0);
                 }
                 let count = fields.len();
@@ -1506,6 +1520,9 @@ impl Emitter {
                 };
                 let ty = info.fields[position].1;
                 self.asm.ldr_imm(Reg::X0, Reg::X0, (position * 8) as u32);
+                if is_boxed_scalar(ty) {
+                    self.emit_unbox_scalar();
+                }
                 Ok(ty)
             }
             Expr::Call {
@@ -2132,6 +2149,49 @@ impl Emitter {
         self.asm.bind(fits);
         self.asm.mov_reg(Reg::X5, Reg::X19);
         self.asm.add_reg(Reg::X19, Reg::X19, Reg::X4);
+    }
+
+    /// Allocate a GC-shaped heap object: a 16-byte header
+    /// `[size|mark][type_tag]` followed by `words` 8-byte payload slots.
+    /// Bumps the allocator, writes the header, and leaves the *user*
+    /// pointer (block + 16) in x0 -- so every existing `[x0 + off]`
+    /// payload access is unchanged. `size` is the 16-aligned block size;
+    /// its low 4 bits are free for the collector's mark/forward bits (0
+    /// here). The tag distinguishes RAW_BYTES (no inner pointers) from
+    /// POINTER_RECORD (every payload slot a heap pointer), so the
+    /// collector -- once live (M7) -- traces only the latter.
+    ///
+    /// M6: objects are laid out GC-shaped while the bump allocator is
+    /// still live and the collector is still dead, so this changes only
+    /// the object representation, not behavior -- the CI eval-differential
+    /// confirms each conversion is semantics-preserving.
+    fn emit_gc_alloc_object(&mut self, words: usize, tag: u64) {
+        let block = (16 + words * 8).div_ceil(16) * 16;
+        self.asm.mov_imm64(Reg::X4, block as u64);
+        self.emit_alloc(); // block base in x5
+        self.asm.mov_imm64(Reg::X1, block as u64);
+        self.asm.str_imm(Reg::X1, Reg::X5, 0); // [block] = size|mark(0)
+        self.asm.mov_imm64(Reg::X1, tag);
+        self.asm.str_imm(Reg::X1, Reg::X5, 8); // [block+8] = type_tag
+        self.asm.add_reg_imm(Reg::X0, Reg::X5, 16); // x0 = user pointer
+    }
+
+    /// Box a scalar (in x0) into its own single-slot `RAW_BYTES` object,
+    /// leaving the box's user pointer in x0. Every heap slot of a
+    /// `POINTER_RECORD` must be a pointer, so scalar record fields and
+    /// list elements are boxed on write and unboxed on read (the uniform
+    /// representation the shared enum lowering already uses).
+    fn emit_box_scalar(&mut self) {
+        self.asm.push(Reg::X0); // preserve the scalar across the alloc
+        self.emit_gc_alloc_object(1, crate::gc_layout::GC_TYPE_RAW_BYTES);
+        self.asm.pop(Reg::X1);
+        self.asm.str_imm(Reg::X1, Reg::X0, 0); // [box] = scalar
+    }
+
+    /// Unbox a scalar: load it from the single-slot box whose user
+    /// pointer is in x0.
+    fn emit_unbox_scalar(&mut self) {
+        self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
     }
 
     /// Copy `[count]` bytes between the byte pointers in `src`/`dst`;
@@ -2990,13 +3050,16 @@ impl Emitter {
     /// Build a record object from `count` field values pushed onto
     /// the machine stack in declaration order → object pointer in x0.
     fn emit_record_object(&mut self, count: usize) {
-        self.asm.mov_imm64(Reg::X4, (count * 8) as u64);
-        self.emit_alloc();
+        // M6: a GC-shaped POINTER_RECORD -- every field is a heap pointer
+        // (scalar fields were boxed by the caller as they were evaluated),
+        // so the collector can trace the payload uniformly. The 16-byte
+        // header shifts the user pointer to block + 16, but fields still
+        // live at [user_ptr + position*8], so field access is unchanged.
+        self.emit_gc_alloc_object(count, crate::gc_layout::GC_TYPE_POINTER_RECORD); // x0 = user ptr
         for position in (0..count).rev() {
             self.asm.pop(Reg::X1);
-            self.asm.str_imm(Reg::X1, Reg::X5, (position * 8) as u32);
+            self.asm.str_imm(Reg::X1, Reg::X0, (position * 8) as u32);
         }
-        self.asm.mov_reg(Reg::X0, Reg::X5);
     }
 
     /// Prepend a cons cell: head value on top of the machine stack,
@@ -3253,6 +3316,11 @@ impl Emitter {
             self.asm.pop(Reg::X0);
             self.asm.push(Reg::X0);
             self.asm.ldr_imm(Reg::X0, Reg::X0, (position * 8) as u32);
+            // Scalar fields are boxed in the POINTER_RECORD; unbox before
+            // printing (string fields are already the pointer).
+            if is_boxed_scalar(*ty) {
+                self.emit_unbox_scalar();
+            }
             self.emit_print_elem(list_elem_of(*ty).expect("checked above"));
         }
         self.asm.pop(Reg::X0); // discard the saved object
