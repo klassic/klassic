@@ -12742,6 +12742,11 @@ impl NativeCodeGenerator {
                 self.asm.mov_imm64(Reg::Rdi, payload_size);
                 self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
                 self.asm.call_label(self.gc_alloc);
+                // Mask defensively before writing the payload: gc_alloc's
+                // return isn't colored today, but this must stay correct
+                // once it is (a fresh allocation is never itself stale).
+                self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
+                self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
                 // rax = heap pointer; store len at offset 0.
                 self.asm.mov_imm64(Reg::Rdi, len as u64);
                 self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rdi);
@@ -12765,6 +12770,10 @@ impl NativeCodeGenerator {
                 self.asm.and_reg_imm32(Reg::Rdi, -8);
                 self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
                 self.asm.call_label(self.gc_alloc);
+                // Mask defensively before writing the payload -- see the
+                // same comment in the StaticString branch above.
+                self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
+                self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
 
                 // Reload the runtime length after gc_alloc, store it in the
                 // heap string header, then copy that many bytes from the
@@ -18681,8 +18690,21 @@ impl NativeCodeGenerator {
         }
         self.asm.pop_reg(Reg::Rcx);
         self.next_stack_offset -= 8;
+        // Resolve the base address (rcx) through the load barrier
+        // *before* combining it with the byte offset -- the forwarding
+        // table is keyed by the object's own address, not
+        // address+offset, and this is the single choke point every
+        // __gc_read/__gc_read_ptr/__gc_read_string call (i.e. every
+        // enum field read) shares. Rdx/r9/r10/r11 are the barrier's own
+        // clobbers; r8 is untouched by it, so it's safe to stash the
+        // offset (currently in rax) there across the call.
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
         self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
-        // rax = address + offset; load *(rax)
+        // rax = resolved_address + offset; load *(rax)
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
         Ok(result)
     }
@@ -18748,7 +18770,15 @@ impl NativeCodeGenerator {
         }
         self.asm.pop_reg(Reg::Rcx);
         self.next_stack_offset -= 8;
-        self.asm.add_reg_reg(Reg::Rcx, Reg::Rax); // rcx = addr + offset
+        // Resolve the base address (rcx) through the load barrier
+        // before combining it with the byte offset -- see the matching
+        // comment in compile_gc_read_qword above.
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.add_reg_reg(Reg::Rcx, Reg::Rax); // rcx = resolved_addr + offset
         self.asm.push_reg(Reg::Rcx);
         self.next_stack_offset += 8;
         let value = self.compile_expr(&arguments[2])?;
