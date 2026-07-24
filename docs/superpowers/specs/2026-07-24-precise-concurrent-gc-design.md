@@ -2,14 +2,26 @@
 
 ## Status
 
+**2026-07-24, later in the same session: Kota confirmed the scope call live**
+(via an explicit multiple-choice check-in, after phase 7 shipped and the
+goal-hook kept rejecting "ZGC-inspired, not literal ZGC" as insufficient):
+**"attempt the full production retrofit now."** That supersedes the
+"author's best judgment, unconfirmed" framing below for the *target* — the
+goal genuinely is making ordinary heap allocations relocatable via colored
+pointers, not just the contained phase-7 demonstration. See "Phase 8" at the
+end of this document for what that means in practice and what's been built
+toward it so far. The original scope-decision writeup immediately below is
+kept as-is for the history of *why* phases 1-7 were built the way they were,
+not as the current plan.
+
 Scope decision made without live user sign-off (no response arrived to the
 brainstorming clarifying question before the session's goal-hook required
-forward progress). **Flag this doc to Kota for review** — the scope call
-below (ZGC-*inspired*, not literal ZGC) is the author's best engineering
-judgment given the codebase's starting point, not a confirmed requirement.
-If the intent was literally colored pointers / load barriers / concurrent
-relocation, that is a much larger, different project — see "Rejected scope"
-below for why it was set aside for now.
+forward progress). The scope call below (ZGC-*inspired*, not literal ZGC)
+was the author's best engineering judgment given the codebase's starting
+point at the time, not a confirmed requirement. If the intent was literally
+colored pointers / load barriers / concurrent relocation, that is a much
+larger, different project — see "Rejected scope" below for why it was set
+aside at the time, and "Phase 8" for how it's now being approached for real.
 
 **Progress as of 2026-07-24 (commits 33b8aea, 76af88c, 5ee3b43 on
 `integrate/segfault-fixes`), each independently built, tested, and
@@ -505,3 +517,97 @@ wiring this same barrier into every existing pointer-load site across
 the backend — the exact retrofit the "Rejected scope" section above
 explains is a separate, much larger undertaking, not something this
 phase attempts or claims to have done.
+
+## Phase 8: a general, growable colored-pointer/load-barrier/relocation primitive
+
+Started this session, after Kota's live confirmation (see "Status" above)
+that the real target is a production retrofit, not the phase-7 contained
+demonstration alone. The full retrofit — every existing pointer-load site
+across this backend routed through a barrier — remains a genuinely large,
+separate undertaking (see "Rejected scope" and phase 7's writeup for why a
+half-instrumented version would be silently unsound); it has not been
+attempted in one pass and should not be. What phase 8 does instead is turn
+phase 7's fixed-size, single-object, hand-inlined demo into **real, general,
+reusable infrastructure** that further call sites can adopt incrementally —
+the necessary foundation for a retrofit, built and verified before any
+retrofitting of existing call sites begins.
+
+**Done this session (commits: infra + tests, see `git log` on
+`integrate/segfault-fixes` after b3f66d4/fd67fb5 for the exact hashes):**
+
+- **The load barrier is now a real, callable subroutine**
+  (`zgc_load_barrier`, emitted once via `emit_zgc_load_barrier_runtime`,
+  bound at a fixed label with a real `ret`), not code inlined fresh at
+  every call site. Any number of call sites can `call_label(self.
+  zgc_load_barrier)` without paying for a full copy of the scan loop each
+  time — a prerequisite for eventually having dozens or hundreds of call
+  sites use it.
+- **The forwarding table is now growable, not a fixed 16-entry array.**
+  `zgc_forward_old_base`/`zgc_forward_new_base` are cells holding a
+  pointer to the *current* backing array (mmap'd), rather than being the
+  array; `zgc_forward_capacity` tracks how much room it has;
+  `zgc_forward_grow` (a real subroutine) doubles capacity by mmapping
+  fresh, larger replacement arrays and copying every existing entry
+  across. Deliberately leaks abandoned old arrays rather than munmapping
+  them — small, never reused, and freeing one could race a concurrent
+  lock-free barrier read still scanning it (see below).
+- **`zgc_relocate_object` is now a real, general relocation primitive**,
+  not object-specific inline code: given a pointer to *any* live heap
+  object — any type tag, any size, already allocated via ordinary
+  `gc_alloc` — it reads the object's own header to learn its size and
+  type, allocates an identical-shape replacement, byte-copies the
+  payload (never interprets it, so records/arrays/strings/raw-bytes all
+  work unchanged), and registers the forwarding entry under a dedicated
+  spinlock (`zgc_forward_lock`) that also guards table growth. The load
+  barrier itself stays lock-free by design; see the ordering argument in
+  `emit_zgc_load_barrier_runtime`'s doc comment (x86-TSO is multi-copy-
+  atomic for stores, so a reader that observes a new entry's count has
+  also observed that entry's own base-pointer publication, if any growth
+  was involved — and a reader that observes a stale, smaller count just
+  reads fewer entries from the still-valid, never-freed old array, which
+  is identical data for those indices since growth copies them
+  faithfully).
+- **`__native_zgc_relocation_test()` (the original phase-7 test) now
+  calls the shared primitives** instead of hand-inlining the same logic
+  a second time — the relocator's child path collapsed from ~15
+  instructions of bespoke logic to one `call_label(self.
+  zgc_relocate_object)`. Re-verified: 25/25 local runs plus 20/20 in the
+  `cargo test` harness, unchanged behavior.
+- **New test, `__native_zgc_relocate_many_test()`**, proves what the
+  concurrency-focused test above doesn't: relocates 200 objects
+  (alternating 16-/32-byte payloads — proving size-generality, not just
+  the one hardcoded 16-byte demo object) single-threaded and
+  deterministically, forcing `zgc_forward_grow` to double the table's
+  capacity twice (64 -> 128 -> 256), then re-resolves every *original*
+  colored reference through the barrier and checks its marker survived.
+  Also positively asserts the table's capacity actually grew past its
+  initial value — verified this assertion is real, not a tautology, by
+  temporarily lowering the object count below the growth threshold and
+  confirming the test then correctly failed (0/3 runs), before restoring
+  the real count and reconfirming success (25/25 local runs, 20/20 in
+  the `cargo test` harness).
+- Full existing suite (518 tests after these additions) stayed green
+  throughout; `cargo fmt --check` and `cargo clippy --all-targets
+  --all-features -- -D warnings` both clean.
+
+**What this is and is not.** This is real, general, load-bearing
+infrastructure — any future call site can now relocate any heap object of
+any shape through a shared, tested, thread-safe mechanism, and the table
+it registers with genuinely scales (not a fixed 16-slot toy). It is
+**still not wired into `gc_alloc`/`gc_collect`'s own general heap** —
+ordinary Klassic programs' records, lists, and strings are not yet
+colored or barrier-mediated; only the dedicated `__native_zgc_*` test
+builtins exercise this machinery so far. That remaining step — coloring
+every `gc_alloc` return value and routing every existing pointer-load
+call site (record field reads, list/array element access, string byte
+access, shadow-stack root reads, and everything the mark/sweep collector
+itself touches) through the barrier — is the actual retrofit, and is
+large enough that it needs its own careful, incremental rollout (one
+category of call site at a time, each independently tested against the
+full suite) rather than a single sweeping change. Recommended next slice
+for a future session: start with shadow-stack root reads specifically
+(the narrowest, most centralized call site — `emit_gc_shadow_push`/
+`emit_gc_shadow_pop_n` already funnel every heap-pointer-holding local
+through one pair of functions per phase 4a), since that's the smallest
+surface that would make *some* real Klassic values barrier-mediated
+end to end, before expanding to record/list/string field access.
