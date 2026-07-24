@@ -38826,40 +38826,23 @@ impl NativeCodeGenerator {
     /// fixpoint. Does NOT flip the mark color and does NOT sweep -- the
     /// caller sweeps.
     fn emit_gc_stw_mark_complete_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_stw_mark_complete);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        // Clear the fallback flag: this from-scratch STW mark is the
-        // recovery. If the worklist overflows AGAIN during this drain,
-        // the live frontier genuinely exceeds capacity and we abort.
-        self.asm
-            .mov_data_addr(Reg::R10, self.gc_stw_fallback_pending);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.call_label(self.gc_clear_all_marks);
-        // Reset the worklist top.
-        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.call_label(self.gc_mark_roots);
-        self.asm.call_label(self.gc_drain);
-        // If the flag is set again, the worklist overflowed even on the
-        // from-scratch mark: genuine over-capacity, abort as before.
-        self.asm
-            .mov_data_addr(Reg::R10, self.gc_stw_fallback_pending);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        let ok = self.asm.create_text_label();
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, ok);
-        self.emit_write_data(
-            2,
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_stw_mark_complete;
+        let targets = portable_asm::StwMarkTargets {
+            clear_all_marks: self.gc_clear_all_marks,
+            mark_roots: self.gc_mark_roots,
+            drain: self.gc_drain,
+        };
+        portable_asm::emit_gc_stw_mark_complete(
+            self,
+            entry,
+            targets,
+            self.gc_stw_fallback_pending,
+            self.gc_mark_worklist_top,
             self.gc_worklist_overflow_text,
             b"klassic gc: mark worklist overflow\n".len(),
         );
-        self.emit_exit_code(1);
-        self.asm.bind_text_label(ok);
-        self.asm.leave();
-        self.asm.ret();
     }
 
     /// Drain the mark worklist to fixpoint by running quanta back to

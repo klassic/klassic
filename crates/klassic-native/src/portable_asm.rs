@@ -476,3 +476,56 @@ pub fn emit_gc_clear_all_marks<E: PortableAsm>(
     out.leave();
     out.ret();
 }
+
+/// Text labels for the subroutines `gc_stw_mark_complete` calls.
+#[derive(Clone, Copy)]
+pub struct StwMarkTargets<T: Copy> {
+    pub clear_all_marks: T,
+    pub mark_roots: T,
+    pub drain: T,
+}
+
+/// Portable version of `gc_stw_mark_complete`: the from-scratch STW
+/// re-mark used to recover from a worklist overflow. Clears the fallback
+/// flag, clears all marks, rescans roots, and drains to fixpoint; if the
+/// flag is set AGAIN the live frontier genuinely exceeds capacity, so it
+/// prints the overflow diagnostic and exits. The diagnostic uses the
+/// platform primitives (`plat_write_data` / `plat_exit`).
+pub fn emit_gc_stw_mark_complete<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    targets: StwMarkTargets<E::TextLabel>,
+    stw_fallback_pending: E::DataLabel,
+    mark_worklist_top: E::DataLabel,
+    worklist_overflow_text: E::DataLabel,
+    worklist_overflow_len: usize,
+) {
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    // Clear the fallback flag: this from-scratch STW mark is the
+    // recovery. If the worklist overflows AGAIN during this drain, the
+    // live frontier genuinely exceeds capacity and we abort.
+    out.mov_data_addr(Reg::V10, stw_fallback_pending);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.call_label(targets.clear_all_marks);
+    // Reset the worklist top.
+    out.mov_data_addr(Reg::V10, mark_worklist_top);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.call_label(targets.mark_roots);
+    out.call_label(targets.drain);
+    // If the flag is set again, the worklist overflowed even on the
+    // from-scratch mark: genuine over-capacity, abort as before.
+    out.mov_data_addr(Reg::V10, stw_fallback_pending);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    let ok = out.create_text_label();
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, ok);
+    out.plat_write_data(2, worklist_overflow_text, worklist_overflow_len);
+    out.plat_exit(1);
+    out.bind_text_label(ok);
+    out.leave();
+    out.ret();
+}
