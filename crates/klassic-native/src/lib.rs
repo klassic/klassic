@@ -13238,6 +13238,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_int_len for non-address list argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
         self.emit_gc_list_length_check(span, "__gc_list_int_len", Reg::Rax);
         Ok(NativeValue::Int)
@@ -13267,6 +13268,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_int_set for non-address list argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
         let idx = self.compile_expr(&arguments[1])?;
@@ -13325,6 +13327,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_int_get for non-address list argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
         let idx = self.compile_expr(&arguments[1])?;
@@ -13375,6 +13378,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_int_push for non-address list argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let lst_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(lst_slot.offset, Reg::Rax);
 
@@ -13398,6 +13402,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
 
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
@@ -13455,6 +13462,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_int_println for non-address argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         // Two non-rooted scratch slots: list pointer and index counter.
         let list_slot = self.allocate_anonymous_slot(NativeValue::Int);
         self.asm.store_rbp_slot(list_slot.offset, Reg::Rax);
@@ -15365,6 +15373,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_ptr_len for non-address argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
         self.emit_gc_list_length_check(span, "__gc_list_ptr_len", Reg::Rax);
         Ok(NativeValue::Int)
@@ -15394,6 +15403,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_ptr_set for non-address list argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
         let idx = self.compile_expr(&arguments[1])?;
@@ -15447,6 +15457,7 @@ impl NativeCodeGenerator {
                 &format!("native {name} for non-address list argument"),
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         self.asm.push_reg(Reg::Rax);
         self.next_stack_offset += 8;
         let idx = self.compile_expr(&arguments[1])?;
@@ -15894,6 +15905,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_int_reverse for non-address argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let lst_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(lst_slot.offset, Reg::Rax);
 
@@ -15906,6 +15918,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
 
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
@@ -16405,6 +16420,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_int_pop for non-address argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let lst_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(lst_slot.offset, Reg::Rax);
 
@@ -16423,6 +16439,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
 
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
