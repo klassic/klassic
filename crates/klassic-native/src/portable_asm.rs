@@ -88,8 +88,13 @@ pub trait PortableAsm {
     fn bind_text_label(&mut self, label: Self::TextLabel);
     fn jmp_label(&mut self, label: Self::TextLabel);
     fn jcc_label(&mut self, cond: Condition, label: Self::TextLabel);
+    /// Direct call to a code-section label (pushes a return address).
+    fn call_label(&mut self, label: Self::TextLabel);
     fn ret(&mut self);
+    /// Standard frame teardown (`mov rsp, rbp; pop rbp` on x86-64).
+    fn leave(&mut self);
 
+    fn push_reg(&mut self, r: Reg);
     fn mov_reg_reg(&mut self, dst: Reg, src: Reg);
     fn mov_imm64(&mut self, dst: Reg, imm: u64);
     fn mov_data_addr(&mut self, dst: Reg, label: Self::DataLabel);
@@ -101,6 +106,8 @@ pub trait PortableAsm {
 
     fn add_reg_reg(&mut self, dst: Reg, src: Reg);
     fn cmp_reg_reg(&mut self, a: Reg, b: Reg);
+    /// Compare `a & b` against zero, setting flags (x86-64 `test`).
+    fn test_reg_reg(&mut self, a: Reg, b: Reg);
     fn add_reg_imm32(&mut self, dst: Reg, imm: i32);
     fn cmp_reg_imm32(&mut self, r: Reg, imm: i32);
     fn shl_reg_imm8(&mut self, r: Reg, imm: u8);
@@ -183,8 +190,17 @@ impl PortableAsm for crate::NativeCodeGenerator {
     fn jcc_label(&mut self, cond: Condition, label: Self::TextLabel) {
         self.asm.jcc_label(cond.into(), label);
     }
+    fn call_label(&mut self, label: Self::TextLabel) {
+        self.asm.call_label(label);
+    }
     fn ret(&mut self) {
         self.asm.ret();
+    }
+    fn leave(&mut self) {
+        self.asm.leave();
+    }
+    fn push_reg(&mut self, r: Reg) {
+        self.asm.push_reg(r.into());
     }
     fn mov_reg_reg(&mut self, dst: Reg, src: Reg) {
         self.asm.mov_reg_reg(dst.into(), src.into());
@@ -206,6 +222,9 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
     fn cmp_reg_reg(&mut self, a: Reg, b: Reg) {
         self.asm.cmp_reg_reg(a.into(), b.into());
+    }
+    fn test_reg_reg(&mut self, a: Reg, b: Reg) {
+        self.asm.test_reg_reg(a.into(), b.into());
     }
     fn add_reg_imm32(&mut self, dst: Reg, imm: i32) {
         self.asm.add_reg_imm32(dst.into(), imm);
@@ -301,4 +320,32 @@ pub fn emit_gc_bounds_error<E: PortableAsm>(
     out.bind_text_label(entry);
     out.plat_write_data(2, text, text_len);
     out.plat_exit(1);
+}
+
+/// Portable version of `gc_drain`: run mark quanta until the worklist is
+/// empty. Each iteration traces up to `GC_QUANTUM_POPS` objects via the
+/// `gc_trace` subroutine, then loops while `gc_mark_worklist_top != 0`.
+/// Sets up a frame (some callees expect an aligned stack) and tears it
+/// down with `leave`.
+pub fn emit_gc_drain<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    gc_trace: E::TextLabel,
+    mark_worklist_top: E::DataLabel,
+) {
+    use crate::gc_layout::GC_QUANTUM_POPS;
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    let drain_loop = out.create_text_label();
+    out.bind_text_label(drain_loop);
+    out.mov_imm64(Reg::V7, GC_QUANTUM_POPS); // rdi = quantum
+    out.call_label(gc_trace);
+    out.mov_data_addr(Reg::V10, mark_worklist_top);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::NotEqual, drain_loop);
+    out.leave();
+    out.ret();
 }

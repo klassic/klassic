@@ -38930,19 +38930,12 @@ impl NativeCodeGenerator {
     /// Drain the mark worklist to fixpoint by running quanta back to
     /// back. Used by the STW paths (gc_stw_mark_complete, gc_mark_end).
     fn emit_gc_drain_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_drain);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        let drain_loop = self.asm.create_text_label();
-        self.asm.bind_text_label(drain_loop);
-        self.asm.mov_imm64(Reg::Rdi, Self::GC_QUANTUM_POPS);
-        self.asm.call_label(self.gc_trace);
-        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::NotEqual, drain_loop);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_drain;
+        let trace = self.gc_trace;
+        let worklist_top = self.gc_mark_worklist_top;
+        portable_asm::emit_gc_drain(self, entry, trace, worklist_top);
     }
 
     /// MarkStart (short STW pause): flip the mark color to the new cycle,
