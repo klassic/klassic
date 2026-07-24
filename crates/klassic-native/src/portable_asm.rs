@@ -886,6 +886,113 @@ pub fn emit_gc_relocate_finish<E: PortableAsm>(
     out.ret();
 }
 
+/// Portable version of `gc_acquire_region`: obtain a fresh mutator
+/// region -- first flushing the current region's watermark, then popping
+/// the free-region pool (zeroing the reused region so stale bytes never
+/// read as bogus pointers), else committing the next tail region if
+/// within budget. Installs the region into the bump globals and returns
+/// `V0` = 1 on success, 0 if the budget is exhausted. Leaf (no frame).
+/// Reuses `RegionTables` for heap_base / heap_top / region_base /
+/// region_top / committed_count; free_region_head / budget_regions /
+/// heap_end are the labels beyond that set.
+pub fn emit_gc_acquire_region<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    t: RegionTables<E::DataLabel>,
+    free_region_head: E::DataLabel,
+    budget_regions: E::DataLabel,
+    heap_end: E::DataLabel,
+) {
+    use crate::gc_layout::{GC_REGION_SHIFT, GC_REGION_SIZE};
+
+    out.bind_text_label(entry);
+    let from_tail = out.create_text_label();
+    let install = out.create_text_label();
+    let fail = out.create_text_label();
+
+    // region_top[cur] = gc_heap_top, where cur = (heap_base -
+    // region_base) >> REGION_SHIFT.
+    out.mov_data_addr(Reg::V10, t.heap_base);
+    out.load_ptr_disp32(Reg::V1, Reg::V10, 0);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.sub_reg_reg(Reg::V1, Reg::V11);
+    out.shr_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.mov_data_addr(Reg::V8, t.heap_top);
+    out.load_ptr_disp32(Reg::V0, Reg::V8, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+
+    // (1) Free-region pool: rax = free_region_head; if non-null pop it.
+    out.mov_data_addr(Reg::V10, free_region_head);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, from_tail);
+    // free_region_head = [rax] (link stored at the region base).
+    out.load_ptr_disp32(Reg::V1, Reg::V0, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V1);
+    // Zero the reused region: unlike a fresh mmap'd tail region, a
+    // reclaimed region still holds its previous objects' bytes. The bump
+    // path does not clear an object's padding qwords (those within the
+    // 16-aligned block size that the constructor doesn't write), and the
+    // mark trace walks every payload qword of a pointer object -- so a
+    // stale non-null value there would be chased as a bogus pointer.
+    // Clearing the whole region once on reuse restores the "all bump
+    // memory reads as zero" invariant.
+    let zero_loop = out.create_text_label();
+    let zero_done = out.create_text_label();
+    out.mov_reg_reg(Reg::V8, Reg::V0); // cursor
+    out.mov_reg_reg(Reg::V11, Reg::V0);
+    out.add_reg_imm32(Reg::V11, GC_REGION_SIZE as i32); // end
+    out.mov_imm64(Reg::V9, 0);
+    out.bind_text_label(zero_loop);
+    out.cmp_reg_reg(Reg::V8, Reg::V11);
+    out.jcc_label(Condition::AboveOrEqual, zero_done);
+    out.store_ptr_disp32(Reg::V8, 0, Reg::V9);
+    out.add_reg_imm32(Reg::V8, 8);
+    out.jmp_label(zero_loop);
+    out.bind_text_label(zero_done);
+    out.jmp_label(install);
+
+    // (2) Commit the next tail region if within budget.
+    out.bind_text_label(from_tail);
+    out.mov_data_addr(Reg::V10, t.committed_count);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.mov_data_addr(Reg::V8, budget_regions);
+    out.load_ptr_disp32(Reg::V11, Reg::V8, 0);
+    out.cmp_reg_reg(Reg::V0, Reg::V11);
+    out.jcc_label(Condition::AboveOrEqual, fail);
+    // new_base = region_base + (committed << REGION_SHIFT).
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.shl_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    out.mov_data_addr(Reg::V8, t.region_base);
+    out.load_ptr_disp32(Reg::V8, Reg::V8, 0);
+    out.add_reg_reg(Reg::V8, Reg::V1);
+    // committed_count = committed + 1.
+    out.add_reg_imm32(Reg::V0, 1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.mov_reg_reg(Reg::V0, Reg::V8);
+
+    // install: rax = new region base. Set the bump globals.
+    out.bind_text_label(install);
+    out.mov_data_addr(Reg::V10, t.heap_base);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.mov_data_addr(Reg::V10, t.heap_top);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.add_reg_imm32(Reg::V1, GC_REGION_SIZE as i32);
+    out.mov_data_addr(Reg::V10, heap_end);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V1);
+    out.mov_imm64(Reg::V0, 1);
+    out.ret();
+
+    out.bind_text_label(fail);
+    out.mov_imm64(Reg::V0, 0);
+    out.ret();
+}
+
 /// Portable version of `gc_relocate_fix_roots`: at RelocateStart, walk
 /// every shadow-stack root slot and, for each root pointing into a
 /// from-space region, redirect it to the object's to-space copy --

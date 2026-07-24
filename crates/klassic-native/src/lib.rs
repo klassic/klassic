@@ -39201,94 +39201,25 @@ impl NativeCodeGenerator {
     /// caller-saved registers. First flushes the current region's
     /// watermark so a subsequent sweep can walk it.
     fn emit_gc_acquire_region_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_acquire_region);
-        let from_tail = self.asm.create_text_label();
-        let install = self.asm.create_text_label();
-        let fail = self.asm.create_text_label();
-
-        // region_top[cur] = gc_heap_top, where cur = (heap_base -
-        // region_base) >> REGION_SHIFT.
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.sub_reg_reg(Reg::Rcx, Reg::R11);
-        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.mov_data_addr(Reg::R8, self.gc_heap_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-
-        // (1) Free-region pool: rax = free_region_head; if non-null pop it.
-        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, from_tail);
-        // free_region_head = [rax] (link stored at the region base).
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
-        // Zero the reused region: unlike a fresh mmap'd tail region, a
-        // reclaimed region still holds its previous objects' bytes. The
-        // bump path does not clear an object's padding qwords (those
-        // within the 16-aligned block size that the constructor doesn't
-        // write), and the mark trace walks every payload qword of a
-        // pointer object -- so a stale non-null value there would be
-        // chased as a bogus pointer. Clearing the whole region once on
-        // reuse restores the "all bump memory reads as zero" invariant.
-        let zero_loop = self.asm.create_text_label();
-        let zero_done = self.asm.create_text_label();
-        self.asm.mov_reg_reg(Reg::R8, Reg::Rax); // cursor
-        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
-        self.asm
-            .add_reg_imm32(Reg::R11, Self::GC_REGION_SIZE as i32); // end
-        self.asm.mov_imm64(Reg::R9, 0);
-        self.asm.bind_text_label(zero_loop);
-        self.asm.cmp_reg_reg(Reg::R8, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, zero_done);
-        self.asm.store_ptr_disp32(Reg::R8, 0, Reg::R9);
-        self.asm.add_reg_imm32(Reg::R8, 8);
-        self.asm.jmp_label(zero_loop);
-        self.asm.bind_text_label(zero_done);
-        self.asm.jmp_label(install);
-
-        // (2) Commit the next tail region if within budget.
-        self.asm.bind_text_label(from_tail);
-        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.mov_data_addr(Reg::R8, self.gc_budget_regions);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R8, 0);
-        self.asm.cmp_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, fail);
-        // new_base = region_base + (committed << REGION_SHIFT).
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
-        self.asm.mov_data_addr(Reg::R8, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
-        self.asm.add_reg_reg(Reg::R8, Reg::Rcx);
-        // committed_count = committed + 1.
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
-
-        // install: rax = new region base. Set the bump globals.
-        self.asm.bind_text_label(install);
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_top);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm
-            .add_reg_imm32(Reg::Rcx, Self::GC_REGION_SIZE as i32);
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_end);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
-        self.asm.mov_imm64(Reg::Rax, 1);
-        self.asm.ret();
-
-        self.asm.bind_text_label(fail);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_acquire_region;
+        let tables = portable_asm::RegionTables {
+            heap_base: self.gc_heap_base,
+            heap_top: self.gc_heap_top,
+            region_base: self.gc_region_base,
+            region_top: self.gc_region_top,
+            committed_count: self.gc_committed_count,
+            region_fromspace: self.gc_region_fromspace,
+        };
+        portable_asm::emit_gc_acquire_region(
+            self,
+            entry,
+            tables,
+            self.gc_free_region_head,
+            self.gc_budget_regions,
+            self.gc_heap_end,
+        );
     }
 
     // ===================== M7 evacuation machinery =====================
