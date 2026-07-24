@@ -454,6 +454,7 @@ mod cbackend;
 mod aarch64;
 mod gc_layout;
 mod macho;
+mod portable_asm;
 
 /// Compile `text` to a portable C translation unit (`--backend c`).
 /// The supported subset is deliberately small (see `cbackend`);
@@ -37679,11 +37680,8 @@ impl NativeCodeGenerator {
     }
 
     fn emit_write_data(&mut self, fd: u64, label: DataLabel, len: usize) {
-        self.emit_syscall_number(PlatformSyscall::Write);
-        self.asm.mov_imm64(Reg::Rdi, fd);
-        self.asm.mov_data_addr(Reg::Rsi, label);
-        self.asm.mov_imm64(Reg::Rdx, len as u64);
-        self.asm.syscall();
+        let write_syscall_number = self.platform.syscall_number(PlatformSyscall::Write);
+        portable_asm::emit_write_data(&mut self.asm, write_syscall_number, fd, label, len);
     }
 
     fn emit_write_data_dynamic_len(&mut self, fd: u64, data: DataLabel, len: DataLabel) {
@@ -39922,9 +39920,8 @@ impl NativeCodeGenerator {
     }
 
     fn emit_exit_code(&mut self, code: u64) {
-        self.emit_syscall_number(PlatformSyscall::Exit);
-        self.asm.mov_imm64(Reg::Rdi, code);
-        self.asm.syscall();
+        let exit_syscall_number = self.platform.syscall_number(PlatformSyscall::Exit);
+        portable_asm::emit_exit_code(&mut self.asm, exit_syscall_number, code);
     }
 
     fn emit_functions(&mut self) -> Result<(), Diagnostic> {
@@ -40199,60 +40196,8 @@ impl NativeCodeGenerator {
     }
 
     fn emit_print_i64_runtime(&mut self) {
-        self.asm.bind_text_label(self.print_i64);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.asm.sub_reg_imm8(Reg::Rsp, 48);
-        self.asm.mov_reg_reg(Reg::R10, Reg::Rsi);
-        self.asm.mov_reg_reg(Reg::Rax, Reg::Rdi);
-        let after_newline = self.asm.create_text_label();
-        self.asm.lea_reg_rbp_disp8(Reg::Rsi, 0);
-        self.asm.mov_imm64(Reg::Rcx, 0);
-        self.asm.cmp_reg_imm8(Reg::Rdx, 0);
-        self.asm.jcc_label(Condition::Equal, after_newline);
-        self.asm.lea_reg_rbp_disp8(Reg::Rsi, -1);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'\n');
-        self.asm.mov_imm64(Reg::Rcx, 1);
-        self.asm.bind_text_label(after_newline);
-        self.asm.cmp_reg_imm8(Reg::Rax, 0);
-        let nonzero = self.asm.create_text_label();
-        let digits = self.asm.create_text_label();
-        let digit_loop = self.asm.create_text_label();
-        let write = self.asm.create_text_label();
-        self.asm.jcc_label(Condition::NotEqual, nonzero);
-        self.asm.dec_reg(Reg::Rsi);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'0');
-        self.asm.inc_reg(Reg::Rcx);
-        self.asm.jmp_label(write);
-        self.asm.bind_text_label(nonzero);
-        self.asm.xor_reg_reg(Reg::R8, Reg::R8);
-        self.asm.cmp_reg_imm8(Reg::Rax, 0);
-        self.asm.jcc_label(Condition::GreaterEqual, digits);
-        self.asm.neg_reg(Reg::Rax);
-        self.asm.mov_imm64(Reg::R8, 1);
-        self.asm.bind_text_label(digits);
-        self.asm.mov_imm64(Reg::Rbx, 10);
-        self.asm.bind_text_label(digit_loop);
-        self.asm.xor_reg_reg(Reg::Rdx, Reg::Rdx);
-        self.asm.div_reg(Reg::Rbx);
-        self.asm.add_reg8_imm8(Reg8::Dl, b'0');
-        self.asm.dec_reg(Reg::Rsi);
-        self.asm.mov_byte_ptr_reg8(Reg::Rsi, Reg8::Dl);
-        self.asm.inc_reg(Reg::Rcx);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::NotEqual, digit_loop);
-        self.asm.cmp_reg_imm8(Reg::R8, 0);
-        self.asm.jcc_label(Condition::Equal, write);
-        self.asm.dec_reg(Reg::Rsi);
-        self.asm.mov_byte_ptr_reg_imm8(Reg::Rsi, b'-');
-        self.asm.inc_reg(Reg::Rcx);
-        self.asm.bind_text_label(write);
-        self.emit_syscall_number(PlatformSyscall::Write);
-        self.asm.mov_reg_reg(Reg::Rdi, Reg::R10);
-        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rcx);
-        self.asm.syscall();
-        self.asm.leave();
-        self.asm.ret();
+        let write_syscall_number = self.platform.syscall_number(PlatformSyscall::Write);
+        portable_asm::emit_print_i64(&mut self.asm, self.print_i64, write_syscall_number);
     }
 
     // GC design constants and the object-format ABI (header layout,
