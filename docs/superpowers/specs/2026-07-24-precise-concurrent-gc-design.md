@@ -611,3 +611,109 @@ for a future session: start with shadow-stack root reads specifically
 through one pair of functions per phase 4a), since that's the smallest
 surface that would make *some* real Klassic values barrier-mediated
 end to end, before expanding to record/list/string field access.
+
+## Phase 9: audited the real retrofit surface, wired the collector's own internals, first empirical coverage measurement
+
+**Audit correction to the phase 8 recommendation above.** A dedicated audit
+(read the actual code, not assumptions) found that shadow-stack root reads
+are *not* actually the narrowest next slice, for a more fundamental reason:
+most `Record`/`List`/`Map`/`Set` values in ordinary Klassic programs never
+touch the GC heap at all in this backend. They're compiled via a
+compile-time shape-tracking scheme (`StaticRecord`/`RuntimeRecord`/
+`StaticList`/... in `NativeValue`) with fields living in `.rodata` literals
+or fixed `.bss` cells — no `gc_alloc` involved. The **only** genuinely
+GC-heap-backed, ordinary-syntax feature is `enum` values, which desugar
+into `__gc_record`/`__gc_alloc`/`__gc_string`/`__gc_write`/`__gc_read*`
+calls before native codegen runs. Everything else that reaches `gc_alloc`
+is the `__gc_*` builtin library (~51 functions with real, direct pointer
+dereferencing, not the ~150 originally feared) plus the collector's own
+internals (`gc_mark_visit`, `gc_collect`'s inlined mark/trace/sweep,
+`gc_deep_equal`, `gc_pin`/`gc_unpin`).
+
+This does *not* shrink the required work the way it first looked like it
+would, though: `gc_alloc` is one shared runtime function used by all ~74
+`__gc_*` builtins, so coloring its output can't be scoped to "just the
+enum-related callers" without adding a per-call-site opt-in flag (not done
+— see "future work" below). Since the load barrier is a proven no-op on
+already-uncolored input, the safe rollout stays exactly as reasoned before:
+add barrier calls to every dereferencing function *first*, while `gc_alloc`
+still returns uncolored pointers (zero behavior change, testable
+incrementally against the full suite), then flip coloring on as the final
+step once coverage is complete.
+
+**Done this session:** wired the collector's own internals, the most
+foundational piece — nothing else matters if the collector can't handle
+colored roots/objects correctly once relocation is real.
+- `gc_mark_visit(rdi)` now resolves `rdi` through `zgc_load_barrier` before
+  reading its header. This is the single choke point all four mark-phase
+  call sites (root table walk, main shadow-stack walk, per-cloned-thread
+  shadow-stack walk, recursive field trace) already funnel through via
+  `call_label(self.gc_mark_visit)` — one change covers all four. The
+  worklist is pushed with the *resolved* address, so the trace loop's own
+  header reads (inlined in `emit_gc_collect_runtime`) need no barrier of
+  their own, and two stale colored references to the same relocated object
+  correctly coalesce onto the same mark-bit check after resolution.
+- `gc_deep_equal(rdi, rsi)` resolves both operands *before* its identity/
+  null fast-path checks — without this, a stale colored reference and the
+  plain resolved address of the same relocated object would compare
+  unequal by raw bit pattern. Its own recursive calls re-resolve their
+  operands the same way.
+- `gc_pin`/`gc_unpin` resolve `rdi` so the static root table always holds
+  a canonical address and `gc_unpin`'s identity compare stays correct
+  regardless of which representation (colored or resolved) a caller passes
+  between a pin and its matching unpin.
+
+**A real bug this surfaced, fixed the same session:** `zgc_relocate_object`
+and both `__native_zgc_*` test builtins wrote to `gc_alloc`'s raw return
+value *before* masking it — harmless today (nothing colors `gc_alloc`'s
+output yet) but would segfault the instant it does, since a colored
+pointer's numeric value sits near 2^63, almost certainly unmapped. Fixed by
+masking (not a full barrier resolve — a fresh allocation can never itself
+be a stale reference) immediately after each of these three `gc_alloc`
+calls.
+
+**First empirical coverage measurement.** Rather than keep reasoning about
+scope in the abstract, temporarily flipped `gc_alloc` to color every
+return value (an uncommitted, reverted experiment) and ran the full suite
+twice — once before, once after the mark_visit/deep_equal/pin/unpin +
+masking fixes above:
+- Before: 386 passed / 132 failed.
+- After: 388 passed / 130 failed — exactly the two `__native_zgc_*` tests
+  that the masking fix repaired, confirming both that the fix was correct
+  and that this measurement technique is trustworthy (it moved by exactly
+  the expected amount, not more or less).
+- The remaining 130 failures are precisely the `__gc_*` builtins and enum
+  desugaring paths not yet covered — i.e., real, concrete, measured
+  evidence of what's left, not an estimate. This experiment was reverted
+  immediately after collecting the numbers; `gc_alloc` still returns
+  uncolored pointers as of this commit.
+
+**Verification:** full 518-test suite green (unchanged) with the real
+(non-experimental) changes in place; `cargo fmt --check`/`clippy -- -D
+warnings` clean; the two `__native_zgc_*` tests re-run 3x via `cargo test`
+(each internally loops the compiled binary 20x) with no failures.
+
+**Recommended next increments, in order:**
+1. Wire the enum-construction/field-access path itself: `compile_gc_alloc`,
+   `compile_gc_record`, `compile_gc_string`, `compile_gc_write`,
+   `compile_gc_read_qword` (the last one backs `__gc_read`/`__gc_read_ptr`/
+   `__gc_read_string` — i.e. *all* enum field reads, in one function).
+   This is the smallest slice that would make a literal Klassic `enum`
+   value colored/relocatable end to end, verified via real enum syntax
+   rather than only internal test builtins.
+2. The remaining `__gc_*` builtins by family (string family has 2-3 wide
+   shared helpers — `emit_heap_string_concat_fragment` alone has 18 call
+   sites — worth covering first for leverage; list/map family is more
+   fragmented, ~24 distinct functions with only 2 small shared helpers).
+3. Only once 1-2 measure at 0 remaining failures under the same
+   coverage-probe technique above: flip `gc_alloc` to color for real.
+
+**Known follow-up, not urgent:** the forwarding table's current single-hop
+resolution doesn't chain — if an already-relocated object were relocated a
+*second* time, a reference holding the *original* (pre-first-relocation)
+address would resolve to the first new address, which is now itself stale,
+and stop there rather than following a second hop. Nothing in the current
+test suite exercises re-relocating the same object, so this hasn't
+mattered yet, but it would need either a looping barrier or self-healing
+writes-back-on-resolve before double relocation of the same object could
+be trusted.
