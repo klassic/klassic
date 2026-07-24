@@ -103,12 +103,19 @@ pub trait PortableAsm {
     fn load_ptr_disp32(&mut self, dst: Reg, base: Reg, disp: i32);
     /// `[base + disp] = src` (64-bit store).
     fn store_ptr_disp32(&mut self, base: Reg, disp: i32, src: Reg);
+    /// `dst = [rbp - offset]` -- read a local frame slot.
+    fn load_rbp_slot(&mut self, dst: Reg, offset: i32);
+    /// `[rbp - offset] = src` -- write a local frame slot.
+    fn store_rbp_slot(&mut self, offset: i32, src: Reg);
 
     fn add_reg_reg(&mut self, dst: Reg, src: Reg);
+    fn sub_reg_reg(&mut self, dst: Reg, src: Reg);
     fn cmp_reg_reg(&mut self, a: Reg, b: Reg);
     /// Compare `a & b` against zero, setting flags (x86-64 `test`).
     fn test_reg_reg(&mut self, a: Reg, b: Reg);
     fn add_reg_imm32(&mut self, dst: Reg, imm: i32);
+    fn sub_reg_imm8(&mut self, r: Reg, imm: i8);
+    fn and_reg_imm32(&mut self, r: Reg, imm: i32);
     fn cmp_reg_imm32(&mut self, r: Reg, imm: i32);
     fn shl_reg_imm8(&mut self, r: Reg, imm: u8);
     fn shr_reg_imm8(&mut self, r: Reg, imm: u8);
@@ -217,8 +224,17 @@ impl PortableAsm for crate::NativeCodeGenerator {
     fn store_ptr_disp32(&mut self, base: Reg, disp: i32, src: Reg) {
         self.asm.store_ptr_disp32(base.into(), disp, src.into());
     }
+    fn load_rbp_slot(&mut self, dst: Reg, offset: i32) {
+        self.asm.load_rbp_slot(dst.into(), offset);
+    }
+    fn store_rbp_slot(&mut self, offset: i32, src: Reg) {
+        self.asm.store_rbp_slot(offset, src.into());
+    }
     fn add_reg_reg(&mut self, dst: Reg, src: Reg) {
         self.asm.add_reg_reg(dst.into(), src.into());
+    }
+    fn sub_reg_reg(&mut self, dst: Reg, src: Reg) {
+        self.asm.sub_reg_reg(dst.into(), src.into());
     }
     fn cmp_reg_reg(&mut self, a: Reg, b: Reg) {
         self.asm.cmp_reg_reg(a.into(), b.into());
@@ -228,6 +244,12 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
     fn add_reg_imm32(&mut self, dst: Reg, imm: i32) {
         self.asm.add_reg_imm32(dst.into(), imm);
+    }
+    fn sub_reg_imm8(&mut self, r: Reg, imm: i8) {
+        self.asm.sub_reg_imm8(r.into(), imm);
+    }
+    fn and_reg_imm32(&mut self, r: Reg, imm: i32) {
+        self.asm.and_reg_imm32(r.into(), imm);
     }
     fn cmp_reg_imm32(&mut self, r: Reg, imm: i32) {
         self.asm.cmp_reg_imm32(r.into(), imm);
@@ -346,6 +368,111 @@ pub fn emit_gc_drain<E: PortableAsm>(
     out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
     out.test_reg_reg(Reg::V0, Reg::V0);
     out.jcc_label(Condition::NotEqual, drain_loop);
+    out.leave();
+    out.ret();
+}
+
+/// Data-section labels the region-walking GC routines address. Grouped
+/// so a migrated routine takes one parameter instead of a long,
+/// easy-to-misorder list of individual `DataLabel`s.
+#[derive(Clone, Copy)]
+pub struct RegionTables<D: Copy> {
+    pub heap_base: D,
+    pub heap_top: D,
+    pub region_base: D,
+    pub region_top: D,
+    pub committed_count: D,
+    pub region_fromspace: D,
+}
+
+/// Portable version of `gc_clear_all_marks`: walk every committed region
+/// and clear both header mark bits on each live block (an `and -16`,
+/// which also leaves size intact since blocks are 16-aligned). Flushes
+/// the current region's watermark first, and skips from-space (ghost)
+/// regions so their forwarding words are preserved. Uses two frame slots
+/// (`[rbp-8]` = region index, `[rbp-16]` = committed bound).
+pub fn emit_gc_clear_all_marks<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    t: RegionTables<E::DataLabel>,
+) {
+    use crate::gc_layout::GC_REGION_SHIFT;
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    out.sub_reg_imm8(Reg::V4, 16);
+    // Flush the current region's watermark so its blocks are covered.
+    out.mov_data_addr(Reg::V10, t.heap_base);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.sub_reg_reg(Reg::V11, Reg::V10);
+    out.shr_reg_imm8(Reg::V11, GC_REGION_SHIFT);
+    out.shl_reg_imm8(Reg::V11, 3);
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V11);
+    out.mov_data_addr(Reg::V8, t.heap_top);
+    out.load_ptr_disp32(Reg::V0, Reg::V8, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    // bound = committed_count; idx = 0.
+    out.mov_data_addr(Reg::V10, t.committed_count);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.store_rbp_slot(16, Reg::V0);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_rbp_slot(8, Reg::V0);
+
+    let region_loop = out.create_text_label();
+    let region_done = out.create_text_label();
+    let block_loop = out.create_text_label();
+    let next_region = out.create_text_label();
+    out.bind_text_label(region_loop);
+    out.load_rbp_slot(Reg::V0, 8);
+    out.load_rbp_slot(Reg::V1, 16);
+    out.cmp_reg_reg(Reg::V0, Reg::V1);
+    out.jcc_label(Condition::AboveOrEqual, region_done);
+    // base (rsi) = region_base + idx<<SHIFT; top (r8) = region_top[idx].
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.shl_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.mov_reg_reg(Reg::V6, Reg::V10);
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.load_ptr_disp32(Reg::V8, Reg::V10, 0);
+    out.cmp_reg_reg(Reg::V8, Reg::V6);
+    out.jcc_label(Condition::Equal, next_region);
+    // M7: skip from-space (ghost) regions (inert while evac is off).
+    // clear_all_marks can run during a degrade while previous-cycle
+    // ghosts still exist; their forwarding words must not be masked.
+    out.load_rbp_slot(Reg::V0, 8);
+    out.shl_reg_imm8(Reg::V0, 3);
+    out.mov_data_addr(Reg::V10, t.region_fromspace);
+    out.add_reg_reg(Reg::V10, Reg::V0);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::NotEqual, next_region);
+    // Walk blocks base..top, clearing both mark bits on each header
+    // word0 (`and -16` also clears FWD, which is always 0 here since
+    // no block is forwarded when the from-scratch mark runs).
+    out.mov_reg_reg(Reg::V11, Reg::V6);
+    out.bind_text_label(block_loop);
+    out.cmp_reg_reg(Reg::V11, Reg::V8);
+    out.jcc_label(Condition::AboveOrEqual, next_region);
+    out.load_ptr_disp32(Reg::V0, Reg::V11, 0);
+    out.and_reg_imm32(Reg::V0, -16); // size, marks cleared
+    out.store_ptr_disp32(Reg::V11, 0, Reg::V0);
+    out.add_reg_reg(Reg::V11, Reg::V0);
+    out.jmp_label(block_loop);
+    out.bind_text_label(next_region);
+    out.load_rbp_slot(Reg::V0, 8);
+    out.add_reg_imm32(Reg::V0, 1);
+    out.store_rbp_slot(8, Reg::V0);
+    out.jmp_label(region_loop);
+    out.bind_text_label(region_done);
     out.leave();
     out.ret();
 }

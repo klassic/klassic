@@ -38806,83 +38806,18 @@ impl NativeCodeGenerator {
     /// STW re-mark must start from a fully-clear state. Own frame:
     /// [rbp-8] = region index, [rbp-16] = committed bound.
     fn emit_gc_clear_all_marks_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_clear_all_marks);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.asm.sub_reg_imm8(Reg::Rsp, 16);
-        // Flush the current region's watermark so its blocks are covered.
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.sub_reg_reg(Reg::R11, Reg::R10);
-        self.asm.shr_reg_imm8(Reg::R11, Self::GC_REGION_SHIFT);
-        self.asm.shl_reg_imm8(Reg::R11, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::R11);
-        self.asm.mov_data_addr(Reg::R8, self.gc_heap_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // bound = committed_count; idx = 0.
-        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.store_rbp_slot(16, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_rbp_slot(8, Reg::Rax);
-
-        let region_loop = self.asm.create_text_label();
-        let region_done = self.asm.create_text_label();
-        let block_loop = self.asm.create_text_label();
-        let next_region = self.asm.create_text_label();
-        self.asm.bind_text_label(region_loop);
-        self.asm.load_rbp_slot(Reg::Rax, 8);
-        self.asm.load_rbp_slot(Reg::Rcx, 16);
-        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.jcc_label(Condition::AboveOrEqual, region_done);
-        // base (rsi) = region_base + idx<<SHIFT; top (r8) = region_top[idx].
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.mov_reg_reg(Reg::Rsi, Reg::R10);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
-        self.asm.cmp_reg_reg(Reg::R8, Reg::Rsi);
-        self.asm.jcc_label(Condition::Equal, next_region);
-        // M7: skip from-space (ghost) regions (inert while evac is off).
-        // clear_all_marks can run during a degrade while previous-cycle
-        // ghosts still exist; their forwarding words must not be masked.
-        self.asm.load_rbp_slot(Reg::Rax, 8);
-        self.asm.shl_reg_imm8(Reg::Rax, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_fromspace);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rax);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::NotEqual, next_region);
-        // Walk blocks base..top, clearing both mark bits on each header
-        // word0 (`and -16` also clears FWD, which is always 0 here since
-        // no block is forwarded when the from-scratch mark runs).
-        self.asm.mov_reg_reg(Reg::R11, Reg::Rsi);
-        self.asm.bind_text_label(block_loop);
-        self.asm.cmp_reg_reg(Reg::R11, Reg::R8);
-        self.asm.jcc_label(Condition::AboveOrEqual, next_region);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R11, 0);
-        self.asm.and_reg_imm32(Reg::Rax, -16); // size, marks cleared
-        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rax);
-        self.asm.add_reg_reg(Reg::R11, Reg::Rax);
-        self.asm.jmp_label(block_loop);
-        self.asm.bind_text_label(next_region);
-        self.asm.load_rbp_slot(Reg::Rax, 8);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_rbp_slot(8, Reg::Rax);
-        self.asm.jmp_label(region_loop);
-        self.asm.bind_text_label(region_done);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_clear_all_marks;
+        let tables = portable_asm::RegionTables {
+            heap_base: self.gc_heap_base,
+            heap_top: self.gc_heap_top,
+            region_base: self.gc_region_base,
+            region_top: self.gc_region_top,
+            committed_count: self.gc_committed_count,
+            region_fromspace: self.gc_region_fromspace,
+        };
+        portable_asm::emit_gc_clear_all_marks(self, entry, tables);
     }
 
     /// From-scratch STW mark to fixpoint (the collector's IDLE-cycle and
