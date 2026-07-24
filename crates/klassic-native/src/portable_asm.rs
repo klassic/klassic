@@ -529,3 +529,82 @@ pub fn emit_gc_stw_mark_complete<E: PortableAsm>(
     out.leave();
     out.ret();
 }
+
+/// Portable version of `gc_free_ghost_regions`: walk every committed
+/// region and, for each from-space (ghost) region, push its backing
+/// store onto the free-region pool and reset the region's metadata
+/// (top = base, fromspace = 0, live = 0). Runs at MarkEnd once the mark
+/// has reached fixpoint, so no live slot still references a ghost. Uses
+/// two frame slots (`[rbp-8]` = index, `[rbp-16]` = committed bound).
+/// Reuses `RegionTables` (committed_count / region_fromspace /
+/// region_base / region_top); `free_region_head` and `region_live` are
+/// the two labels beyond that set.
+pub fn emit_gc_free_ghost_regions<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    t: RegionTables<E::DataLabel>,
+    free_region_head: E::DataLabel,
+    region_live: E::DataLabel,
+) {
+    use crate::gc_layout::GC_REGION_SHIFT;
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    out.sub_reg_imm8(Reg::V4, 16);
+    out.mov_data_addr(Reg::V10, t.committed_count);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.store_rbp_slot(16, Reg::V0); // bound
+    out.mov_imm64(Reg::V0, 0);
+    out.store_rbp_slot(8, Reg::V0); // idx
+    let loop_l = out.create_text_label();
+    let done_l = out.create_text_label();
+    let next_l = out.create_text_label();
+    out.bind_text_label(loop_l);
+    out.load_rbp_slot(Reg::V0, 8);
+    out.load_rbp_slot(Reg::V1, 16);
+    out.cmp_reg_reg(Reg::V0, Reg::V1);
+    out.jcc_label(Condition::AboveOrEqual, done_l);
+    // fromspace[idx]?
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.mov_data_addr(Reg::V10, t.region_fromspace);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.test_reg_reg(Reg::V11, Reg::V11);
+    out.jcc_label(Condition::Equal, next_l);
+    // base = region_base + (idx << SHIFT)
+    out.load_rbp_slot(Reg::V0, 8);
+    out.shl_reg_imm8(Reg::V0, GC_REGION_SHIFT);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.add_reg_reg(Reg::V0, Reg::V10); // rax = base
+    // push onto free pool: [base] = free_head; free_head = base
+    out.mov_data_addr(Reg::V10, free_region_head);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.store_ptr_disp32(Reg::V0, 0, Reg::V11);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    // idx*8 in rcx for the three arrays.
+    out.load_rbp_slot(Reg::V1, 8);
+    out.shl_reg_imm8(Reg::V1, 3);
+    // region_top[idx] = base (empty)
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    // fromspace[idx] = 0 ; live[idx] = 0
+    out.mov_imm64(Reg::V11, 0);
+    out.mov_data_addr(Reg::V10, t.region_fromspace);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V11);
+    out.mov_data_addr(Reg::V10, region_live);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V11);
+    out.bind_text_label(next_l);
+    out.load_rbp_slot(Reg::V0, 8);
+    out.add_reg_imm32(Reg::V0, 1);
+    out.store_rbp_slot(8, Reg::V0);
+    out.jmp_label(loop_l);
+    out.bind_text_label(done_l);
+    out.leave();
+    out.ret();
+}

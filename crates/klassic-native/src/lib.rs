@@ -39426,65 +39426,24 @@ impl NativeCodeGenerator {
     /// slot still references a ghost (soundness invariant III). Freed
     /// regions are zeroed on reuse, erasing stale forwarding words.
     fn emit_gc_free_ghost_regions_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_free_ghost_regions);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.asm.sub_reg_imm8(Reg::Rsp, 16);
-        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.store_rbp_slot(16, Reg::Rax); // bound
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_rbp_slot(8, Reg::Rax); // idx
-        let loop_l = self.asm.create_text_label();
-        let done_l = self.asm.create_text_label();
-        let next_l = self.asm.create_text_label();
-        self.asm.bind_text_label(loop_l);
-        self.asm.load_rbp_slot(Reg::Rax, 8);
-        self.asm.load_rbp_slot(Reg::Rcx, 16);
-        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.jcc_label(Condition::AboveOrEqual, done_l);
-        // fromspace[idx]?
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_fromspace);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::R11, Reg::R11);
-        self.asm.jcc_label(Condition::Equal, next_l);
-        // base = region_base + (idx << SHIFT)
-        self.asm.load_rbp_slot(Reg::Rax, 8);
-        self.asm.shl_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.add_reg_reg(Reg::Rax, Reg::R10); // rax = base
-        // push onto free pool: [base] = free_head; free_head = base
-        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::R11);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // idx*8 in rcx for the three arrays.
-        self.asm.load_rbp_slot(Reg::Rcx, 8);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        // region_top[idx] = base (empty)
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // fromspace[idx] = 0 ; live[idx] = 0
-        self.asm.mov_imm64(Reg::R11, 0);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_fromspace);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_live);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-        self.asm.bind_text_label(next_l);
-        self.asm.load_rbp_slot(Reg::Rax, 8);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_rbp_slot(8, Reg::Rax);
-        self.asm.jmp_label(loop_l);
-        self.asm.bind_text_label(done_l);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_free_ghost_regions;
+        let tables = portable_asm::RegionTables {
+            heap_base: self.gc_heap_base,
+            heap_top: self.gc_heap_top,
+            region_base: self.gc_region_base,
+            region_top: self.gc_region_top,
+            committed_count: self.gc_committed_count,
+            region_fromspace: self.gc_region_fromspace,
+        };
+        portable_asm::emit_gc_free_ghost_regions(
+            self,
+            entry,
+            tables,
+            self.gc_free_region_head,
+            self.gc_region_live,
+        );
     }
 
     /// Acquire a fresh to-space region into the dedicated evacuation bump
