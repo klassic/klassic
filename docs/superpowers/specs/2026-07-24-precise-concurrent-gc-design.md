@@ -454,3 +454,54 @@ silently changing what a very common existing pattern means). Phases
 stacks, collection safety, disabled floor probe) are all reusable
 building blocks for whichever answer is chosen; none of that work needs
 to be redone.
+
+## Phase 7: a real, contained colored-pointer/load-barrier/concurrent-relocation demonstration
+
+Done (commit d1f86c3). Rather than continue treating "literal ZGC
+technique" as categorically off the table, this builds and verifies the
+actual technique — just as a brand new, self-contained subsystem rather
+than an instrumentation pass over the existing codegen. The "Rejected
+scope" section above still holds for *retrofitting* colored pointers into
+every one of this backend's existing pointer-load sites (still infeasible
+to do correctly and testably); it does not mean the technique itself
+can't be demonstrated honestly in isolation.
+
+- **`emit_zgc_load_barrier`**: a real load barrier. Input/output in `rax`.
+  Heap addresses on Linux x86-64 never use bit 63 (real addresses stay
+  far below 2^47), so it's free to repurpose as a one-bit color: set
+  means "this reference's target may have been relocated, resolve before
+  dereferencing." A colored value is masked, looked up in a small
+  forwarding table (`zgc_forward_old`/`zgc_forward_new`, populated by a
+  relocator thread with the entry written *before* the count that makes
+  it visible — release ordering, free on x86 TSO, no lock needed on the
+  read side), and resolved to the live address on a hit or the
+  still-valid original on a miss.
+- **`__native_zgc_relocation_test()`**: a real relocator thread moves an
+  object to a new heap address while the mutator (parent) concurrently,
+  millions of times, resolves the same colored reference through the
+  barrier — no lock excludes the mutator during the move. A second,
+  deterministic check after the join confirms the barrier resolves to
+  *exactly* the relocator's published address, not merely to something
+  that happens to still hold the right bytes (the pre-relocation address
+  is deliberately left readable in this demo — real ZGC `mprotect`s it
+  away after a safepoint, which this scoped-down version doesn't
+  implement — so a barrier that silently never redirects would still
+  pass a naive "read the right bytes" check; the post-join check is what
+  actually proves the forwarding lookup is doing the work).
+- **Verified the test's own discriminating power directly**: temporarily
+  broke the barrier (skipped the forwarding lookup) and confirmed the
+  test caught it every time (0/5 runs), before restoring the correct
+  implementation and reconfirming success (20+/20+ runs, twice).
+
+**What this does and does not claim.** This *is* a real, working,
+independently-verified exercise of colored pointers, a load barrier, and
+concurrent relocation — the three techniques that give ZGC its name. It
+is *not* a general-purpose moving collector: it relocates exactly one
+object, chosen and driven entirely by test code, with a fixed-size
+16-entry forwarding table and no safepoint/memory-protection mechanism
+to reclaim the pre-relocation address. Making ordinary heap objects
+(the ones `gc_alloc`/`gc_collect` already manage) relocatable would mean
+wiring this same barrier into every existing pointer-load site across
+the backend — the exact retrofit the "Rejected scope" section above
+explains is a separate, much larger undertaking, not something this
+phase attempts or claims to have done.
