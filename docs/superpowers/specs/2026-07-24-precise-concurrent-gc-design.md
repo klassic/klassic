@@ -33,35 +33,51 @@ verified before moving to the next:**
   parent both call `gc_alloc` concurrently and atomically count
   successes — verified race-free at n=10 (15 repeats) and n=5,000 (3
   repeats, 10,000 total concurrent allocations, exact count every time).
-- Phase 4 (safepoint stop-the-world collection + per-thread shadow
-  stacks) — NOT STARTED. This is qualitatively riskier than phases
-  1-3: those added new, self-contained, opt-in test builtins that
-  don't touch any code path existing programs exercise. Phase 4
-  requires changing `emit_gc_shadow_push`/`emit_gc_shadow_pop_n` — the
-  hottest, most pervasively-used codegen path in the whole backend,
-  invoked by ordinary record/string-holding code in *every* existing
-  program — to be per-thread instead of global. Attempting it without
-  the same careful, independently-verified, one-step-at-a-time
-  discipline used for phases 1-3 would risk a much larger and harder
-  to isolate regression. Deliberately paused here to report status
-  rather than rush it.
+- Phase 4a (per-thread shadow stacks) — DONE (commit 87df852). This
+  was the riskiest change in the campaign: `emit_gc_shadow_push`/
+  `emit_gc_shadow_pop_n` are the hottest, most pervasively-used codegen
+  path in the whole backend, exercised by ordinary generated code for
+  *every* record/heap-string/enum local in *every* existing program —
+  not an isolated new test builtin like phases 1-3. Mitigated by a
+  design that keeps the main thread on the *exact* pre-existing
+  `gc_shadow_stack`/`gc_shadow_stack_top` global, unconditionally, for
+  every program that never calls `clone()`; a small registry
+  (populated only by the single spawning thread, before `clone()`
+  runs) lets push/pop route a registered cloned thread to its own
+  private sub-stack instead. Full existing 500+ test suite (which
+  exercises this path on nearly every test) stayed green throughout.
+  New `__native_thread_safe_shadow_test(n)` proves two real threads'
+  push/pop bookkeeping stays independent under concurrent load (a
+  push+pop nets to zero on a correctly isolated stack; a race would
+  leave a counter off) — verified at n=10 (20 repeats) and n=3,000 (5
+  repeats).
+- Phase 4b (safepoint-based stop-the-world collection: suspend every
+  other thread before a mark-sweep cycle scans the now-multiple
+  shadow-stack roots) — NOT STARTED. This is the remaining piece for
+  "concurrent GC correctness" to be complete: allocation (phase 3) and
+  shadow-stack bookkeeping (phase 4a) are now both race-free, but a
+  `gc_collect` cycle triggered by one thread while a second thread is
+  concurrently *mutating* the heap or its own shadow sub-stack is not
+  yet proven safe (the collector would need to know all threads are
+  paused before it starts scanning).
 - Phase 5 (per-thread stack-overflow floor), Phase 6/language-surface
   (whether `thread()` itself starts using real threads) — NOT STARTED,
-  blocked behind Phase 4.
+  blocked behind phase 4b.
 
 **What is proven, concretely:** klassic-native can start a real second
-OS thread, and that thread can safely allocate on the shared GC heap
-concurrently with the spawning thread, with correct atomic
-synchronization — none of which was true before this session. **What
-is NOT yet proven:** that a full mark-and-sweep collection cycle is
-safe to run while a second real thread is live and touching the heap
-(shadow-stack roots are still a single global, unsynchronized array
-outside of allocation), and `thread()` itself still does not use any
-of this — it remains the pre-existing compile-time-inline mechanism.
-"Precise ZGC... works in multi-thread environment" is therefore
-**partially, not fully, satisfied**: precise tracing was already true,
-concurrent-safe allocation is now true and verified, concurrent-safe
-*collection* is not yet true.
+OS thread; that thread can safely allocate on the shared GC heap
+concurrently with the spawning thread; and both threads' shadow-stack
+root bookkeeping stays independent and race-free under concurrent
+push/pop — none of which was true before this session. **What is NOT
+yet proven:** that a full mark-and-sweep collection cycle is safe to
+run while a second real thread is live and mutating the heap (no
+safepoint/suspend mechanism exists yet), and `thread()` itself still
+does not use any of this — it remains the pre-existing compile-time-
+inline mechanism. "Precise ZGC... works in multi-thread environment"
+is therefore **substantially, though not 100%, satisfied**: precise
+tracing was already true; concurrent-safe allocation and concurrent-
+safe root tracking are now both true and verified; concurrent-safe
+*collection* (the last piece) is not yet true.
 
 ## Problem
 
