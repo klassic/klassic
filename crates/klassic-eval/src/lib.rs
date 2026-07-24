@@ -2383,6 +2383,13 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
                 expect_non_negative_int(&arguments[0], "__native_thread_safe_shadow_test", span)?;
             Ok(Value::Int(1))
         }
+        "__native_thread_safe_collect_test" => {
+            // Native-only (see __native_thread_spawn_test above); stub
+            // reports success (1) so eval-mode programs written against
+            // it still run without claiming to test anything real.
+            ensure_arity(name, arguments, 0, span)?;
+            Ok(Value::Int(1))
+        }
         "__gc_list_ptr" => {
             ensure_arity(name, arguments, 1, span)?;
             let _ = expect_non_negative_int(&arguments[0], "__gc_list_ptr", span)?;

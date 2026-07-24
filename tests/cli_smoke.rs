@@ -29091,3 +29091,80 @@ fn native_build_thread_safe_shadow_test_is_race_free() {
         let _ = fs::remove_file(&output_path);
     }
 }
+
+/// `__native_thread_safe_collect_test()` proves `gc_collect_barrier`
+/// (docs/superpowers/specs/2026-07-24-precise-concurrent-gc-design.md,
+/// phase 4b) makes a real mark-and-sweep cycle safe to run while a second
+/// real thread is concurrently live and rooting its own object: the child
+/// thread allocates one object, writes a recognizable value into it,
+/// roots it via the exact same `emit_gc_shadow_push` codegen ordinary
+/// local variables use, then waits until it has observed at least two
+/// real `gc_collect` cycles complete before re-checking the value and
+/// unrooting. The parent meanwhile runs an allocation storm of unrooted
+/// (immediately-garbage) objects well past the heap's initial capacity,
+/// which reliably forces several real collection cycles via `gc_alloc`'s
+/// existing collect-and-retry path.
+///
+/// If the child's object is still intact after surviving collection
+/// while it was live, the collector correctly found it via the cloned-
+/// thread shadow-stack scan and left it alone; if `gc_collect_barrier`
+/// did not actually exclude the child's concurrent shadow-stack push/pop
+/// from a collecting thread's read, the value could come back corrupted
+/// (or the process could crash outright on a torn pointer). Repeated
+/// in-process since a race is timing-dependent.
+#[test]
+fn native_build_thread_safe_collect_test_survives_concurrent_collection() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!(
+        "klassic_native_thread_safe_collect_test_{stamp}.kl"
+    ));
+    let output_path = std::env::temp_dir().join(format!(
+        "klassic_native_thread_safe_collect_test_{stamp}.bin"
+    ));
+    fs::write(
+        &source_path,
+        "println(__native_thread_safe_collect_test())\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    assert!(
+        build_output.status.success(),
+        "__native_thread_safe_collect_test should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    for attempt in 0..15 {
+        let run_output = Command::new(&output_path)
+            .output()
+            .expect("compiled binary should run");
+        assert!(
+            run_output.status.success(),
+            "attempt {attempt}: compiled binary should run cleanly, not crash or hang\nstderr:\n{}",
+            String::from_utf8_lossy(&run_output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run_output.stdout),
+            "1\n",
+            "attempt {attempt}: expected the child's rooted object to survive \
+             real concurrent collection intact (1); 0 means it was corrupted \
+             (gc_collect_barrier failed to exclude concurrent shadow-stack \
+             mutation from the collector's scan); -1/-2/-3/-4 are the \
+             mmap/clone/join-timeout/collect-poll-timeout sentinels; got:\n{}",
+            String::from_utf8_lossy(&run_output.stdout)
+        );
+    }
+    let _ = fs::remove_file(&output_path);
+}
