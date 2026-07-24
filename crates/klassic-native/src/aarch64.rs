@@ -3719,16 +3719,32 @@ impl Emitter {
                 if self.expression(&arguments[0])? != ValueType::Int {
                     return Err(unsupported(span, &format!("{name} with a non-Int size")));
                 }
-                if name == "__gc_record" {
-                    // n pointer slots → n * 8 bytes.
+                // M6: a GC-shaped object with a 16-byte header. The enum
+                // lowering boxes every scalar/bool/double field and the
+                // discriminant, so a `__gc_record`'s n slots are all heap
+                // pointers (POINTER_RECORD, size = 1 + field_count >= 1); a
+                // `__gc_alloc` cell is raw bytes (RAW_BYTES). Both return the
+                // user pointer (block + 16), so the `__gc_write`/`__gc_read`
+                // payload offsets are unchanged.
+                let tag = if name == "__gc_record" {
+                    // n pointer slots -> n * 8 bytes.
                     self.asm.lsl_imm(Reg::X4, Reg::X0, 3);
+                    crate::gc_layout::GC_TYPE_POINTER_RECORD
                 } else {
                     self.asm.add_reg_imm(Reg::X4, Reg::X0, 7);
                     self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
                     self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-                }
-                self.emit_alloc();
-                self.asm.mov_reg(Reg::X0, Reg::X5);
+                    crate::gc_layout::GC_TYPE_RAW_BYTES
+                };
+                // block = align16(payload + 16 header).
+                self.asm.add_reg_imm(Reg::X4, Reg::X4, 16 + 15);
+                self.asm.lsr_imm(Reg::X4, Reg::X4, 4);
+                self.asm.lsl_imm(Reg::X4, Reg::X4, 4);
+                self.emit_alloc(); // x5 = block base, x4 = block size preserved
+                self.asm.str_imm(Reg::X4, Reg::X5, 0); // [block] = size|mark(0)
+                self.asm.mov_imm64(Reg::X6, tag);
+                self.asm.str_imm(Reg::X6, Reg::X5, 8); // [block + 8] = type_tag
+                self.asm.add_reg_imm(Reg::X0, Reg::X5, 16); // x0 = user pointer
                 Ok(Some(ValueType::Ptr))
             }
             ("__gc_write", 3) => {
