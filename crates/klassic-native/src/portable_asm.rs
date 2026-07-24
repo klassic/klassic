@@ -1621,6 +1621,228 @@ pub fn emit_gc_acquire_region<E: PortableAsm>(
     out.ret();
 }
 
+/// All the data cells `gc_relocate_start` reads/writes across its color
+/// setup, sparsest-first selection, and Relocate/Idle entry. Grouped into
+/// one parameter because the routine touches ~18 globals.
+#[derive(Clone, Copy)]
+pub struct RelocateStartCells<D: Copy> {
+    pub good_color: D,
+    pub bad_mask: D,
+    pub free_region_head: D,
+    pub budget_regions: D,
+    pub committed_count: D,
+    pub heap_base: D,
+    pub region_base: D,
+    pub region_top: D,
+    pub region_live: D,
+    pub region_fromspace: D,
+    pub evac_region_base: D,
+    pub evac_top: D,
+    pub evac_end: D,
+    pub reloc_scan_idx: D,
+    pub reloc_block: D,
+    pub bytes_since_quantum: D,
+    pub phase: D,
+    pub bytes_since_cycle: D,
+}
+
+/// Portable version of `gc_relocate_start` (fused into the MarkEnd pause).
+/// When evacuation is active, switch to the Idle/Relocate color config
+/// (good = R), compute the evacuation byte cap from the free-region count,
+/// select the sparsest non-current, non-large from-space regions within
+/// the headroom cap, fix up the roots to their to-space copies, reset the
+/// relocate cursor + quantum pacer, and enter the Relocate phase. If
+/// evacuation is compiled off (`evac_off`), or nothing worth evacuating is
+/// selected, close the cycle straight to Idle. `poison` forces
+/// `bad = COLOR_MASK` (the barrier-coverage canary). Both flags gate
+/// codegen and are passed in.
+pub fn emit_gc_relocate_start<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    c: RelocateStartCells<E::DataLabel>,
+    fix_roots: E::TextLabel,
+    evac_off: bool,
+    poison: bool,
+) {
+    use crate::gc_layout::{
+        GC_COLOR_M0, GC_COLOR_M1, GC_COLOR_MASK, GC_COLOR_R, GC_PHASE_IDLE, GC_PHASE_RELOCATE,
+        GC_REGION_SHIFT, GC_REGION_SIZE,
+    };
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    let mark_only = out.create_text_label();
+    if !evac_off {
+        // slots: 8=idx, 16=committed, 24=cap_bytes, 32=selected_live,
+        // 40=cur_bump_idx.
+        out.sub_reg_imm8(Reg::V4, 48);
+        // Idle/Relocate color config: good = R, bad = M0|M1 (or COLOR_MASK
+        // under poison). Applies to both the Relocate entry and the
+        // mark-only fallback (both end at good = R).
+        out.mov_imm64(Reg::V0, GC_COLOR_R);
+        out.mov_data_addr(Reg::V10, c.good_color);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        if poison {
+            out.mov_imm64(Reg::V0, GC_COLOR_MASK);
+        } else {
+            out.mov_imm64(Reg::V0, GC_COLOR_M0 | GC_COLOR_M1);
+        }
+        out.mov_data_addr(Reg::V10, c.bad_mask);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        out.mov_data_addr(Reg::GoodColor, c.good_color);
+        out.load_ptr_disp32(Reg::GoodColor, Reg::GoodColor, 0);
+        out.mov_data_addr(Reg::BadMask, c.bad_mask);
+        out.load_ptr_disp32(Reg::BadMask, Reg::BadMask, 0);
+        // free_regions = (budget - committed) + free-pool count.
+        out.mov_imm64(Reg::V1, 0);
+        out.mov_data_addr(Reg::V10, c.free_region_head);
+        out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+        let fp_loop = out.create_text_label();
+        let fp_done = out.create_text_label();
+        out.bind_text_label(fp_loop);
+        out.test_reg_reg(Reg::V0, Reg::V0);
+        out.jcc_label(Condition::Equal, fp_done);
+        out.add_reg_imm32(Reg::V1, 1);
+        out.load_ptr_disp32(Reg::V0, Reg::V0, 0);
+        out.jmp_label(fp_loop);
+        out.bind_text_label(fp_done);
+        out.mov_data_addr(Reg::V10, c.budget_regions);
+        out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+        out.mov_data_addr(Reg::V10, c.committed_count);
+        out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+        out.sub_reg_reg(Reg::V0, Reg::V11);
+        out.add_reg_reg(Reg::V0, Reg::V1); // rax = free_regions
+        // cap_bytes = (free_regions >= 2) ? (free_regions-2)<<(SHIFT-1) : 0.
+        // Half the free bytes keeps the region count within free_regions-2
+        // even at ~50% packing, so acquire_evac_region never runs past the
+        // reservation.
+        let have_cap = out.create_text_label();
+        let store_cap = out.create_text_label();
+        out.cmp_reg_imm8(Reg::V0, 2);
+        out.jcc_label(Condition::AboveOrEqual, have_cap);
+        out.mov_imm64(Reg::V0, 0);
+        out.jmp_label(store_cap);
+        out.bind_text_label(have_cap);
+        out.sub_reg_imm8(Reg::V0, 2);
+        out.shl_reg_imm8(Reg::V0, GC_REGION_SHIFT - 1);
+        out.bind_text_label(store_cap);
+        out.store_rbp_slot(24, Reg::V0); // cap_bytes
+        // cur_bump_idx = (heap_base - region_base) >> SHIFT.
+        out.mov_data_addr(Reg::V10, c.heap_base);
+        out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+        out.mov_data_addr(Reg::V10, c.region_base);
+        out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+        out.sub_reg_reg(Reg::V0, Reg::V11);
+        out.shr_reg_imm8(Reg::V0, GC_REGION_SHIFT);
+        out.store_rbp_slot(40, Reg::V0);
+        out.mov_data_addr(Reg::V10, c.committed_count);
+        out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+        out.store_rbp_slot(16, Reg::V0); // committed bound
+        out.mov_imm64(Reg::V0, 0);
+        out.store_rbp_slot(8, Reg::V0); // idx
+        out.store_rbp_slot(32, Reg::V0); // selected_live
+        let sel_loop = out.create_text_label();
+        let sel_next = out.create_text_label();
+        let sel_done = out.create_text_label();
+        out.bind_text_label(sel_loop);
+        out.load_rbp_slot(Reg::V0, 8);
+        out.load_rbp_slot(Reg::V1, 16);
+        out.cmp_reg_reg(Reg::V0, Reg::V1);
+        out.jcc_label(Condition::AboveOrEqual, sel_done);
+        // skip the current bump region.
+        out.load_rbp_slot(Reg::V1, 40);
+        out.cmp_reg_reg(Reg::V0, Reg::V1);
+        out.jcc_label(Condition::Equal, sel_next);
+        // base = region_base + idx<<SHIFT ; top = region_top[idx].
+        out.mov_reg_reg(Reg::V1, Reg::V0);
+        out.shl_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+        out.mov_data_addr(Reg::V10, c.region_base);
+        out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+        out.add_reg_reg(Reg::V1, Reg::V10); // base (rcx)
+        out.load_rbp_slot(Reg::V8, 8);
+        out.shl_reg_imm8(Reg::V8, 3);
+        out.mov_data_addr(Reg::V10, c.region_top);
+        out.add_reg_reg(Reg::V10, Reg::V8);
+        out.load_ptr_disp32(Reg::V8, Reg::V10, 0); // top (r8)
+        // empty (top == base)?
+        out.cmp_reg_reg(Reg::V8, Reg::V1);
+        out.jcc_label(Condition::Equal, sel_next);
+        // large (top - base > REGION_SIZE)?
+        out.sub_reg_reg(Reg::V8, Reg::V1); // used bytes
+        out.cmp_reg_imm32(Reg::V8, GC_REGION_SIZE as i32);
+        out.jcc_label(Condition::Above, sel_next);
+        // live = gc_region_live[idx].
+        out.load_rbp_slot(Reg::V8, 8);
+        out.shl_reg_imm8(Reg::V8, 3);
+        out.mov_data_addr(Reg::V10, c.region_live);
+        out.add_reg_reg(Reg::V10, Reg::V8);
+        out.load_ptr_disp32(Reg::V11, Reg::V10, 0); // live (r11)
+        // not sparse (live >= REGION_SIZE/2)?
+        out.cmp_reg_imm32(Reg::V11, (GC_REGION_SIZE / 2) as i32);
+        out.jcc_label(Condition::AboveOrEqual, sel_next);
+        // headroom (selected_live + live > cap)?
+        out.load_rbp_slot(Reg::V0, 32);
+        out.add_reg_reg(Reg::V0, Reg::V11);
+        out.load_rbp_slot(Reg::V1, 24);
+        out.cmp_reg_reg(Reg::V0, Reg::V1);
+        out.jcc_label(Condition::Above, sel_next);
+        // select: fromspace[idx] = 1 ; selected_live += live.
+        out.store_rbp_slot(32, Reg::V0); // selected_live += live
+        out.load_rbp_slot(Reg::V8, 8);
+        out.shl_reg_imm8(Reg::V8, 3);
+        out.mov_data_addr(Reg::V10, c.region_fromspace);
+        out.add_reg_reg(Reg::V10, Reg::V8);
+        out.mov_imm64(Reg::V0, 1);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        out.bind_text_label(sel_next);
+        out.load_rbp_slot(Reg::V0, 8);
+        out.add_reg_imm32(Reg::V0, 1);
+        out.store_rbp_slot(8, Reg::V0);
+        out.jmp_label(sel_loop);
+        out.bind_text_label(sel_done);
+        // Nothing selected -> mark-only close.
+        out.load_rbp_slot(Reg::V0, 32);
+        out.test_reg_reg(Reg::V0, Reg::V0);
+        out.jcc_label(Condition::Equal, mark_only);
+        // Reset the evacuation bump so the first copy acquires a fresh
+        // to-space region (relocate_finish only clears evac_region_base).
+        out.mov_imm64(Reg::V0, 0);
+        out.mov_data_addr(Reg::V10, c.evac_region_base);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        out.mov_data_addr(Reg::V10, c.evac_top);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        out.mov_data_addr(Reg::V10, c.evac_end);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        // Fix roots, reset the relocate cursor + quantum pacer, enter the
+        // Relocate phase.
+        out.call_label(fix_roots);
+        out.mov_imm64(Reg::V0, 0);
+        out.mov_data_addr(Reg::V10, c.reloc_scan_idx);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        out.mov_data_addr(Reg::V10, c.reloc_block);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        out.mov_data_addr(Reg::V10, c.bytes_since_quantum);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        out.mov_data_addr(Reg::V10, c.phase);
+        out.mov_imm64(Reg::V0, GC_PHASE_RELOCATE);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+        out.leave();
+        out.ret();
+    }
+    // Mark-only close (evac off, or nothing selected): back to Idle, reset
+    // the proactive counter.
+    out.bind_text_label(mark_only);
+    out.mov_data_addr(Reg::V10, c.phase);
+    out.mov_imm64(Reg::V0, GC_PHASE_IDLE);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.mov_data_addr(Reg::V10, c.bytes_since_cycle);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.leave();
+    out.ret();
+}
+
 /// The resumable-cursor and mark cells the relocate quantum reads.
 #[derive(Clone, Copy)]
 pub struct RelocQuantumCells<D: Copy> {
