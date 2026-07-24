@@ -38134,23 +38134,29 @@ impl NativeCodeGenerator {
     /// the clock syscall path panics on Windows, and no cell is written
     /// there, so a pause simply reads 0). Emitted at the start of each
     /// STW pause (MarkStart, MarkEnd, and the synchronous full collect).
+    fn gc_pause_cells(&self) -> portable_asm::PauseCells<DataLabel> {
+        portable_asm::PauseCells {
+            start_ns: self.gc_pause_start_ns,
+            total_ns: self.gc_pause_total_ns,
+            max_ns: self.gc_pause_max_ns,
+        }
+    }
+
     fn emit_gc_pause_start(&mut self) {
         // Delegated to the portable emitter; the `--gc-log`-and-not-Windows
         // gate stays here (it is host-config state, not codegen), and the
         // clock read is a `PortableAsm` platform primitive. Byte-identical.
         let timing = self.gc_log && !self.is_windows;
-        let start = self.gc_pause_start_ns;
-        portable_asm::emit_gc_pause_start(self, timing, start);
+        let cells = self.gc_pause_cells();
+        portable_asm::emit_gc_pause_start(self, timing, cells);
     }
 
     /// Fold the elapsed pause (now - gc_pause_start_ns) into the max and
     /// total pause accumulators. Emitted at the end of each STW pause.
     fn emit_gc_pause_end(&mut self) {
         let timing = self.gc_log && !self.is_windows;
-        let start = self.gc_pause_start_ns;
-        let total = self.gc_pause_total_ns;
-        let max = self.gc_pause_max_ns;
-        portable_asm::emit_gc_pause_end(self, timing, start, total, max);
+        let cells = self.gc_pause_cells();
+        portable_asm::emit_gc_pause_end(self, timing, cells);
     }
 
     fn emit_gc_alloc_runtime(&mut self) {
@@ -38934,43 +38940,27 @@ impl NativeCodeGenerator {
     /// to fixpoint (a straggler may have been added by the barrier), and
     /// if THAT overflows, degrade. Then sweep and return to Idle.
     fn emit_gc_mark_end_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_mark_end);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.emit_gc_pause_start(); // MarkEnd STW pause (final drain + sweep).
-        let do_degrade = self.asm.create_text_label();
-        let after_mark = self.asm.create_text_label();
-        self.asm
-            .mov_data_addr(Reg::R10, self.gc_stw_fallback_pending);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::NotEqual, do_degrade);
-        self.asm.call_label(self.gc_drain);
-        self.asm
-            .mov_data_addr(Reg::R10, self.gc_stw_fallback_pending);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, after_mark);
-        self.asm.bind_text_label(do_degrade);
-        self.asm.mov_data_addr(Reg::R10, self.gc_stw_fallbacks);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.call_label(self.gc_stw_mark_complete);
-        self.asm.bind_text_label(after_mark);
-        // Free the previous cycle's ghost (from-space) regions: the mark
-        // just reached fixpoint, so no live slot references them
-        // (soundness invariant III). A no-op until evacuation runs.
-        self.asm.call_label(self.gc_free_ghost_regions);
-        self.asm.call_label(self.gc_sweep);
-        // Close the cycle. gc_relocate_start selects from-space regions,
-        // fixes roots, and enters the Relocate phase when evacuation is
-        // active; until the activation step it just returns to Idle and
-        // resets the proactive-trigger counter.
-        self.asm.call_label(self.gc_relocate_start);
-        self.emit_gc_pause_end();
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_mark_end;
+        let timing = self.gc_log && !self.is_windows;
+        let pause = self.gc_pause_cells();
+        let targets = portable_asm::MarkEndTargets {
+            drain: self.gc_drain,
+            stw_mark_complete: self.gc_stw_mark_complete,
+            free_ghost_regions: self.gc_free_ghost_regions,
+            sweep: self.gc_sweep,
+            relocate_start: self.gc_relocate_start,
+        };
+        portable_asm::emit_gc_mark_end(
+            self,
+            entry,
+            timing,
+            pause,
+            targets,
+            self.gc_stw_fallback_pending,
+            self.gc_stw_fallbacks,
+        );
     }
 
     /// `gc_mark_visit(addr)` (rdi = addr): if addr points to an unmarked

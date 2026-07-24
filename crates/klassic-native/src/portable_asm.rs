@@ -282,43 +282,53 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
 }
 
+/// The three `--gc-log` STW-pause accumulator cells, grouped so pause
+/// timing threads through the collector as one parameter.
+#[derive(Clone, Copy)]
+pub struct PauseCells<D: Copy> {
+    /// Timestamp captured at pause entry.
+    pub start_ns: D,
+    /// Running sum of all pause durations.
+    pub total_ns: D,
+    /// Longest single pause seen.
+    pub max_ns: D,
+}
+
 /// Portable version of the `gc_pause_start` STW-pause helper: when
 /// `timing` is set (the `--gc-log` build on a platform whose clock the
-/// backend supports), capture the monotonic clock into `pause_start_ns`;
+/// backend supports), capture the monotonic clock into `cells.start_ns`;
 /// otherwise emit nothing. Inlined at the start of every STW pause.
 pub fn emit_gc_pause_start<E: PortableAsm>(
     out: &mut E,
     timing: bool,
-    pause_start_ns: E::DataLabel,
+    cells: PauseCells<E::DataLabel>,
 ) {
     if timing {
         out.plat_read_monotonic_ns();
-        out.mov_data_addr(Reg::V10, pause_start_ns);
+        out.mov_data_addr(Reg::V10, cells.start_ns);
         out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
     }
 }
 
 /// Portable version of the `gc_pause_end` STW-pause helper: when `timing`
-/// is set, fold the elapsed pause (`now - pause_start_ns`) into the total
+/// is set, fold the elapsed pause (`now - cells.start_ns`) into the total
 /// and max accumulators; otherwise emit nothing. Inlined at the end of
 /// every STW pause.
 pub fn emit_gc_pause_end<E: PortableAsm>(
     out: &mut E,
     timing: bool,
-    pause_start_ns: E::DataLabel,
-    pause_total_ns: E::DataLabel,
-    pause_max_ns: E::DataLabel,
+    cells: PauseCells<E::DataLabel>,
 ) {
     if timing {
         out.plat_read_monotonic_ns();
-        out.mov_data_addr(Reg::V10, pause_start_ns);
+        out.mov_data_addr(Reg::V10, cells.start_ns);
         out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
         out.sub_reg_reg(Reg::V0, Reg::V11); // rax = delta ns
-        out.mov_data_addr(Reg::V10, pause_total_ns);
+        out.mov_data_addr(Reg::V10, cells.total_ns);
         out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
         out.add_reg_reg(Reg::V11, Reg::V0);
         out.store_ptr_disp32(Reg::V10, 0, Reg::V11);
-        out.mov_data_addr(Reg::V10, pause_max_ns);
+        out.mov_data_addr(Reg::V10, cells.max_ns);
         out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
         out.cmp_reg_reg(Reg::V0, Reg::V11);
         let keep_max = out.create_text_label();
@@ -756,6 +766,69 @@ pub fn emit_gc_mark_visit<E: PortableAsm>(
     out.mov_data_addr(Reg::V10, w.stw_fallback_pending);
     out.mov_imm64(Reg::V0, 1);
     out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.leave();
+    out.ret();
+}
+
+/// Text labels for the subroutines `gc_mark_end` chains through to close
+/// a cycle.
+#[derive(Clone, Copy)]
+pub struct MarkEndTargets<T: Copy> {
+    pub drain: T,
+    pub stw_mark_complete: T,
+    pub free_ghost_regions: T,
+    pub sweep: T,
+    pub relocate_start: T,
+}
+
+/// Portable version of `gc_mark_end` (short STW pause): finish the cycle.
+/// If the worklist overflowed during the incremental quanta, degrade to a
+/// from-scratch STW re-mark; otherwise drain the remaining frontier to
+/// fixpoint (a straggler may have been added by the barrier), and if THAT
+/// overflows, degrade. Then free ghosts, sweep, and close via
+/// `relocate_start`. Wraps the body in the portable pause-timing helpers.
+pub fn emit_gc_mark_end<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    timing: bool,
+    pause: PauseCells<E::DataLabel>,
+    targets: MarkEndTargets<E::TextLabel>,
+    stw_fallback_pending: E::DataLabel,
+    stw_fallbacks: E::DataLabel,
+) {
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    emit_gc_pause_start(out, timing, pause); // MarkEnd STW pause (final drain + sweep).
+    let do_degrade = out.create_text_label();
+    let after_mark = out.create_text_label();
+    out.mov_data_addr(Reg::V10, stw_fallback_pending);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::NotEqual, do_degrade);
+    out.call_label(targets.drain);
+    out.mov_data_addr(Reg::V10, stw_fallback_pending);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, after_mark);
+    out.bind_text_label(do_degrade);
+    out.mov_data_addr(Reg::V10, stw_fallbacks);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.add_reg_imm32(Reg::V0, 1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.call_label(targets.stw_mark_complete);
+    out.bind_text_label(after_mark);
+    // Free the previous cycle's ghost (from-space) regions: the mark just
+    // reached fixpoint, so no live slot references them (soundness
+    // invariant III). A no-op until evacuation runs.
+    out.call_label(targets.free_ghost_regions);
+    out.call_label(targets.sweep);
+    // Close the cycle. gc_relocate_start selects from-space regions, fixes
+    // roots, and enters the Relocate phase when evacuation is active;
+    // until the activation step it just returns to Idle and resets the
+    // proactive-trigger counter.
+    out.call_label(targets.relocate_start);
+    emit_gc_pause_end(out, timing, pause);
     out.leave();
     out.ret();
 }
