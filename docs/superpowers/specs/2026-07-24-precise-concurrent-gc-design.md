@@ -749,3 +749,48 @@ Net progression across this session's three measurements: 386 -> 388 ->
 518-test suite under temporarily-forced universal coloring. Real
 (committed) state is unchanged at every step: 518/518 green, `gc_alloc`
 still returns uncolored pointers.
+
+**Second addendum (same session, commit 14ce971): remaining independent
+string builtins done, a real near-miss caught by register-liveness
+tracing, coverage 428 -> 438.**
+
+Wired the ~15 `__gc_string_*` builtins with no shared loader (get_byte,
+set_byte, substring, starts_with, ends_with, contains, repeat, index_of,
+index_of_from, last_index_of, to_int, split) plus `__gc_list_ptr_join`
+(joins a list of heap strings — both the top-level argument and, more
+subtly, each individual list *element*, itself a colored heap-string
+pointer read out of the list during the join).
+
+**Important methodological finding, worth calling out on its own:** the
+first attempt at resolving `__gc_list_ptr_join`'s per-element pointer
+(inside its length-summing loop) stashed the loop's live registers in
+what looked like "spare" registers (r9, r10) across the barrier call —
+but that loop actually carries **five** live values across every
+iteration (rax = running total, rcx = index, r9 = separator length
+needed *after* the loop too, r10 = list base, r11 = loop bound), and the
+barrier clobbers four of those five (rcx, r9, r10, r11). The draft fix
+would have silently corrupted the loop from the second iteration onward
+— not something the *current* test suite could catch, since `gc_alloc`
+doesn't color anything yet, so the barrier call is a no-op today and the
+bug is purely latent, waiting for the day coloring goes live. Caught
+only by explicitly tracing which registers survive from one loop
+iteration to the next before trusting the fix, not by running anything.
+Fixed by stack-saving all five registers around the barrier call rather
+than assuming free registers exist. A second per-element resolution in
+the same function (a different loop that reloads everything from rbp
+slots each iteration, carrying nothing in registers across iterations)
+needed no such care — confirming this is a per-loop judgment call, not a
+pattern that transfers automatically.
+
+This is the clearest evidence yet that the remaining ~24 list/map family
+functions (the most fragmented area per the original audit) cannot be
+retrofitted as a fast, uniform copy-paste pass — several of them are
+loop-heavy in the same way, and each loop's live-register set has to be
+traced individually before a barrier call is safe to insert. Budget
+accordingly for whatever session continues this.
+
+Coverage progression across five measurements this session: 386 -> 388
+-> 423 -> 428 -> 438 passing / 132 -> 130 -> 95 -> 90 -> 80 failing, out
+of 518, all under the same temporarily-forced-universal-coloring probe.
+Real (committed) state stays 518/518 green and `gc_alloc` uncolored at
+every step.
