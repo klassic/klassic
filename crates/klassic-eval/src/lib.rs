@@ -2404,6 +2404,11 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             ensure_arity(name, arguments, 0, span)?;
             Ok(Value::Int(1))
         }
+        "__native_zgc_relocate_many_test" => {
+            // Native-only; see __native_zgc_relocation_test above.
+            ensure_arity(name, arguments, 0, span)?;
+            Ok(Value::Int(1))
+        }
         "__gc_list_ptr" => {
             ensure_arity(name, arguments, 1, span)?;
             let _ = expect_non_negative_int(&arguments[0], "__gc_list_ptr", span)?;

@@ -4097,22 +4097,39 @@ struct NativeCodeGenerator {
     /// was corrupted or the child's poll for enough collection cycles
     /// to actually happen timed out before checking.
     collect_test_child_ok: DataLabel,
-    /// How many entries of `zgc_forward_old`/`zgc_forward_new` are
-    /// populated. Written last by the relocator, *after* the
-    /// corresponding entry pair is fully written (x86 TSO preserves that
-    /// store order), so a barrier that observes count `>= k` has also
-    /// observed entries `0..k` -- no lock needed on the read side. Part
-    /// of the small, self-contained ZGC-technique proof-of-concept (see
+    /// How many entries of the forwarding table (`zgc_forward_old_base`/
+    /// `zgc_forward_new_base`) are populated. Written last by
+    /// `zgc_relocate_object`, *after* the corresponding entry pair is
+    /// fully written and after any table growth's new base pointers are
+    /// published (x86 TSO preserves that store order), so a barrier that
+    /// observes count `>= k` has also observed entries `0..k` at their
+    /// *current* location -- no lock needed on the read side. See
     /// docs/superpowers/specs/2026-07-24-precise-concurrent-gc-design.md,
-    /// "Phase 7: a real, contained colored-pointer/load-barrier/
-    /// concurrent-relocation demonstration") -- deliberately NOT wired
-    /// into the general heap/collector; this exercises the technique in
-    /// isolation, it does not make ordinary allocations relocatable.
+    /// "Phase 8: a general, growable colored-pointer/load-barrier/
+    /// relocation primitive", for the ordering argument in full and why
+    /// this remains a separate, additive mechanism rather than something
+    /// wired into every existing pointer-load site in the general heap.
     zgc_forward_count: DataLabel,
-    /// Pre-relocation (old) addresses, parallel to `zgc_forward_new`.
-    zgc_forward_old: DataLabel,
-    /// Post-relocation (new) addresses, parallel to `zgc_forward_old`.
-    zgc_forward_new: DataLabel,
+    /// How many entries `zgc_forward_old_base`/`zgc_forward_new_base`
+    /// currently have room for. Doubles via `zgc_forward_grow` whenever
+    /// `zgc_relocate_object` finds `zgc_forward_count == zgc_forward_capacity`.
+    zgc_forward_capacity: DataLabel,
+    /// Pointer to the current (possibly grown) array of pre-relocation
+    /// (old) addresses, parallel to `zgc_forward_new_base`. A cell
+    /// holding a pointer, not the array itself -- `zgc_forward_grow`
+    /// replaces the pointed-to array wholesale rather than resizing it
+    /// in place, so this cell's value can change over the program's
+    /// lifetime.
+    zgc_forward_old_base: DataLabel,
+    /// Pointer to the current (possibly grown) array of post-relocation
+    /// (new) addresses, parallel to `zgc_forward_old_base`.
+    zgc_forward_new_base: DataLabel,
+    /// Spinlock serializing `zgc_relocate_object` calls (growth +
+    /// append must be one atomic critical section w.r.t. other
+    /// concurrent relocators). Never taken by the load barrier, which
+    /// stays lock-free by design -- see `zgc_forward_count`'s doc
+    /// comment for why that is still safe.
+    zgc_forward_lock: DataLabel,
     /// The mutator's current reference to the test object, always
     /// stored *colored* (bit 63 set) -- the load barrier is what makes
     /// a colored pointer usable at all, exactly mirroring how every
@@ -4128,6 +4145,27 @@ struct NativeCodeGenerator {
     /// magic value. Never cleared once set, so a single bad iteration
     /// out of millions still fails the whole test.
     zgc_test_saw_wrong_value: DataLabel,
+    /// Callable load-barrier subroutine (see `emit_zgc_load_barrier_runtime`).
+    /// Input/output rax; `ret`s to the caller rather than being inlined,
+    /// so it can be called from an arbitrary number of sites without
+    /// each one paying for a full copy of the scan loop.
+    zgc_load_barrier: TextLabel,
+    /// Callable general relocation primitive (see
+    /// `emit_zgc_relocate_object_runtime`): given a pointer to any live
+    /// heap object, of any type tag or size, allocates a same-shape
+    /// replacement, copies the payload, and registers a forwarding
+    /// entry. Input rax = pointer to relocate; output rax = new address.
+    zgc_relocate_object: TextLabel,
+    /// Doubles the forwarding table's capacity (see
+    /// `emit_zgc_forward_grow_runtime`). Internal to `zgc_relocate_object`
+    /// -- callable only while holding `zgc_forward_lock`.
+    zgc_forward_grow: TextLabel,
+    /// Fixed-size scratch array of colored pointers used by
+    /// `__native_zgc_relocate_many_test` to drive many relocations
+    /// through a single-threaded, deterministic capacity-growth and
+    /// size-generality check (as opposed to `__native_zgc_relocation_test`'s
+    /// concurrency focus). Not touched by anything else.
+    zgc_many_test_ptrs: DataLabel,
     /// Per-scope counter parallel to scope_base_offsets — number of GC
     /// pointer slots pushed onto the shadow stack in this scope.
     scope_gc_root_counts: Vec<usize>,
@@ -4339,11 +4377,17 @@ impl NativeCodeGenerator {
         let collect_test_child_done = asm.data_label_with_i64s(&[0]);
         let collect_test_child_ok = asm.data_label_with_i64s(&[0]);
         let zgc_forward_count = asm.data_label_with_i64s(&[0]);
-        let zgc_forward_old = asm.data_label_with_i64s(&[0; Self::ZGC_FORWARD_TABLE_LEN]);
-        let zgc_forward_new = asm.data_label_with_i64s(&[0; Self::ZGC_FORWARD_TABLE_LEN]);
+        let zgc_forward_capacity = asm.data_label_with_i64s(&[0]);
+        let zgc_forward_old_base = asm.data_label_with_i64s(&[0]);
+        let zgc_forward_new_base = asm.data_label_with_i64s(&[0]);
+        let zgc_forward_lock = asm.data_label_with_i64s(&[0]);
         let zgc_mutator_ptr = asm.data_label_with_i64s(&[0]);
         let zgc_test_child_done = asm.data_label_with_i64s(&[0]);
         let zgc_test_saw_wrong_value = asm.data_label_with_i64s(&[0]);
+        let zgc_load_barrier = asm.create_text_label();
+        let zgc_relocate_object = asm.create_text_label();
+        let zgc_forward_grow = asm.create_text_label();
+        let zgc_many_test_ptrs = asm.data_label_with_i64s(&[0; Self::ZGC_MANY_TEST_COUNT]);
         let mut record_schemas = HashMap::new();
         record_schemas.insert(
             "Point".to_string(),
@@ -4427,11 +4471,17 @@ impl NativeCodeGenerator {
             collect_test_child_done,
             collect_test_child_ok,
             zgc_forward_count,
-            zgc_forward_old,
-            zgc_forward_new,
+            zgc_forward_capacity,
+            zgc_forward_old_base,
+            zgc_forward_new_base,
+            zgc_forward_lock,
             zgc_mutator_ptr,
             zgc_test_child_done,
             zgc_test_saw_wrong_value,
+            zgc_load_barrier,
+            zgc_relocate_object,
+            zgc_forward_grow,
+            zgc_many_test_ptrs,
             scope_gc_root_counts: vec![0],
             scopes: vec![HashMap::new()],
             static_scopes: vec![HashMap::new()],
@@ -4995,6 +5045,7 @@ impl NativeCodeGenerator {
         self.emit_store_command_line_state();
         self.emit_initialize_stack_floor();
         self.emit_initialize_gc_heap();
+        self.emit_initialize_zgc_forward_table();
         self.compile_top_level(expr)?;
         self.emit_queued_threads()?;
         self.emit_exit_success();
@@ -5009,6 +5060,9 @@ impl NativeCodeGenerator {
         self.emit_gc_unpin_runtime();
         self.emit_gc_grow_heap_runtime();
         self.emit_gc_bounds_error_runtime();
+        self.emit_zgc_load_barrier_runtime();
+        self.emit_zgc_forward_grow_runtime();
+        self.emit_zgc_relocate_object_runtime();
         Ok(self.asm.finish())
     }
 
@@ -7231,6 +7285,9 @@ impl NativeCodeGenerator {
             "__native_zgc_relocation_test" => {
                 self.compile_native_zgc_relocation_test(arguments, span)
             }
+            "__native_zgc_relocate_many_test" => {
+                self.compile_native_zgc_relocate_many_test(arguments, span)
+            }
             "__gc_list_int" => self.compile_gc_list_int(arguments, span),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span),
             "__gc_list_int_set" => self.compile_gc_list_int_set(arguments, span),
@@ -8271,6 +8328,9 @@ impl NativeCodeGenerator {
                 .map(Some),
             "__native_zgc_relocation_test" => self
                 .compile_native_zgc_relocation_test(arguments, span)
+                .map(Some),
+            "__native_zgc_relocate_many_test" => self
+                .compile_native_zgc_relocate_many_test(arguments, span)
                 .map(Some),
             "__gc_list_int" => self.compile_gc_list_int(arguments, span).map(Some),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span).map(Some),
@@ -14885,7 +14945,7 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::Equal, mutate_loop_done);
         self.asm.mov_data_addr(Reg::R10, self.zgc_mutator_ptr);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.emit_zgc_load_barrier();
+        self.asm.call_label(self.zgc_load_barrier);
         self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rax, 0);
         self.asm.cmp_reg_imm32(Reg::Rcx, MAGIC);
         self.asm.jcc_label(Condition::Equal, value_ok);
@@ -14957,9 +15017,10 @@ impl NativeCodeGenerator {
         // right bytes.
         self.asm.mov_data_addr(Reg::R10, self.zgc_mutator_ptr);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.emit_zgc_load_barrier();
-        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_new);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_new_base);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0); // cell -> array base
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0); // array[0]
         self.asm.cmp_reg_reg(Reg::Rax, Reg::R10);
         self.asm.jcc_label(Condition::NotEqual, return_zero);
         self.asm.jmp_label(return_success);
@@ -14975,29 +15036,15 @@ impl NativeCodeGenerator {
         // ---- child path: relocator ----
         self.asm.bind_text_label(child_label);
 
+        // zgc_relocate_object handles masking, allocation, the payload
+        // copy, and registering the forwarding entry (growing the
+        // table first if needed) -- all in one call. Before phase 8
+        // this logic was inlined by hand for this one 16-byte object;
+        // now it's the same shared, general primitive every relocator
+        // uses, exercised here under real concurrent mutator load.
         self.asm.mov_data_addr(Reg::R10, self.zgc_mutator_ptr);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
-        self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.mov_reg_reg(Reg::Rbx, Reg::Rax); // rbx = old_addr
-
-        self.asm.mov_imm64(Reg::Rdi, 16);
-        self.asm.mov_imm64(Reg::Rsi, GC_TYPE_RAW_BYTES);
-        self.asm.call_label(self.gc_alloc);
-        // rax = new_addr. Copy the magic value across.
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rbx, 0);
-        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rcx);
-
-        // Publish the forwarding entry -- old address, then new address,
-        // then (last, so a concurrent barrier's count check never sees
-        // a partially-written entry) the incremented count.
-        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_old);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rbx);
-        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_new);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_count);
-        self.asm.mov_imm64(Reg::Rcx, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
+        self.asm.call_label(self.zgc_relocate_object);
 
         self.asm.mov_data_addr(Reg::R10, self.zgc_test_child_done);
         self.asm.mov_imm64(Reg::Rcx, 1);
@@ -15005,6 +15052,150 @@ impl NativeCodeGenerator {
         self.emit_syscall_number(PlatformSyscall::Exit);
         self.asm.mov_imm64(Reg::Rdi, 0);
         self.asm.syscall();
+
+        self.asm.bind_text_label(done);
+        Ok(NativeValue::Int)
+    }
+
+    /// Single-threaded, fully deterministic companion to
+    /// `__native_zgc_relocation_test`: where that test proves the
+    /// barrier/relocator pair is safe under real concurrent load on one
+    /// fixed-size object, this one proves `zgc_relocate_object` and
+    /// `zgc_forward_grow` are correct at scale and across varying object
+    /// sizes, with no concurrency involved to isolate what it's
+    /// checking. Allocates `ZGC_MANY_TEST_COUNT` (200) objects
+    /// alternating between 16- and 32-byte payloads, each holding its
+    /// own index as a marker; relocates every one of them (forcing
+    /// `zgc_forward_grow` to double the table's capacity twice, since
+    /// 200 exceeds `ZGC_FORWARD_INITIAL_CAPACITY` (64) after one
+    /// doubling to 128 but not two, to 256); then re-resolves every
+    /// *original* colored reference through `zgc_load_barrier` and
+    /// checks each one's marker still reads back correctly. Returns 1
+    /// if every marker matches and the forwarding table ends with
+    /// exactly 200 entries, 0 on any mismatch.
+    fn compile_native_zgc_relocate_many_test(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if !arguments.is_empty() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__native_zgc_relocate_many_test expects 0 arguments but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+
+        const GC_TYPE_RAW_BYTES: u64 = 1;
+        const COLOR_BIT: u64 = 1_u64 << 63;
+        let object_count = Self::ZGC_MANY_TEST_COUNT as i32;
+
+        let done = self.asm.create_text_label();
+        let return_zero = self.asm.create_text_label();
+
+        // Reset shared state -- this test may run in the same process
+        // as other zgc tests (or itself, if ever called twice).
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_count);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        // ---- allocate: object i gets a 16- or 32-byte payload
+        // (alternating on i's low bit) holding marker value i, colored,
+        // recorded in zgc_many_test_ptrs[i]. ----
+        self.asm.mov_imm64(Reg::Rbx, 0);
+        let alloc_loop = self.asm.create_text_label();
+        let alloc_done = self.asm.create_text_label();
+        self.asm.bind_text_label(alloc_loop);
+        self.asm.cmp_reg_imm32(Reg::Rbx, object_count);
+        self.asm.jcc_label(Condition::GreaterEqual, alloc_done);
+
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rbx);
+        self.asm.and_reg_imm32(Reg::Rdx, 1);
+        self.asm.shl_reg_imm8(Reg::Rdx, 4); // 0 or 16
+        self.asm.mov_imm64(Reg::Rdi, 16);
+        self.asm.add_reg_reg(Reg::Rdi, Reg::Rdx); // 16 or 32
+        self.asm.mov_imm64(Reg::Rsi, GC_TYPE_RAW_BYTES);
+        self.asm.call_label(self.gc_alloc); // rax = new object; rbx preserved
+
+        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rbx); // marker = i
+        self.asm.mov_imm64(Reg::Rcx, COLOR_BIT);
+        self.asm.or_reg_reg(Reg::Rax, Reg::Rcx);
+
+        self.asm.mov_data_addr(Reg::R10, self.zgc_many_test_ptrs);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rbx);
+        self.asm.shl_reg_imm8(Reg::R9, 3);
+        self.asm.add_reg_reg(Reg::R10, Reg::R9);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        self.asm.add_reg_imm32(Reg::Rbx, 1);
+        self.asm.jmp_label(alloc_loop);
+        self.asm.bind_text_label(alloc_done);
+
+        // ---- relocate every object (forces zgc_forward_grow to run
+        // twice: 64 -> 128 -> 256). ----
+        self.asm.mov_imm64(Reg::Rbx, 0);
+        let reloc_loop = self.asm.create_text_label();
+        let reloc_done = self.asm.create_text_label();
+        self.asm.bind_text_label(reloc_loop);
+        self.asm.cmp_reg_imm32(Reg::Rbx, object_count);
+        self.asm.jcc_label(Condition::GreaterEqual, reloc_done);
+
+        self.asm.mov_data_addr(Reg::R10, self.zgc_many_test_ptrs);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rbx);
+        self.asm.shl_reg_imm8(Reg::R9, 3);
+        self.asm.add_reg_reg(Reg::R10, Reg::R9);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.call_label(self.zgc_relocate_object); // rbx preserved
+
+        self.asm.add_reg_imm32(Reg::Rbx, 1);
+        self.asm.jmp_label(reloc_loop);
+        self.asm.bind_text_label(reloc_done);
+
+        // ---- re-resolve every *original* colored reference through
+        // the barrier and check its marker survived relocation. ----
+        self.asm.mov_imm64(Reg::Rbx, 0);
+        let verify_loop = self.asm.create_text_label();
+        let verify_done = self.asm.create_text_label();
+        self.asm.bind_text_label(verify_loop);
+        self.asm.cmp_reg_imm32(Reg::Rbx, object_count);
+        self.asm.jcc_label(Condition::GreaterEqual, verify_done);
+
+        self.asm.mov_data_addr(Reg::R10, self.zgc_many_test_ptrs);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rbx);
+        self.asm.shl_reg_imm8(Reg::R9, 3);
+        self.asm.add_reg_reg(Reg::R10, Reg::R9);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.call_label(self.zgc_load_barrier); // rbx preserved
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rax, 0);
+        self.asm.cmp_reg_reg(Reg::Rcx, Reg::Rbx);
+        self.asm.jcc_label(Condition::NotEqual, return_zero);
+
+        self.asm.add_reg_imm32(Reg::Rbx, 1);
+        self.asm.jmp_label(verify_loop);
+        self.asm.bind_text_label(verify_done);
+
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_count);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.cmp_reg_imm32(Reg::Rax, object_count);
+        self.asm.jcc_label(Condition::NotEqual, return_zero);
+
+        // Positive proof that zgc_forward_grow actually ran (rather
+        // than every relocation silently landing within slack the
+        // initial capacity happened to have): 200 objects must have
+        // grown capacity past its starting value of 64.
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_capacity);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm
+            .cmp_reg_imm32(Reg::Rax, Self::ZGC_FORWARD_INITIAL_CAPACITY as i32);
+        self.asm.jcc_label(Condition::LessEqual, return_zero);
+
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.jmp_label(done);
+
+        self.asm.bind_text_label(return_zero);
+        self.asm.mov_imm64(Reg::Rax, 0);
 
         self.asm.bind_text_label(done);
         Ok(NativeValue::Int)
@@ -39830,11 +40021,15 @@ impl NativeCodeGenerator {
     /// -- this phase proves the routing and bookkeeping are race-free,
     /// not that it scales to deep recursion on a spawned thread.
     const CLONED_THREAD_SHADOW_LEN: usize = 4096;
-    /// Capacity of the ZGC-technique-demonstration forwarding table (see
-    /// `zgc_forward_count`'s doc comment). Deliberately tiny -- this is a
-    /// contained proof of concept exercising one relocation at a time,
-    /// not a general-purpose forwarding mechanism.
-    const ZGC_FORWARD_TABLE_LEN: usize = 16;
+    /// Initial capacity of the forwarding table (see `zgc_forward_count`'s
+    /// doc comment). `zgc_forward_grow` doubles it on demand, so this
+    /// only controls how soon the first growth happens, not a hard cap.
+    const ZGC_FORWARD_INITIAL_CAPACITY: usize = 64;
+    /// How many objects `__native_zgc_relocate_many_test` relocates in
+    /// one (single-threaded, deterministic) run. Deliberately well past
+    /// `ZGC_FORWARD_INITIAL_CAPACITY` so the test forces multiple
+    /// `zgc_forward_grow` doublings (64 -> 128 -> 256).
+    const ZGC_MANY_TEST_COUNT: usize = 200;
     const GC_MAX_PAYLOAD_SIZE: u64 = i64::MAX as u64 - 31 - 4095;
     const GC_MAX_STRING_ALLOC_SIZE: u64 = Self::GC_MAX_PAYLOAD_SIZE - 15;
     const GC_MAX_POINTER_SLOT_COUNT: u64 = Self::GC_MAX_PAYLOAD_SIZE / 8;
@@ -40006,6 +40201,75 @@ impl NativeCodeGenerator {
         // gc_segment_count = 1
         self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
         self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+    }
+
+    /// mmap the forwarding table's two parallel arrays (old/new
+    /// addresses) at their initial capacity and seed
+    /// `zgc_forward_capacity`/`zgc_forward_count`/`zgc_forward_lock`.
+    /// See "Phase 8" in docs/superpowers/specs/2026-07-24-precise-
+    /// concurrent-gc-design.md.
+    fn emit_initialize_zgc_forward_table(&mut self) {
+        let bytes = (Self::ZGC_FORWARD_INITIAL_CAPACITY * 8) as u64;
+
+        self.emit_syscall_number(PlatformSyscall::Mmap);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.mov_imm64(Reg::Rsi, bytes);
+        self.asm
+            .mov_imm64(Reg::Rdx, self.platform.mmap_prot_read_write());
+        self.asm
+            .mov_imm64(Reg::R10, self.platform.mmap_private_anonymous_flags());
+        self.asm
+            .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.syscall();
+        let old_ok = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, old_ok);
+        let mmap_failed_text = self.asm.data_label_with_bytes(b"klassic gc: mmap failed\n");
+        self.emit_write_data(
+            self.platform.stderr_fd(),
+            mmap_failed_text,
+            b"klassic gc: mmap failed\n".len(),
+        );
+        self.emit_exit_code(1);
+        self.asm.bind_text_label(old_ok);
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_old_base);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        self.emit_syscall_number(PlatformSyscall::Mmap);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.mov_imm64(Reg::Rsi, bytes);
+        self.asm
+            .mov_imm64(Reg::Rdx, self.platform.mmap_prot_read_write());
+        self.asm
+            .mov_imm64(Reg::R10, self.platform.mmap_private_anonymous_flags());
+        self.asm
+            .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.syscall();
+        let new_ok = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, new_ok);
+        let mmap_failed_text2 = self.asm.data_label_with_bytes(b"klassic gc: mmap failed\n");
+        self.emit_write_data(
+            self.platform.stderr_fd(),
+            mmap_failed_text2,
+            b"klassic gc: mmap failed\n".len(),
+        );
+        self.emit_exit_code(1);
+        self.asm.bind_text_label(new_ok);
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_new_base);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_capacity);
+        self.asm
+            .mov_imm64(Reg::Rax, Self::ZGC_FORWARD_INITIAL_CAPACITY as u64);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_count);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_lock);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
     }
 
@@ -41044,29 +41308,24 @@ impl NativeCodeGenerator {
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
     }
 
-    /// A real (if deliberately contained) exercise of ZGC's namesake
-    /// technique -- colored pointers plus a load barrier -- kept
-    /// completely separate from the general heap/collector rather than
-    /// retrofitted into it. See docs/superpowers/specs/2026-07-24-
-    /// precise-concurrent-gc-design.md, "Phase 7", for why: instrumenting
-    /// every one of this backend's existing pointer-load call sites
-    /// correctly is a much larger, separate undertaking, and a
-    /// *partially* instrumented version would be silently unsound. This
-    /// is instead a small, new, self-contained pair of primitives
-    /// (barrier + relocator, below) that own their own pointer
-    /// representation end to end, so every load of a value that
-    /// participates in this scheme is guaranteed to go through the
-    /// barrier by construction -- the same "narrow but total" correctness
-    /// property the shadow-stack/collector fixes in phases 3-4b relied
-    /// on, applied to a new, additive capability instead of an existing
-    /// one.
+    /// A real, general, callable load barrier -- colored pointers plus
+    /// forwarding-table resolution -- shared by every caller rather than
+    /// inlined per site. See docs/superpowers/specs/2026-07-24-precise-
+    /// concurrent-gc-design.md, "Phase 7" for the original contained
+    /// proof of concept and "Phase 8" for why this is now a growable,
+    /// lockable, `call`-able primitive instead of a fixed 16-entry demo
+    /// table: the goal is real, reusable infrastructure that additional
+    /// call sites can adopt incrementally, not a retrofit of every
+    /// existing pointer-load site in one pass (still assessed as its own
+    /// large, separate undertaking -- a half-instrumented version would
+    /// be silently unsound).
     ///
     /// A "colored" pointer here is a real heap address with bit 63 set
     /// (heap/mmap addresses on Linux x86-64 are always far below 2^47,
     /// so bit 63 is never part of a real address and is free to
     /// repurpose as a one-bit color: "this reference's target may have
     /// been relocated, resolve it before dereferencing"). Every
-    /// reference `__native_zgc_relocation_test` hands to its mutator is
+    /// reference handed out by something that colors its pointers is
     /// colored from creation, mirroring how every heap reference is
     /// colored in real ZGC, not just ones known to be mid-relocation.
     ///
@@ -41075,12 +41334,30 @@ impl NativeCodeGenerator {
     /// unchanged (the common case is a single `test`+`jcc` — cheap by
     /// design, matching a real load barrier's fast path). If set, the
     /// masked (uncolored) address is looked up in the forwarding table
-    /// (`zgc_forward_old`/`zgc_forward_new`, populated by the relocator
-    /// in `emit_zgc_relocate_object`); a match resolves rax to the
-    /// *new*, live address. No match (relocation hasn't happened yet,
-    /// or this pointer was never relocated) leaves rax as the masked
-    /// address, still perfectly valid to dereference.
-    fn emit_zgc_load_barrier(&mut self) {
+    /// (`zgc_forward_old_base`/`zgc_forward_new_base`, populated by
+    /// `zgc_relocate_object`); a match resolves rax to the *new*, live
+    /// address. No match (relocation hasn't happened yet, or this
+    /// pointer was never relocated) leaves rax as the masked address,
+    /// still perfectly valid to dereference.
+    ///
+    /// Deliberately lock-free on the read side even though
+    /// `zgc_relocate_object`/`zgc_forward_grow` can concurrently append
+    /// entries and grow the backing arrays: this function reads
+    /// `zgc_forward_count` *before* the base-pointer cells below it, and
+    /// the writer always publishes (grown bases, if any) -> (this
+    /// entry's old/new values) -> (incremented count) in that order.
+    /// x86-TSO is multi-copy-atomic for stores, so any reader that
+    /// observes the incremented count is guaranteed to also observe
+    /// every store that preceded it in the writer's program order --
+    /// including a base-pointer update from a growth that happened
+    /// before this entry was appended. A reader that instead observes a
+    /// stale (pre-growth) base together with a stale (lower) count just
+    /// scans fewer entries in the old (still valid, never freed) array,
+    /// which is also correct: growth copies every existing entry to the
+    /// same indices in the new array, so entries `0..old_count` read
+    /// identically from either array.
+    fn emit_zgc_load_barrier_runtime(&mut self) {
+        self.asm.bind_text_label(self.zgc_load_barrier);
         let not_colored = self.asm.create_text_label();
         let scan_loop = self.asm.create_text_label();
         let found = self.asm.create_text_label();
@@ -41099,18 +41376,20 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(scan_loop);
         self.asm.cmp_reg_reg(Reg::Rcx, Reg::R10);
         self.asm.jcc_label(Condition::GreaterEqual, done);
-        self.asm.mov_data_addr(Reg::Rdx, self.zgc_forward_old);
+        self.asm.mov_data_addr(Reg::Rdx, self.zgc_forward_old_base);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0); // dereference: cell -> array base
         self.asm.mov_reg_reg(Reg::R9, Reg::Rcx);
         self.asm.shl_reg_imm8(Reg::R9, 3);
         self.asm.add_reg_reg(Reg::Rdx, Reg::R9);
-        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0); // array[index]
         self.asm.cmp_reg_reg(Reg::Rax, Reg::Rdx);
         self.asm.jcc_label(Condition::Equal, found);
         self.asm.add_reg_imm32(Reg::Rcx, 1);
         self.asm.jmp_label(scan_loop);
 
         self.asm.bind_text_label(found);
-        self.asm.mov_data_addr(Reg::Rdx, self.zgc_forward_new);
+        self.asm.mov_data_addr(Reg::Rdx, self.zgc_forward_new_base);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0);
         self.asm.mov_reg_reg(Reg::R9, Reg::Rcx);
         self.asm.shl_reg_imm8(Reg::R9, 3);
         self.asm.add_reg_reg(Reg::Rdx, Reg::R9);
@@ -41120,6 +41399,265 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(not_colored);
         // rax is already the real, uncolored address.
         self.asm.bind_text_label(done);
+        self.asm.ret();
+    }
+
+    /// Doubles the forwarding table's capacity: mmaps two fresh, larger
+    /// arrays, copies every existing (old, new) address pair across, and
+    /// republishes `zgc_forward_old_base`/`zgc_forward_new_base`/
+    /// `zgc_forward_capacity`. Callable only while the caller
+    /// (`zgc_relocate_object`) holds `zgc_forward_lock` -- this function
+    /// takes no lock of its own. Deliberately does not munmap the
+    /// abandoned old arrays: they are small (a few KB even after many
+    /// doublings), never reused, and a concurrent lock-free barrier read
+    /// may still be scanning one when this runs (see
+    /// `emit_zgc_load_barrier_runtime`'s doc comment) -- freeing them
+    /// would turn that safe stale read into a use-after-free. Preserves
+    /// rbx untouched (the caller keeps a live value there across this
+    /// call).
+    fn emit_zgc_forward_grow_runtime(&mut self) {
+        self.asm.bind_text_label(self.zgc_forward_grow);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 48);
+        // [rbp-8] old_capacity, [rbp-16] new_capacity,
+        // [rbp-24] old_old_base, [rbp-32] old_new_base,
+        // [rbp-40] new_old_base, [rbp-48] new_new_base.
+
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_capacity);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.store_rbp_slot(8, Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.add_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.store_rbp_slot(16, Reg::Rcx);
+
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_old_base);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.store_rbp_slot(24, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_new_base);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.store_rbp_slot(32, Reg::Rax);
+
+        let mmap_failed = self.asm.create_text_label();
+        let mmap1_ok = self.asm.create_text_label();
+        let mmap2_ok = self.asm.create_text_label();
+
+        self.emit_syscall_number(PlatformSyscall::Mmap);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.load_rbp_slot(Reg::Rsi, 16);
+        self.asm.mov_imm64(Reg::Rcx, 8);
+        self.asm.imul_reg_reg(Reg::Rsi, Reg::Rcx);
+        self.asm
+            .mov_imm64(Reg::Rdx, self.platform.mmap_prot_read_write());
+        self.asm
+            .mov_imm64(Reg::R10, self.platform.mmap_private_anonymous_flags());
+        self.asm
+            .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.syscall();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, mmap1_ok);
+        self.asm.jmp_label(mmap_failed);
+        self.asm.bind_text_label(mmap1_ok);
+        self.asm.store_rbp_slot(40, Reg::Rax);
+
+        self.emit_syscall_number(PlatformSyscall::Mmap);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.load_rbp_slot(Reg::Rsi, 16);
+        self.asm.mov_imm64(Reg::Rcx, 8);
+        self.asm.imul_reg_reg(Reg::Rsi, Reg::Rcx);
+        self.asm
+            .mov_imm64(Reg::Rdx, self.platform.mmap_prot_read_write());
+        self.asm
+            .mov_imm64(Reg::R10, self.platform.mmap_private_anonymous_flags());
+        self.asm
+            .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.syscall();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, mmap2_ok);
+        self.asm.jmp_label(mmap_failed);
+        self.asm.bind_text_label(mmap2_ok);
+        self.asm.store_rbp_slot(48, Reg::Rax);
+
+        // Copy `old_capacity` qwords from each old array into its
+        // replacement -- copying the whole capacity (not just `count`)
+        // is simply simpler and copies a few still-zero trailing slots
+        // at worst.
+        self.asm.load_rbp_slot(Reg::Rcx, 8);
+        self.asm.load_rbp_slot(Reg::R10, 24);
+        self.asm.load_rbp_slot(Reg::R11, 40);
+        let copy1_loop = self.asm.create_text_label();
+        let copy1_done = self.asm.create_text_label();
+        self.asm.bind_text_label(copy1_loop);
+        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
+        self.asm.jcc_label(Condition::Equal, copy1_done);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::R9);
+        self.asm.add_reg_imm32(Reg::R10, 8);
+        self.asm.add_reg_imm32(Reg::R11, 8);
+        self.asm.sub_reg_imm32(Reg::Rcx, 1);
+        self.asm.jmp_label(copy1_loop);
+        self.asm.bind_text_label(copy1_done);
+
+        self.asm.load_rbp_slot(Reg::Rcx, 8);
+        self.asm.load_rbp_slot(Reg::R10, 32);
+        self.asm.load_rbp_slot(Reg::R11, 48);
+        let copy2_loop = self.asm.create_text_label();
+        let copy2_done = self.asm.create_text_label();
+        self.asm.bind_text_label(copy2_loop);
+        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
+        self.asm.jcc_label(Condition::Equal, copy2_done);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::R9);
+        self.asm.add_reg_imm32(Reg::R10, 8);
+        self.asm.add_reg_imm32(Reg::R11, 8);
+        self.asm.sub_reg_imm32(Reg::Rcx, 1);
+        self.asm.jmp_label(copy2_loop);
+        self.asm.bind_text_label(copy2_done);
+
+        // Publish: bases first, capacity last -- see
+        // emit_zgc_load_barrier_runtime's doc comment for why a
+        // concurrent lock-free reader relies on exactly this order.
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_old_base);
+        self.asm.load_rbp_slot(Reg::Rax, 40);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_new_base);
+        self.asm.load_rbp_slot(Reg::Rax, 48);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_capacity);
+        self.asm.load_rbp_slot(Reg::Rax, 16);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        let epilogue = self.asm.create_text_label();
+        self.asm.jmp_label(epilogue);
+
+        self.asm.bind_text_label(mmap_failed);
+        let mmap_failed_text = self.asm.data_label_with_bytes(b"klassic gc: mmap failed\n");
+        self.emit_write_data(
+            self.platform.stderr_fd(),
+            mmap_failed_text,
+            b"klassic gc: mmap failed\n".len(),
+        );
+        self.emit_exit_code(1);
+
+        self.asm.bind_text_label(epilogue);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// A real, general relocation primitive: given a pointer (colored
+    /// or not -- masked unconditionally) to any live heap object of any
+    /// type tag or size, allocates a fresh block of the identical total
+    /// size and type, copies the payload across byte-for-byte, and
+    /// registers a forwarding entry (growing the table first if it is
+    /// full) so `zgc_load_barrier` redirects future references to the
+    /// new location. This generalizes the single hardcoded 16-byte
+    /// object relocation the original phase-7 demo inlined by hand to
+    /// arbitrary objects -- any record, array, string, or raw-bytes
+    /// block already allocated via `gc_alloc` can be handed to this
+    /// function unchanged, since it only ever copies bytes and never
+    /// interprets the payload.
+    ///
+    /// Input: rax = pointer to relocate. Output: rax = new address.
+    /// Preserves rbx, rbp, rsp; clobbers everything else. Thread-safe:
+    /// the append (and any growth it triggers) happens under
+    /// `zgc_forward_lock`, so concurrent relocators never race on the
+    /// same table index or a torn growth.
+    fn emit_zgc_relocate_object_runtime(&mut self) {
+        self.asm.bind_text_label(self.zgc_relocate_object);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.push_reg(Reg::Rbx);
+
+        self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.mov_reg_reg(Reg::Rbx, Reg::Rax); // rbx = old_addr
+
+        // total_size = [old_addr - 16], type = [old_addr - 8]. Ask
+        // gc_alloc for (total_size - 16): it re-adds 16 and 16-byte
+        // aligns, exactly reproducing total_size since total_size is
+        // already 16-aligned from the object's original allocation.
+        self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rbx, -16);
+        self.asm.load_ptr_disp32(Reg::Rsi, Reg::Rbx, -8);
+        self.asm.sub_reg_imm32(Reg::Rdi, 16);
+        self.asm.call_label(self.gc_alloc); // rax = new_addr
+
+        // memcpy total_size - 16 bytes, one qword at a time (always a
+        // multiple of 8, since total_size is 16-aligned).
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rbx, -16);
+        self.asm.sub_reg_imm32(Reg::Rcx, 16);
+        self.asm.mov_reg_reg(Reg::R10, Reg::Rbx);
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+        let copy_loop = self.asm.create_text_label();
+        let copy_done = self.asm.create_text_label();
+        self.asm.bind_text_label(copy_loop);
+        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
+        self.asm.jcc_label(Condition::Equal, copy_done);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::R9);
+        self.asm.add_reg_imm32(Reg::R10, 8);
+        self.asm.add_reg_imm32(Reg::R11, 8);
+        self.asm.sub_reg_imm32(Reg::Rcx, 8);
+        self.asm.jmp_label(copy_loop);
+        self.asm.bind_text_label(copy_done);
+        // rax (new_addr) untouched by the copy loop.
+
+        self.asm.push_reg(Reg::Rax); // stash new_addr across the lock section
+
+        let lock_loop = self.asm.create_text_label();
+        let lock_acquired = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_lock);
+        self.asm.bind_text_label(lock_loop);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.xchg_mem_disp32_reg(Reg::R10, 0, Reg::Rax);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, lock_acquired);
+        self.asm.pause();
+        self.asm.jmp_label(lock_loop);
+        self.asm.bind_text_label(lock_acquired);
+
+        let have_room = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_count);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_capacity);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::Less, have_room);
+        self.asm.call_label(self.zgc_forward_grow);
+        self.asm.bind_text_label(have_room);
+
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_count);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0); // index
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rcx);
+        self.asm.shl_reg_imm8(Reg::R9, 3);
+
+        self.asm.mov_data_addr(Reg::Rdx, self.zgc_forward_old_base);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0);
+        self.asm.add_reg_reg(Reg::Rdx, Reg::R9);
+        self.asm.store_ptr_disp32(Reg::Rdx, 0, Reg::Rbx);
+
+        self.asm.pop_reg(Reg::Rax); // rax = new_addr, restored; kept through return
+        self.asm.mov_data_addr(Reg::Rdx, self.zgc_forward_new_base);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0);
+        self.asm.add_reg_reg(Reg::Rdx, Reg::R9);
+        self.asm.store_ptr_disp32(Reg::Rdx, 0, Reg::Rax);
+
+        // count++ last (release order -- see emit_zgc_load_barrier_
+        // runtime's doc comment). Uses rdx, not rax, so rax (new_addr)
+        // survives untouched.
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_count);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::R10, 0);
+        self.asm.add_reg_imm32(Reg::Rdx, 1);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdx);
+
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_lock);
+        self.asm.mov_imm64(Reg::R11, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
+
+        self.asm.pop_reg(Reg::Rbx);
+        self.asm.leave();
+        self.asm.ret();
     }
 
     /// Emit a runtime push of `[rbp - rbp_offset]` (the slot's address)

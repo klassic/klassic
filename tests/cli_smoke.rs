@@ -29317,3 +29317,63 @@ fn native_build_zgc_relocation_test_survives_concurrent_relocation() {
     }
     let _ = fs::remove_file(&output_path);
 }
+
+/// Single-threaded, deterministic companion to the concurrency-focused
+/// test above: relocates 200 objects (alternating 16-/32-byte payloads,
+/// well past the forwarding table's initial 64-entry capacity, forcing
+/// `zgc_forward_grow` to double it twice) and confirms every original
+/// colored reference still resolves to the right marker through the
+/// barrier afterward, plus that the table's capacity actually grew --
+/// verified during development by temporarily shrinking the object
+/// count below the growth threshold and confirming the growth
+/// assertion alone made this test fail (return 0) every time, then
+/// restoring the real count and reconfirming success.
+#[test]
+fn native_build_zgc_relocate_many_test_grows_the_forwarding_table() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_zgc_relocate_many_test_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_zgc_relocate_many_test_{stamp}.bin"));
+    fs::write(&source_path, "println(__native_zgc_relocate_many_test())\n")
+        .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    assert!(
+        build_output.status.success(),
+        "__native_zgc_relocate_many_test should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    for attempt in 0..20 {
+        let run_output = Command::new(&output_path)
+            .output()
+            .expect("compiled binary should run");
+        assert!(
+            run_output.status.success(),
+            "attempt {attempt}: compiled binary should run cleanly, not crash or hang\nstderr:\n{}",
+            String::from_utf8_lossy(&run_output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run_output.stdout),
+            "1\n",
+            "attempt {attempt}: expected every relocated object's marker to \
+             read back correctly through the barrier and the forwarding \
+             table's capacity to have grown past its initial value; got:\n{}",
+            String::from_utf8_lossy(&run_output.stdout)
+        );
+    }
+    let _ = fs::remove_file(&output_path);
+}
