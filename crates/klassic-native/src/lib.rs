@@ -496,6 +496,7 @@ mod llvm;
 mod aarch64;
 mod macho;
 mod pe;
+mod portable_asm;
 
 /// Compile `text` to a portable C translation unit (`--backend c`).
 /// The supported subset is deliberately small (see `cbackend`);
@@ -40283,50 +40284,16 @@ impl NativeCodeGenerator {
     /// rax = 1 if the budget could grow enough, rax = 0 if even the whole
     /// reservation cannot hold the request. Leaf routine.
     fn emit_gc_grow_budget_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_grow_budget);
-        let have = self.asm.create_text_label();
-        let set = self.asm.create_text_label();
-        let fail = self.asm.create_text_label();
-
-        // rcx = N = ceil(total / REGION_SIZE).
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
-        self.asm
-            .add_reg_imm32(Reg::Rcx, (Self::GC_REGION_SIZE - 1) as i32);
-        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
-        // r8 = committed + N (the minimum budget the request needs).
-        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
-        self.asm.add_reg_reg(Reg::R8, Reg::Rcx);
-        // rax = budget * 2.
-        self.asm.mov_data_addr(Reg::R10, self.gc_budget_regions);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.shl_reg_imm8(Reg::Rax, 1);
-        // rax = max(2*budget, committed+N).
-        self.asm.cmp_reg_reg(Reg::Rax, Reg::R8);
-        self.asm.jcc_label(Condition::AboveOrEqual, have);
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
-        self.asm.bind_text_label(have);
-        // Cap at GC_RESERVE_REGIONS (unsigned region counts).
-        let over_cap = self.asm.create_text_label();
-        self.asm
-            .cmp_reg_imm32(Reg::Rax, Self::GC_RESERVE_REGIONS as i32);
-        self.asm.jcc_label(Condition::Above, over_cap);
-        self.asm.jmp_label(set); // rax <= reserve: use it as-is
-        self.asm.bind_text_label(over_cap);
-        // Over the cap: the request fits only if committed+N <= reserve.
-        self.asm
-            .cmp_reg_imm32(Reg::R8, Self::GC_RESERVE_REGIONS as i32);
-        self.asm.jcc_label(Condition::Above, fail);
-        self.asm.mov_imm64(Reg::Rax, Self::GC_RESERVE_REGIONS);
-        self.asm.bind_text_label(set);
-        self.asm.mov_data_addr(Reg::R10, self.gc_budget_regions);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rax, 1);
-        self.asm.ret();
-
-        self.asm.bind_text_label(fail);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait: the
+        // routine's logic is now architecture-independent (a future
+        // AArch64 backend would provide a `PortableAsm` impl and reuse
+        // this exact function); only the x86-64 instruction encoding is
+        // per-backend. Behavior is byte-identical -- the x86-64
+        // `PortableAsm` impl is a 1:1 thin wrapper over `Assembler`.
+        let entry = self.gc_grow_budget;
+        let committed = self.gc_committed_count;
+        let budget = self.gc_budget_regions;
+        portable_asm::emit_gc_grow_budget(&mut self.asm, entry, committed, budget);
     }
 
     /// `gc_bounds_error` is a non-returning subroutine that prints a
