@@ -18228,6 +18228,7 @@ impl NativeCodeGenerator {
                 "native __gc_smap_size for non-address argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
         self.emit_gc_smap_length_check(span, "__gc_smap_size", Reg::Rax);
         self.asm.shr_reg_imm8(Reg::Rax, 1);
@@ -18268,6 +18269,21 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rsi, Reg::R10);
         self.asm.add_reg_reg(Reg::Rsi, Reg::Rdx);
         self.asm.load_ptr_disp32(Reg::R8, Reg::Rsi, 0);
+        // Resolve the candidate key (an element pointer read out of the
+        // map's entry list) through the barrier before dereferencing
+        // its length. Safe with no stack-save here, unlike
+        // __gc_list_ptr_join's loop: rcx/rdx/r9/r10/r11 (the barrier's
+        // clobbers) are all either about to be freshly reloaded at the
+        // top of the next iteration (r10, r11) or overwritten later in
+        // *this* iteration before their pre-call value would ever be
+        // read again (rdx, rsi is about to be overwritten too, r9 is
+        // loaded fresh on the next line, rcx isn't touched again until
+        // it's reloaded from i_slot at next_iter). Verified by tracing
+        // every use of each register from here to the next
+        // `scan_loop`/`next_iter` label.
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
         self.asm.load_rbp_slot(Reg::R9, key_slot.offset);
         self.asm.load_ptr_disp32(Reg::Rdx, Reg::R9, 0);
@@ -18314,6 +18330,7 @@ impl NativeCodeGenerator {
                 "native __gc_smap_has for non-address map",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let m_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(m_slot.offset, Reg::Rax);
         let key = self.compile_expr(&arguments[1])?;
@@ -18323,6 +18340,7 @@ impl NativeCodeGenerator {
                 "native __gc_smap_has for non-address key",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let key_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(key_slot.offset, Reg::Rax);
         self.asm.load_rbp_slot(Reg::R10, key_slot.offset);
@@ -18370,6 +18388,7 @@ impl NativeCodeGenerator {
                 &format!("native {name} for non-address map"),
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let m_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(m_slot.offset, Reg::Rax);
         let key = self.compile_expr(&arguments[1])?;
@@ -18379,6 +18398,7 @@ impl NativeCodeGenerator {
                 &format!("native {name} for non-address key"),
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let key_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(key_slot.offset, Reg::Rax);
         self.asm.load_rbp_slot(Reg::R10, key_slot.offset);
@@ -18463,6 +18483,7 @@ impl NativeCodeGenerator {
                 "native __gc_smap_set for non-address map",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let m_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(m_slot.offset, Reg::Rax);
         let key = self.compile_expr(&arguments[1])?;
@@ -18472,6 +18493,7 @@ impl NativeCodeGenerator {
                 "native __gc_smap_set for non-address key",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let key_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(key_slot.offset, Reg::Rax);
         self.asm.load_rbp_slot(Reg::R10, key_slot.offset);
@@ -18540,6 +18562,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_POINTER_LIST);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
         // Stamp len.
         self.asm.load_rbp_slot(Reg::Rcx, new_len_slot.offset);
@@ -18634,6 +18659,7 @@ impl NativeCodeGenerator {
                 "native __gc_smap_keys/values for non-address",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let m_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(m_slot.offset, Reg::Rax);
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
@@ -18654,6 +18680,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_POINTER_LIST);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
         self.asm.load_rbp_slot(Reg::R11, pair_count_slot.offset);
         self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::R11);
