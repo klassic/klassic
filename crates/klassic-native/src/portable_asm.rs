@@ -117,7 +117,9 @@ pub trait PortableAsm {
     fn test_reg_reg(&mut self, a: Reg, b: Reg);
     fn add_reg_imm32(&mut self, dst: Reg, imm: i32);
     fn sub_reg_imm8(&mut self, r: Reg, imm: i8);
+    fn sub_reg_imm32(&mut self, r: Reg, imm: i32);
     fn and_reg_imm32(&mut self, r: Reg, imm: i32);
+    fn cmp_reg_imm8(&mut self, r: Reg, imm: i8);
     fn cmp_reg_imm32(&mut self, r: Reg, imm: i32);
     fn shl_reg_imm8(&mut self, r: Reg, imm: u8);
     fn shr_reg_imm8(&mut self, r: Reg, imm: u8);
@@ -262,8 +264,14 @@ impl PortableAsm for crate::NativeCodeGenerator {
     fn sub_reg_imm8(&mut self, r: Reg, imm: i8) {
         self.asm.sub_reg_imm8(r.into(), imm);
     }
+    fn sub_reg_imm32(&mut self, r: Reg, imm: i32) {
+        self.asm.sub_reg_imm32(r.into(), imm);
+    }
     fn and_reg_imm32(&mut self, r: Reg, imm: i32) {
         self.asm.and_reg_imm32(r.into(), imm);
+    }
+    fn cmp_reg_imm8(&mut self, r: Reg, imm: i8) {
+        self.asm.cmp_reg_imm8(r.into(), imm);
     }
     fn cmp_reg_imm32(&mut self, r: Reg, imm: i32) {
         self.asm.cmp_reg_imm32(r.into(), imm);
@@ -546,6 +554,191 @@ pub fn emit_gc_clear_all_marks<E: PortableAsm>(
     out.store_rbp_slot(8, Reg::V0);
     out.jmp_label(region_loop);
     out.bind_text_label(region_done);
+    out.leave();
+    out.ret();
+}
+
+/// Portable version of `gc_sweep`: the region-based sweep. Bumps the
+/// collection counter, flushes the current region's watermark, then walks
+/// every committed region clearing the current-parity mark on live blocks
+/// (rewriting each live header as `size | mark`), recording per-region
+/// live bytes for M7 sparsest-first selection, and reclaiming any
+/// wholly-dead region's run onto the free-region pool (never the current
+/// bump region, never a from-space ghost). Frame slots: 8 = mark bit, 16
+/// = per-region live bytes, 40 = region index, 48 = committed bound, 56 =
+/// region base. Reuses `RegionTables`; collect_counter / free_region_head
+/// / header_mark / region_live are the labels beyond that set.
+pub fn emit_gc_sweep<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    t: RegionTables<E::DataLabel>,
+    collect_counter: E::DataLabel,
+    free_region_head: E::DataLabel,
+    header_mark: E::DataLabel,
+    region_live: E::DataLabel,
+) {
+    use crate::gc_layout::{GC_REGION_SHIFT, GC_REGION_SIZE};
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    out.sub_reg_imm8(Reg::V4, 64);
+    // One completed collection cycle per sweep: bump the counter here so
+    // both the synchronous and incremental paths count once.
+    out.mov_data_addr(Reg::V10, collect_counter);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.add_reg_imm32(Reg::V0, 1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    // Flush the current region's watermark (the bump path only updates the
+    // global gc_heap_top) so its objects are covered.
+    out.mov_data_addr(Reg::V10, t.heap_base);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.sub_reg_reg(Reg::V11, Reg::V10); // offset = heap_base - region_base
+    out.shr_reg_imm8(Reg::V11, GC_REGION_SHIFT); // cur region index
+    out.shl_reg_imm8(Reg::V11, 3); // * 8
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V11);
+    out.mov_data_addr(Reg::V8, t.heap_top);
+    out.load_ptr_disp32(Reg::V0, Reg::V8, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0); // region_top[cur] = heap_top
+    // Cache committed bound (48), reset region index (40), seed the
+    // free-region accumulator (r9) with the EXISTING pool head, not zero,
+    // so already-free regions stay linked.
+    out.mov_data_addr(Reg::V10, t.committed_count);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.store_rbp_slot(48, Reg::V0);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_rbp_slot(40, Reg::V0);
+    out.mov_data_addr(Reg::V10, free_region_head);
+    out.load_ptr_disp32(Reg::V9, Reg::V10, 0);
+    // Cache the current-parity header mark bit in slot 8.
+    out.mov_data_addr(Reg::V10, header_mark);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.store_rbp_slot(8, Reg::V0);
+
+    let region_loop = out.create_text_label();
+    let region_done = out.create_text_label();
+    let inner_loop = out.create_text_label();
+    let inner_done = out.create_text_label();
+    let block_dead = out.create_text_label();
+    let next_region = out.create_text_label();
+    let reclaim_step = out.create_text_label();
+
+    out.bind_text_label(region_loop);
+    out.load_rbp_slot(Reg::V0, 40);
+    out.load_rbp_slot(Reg::V1, 48);
+    out.cmp_reg_reg(Reg::V0, Reg::V1);
+    out.jcc_label(Condition::AboveOrEqual, region_done);
+
+    // rsi = region_base + (i << REGION_SHIFT); save it.
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.shl_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.mov_reg_reg(Reg::V6, Reg::V10);
+    out.store_rbp_slot(56, Reg::V6);
+    // r8 = region_top[i]
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.load_ptr_disp32(Reg::V8, Reg::V10, 0);
+    // Empty region (top == base): skip; it is already free.
+    out.cmp_reg_reg(Reg::V8, Reg::V6);
+    out.jcc_label(Condition::Equal, next_region);
+    // M7: skip from-space (ghost) regions. Inert while evac is off.
+    out.load_rbp_slot(Reg::V0, 40);
+    out.shl_reg_imm8(Reg::V0, 3);
+    out.mov_data_addr(Reg::V10, t.region_fromspace);
+    out.add_reg_reg(Reg::V10, Reg::V0);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::NotEqual, next_region);
+
+    // Inner block walk: r11 = cursor, rdx = any_live flag, slot 16 =
+    // live-byte accumulator for this region.
+    out.mov_reg_reg(Reg::V11, Reg::V6);
+    out.xor_reg_reg(Reg::V2, Reg::V2);
+    out.mov_imm64(Reg::V0, 0);
+    out.store_rbp_slot(16, Reg::V0);
+    out.bind_text_label(inner_loop);
+    out.cmp_reg_reg(Reg::V11, Reg::V8);
+    out.jcc_label(Condition::AboveOrEqual, inner_done);
+    out.load_ptr_disp32(Reg::V0, Reg::V11, 0); // header word0
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.and_reg_imm32(Reg::V1, -16); // size (clears FWD + mark bits)
+    // Live iff the current-parity mark bit is set (slot 8).
+    out.load_rbp_slot(Reg::V7, 8);
+    out.test_reg_reg(Reg::V0, Reg::V7);
+    out.jcc_label(Condition::Equal, block_dead);
+    // Live: rewrite the header as size | current mark -- KEEPS the current
+    // mark (so the relocate walk can still read liveness after the sweep)
+    // and clears the stale (previous-cycle) mark and the FWD bit.
+    out.mov_reg_reg(Reg::V0, Reg::V1);
+    out.or_reg_reg(Reg::V0, Reg::V7);
+    out.store_ptr_disp32(Reg::V11, 0, Reg::V0);
+    out.mov_imm64(Reg::V2, 1);
+    out.load_rbp_slot(Reg::V0, 16);
+    out.add_reg_reg(Reg::V0, Reg::V1);
+    out.store_rbp_slot(16, Reg::V0);
+    out.add_reg_reg(Reg::V11, Reg::V1);
+    out.jmp_label(inner_loop);
+    out.bind_text_label(block_dead);
+    // Dead: skip; whole-region reclamation is decided after the walk.
+    out.add_reg_reg(Reg::V11, Reg::V1);
+    out.jmp_label(inner_loop);
+
+    out.bind_text_label(inner_done);
+    // Record this region's live bytes for M7 sparsest-first selection.
+    out.load_rbp_slot(Reg::V0, 40);
+    out.shl_reg_imm8(Reg::V0, 3);
+    out.mov_data_addr(Reg::V10, region_live);
+    out.add_reg_reg(Reg::V10, Reg::V0);
+    out.load_rbp_slot(Reg::V0, 16);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.test_reg_reg(Reg::V2, Reg::V2);
+    out.jcc_label(Condition::NotEqual, next_region); // any live: keep
+    out.load_rbp_slot(Reg::V6, 56);
+    // Never reclaim the current bump region.
+    out.mov_data_addr(Reg::V10, t.heap_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.cmp_reg_reg(Reg::V6, Reg::V10);
+    out.jcc_label(Condition::Equal, next_region);
+    // Fully dead: reclaim the run. rax = first block size (== the object
+    // size; a large run spans multiple regions, a normal region is one).
+    out.load_ptr_disp32(Reg::V0, Reg::V6, 0);
+    out.and_reg_imm32(Reg::V0, -16); // size (clears FWD + marks)
+    out.mov_reg_reg(Reg::V7, Reg::V6); // rdi = m = run base
+    out.bind_text_label(reclaim_step);
+    // Link this region into the free pool and mark it empty.
+    out.store_ptr_disp32(Reg::V7, 0, Reg::V9);
+    out.mov_reg_reg(Reg::V9, Reg::V7);
+    out.mov_reg_reg(Reg::V1, Reg::V7);
+    out.mov_data_addr(Reg::V10, t.region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.sub_reg_reg(Reg::V1, Reg::V10);
+    out.shr_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.mov_data_addr(Reg::V10, t.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V7); // region_top[idx] = base
+    out.sub_reg_imm32(Reg::V0, GC_REGION_SIZE as i32);
+    out.add_reg_imm32(Reg::V7, GC_REGION_SIZE as i32);
+    out.cmp_reg_imm8(Reg::V0, 0);
+    out.jcc_label(Condition::Greater, reclaim_step);
+
+    out.bind_text_label(next_region);
+    out.load_rbp_slot(Reg::V0, 40);
+    out.add_reg_imm32(Reg::V0, 1);
+    out.store_rbp_slot(40, Reg::V0);
+    out.jmp_label(region_loop);
+
+    out.bind_text_label(region_done);
+    out.mov_data_addr(Reg::V10, free_region_head);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V9);
     out.leave();
     out.ret();
 }

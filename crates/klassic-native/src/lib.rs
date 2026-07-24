@@ -38580,195 +38580,26 @@ impl NativeCodeGenerator {
     /// Sweep: region-based reclamation -- clear mark bits and reclaim
     /// whole-dead regions onto the free-region pool.
     fn emit_gc_sweep_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_sweep);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.asm.sub_reg_imm8(Reg::Rsp, 64);
-        // One completed collection cycle per sweep: bump the counter here
-        // so both the synchronous and incremental paths count once.
-        self.asm.mov_data_addr(Reg::R10, self.gc_collect_counter);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // ---- Sweep phase (region-based) ----
-        // Walk every committed region. Within a region, walk its blocks
-        // from base to the region's watermark: clear the mark bit on live
-        // blocks, and note whether any block is live. A region with NO
-        // live block is reclaimed wholesale onto the free-region pool (a
-        // large object's contiguous run is reclaimed as a unit); a region
-        // with any live block is kept as-is, its dead space stranded until
-        // M7 compaction. r9 accumulates the free-region-list head across
-        // both loops (CALL-free, so it survives).
-        //
-        // First flush the current region's watermark (the bump path only
-        // updates the global gc_heap_top) so its objects are covered.
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.sub_reg_reg(Reg::R11, Reg::R10); // offset = heap_base - region_base
-        self.asm.shr_reg_imm8(Reg::R11, Self::GC_REGION_SHIFT); // cur region index
-        self.asm.shl_reg_imm8(Reg::R11, 3); // * 8
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::R11);
-        self.asm.mov_data_addr(Reg::R8, self.gc_heap_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax); // region_top[cur] = heap_top
-
-        // Cache committed bound, reset region index. Seed the free-region
-        // accumulator with the EXISTING pool head, not zero: regions that
-        // were already free at sweep entry are skipped by the walk (their
-        // watermark is base), so if we started from zero we would drop
-        // them from the list entirely -- leaking them (still committed,
-        // but unreachable to acquire, the tail-commit path, and
-        // gc_alloc_large). Seeding from the current head keeps the old
-        // chain intact (their [base] link qwords are untouched by the
-        // walk) and pushes this cycle's newly-dead regions on top.
-        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.store_rbp_slot(48, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_rbp_slot(40, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
-        self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
-        // Cache the current-parity header mark bit in slot 8 (M7: the
-        // mark bit lives in header word0 bits 1-2, alternating per cycle,
-        // so a live block tests non-zero against this bit). Slot 16 holds
-        // the per-region live-byte accumulator (gc_region_live[idx]),
-        // which drives M7 sparsest-first evacuation selection.
-        self.asm.mov_data_addr(Reg::R10, self.gc_header_mark);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.store_rbp_slot(8, Reg::Rax);
-
-        let region_loop = self.asm.create_text_label();
-        let region_done = self.asm.create_text_label();
-        let inner_loop = self.asm.create_text_label();
-        let inner_done = self.asm.create_text_label();
-        let block_dead = self.asm.create_text_label();
-        let next_region = self.asm.create_text_label();
-        let reclaim_step = self.asm.create_text_label();
-
-        self.asm.bind_text_label(region_loop);
-        self.asm.load_rbp_slot(Reg::Rax, 40);
-        self.asm.load_rbp_slot(Reg::Rcx, 48);
-        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.jcc_label(Condition::AboveOrEqual, region_done);
-
-        // rsi = region_base + (i << REGION_SHIFT); save it.
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.mov_reg_reg(Reg::Rsi, Reg::R10);
-        self.asm.store_rbp_slot(56, Reg::Rsi);
-        // r8 = region_top[i]
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
-        // Empty region (top == base): skip; it is already free.
-        self.asm.cmp_reg_reg(Reg::R8, Reg::Rsi);
-        self.asm.jcc_label(Condition::Equal, next_region);
-        // M7: skip from-space (ghost) regions -- they are handled by the
-        // relocate/free-ghost machinery, not swept. Inert while evac is
-        // off (the array is all zero).
-        self.asm.load_rbp_slot(Reg::Rax, 40);
-        self.asm.shl_reg_imm8(Reg::Rax, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_fromspace);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rax);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::NotEqual, next_region);
-
-        // Inner block walk: r11 = cursor, rdx = any_live flag, slot 16 =
-        // live-byte accumulator for this region.
-        self.asm.mov_reg_reg(Reg::R11, Reg::Rsi);
-        self.asm.xor_reg_reg(Reg::Rdx, Reg::Rdx);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_rbp_slot(16, Reg::Rax);
-        self.asm.bind_text_label(inner_loop);
-        self.asm.cmp_reg_reg(Reg::R11, Reg::R8);
-        self.asm.jcc_label(Condition::AboveOrEqual, inner_done);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R11, 0); // header word0
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.and_reg_imm32(Reg::Rcx, -16); // size (clears FWD + mark bits)
-        // Live iff the current-parity mark bit is set (slot 8).
-        self.asm.load_rbp_slot(Reg::Rdi, 8);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rdi);
-        self.asm.jcc_label(Condition::Equal, block_dead);
-        // Live: rewrite the header as size | current mark -- this KEEPS
-        // the current mark (so the relocate walk can still read liveness
-        // after the sweep) and clears the stale (previous-cycle) mark and
-        // the FWD bit. any_live=1; accumulate the live bytes.
-        self.asm.mov_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.or_reg_reg(Reg::Rax, Reg::Rdi);
-        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rdx, 1);
-        self.asm.load_rbp_slot(Reg::Rax, 16);
-        self.asm.add_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.store_rbp_slot(16, Reg::Rax);
-        self.asm.add_reg_reg(Reg::R11, Reg::Rcx);
-        self.asm.jmp_label(inner_loop);
-        self.asm.bind_text_label(block_dead);
-        // Dead: skip; whole-region reclamation is decided after the walk.
-        self.asm.add_reg_reg(Reg::R11, Reg::Rcx);
-        self.asm.jmp_label(inner_loop);
-
-        self.asm.bind_text_label(inner_done);
-        // Record this region's live bytes for M7 sparsest-first selection.
-        self.asm.load_rbp_slot(Reg::Rax, 40);
-        self.asm.shl_reg_imm8(Reg::Rax, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_live);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rax);
-        self.asm.load_rbp_slot(Reg::Rax, 16);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.test_reg_reg(Reg::Rdx, Reg::Rdx);
-        self.asm.jcc_label(Condition::NotEqual, next_region); // any live: keep
-        self.asm.load_rbp_slot(Reg::Rsi, 56);
-        // Never reclaim the current bump region.
-        self.asm.mov_data_addr(Reg::R10, self.gc_heap_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.cmp_reg_reg(Reg::Rsi, Reg::R10);
-        self.asm.jcc_label(Condition::Equal, next_region);
-        // Fully dead: reclaim the run. rax = first block size (== the
-        // object size; for a large run it spans multiple regions, for a
-        // normal region it is <= REGION_SIZE so exactly one region).
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rsi, 0);
-        self.asm.and_reg_imm32(Reg::Rax, -16); // size (clears FWD + marks)
-        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rsi); // rdi = m = run base
-        self.asm.bind_text_label(reclaim_step);
-        // Link this region into the free pool and mark it empty.
-        self.asm.store_ptr_disp32(Reg::Rdi, 0, Reg::R9);
-        self.asm.mov_reg_reg(Reg::R9, Reg::Rdi);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.sub_reg_reg(Reg::Rcx, Reg::R10);
-        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdi); // region_top[idx] = base
-        self.asm
-            .sub_reg_imm32(Reg::Rax, Self::GC_REGION_SIZE as i32);
-        self.asm
-            .add_reg_imm32(Reg::Rdi, Self::GC_REGION_SIZE as i32);
-        self.asm.cmp_reg_imm8(Reg::Rax, 0);
-        self.asm.jcc_label(Condition::Greater, reclaim_step);
-
-        self.asm.bind_text_label(next_region);
-        self.asm.load_rbp_slot(Reg::Rax, 40);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_rbp_slot(40, Reg::Rax);
-        self.asm.jmp_label(region_loop);
-
-        self.asm.bind_text_label(region_done);
-        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_sweep;
+        let tables = portable_asm::RegionTables {
+            heap_base: self.gc_heap_base,
+            heap_top: self.gc_heap_top,
+            region_base: self.gc_region_base,
+            region_top: self.gc_region_top,
+            committed_count: self.gc_committed_count,
+            region_fromspace: self.gc_region_fromspace,
+        };
+        portable_asm::emit_gc_sweep(
+            self,
+            entry,
+            tables,
+            self.gc_collect_counter,
+            self.gc_free_region_head,
+            self.gc_header_mark,
+            self.gc_region_live,
+        );
     }
 
     /// Clear the mark bit on EVERY block of every committed region,
