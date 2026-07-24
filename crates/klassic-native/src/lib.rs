@@ -6765,10 +6765,22 @@ impl NativeCodeGenerator {
         if !matches!(lhs_value, NativeValue::Int | NativeValue::HeapPointer) {
             return Err(unsupported(span, "native binary operation for non-Int lhs"));
         }
+        // A HeapPointer reaching this generic Int-like arithmetic/
+        // comparison fallback (e.g. `__gc_alloc(n) > 0` as a null/OOM
+        // check) is being treated as a raw address -- resolve it
+        // through the barrier first, or a colored pointer's high bit
+        // would make it compare as a large negative number even though
+        // the underlying object is perfectly valid.
+        if lhs_value == NativeValue::HeapPointer {
+            self.asm.call_label(self.zgc_load_barrier);
+        }
         self.push_temp_reg(Reg::Rax);
         let rhs_value = self.compile_expr(rhs)?;
         if !matches!(rhs_value, NativeValue::Int | NativeValue::HeapPointer) {
             return Err(unsupported(span, "native binary operation for non-Int rhs"));
+        }
+        if rhs_value == NativeValue::HeapPointer {
+            self.asm.call_label(self.zgc_load_barrier);
         }
         self.pop_temp_reg(Reg::Rcx);
         match op {
@@ -12875,6 +12887,9 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rdi, payload_size);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
         // rax = heap pointer; store len at offset 0.
         self.asm.mov_imm64(Reg::Rdi, len as u64);
         self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rdi);
@@ -12898,6 +12913,9 @@ impl NativeCodeGenerator {
         self.asm.and_reg_imm32(Reg::Rdi, -8);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
 
         // Reload the runtime length after gc_alloc, store it in the heap
         // string header, then copy that many bytes from the fixed runtime
@@ -13192,6 +13210,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
         // rax = heap pointer.
         self.asm.pop_reg(Reg::Rcx);
         self.next_stack_offset -= 8;
@@ -13889,6 +13910,7 @@ impl NativeCodeGenerator {
                 "native __gc_pointer_count for non-address argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         // header_word = [rax - 16]
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, -16);
         // size = header_word & ~MARK_BIT
@@ -14765,6 +14787,9 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rdi, 32);
         self.asm.mov_imm64(Reg::Rsi, GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
         self.asm.store_rbp_slot(8, Reg::Rax);
         self.asm.mov_imm64(Reg::Rcx, MAGIC as u64);
         self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rcx);
@@ -15328,6 +15353,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_POINTER_LIST);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
         self.asm.pop_reg(Reg::Rcx);
         self.next_stack_offset -= 8;
         // Store length at offset 0.
@@ -15590,6 +15618,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rcx);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
 
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
@@ -16493,6 +16524,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_concat for non-address first argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
 
@@ -16503,6 +16535,7 @@ impl NativeCodeGenerator {
                 "native __gc_list_concat for non-address second argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let b_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(b_slot.offset, Reg::Rax);
 
@@ -16521,6 +16554,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
 
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
@@ -17333,6 +17369,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
 
         self.asm.load_rbp_slot(Reg::Rcx, total_slot.offset);
@@ -17421,6 +17460,7 @@ impl NativeCodeGenerator {
                 "native __gc_string_replace for non-address source",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let s_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(s_slot.offset, Reg::Rax);
 
@@ -17431,6 +17471,7 @@ impl NativeCodeGenerator {
                 "native __gc_string_replace for non-address `from`",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let from_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(from_slot.offset, Reg::Rax);
 
@@ -17441,6 +17482,7 @@ impl NativeCodeGenerator {
                 "native __gc_string_replace for non-address `to`",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let to_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(to_slot.offset, Reg::Rax);
 
@@ -17589,6 +17631,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
         // Store new_len.
         self.asm.load_rbp_slot(Reg::Rcx, new_len_slot.offset);
@@ -17694,6 +17739,7 @@ impl NativeCodeGenerator {
                 "native __gc_string_trim for non-address argument",
             ));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let s_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(s_slot.offset, Reg::Rax);
 
@@ -17769,6 +17815,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
         // Store length.
         self.asm.load_rbp_slot(Reg::R8, end_slot.offset);
@@ -17813,6 +17862,7 @@ impl NativeCodeGenerator {
         if !matches!(s, NativeValue::HeapPointer | NativeValue::HeapString) {
             return Err(unsupported(span, "native string case op for non-address"));
         }
+        self.asm.call_label(self.zgc_load_barrier);
         let s_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(s_slot.offset, Reg::Rax);
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
@@ -17826,6 +17876,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload.
+        self.asm.mov_imm64(Reg::Rdi, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rdi);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
 
         // Store length.
@@ -40561,6 +40614,20 @@ impl NativeCodeGenerator {
         self.emit_exit_code(1);
 
         self.asm.bind_text_label(success);
+        // Color every heap reference this backend ever hands out (bit
+        // 63 set -- real heap/mmap addresses on Linux x86-64 never set
+        // it, so this is a safe, free-to-repurpose tag). This is the
+        // final step of the ZGC retrofit (see docs/superpowers/specs/
+        // 2026-07-24-precise-concurrent-gc-design.md, "Phase 10"): every
+        // dereference site that could see a colored pointer has already
+        // been routed through zgc_load_barrier (phases 8-9), verified by
+        // temporarily forcing this exact coloring and confirming the
+        // full test suite passed unchanged before making it permanent
+        // here. `zgc_relocate_object` can now actually relocate any
+        // ordinary heap object -- colored pointers are the default, not
+        // a separate opt-in scheme.
+        self.asm.mov_imm64(Reg::R9, 1_u64 << 63);
+        self.asm.or_reg_reg(Reg::Rax, Reg::R9);
         // Release gc_alloc_lock before returning. rax holds the
         // allocated pointer -- this function's return value -- and must
         // not be clobbered, so the release uses r10/r11 only.
