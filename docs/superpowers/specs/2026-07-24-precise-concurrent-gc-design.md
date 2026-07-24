@@ -864,3 +864,153 @@ concurrently with mutators touching real program objects rather than
 test-harness-only ones, reclaiming the vacated space) is the natural
 next phase if this campaign continues, and is scoped separately from
 "the retrofit" this phase completes.
+
+## Phase 11: automatic compaction -- gc_collect actually moves things now
+
+**Done this session.** Closes the gap Phase 10 named explicitly: when a
+collection cycle finds more than one heap segment mapped, it now
+evacuates every live object out of the oldest segment (`segments[0]`)
+into fresh space via a new bump-only allocator (`gc_compact_alloc`),
+registers a forwarding entry for each one, removes the emptied segment
+from the tracked array, and lets the pre-existing sweep phase handle
+the rest. This is real, self-triggered, on ordinary program objects --
+not a test-harness-only demo. `zgc_relocate_object` (phases 7-8) proved
+the relocate-and-forward *mechanism*; this phase is what actually
+invokes it, automatically, as part of collecting.
+
+**New primitives added:**
+- `gc_compact_alloc` / `emit_gc_compact_bump_attempt`: a bump-only
+  allocator (no free-list check, and critically no `gc_collect` call on
+  exhaustion -- it grows the heap directly instead). `gc_alloc`'s own
+  OOM path calling `gc_collect` recursively is fine for ordinary
+  allocation; it would be a hard reentrancy bug for allocations made
+  *from inside* `gc_collect` itself, which is exactly what compaction's
+  relocations are.
+- `zgc_register_forwarding_entry`: the forwarding-table-append logic
+  factored out of `zgc_relocate_object` into its own callable leaf, so
+  the compaction loop can reuse it directly.
+
+**Three real bugs found and fixed, each significant enough to be worth
+naming for whoever debugs this area next:**
+
+1. **Relocated objects were being swept as garbage.** `gc_compact_alloc`
+   wrote fresh headers with the mark bit clear, matching `gc_alloc`'s
+   own convention (new allocations get marked on the *next* cycle's
+   mark phase, not at allocation time). But compaction's relocations
+   happen *after* this cycle's mark phase has already run, and the
+   sweep phase immediately follows compaction in the same cycle -- so
+   every object compaction had just relocated looked "unmarked" to
+   sweep and got linked onto the free list, stomping the payload it had
+   just copied. Fixed by having `gc_compact_alloc` write the mark bit
+   *set*: every relocation here is, by construction, an object the
+   mark phase already found live (the compaction loop only calls it
+   for marked blocks).
+
+2. **Single-hop forwarding wasn't enough, and neither was leaking the
+   table.** An object relocated in one collection cycle can be
+   relocated *again* in a later cycle (its new home eventually becomes
+   `segments[0]` too, once enough allocation happens past it). A
+   pointer that hasn't been re-read since the *first* relocation only
+   knows the object's original address, which the naive load barrier
+   resolved to an *intermediate* address -- one whose backing memory a
+   later compaction had already reclaimed. Two fixes together, not
+   either alone:
+   - The compacted-away segment's memory is deliberately **never
+     munmap'd**, only removed from the tracked segments array (`docs`
+     call this out explicitly at the removal site). Freeing it would
+     let a later `mmap` hand the exact same address range back out,
+     and any still-live forwarding-table entry whose `old_addr`
+     happens to land there would then alias a brand-new, never-
+     relocated pointer -- the barrier has no way to tell "genuinely
+     stale" apart from "coincidentally reused address." This mirrors
+     `zgc_forward_grow`'s own pre-existing choice never to free its
+     abandoned arrays, for the identical reason.
+   - Each compaction pass **compresses** the forwarding table:
+     for every entry that existed before this pass, if its `new_addr`
+     matches the `old_addr` of one of this pass's fresh entries (i.e.
+     the object it points at just moved again), that prior entry's
+     `new_addr` is rewritten to the fresh entry's `new_addr`. By
+     induction this keeps every entry, however many cycles deep its
+     history, resolved to the object's *current* address after every
+     single compaction -- so the load barrier only ever needs to
+     check one entry per lookup, not chase a growing chain. (The
+     barrier still contains a chase loop as a belt-and-suspenders
+     fallback, but compression keeps it a single iteration in
+     practice.) The compression sweep costs `O(prior_entries x
+     this_pass_entries)`, paid once per collection, which is the right
+     place to pay it -- the alternative (resolving lazily at every
+     dereference) would pay a version of that cost on every single
+     heap read for the rest of the program's life.
+
+3. **A real self-deadlock, not a performance bug, and the one that
+   mattered most.** `gc_alloc`'s OOM path calls `gc_collect` while
+   still holding `gc_alloc_lock` -- true before this phase too, but
+   harmless then, since nothing `gc_collect` called ever touched that
+   lock. Once compaction started calling `gc_compact_alloc`, which
+   acquired the same lock itself, any collection reached through
+   `gc_alloc`'s OOM path (the overwhelmingly common way real programs
+   ever call `gc_collect` at all -- explicit `__gc_collect()` calls are
+   rare) would deadlock the instant it tried to compact. Fixed by
+   moving lock ownership up a level: `gc_collect` now acquires
+   `gc_alloc_lock` itself, for its whole mark/sweep/compact critical
+   section (right after `gc_collect_barrier`, keeping acquisition order
+   consistent everywhere both are taken); `gc_compact_alloc` no longer
+   acquires it at all, relying on its only caller (compaction, inside
+   `gc_collect`) to already hold it; and `gc_alloc`'s OOM path releases
+   the lock before calling `gc_collect` and re-acquires it right after,
+   before retrying its own allocation attempt. This also closes a
+   latent pre-existing gap: the explicit `__gc_collect()` builtin never
+   held `gc_alloc_lock` at all before this fix, meaning sweep's segment
+   and free-list mutations had no protection against a concurrent
+   thread's ordinary `gc_alloc()` racing it -- this fix is strictly
+   more correct for the "works in multi-thread environment" goal, not
+   just a deadlock patch.
+
+**A genuinely useful, previously-undocumented fact surfaced while
+debugging bug 3 (recorded here since it cost real time to discover):
+`print_i64` (the runtime integer-printing helper used throughout this
+file for ad-hoc debug output) clobbers `rbx` internally and does not
+save/restore it.** Any future debug instrumentation that calls it must
+explicitly `push_reg(Rbx)` / `pop_reg(Rbx)` around the call if `rbx`
+holds anything live, or (as happened twice this session) the debug
+instrumentation itself corrupts the very state it's trying to observe.
+
+**Verification:**
+- Full workspace test suite green (519/519 including the new
+  compaction-specific test below), `cargo fmt --check` and `cargo
+  clippy --all-targets --all-features -- -D warnings` both clean.
+- A dedicated integration test,
+  `builds_native_executable_for_gc_automatic_compaction_across_multiple_cycles`
+  in `tests/cli_smoke.rs`, forces four separate rounds of growth-then-
+  collect with large allocations, so several objects are relocated more
+  than once across separate cycles, and asserts every one reads back
+  correctly afterward -- specifically exercising the multi-hop/
+  compression path from bug 2, not just a single relocation.
+- Manually verified with several ad-hoc `.kl` programs beyond the
+  committed test: an 8-object single-collection case, a 20-object/
+  4-collection case (the basis for the committed test), and a
+  20000-node real (type-tagged, properly traced) recursive enum linked
+  list surviving repeated collection during construction.
+
+**Known, deliberately-not-fixed-this-phase limitation, stated plainly
+so it isn't mistaken for silent scope creep having been resolved:** the
+forwarding table is a flat array, and `zgc_load_barrier`'s lookup (even
+with compression keeping it single-hop) is a **linear scan** over every
+entry ever registered, unpruned, for the table's entire lifetime.
+Compression bounds compaction's own cost per collection; it does
+*not* bound the table's total size, which only grows. For workloads
+that call `__gc_collect()` very frequently against a rapidly-growing
+large structure (thousands of forced collections, each relocating
+thousands of objects), per-dereference lookup cost grows with the
+table and can dominate. This was discovered directly: a 40000-node
+list with `__gc_collect()` forced every 2000 allocations took 50+
+seconds where the same list with sparser forced collection (or no
+forced collection at all, letting the collector decide) was instant.
+Realistic programs -- which don't call `__gc_collect()` in a tight loop
+against a structure that's still growing -- are unaffected; this is a
+scalability characteristic of the linear-scan table design, not a
+correctness bug, and a real fix (a hash table, or generational pruning
+once a full mark phase proves no live reference can still hold an
+address in a given range) is a separate, larger undertaking than
+"implement automatic compaction" was scoped to cover. Flagged here as
+explicit follow-up work rather than left undiscovered.

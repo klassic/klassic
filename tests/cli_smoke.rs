@@ -10935,6 +10935,102 @@ println(__gc_collect_count())
     assert!(run.stderr.is_empty());
 }
 
+/// Phase 11: `__gc_collect()` doesn't just mark-and-sweep -- once more
+/// than one heap segment exists, it also compacts, evacuating every
+/// live object out of the oldest segment into fresh space and
+/// registering a forwarding entry so later dereferences (through the
+/// load barrier) still resolve correctly. This test forces four
+/// rounds of growth-then-collect with large (150000-byte) allocations,
+/// so several objects each get relocated more than once across
+/// separate collection cycles -- exercising the forwarding table's
+/// multi-hop chase/compression path, not just a single relocation.
+/// `__gc_segment_count()` is asserted at its exact observed value (a
+/// snapshot, not a claim that it always shrinks -- with these object
+/// sizes, evacuating a full segment can itself need more room than the
+/// current destination segment has left, growing the heap again mid-
+/// compaction, so segment count doesn't monotonically decrease). If
+/// compaction regresses, this exact count is expected to change.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn builds_native_executable_for_gc_automatic_compaction_across_multiple_cycles() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic-native-gc-compact-{unique}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic-native-gc-compact-{unique}"));
+    fs::write(
+        &source_path,
+        r#"val a0 = __gc_alloc(150000)
+val a1 = __gc_alloc(150000)
+val a2 = __gc_alloc(150000)
+val a3 = __gc_alloc(150000)
+val a4 = __gc_alloc(150000)
+__gc_write(a0, 0, 100)
+__gc_collect()
+val a5 = __gc_alloc(150000)
+val a6 = __gc_alloc(150000)
+val a7 = __gc_alloc(150000)
+val a8 = __gc_alloc(150000)
+val a9 = __gc_alloc(150000)
+__gc_write(a5, 0, 500)
+__gc_collect()
+val a10 = __gc_alloc(150000)
+val a11 = __gc_alloc(150000)
+val a12 = __gc_alloc(150000)
+val a13 = __gc_alloc(150000)
+val a14 = __gc_alloc(150000)
+__gc_write(a10, 0, 1000)
+__gc_collect()
+val a15 = __gc_alloc(150000)
+val a16 = __gc_alloc(150000)
+val a17 = __gc_alloc(150000)
+val a18 = __gc_alloc(150000)
+val a19 = __gc_alloc(150000)
+__gc_write(a15, 0, 1500)
+__gc_collect()
+println(__gc_read(a0, 0))
+println(__gc_read(a5, 0))
+println(__gc_read(a10, 0))
+println(__gc_read(a15, 0))
+println(__gc_read(a19, 0))
+println(__gc_segment_count())
+"#,
+    )
+    .expect("source should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_string_lossy().as_ref(),
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("klassic build should run");
+
+    assert!(
+        build.status.success(),
+        "automatic compaction build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "100\n500\n1000\n1500\n0\n4\n"
+    );
+    assert!(run.stderr.is_empty());
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn builds_native_executable_for_gc_list_int_bounds_check_negative() {

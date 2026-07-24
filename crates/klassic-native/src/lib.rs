@@ -4160,6 +4160,19 @@ struct NativeCodeGenerator {
     /// `emit_zgc_forward_grow_runtime`). Internal to `zgc_relocate_object`
     /// -- callable only while holding `zgc_forward_lock`.
     zgc_forward_grow: TextLabel,
+    /// Registers a forwarding entry {old_addr in rbx, new_addr in rax},
+    /// growing the table first if full (see
+    /// `emit_zgc_register_forwarding_entry_runtime`). Factored out of
+    /// `zgc_relocate_object` so `gc_collect`'s own compaction phase
+    /// (phase 11) can reuse it with a different destination allocator.
+    zgc_register_forwarding_entry: TextLabel,
+    /// Bump-only allocator used exclusively by `gc_collect`'s compaction
+    /// phase (see `emit_gc_compact_alloc_runtime`): never touches the
+    /// free list and never recurses into `gc_collect` on exhaustion (it
+    /// grows the heap directly instead), since `gc_collect` already
+    /// holds `gc_collect_barrier` -- a second acquire from the same
+    /// thread would deadlock a plain, non-reentrant spinlock.
+    gc_compact_alloc: TextLabel,
     /// Fixed-size scratch array of colored pointers used by
     /// `__native_zgc_relocate_many_test` to drive many relocations
     /// through a single-threaded, deterministic capacity-growth and
@@ -4387,6 +4400,8 @@ impl NativeCodeGenerator {
         let zgc_load_barrier = asm.create_text_label();
         let zgc_relocate_object = asm.create_text_label();
         let zgc_forward_grow = asm.create_text_label();
+        let zgc_register_forwarding_entry = asm.create_text_label();
+        let gc_compact_alloc = asm.create_text_label();
         let zgc_many_test_ptrs = asm.data_label_with_i64s(&[0; Self::ZGC_MANY_TEST_COUNT]);
         let mut record_schemas = HashMap::new();
         record_schemas.insert(
@@ -4481,6 +4496,8 @@ impl NativeCodeGenerator {
             zgc_load_barrier,
             zgc_relocate_object,
             zgc_forward_grow,
+            zgc_register_forwarding_entry,
+            gc_compact_alloc,
             zgc_many_test_ptrs,
             scope_gc_root_counts: vec![0],
             scopes: vec![HashMap::new()],
@@ -5062,7 +5079,9 @@ impl NativeCodeGenerator {
         self.emit_gc_bounds_error_runtime();
         self.emit_zgc_load_barrier_runtime();
         self.emit_zgc_forward_grow_runtime();
+        self.emit_zgc_register_forwarding_entry_runtime();
         self.emit_zgc_relocate_object_runtime();
+        self.emit_gc_compact_alloc_runtime();
         Ok(self.asm.finish())
     }
 
@@ -40584,7 +40603,32 @@ impl NativeCodeGenerator {
         self.emit_gc_alloc_attempt(do_collect, success);
         // First attempt failed; run collector then retry.
         self.asm.bind_text_label(do_collect);
+        // Release gc_alloc_lock before calling gc_collect: gc_collect
+        // now acquires it itself for its whole mark/sweep/compact
+        // critical section (compaction's gc_compact_alloc relies on the
+        // lock already being held, and does not re-acquire it). Calling
+        // gc_collect while still holding this lock would deadlock the
+        // instant compaction runs and tries to allocate destination
+        // space. Re-acquire it right after gc_collect returns, before
+        // the retry below -- this thread has no allocation-relevant
+        // state that needs to survive the gap, so a concurrent thread
+        // grabbing the lock in between (to allocate, or to run its own
+        // collection) is just ordinary, correct contention.
+        self.asm.mov_data_addr(Reg::R10, self.gc_alloc_lock);
+        self.asm.mov_imm64(Reg::R11, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
         self.asm.call_label(self.gc_collect);
+        let realloc_lock_acquire_loop = self.asm.create_text_label();
+        let realloc_lock_acquired = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.gc_alloc_lock);
+        self.asm.bind_text_label(realloc_lock_acquire_loop);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.xchg_mem_disp32_reg(Reg::R10, 0, Reg::Rax);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, realloc_lock_acquired);
+        self.asm.pause();
+        self.asm.jmp_label(realloc_lock_acquire_loop);
+        self.asm.bind_text_label(realloc_lock_acquired);
         self.asm.bind_text_label(after_collect);
         self.emit_gc_alloc_attempt(do_grow, success);
 
@@ -40719,6 +40763,119 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(success);
     }
 
+    /// Bump-only allocator used exclusively by `gc_collect`'s compaction
+    /// phase (phase 11). Input: rdi = total_size (full block size,
+    /// 16-byte-header-inclusive, already 16-aligned), rsi = type_tag.
+    /// Output: rax = user pointer, header stamped (size = total_size,
+    /// mark bit clear; type = rsi). Deliberately never touches the free
+    /// list (compaction destinations are always fresh memory -- kept
+    /// simple and separate from ordinary allocation's free-list reuse)
+    /// and never calls `gc_collect` on exhaustion, growing the heap
+    /// directly instead: the one caller already holds
+    /// `gc_collect_barrier`, a plain non-reentrant spinlock, so a
+    /// nested acquire from the same thread (which `gc_alloc`'s own OOM
+    /// path would trigger) would deadlock forever.
+    fn emit_gc_compact_alloc_runtime(&mut self) {
+        self.asm.bind_text_label(self.gc_compact_alloc);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.push_reg(Reg::Rbx);
+
+        // Unlike gc_alloc, this function does NOT acquire gc_alloc_lock
+        // itself: its only caller is gc_collect's compaction phase, and
+        // gc_collect now holds gc_alloc_lock for its entire mark/sweep/
+        // compact critical section (see emit_gc_collect_runtime's own
+        // acquire). Taking it again here would deadlock -- gc_collect
+        // is reached either via an explicit __gc_collect() call (which
+        // now acquires the lock itself before doing anything else) or
+        // via gc_alloc's own OOM path (which releases the lock before
+        // calling gc_collect and re-acquires it after, precisely so
+        // gc_collect can own it uncontested for the duration).
+        self.asm.sub_reg_imm8(Reg::Rsp, 16);
+        self.asm.store_rbp_slot(16, Reg::Rdi); // total_size (pre-aligned by caller)
+        self.asm.store_rbp_slot(24, Reg::Rsi); // type_tag
+
+        let success = self.asm.create_text_label();
+        let do_grow = self.asm.create_text_label();
+        let oom = self.asm.create_text_label();
+
+        self.emit_gc_compact_bump_attempt(do_grow, success);
+
+        // Bump failed (active segment full, or a concurrent allocation
+        // beat us to the room we expected): grow the heap directly and
+        // retry once. No collect step, ever -- see the doc comment
+        // above for why.
+        self.asm.bind_text_label(do_grow);
+        self.asm.load_rbp_slot(Reg::Rdi, 16);
+        self.asm.call_label(self.gc_grow_heap);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, oom);
+        self.emit_gc_compact_bump_attempt(oom, success);
+
+        self.asm.bind_text_label(oom);
+        // Do not release gc_alloc_lock here -- this function never
+        // acquired it (see the doc comment above); it's owned by
+        // gc_collect, further up the call stack. The process is about
+        // to exit unconditionally either way.
+        self.emit_write_data(
+            self.platform.stderr_fd(),
+            self.gc_oom_text,
+            b"klassic gc: out of memory\n".len(),
+        );
+        self.emit_exit_code(1);
+
+        self.asm.bind_text_label(success);
+        // Not colored here -- the caller (gc_collect's compaction
+        // phase) registers the forwarding entry using this plain,
+        // uncolored address directly; whoever later dereferences the
+        // relocated object through a colored reference resolves it via
+        // zgc_load_barrier as usual, exactly like zgc_relocate_object's
+        // own destination.
+        self.asm.add_reg_imm32(Reg::Rsp, 16);
+        self.asm.pop_reg(Reg::Rbx);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// Bump-only attempt (no free-list check): jumps to `fail` if the
+    /// active segment doesn't have room, to `success` (rax = user
+    /// pointer) otherwise. Shares `emit_gc_alloc_attempt`'s rbp-slot
+    /// convention (16 = total_size, 24 = type_tag) so the two read
+    /// identically at a glance.
+    fn emit_gc_compact_bump_attempt(&mut self, fail: TextLabel, success: TextLabel) {
+        self.asm.mov_data_addr(Reg::R10, self.gc_heap_top);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.load_rbp_slot(Reg::Rdi, 16);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R11);
+        self.asm.add_reg_reg(Reg::Rcx, Reg::Rdi);
+        self.asm.mov_data_addr(Reg::R8, self.gc_heap_end);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
+        self.asm.cmp_reg_reg(Reg::Rcx, Reg::R8);
+        self.asm.jcc_label(Condition::Above, fail);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
+        // Header is written with the mark bit already SET (unlike
+        // gc_alloc's plain, unmarked headers). Every relocation here
+        // is, by construction, an object the mark phase just found
+        // live (compact_loop only calls this for marked blocks) -- and
+        // the sweep phase runs immediately after compaction, in the
+        // same collection cycle, over every currently-mapped segment
+        // including the one this just bumped into. Without the mark
+        // bit, sweep would see a fresh, "unmarked" header and link the
+        // block onto the free list, stomping its just-copied payload.
+        // r9 carries the marked header value; rdi (plain size) is kept
+        // untouched since the caller still needs it for the payload
+        // copy length.
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rdi);
+        self.asm.mov_imm64(Reg::Rax, 1_u64 << 63);
+        self.asm.or_reg_reg(Reg::R9, Reg::Rax);
+        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::R9);
+        self.asm.load_rbp_slot(Reg::Rsi, 24);
+        self.asm.store_ptr_disp32(Reg::R11, 8, Reg::Rsi);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
+        self.asm.add_reg_imm32(Reg::Rax, 16);
+        self.asm.jmp_label(success);
+    }
+
     /// Stop-the-world mark-and-sweep.
     ///
     /// Phase 1 only honors statically-registered roots, of which there are
@@ -40729,6 +40886,16 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(self.gc_collect);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        // Preserve the caller's rbx: this function (via the compaction
+        // phase, phase 11) uses rbx internally as its block cursor, and
+        // callers of __gc_collect() are entitled to assume it survives
+        // a call -- the same convention gc_alloc/zgc_relocate_object/
+        // gc_compact_alloc already establish and document. Before phase
+        // 11, gc_collect never touched rbx, so this was never needed;
+        // omitting it now would silently corrupt caller state whenever
+        // compaction actually runs (only reproduces with 2+ segments,
+        // never showed up in this function's earlier, rbx-free form).
+        self.asm.push_reg(Reg::Rbx);
 
         // Acquire gc_collect_barrier for the whole scan: no thread may be
         // mid-push/pop on any shadow (sub-)stack while roots are read
@@ -40738,6 +40905,35 @@ impl NativeCodeGenerator {
         // thread" lock rather than a full safepoint/suspend protocol.
         self.emit_gc_collect_barrier_acquire();
 
+        // Acquire gc_alloc_lock too, for the whole mark/sweep/compact
+        // critical section -- not just the sweep and compact phases
+        // that actually touch gc_heap_top/segments/the free list, but
+        // consistently from here, so the acquire order (barrier, then
+        // alloc_lock) is the same on every path that ever takes both.
+        // Compaction (phase 11) allocates fresh space via
+        // gc_compact_alloc, which itself does NOT take this lock -- it
+        // relies on the caller (here) already holding it, precisely to
+        // avoid the self-deadlock that would otherwise happen when
+        // gc_collect is reached from gc_alloc's own OOM path (gc_alloc
+        // releases gc_alloc_lock before calling here and re-acquires it
+        // after, specifically so this acquire never contends with
+        // itself on the same thread; see emit_gc_alloc_runtime). An
+        // explicit __gc_collect() call never holds this lock beforehand,
+        // so this acquire is what protects the sweep/compact phases'
+        // segment and free-list mutations against a concurrent thread's
+        // ordinary gc_alloc() in that case.
+        let alloc_lock_acquire_loop = self.asm.create_text_label();
+        let alloc_lock_acquired = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.gc_alloc_lock);
+        self.asm.bind_text_label(alloc_lock_acquire_loop);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.xchg_mem_disp32_reg(Reg::R10, 0, Reg::Rax);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, alloc_lock_acquired);
+        self.asm.pause();
+        self.asm.jmp_label(alloc_lock_acquire_loop);
+        self.asm.bind_text_label(alloc_lock_acquired);
+
         // Increment the global collection counter so user code can
         // observe how many cycles have run, e.g. for tests that need to
         // confirm a forced collection actually happened.
@@ -40745,9 +40941,10 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
         self.asm.add_reg_imm32(Reg::Rax, 1);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        // Reserve seven qword locals (rbp-relative addressing). The first
-        // four are reused across phases; the sweep pair follows; the last
-        // tracks which cloned-thread shadow sub-stack is being scanned.
+        // Reserve eleven qword locals (rbp-relative addressing). The
+        // first four are reused across phases; the sweep pair follows;
+        // then cloned-thread-index; the last four back the compaction
+        // phase.
         //   [rbp -  8]: root_cursor (current &gc_root_table[i]) --
         //               reused as shadow-stack cursor, then reused again
         //               as each cloned-thread sub-stack's own cursor
@@ -40759,7 +40956,22 @@ impl NativeCodeGenerator {
         //   [rbp - 48]: sweep_segment_count
         //   [rbp - 56]: cloned_thread_index (which registered slot the
         //               cloned-thread shadow scan below is currently on)
-        self.asm.sub_reg_imm8(Reg::Rsp, 56);
+        //   [rbp - 64]: compact_orig_base (segments[0]'s original base,
+        //               kept past the segment-array shift for the
+        //               free-list purge below)
+        //   [rbp - 72]: compact_end (segments[0]'s original top, kept
+        //               past the segment-array shift for the free-list
+        //               purge below)
+        //   [rbp - 80]: compact_next_ptr (scratch: next block's address,
+        //               computed before a relocation call clobbers
+        //               everything but rbx, consumed right after)
+        //   [rbp - 88]: compact_pass_start_count (zgc_forward_count as
+        //               of the start of this cycle's compaction, i.e.
+        //               how many entries existed before this pass. Used
+        //               to bound the post-pass compression sweep to
+        //               "prior entries x this pass's new entries" --
+        //               see the compression comment below)
+        self.asm.sub_reg_imm8(Reg::Rsp, 88);
 
         // ---- Mark phase ----
         // Reset the worklist top pointer.
@@ -40964,6 +41176,291 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(trace_field_loop);
         self.asm.bind_text_label(trace_done);
 
+        // ---- Compact phase (phase 11) ----
+        // If there's more than one segment, evacuate every live object
+        // out of the oldest one (segments[0]) into fresh space via
+        // gc_compact_alloc, purge the free list of any stale entries
+        // pointing into it, then remove it from the segments array (its
+        // memory is intentionally leaked, not munmap'd -- see the doc
+        // comment further down in this function for why). This is the
+        // actual, self-triggered "moving" half of the collector: zgc_relocate_object
+        // proved the mechanism works (phases 7-8), and phases 9-10 made
+        // every dereference in the whole backend safe to see a
+        // relocated reference -- this phase is what actually invokes it
+        // during an ordinary collection cycle, on ordinary heap objects,
+        // with no test harness involved.
+        //
+        // Skipped entirely when there's only one segment: nothing to
+        // consolidate into, and that one segment IS the active bump
+        // target, so relocating out of it would be self-referential.
+        // gc_compact_alloc, not gc_alloc, backs every relocation here --
+        // see its doc comment for why gc_alloc's own OOM-triggered
+        // gc_collect call would deadlock: this function already holds
+        // gc_collect_barrier, a plain non-reentrant spinlock.
+        let compact_skip = self.asm.create_text_label();
+        let compact_loop = self.asm.create_text_label();
+        let compact_done = self.asm.create_text_label();
+        let compact_not_marked = self.asm.create_text_label();
+        let compact_advance = self.asm.create_text_label();
+
+        self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.cmp_reg_imm8(Reg::Rax, 1);
+        self.asm.jcc_label(Condition::LessEqual, compact_skip);
+
+        self.asm.mov_data_addr(Reg::R10, self.gc_segments);
+        self.asm.load_ptr_disp32(Reg::Rbx, Reg::R10, 0); // rbx = cursor = base
+        self.asm.store_rbp_slot(64, Reg::Rbx); // orig_base
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 8); // segments[0].top
+        self.asm.store_rbp_slot(72, Reg::Rax); // end
+
+        // Snapshot how many forwarding entries exist before this pass
+        // registers any of its own -- the post-pass compression sweep
+        // below uses this to know which entries are "prior" (may need
+        // updating) versus "fresh" (this pass's own, already current).
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_count);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.store_rbp_slot(88, Reg::Rax);
+
+        self.asm.bind_text_label(compact_loop);
+        self.asm.load_rbp_slot(Reg::R11, 72);
+        self.asm.cmp_reg_reg(Reg::Rbx, Reg::R11);
+        self.asm.jcc_label(Condition::AboveOrEqual, compact_done);
+
+        // header_word = [cursor]; masked size in rcx.
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rbx, 0);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
+        self.asm.mov_imm64(Reg::Rdi, !((1_u64) << 63));
+        self.asm.and_reg_reg(Reg::Rcx, Reg::Rdi);
+        // next_ptr = cursor + masked_size, stashed now (before any call
+        // clobbers everything but rbx) and reloaded at compact_advance.
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rbx);
+        self.asm.add_reg_reg(Reg::R9, Reg::Rcx);
+        self.asm.store_rbp_slot(80, Reg::R9);
+
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm
+            .jcc_label(Condition::GreaterEqual, compact_not_marked);
+
+        // Marked (live): relocate into fresh space.
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rcx); // total_size
+        self.asm.load_ptr_disp32(Reg::Rsi, Reg::Rbx, 8); // type_tag
+        self.asm.call_label(self.gc_compact_alloc); // rax = new user ptr
+
+        // Recompute payload_len from the stashed next_ptr and rbx
+        // (still the old block's start -- gc_compact_alloc preserves
+        // it) rather than assuming rcx survived the call.
+        self.asm.load_rbp_slot(Reg::Rcx, 80);
+        self.asm.sub_reg_reg(Reg::Rcx, Reg::Rbx); // masked_size
+        self.asm.sub_reg_imm32(Reg::Rcx, 16); // payload_len
+        self.asm.mov_reg_reg(Reg::R10, Reg::Rbx);
+        self.asm.add_reg_imm32(Reg::R10, 16); // src = old user ptr
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax); // dst = new user ptr
+        let compact_copy_loop = self.asm.create_text_label();
+        let compact_copy_done = self.asm.create_text_label();
+        self.asm.bind_text_label(compact_copy_loop);
+        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
+        self.asm.jcc_label(Condition::Equal, compact_copy_done);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
+        self.asm.store_ptr_disp32(Reg::R11, 0, Reg::R9);
+        self.asm.add_reg_imm32(Reg::R10, 8);
+        self.asm.add_reg_imm32(Reg::R11, 8);
+        self.asm.sub_reg_imm32(Reg::Rcx, 8);
+        self.asm.jmp_label(compact_copy_loop);
+        self.asm.bind_text_label(compact_copy_done);
+        // rax (new user ptr) untouched by the copy loop.
+
+        self.asm.add_reg_imm32(Reg::Rbx, 16); // rbx: block-start -> old user ptr
+        self.asm.call_label(self.zgc_register_forwarding_entry);
+        self.asm.jmp_label(compact_advance);
+
+        self.asm.bind_text_label(compact_not_marked);
+        // Dead block: nothing to relocate, nothing to add to any free
+        // list (the whole segment is being discarded).
+
+        self.asm.bind_text_label(compact_advance);
+        self.asm.load_rbp_slot(Reg::Rbx, 80); // advance cursor to next_ptr
+        self.asm.jmp_label(compact_loop);
+
+        self.asm.bind_text_label(compact_done);
+
+        // Compress the forwarding table: for every entry that existed
+        // before this pass (i in [0, pass_start_count)), if its new_addr
+        // exactly matches the old_addr of one of this pass's freshly
+        // registered entries (j in [pass_start_count, new_count)), the
+        // object that prior entry points at has just been relocated
+        // *again* -- fold that hop in immediately by overwriting the
+        // prior entry's new_addr with the fresh entry's new_addr.
+        //
+        // Without this, the load barrier's table lookup would need to
+        // chase arbitrarily long chains (old -> mid -> ... -> current)
+        // for any pointer that hasn't been re-read since an early
+        // relocation, and do so on every single dereference -- with a
+        // never-pruned, ever-growing table, that cost compounds across
+        // the program's whole lifetime and dominates everything else. A
+        // compaction pass relocates each live object at most once, so a
+        // single backward step here is sufficient to keep every entry,
+        // however many passes deep its history, resolved to the current
+        // address: by induction, every entry was already fully current
+        // as of the end of the previous pass, and this pass introduces
+        // at most one additional hop per relocated object, which this
+        // step immediately folds back in. The result is that the load
+        // barrier only ever needs to check a single entry -- the cost of
+        // keeping the table flat is paid once per collection here,
+        // instead of once per dereference forever after.
+        let compress_outer = self.asm.create_text_label();
+        let compress_outer_done = self.asm.create_text_label();
+        let compress_inner = self.asm.create_text_label();
+        let compress_inner_done = self.asm.create_text_label();
+        let compress_inner_next = self.asm.create_text_label();
+
+        self.asm.load_rbp_slot(Reg::R11, 88); // pass_start_count
+        self.asm.mov_data_addr(Reg::R10, self.zgc_forward_count);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0); // new_count
+        self.asm.mov_imm64(Reg::Rbx, 0); // i
+        self.asm.bind_text_label(compress_outer);
+        self.asm.cmp_reg_reg(Reg::Rbx, Reg::R11);
+        self.asm
+            .jcc_label(Condition::AboveOrEqual, compress_outer_done);
+
+        // rax = new_base[i]
+        self.asm.mov_data_addr(Reg::Rdx, self.zgc_forward_new_base);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rbx);
+        self.asm.shl_reg_imm8(Reg::R9, 3);
+        self.asm.add_reg_reg(Reg::Rdx, Reg::R9);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdx, 0);
+
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R11); // j = pass_start_count
+        self.asm.bind_text_label(compress_inner);
+        self.asm.cmp_reg_reg(Reg::Rcx, Reg::R10);
+        self.asm
+            .jcc_label(Condition::AboveOrEqual, compress_inner_done);
+
+        // r8 = old_base[j]
+        self.asm.mov_data_addr(Reg::R8, self.zgc_forward_old_base);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rcx);
+        self.asm.shl_reg_imm8(Reg::R9, 3);
+        self.asm.add_reg_reg(Reg::R8, Reg::R9);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::R8);
+        self.asm.jcc_label(Condition::NotEqual, compress_inner_next);
+
+        // Match: new_base[i] = new_base[j].
+        self.asm.mov_data_addr(Reg::Rdx, self.zgc_forward_new_base);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rcx);
+        self.asm.shl_reg_imm8(Reg::R9, 3);
+        self.asm.add_reg_reg(Reg::Rdx, Reg::R9);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::Rdx, 0); // r9 = new_base[j] (fresh)
+        self.asm.mov_data_addr(Reg::Rdx, self.zgc_forward_new_base);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0);
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rbx);
+        self.asm.shl_reg_imm8(Reg::R8, 3);
+        self.asm.add_reg_reg(Reg::Rdx, Reg::R8); // rdx = &new_base[i]
+        self.asm.store_ptr_disp32(Reg::Rdx, 0, Reg::R9);
+        self.asm.jmp_label(compress_inner_done); // old_addr values are
+        // unique within a single pass -- no need to keep scanning.
+
+        self.asm.bind_text_label(compress_inner_next);
+        self.asm.add_reg_imm32(Reg::Rcx, 1);
+        self.asm.jmp_label(compress_inner);
+
+        self.asm.bind_text_label(compress_inner_done);
+        self.asm.add_reg_imm32(Reg::Rbx, 1);
+        self.asm.jmp_label(compress_outer);
+        self.asm.bind_text_label(compress_outer_done);
+
+        // Purge gc_free_list_head of any node within [orig_base, end):
+        // earlier collection cycles may have already added dead blocks
+        // from this same segment to the free list, and this segment is
+        // about to be removed from the segments array below. The range
+        // stays mapped (see the no-munmap comment further down), but it
+        // is no longer part of the tracked heap, so nothing should be
+        // handed out of it as if it were live free space.
+        let purge_loop = self.asm.create_text_label();
+        let purge_done = self.asm.create_text_label();
+        let purge_keep = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.gc_free_list_head);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.bind_text_label(purge_loop);
+        self.asm.test_reg_reg(Reg::R11, Reg::R11);
+        self.asm.jcc_label(Condition::Equal, purge_done);
+        self.asm.load_rbp_slot(Reg::Rax, 64);
+        self.asm.cmp_reg_reg(Reg::R11, Reg::Rax);
+        self.asm.jcc_label(Condition::Below, purge_keep);
+        self.asm.load_rbp_slot(Reg::Rax, 72);
+        self.asm.cmp_reg_reg(Reg::R11, Reg::Rax);
+        self.asm.jcc_label(Condition::AboveOrEqual, purge_keep);
+        // In range: unlink. *prev_link = [current + 16]; advance
+        // current without moving prev_link.
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R11, 16);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rcx);
+        self.asm.jmp_label(purge_loop);
+        self.asm.bind_text_label(purge_keep);
+        self.asm.mov_reg_reg(Reg::R10, Reg::R11);
+        self.asm.add_reg_imm32(Reg::R10, 16);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
+        self.asm.jmp_label(purge_loop);
+        self.asm.bind_text_label(purge_done);
+
+        // Remove segments[0] by shifting segments[1..count) down by one
+        // -- NOT by swapping in the last entry, which would move the
+        // active segment's record away from index count-1 and break
+        // the sweep phase's "segments[count-1] is always the active
+        // one" assumption below.
+        let shift_loop = self.asm.create_text_label();
+        let shift_done = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
+        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0); // count (fixed bound)
+        self.asm.mov_imm64(Reg::Rcx, 1); // i = 1
+        self.asm.bind_text_label(shift_loop);
+        self.asm.cmp_reg_reg(Reg::Rcx, Reg::R11);
+        self.asm.jcc_label(Condition::AboveOrEqual, shift_done);
+        self.asm.mov_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.mov_imm64(Reg::Rdi, 24);
+        self.asm.imul_reg_reg(Reg::Rax, Reg::Rdi);
+        self.asm.mov_data_addr(Reg::R8, self.gc_segments);
+        self.asm.add_reg_reg(Reg::R8, Reg::Rax); // &segments[i]
+        self.asm.mov_reg_reg(Reg::R9, Reg::R8);
+        self.asm.sub_reg_imm32(Reg::R9, 24); // &segments[i-1]
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::R8, 0);
+        self.asm.store_ptr_disp32(Reg::R9, 0, Reg::Rdx);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::R8, 8);
+        self.asm.store_ptr_disp32(Reg::R9, 8, Reg::Rdx);
+        self.asm.load_ptr_disp32(Reg::Rdx, Reg::R8, 16);
+        self.asm.store_ptr_disp32(Reg::R9, 16, Reg::Rdx);
+        self.asm.add_reg_imm32(Reg::Rcx, 1);
+        self.asm.jmp_label(shift_loop);
+        self.asm.bind_text_label(shift_done);
+
+        self.asm.mov_data_addr(Reg::R10, self.gc_segment_count);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.sub_reg_imm32(Reg::Rax, 1);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        // Deliberately do NOT munmap the original segment's memory.
+        // The free-list purge above only removes *this* collection's
+        // dangling references to it; it says nothing about references
+        // that don't exist yet. If this range were unmapped, a later
+        // mmap (the very next gc_grow_heap, or the next zgc_forward_grow)
+        // is free to hand this exact address range back out -- and any
+        // still-live forwarding-table entry whose old_addr happens to
+        // fall in it (registered in this or an earlier collection cycle,
+        // and still needed to resolve a reference nothing has re-read
+        // since) would then alias a brand-new, never-relocated pointer.
+        // The barrier can't tell "genuinely stale, needs forwarding"
+        // apart from "coincidentally reused address" -- it would chase
+        // the stale entry and misresolve a perfectly valid pointer into
+        // garbage. Leaking here mirrors zgc_forward_grow's own choice to
+        // never free its abandoned arrays, and for the same reason: an
+        // address that might still be a forwarding-table key must never
+        // become available for reuse.
+
+        self.asm.bind_text_label(compact_skip);
+
         // ---- Sweep phase ----
         // Walk every segment that has been mmap'd, rebuilding the global
         // free list from blocks whose mark bit is still clear after the
@@ -41056,12 +41553,24 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R10, self.gc_free_list_head);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
 
-        // Release gc_collect_barrier. rax is not this function's return
-        // value (its one caller, gc_alloc's retry path, always
-        // recomputes rax via emit_gc_alloc_attempt right after the
-        // call), so it's free to clobber here.
+        // Release gc_alloc_lock (acquired at the top of this function,
+        // covering the whole mark/sweep/compact critical section), then
+        // gc_collect_barrier. rax is not this function's return value
+        // (its callers -- gc_alloc's retry path and the explicit
+        // __gc_collect() builtin -- never depend on it), so it's free to
+        // clobber here.
+        self.asm.mov_data_addr(Reg::R10, self.gc_alloc_lock);
+        self.asm.mov_imm64(Reg::R11, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
         self.emit_gc_collect_barrier_release();
 
+        // Undo the 88-byte local reservation before popping the saved
+        // rbx -- it sits at [rbp-8], directly below the locals, so rsp
+        // must be walked back up to there first (mirrors gc_alloc's
+        // own `add_reg_imm32(Rsp, N); pop_reg(Rbx); leave(); ret();`
+        // epilogue shape exactly).
+        self.asm.add_reg_imm32(Reg::Rsp, 88);
+        self.asm.pop_reg(Reg::Rbx);
         self.asm.leave();
         self.asm.ret();
     }
@@ -41656,10 +42165,14 @@ impl NativeCodeGenerator {
     /// design, matching a real load barrier's fast path). If set, the
     /// masked (uncolored) address is looked up in the forwarding table
     /// (`zgc_forward_old_base`/`zgc_forward_new_base`, populated by
-    /// `zgc_relocate_object`); a match resolves rax to the *new*, live
-    /// address. No match (relocation hasn't happened yet, or this
-    /// pointer was never relocated) leaves rax as the masked address,
-    /// still perfectly valid to dereference.
+    /// `zgc_relocate_object` and by automatic compaction); each match
+    /// re-resolves rax to the *new* address and the lookup repeats from
+    /// that new address, so a reference relocated across several
+    /// collection cycles is fully chased to its current, live location
+    /// in one call rather than stopping at the first (possibly stale,
+    /// since-unmapped) hop. No match on a given pass (relocation hasn't
+    /// happened yet, or the address is already current) leaves rax
+    /// unchanged and returns it, still perfectly valid to dereference.
     ///
     /// Deliberately lock-free on the read side even though
     /// `zgc_relocate_object`/`zgc_forward_grow` can concurrently append
@@ -41680,6 +42193,7 @@ impl NativeCodeGenerator {
     fn emit_zgc_load_barrier_runtime(&mut self) {
         self.asm.bind_text_label(self.zgc_load_barrier);
         let not_colored = self.asm.create_text_label();
+        let rescan = self.asm.create_text_label();
         let scan_loop = self.asm.create_text_label();
         let found = self.asm.create_text_label();
         let done = self.asm.create_text_label();
@@ -41691,6 +42205,21 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::R11, 0x7fff_ffff_ffff_ffff_u64);
         self.asm.and_reg_reg(Reg::Rax, Reg::R11);
 
+        // Chase the forwarding chain to a fixed point rather than
+        // stopping at the first hit. An object relocated by compaction
+        // in one collection cycle can be relocated *again* in a later
+        // cycle (its home segment becomes "segments[0]" again once it
+        // fills and the heap grows past it) -- each relocation appends
+        // a fresh (old, new) pair rather than rewriting prior entries,
+        // so a pointer that has never been re-read since the object's
+        // very first move only knows the *original* address, which now
+        // resolves to an intermediate address whose backing segment has
+        // itself since been munmapped. Re-scanning with each resolved
+        // address as the next lookup key until a scan finds no match
+        // walks old -> mid -> ... -> current without ever dereferencing
+        // an intermediate (possibly unmapped) address -- the table is
+        // read purely as data, by value, at every hop.
+        self.asm.bind_text_label(rescan);
         self.asm.mov_data_addr(Reg::R10, self.zgc_forward_count);
         self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
         self.asm.mov_imm64(Reg::Rcx, 0);
@@ -41715,7 +42244,7 @@ impl NativeCodeGenerator {
         self.asm.shl_reg_imm8(Reg::R9, 3);
         self.asm.add_reg_reg(Reg::Rdx, Reg::R9);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdx, 0);
-        self.asm.jmp_label(done);
+        self.asm.jmp_label(rescan);
 
         self.asm.bind_text_label(not_colored);
         // rax is already the real, uncolored address.
@@ -41932,6 +42461,24 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(copy_done);
         // rax (new_addr) untouched by the copy loop.
 
+        // rbx already holds old_addr; register the forwarding entry.
+        self.asm.call_label(self.zgc_register_forwarding_entry);
+
+        self.asm.pop_reg(Reg::Rbx);
+        self.asm.leave();
+        self.asm.ret();
+    }
+
+    /// Registers a forwarding entry {old_addr in rbx, new_addr in rax},
+    /// growing the table first if full. Input: rbx = old_addr, rax =
+    /// new_addr. Output: rax = new_addr (unchanged). Clobbers rcx, rdx,
+    /// r9, r10, r11; preserves rbx. Factored out of
+    /// `zgc_relocate_object` so `gc_collect`'s compaction phase can
+    /// reuse the exact same (already tested) table-growth and append
+    /// logic with a different destination allocator.
+    fn emit_zgc_register_forwarding_entry_runtime(&mut self) {
+        self.asm.bind_text_label(self.zgc_register_forwarding_entry);
+
         self.asm.push_reg(Reg::Rax); // stash new_addr across the lock section
 
         let lock_loop = self.asm.create_text_label();
@@ -41984,8 +42531,6 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::R11, 0);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
 
-        self.asm.pop_reg(Reg::Rbx);
-        self.asm.leave();
         self.asm.ret();
     }
 
