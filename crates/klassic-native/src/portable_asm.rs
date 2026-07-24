@@ -1531,6 +1531,125 @@ pub fn emit_gc_acquire_region<E: PortableAsm>(
     out.ret();
 }
 
+/// Data cells the evacuation-region acquire path reads and writes: the
+/// dedicated to-space bump (`evac_*`), the region arrays, and the free
+/// pool. Distinct from the mutator's `gc_heap_*` bump.
+#[derive(Clone, Copy)]
+pub struct EvacRegionCells<D: Copy> {
+    pub evac_region_base: D,
+    pub evac_top: D,
+    pub evac_end: D,
+    pub region_base: D,
+    pub region_top: D,
+    pub committed_count: D,
+    pub free_region_head: D,
+}
+
+/// Portable version of `gc_acquire_evac_region`: obtain a fresh to-space
+/// region into the dedicated evacuation bump (NOT the mutator's bump).
+/// Flushes the previous evac region's watermark, then pops the free pool
+/// (zeroing the reused region) or commits the next tail region -- aborting
+/// via the exhaustion diagnostic if that would pass the reservation (a
+/// safety net; the headroom cap makes it unreachable). Installs the evac
+/// bump globals and sets the new region's watermark to base. Leaf (no
+/// frame). `exhausted_msg` / `exhausted_len` / `stderr_fd` describe the
+/// abort diagnostic; the message label is built by the caller.
+pub fn emit_gc_acquire_evac_region<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    c: EvacRegionCells<E::DataLabel>,
+    exhausted_msg: E::DataLabel,
+    exhausted_len: usize,
+    stderr_fd: u64,
+) {
+    use crate::gc_layout::{GC_REGION_SHIFT, GC_REGION_SIZE, GC_RESERVE_REGIONS};
+
+    out.bind_text_label(entry);
+    let no_flush = out.create_text_label();
+    let from_tail = out.create_text_label();
+    let install = out.create_text_label();
+    // Flush the previous evac region's watermark, if any.
+    out.mov_data_addr(Reg::V10, c.evac_region_base);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, no_flush);
+    out.mov_data_addr(Reg::V10, c.region_base);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.sub_reg_reg(Reg::V0, Reg::V11);
+    out.shr_reg_imm8(Reg::V0, GC_REGION_SHIFT);
+    out.shl_reg_imm8(Reg::V0, 3);
+    out.mov_data_addr(Reg::V10, c.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V0);
+    out.mov_data_addr(Reg::V8, c.evac_top);
+    out.load_ptr_disp32(Reg::V2, Reg::V8, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V2);
+    out.bind_text_label(no_flush);
+    // (1) Free-region pool.
+    out.mov_data_addr(Reg::V10, c.free_region_head);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, from_tail);
+    out.load_ptr_disp32(Reg::V1, Reg::V0, 0);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V1); // pop
+    // Zero the reused region.
+    let zero_loop = out.create_text_label();
+    let zero_done = out.create_text_label();
+    out.mov_reg_reg(Reg::V8, Reg::V0);
+    out.mov_reg_reg(Reg::V11, Reg::V0);
+    out.add_reg_imm32(Reg::V11, GC_REGION_SIZE as i32);
+    out.mov_imm64(Reg::V9, 0);
+    out.bind_text_label(zero_loop);
+    out.cmp_reg_reg(Reg::V8, Reg::V11);
+    out.jcc_label(Condition::AboveOrEqual, zero_done);
+    out.store_ptr_disp32(Reg::V8, 0, Reg::V9);
+    out.add_reg_imm32(Reg::V8, 8);
+    out.jmp_label(zero_loop);
+    out.bind_text_label(zero_done);
+    out.jmp_label(install);
+    // (2) Commit the next tail region. Hard safety net: never commit past
+    // the reservation. The headroom cap in gc_relocate_start makes this
+    // unreachable, but an out-of-bounds to-space write would be silent
+    // corruption, so abort cleanly if the accounting is ever wrong.
+    out.bind_text_label(from_tail);
+    out.mov_data_addr(Reg::V10, c.committed_count);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    let evac_ok = out.create_text_label();
+    out.cmp_reg_imm32(Reg::V0, GC_RESERVE_REGIONS as i32);
+    out.jcc_label(Condition::Below, evac_ok);
+    out.plat_write_data(stderr_fd, exhausted_msg, exhausted_len);
+    out.plat_exit(1);
+    out.bind_text_label(evac_ok);
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.shl_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    out.mov_data_addr(Reg::V8, c.region_base);
+    out.load_ptr_disp32(Reg::V8, Reg::V8, 0);
+    out.add_reg_reg(Reg::V8, Reg::V1);
+    out.add_reg_imm32(Reg::V0, 1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.mov_reg_reg(Reg::V0, Reg::V8); // rax = new base
+    // install: set the evac bump globals (NOT the mutator's).
+    out.bind_text_label(install);
+    out.mov_data_addr(Reg::V10, c.evac_region_base);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.mov_data_addr(Reg::V10, c.evac_top);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.add_reg_imm32(Reg::V1, GC_REGION_SIZE as i32);
+    out.mov_data_addr(Reg::V10, c.evac_end);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V1);
+    // region_top[newidx] = base (empty until the watermark is flushed).
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.mov_data_addr(Reg::V10, c.region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.sub_reg_reg(Reg::V1, Reg::V10);
+    out.shr_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.mov_data_addr(Reg::V10, c.region_top);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.ret();
+}
+
 /// Portable version of `gc_relocate_fix_roots`: at RelocateStart, walk
 /// every shadow-stack root slot and, for each root pointing into a
 /// from-space region, redirect it to the object's to-space copy --

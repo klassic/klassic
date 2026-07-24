@@ -38853,97 +38853,24 @@ impl NativeCodeGenerator {
     /// (<= REGION_SIZE). Flushes the previous evac region's watermark
     /// first. Never fails: the headroom invariant guarantees a region.
     fn emit_gc_acquire_evac_region_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_acquire_evac_region);
-        let no_flush = self.asm.create_text_label();
-        let from_tail = self.asm.create_text_label();
-        let install = self.asm.create_text_label();
-        // Flush the previous evac region's watermark, if any.
-        self.asm.mov_data_addr(Reg::R10, self.gc_evac_region_base);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, no_flush);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.sub_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.shr_reg_imm8(Reg::Rax, Self::GC_REGION_SHIFT);
-        self.asm.shl_reg_imm8(Reg::Rax, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R8, self.gc_evac_top);
-        self.asm.load_ptr_disp32(Reg::Rdx, Reg::R8, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdx);
-        self.asm.bind_text_label(no_flush);
-        // (1) Free-region pool.
-        self.asm.mov_data_addr(Reg::R10, self.gc_free_region_head);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, from_tail);
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rax, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx); // pop
-        // Zero the reused region.
-        let zero_loop = self.asm.create_text_label();
-        let zero_done = self.asm.create_text_label();
-        self.asm.mov_reg_reg(Reg::R8, Reg::Rax);
-        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
-        self.asm
-            .add_reg_imm32(Reg::R11, Self::GC_REGION_SIZE as i32);
-        self.asm.mov_imm64(Reg::R9, 0);
-        self.asm.bind_text_label(zero_loop);
-        self.asm.cmp_reg_reg(Reg::R8, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, zero_done);
-        self.asm.store_ptr_disp32(Reg::R8, 0, Reg::R9);
-        self.asm.add_reg_imm32(Reg::R8, 8);
-        self.asm.jmp_label(zero_loop);
-        self.asm.bind_text_label(zero_done);
-        self.asm.jmp_label(install);
-        // (2) Commit the next tail region. Hard safety net: never commit
-        // past the reservation. The headroom cap in gc_relocate_start
-        // makes this unreachable (selected live bytes fit in
-        // free_regions-2 even at ~50% packing), but an out-of-bounds
-        // to-space write would be silent memory corruption, so abort
-        // cleanly instead if the accounting is ever wrong.
-        self.asm.bind_text_label(from_tail);
-        self.asm.mov_data_addr(Reg::R10, self.gc_committed_count);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        let evac_ok = self.asm.create_text_label();
-        self.asm
-            .cmp_reg_imm32(Reg::Rax, Self::GC_RESERVE_REGIONS as i32);
-        self.asm.jcc_label(Condition::Below, evac_ok);
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper). The
+        // exhaustion-diagnostic label and stderr fd are host-side details
+        // resolved here and passed in.
+        let entry = self.gc_acquire_evac_region;
         let msg = b"klassic gc: evacuation exhausted the heap reservation\n";
         let txt = self.asm.data_label_with_bytes(msg);
-        self.emit_write_data(self.platform.stderr_fd(), txt, msg.len());
-        self.emit_exit_code(1);
-        self.asm.bind_text_label(evac_ok);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.shl_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
-        self.asm.mov_data_addr(Reg::R8, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
-        self.asm.add_reg_reg(Reg::R8, Reg::Rcx);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R8); // rax = new base
-        // install: set the evac bump globals (NOT the mutator's).
-        self.asm.bind_text_label(install);
-        self.asm.mov_data_addr(Reg::R10, self.gc_evac_region_base);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_evac_top);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm
-            .add_reg_imm32(Reg::Rcx, Self::GC_REGION_SIZE as i32);
-        self.asm.mov_data_addr(Reg::R10, self.gc_evac_end);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
-        // region_top[newidx] = base (empty until the watermark is flushed).
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.sub_reg_reg(Reg::Rcx, Reg::R10);
-        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_top);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.ret();
+        let stderr_fd = self.platform.stderr_fd();
+        let cells = portable_asm::EvacRegionCells {
+            evac_region_base: self.gc_evac_region_base,
+            evac_top: self.gc_evac_top,
+            evac_end: self.gc_evac_end,
+            region_base: self.gc_region_base,
+            region_top: self.gc_region_top,
+            committed_count: self.gc_committed_count,
+            free_region_head: self.gc_free_region_head,
+        };
+        portable_asm::emit_gc_acquire_evac_region(self, entry, cells, txt, msg.len(), stderr_fd);
     }
 
     /// Evacuate one object: rdi = user pointer. Returns rax = to-space
