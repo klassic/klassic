@@ -36754,7 +36754,8 @@ impl NativeCodeGenerator {
     const GC_RESERVE_BYTES: u64 = crate::gc_layout::GC_RESERVE_BYTES;
     const GC_INITIAL_BUDGET_REGIONS: u64 = crate::gc_layout::GC_INITIAL_BUDGET_REGIONS;
     const GC_TABLES_BYTES: u64 = crate::gc_layout::GC_TABLES_BYTES;
-    const GC_MARK_WORKLIST_LEN: usize = crate::gc_layout::GC_MARK_WORKLIST_LEN;
+    // GC_MARK_WORKLIST_LEN's last in-lib.rs user moved to the portable
+    // emitter; reference crate::gc_layout::GC_MARK_WORKLIST_LEN directly.
     const GC_SHADOW_STACK_LEN: usize = crate::gc_layout::GC_SHADOW_STACK_LEN;
     const GC_MAX_PAYLOAD_SIZE: u64 = crate::gc_layout::GC_MAX_PAYLOAD_SIZE;
     const GC_MAX_STRING_ALLOC_SIZE: u64 = crate::gc_layout::GC_MAX_STRING_ALLOC_SIZE;
@@ -38988,73 +38989,16 @@ impl NativeCodeGenerator {
     /// worklist. A no-op when addr is null or already marked. Aborts if
     /// the worklist is full.
     fn emit_gc_mark_visit_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_mark_visit);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-
-        let bail = self.asm.create_text_label();
-        let overflow = self.asm.create_text_label();
-
-        // Null check.
-        self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
-        self.asm.jcc_label(Condition::Equal, bail);
-        // M7: follow forwarding first. If [rdi-16] is a forwarding word
-        // (FWD bit set), rdi points at a ghost -- redirect to the
-        // to-space copy so we mark (and later trace) the live object, not
-        // the ghost. ORing a mark into a ghost's forwarding word would
-        // corrupt the address. Inert while evac is off (FWD never set).
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdi, -16);
-        let not_fwd = self.asm.create_text_label();
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rax);
-        self.asm.and_reg_imm32(Reg::Rcx, Self::GC_FWD as i32);
-        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
-        self.asm.jcc_label(Condition::Equal, not_fwd);
-        self.asm.and_reg_imm32(Reg::Rax, -16); // new user ptr
-        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rdi, -16); // to-space header
-        self.asm.bind_text_label(not_fwd);
-        // Already marked this cycle? (current-parity mark bit set)
-        self.asm.mov_data_addr(Reg::R10, self.gc_header_mark);
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.jcc_label(Condition::NotEqual, bail);
-        // Set the current mark bit.
-        self.asm.or_reg_reg(Reg::Rax, Reg::Rcx);
-        self.asm.store_ptr_disp32(Reg::Rdi, -16, Reg::Rax);
-        // Push onto worklist: worklist[top++] = rdi
-        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm
-            .cmp_reg_imm32(Reg::Rax, Self::GC_MARK_WORKLIST_LEN as i32);
-        self.asm.jcc_label(Condition::AboveOrEqual, overflow);
-        self.asm.mov_data_addr(Reg::R8, self.gc_mark_worklist);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
-        // r9 = base + rax*8
-        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
-        self.asm.shl_reg_imm8(Reg::R9, 3);
-        self.asm.add_reg_reg(Reg::R8, Reg::R9);
-        self.asm.store_ptr_disp32(Reg::R8, 0, Reg::Rdi);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-
-        self.asm.bind_text_label(bail);
-        self.asm.leave();
-        self.asm.ret();
-
-        self.asm.bind_text_label(overflow);
-        // Worklist full. The object's mark bit is already set (above), so
-        // it is not lost -- only its frontier (children-to-scan) entry is
-        // dropped. Raise the STW-fallback flag: the incremental driver
-        // (or gc_stw_mark_complete) will re-mark from scratch, which
-        // recovers the dropped frontier. On the from-scratch STW path
-        // that re-mark checks this flag after draining and aborts if it
-        // is still set (genuine over-capacity).
-        self.asm
-            .mov_data_addr(Reg::R10, self.gc_stw_fallback_pending);
-        self.asm.mov_imm64(Reg::Rax, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_mark_visit;
+        let worklist = portable_asm::MarkWorklist {
+            header_mark: self.gc_header_mark,
+            worklist: self.gc_mark_worklist,
+            worklist_top: self.gc_mark_worklist_top,
+            stw_fallback_pending: self.gc_stw_fallback_pending,
+        };
+        portable_asm::emit_gc_mark_visit(self, entry, worklist);
     }
 
     /// `gc_load_barrier_slow` (in: rax = bad-colored heap pointer,

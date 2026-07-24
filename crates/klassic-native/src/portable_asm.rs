@@ -110,6 +110,7 @@ pub trait PortableAsm {
 
     fn add_reg_reg(&mut self, dst: Reg, src: Reg);
     fn sub_reg_reg(&mut self, dst: Reg, src: Reg);
+    fn or_reg_reg(&mut self, dst: Reg, src: Reg);
     fn cmp_reg_reg(&mut self, a: Reg, b: Reg);
     /// Compare `a & b` against zero, setting flags (x86-64 `test`).
     fn test_reg_reg(&mut self, a: Reg, b: Reg);
@@ -235,6 +236,9 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
     fn sub_reg_reg(&mut self, dst: Reg, src: Reg) {
         self.asm.sub_reg_reg(dst.into(), src.into());
+    }
+    fn or_reg_reg(&mut self, dst: Reg, src: Reg) {
+        self.asm.or_reg_reg(dst.into(), src.into());
     }
     fn cmp_reg_reg(&mut self, a: Reg, b: Reg) {
         self.asm.cmp_reg_reg(a.into(), b.into());
@@ -605,6 +609,98 @@ pub fn emit_gc_free_ghost_regions<E: PortableAsm>(
     out.store_rbp_slot(8, Reg::V0);
     out.jmp_label(loop_l);
     out.bind_text_label(done_l);
+    out.leave();
+    out.ret();
+}
+
+/// Data-section labels the incremental-mark worklist routines address.
+#[derive(Clone, Copy)]
+pub struct MarkWorklist<D: Copy> {
+    pub header_mark: D,
+    pub worklist: D,
+    pub worklist_top: D,
+    pub stw_fallback_pending: D,
+}
+
+/// Portable version of `gc_mark_visit(addr)` (V7/rdi = addr): if `addr`
+/// points at an unmarked heap block, set its current-parity mark bit and
+/// push it onto the trace worklist; a no-op when null or already marked.
+/// Follows an M7 forwarding word first (a ghost redirects to its
+/// to-space copy). On worklist overflow the mark bit is already set (so
+/// the object is not lost, only its frontier entry), so it raises the
+/// STW-fallback flag for a from-scratch re-mark. Note the routine emits
+/// its fall-through `leave; ret` at the `bail` label, THEN the overflow
+/// handler after it -- the emission order is preserved exactly.
+pub fn emit_gc_mark_visit<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    w: MarkWorklist<E::DataLabel>,
+) {
+    use crate::gc_layout::{GC_FWD, GC_MARK_WORKLIST_LEN};
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+
+    let bail = out.create_text_label();
+    let overflow = out.create_text_label();
+
+    // Null check.
+    out.test_reg_reg(Reg::V7, Reg::V7);
+    out.jcc_label(Condition::Equal, bail);
+    // M7: follow forwarding first. If [rdi-16] is a forwarding word (FWD
+    // bit set), rdi points at a ghost -- redirect to the to-space copy so
+    // we mark (and later trace) the live object, not the ghost. ORing a
+    // mark into a ghost's forwarding word would corrupt the address.
+    // Inert while evac is off (FWD never set).
+    out.load_ptr_disp32(Reg::V0, Reg::V7, -16);
+    let not_fwd = out.create_text_label();
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.and_reg_imm32(Reg::V1, GC_FWD as i32);
+    out.test_reg_reg(Reg::V1, Reg::V1);
+    out.jcc_label(Condition::Equal, not_fwd);
+    out.and_reg_imm32(Reg::V0, -16); // new user ptr
+    out.mov_reg_reg(Reg::V7, Reg::V0);
+    out.load_ptr_disp32(Reg::V0, Reg::V7, -16); // to-space header
+    out.bind_text_label(not_fwd);
+    // Already marked this cycle? (current-parity mark bit set)
+    out.mov_data_addr(Reg::V10, w.header_mark);
+    out.load_ptr_disp32(Reg::V1, Reg::V10, 0);
+    out.test_reg_reg(Reg::V0, Reg::V1);
+    out.jcc_label(Condition::NotEqual, bail);
+    // Set the current mark bit.
+    out.or_reg_reg(Reg::V0, Reg::V1);
+    out.store_ptr_disp32(Reg::V7, -16, Reg::V0);
+    // Push onto worklist: worklist[top++] = rdi
+    out.mov_data_addr(Reg::V10, w.worklist_top);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.cmp_reg_imm32(Reg::V0, GC_MARK_WORKLIST_LEN as i32);
+    out.jcc_label(Condition::AboveOrEqual, overflow);
+    out.mov_data_addr(Reg::V8, w.worklist);
+    out.load_ptr_disp32(Reg::V8, Reg::V8, 0);
+    // r9 = base + rax*8
+    out.mov_reg_reg(Reg::V9, Reg::V0);
+    out.shl_reg_imm8(Reg::V9, 3);
+    out.add_reg_reg(Reg::V8, Reg::V9);
+    out.store_ptr_disp32(Reg::V8, 0, Reg::V7);
+    out.add_reg_imm32(Reg::V0, 1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+
+    out.bind_text_label(bail);
+    out.leave();
+    out.ret();
+
+    out.bind_text_label(overflow);
+    // Worklist full. The object's mark bit is already set (above), so it
+    // is not lost -- only its frontier (children-to-scan) entry is
+    // dropped. Raise the STW-fallback flag: the incremental driver (or
+    // gc_stw_mark_complete) will re-mark from scratch, which recovers the
+    // dropped frontier. On the from-scratch STW path that re-mark checks
+    // this flag after draining and aborts if it is still set (genuine
+    // over-capacity).
+    out.mov_data_addr(Reg::V10, w.stw_fallback_pending);
+    out.mov_imm64(Reg::V0, 1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
     out.leave();
     out.ret();
 }
