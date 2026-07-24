@@ -105,6 +105,17 @@ pub trait PortableAsm {
     fn cmp_reg_imm32(&mut self, r: Reg, imm: i32);
     fn shl_reg_imm8(&mut self, r: Reg, imm: u8);
     fn shr_reg_imm8(&mut self, r: Reg, imm: u8);
+
+    // Platform primitives. These are the genuinely platform-DEPENDENT
+    // operations the collector needs -- the OS interface, not an
+    // instruction encoding. Each backend implements them however its
+    // platform requires (Linux/macOS `syscall`, a Windows shim `call`, a
+    // future ARM-Linux `svc`), so that per-OS emission stays inside the
+    // impl and never leaks into the portable GC code that calls them.
+    /// Write `len` bytes at data label `data` to file descriptor `fd`.
+    fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize);
+    /// Terminate the process with status `code` (does not return).
+    fn plat_exit(&mut self, code: u64);
 }
 
 impl From<Reg> for crate::Reg {
@@ -147,57 +158,73 @@ impl From<Condition> for crate::Condition {
     }
 }
 
-impl PortableAsm for crate::Assembler {
+// The x86-64 backend implements `PortableAsm` on `NativeCodeGenerator`
+// (not the bare `Assembler`) because the platform primitives need the
+// generator's `is_windows`/`platform`/`windows` state: `plat_write_data`
+// / `plat_exit` reuse the generator's existing, tested `emit_write_data`
+// / `emit_exit_code` helpers, which already choose a Linux/macOS syscall
+// vs a Windows shim `call`. The instruction methods are 1:1 thin
+// wrappers over the inherent `Assembler` methods, so a migrated GC
+// function emits byte-identical code. A future AArch64 backend would
+// impl this same trait on its own generator type.
+impl PortableAsm for crate::NativeCodeGenerator {
     type TextLabel = crate::TextLabel;
     type DataLabel = crate::DataLabel;
 
     fn create_text_label(&mut self) -> Self::TextLabel {
-        crate::Assembler::create_text_label(self)
+        self.asm.create_text_label()
     }
     fn bind_text_label(&mut self, label: Self::TextLabel) {
-        crate::Assembler::bind_text_label(self, label);
+        self.asm.bind_text_label(label);
     }
     fn jmp_label(&mut self, label: Self::TextLabel) {
-        crate::Assembler::jmp_label(self, label);
+        self.asm.jmp_label(label);
     }
     fn jcc_label(&mut self, cond: Condition, label: Self::TextLabel) {
-        crate::Assembler::jcc_label(self, cond.into(), label);
+        self.asm.jcc_label(cond.into(), label);
     }
     fn ret(&mut self) {
-        crate::Assembler::ret(self);
+        self.asm.ret();
     }
     fn mov_reg_reg(&mut self, dst: Reg, src: Reg) {
-        crate::Assembler::mov_reg_reg(self, dst.into(), src.into());
+        self.asm.mov_reg_reg(dst.into(), src.into());
     }
     fn mov_imm64(&mut self, dst: Reg, imm: u64) {
-        crate::Assembler::mov_imm64(self, dst.into(), imm);
+        self.asm.mov_imm64(dst.into(), imm);
     }
     fn mov_data_addr(&mut self, dst: Reg, label: Self::DataLabel) {
-        crate::Assembler::mov_data_addr(self, dst.into(), label);
+        self.asm.mov_data_addr(dst.into(), label);
     }
     fn load_ptr_disp32(&mut self, dst: Reg, base: Reg, disp: i32) {
-        crate::Assembler::load_ptr_disp32(self, dst.into(), base.into(), disp);
+        self.asm.load_ptr_disp32(dst.into(), base.into(), disp);
     }
     fn store_ptr_disp32(&mut self, base: Reg, disp: i32, src: Reg) {
-        crate::Assembler::store_ptr_disp32(self, base.into(), disp, src.into());
+        self.asm.store_ptr_disp32(base.into(), disp, src.into());
     }
     fn add_reg_reg(&mut self, dst: Reg, src: Reg) {
-        crate::Assembler::add_reg_reg(self, dst.into(), src.into());
+        self.asm.add_reg_reg(dst.into(), src.into());
     }
     fn cmp_reg_reg(&mut self, a: Reg, b: Reg) {
-        crate::Assembler::cmp_reg_reg(self, a.into(), b.into());
+        self.asm.cmp_reg_reg(a.into(), b.into());
     }
     fn add_reg_imm32(&mut self, dst: Reg, imm: i32) {
-        crate::Assembler::add_reg_imm32(self, dst.into(), imm);
+        self.asm.add_reg_imm32(dst.into(), imm);
     }
     fn cmp_reg_imm32(&mut self, r: Reg, imm: i32) {
-        crate::Assembler::cmp_reg_imm32(self, r.into(), imm);
+        self.asm.cmp_reg_imm32(r.into(), imm);
     }
     fn shl_reg_imm8(&mut self, r: Reg, imm: u8) {
-        crate::Assembler::shl_reg_imm8(self, r.into(), imm);
+        self.asm.shl_reg_imm8(r.into(), imm);
     }
     fn shr_reg_imm8(&mut self, r: Reg, imm: u8) {
-        crate::Assembler::shr_reg_imm8(self, r.into(), imm);
+        self.asm.shr_reg_imm8(r.into(), imm);
+    }
+
+    fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize) {
+        self.emit_write_data(fd, data, len);
+    }
+    fn plat_exit(&mut self, code: u64) {
+        self.emit_exit_code(code);
     }
 }
 
@@ -256,4 +283,22 @@ pub fn emit_gc_grow_budget<E: PortableAsm>(
     out.bind_text_label(fail);
     out.mov_imm64(Reg::V0, 0);
     out.ret();
+}
+
+/// Portable version of `gc_bounds_error`: a non-returning subroutine that
+/// prints a fixed diagnostic to stderr and exits with status 1. The list
+/// / string builtins jump here directly on a detected out-of-range index.
+/// This is the first migration to exercise the platform primitives
+/// (`plat_write_data` / `plat_exit`): the routine's control flow is
+/// architecture-independent, while each backend's impl chooses the actual
+/// OS interface (Linux/macOS `syscall` vs Windows shim `call`).
+pub fn emit_gc_bounds_error<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    text: E::DataLabel,
+    text_len: usize,
+) {
+    out.bind_text_label(entry);
+    out.plat_write_data(2, text, text_len);
+    out.plat_exit(1);
 }

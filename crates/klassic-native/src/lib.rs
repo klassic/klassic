@@ -40293,7 +40293,7 @@ impl NativeCodeGenerator {
         let entry = self.gc_grow_budget;
         let committed = self.gc_committed_count;
         let budget = self.gc_budget_regions;
-        portable_asm::emit_gc_grow_budget(&mut self.asm, entry, committed, budget);
+        portable_asm::emit_gc_grow_budget(self, entry, committed, budget);
     }
 
     /// `gc_bounds_error` is a non-returning subroutine that prints a
@@ -40301,13 +40301,15 @@ impl NativeCodeGenerator {
     /// builtins jump here directly when they detect an index outside
     /// the stored length range.
     fn emit_gc_bounds_error_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_bounds_error);
-        self.emit_write_data(
-            2,
-            self.gc_bounds_error_text,
-            b"klassic gc: index out of bounds\n".len(),
-        );
-        self.emit_exit_code(1);
+        // Migrated onto the portable `PortableAsm` emitter trait -- the
+        // first GC routine to use its platform primitives. The control
+        // flow (bind, write diagnostic, exit) is architecture-independent;
+        // the OS interface (Linux/macOS syscall vs Windows shim) lives in
+        // the impl. Byte-identical to the previous inline emission.
+        let entry = self.gc_bounds_error;
+        let text = self.gc_bounds_error_text;
+        let len = b"klassic gc: index out of bounds\n".len();
+        portable_asm::emit_gc_bounds_error(self, entry, text, len);
     }
 
     fn push_scope(&mut self) {
