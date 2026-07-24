@@ -29014,3 +29014,80 @@ fn native_build_thread_safe_alloc_test_is_race_free() {
         let _ = fs::remove_file(&output_path);
     }
 }
+
+/// `__native_thread_safe_shadow_test(n)` proves the per-cloned-thread
+/// shadow sub-stack routing added to `emit_gc_shadow_push`/
+/// `emit_gc_shadow_pop_n` (docs/superpowers/specs/2026-07-24-precise-
+/// concurrent-gc-design.md, phase 4) keeps two real threads' shadow-stack
+/// bookkeeping independent: a real child thread is spawned and its stack
+/// range registered *before* cloning, then both the parent and the child
+/// run a tight push-then-pop loop `n` times using the exact same codegen
+/// every ordinary record/heap-string local variable goes through. A push
+/// immediately followed by a pop is a net no-op on a correctly-isolated
+/// stack, so each thread's own top-of-stack counter must land back on
+/// its starting value; if the fix let the two threads' concurrent
+/// operations still race the same counter, an interleaved increment from
+/// the other thread would very likely leave at least one counter off.
+///
+/// Run at two scales (10 and 3,000 per thread, both push+pop so neither
+/// stresses the shadow stack's actual capacity) and repeated several
+/// times in-process, since a race is timing-dependent and a single run
+/// could get lucky and not observe it.
+#[test]
+fn native_build_thread_safe_shadow_test_is_race_free() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+
+    for (label, n, repeats) in [("small", 10, 20), ("stress", 3000, 5)] {
+        let source_path = std::env::temp_dir().join(format!(
+            "klassic_native_thread_safe_shadow_test_{label}_{stamp}.kl"
+        ));
+        let output_path = std::env::temp_dir().join(format!(
+            "klassic_native_thread_safe_shadow_test_{label}_{stamp}.bin"
+        ));
+        fs::write(
+            &source_path,
+            format!("println(__native_thread_safe_shadow_test({n}))\n"),
+        )
+        .expect("temp source file should write");
+
+        let build_output = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_str().expect("path should be utf-8"),
+                "-o",
+                output_path.to_str().expect("path should be utf-8"),
+            ])
+            .output()
+            .expect("binary should run");
+        let _ = fs::remove_file(&source_path);
+        assert!(
+            build_output.status.success(),
+            "{label}: __native_thread_safe_shadow_test should compile natively\nstderr:\n{}",
+            String::from_utf8_lossy(&build_output.stderr)
+        );
+
+        for attempt in 0..repeats {
+            let run_output = Command::new(&output_path)
+                .output()
+                .expect("compiled binary should run");
+            assert!(
+                run_output.status.success(),
+                "{label} attempt {attempt}: compiled binary should run cleanly, not crash or hang\nstderr:\n{}",
+                String::from_utf8_lossy(&run_output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&run_output.stdout),
+                "1\n",
+                "{label} attempt {attempt}: expected both threads' shadow-stack \
+                 counters to return to their exact starting values (1); 0 means \
+                 one drifted (the two threads raced the same counter); -1/-2/-3 \
+                 are the mmap/clone/join-timeout sentinels; got:\n{}",
+                String::from_utf8_lossy(&run_output.stdout)
+            );
+        }
+        let _ = fs::remove_file(&output_path);
+    }
+}

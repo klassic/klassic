@@ -32,6 +32,7 @@ pub(crate) fn builtin_name(name: &str) -> Option<&'static str> {
         "__native_atomic_self_test" => Some("__native_atomic_self_test"),
         "__native_thread_spawn_test" => Some("__native_thread_spawn_test"),
         "__native_thread_safe_alloc_test" => Some("__native_thread_safe_alloc_test"),
+        "__native_thread_safe_shadow_test" => Some("__native_thread_safe_shadow_test"),
         "__gc_list_int" => Some("__gc_list_int"),
         "__gc_list_int_len" => Some("__gc_list_int_len"),
         "__gc_list_int_set" => Some("__gc_list_int_set"),
@@ -116,7 +117,8 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         | "__gc_smap_values"
         | "__gc_pin"
         | "__gc_unpin"
-        | "__native_thread_safe_alloc_test" => Some(1),
+        | "__native_thread_safe_alloc_test"
+        | "__native_thread_safe_shadow_test" => Some(1),
         "__gc_collect"
         | "__gc_segment_count"
         | "__gc_collect_count"

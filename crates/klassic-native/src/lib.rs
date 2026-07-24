@@ -4034,6 +4034,41 @@ struct NativeCodeGenerator {
     /// after it finishes its own allocation loop; polled by the
     /// parent's join spin-loop, same pattern as `thread_done_flag`.
     alloc_test_child_done: DataLabel,
+    /// How many entries of `cloned_thread_ranges` are populated (0..=
+    /// `MAX_CLONED_THREADS`). Only ever written by the thread that calls
+    /// `clone()` to spawn another one, *before* the `clone` syscall runs
+    /// -- i.e. synchronously by whichever single thread is doing the
+    /// spawning, so this phase does not (yet) need a lock around
+    /// registration itself, only around what each registered thread
+    /// then does concurrently (the shadow-stack routing below).
+    cloned_thread_count: DataLabel,
+    /// `MAX_CLONED_THREADS` `{stack_base, stack_end}` pairs (2 i64s each,
+    /// 8 total). A thread whose current `rsp` falls within
+    /// `[stack_base, stack_end)` for entry `i` uses shadow sub-stack `i`
+    /// (`cloned_thread_shadow_storage`/`cloned_thread_shadow_top`)
+    /// instead of the main thread's global `gc_shadow_stack`.
+    cloned_thread_ranges: DataLabel,
+    /// `MAX_CLONED_THREADS * CLONED_THREAD_SHADOW_LEN` i64 slots: each
+    /// cloned thread's own private shadow sub-stack, laid out
+    /// contiguously (slot `i` starts at `i * CLONED_THREAD_SHADOW_LEN`).
+    cloned_thread_shadow_storage: DataLabel,
+    /// `MAX_CLONED_THREADS` running top-of-stack counters, one per
+    /// cloned-thread slot, parallel to `cloned_thread_shadow_storage`.
+    cloned_thread_shadow_top: DataLabel,
+    /// Scratch cell used by `__native_thread_safe_shadow_test` to stash
+    /// the main thread's `gc_shadow_stack_top` value from just before
+    /// the test's push/pop loop starts, so the test can check the
+    /// counter returned to exactly that baseline afterward without
+    /// assuming it started at 0 (whatever enclosing scope called this
+    /// builtin may already have live shadow-stack entries of its own).
+    shadow_test_main_start: DataLabel,
+    /// Set by the child thread in `__native_thread_safe_shadow_test`
+    /// after it finishes its own push/pop loop; polled by the parent's
+    /// join spin-loop. Deliberately separate from `alloc_test_child_done`
+    /// (a different test's flag) even though the two are never live at
+    /// the same time -- reusing it would be a correctness trap the
+    /// moment either test's shape changes.
+    shadow_test_child_done: DataLabel,
     /// Per-scope counter parallel to scope_base_offsets — number of GC
     /// pointer slots pushed onto the shadow stack in this scope.
     scope_gc_root_counts: Vec<usize>,
@@ -4231,6 +4266,16 @@ impl NativeCodeGenerator {
         let gc_alloc_lock = asm.data_label_with_i64s(&[0]);
         let alloc_test_count = asm.data_label_with_i64s(&[0]);
         let alloc_test_child_done = asm.data_label_with_i64s(&[0]);
+        let cloned_thread_count = asm.data_label_with_i64s(&[0]);
+        let cloned_thread_ranges = asm.data_label_with_i64s(&[0; Self::MAX_CLONED_THREADS * 2]);
+        let cloned_thread_shadow_storage = asm.data_label_with_i64s(&vec![
+            0;
+            Self::MAX_CLONED_THREADS
+                * Self::CLONED_THREAD_SHADOW_LEN
+        ]);
+        let cloned_thread_shadow_top = asm.data_label_with_i64s(&[0; Self::MAX_CLONED_THREADS]);
+        let shadow_test_main_start = asm.data_label_with_i64s(&[0]);
+        let shadow_test_child_done = asm.data_label_with_i64s(&[0]);
         let mut record_schemas = HashMap::new();
         record_schemas.insert(
             "Point".to_string(),
@@ -4304,6 +4349,12 @@ impl NativeCodeGenerator {
             gc_alloc_lock,
             alloc_test_count,
             alloc_test_child_done,
+            cloned_thread_count,
+            cloned_thread_ranges,
+            cloned_thread_shadow_storage,
+            cloned_thread_shadow_top,
+            shadow_test_main_start,
+            shadow_test_child_done,
             scope_gc_root_counts: vec![0],
             scopes: vec![HashMap::new()],
             static_scopes: vec![HashMap::new()],
@@ -7091,6 +7142,9 @@ impl NativeCodeGenerator {
             "__native_thread_safe_alloc_test" => {
                 self.compile_native_thread_safe_alloc_test(arguments, span)
             }
+            "__native_thread_safe_shadow_test" => {
+                self.compile_native_thread_safe_shadow_test(arguments, span)
+            }
             "__gc_list_int" => self.compile_gc_list_int(arguments, span),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span),
             "__gc_list_int_set" => self.compile_gc_list_int_set(arguments, span),
@@ -8119,6 +8173,9 @@ impl NativeCodeGenerator {
                 .map(Some),
             "__native_thread_safe_alloc_test" => self
                 .compile_native_thread_safe_alloc_test(arguments, span)
+                .map(Some),
+            "__native_thread_safe_shadow_test" => self
+                .compile_native_thread_safe_shadow_test(arguments, span)
                 .map(Some),
             "__gc_list_int" => self.compile_gc_list_int(arguments, span).map(Some),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span).map(Some),
@@ -14093,6 +14150,230 @@ impl NativeCodeGenerator {
         self.asm.jmp_label(child_loop);
         self.asm.bind_text_label(child_loop_done);
         self.asm.mov_data_addr(Reg::R10, self.alloc_test_child_done);
+        self.asm.mov_imm64(Reg::Rcx, 1);
+        self.asm.lock_xadd_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
+        self.emit_syscall_number(PlatformSyscall::Exit);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.syscall();
+
+        self.asm.bind_text_label(done);
+        Ok(NativeValue::Int)
+    }
+
+    /// `__native_thread_safe_shadow_test(n)` proves the per-cloned-thread
+    /// shadow sub-stack routing added to `emit_gc_shadow_push`/
+    /// `emit_gc_shadow_pop_n` (see docs/superpowers/specs/2026-07-24-
+    /// precise-concurrent-gc-design.md, phase 4) keeps each thread's push/
+    /// pop bookkeeping independent under real concurrent execution: it
+    /// spawns a real child thread, *registers* its stack range in
+    /// `cloned_thread_ranges` before cloning (so the child's very first
+    /// shadow-stack operation already routes to its own sub-stack, not
+    /// the main thread's), and has both the parent and the child run a
+    /// tight push-then-immediately-pop loop `n` times, each iteration
+    /// calling the exact same `emit_gc_shadow_push`/`emit_gc_shadow_pop_n`
+    /// codegen every ordinary record/heap-string local variable uses.
+    ///
+    /// A push followed by a pop is a net no-op on a correctly-isolated
+    /// stack: each thread's own top-of-stack counter must end back at
+    /// exactly its starting value. If the two threads' concurrent
+    /// operations were still racing the same counter (the bug this phase
+    /// fixes), interleaved increments/decrements from the *other* thread
+    /// would very likely leave at least one counter off by a nonzero
+    /// amount. Returns `1` if both counters landed back exactly on their
+    /// starting values, `0` if either drifted, or the same `-1`/`-2`/`-3`
+    /// mmap/clone/join-timeout sentinels as the other `__native_thread_*`
+    /// test builtins.
+    fn compile_native_thread_safe_shadow_test(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if arguments.len() != 1 {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__native_thread_safe_shadow_test expects 1 argument but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        let count_value = self.compile_expr(&arguments[0])?;
+        if count_value != NativeValue::Int {
+            return Err(unsupported(
+                span,
+                "native __native_thread_safe_shadow_test for non-Int argument",
+            ));
+        }
+        self.asm.mov_reg_reg(Reg::Rbx, Reg::Rax);
+
+        const THREAD_STACK_SIZE: i32 = 2 * 1024 * 1024;
+        const CLONE_FLAGS: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x4_0000;
+        const JOIN_SPIN_BUDGET: u64 = 100_000_000;
+
+        let done = self.asm.create_text_label();
+        let mmap_ok = self.asm.create_text_label();
+        let clone_ok = self.asm.create_text_label();
+        let child_label = self.asm.create_text_label();
+
+        // Snapshot the main thread's starting shadow-stack top so the
+        // parent's "did I return to baseline" check below doesn't assume
+        // it started at 0 -- whatever enclosing scope called this
+        // builtin may already have live shadow-stack entries of its own.
+        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack_top);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm
+            .mov_data_addr(Reg::R10, self.shadow_test_main_start);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        // Reset the join flag in case this builtin ever runs more than
+        // once in the same process (each generated binary today only
+        // calls it once, but this is one instruction of defensive
+        // correctness against that assumption changing).
+        self.asm
+            .mov_data_addr(Reg::R10, self.shadow_test_child_done);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+
+        // mmap a fresh stack for the child.
+        self.emit_syscall_number(PlatformSyscall::Mmap);
+        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.mov_imm64(Reg::Rsi, THREAD_STACK_SIZE as u64);
+        self.asm
+            .mov_imm64(Reg::Rdx, self.platform.mmap_prot_read_write());
+        self.asm
+            .mov_imm64(Reg::R10, self.platform.mmap_private_anonymous_flags());
+        self.asm
+            .mov_imm64(Reg::R8, self.platform.mmap_anonymous_fd());
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.syscall();
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::GreaterEqual, mmap_ok);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(mmap_ok);
+
+        // r11 = child stack top; rax still holds the mmap'd base.
+        self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
+        self.asm.add_reg_imm32(Reg::R11, THREAD_STACK_SIZE);
+
+        // Register this child's stack range *before* cloning, so its
+        // very first shadow-stack push/pop already finds its own slot
+        // instead of falling through to the main thread's. Only the
+        // (single, synchronous) spawning thread ever writes this table
+        // -- see the `cloned_thread_count` field doc comment.
+        self.asm.mov_data_addr(Reg::R9, self.cloned_thread_count);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R9, 0);
+        self.asm.mov_data_addr(Reg::R8, self.cloned_thread_ranges);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R10);
+        self.asm.shl_reg_imm8(Reg::Rcx, 4);
+        self.asm.add_reg_reg(Reg::R8, Reg::Rcx);
+        self.asm.store_ptr_disp32(Reg::R8, 0, Reg::Rax); // base
+        self.asm.store_ptr_disp32(Reg::R8, 8, Reg::R11); // end
+        self.asm.add_reg_imm32(Reg::R10, 1);
+        self.asm.store_ptr_disp32(Reg::R9, 0, Reg::R10);
+
+        self.emit_syscall_number(PlatformSyscall::Clone);
+        self.asm.mov_imm64(Reg::Rdi, CLONE_FLAGS);
+        self.asm.mov_reg_reg(Reg::Rsi, Reg::R11);
+        self.asm.mov_imm64(Reg::Rdx, 0);
+        self.asm.mov_imm64(Reg::R10, 0);
+        self.asm.mov_imm64(Reg::R8, 0);
+        self.asm.syscall();
+
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, child_label);
+
+        // ---- parent path ----
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Greater, clone_ok);
+        self.asm.mov_imm64(Reg::Rax, (-2i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(clone_ok);
+
+        // Temporary frame on the parent's own (already-established)
+        // stack, purely to give emit_gc_shadow_push a valid rbp-relative
+        // slot address to compute -- its contents are never read, since
+        // this test only exercises the push/pop *bookkeeping*, not
+        // marking a real pointer.
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 16);
+        let parent_loop = self.asm.create_text_label();
+        let parent_loop_done = self.asm.create_text_label();
+        self.asm.bind_text_label(parent_loop);
+        self.asm.test_reg_reg(Reg::Rbx, Reg::Rbx);
+        self.asm.jcc_label(Condition::Equal, parent_loop_done);
+        self.emit_gc_shadow_push(8);
+        self.emit_gc_shadow_pop_n(1);
+        self.asm.sub_reg_imm32(Reg::Rbx, 1);
+        self.asm.jmp_label(parent_loop);
+        self.asm.bind_text_label(parent_loop_done);
+        self.asm.add_reg_imm32(Reg::Rsp, 16);
+        self.asm.pop_reg(Reg::Rbp);
+
+        let spin_top = self.asm.create_text_label();
+        let spin_done = self.asm.create_text_label();
+        let spin_timeout = self.asm.create_text_label();
+        self.asm.mov_imm64(Reg::Rcx, JOIN_SPIN_BUDGET);
+        self.asm.bind_text_label(spin_top);
+        self.asm
+            .mov_data_addr(Reg::R10, self.shadow_test_child_done);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::NotEqual, spin_done);
+        self.asm.sub_reg_imm32(Reg::Rcx, 1);
+        self.asm.cmp_reg_imm8(Reg::Rcx, 0);
+        self.asm.jcc_label(Condition::Equal, spin_timeout);
+        self.asm.pause();
+        self.asm.jmp_label(spin_top);
+        self.asm.bind_text_label(spin_timeout);
+        self.asm.mov_imm64(Reg::Rax, (-3i64) as u64);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(spin_done);
+
+        // Both counters back at baseline? Main thread: compare against
+        // the snapshot taken before the loop. Child (slot 0, the only
+        // slot this test ever registers): compare against 0.
+        let mismatch = self.asm.create_text_label();
+        let checks_ok = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack_top);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm
+            .mov_data_addr(Reg::R10, self.shadow_test_main_start);
+        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::NotEqual, mismatch);
+        self.asm
+            .mov_data_addr(Reg::R10, self.cloned_thread_shadow_top);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::NotEqual, mismatch);
+        self.asm.jmp_label(checks_ok);
+        self.asm.bind_text_label(mismatch);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(checks_ok);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.jmp_label(done);
+
+        // ---- child path ----
+        self.asm.bind_text_label(child_label);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.asm.sub_reg_imm8(Reg::Rsp, 16);
+        let child_loop = self.asm.create_text_label();
+        let child_loop_done = self.asm.create_text_label();
+        self.asm.bind_text_label(child_loop);
+        self.asm.test_reg_reg(Reg::Rbx, Reg::Rbx);
+        self.asm.jcc_label(Condition::Equal, child_loop_done);
+        self.emit_gc_shadow_push(8);
+        self.emit_gc_shadow_pop_n(1);
+        self.asm.sub_reg_imm32(Reg::Rbx, 1);
+        self.asm.jmp_label(child_loop);
+        self.asm.bind_text_label(child_loop_done);
+        self.asm.add_reg_imm32(Reg::Rsp, 16);
+        self.asm.pop_reg(Reg::Rbp);
+        self.asm
+            .mov_data_addr(Reg::R10, self.shadow_test_child_done);
         self.asm.mov_imm64(Reg::Rcx, 1);
         self.asm.lock_xadd_mem_disp32_reg(Reg::R10, 0, Reg::Rcx);
         self.emit_syscall_number(PlatformSyscall::Exit);
@@ -38908,6 +39189,21 @@ impl NativeCodeGenerator {
     // abort. The tables are zero-filled .data, so growing them grows
     // every emitted binary — keep proportionate.
     const GC_SHADOW_STACK_LEN: usize = 32768;
+    /// How many `clone()`-spawned threads can register their own shadow
+    /// sub-stack (see docs/superpowers/specs/2026-07-24-precise-
+    /// concurrent-gc-design.md, phase 4). The *main* thread never
+    /// occupies a slot here -- it keeps using `gc_shadow_stack`/
+    /// `gc_shadow_stack_top` exactly as before this phase, unconditionally
+    /// and unchanged, so single-threaded programs (the overwhelming
+    /// majority) take the exact same code path as always. A slot is only
+    /// consulted for a thread whose current `rsp` falls inside a
+    /// registered range.
+    const MAX_CLONED_THREADS: usize = 4;
+    /// Shadow-stack depth available to each *individual* cloned thread.
+    /// Deliberately smaller than the main thread's `GC_SHADOW_STACK_LEN`
+    /// -- this phase proves the routing and bookkeeping are race-free,
+    /// not that it scales to deep recursion on a spawned thread.
+    const CLONED_THREAD_SHADOW_LEN: usize = 4096;
     const GC_MAX_PAYLOAD_SIZE: u64 = i64::MAX as u64 - 31 - 4095;
     const GC_MAX_STRING_ALLOC_SIZE: u64 = Self::GC_MAX_PAYLOAD_SIZE - 15;
     const GC_MAX_POINTER_SLOT_COUNT: u64 = Self::GC_MAX_PAYLOAD_SIZE / 8;
@@ -39981,19 +40277,112 @@ impl NativeCodeGenerator {
     /// onto the GC shadow stack. Preserves rax across the operation so
     /// callers can use this immediately after computing a heap pointer
     /// without an extra spill.
+    /// Scans `cloned_thread_ranges` for an entry containing `rcx` (the
+    /// caller's current `rsp`, captured by the caller before invoking
+    /// this shared block) and leaves the effective shadow-stack top
+    /// counter address in `r10` for the caller to use. `emit_gc_shadow_push`
+    /// additionally needs the storage array's base address (`r8`) and
+    /// its capacity (left in the return via a second emission below);
+    /// `emit_gc_shadow_pop_n` only needs `r10`. Both callers get the
+    /// *exact* pre-phase-4 behavior (global `gc_shadow_stack`/
+    /// `gc_shadow_stack_top`, unconditionally) whenever `rcx` matches no
+    /// registered cloned-thread range -- i.e. always, for every
+    /// single-threaded program, and for the main thread in every
+    /// multi-threaded one. Clobbers rax/rcx/r8/r9/r10 (already the
+    /// existing clobber contract of both callers).
+    ///
+    /// This function only emits the *scan*; each caller binds its own
+    /// `use_main`/`found` labels around a call to
+    /// `emit_gc_thread_local_shadow_slot_body` so the two can lay out
+    /// slightly different follow-up code (push additionally needs the
+    /// storage base and capacity; pop needs only the counter address).
+    fn emit_gc_thread_local_shadow_slot_scan(&mut self, use_main: TextLabel, found: TextLabel) {
+        let scan_loop = self.asm.create_text_label();
+        let scan_next = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R9, self.cloned_thread_count);
+        self.asm.load_ptr_disp32(Reg::R9, Reg::R9, 0);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.bind_text_label(scan_loop);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::R9);
+        self.asm.jcc_label(Condition::GreaterEqual, use_main);
+        self.asm.mov_data_addr(Reg::R8, self.cloned_thread_ranges);
+        self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::R10, 4); // i * 16 (two i64s per entry)
+        self.asm.add_reg_reg(Reg::R8, Reg::R10);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R8, 0); // range base
+        self.asm.cmp_reg_reg(Reg::Rcx, Reg::R10);
+        self.asm.jcc_label(Condition::Below, scan_next);
+        self.asm.load_ptr_disp32(Reg::R10, Reg::R8, 8); // range end
+        self.asm.cmp_reg_reg(Reg::Rcx, Reg::R10);
+        self.asm.jcc_label(Condition::AboveOrEqual, scan_next);
+        self.asm.jmp_label(found); // rax = matching slot index
+        self.asm.bind_text_label(scan_next);
+        self.asm.add_reg_imm32(Reg::Rax, 1);
+        self.asm.jmp_label(scan_loop);
+    }
+
     fn emit_gc_shadow_push(&mut self, rbp_offset: i32) {
         let overflow = self.asm.create_text_label();
         let success = self.asm.create_text_label();
+        let use_main = self.asm.create_text_label();
+        let found = self.asm.create_text_label();
+        let have_slot = self.asm.create_text_label();
         // Save rax — most callers have the just-computed heap pointer in
         // it and need to store it into the new slot after this returns.
         self.asm.push_reg(Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+
+        // Which shadow stack does the calling thread use? rcx = its rsp
+        // (constant for the rest of this function; nothing below pushes
+        // or pops before `success`). See emit_gc_thread_local_shadow_slot_scan.
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rsp);
+        self.emit_gc_thread_local_shadow_slot_scan(use_main, found);
+
+        self.asm.bind_text_label(found);
+        // rax = matching cloned-thread slot index. r10 = &top[slot]; r8 =
+        // storage base for slot (a plain inline `.data` array -- unlike
+        // gc_shadow_stack below, no separate mmap'd region to dereference
+        // through). rcx = this slot's capacity, for the shared bounds
+        // check just below `have_slot`.
         self.asm
-            .cmp_reg_imm32(Reg::Rax, Self::GC_SHADOW_STACK_LEN as i32);
-        self.asm.jcc_label(Condition::AboveOrEqual, overflow);
+            .mov_data_addr(Reg::R10, self.cloned_thread_shadow_top);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::R9, 3);
+        self.asm.add_reg_reg(Reg::R10, Reg::R9);
+        self.asm
+            .mov_data_addr(Reg::R8, self.cloned_thread_shadow_storage);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
+        // slot * CLONED_THREAD_SHADOW_LEN * 8 bytes/i64; LEN is a power
+        // of two (4096) so this is a shift, not a multiply.
+        debug_assert_eq!(
+            Self::CLONED_THREAD_SHADOW_LEN.count_ones(),
+            1,
+            "CLONED_THREAD_SHADOW_LEN must stay a power of two for this shift"
+        );
+        self.asm.shl_reg_imm8(
+            Reg::R9,
+            Self::CLONED_THREAD_SHADOW_LEN.trailing_zeros() as u8 + 3,
+        );
+        self.asm.add_reg_reg(Reg::R8, Reg::R9);
+        self.asm
+            .mov_imm64(Reg::Rcx, Self::CLONED_THREAD_SHADOW_LEN as u64);
+        self.asm.jmp_label(have_slot);
+
+        self.asm.bind_text_label(use_main);
+        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack_top);
         self.asm.mov_data_addr(Reg::R8, self.gc_shadow_stack);
         self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
+        self.asm
+            .mov_imm64(Reg::Rcx, Self::GC_SHADOW_STACK_LEN as u64);
+
+        self.asm.bind_text_label(have_slot);
+        // r10 = &top counter, r8 = storage base, rcx = capacity for
+        // whichever stack was selected above. Unchanged from before
+        // phase 4 except that r8/r10/the capacity now come from the
+        // branch above instead of being hardcoded to the main thread's
+        // cells.
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::AboveOrEqual, overflow);
         self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
         self.asm.shl_reg_imm8(Reg::R9, 3);
         self.asm.add_reg_reg(Reg::R8, Reg::R9);
@@ -40021,8 +40410,26 @@ impl NativeCodeGenerator {
         if count == 0 {
             return;
         }
+        let use_main = self.asm.create_text_label();
+        let found = self.asm.create_text_label();
+        let have_top = self.asm.create_text_label();
+
         self.asm.push_reg(Reg::Rax);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rsp);
+        self.emit_gc_thread_local_shadow_slot_scan(use_main, found);
+
+        self.asm.bind_text_label(found);
+        self.asm
+            .mov_data_addr(Reg::R10, self.cloned_thread_shadow_top);
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
+        self.asm.shl_reg_imm8(Reg::R9, 3);
+        self.asm.add_reg_reg(Reg::R10, Reg::R9);
+        self.asm.jmp_label(have_top);
+
+        self.asm.bind_text_label(use_main);
         self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack_top);
+
+        self.asm.bind_text_label(have_top);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
         self.asm.sub_reg_imm32(Reg::Rax, count as i32);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
