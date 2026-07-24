@@ -3986,11 +3986,15 @@ pub(crate) fn emit_macho_program(
     }
 
     emitter.asm.finish();
+    // No writable data segment yet: the GC's __bss cells arrive with the
+    // data-label machinery (M3) and the GC runtime wiring (M5). Until
+    // then pass 0 so the image is byte-for-byte the pre-GC layout.
     Ok(macho::write_executable(
         emitter.asm.code,
         emitter.asm.rodata,
         &emitter.asm.fixups,
         "klassic",
+        0,
     ))
 }
 
