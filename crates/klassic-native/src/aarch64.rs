@@ -4295,6 +4295,476 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
 /// Compile the whole program to a signed Mach-O arm64 executable.
 /// `lowered_enums` names the enums `desugar_enums` already lowered to
 /// `__gc_record` shape.
+/// Every data cell, diagnostic string, and subroutine label the portable
+/// ZGC needs, reserved in one pass and threaded into the `emit_gc_*`
+/// calls. Mirrors the x86-64 backend's GC field set (lib.rs) one-to-one.
+/// The single-qword cells and the three 512-entry region arrays live in
+/// `__DATA,__bss`; the diagnostic strings live in read-only `__const`.
+struct GcState {
+    heap_base: PortDataAddr,
+    heap_top: PortDataAddr,
+    heap_end: PortDataAddr,
+    free_region_head: PortDataAddr,
+    mark_worklist: PortDataAddr,
+    mark_worklist_top: PortDataAddr,
+    shadow_stack: PortDataAddr,
+    shadow_stack_top: PortDataAddr,
+    region_base: PortDataAddr,
+    committed_count: PortDataAddr,
+    budget_regions: PortDataAddr,
+    phase: PortDataAddr,
+    good_color: PortDataAddr,
+    bad_mask: PortDataAddr,
+    bytes_since_cycle: PortDataAddr,
+    bytes_since_quantum: PortDataAddr,
+    stw_fallback_pending: PortDataAddr,
+    stw_fallbacks: PortDataAddr,
+    header_mark: PortDataAddr,
+    mark_color: PortDataAddr,
+    evac_region_base: PortDataAddr,
+    evac_top: PortDataAddr,
+    evac_end: PortDataAddr,
+    reloc_scan_idx: PortDataAddr,
+    reloc_block: PortDataAddr,
+    relocated_count: PortDataAddr,
+    collect_counter: PortDataAddr,
+    alloc_count: PortDataAddr,
+    bytes_allocated: PortDataAddr,
+    pause_max_ns: PortDataAddr,
+    pause_total_ns: PortDataAddr,
+    pause_start_ns: PortDataAddr,
+    region_top: PortDataAddr,
+    region_live: PortDataAddr,
+    region_fromspace: PortDataAddr,
+    oom: (PortDataAddr, usize),
+    worklist_overflow: (PortDataAddr, usize),
+    bounds_error_text: (PortDataAddr, usize),
+    evac_exhausted: (PortDataAddr, usize),
+    evac_oversized: (PortDataAddr, usize),
+    l_alloc: Label,
+    l_collect: Label,
+    l_mark_roots: Label,
+    l_trace: Label,
+    l_sweep: Label,
+    l_clear_all_marks: Label,
+    l_stw_mark_complete: Label,
+    l_drain: Label,
+    l_evacuate: Label,
+    l_acquire_evac_region: Label,
+    l_relocate_start: Label,
+    l_relocate_quantum: Label,
+    l_relocate_finish: Label,
+    l_free_ghost_regions: Label,
+    l_relocate_fix_roots: Label,
+    l_mark_start: Label,
+    l_mark_end: Label,
+    l_mark_visit: Label,
+    l_deep_equal: Label,
+    l_load_barrier_slow: Label,
+    l_acquire_region: Label,
+    l_alloc_large: Label,
+    l_grow_budget: Label,
+    l_bounds_error: Label,
+}
+
+impl Emitter {
+    /// Reserve all GC cells (single qwords + the three region arrays) in
+    /// `__DATA,__bss`, intern the diagnostic strings, and create the
+    /// subroutine labels.
+    fn reserve_gc_state(&mut self) -> GcState {
+        const REGIONS: usize = crate::gc_layout::GC_RESERVE_REGIONS as usize;
+        let mut cell = || PortDataAddr::Bss(self.asm.reserve_data_cells(1));
+        let heap_base = cell();
+        let heap_top = cell();
+        let heap_end = cell();
+        let free_region_head = cell();
+        let mark_worklist = cell();
+        let mark_worklist_top = cell();
+        let shadow_stack = cell();
+        let shadow_stack_top = cell();
+        let region_base = cell();
+        let committed_count = cell();
+        let budget_regions = cell();
+        let phase = cell();
+        let good_color = cell();
+        let bad_mask = cell();
+        let bytes_since_cycle = cell();
+        let bytes_since_quantum = cell();
+        let stw_fallback_pending = cell();
+        let stw_fallbacks = cell();
+        let header_mark = cell();
+        let mark_color = cell();
+        let evac_region_base = cell();
+        let evac_top = cell();
+        let evac_end = cell();
+        let reloc_scan_idx = cell();
+        let reloc_block = cell();
+        let relocated_count = cell();
+        let collect_counter = cell();
+        let alloc_count = cell();
+        let bytes_allocated = cell();
+        let pause_max_ns = cell();
+        let pause_total_ns = cell();
+        let pause_start_ns = cell();
+        let region_top = PortDataAddr::Bss(self.asm.reserve_data_cells(REGIONS));
+        let region_live = PortDataAddr::Bss(self.asm.reserve_data_cells(REGIONS));
+        let region_fromspace = PortDataAddr::Bss(self.asm.reserve_data_cells(REGIONS));
+
+        let mut string = |bytes: &[u8]| {
+            (
+                PortDataAddr::Rodata(self.asm.intern_rodata(bytes)),
+                bytes.len(),
+            )
+        };
+        let oom = string(b"klassic gc: out of memory\n");
+        let worklist_overflow = string(b"klassic gc: mark worklist overflow\n");
+        let bounds_error_text = string(b"klassic gc: index out of bounds\n");
+        let evac_exhausted = string(b"klassic gc: evacuation exhausted the heap reservation\n");
+        let evac_oversized = string(b"klassic gc: evacuation object exceeds a region\n");
+
+        GcState {
+            heap_base,
+            heap_top,
+            heap_end,
+            free_region_head,
+            mark_worklist,
+            mark_worklist_top,
+            shadow_stack,
+            shadow_stack_top,
+            region_base,
+            committed_count,
+            budget_regions,
+            phase,
+            good_color,
+            bad_mask,
+            bytes_since_cycle,
+            bytes_since_quantum,
+            stw_fallback_pending,
+            stw_fallbacks,
+            header_mark,
+            mark_color,
+            evac_region_base,
+            evac_top,
+            evac_end,
+            reloc_scan_idx,
+            reloc_block,
+            relocated_count,
+            collect_counter,
+            alloc_count,
+            bytes_allocated,
+            pause_max_ns,
+            pause_total_ns,
+            pause_start_ns,
+            region_top,
+            region_live,
+            region_fromspace,
+            oom,
+            worklist_overflow,
+            bounds_error_text,
+            evac_exhausted,
+            evac_oversized,
+            l_alloc: self.asm.new_label(),
+            l_collect: self.asm.new_label(),
+            l_mark_roots: self.asm.new_label(),
+            l_trace: self.asm.new_label(),
+            l_sweep: self.asm.new_label(),
+            l_clear_all_marks: self.asm.new_label(),
+            l_stw_mark_complete: self.asm.new_label(),
+            l_drain: self.asm.new_label(),
+            l_evacuate: self.asm.new_label(),
+            l_acquire_evac_region: self.asm.new_label(),
+            l_relocate_start: self.asm.new_label(),
+            l_relocate_quantum: self.asm.new_label(),
+            l_relocate_finish: self.asm.new_label(),
+            l_free_ghost_regions: self.asm.new_label(),
+            l_relocate_fix_roots: self.asm.new_label(),
+            l_mark_start: self.asm.new_label(),
+            l_mark_end: self.asm.new_label(),
+            l_mark_visit: self.asm.new_label(),
+            l_deep_equal: self.asm.new_label(),
+            l_load_barrier_slow: self.asm.new_label(),
+            l_acquire_region: self.asm.new_label(),
+            l_alloc_large: self.asm.new_label(),
+            l_grow_budget: self.asm.new_label(),
+            l_bounds_error: self.asm.new_label(),
+        }
+    }
+
+    /// Emit all 24 portable GC runtime routines into the code buffer.
+    /// M5: evacuation is off (non-moving) and pause timing is disabled
+    /// (`plat_read_monotonic_ns` is a stub); the `--gc-log`/`--gc-stress`
+    /// flags are threaded in at go-live (M7). Emitted after the program
+    /// body and its exit, so the routines are reachable only once the
+    /// mutator calls `gc_alloc` (M7) -- dead but linked until then.
+    fn emit_gc_runtime(&mut self, gc: &GcState) {
+        use portable_asm as pa;
+        let asm = &mut self.asm;
+        let evac_off = true;
+        let poison = false;
+        let timing = false;
+        let stderr_fd = 2u64;
+        let tables = pa::RegionTables {
+            heap_base: gc.heap_base,
+            heap_top: gc.heap_top,
+            region_base: gc.region_base,
+            region_top: gc.region_top,
+            committed_count: gc.committed_count,
+            region_fromspace: gc.region_fromspace,
+        };
+        let pause = pa::PauseCells {
+            start_ns: gc.pause_start_ns,
+            total_ns: gc.pause_total_ns,
+            max_ns: gc.pause_max_ns,
+        };
+
+        pa::emit_gc_mark_visit(
+            asm,
+            gc.l_mark_visit,
+            pa::MarkWorklist {
+                header_mark: gc.header_mark,
+                worklist: gc.mark_worklist,
+                worklist_top: gc.mark_worklist_top,
+                stw_fallback_pending: gc.stw_fallback_pending,
+            },
+        );
+        pa::emit_gc_deep_equal(asm, gc.l_deep_equal);
+        pa::emit_gc_load_barrier_slow(
+            asm,
+            gc.l_load_barrier_slow,
+            gc.phase,
+            gc.region_base,
+            gc.region_fromspace,
+            gc.l_evacuate,
+            gc.l_mark_visit,
+        );
+        pa::emit_gc_alloc(
+            asm,
+            gc.l_alloc,
+            pa::AllocCells {
+                phase: gc.phase,
+                bytes_since_cycle: gc.bytes_since_cycle,
+                budget_regions: gc.budget_regions,
+                bytes_since_quantum: gc.bytes_since_quantum,
+                mark_worklist_top: gc.mark_worklist_top,
+                header_mark: gc.header_mark,
+                alloc_count: gc.alloc_count,
+                bytes_allocated: gc.bytes_allocated,
+                heap_top: gc.heap_top,
+                heap_end: gc.heap_end,
+                oom_text: gc.oom.0,
+            },
+            pa::AllocTargets {
+                mark_start: gc.l_mark_start,
+                trace: gc.l_trace,
+                mark_end: gc.l_mark_end,
+                relocate_quantum: gc.l_relocate_quantum,
+                collect: gc.l_collect,
+                grow_budget: gc.l_grow_budget,
+                acquire_region: gc.l_acquire_region,
+                alloc_large: gc.l_alloc_large,
+            },
+            pa::AllocFlags {
+                stress: false,
+                log: false,
+            },
+            gc.oom.1,
+            stderr_fd,
+        );
+        pa::emit_gc_collect(
+            asm,
+            gc.l_collect,
+            timing,
+            pause,
+            gc.phase,
+            pa::CollectTargets {
+                stw_mark_complete: gc.l_stw_mark_complete,
+                free_ghost_regions: gc.l_free_ghost_regions,
+                sweep: gc.l_sweep,
+                relocate_quantum: gc.l_relocate_quantum,
+                mark_end: gc.l_mark_end,
+            },
+        );
+        pa::emit_gc_mark_roots(
+            asm,
+            gc.l_mark_roots,
+            gc.shadow_stack,
+            gc.shadow_stack_top,
+            gc.l_mark_visit,
+        );
+        pa::emit_gc_trace(
+            asm,
+            gc.l_trace,
+            gc.mark_worklist_top,
+            gc.mark_worklist,
+            gc.l_mark_visit,
+        );
+        pa::emit_gc_sweep(
+            asm,
+            gc.l_sweep,
+            tables,
+            gc.collect_counter,
+            gc.free_region_head,
+            gc.header_mark,
+            gc.region_live,
+        );
+        pa::emit_gc_clear_all_marks(asm, gc.l_clear_all_marks, tables);
+        pa::emit_gc_stw_mark_complete(
+            asm,
+            gc.l_stw_mark_complete,
+            pa::StwMarkTargets {
+                clear_all_marks: gc.l_clear_all_marks,
+                mark_roots: gc.l_mark_roots,
+                drain: gc.l_drain,
+            },
+            gc.stw_fallback_pending,
+            gc.mark_worklist_top,
+            gc.worklist_overflow.0,
+            gc.worklist_overflow.1,
+        );
+        pa::emit_gc_drain(asm, gc.l_drain, gc.l_trace, gc.mark_worklist_top);
+        pa::emit_gc_evacuate(
+            asm,
+            gc.l_evacuate,
+            pa::EvacBumpCells {
+                evac_top: gc.evac_top,
+                evac_end: gc.evac_end,
+                relocated_count: gc.relocated_count,
+            },
+            gc.l_acquire_evac_region,
+            gc.evac_oversized.0,
+            gc.evac_oversized.1,
+            stderr_fd,
+        );
+        pa::emit_gc_acquire_evac_region(
+            asm,
+            gc.l_acquire_evac_region,
+            pa::EvacRegionCells {
+                evac_region_base: gc.evac_region_base,
+                evac_top: gc.evac_top,
+                evac_end: gc.evac_end,
+                region_base: gc.region_base,
+                region_top: gc.region_top,
+                committed_count: gc.committed_count,
+                free_region_head: gc.free_region_head,
+            },
+            gc.evac_exhausted.0,
+            gc.evac_exhausted.1,
+            stderr_fd,
+        );
+        pa::emit_gc_relocate_start(
+            asm,
+            gc.l_relocate_start,
+            pa::RelocateStartCells {
+                good_color: gc.good_color,
+                bad_mask: gc.bad_mask,
+                free_region_head: gc.free_region_head,
+                budget_regions: gc.budget_regions,
+                committed_count: gc.committed_count,
+                heap_base: gc.heap_base,
+                region_base: gc.region_base,
+                region_top: gc.region_top,
+                region_live: gc.region_live,
+                region_fromspace: gc.region_fromspace,
+                evac_region_base: gc.evac_region_base,
+                evac_top: gc.evac_top,
+                evac_end: gc.evac_end,
+                reloc_scan_idx: gc.reloc_scan_idx,
+                reloc_block: gc.reloc_block,
+                bytes_since_quantum: gc.bytes_since_quantum,
+                phase: gc.phase,
+                bytes_since_cycle: gc.bytes_since_cycle,
+            },
+            gc.l_relocate_fix_roots,
+            evac_off,
+            poison,
+        );
+        pa::emit_gc_relocate_quantum(
+            asm,
+            gc.l_relocate_quantum,
+            tables,
+            pa::RelocQuantumCells {
+                reloc_scan_idx: gc.reloc_scan_idx,
+                reloc_block: gc.reloc_block,
+                header_mark: gc.header_mark,
+            },
+            gc.l_evacuate,
+            gc.l_relocate_finish,
+        );
+        pa::emit_gc_relocate_finish(
+            asm,
+            gc.l_relocate_finish,
+            tables,
+            gc.evac_region_base,
+            gc.evac_top,
+            gc.phase,
+            gc.bytes_since_cycle,
+        );
+        pa::emit_gc_free_ghost_regions(
+            asm,
+            gc.l_free_ghost_regions,
+            tables,
+            gc.free_region_head,
+            gc.region_live,
+        );
+        pa::emit_gc_relocate_fix_roots(
+            asm,
+            gc.l_relocate_fix_roots,
+            gc.shadow_stack,
+            gc.shadow_stack_top,
+            gc.region_base,
+            gc.region_fromspace,
+            gc.l_evacuate,
+        );
+        pa::emit_gc_mark_start(
+            asm,
+            gc.l_mark_start,
+            timing,
+            pause,
+            pa::MarkStartCells {
+                header_mark: gc.header_mark,
+                good_color: gc.good_color,
+                bad_mask: gc.bad_mask,
+                mark_color: gc.mark_color,
+                worklist_top: gc.mark_worklist_top,
+                phase: gc.phase,
+            },
+            gc.l_mark_roots,
+            pa::MarkColorMode { evac_off, poison },
+        );
+        pa::emit_gc_mark_end(
+            asm,
+            gc.l_mark_end,
+            timing,
+            pause,
+            pa::MarkEndTargets {
+                drain: gc.l_drain,
+                stw_mark_complete: gc.l_stw_mark_complete,
+                free_ghost_regions: gc.l_free_ghost_regions,
+                sweep: gc.l_sweep,
+                relocate_start: gc.l_relocate_start,
+            },
+            gc.stw_fallback_pending,
+            gc.stw_fallbacks,
+        );
+        pa::emit_gc_acquire_region(
+            asm,
+            gc.l_acquire_region,
+            tables,
+            gc.free_region_head,
+            gc.budget_regions,
+            gc.heap_end,
+        );
+        pa::emit_gc_alloc_large(asm, gc.l_alloc_large, tables, gc.budget_regions);
+        pa::emit_gc_grow_budget(asm, gc.l_grow_budget, gc.committed_count, gc.budget_regions);
+        pa::emit_gc_bounds_error(
+            asm,
+            gc.l_bounds_error,
+            gc.bounds_error_text.0,
+            gc.bounds_error_text.1,
+        );
+    }
+}
+
 pub(crate) fn emit_macho_program(
     expr: &Expr,
     lowered_enums: std::collections::HashSet<String>,
@@ -4354,6 +4824,16 @@ pub(crate) fn emit_macho_program(
     if let Some(label) = emitter.heap_grow_label {
         emitter.emit_heap_grow_routine(label);
     }
+
+    // M5: reserve the GC's __DATA,__bss cells and emit all 24 portable
+    // ZGC runtime routines after the program's exit. Nothing calls
+    // gc_alloc yet (the bump allocator is still live), so this is dead
+    // but linked -- it exercises the __DATA segment, the data fixups, and
+    // the whole PortableAsm lowering end-to-end, and must encode validly.
+    // The go-live (M7) routes the mutator through gc_alloc and adds the
+    // startup mmap/colour seeding.
+    let gc = emitter.reserve_gc_state();
+    emitter.emit_gc_runtime(&gc);
 
     emitter.asm.finish();
     // `bss_len` is 0 for every program today (no codegen reserves GC
