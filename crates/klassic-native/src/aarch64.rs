@@ -1432,6 +1432,11 @@ impl Emitter {
                     if *elem.get_or_insert(this_elem) != this_elem {
                         return Err(unsupported(*span, "mixed list element types"));
                     }
+                    // Box a scalar element so the cons cell's head slot is
+                    // a pointer (string/list/record heads already are).
+                    if is_boxed_scalar(ty) {
+                        self.emit_box_scalar();
+                    }
                     self.asm.push(Reg::X0);
                 }
                 self.asm.mov_imm64(Reg::X0, 0); // nil
@@ -1548,6 +1553,10 @@ impl Emitter {
                             "a list element of this type",
                         ));
                     };
+                    // Box a scalar head so the cons cell holds a pointer.
+                    if is_boxed_scalar(head_ty) {
+                        self.emit_box_scalar();
+                    }
                     self.asm.push(Reg::X0);
                     let tail_ty = self.expression(&arguments[0])?;
                     if !assignable(tail_ty, ValueType::List(elem)) {
@@ -3064,13 +3073,22 @@ impl Emitter {
 
     /// Prepend a cons cell: head value on top of the machine stack,
     /// tail pointer in x0 → fresh cell pointer in x0.
+    ///
+    /// M6: a GC-shaped `POINTER_RECORD` with two pointer slots
+    /// `[head][next]`. The head on the stack is already a pointer -- a
+    /// scalar head was boxed by the caller, a string/list/record head is
+    /// a pointer already -- and `next` in x0 is a cell pointer or 0
+    /// (nil), so the collector can trace both slots uniformly. The
+    /// 16-byte header shifts the user pointer to block + 16, but the head
+    /// and next still live at `[cell + 0]`/`[cell + 8]`, so every list
+    /// read keeps the same offsets.
     fn emit_cons_cell(&mut self) {
-        self.asm.mov_imm64(Reg::X4, 16);
-        self.emit_alloc();
+        self.asm.push(Reg::X0); // preserve `next` across the alloc
+        self.emit_gc_alloc_object(2, crate::gc_layout::GC_TYPE_POINTER_RECORD); // x0 = user ptr
         self.asm.pop(Reg::X1);
-        self.asm.str_imm(Reg::X1, Reg::X5, 0);
-        self.asm.str_imm(Reg::X0, Reg::X5, 8);
-        self.asm.mov_reg(Reg::X0, Reg::X5);
+        self.asm.str_imm(Reg::X1, Reg::X0, 8); // [cell + 8] = next
+        self.asm.pop(Reg::X1);
+        self.asm.str_imm(Reg::X1, Reg::X0, 0); // [cell + 0] = head
     }
 
     /// Get/create the lazily-emitted membership-scan routine label for
@@ -3131,9 +3149,14 @@ impl Emitter {
             self.asm.branch(member, BranchKind::Link);
             let skip = self.asm.new_label();
             self.asm.branch(skip, BranchKind::CompareNonZero(Reg::X0));
-            // Absent: prepend the candidate to the accumulator.
+            // Absent: prepend the candidate to the accumulator. Box a
+            // scalar candidate so the cons cell's head slot is a pointer.
             self.asm.pop(Reg::X1);
-            self.asm.push(Reg::X1); // head for emit_cons_cell
+            self.asm.mov_reg(Reg::X0, Reg::X1);
+            if is_boxed_scalar(elem_value_type(this)) {
+                self.emit_box_scalar();
+            }
+            self.asm.push(Reg::X0); // head for emit_cons_cell
             self.asm.load_local(Reg::X0, acc);
             self.emit_cons_cell();
             self.asm.store_local(Reg::X0, acc);
@@ -3166,6 +3189,11 @@ impl Emitter {
         self.asm.pop(Reg::X3);
         self.asm.push(Reg::X3);
         self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        // Scalar elements are boxed in the cell; unbox before printing
+        // (string elements are already the pointer).
+        if is_boxed_scalar(elem_value_type(elem)) {
+            self.emit_unbox_scalar();
+        }
         self.emit_print_elem(elem);
         self.asm.pop(Reg::X3);
         self.asm.ldr_imm(Reg::X3, Reg::X3, 8);
@@ -3188,7 +3216,8 @@ impl Emitter {
         let not_found = self.asm.new_label();
         self.asm.bind(loop_start);
         self.asm.branch(not_found, BranchKind::CompareZero(Reg::X2));
-        self.asm.ldr_imm(Reg::X3, Reg::X2, 0);
+        self.asm.ldr_imm(Reg::X3, Reg::X2, 0); // boxed element pointer
+        self.asm.ldr_imm(Reg::X3, Reg::X3, 0); // unbox to the raw scalar
         self.asm.cmp_reg(Reg::X3, Reg::X1);
         self.asm.branch(found, BranchKind::Conditional(Cond::Eq));
         self.asm.ldr_imm(Reg::X2, Reg::X2, 8);
@@ -3247,12 +3276,21 @@ impl Emitter {
         self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // head
         self.asm.ldr_imm(Reg::X0, Reg::X0, 8); // advance input
-        // Build [head][acc]; emit_alloc preserves x0-x5 across grow.
-        self.asm.mov_imm64(Reg::X4, 16);
-        self.emit_alloc();
-        self.asm.str_imm(Reg::X2, Reg::X5, 0); // head
-        self.asm.str_imm(Reg::X1, Reg::X5, 8); // next = acc
-        self.asm.mov_reg(Reg::X1, Reg::X5); // acc = new cell
+        // Build a GC-shaped [header][head][acc] cell. emit_alloc preserves
+        // x0-x5 across grow, so cursor (x0), acc (x1) and head (x2)
+        // survive; x3 is a free scratch. The head copied from the source
+        // cell is already boxed/a pointer, so it needs no re-boxing -- only
+        // the 16-byte header and POINTER_RECORD tag are added.
+        self.asm.mov_imm64(Reg::X4, 32);
+        self.emit_alloc(); // x5 = block base
+        self.asm.mov_imm64(Reg::X3, 32);
+        self.asm.str_imm(Reg::X3, Reg::X5, 0); // [block] = size|mark(0)
+        self.asm
+            .mov_imm64(Reg::X3, crate::gc_layout::GC_TYPE_POINTER_RECORD);
+        self.asm.str_imm(Reg::X3, Reg::X5, 8); // [block + 8] = type_tag
+        self.asm.str_imm(Reg::X2, Reg::X5, 16); // [cell + 0] = head
+        self.asm.str_imm(Reg::X1, Reg::X5, 24); // [cell + 8] = next = acc
+        self.asm.add_reg_imm(Reg::X1, Reg::X5, 16); // acc = user ptr
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(done);
         self.asm.mov_reg(Reg::X0, Reg::X1);
@@ -3342,6 +3380,11 @@ impl Emitter {
         self.asm.pop(Reg::X3);
         self.asm.push(Reg::X3);
         self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        // Scalar elements are boxed in the cell; unbox before printing
+        // (string elements are already the pointer).
+        if is_boxed_scalar(elem_value_type(elem)) {
+            self.emit_unbox_scalar();
+        }
         self.emit_print_elem(elem);
         self.asm.pop(Reg::X3);
         self.asm.ldr_imm(Reg::X3, Reg::X3, 8);
@@ -3594,6 +3637,11 @@ impl Emitter {
                 self.asm.emit_exit(1);
                 self.asm.bind(non_empty);
                 self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+                // Scalar heads are boxed in the cell; unbox before use
+                // (string/list/record heads are already the pointer).
+                if is_boxed_scalar(elem_value_type(elem)) {
+                    self.emit_unbox_scalar();
+                }
                 Ok(Some(elem_value_type(elem)))
             }
             ("tail", 1) => {
