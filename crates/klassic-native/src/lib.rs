@@ -489,6 +489,7 @@ pub fn compile_source_to_elf(
 
 #[allow(clippy::result_large_err)]
 mod cbackend;
+mod gc_layout;
 mod llvm;
 
 #[allow(clippy::result_large_err)]
@@ -36741,55 +36742,26 @@ impl NativeCodeGenerator {
         self.asm.ret();
     }
 
-    /// Region granularity for the region-based heap. Objects bump-allocate
-    /// within a region; whole dead regions are the unit of reclamation.
-    const GC_REGION_SIZE: u64 = 1 << 17; // 128 KiB
-    const GC_REGION_SHIFT: u8 = 17;
-    /// The heap is one up-front virtual reservation of this many regions
-    /// (64 MiB, matching the old segment cap). Linux demand-pages it, so
-    /// only touched regions cost physical memory; the soft budget below
-    /// bounds how many the mutator may touch before a collection.
-    const GC_RESERVE_REGIONS: u64 = 512;
-    const GC_RESERVE_BYTES: u64 = Self::GC_REGION_SIZE * Self::GC_RESERVE_REGIONS;
-    /// Initial soft budget: 8 regions = 1 MiB, preserving the collection
-    /// cadence of the old 1 MiB initial heap. Doubles on allocation stall,
-    /// capped at GC_RESERVE_REGIONS.
-    const GC_INITIAL_BUDGET_REGIONS: u64 = 8;
-    /// Total bytes for the single mmap backing the GC's runtime tables:
-    /// the shadow stack (the sole root source) and the mark worklist.
-    const GC_TABLES_BYTES: u64 =
-        ((Self::GC_SHADOW_STACK_LEN + Self::GC_MARK_WORKLIST_LEN) * 8) as u64;
-    // The mark worklist must hold the breadth-first frontier of the
-    // live object graph; deep recursion with per-frame heap values
-    // makes the live set proportional to recursion depth.
-    const GC_MARK_WORKLIST_LEN: usize = 262144;
-    /// Maximum number of stack-frame heap-pointer slots tracked at any
-    /// one time. Allocating a 33rd nested heap-pointer var beyond this
-    /// limit aborts with an explicit shadow-stack overflow message.
-    // Sized for deep recursion: every live frame of a function with
-    // heap-pointer parameters holds roots here. The GC tables are
-    // lazily-backed mmap (see the GC-table init), so a large cap
-    // reserves address space without committing pages until used;
-    // sized to comfortably exceed the frame count the C call stack can
-    // hold, so a deep recursion trips the stack-overflow probe (a
-    // clean diagnostic) before this cap, matching the evaluator.
-    const GC_SHADOW_STACK_LEN: usize = 262144;
-    const GC_MAX_PAYLOAD_SIZE: u64 = i64::MAX as u64 - 31 - 4095;
-    const GC_MAX_STRING_ALLOC_SIZE: u64 = Self::GC_MAX_PAYLOAD_SIZE - 15;
-    const GC_MAX_POINTER_SLOT_COUNT: u64 = Self::GC_MAX_PAYLOAD_SIZE / 8;
-    const GC_MAX_LIST_LENGTH: u64 = (Self::GC_MAX_PAYLOAD_SIZE - 8) / 8;
-    /// Type tag stored in the second header word. 0 marks a free block,
-    /// 1 marks a raw-bytes payload (no pointer fields), 2 marks a
-    /// "pointer record" whose payload is interpreted as a packed array
-    /// of heap pointers that the mark phase recurses into, and 3 marks a
-    /// variable-length pointer array (same tracing as a record).
-    const GC_TYPE_RAW_BYTES: u64 = 1;
-    const GC_TYPE_POINTER_RECORD: u64 = 2;
-    /// Heap-backed pointer list: payload is `[len: i64, ptr_0, ptr_1,
-    /// ...]`. The first qword is an integer length and must be skipped
-    /// by the mark phase; the remaining payload is a packed pointer
-    /// table identical to `GC_TYPE_POINTER_ARRAY` for tracing purposes.
-    const GC_TYPE_POINTER_LIST: u64 = 4;
+    // Region-heap GC design constants. The definitions and their prose
+    // live in the architecture-independent `gc_layout` module (the
+    // single non-x86-64 home for the collector's ABI); these associated
+    // aliases keep the `Self::GC_*` call sites throughout this file
+    // unchanged.
+    const GC_REGION_SIZE: u64 = crate::gc_layout::GC_REGION_SIZE;
+    const GC_REGION_SHIFT: u8 = crate::gc_layout::GC_REGION_SHIFT;
+    const GC_RESERVE_REGIONS: u64 = crate::gc_layout::GC_RESERVE_REGIONS;
+    const GC_RESERVE_BYTES: u64 = crate::gc_layout::GC_RESERVE_BYTES;
+    const GC_INITIAL_BUDGET_REGIONS: u64 = crate::gc_layout::GC_INITIAL_BUDGET_REGIONS;
+    const GC_TABLES_BYTES: u64 = crate::gc_layout::GC_TABLES_BYTES;
+    const GC_MARK_WORKLIST_LEN: usize = crate::gc_layout::GC_MARK_WORKLIST_LEN;
+    const GC_SHADOW_STACK_LEN: usize = crate::gc_layout::GC_SHADOW_STACK_LEN;
+    const GC_MAX_PAYLOAD_SIZE: u64 = crate::gc_layout::GC_MAX_PAYLOAD_SIZE;
+    const GC_MAX_STRING_ALLOC_SIZE: u64 = crate::gc_layout::GC_MAX_STRING_ALLOC_SIZE;
+    const GC_MAX_POINTER_SLOT_COUNT: u64 = crate::gc_layout::GC_MAX_POINTER_SLOT_COUNT;
+    const GC_MAX_LIST_LENGTH: u64 = crate::gc_layout::GC_MAX_LIST_LENGTH;
+    const GC_TYPE_RAW_BYTES: u64 = crate::gc_layout::GC_TYPE_RAW_BYTES;
+    const GC_TYPE_POINTER_RECORD: u64 = crate::gc_layout::GC_TYPE_POINTER_RECORD;
+    const GC_TYPE_POINTER_LIST: u64 = crate::gc_layout::GC_TYPE_POINTER_LIST;
 
     /// Initialize the GC heap: mmap a private anonymous region and seed the
     /// heap_base / heap_top / heap_end globals.
@@ -37907,41 +37879,25 @@ impl NativeCodeGenerator {
         self.emit_exit_code(1);
     }
 
-    /// ZGC colored-pointer bits (in bits 60-62; mmap addresses are <= 47
-    /// bits, so these are free, and any pointer with one set is
-    /// non-canonical -- dereferencing a colored pointer without stripping
-    /// faults, which is the barrier-coverage guarantee).
-    const GC_COLOR_M0: u64 = 1 << 60;
-    const GC_COLOR_M1: u64 = 1 << 61;
-    const GC_COLOR_R: u64 = 1 << 62;
-    const GC_COLOR_MASK: u64 = 7 << 60;
-    /// Strip mask: clears the color bits, leaving the raw address.
-    const GC_COLOR_STRIP: u64 = !Self::GC_COLOR_MASK;
-    /// Bad-color test mask: a good (M0) pointer ANDs to zero; a poisoned
-    /// (M1) or relocation-flagged (R) pointer ANDs non-zero and takes the
-    /// load-barrier slow path.
-    const GC_COLOR_BAD_MASK: u64 = Self::GC_COLOR_M1 | Self::GC_COLOR_R;
-    /// M6 incremental-marking tuning. A mark quantum traces up to
-    /// GC_QUANTUM_POPS worklist objects; the driver runs one quantum per
-    /// GC_QUANTUM_BYTES allocated during the Mark phase. A cycle starts
-    /// proactively when live regions exceed 5/8 of the soft budget.
-    const GC_QUANTUM_POPS: u64 = 512;
-    const GC_QUANTUM_BYTES: u64 = 8192;
-    const GC_PHASE_IDLE: u64 = 0;
-    const GC_PHASE_MARK: u64 = 1;
-    /// M7 relocation phase: live objects are evacuated out of the sparsest
-    /// regions so those regions can be freed (heap compaction).
-    const GC_PHASE_RELOCATE: u64 = 2;
-    /// M7 object-header low bits (the size is 16-aligned, so bits 0-3 of
-    /// header word0 are free). bit0 = forwarded (word0 then holds the new
-    /// user pointer | GC_FWD); bits 1-2 = the two alternating mark bits
-    /// (which parity is "current" this cycle lives in the gc_header_mark
-    /// cell). The mark bit moved off bit 63 so word0 can hold a
-    /// forwarding pointer. Size is recovered with `and reg, -16`.
-    const GC_FWD: u64 = 1;
-    const GC_HMARK0: u64 = 1 << 1;
-    const GC_HMARK1: u64 = 1 << 2;
-    const GC_HMARK_BOTH: u64 = Self::GC_HMARK0 | Self::GC_HMARK1;
+    // Colored-pointer + phase/header GC design constants. Definitions and
+    // prose live in `gc_layout`; these are `Self::GC_*` aliases.
+    const GC_COLOR_M0: u64 = crate::gc_layout::GC_COLOR_M0;
+    const GC_COLOR_M1: u64 = crate::gc_layout::GC_COLOR_M1;
+    const GC_COLOR_R: u64 = crate::gc_layout::GC_COLOR_R;
+    const GC_COLOR_MASK: u64 = crate::gc_layout::GC_COLOR_MASK;
+    const GC_COLOR_STRIP: u64 = crate::gc_layout::GC_COLOR_STRIP;
+    const GC_COLOR_BAD_MASK: u64 = crate::gc_layout::GC_COLOR_BAD_MASK;
+    const GC_QUANTUM_POPS: u64 = crate::gc_layout::GC_QUANTUM_POPS;
+    const GC_QUANTUM_BYTES: u64 = crate::gc_layout::GC_QUANTUM_BYTES;
+    const GC_PHASE_IDLE: u64 = crate::gc_layout::GC_PHASE_IDLE;
+    const GC_PHASE_MARK: u64 = crate::gc_layout::GC_PHASE_MARK;
+    const GC_PHASE_RELOCATE: u64 = crate::gc_layout::GC_PHASE_RELOCATE;
+    const GC_FWD: u64 = crate::gc_layout::GC_FWD;
+    // GC_HMARK0 has no direct `Self::` use in this file (its only prior
+    // reference was inside GC_HMARK_BOTH's definition, now in gc_layout);
+    // reference it via `crate::gc_layout::GC_HMARK0` if ever needed.
+    const GC_HMARK1: u64 = crate::gc_layout::GC_HMARK1;
+    const GC_HMARK_BOTH: u64 = crate::gc_layout::GC_HMARK_BOTH;
 
     /// Initialize the reserved color registers once, before any user
     /// code or collector routine runs. r13 = strip mask, r14 = good
