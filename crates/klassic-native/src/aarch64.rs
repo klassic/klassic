@@ -20,6 +20,7 @@ use klassic_span::{Diagnostic, Span};
 use klassic_syntax::{BinaryOp, Expr, StringPart};
 
 use crate::macho::{self, DataFixup, FixupSection};
+use crate::portable_asm;
 
 const SYS_EXIT: u16 = 1;
 const SYS_WRITE: u16 = 4;
@@ -112,6 +113,21 @@ enum Reg {
     X22 = 22,
     /// Callee-saved: `envp`, captured from dyld's `LC_MAIN` entry.
     X23 = 23,
+    /// Callee-saved: GC load-barrier colour-strip mask (`ColorStrip`).
+    /// Seeded once at startup; the portable collector keeps it live.
+    #[allow(dead_code)]
+    X24 = 24,
+    /// Callee-saved: GC current good colour (`GoodColor`).
+    #[allow(dead_code)]
+    X25 = 25,
+    /// Callee-saved: GC bad-colour test mask (`BadMask`).
+    #[allow(dead_code)]
+    X26 = 26,
+    /// The frame pointer, as a base register for the GC's rbp-relative
+    /// frame slots (`[x29, #-offset]`). The rest of the backend addresses
+    /// the frame through the bare `FP` const and `mov_fp_sp`.
+    #[allow(dead_code)]
+    X29 = 29,
 }
 
 /// AAPCS64 integer argument registers, in order.
@@ -207,6 +223,12 @@ struct Assembler {
     /// Total bytes reserved in `__DATA,__bss` (the GC's zero-init cells).
     /// Zero for pre-GC programs, so no writable segment is emitted.
     bss_len: usize,
+    /// Set by the PortableAsm `bt_reg_imm8` lowering (which becomes a
+    /// flag-setting `tst reg, #(1<<bit)` → Z = (bit == 0)); the next
+    /// `jcc_label` consumes it to remap the x86 carry-based condition to
+    /// the AArch64 zero-based one. The GC always emits the branch
+    /// immediately after the bit test.
+    bt_pending: bool,
 }
 
 impl Assembler {
@@ -809,6 +831,312 @@ impl Assembler {
     /// `ret`
     fn ret(&mut self) {
         self.word(0xd65f_03c0);
+    }
+}
+
+/// Address of a datum the portable GC codegen references through
+/// `mov_data_addr`: a byte in read-only `__TEXT,__const` (constants,
+/// diagnostic strings) or a cell in writable `__DATA,__bss` (the
+/// collector's mutable globals). The AArch64 `PortableAsm::DataLabel`.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum PortDataAddr {
+    Rodata(usize),
+    Bss(DataLabel),
+}
+
+/// Scratch register for immediate materialization and large-displacement
+/// forms. It sits outside the `V0..V11` mapping, so the portable
+/// collector never holds a live value in it.
+const PORT_SCRATCH: Reg = Reg::X10;
+
+/// Map a portable register to its AArch64 home. `V4`/`V5` (the x86 rsp/
+/// rbp roles) are the stack and frame pointers; the frame-shaped methods
+/// handle them inline and never route them through here.
+fn port_reg(r: portable_asm::Reg) -> Reg {
+    use portable_asm::Reg as P;
+    match r {
+        P::V0 => Reg::X0,
+        P::V1 => Reg::X1,
+        P::V2 => Reg::X2,
+        P::V3 => Reg::X3,
+        P::V6 => Reg::X4,
+        P::V7 => Reg::X5,
+        P::V8 => Reg::X6,
+        P::V9 => Reg::X7,
+        P::V10 => Reg::X8,
+        P::V11 => Reg::X9,
+        P::ColorStrip => Reg::X24,
+        P::GoodColor => Reg::X25,
+        P::BadMask => Reg::X26,
+        P::V4 | P::V5 => {
+            unreachable!("V4/V5 (sp/fp) are handled by the frame-shaped methods")
+        }
+    }
+}
+
+fn port_cond(c: portable_asm::Condition) -> Cond {
+    use portable_asm::Condition as P;
+    match c {
+        P::Equal => Cond::Eq,
+        P::NotEqual => Cond::Ne,
+        P::Below => Cond::Cc,
+        P::Above => Cond::Hi,
+        P::AboveOrEqual => Cond::Hs,
+        P::Less => Cond::Lt,
+        P::LessEqual => Cond::Le,
+        P::Greater => Cond::Gt,
+        P::GreaterEqual => Cond::Ge,
+        P::NoOverflow | P::Parity => {
+            unreachable!("condition not emitted by any GC runtime routine")
+        }
+    }
+}
+
+/// AArch64 realization of the portable ZGC emitter. Every method lowers
+/// one x86-flavored `PortableAsm` operation to AArch64, so the ~24
+/// architecture-independent `portable_asm::emit_gc_*` routines emit into
+/// this `Assembler` unchanged. Two conventions differ from x86 and are
+/// absorbed here: the frame (x86 `push rbp` leaves the return address on
+/// the stack, but AArch64 `bl` leaves it in x30, so the prologue saves a
+/// full frame record x29/x30), and rbp-relative slots (x29 sits at the
+/// frame top, so a slot is `[x29, #-offset]`).
+impl portable_asm::PortableAsm for Assembler {
+    type TextLabel = Label;
+    type DataLabel = PortDataAddr;
+
+    fn create_text_label(&mut self) -> Label {
+        self.new_label()
+    }
+    fn bind_text_label(&mut self, label: Label) {
+        self.bind(label);
+    }
+    fn jmp_label(&mut self, label: Label) {
+        self.branch(label, BranchKind::Unconditional);
+    }
+    fn jcc_label(&mut self, cond: portable_asm::Condition, label: Label) {
+        use portable_asm::Condition as P;
+        let cond = if self.bt_pending {
+            self.bt_pending = false;
+            // The bit test lowered to `tst reg, #(1<<bit)`, setting
+            // Z = (bit == 0). x86 `Below` (bit set) becomes `Ne`;
+            // `AboveOrEqual` (bit clear) becomes `Eq`.
+            match cond {
+                P::Below => Cond::Ne,
+                P::AboveOrEqual => Cond::Eq,
+                other => port_cond(other),
+            }
+        } else {
+            port_cond(cond)
+        };
+        self.branch(label, BranchKind::Conditional(cond));
+    }
+    fn call_label(&mut self, label: Label) {
+        self.branch(label, BranchKind::Link);
+    }
+    fn ret(&mut self) {
+        Assembler::ret(self);
+    }
+    fn leave(&mut self) {
+        self.word(0x9100_03bf); // mov sp, x29 (add sp, x29, #0)
+        self.pop_frame_record(); // ldp x29, x30, [sp], #16
+    }
+
+    fn push_reg(&mut self, r: portable_asm::Reg) {
+        match r {
+            portable_asm::Reg::V5 => self.push_frame_record(), // save fp+lr
+            other => self.push(port_reg(other)),
+        }
+    }
+    fn pop_reg(&mut self, r: portable_asm::Reg) {
+        match r {
+            portable_asm::Reg::V5 => self.pop_frame_record(),
+            other => self.pop(port_reg(other)),
+        }
+    }
+    fn mov_reg_reg(&mut self, dst: portable_asm::Reg, src: portable_asm::Reg) {
+        use portable_asm::Reg as P;
+        match (dst, src) {
+            (P::V5, P::V4) => self.mov_fp_sp(), // mov x29, sp
+            _ => self.mov_reg(port_reg(dst), port_reg(src)),
+        }
+    }
+    fn mov_imm64(&mut self, dst: portable_asm::Reg, imm: u64) {
+        Assembler::mov_imm64(self, port_reg(dst), imm);
+    }
+    fn mov_data_addr(&mut self, dst: portable_asm::Reg, label: PortDataAddr) {
+        let reg = port_reg(dst);
+        match label {
+            PortDataAddr::Rodata(off) => self.load_rodata_address(reg, off),
+            PortDataAddr::Bss(dl) => self.load_data_address(reg, dl),
+        }
+    }
+
+    fn load_ptr_disp32(&mut self, dst: portable_asm::Reg, base: portable_asm::Reg, disp: i32) {
+        let (d, b) = (port_reg(dst), port_reg(base));
+        if disp >= 0 && disp % 8 == 0 && disp / 8 < 4096 {
+            self.ldr_imm(d, b, disp as u32);
+        } else if (-256..=255).contains(&disp) {
+            self.ldur(d, b, disp);
+        } else {
+            Assembler::mov_imm64(self, PORT_SCRATCH, disp as i64 as u64);
+            self.ldr_reg_offset(d, b, PORT_SCRATCH);
+        }
+    }
+    fn store_ptr_disp32(&mut self, base: portable_asm::Reg, disp: i32, src: portable_asm::Reg) {
+        let (s, b) = (port_reg(src), port_reg(base));
+        if disp >= 0 && disp % 8 == 0 && disp / 8 < 4096 {
+            self.str_imm(s, b, disp as u32);
+        } else if (-256..=255).contains(&disp) {
+            self.stur(s, b, disp);
+        } else {
+            Assembler::mov_imm64(self, PORT_SCRATCH, disp as i64 as u64);
+            self.str_reg_offset(s, b, PORT_SCRATCH);
+        }
+    }
+    fn load_rbp_slot(&mut self, dst: portable_asm::Reg, offset: i32) {
+        // x86 `[rbp - offset]`; x29 sits at the frame top, so `[x29, -off]`.
+        self.ldur(port_reg(dst), Reg::X29, -offset);
+    }
+    fn store_rbp_slot(&mut self, offset: i32, src: portable_asm::Reg) {
+        self.stur(port_reg(src), Reg::X29, -offset);
+    }
+
+    fn add_reg_reg(&mut self, dst: portable_asm::Reg, src: portable_asm::Reg) {
+        let (d, s) = (port_reg(dst), port_reg(src));
+        self.add_reg(d, d, s);
+    }
+    fn sub_reg_reg(&mut self, dst: portable_asm::Reg, src: portable_asm::Reg) {
+        let (d, s) = (port_reg(dst), port_reg(src));
+        self.sub_reg(d, d, s);
+    }
+    fn and_reg_reg(&mut self, dst: portable_asm::Reg, src: portable_asm::Reg) {
+        let (d, s) = (port_reg(dst), port_reg(src));
+        self.and_reg(d, d, s);
+    }
+    fn or_reg_reg(&mut self, dst: portable_asm::Reg, src: portable_asm::Reg) {
+        let (d, s) = (port_reg(dst), port_reg(src));
+        self.orr_reg(d, d, s);
+    }
+    fn xor_reg_reg(&mut self, dst: portable_asm::Reg, src: portable_asm::Reg) {
+        let (d, s) = (port_reg(dst), port_reg(src));
+        self.eor_reg(d, d, s);
+    }
+    fn cmp_reg_reg(&mut self, a: portable_asm::Reg, b: portable_asm::Reg) {
+        self.cmp_reg(port_reg(a), port_reg(b));
+    }
+    fn test_reg_reg(&mut self, a: portable_asm::Reg, b: portable_asm::Reg) {
+        self.tst_reg(port_reg(a), port_reg(b));
+    }
+
+    fn add_reg_imm32(&mut self, dst: portable_asm::Reg, imm: i32) {
+        if dst == portable_asm::Reg::V4 {
+            debug_assert!((0..4096).contains(&imm));
+            self.add_sp_imm(imm as u32);
+        } else {
+            let d = port_reg(dst);
+            if (0..4096).contains(&imm) {
+                self.add_reg_imm(d, d, imm as u32);
+            } else if (-4095..0).contains(&imm) {
+                self.sub_reg_imm(d, d, (-imm) as u32);
+            } else {
+                Assembler::mov_imm64(self, PORT_SCRATCH, imm as i64 as u64);
+                self.add_reg(d, d, PORT_SCRATCH);
+            }
+        }
+    }
+    fn sub_reg_imm8(&mut self, r: portable_asm::Reg, imm: i8) {
+        if r == portable_asm::Reg::V4 {
+            self.sub_sp_imm(imm as u32);
+        } else {
+            let d = port_reg(r);
+            self.sub_reg_imm(d, d, imm as u32);
+        }
+    }
+    fn sub_reg_imm32(&mut self, r: portable_asm::Reg, imm: i32) {
+        let d = port_reg(r);
+        if (0..4096).contains(&imm) {
+            self.sub_reg_imm(d, d, imm as u32);
+        } else {
+            Assembler::mov_imm64(self, PORT_SCRATCH, imm as i64 as u64);
+            self.sub_reg(d, d, PORT_SCRATCH);
+        }
+    }
+    fn and_reg_imm32(&mut self, r: portable_asm::Reg, imm: i32) {
+        // Materialize the mask and AND register-register, sidestepping the
+        // AArch64 logical-immediate (N:immr:imms) encoder.
+        let d = port_reg(r);
+        Assembler::mov_imm64(self, PORT_SCRATCH, imm as i64 as u64);
+        self.and_reg(d, d, PORT_SCRATCH);
+    }
+    fn cmp_reg_imm8(&mut self, r: portable_asm::Reg, imm: i8) {
+        let d = port_reg(r);
+        if imm >= 0 {
+            self.cmp_imm(d, imm as u32);
+        } else {
+            Assembler::mov_imm64(self, PORT_SCRATCH, imm as i64 as u64);
+            self.cmp_reg(d, PORT_SCRATCH);
+        }
+    }
+    fn cmp_reg_imm32(&mut self, r: portable_asm::Reg, imm: i32) {
+        let d = port_reg(r);
+        if (0..4096).contains(&imm) {
+            self.cmp_imm(d, imm as u32);
+        } else {
+            Assembler::mov_imm64(self, PORT_SCRATCH, imm as i64 as u64);
+            self.cmp_reg(d, PORT_SCRATCH);
+        }
+    }
+    fn shl_reg_imm8(&mut self, r: portable_asm::Reg, imm: u8) {
+        let d = port_reg(r);
+        self.lsl_imm(d, d, u32::from(imm));
+    }
+    fn shr_reg_imm8(&mut self, r: portable_asm::Reg, imm: u8) {
+        let d = port_reg(r);
+        self.lsr_imm(d, d, u32::from(imm));
+    }
+    fn bt_reg_imm8(&mut self, r: portable_asm::Reg, bit: u8) {
+        // Flag-setting `tst reg, #(1<<bit)` via a materialized mask;
+        // `jcc_label` remaps the following branch (see `bt_pending`).
+        Assembler::mov_imm64(self, PORT_SCRATCH, 1u64 << bit);
+        self.tst_reg(port_reg(r), PORT_SCRATCH);
+        self.bt_pending = true;
+    }
+    fn rep_movsb(&mut self) {
+        // Copy V1 (rcx=x1) bytes from [V6 (rsi=x4)] to [V7 (rdi=x5)].
+        let (count, src, dst) = (Reg::X1, Reg::X4, Reg::X5);
+        let copy_loop = self.new_label();
+        let done = self.new_label();
+        self.bind(copy_loop);
+        self.branch(done, BranchKind::CompareZero(count));
+        self.ldrb_post_increment(PORT_SCRATCH, src);
+        self.strb_post_increment(PORT_SCRATCH, dst);
+        self.sub_reg_imm(count, count, 1);
+        self.branch(copy_loop, BranchKind::Unconditional);
+        self.bind(done);
+    }
+
+    fn plat_write_data(&mut self, fd: u64, data: PortDataAddr, len: usize) {
+        Assembler::mov_imm64(self, Reg::X0, fd);
+        match data {
+            PortDataAddr::Rodata(off) => self.load_rodata_address(Reg::X1, off),
+            PortDataAddr::Bss(dl) => self.load_data_address(Reg::X1, dl),
+        }
+        Assembler::mov_imm64(self, Reg::X2, len as u64);
+        Assembler::mov_imm64(self, Reg::X16, u64::from(SYS_WRITE));
+        self.svc_0x80();
+    }
+    fn plat_exit(&mut self, code: u64) {
+        Assembler::mov_imm64(self, Reg::X0, code);
+        Assembler::mov_imm64(self, Reg::X16, u64::from(SYS_EXIT));
+        self.svc_0x80();
+    }
+    fn plat_read_monotonic_ns(&mut self) {
+        // Minimal: report 0 ns (like the x86 Windows path, whose pauses
+        // also read 0). The GC wiring keeps `--gc-log` timing disabled on
+        // AArch64, so this is never emitted; a real monotonic clock can
+        // replace it later.
+        Assembler::mov_imm64(self, Reg::X0, 0);
     }
 }
 
@@ -4136,6 +4464,66 @@ mod tests {
         // b.cond encodes cond in the low 4 bits; offset patched to +N words.
         assert_eq!(w[0] & 0xff00_001f, 0x5400_0008); // b.hi
         assert_eq!(w[1] & 0xff00_001f, 0x5400_0002); // b.hs
+    }
+
+    #[test]
+    fn portable_gc_routines_emit_valid_aarch64() {
+        // Emit whole architecture-independent GC routines through the
+        // AArch64 PortableAsm impl and sanity-check the byte stream. Set
+        // KLASSIC_AA_DUMP to a path to dump the code for capstone disasm.
+        let mut asm = Assembler::default();
+
+        let cc = PortDataAddr::Bss(asm.reserve_data_cells(1));
+        let br = PortDataAddr::Bss(asm.reserve_data_cells(1));
+        let grow = asm.new_label();
+        crate::portable_asm::emit_gc_grow_budget(&mut asm, grow, cc, br);
+
+        let bounds = asm.new_label();
+        crate::portable_asm::emit_gc_bounds_error(&mut asm, bounds, PortDataAddr::Rodata(0), 32);
+
+        let worklist_top = PortDataAddr::Bss(asm.reserve_data_cells(1));
+        let drain = asm.new_label();
+        let trace = asm.new_label();
+        asm.bind(trace); // a stand-in body so `finish` can resolve the call
+        asm.ret();
+        crate::portable_asm::emit_gc_drain(&mut asm, drain, trace, worklist_top);
+
+        // mark_roots exercises the rbp-relative frame slots ([x29,#-N]).
+        let shadow = PortDataAddr::Bss(asm.reserve_data_cells(1));
+        let shadow_top = PortDataAddr::Bss(asm.reserve_data_cells(1));
+        let mark_visit = asm.new_label();
+        asm.bind(mark_visit);
+        asm.ret();
+        let mark_roots = asm.new_label();
+        crate::portable_asm::emit_gc_mark_roots(
+            &mut asm, mark_roots, shadow, shadow_top, mark_visit,
+        );
+
+        // load_barrier_slow exercises the bit-test remap and the reserved
+        // colour registers (x24/x25/x26) and the [base-16] header access.
+        let phase = PortDataAddr::Bss(asm.reserve_data_cells(1));
+        let region_base = PortDataAddr::Bss(asm.reserve_data_cells(1));
+        let region_fromspace = PortDataAddr::Bss(asm.reserve_data_cells(1));
+        let evacuate = asm.new_label();
+        asm.bind(evacuate);
+        asm.ret();
+        let lbs = asm.new_label();
+        crate::portable_asm::emit_gc_load_barrier_slow(
+            &mut asm,
+            lbs,
+            phase,
+            region_base,
+            region_fromspace,
+            evacuate,
+            mark_visit,
+        );
+
+        asm.finish();
+        assert!(!asm.code.is_empty());
+        assert_eq!(asm.code.len() % 4, 0, "every instruction is a 32-bit word");
+        if let Ok(path) = std::env::var("KLASSIC_AA_DUMP") {
+            std::fs::write(path, &asm.code).unwrap();
+        }
     }
 
     #[test]
