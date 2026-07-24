@@ -136,13 +136,22 @@ const FP: u32 = 29;
 enum Cond {
     Eq = 0,
     Ne = 1,
+    /// Unsigned "higher or same" (carry set). Also the GC port's
+    /// `AboveOrEqual`. Same encoding as ARM `CS`. Inert until the
+    /// PortableAsm condition mapping (M4) constructs it.
+    #[allow(dead_code)]
+    Hs = 2,
     /// Carry clear. Darwin's `svc #0x80` convention signals a
     /// *successful* syscall this way (carry set = failure, x0 holds
     /// the positive errno) — the mirror image of Linux's
-    /// negative-rax convention.
+    /// negative-rax convention. Also the GC port's unsigned `Below`.
     Cc = 3,
     /// After `fcmp`: strictly less, unordered fails — the float `<`.
     Mi = 4,
+    /// Unsigned "higher" (strictly greater). The GC port's `Above`.
+    /// Inert until the PortableAsm condition mapping (M4).
+    #[allow(dead_code)]
+    Hi = 8,
     /// After `fcmp`: less-or-equal, unordered fails — the float `<=`.
     Ls = 9,
     Ge = 10,
@@ -304,6 +313,39 @@ impl Assembler {
         self.word(0xeb00_001f | ((rhs as u32) << 16) | ((lhs as u32) << 5));
     }
 
+    // The logical-register and unscaled load/store primitives below are
+    // added for the AArch64 GC port and stay inert (dead code) until the
+    // PortableAsm impl (M4) lowers `and/or/xor/test_reg_reg`,
+    // `load/store_ptr_disp32`, and `bt_reg_imm8` onto them.
+
+    /// `and xd, xn, xm` (logical AND, shifted register, shift 0).
+    #[allow(dead_code)]
+    fn and_reg(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        self.word(0x8a00_0000 | ((rhs as u32) << 16) | ((lhs as u32) << 5) | dst as u32);
+    }
+
+    /// `orr xd, xn, xm` (logical OR). `mov xd, xm` is the `xn = xzr` case.
+    #[allow(dead_code)]
+    fn orr_reg(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        self.word(0xaa00_0000 | ((rhs as u32) << 16) | ((lhs as u32) << 5) | dst as u32);
+    }
+
+    /// `eor xd, xn, xm` (logical XOR).
+    #[allow(dead_code)]
+    fn eor_reg(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        self.word(0xca00_0000 | ((rhs as u32) << 16) | ((lhs as u32) << 5) | dst as u32);
+    }
+
+    /// `tst xn, xm` (ands xzr, xn, xm) — flag-setting AND that discards
+    /// its result, setting Z = ((xn & xm) == 0). The GC port lowers
+    /// `test_reg_reg` here, and its bit-test to `tst xn, scratch` with a
+    /// materialized `1 << bit` mask (avoiding the logical-immediate
+    /// encoder), then remaps the following conditional branch.
+    #[allow(dead_code)]
+    fn tst_reg(&mut self, lhs: Reg, rhs: Reg) {
+        self.word(0xea00_001f | ((rhs as u32) << 16) | ((lhs as u32) << 5));
+    }
+
     /// `cset xd, cond`
     fn cset(&mut self, dst: Reg, cond: Cond) {
         self.word(0x9a9f_07e0 | (cond.inverted_bits() << 12) | dst as u32);
@@ -359,6 +401,25 @@ impl Assembler {
     fn load_local(&mut self, reg: Reg, offset: u32) {
         debug_assert!(offset.is_multiple_of(8) && offset / 8 < 4096);
         self.word(0xf940_0000 | ((offset / 8) << 10) | (FP << 5) | reg as u32);
+    }
+
+    /// `ldur xt, [xn, #simm9]` — unscaled load, signed 9-bit byte offset
+    /// in `-256..=255`. The GC port needs this for the object header's
+    /// `[base-16]` (word0) / `[base-8]` (type tag) accesses, which the
+    /// scaled `ldr` immediate form cannot express (it is non-negative).
+    #[allow(dead_code)]
+    fn ldur(&mut self, reg: Reg, base: Reg, offset: i32) {
+        debug_assert!((-256..=255).contains(&offset));
+        let imm9 = (offset as u32) & 0x1ff;
+        self.word(0xf840_0000 | (imm9 << 12) | ((base as u32) << 5) | reg as u32);
+    }
+
+    /// `stur xt, [xn, #simm9]` — unscaled store, signed 9-bit byte offset.
+    #[allow(dead_code)]
+    fn stur(&mut self, reg: Reg, base: Reg, offset: i32) {
+        debug_assert!((-256..=255).contains(&offset));
+        let imm9 = (offset as u32) & 0x1ff;
+        self.word(0xf800_0000 | (imm9 << 12) | ((base as u32) << 5) | reg as u32);
     }
 
     /// `strb wt, [xn, #-1]!`
@@ -3982,6 +4043,51 @@ mod tests {
                 0xf940_07a2, // ldr x2, [x29, #8]
             ]
         );
+    }
+
+    #[test]
+    fn encodes_gc_port_instructions() {
+        // Golden words generated with keystone-engine (ARM64) and
+        // round-tripped through capstone; see the aarch64 GC port plan.
+        // These primitives are inert until the PortableAsm impl (M4)
+        // references them.
+        let mut asm = Assembler::default();
+        asm.and_reg(Reg::X0, Reg::X1, Reg::X2);
+        asm.orr_reg(Reg::X0, Reg::X1, Reg::X2);
+        asm.eor_reg(Reg::X0, Reg::X1, Reg::X2);
+        asm.tst_reg(Reg::X0, Reg::X1);
+        asm.ldur(Reg::X0, Reg::X7, -16);
+        asm.ldur(Reg::X0, Reg::X7, -8);
+        asm.stur(Reg::X11, Reg::X10, -16);
+        asm.ldur(Reg::X0, Reg::X7, 255);
+        assert_eq!(
+            words(&asm),
+            vec![
+                0x8a02_0020, // and x0, x1, x2
+                0xaa02_0020, // orr x0, x1, x2
+                0xca02_0020, // eor x0, x1, x2
+                0xea01_001f, // tst x0, x1  (ands xzr, x0, x1)
+                0xf85f_00e0, // ldur x0, [x7, #-16]
+                0xf85f_80e0, // ldur x0, [x7, #-8]
+                0xf81f_014b, // stur x11, [x10, #-16]
+                0xf84f_f0e0, // ldur x0, [x7, #255]
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_unsigned_conditional_branches() {
+        // b.hi (Above) = cond 8, b.hs/b.cs (AboveOrEqual) = cond 2.
+        let mut asm = Assembler::default();
+        let target = asm.new_label();
+        asm.branch(target, BranchKind::Conditional(Cond::Hi));
+        asm.branch(target, BranchKind::Conditional(Cond::Hs));
+        asm.bind(target);
+        asm.finish();
+        let w = words(&asm);
+        // b.cond encodes cond in the low 4 bits; offset patched to +N words.
+        assert_eq!(w[0] & 0xff00_001f, 0x5400_0008); // b.hi
+        assert_eq!(w[1] & 0xff00_001f, 0x5400_0002); // b.hs
     }
 
     #[test]
