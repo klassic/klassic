@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use klassic_span::{Diagnostic, Span};
 use klassic_syntax::{BinaryOp, Expr, StringPart};
 
-use crate::macho::{self, DataFixup};
+use crate::macho::{self, DataFixup, FixupSection};
 
 const SYS_EXIT: u16 = 1;
 const SYS_WRITE: u16 = 4;
@@ -172,6 +172,12 @@ impl Cond {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Label(usize);
 
+/// Handle to a zero-initialized cell in the writable `__DATA,__bss`
+/// section; the value is the byte offset from the segment base. The
+/// AArch64 analog of the x86-64 backend's data label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DataLabel(usize);
+
 enum BranchKind {
     /// `b label` — 26-bit signed word offset.
     Unconditional,
@@ -198,6 +204,9 @@ struct Assembler {
     fixups: Vec<DataFixup>,
     labels: Vec<Option<usize>>,
     branches: Vec<BranchFixup>,
+    /// Total bytes reserved in `__DATA,__bss` (the GC's zero-init cells).
+    /// Zero for pre-GC programs, so no writable segment is emitted.
+    bss_len: usize,
 }
 
 impl Assembler {
@@ -440,6 +449,39 @@ impl Assembler {
             adrp_offset,
             add_offset,
             data_offset,
+            section: FixupSection::Rodata,
+        });
+    }
+
+    /// Reserve `count` zero-initialized 8-byte cells in the writable
+    /// `__DATA,__bss` section and return a handle to the first. The GC's
+    /// mutable globals (heap pointers, phase, mark worklist, region
+    /// tables, counters, ...) live here — the AArch64 analog of the
+    /// x86-64 backend's `data_label_with_i64s(&[0; count])`. Inert until
+    /// the GC runtime wiring (M5) reserves and addresses cells.
+    #[allow(dead_code)]
+    fn reserve_data_cells(&mut self, count: usize) -> DataLabel {
+        let label = DataLabel(self.bss_len);
+        self.bss_len += count * 8;
+        label
+    }
+
+    /// `adrp xd, <page>` + `add xd, xd, #<pageoff>` addressing a cell in
+    /// `__DATA,__bss`; the immediates are zero placeholders patched by the
+    /// Mach-O writer against the segment vmaddr once the layout is final.
+    /// The GC port lowers `mov_data_addr` here.
+    #[allow(dead_code)]
+    fn load_data_address(&mut self, reg: Reg, label: DataLabel) {
+        let adrp_offset = self.code.len();
+        self.word(0x9000_0000 | reg as u32);
+        let add_offset = self.code.len();
+        let rn = reg as u32;
+        self.word(0x9100_0000 | (rn << 5) | rn);
+        self.fixups.push(DataFixup {
+            adrp_offset,
+            add_offset,
+            data_offset: label.0,
+            section: FixupSection::Data,
         });
     }
 
@@ -3986,15 +4028,17 @@ pub(crate) fn emit_macho_program(
     }
 
     emitter.asm.finish();
-    // No writable data segment yet: the GC's __bss cells arrive with the
-    // data-label machinery (M3) and the GC runtime wiring (M5). Until
-    // then pass 0 so the image is byte-for-byte the pre-GC layout.
+    // `bss_len` is 0 for every program today (no codegen reserves GC
+    // cells until M5), so no writable segment is emitted and the image
+    // stays byte-for-byte the pre-GC layout. The data-label machinery
+    // (reserve_data_cells / load_data_address) is wired to it and ready.
+    let bss_len = emitter.asm.bss_len as u64;
     Ok(macho::write_executable(
         emitter.asm.code,
         emitter.asm.rodata,
         &emitter.asm.fixups,
         "klassic",
-        0,
+        bss_len,
     ))
 }
 

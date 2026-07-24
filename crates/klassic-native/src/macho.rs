@@ -13,13 +13,23 @@
 //! — and no external `codesign` / `cc` / `ld` is involved, keeping
 //! the no-toolchain policy of the direct backends.
 
-/// An `adrp`+`add` pair in `code` that must be patched to address a
-/// byte in `rodata` once the final image layout is known.
+/// Which segment a `DataFixup` addresses: the read-only `__TEXT,__const`
+/// (constants, strings) or the writable `__DATA,__bss` (the GC's cells).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FixupSection {
+    Rodata,
+    Data,
+}
+
+/// An `adrp`+`add` pair in `code` that must be patched to address a byte
+/// in `section` (at `data_offset` within it) once the final image layout
+/// is known.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DataFixup {
     pub adrp_offset: usize,
     pub add_offset: usize,
     pub data_offset: usize,
+    pub section: FixupSection,
 }
 
 const PAGE_SIZE: u64 = 16384;
@@ -154,7 +164,13 @@ pub(crate) fn write_executable(
     };
 
     for fixup in fixups {
-        patch_data_fixup(&mut code, code_offset, rodata_offset, fixup);
+        let section_base = match fixup.section {
+            FixupSection::Rodata => TEXT_BASE + rodata_offset,
+            // __DATA maps right after __TEXT; the zero-fill __bss shares
+            // the segment's vmaddr (its file offset is meaningless).
+            FixupSection::Data => data_vmaddr,
+        };
+        patch_data_fixup(&mut code, code_offset, section_base, fixup);
     }
 
     let identifier_bytes = identifier.as_bytes();
@@ -339,9 +355,9 @@ pub(crate) fn write_executable(
     out.bytes
 }
 
-fn patch_data_fixup(code: &mut [u8], code_offset: u64, rodata_offset: u64, fixup: &DataFixup) {
+fn patch_data_fixup(code: &mut [u8], code_offset: u64, section_base: u64, fixup: &DataFixup) {
     let place = TEXT_BASE + code_offset + fixup.adrp_offset as u64;
-    let target = TEXT_BASE + rodata_offset + fixup.data_offset as u64;
+    let target = section_base + fixup.data_offset as u64;
     let page_delta = ((target >> 12) as i64 - (place >> 12) as i64) as u64;
     let immlo = (page_delta & 0x3) as u32;
     let immhi = ((page_delta >> 2) & 0x7_ffff) as u32;
@@ -652,6 +668,7 @@ mod tests {
             adrp_offset: 0,
             add_offset: 4,
             data_offset: 0,
+            section: FixupSection::Rodata,
         }];
         let image = write_executable(code, b"x".to_vec(), &fixups, "klassic", 0);
         // Locate the code from the layout formula: header (32) +
@@ -663,5 +680,50 @@ mod tests {
         let add = u32::from_le_bytes(image[code_offset + 4..code_offset + 8].try_into().unwrap());
         let rodata_offset = align_to(code_offset as u64 + 8, 8) as u32;
         assert_eq!(add, 0x9100_0021 | (rodata_offset << 10));
+    }
+
+    /// Decode an `adrp xd, <page>` + `add xd, xd, #<off>` pair back to the
+    /// absolute address it computes, independent of the writer's formula.
+    fn decode_adrp_add(image: &[u8], adrp_at: usize) -> u64 {
+        let adrp = u32::from_le_bytes(image[adrp_at..adrp_at + 4].try_into().unwrap());
+        let add = u32::from_le_bytes(image[adrp_at + 4..adrp_at + 8].try_into().unwrap());
+        let immlo = ((adrp >> 29) & 0x3) as u64;
+        let immhi = ((adrp >> 5) & 0x7_ffff) as u64;
+        let mut page_delta = (immhi << 2) | immlo; // 21-bit signed
+        if page_delta & (1 << 20) != 0 {
+            page_delta |= !0 << 21; // sign-extend
+        }
+        let place = TEXT_BASE + adrp_at as u64;
+        let target_page = (place & !0xfff).wrapping_add(page_delta.wrapping_shl(12));
+        let imm12 = ((add >> 10) & 0xfff) as u64;
+        target_page + imm12
+    }
+
+    #[test]
+    fn data_section_fixups_resolve_against_data_segment() {
+        // adrp/add addressing the second GC cell (byte offset 8) in
+        // __DATA,__bss. Its target is a full segment away from the code,
+        // so the adrp page delta is non-zero (unlike the rodata case).
+        let code = vec![
+            0x01, 0x00, 0x00, 0x90, // adrp x1, 0 (placeholder)
+            0x21, 0x00, 0x00, 0x91, // add x1, x1, #0 (placeholder)
+        ];
+        let fixups = [DataFixup {
+            adrp_offset: 0,
+            add_offset: 4,
+            data_offset: 8,
+            section: FixupSection::Data,
+        }];
+        let image = write_executable(code, b"x".to_vec(), &fixups, "klassic", 16);
+
+        let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap());
+        let text = find_segment(&image, ncmds, "__TEXT").unwrap();
+        let text_filesize = u64::from_le_bytes(image[text + 32..text + 40].try_into().unwrap());
+        let data_vmaddr = TEXT_BASE + text_filesize;
+
+        let sizeofcmds = u32::from_le_bytes(image[20..24].try_into().unwrap()) as u64;
+        let code_offset = align_to(32 + sizeofcmds, 16) as usize;
+        let resolved = decode_adrp_add(&image, code_offset);
+        assert_eq!(resolved, data_vmaddr + 8);
     }
 }
