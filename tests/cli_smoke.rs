@@ -29242,3 +29242,78 @@ fn native_build_disables_stack_floor_probe_after_spawning_a_thread() {
     }
     let _ = fs::remove_file(&output_path);
 }
+
+/// `__native_zgc_relocation_test()` is a real, working, but deliberately
+/// contained exercise of ZGC's namesake technique -- colored pointers, a
+/// load barrier, and concurrent object relocation -- kept entirely
+/// separate from the general heap/collector rather than retrofitted into
+/// it (see `emit_zgc_load_barrier`'s doc comment and
+/// docs/superpowers/specs/2026-07-24-precise-concurrent-gc-design.md,
+/// "Phase 7", for why: instrumenting every one of this backend's existing
+/// pointer-load call sites correctly would be a much larger, separate
+/// undertaking, and a partially-instrumented version would be silently
+/// unsound).
+///
+/// A real child thread (the relocator) moves an object to a brand new
+/// heap address while the parent (the mutator) concurrently, millions of
+/// times, resolves the same colored reference through the barrier and
+/// checks its contents -- no lock excludes the mutator during the move.
+/// After joining, a second, deterministic check (both threads finished,
+/// no race left) confirms the barrier resolves the reference to *exactly*
+/// the relocator's published address, not merely to something that
+/// happens to still hold the right bytes -- verified during development
+/// by temporarily breaking the barrier's forwarding lookup and confirming
+/// this test caught it (returned 0 every time), then restoring the
+/// correct implementation.
+#[test]
+fn native_build_zgc_relocation_test_survives_concurrent_relocation() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path =
+        std::env::temp_dir().join(format!("klassic_native_zgc_relocation_test_{stamp}.kl"));
+    let output_path =
+        std::env::temp_dir().join(format!("klassic_native_zgc_relocation_test_{stamp}.bin"));
+    fs::write(&source_path, "println(__native_zgc_relocation_test())\n")
+        .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    assert!(
+        build_output.status.success(),
+        "__native_zgc_relocation_test should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    for attempt in 0..20 {
+        let run_output = Command::new(&output_path)
+            .output()
+            .expect("compiled binary should run");
+        assert!(
+            run_output.status.success(),
+            "attempt {attempt}: compiled binary should run cleanly, not crash or hang\nstderr:\n{}",
+            String::from_utf8_lossy(&run_output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run_output.stdout),
+            "1\n",
+            "attempt {attempt}: expected every barrier-mediated read to see \
+             the correct value under concurrent relocation, and the final \
+             deterministic check to confirm the barrier resolves to the \
+             real relocated address (1); 0 means either check failed; \
+             -1/-2/-3/-5 are the mmap/clone/join-timeout/relocation-not-\
+             observed sentinels; got:\n{}",
+            String::from_utf8_lossy(&run_output.stdout)
+        );
+    }
+    let _ = fs::remove_file(&output_path);
+}

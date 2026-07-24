@@ -35,6 +35,7 @@ pub(crate) fn builtin_name(name: &str) -> Option<&'static str> {
         "__native_thread_safe_shadow_test" => Some("__native_thread_safe_shadow_test"),
         "__native_thread_safe_collect_test" => Some("__native_thread_safe_collect_test"),
         "__native_stack_floor_is_disabled" => Some("__native_stack_floor_is_disabled"),
+        "__native_zgc_relocation_test" => Some("__native_zgc_relocation_test"),
         "__gc_list_int" => Some("__gc_list_int"),
         "__gc_list_int_len" => Some("__gc_list_int_len"),
         "__gc_list_int_set" => Some("__gc_list_int_set"),
@@ -128,7 +129,8 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
         | "__native_atomic_self_test"
         | "__native_thread_spawn_test"
         | "__native_thread_safe_collect_test"
-        | "__native_stack_floor_is_disabled" => Some(0),
+        | "__native_stack_floor_is_disabled"
+        | "__native_zgc_relocation_test" => Some(0),
         "__gc_read"
         | "__gc_read_ptr"
         | "__gc_read_string"
