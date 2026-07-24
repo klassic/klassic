@@ -29168,3 +29168,77 @@ fn native_build_thread_safe_collect_test_survives_concurrent_collection() {
     }
     let _ = fs::remove_file(&output_path);
 }
+
+/// Phase 5 of docs/superpowers/specs/2026-07-24-precise-concurrent-gc-
+/// design.md: the function-prologue stack-overflow probe's `stack_floor`
+/// is computed once from the *main* thread's own `rsp`/`getrlimit` at
+/// startup and is meaningless for a `clone()`-spawned thread's separate
+/// mmap'd stack. Rather than add a per-thread range lookup to *every*
+/// function call in the program (the probe is far hotter than the
+/// shadow-stack push/pop path from phase 4a), `emit_disable_stack_floor_
+/// probe` zeroes the shared `stack_floor` cell once, right after a
+/// successful `clone()` -- exactly what the field's own doc comment
+/// already promised ("zero ... when the program uses threads"), for
+/// every thread, main included, from that point on.
+///
+/// `__native_stack_floor_is_disabled()` gives direct, unambiguous
+/// visibility into that cell: `0` before any thread has been spawned
+/// (the probe is live), `1` after (disabled). This checks the exact
+/// before/after transition around a real `clone()` call, rather than
+/// inferring the mechanism worked from an absence of crashes elsewhere.
+#[test]
+fn native_build_disables_stack_floor_probe_after_spawning_a_thread() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!(
+        "klassic_native_stack_floor_disable_test_{stamp}.kl"
+    ));
+    let output_path = std::env::temp_dir().join(format!(
+        "klassic_native_stack_floor_disable_test_{stamp}.bin"
+    ));
+    fs::write(
+        &source_path,
+        "println(__native_stack_floor_is_disabled())\n\
+         println(__native_thread_spawn_test())\n\
+         println(__native_stack_floor_is_disabled())\n",
+    )
+    .expect("temp source file should write");
+
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    assert!(
+        build_output.status.success(),
+        "__native_stack_floor_is_disabled should compile natively\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    for attempt in 0..5 {
+        let run_output = Command::new(&output_path)
+            .output()
+            .expect("compiled binary should run");
+        assert!(
+            run_output.status.success(),
+            "attempt {attempt}: compiled binary should run cleanly\nstderr:\n{}",
+            String::from_utf8_lossy(&run_output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run_output.stdout),
+            "0\n1\n1\n",
+            "attempt {attempt}: expected the floor probe to be live (0) before \
+             spawning a thread, the spawn to succeed (1), and the floor probe \
+             to be disabled (1) immediately after; got:\n{}",
+            String::from_utf8_lossy(&run_output.stdout)
+        );
+    }
+    let _ = fs::remove_file(&output_path);
+}

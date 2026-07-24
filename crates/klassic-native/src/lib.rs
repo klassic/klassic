@@ -7182,6 +7182,9 @@ impl NativeCodeGenerator {
             "__native_thread_safe_collect_test" => {
                 self.compile_native_thread_safe_collect_test(arguments, span)
             }
+            "__native_stack_floor_is_disabled" => {
+                self.compile_native_stack_floor_is_disabled(arguments, span)
+            }
             "__gc_list_int" => self.compile_gc_list_int(arguments, span),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span),
             "__gc_list_int_set" => self.compile_gc_list_int_set(arguments, span),
@@ -8216,6 +8219,9 @@ impl NativeCodeGenerator {
                 .map(Some),
             "__native_thread_safe_collect_test" => self
                 .compile_native_thread_safe_collect_test(arguments, span)
+                .map(Some),
+            "__native_stack_floor_is_disabled" => self
+                .compile_native_stack_floor_is_disabled(arguments, span)
                 .map(Some),
             "__gc_list_int" => self.compile_gc_list_int(arguments, span).map(Some),
             "__gc_list_int_len" => self.compile_gc_list_int_len(arguments, span).map(Some),
@@ -13991,6 +13997,7 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rax, (-2i64) as u64);
         self.asm.jmp_label(done);
         self.asm.bind_text_label(clone_ok);
+        self.emit_disable_stack_floor_probe();
 
         self.asm.mov_imm64(Reg::Rcx, JOIN_SPIN_BUDGET);
         self.asm.bind_text_label(spin_top);
@@ -14135,6 +14142,7 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rax, (-2i64) as u64);
         self.asm.jmp_label(done);
         self.asm.bind_text_label(clone_ok);
+        self.emit_disable_stack_floor_probe();
 
         let parent_loop = self.asm.create_text_label();
         let parent_loop_done = self.asm.create_text_label();
@@ -14328,6 +14336,7 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rax, (-2i64) as u64);
         self.asm.jmp_label(done);
         self.asm.bind_text_label(clone_ok);
+        self.emit_disable_stack_floor_probe();
 
         // Temporary frame on the parent's own (already-established)
         // stack, purely to give emit_gc_shadow_push a valid rbp-relative
@@ -14541,6 +14550,7 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rax, (-2i64) as u64);
         self.asm.jmp_label(done);
         self.asm.bind_text_label(clone_ok);
+        self.emit_disable_stack_floor_probe();
 
         self.asm.mov_imm64(Reg::Rbx, ALLOC_STORM_COUNT);
         let storm_loop = self.asm.create_text_label();
@@ -14652,6 +14662,35 @@ impl NativeCodeGenerator {
         self.asm.syscall();
 
         self.asm.bind_text_label(done);
+        Ok(NativeValue::Int)
+    }
+
+    /// `__native_stack_floor_is_disabled()` returns `1` if `stack_floor`
+    /// is currently zero (the function-prologue stack-overflow probe
+    /// never fires -- see `emit_disable_stack_floor_probe`'s doc
+    /// comment, phase 5 of docs/superpowers/specs/2026-07-24-precise-
+    /// concurrent-gc-design.md), `0` otherwise. Debug/test-only
+    /// visibility into that cell, the same way `__gc_collect_count()`
+    /// exposes `gc_collect_counter`.
+    fn compile_native_stack_floor_is_disabled(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        if !arguments.is_empty() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "__native_stack_floor_is_disabled expects 0 arguments but got {}",
+                    arguments.len()
+                ),
+            ));
+        }
+        self.asm.mov_data_addr(Reg::R10, self.stack_floor);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.setcc_al(Condition::Equal);
+        self.asm.movzx_rax_al();
         Ok(NativeValue::Int)
     }
 
@@ -40655,6 +40694,31 @@ impl NativeCodeGenerator {
     /// TSO memory model). Clobbers rax and r10.
     fn emit_gc_collect_barrier_release(&mut self) {
         self.asm.mov_data_addr(Reg::R10, self.gc_collect_barrier);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+    }
+
+    /// Zero `stack_floor`, permanently disabling the function-prologue
+    /// stack-overflow probe for the rest of the process -- exactly what
+    /// its own doc comment already promises happens "when the program
+    /// uses threads (thread stacks live at unrelated addresses)". Call
+    /// once, from the spawning thread, right after a successful
+    /// `clone()`: the floor is computed once from the *main* thread's
+    /// own `rsp`/`getrlimit` at startup and is meaningless for a cloned
+    /// thread's separately mmap'd stack (which could easily sit at an
+    /// address the main thread's floor would treat as "already
+    /// overflowed", or vice versa). Making the check per-thread-aware
+    /// would need a range lookup added to *every* function call in the
+    /// program (far hotter than the shadow-stack push/pop path from
+    /// phase 4a, which only fires for pointer-holding locals) for a
+    /// probe that is a safety net, not a correctness requirement --
+    /// disabling it once threading starts is the same trade-off this
+    /// backend already documented before this session touched it.
+    /// `stack_floor` is a single shared cell, so one write from the
+    /// spawning thread disables the probe for every thread, including
+    /// the child, without needing this called from the child too.
+    fn emit_disable_stack_floor_probe(&mut self) {
+        self.asm.mov_data_addr(Reg::R10, self.stack_floor);
         self.asm.mov_imm64(Reg::Rax, 0);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
     }

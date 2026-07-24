@@ -2390,6 +2390,13 @@ fn eval_builtin(name: &str, arguments: &[Value], span: Span) -> Result<Value, Di
             ensure_arity(name, arguments, 0, span)?;
             Ok(Value::Int(1))
         }
+        "__native_stack_floor_is_disabled" => {
+            // Native-only; the evaluator has no stack-floor probe to
+            // report on. Stub reports "disabled" (1), matching the
+            // native builtin's steady state once any thread spawns.
+            ensure_arity(name, arguments, 0, span)?;
+            Ok(Value::Int(1))
+        }
         "__gc_list_ptr" => {
             ensure_arity(name, arguments, 1, span)?;
             let _ = expect_non_negative_int(&arguments[0], "__gc_list_ptr", span)?;
