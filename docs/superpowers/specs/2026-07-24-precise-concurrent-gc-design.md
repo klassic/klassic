@@ -1014,3 +1014,105 @@ once a full mark phase proves no live reference can still hold an
 address in a given range) is a separate, larger undertaking than
 "implement automatic compaction" was scoped to cover. Flagged here as
 explicit follow-up work rather than left undiscovered.
+
+## Phase 12: extracting the architecture-independent parts -- a first, honest slice
+
+Kota's phase-11 `/goal` had two halves: "perfectly implement the
+untouched parts" (phase 11, above) and "then extract the architecture-
+independent parts" (手つかずの部分完璧に実装して。そのあとにアーキテクチャ
+非依存部分をきりだす). This section is that second half -- started, not
+finished, and deliberately scoped small rather than attempted all at
+once.
+
+**What "architecture-independent" actually means here, precisely.**
+`docs/roadmap-targets-stdlib.md`'s own Runtime Sharing Strategy section
+settles a question that could otherwise stall this indefinitely: the
+direct-syscall path (x86-64 Linux today, and any future AArch64 Linux
+direct-ELF backend under Tier 1) is explicitly documented as **not**
+linking `klassic-runtime` -- that crate is for the *runtime call path*
+(macOS/Windows/Wasm/the portable C backend), a different execution
+model entirely. So "extract the architecture-independent parts" of a
+direct-syscall-path collector cannot mean "move code into
+`klassic-runtime`" -- the project's own architecture already rules that
+out. What it *can* mean, for a design where every backend that ever
+implements it still emits its own inline machine code, is separating
+the collector's **design** (its constants, its object-format ABI, its
+algorithmic structure) from its **realization** (the specific x86-64
+instructions that implement that design) -- so the design is written
+down once, in one place, independent of any instruction set, and a
+future backend adopting the same collector would have exactly that to
+implement against rather than needing to reverse-engineer it from
+~40,000 lines of x86-64 assembly emission.
+
+**Done this session:** `crates/klassic-native/src/gc_layout.rs`, a new,
+small, focused module (following the existing precedent of
+`aarch64.rs`/`macho.rs`/`cbackend.rs` living alongside `lib.rs` --
+CLAUDE.md's "don't split lib.rs" guidance is about not fragmenting the
+~40k lines of instruction-emission function bodies, not a ban on new,
+genuinely separable files). It holds:
+- Every GC design constant that was previously an associated `const` on
+  `NativeCodeGenerator` (`GC_HEAP_SIZE`, `GC_GROW_SIZE`,
+  `GC_MAX_SEGMENTS`, `GC_ROOT_TABLE_LEN`, `GC_SHADOW_STACK_LEN`,
+  `GC_MARK_WORKLIST_LEN`, the cloned-thread shadow-stack sizing, the
+  forwarding-table growth constants, the payload-size limits, and all
+  four-going-on-five `GC_TYPE_*` type tags including a newly-named
+  `GC_TYPE_FREE` for what used to be a bare `0` literal at its one call
+  site) -- genuinely architecture-independent values: an ARM64 backend
+  implementing the same collector would want the identical numbers, not
+  different ones, since they describe the collector's own design
+  budget, not anything about an instruction set.
+- A module-level doc comment writing down, in prose, the object header
+  layout (`[block+0]` = size|mark-bit, `[block+8]` = type tag,
+  `[block+16..]` = payload), the pointer-coloring convention (bit 63 of
+  a *value*, distinct from the header's mark bit), the forwarding-table
+  structure, and the segment-table structure -- previously scattered
+  across dozens of inline comments at their various call sites
+  throughout `lib.rs`, now stated once, completely, in the one place
+  any future implementer would need to start from.
+
+`lib.rs`'s own associated consts became thin re-exports
+(`const GC_HEAP_SIZE: u64 = gc_layout::GC_HEAP_SIZE;`, etc.) rather than
+being deleted and replaced at every call site -- deliberately, to keep
+this a zero-behavior-change extraction. All 84 existing `Self::GC_*`
+call sites throughout the codegen needed no edits at all; the values
+just moved to live in one architecture-independent place instead of
+being defined inline in the x86-64-specific `impl` block. Verified with
+the full 519-test suite green, `cargo fmt --check`/`clippy -- -D
+warnings` clean, before and after -- this step changes zero instructions
+in any emitted binary, only where the constants that describe them are
+declared.
+
+**What this is not, stated as plainly as phase 8's equivalent
+disclaimer was:** this is not the shared pseudo-instruction IR Kota
+described wanting ("大部分はポータブルで一部だけアーキテクチャ依存" --
+mostly portable, only a small part architecture-specific) when the
+ARM64 question came up earlier in this campaign. That would mean
+`lib.rs`'s ~40,000 lines of instruction-emission functions -- the mark
+phase, the sweep phase, the compaction loop, every `__gc_*` builtin,
+every barrier call site -- lowering through a shared intermediate
+representation that per-architecture backends (x86-64 today, AArch64
+Linux direct-ELF as a real future candidate per the roadmap's Tier 1)
+consume, rather than emitting raw `Reg`/`Condition` machine instructions
+directly as they do now. That is a genuinely large, separate
+undertaking -- realistically its own multi-session `brainstorming` ->
+`writing-plans` cycle, given it touches the single largest, most
+load-bearing surface in the entire codebase, exactly the kind of change
+this campaign's own established discipline says to scope properly
+rather than force through in one sitting. What's done this phase is the
+narrowest genuine slice of "architecture independence" available
+without that larger redesign: the design is now written down once,
+independent of x86-64, ready to be the starting reference for whichever
+future session takes on the full IR extraction.
+
+**Recommended next step, not started:** before touching codegen at all,
+`superpowers:brainstorming` a real design for the shared IR -- what its
+instruction set looks like (a small, typed set of portable ops:
+load/store/arithmetic/branch/call, register allocation left to each
+backend), how the ~40k lines of existing x86-64 emission would migrate
+without a big-bang rewrite (most plausibly: new code goes through the
+IR first, existing code migrates incrementally, category by category,
+exactly like phases 9-10's barrier retrofit did for coloring), and
+whether AArch64 Linux direct-ELF (matching x86-64's execution model
+most closely) is really the right second target to prove the
+abstraction with, per the roadmap's own suggestion, before Mach-O
+AArch64 or anything further afield.

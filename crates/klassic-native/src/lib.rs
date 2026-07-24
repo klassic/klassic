@@ -452,6 +452,7 @@ mod cbackend;
 
 #[allow(clippy::result_large_err)]
 mod aarch64;
+mod gc_layout;
 mod macho;
 
 /// Compile `text` to a portable C translation unit (`--backend c`).
@@ -40254,80 +40255,34 @@ impl NativeCodeGenerator {
         self.asm.ret();
     }
 
-    /// Heap size used by the GC. Picked small so unit tests can exercise GC
-    /// reclamation without needing to allocate megabytes.
-    const GC_HEAP_SIZE: u64 = 1 << 20; // 1 MiB
-    /// Default size of each follow-on segment allocated when the initial
-    /// heap fills up after a collection.
-    const GC_GROW_SIZE: u64 = 1 << 20; // 1 MiB
-    /// Maximum number of distinct mmap'd segments the GC can ever own.
-    /// Each segment is 1 MiB (or more for an oversized allocation), so the
-    /// total reachable budget is GC_MAX_SEGMENTS * GC_GROW_SIZE = 64 MiB.
-    const GC_MAX_SEGMENTS: usize = 64;
-    /// Number of pointer slots in the static GC root table. Each slot is
-    /// either zero (free) or holds a heap pointer pinned via `__gc_pin`.
-    const GC_ROOT_TABLE_LEN: usize = 4096;
-    /// Maximum number of objects that can be queued for tracing during a
-    /// single mark phase. Marking aborts with an error message if the
-    /// worklist overflows.
-    const GC_TABLES_BYTES: u64 =
-        ((Self::GC_ROOT_TABLE_LEN + Self::GC_SHADOW_STACK_LEN + Self::GC_MARK_WORKLIST_LEN) * 8)
-            as u64;
-    // The mark worklist must hold the breadth-first frontier of the
-    // live object graph; deep recursion with per-frame heap values
-    // makes the live set proportional to recursion depth.
-    const GC_MARK_WORKLIST_LEN: usize = 65536;
-    /// Maximum number of stack-frame heap-pointer slots tracked at any
-    /// one time. Allocating a 33rd nested heap-pointer var beyond this
-    /// limit aborts with an explicit shadow-stack overflow message.
-    // Sized for deep recursion: every live frame of a function with
-    // heap-pointer parameters holds roots here (param slots plus any
-    // rooted temporaries), so the cap bounds recursion depth for
-    // string- and enum-carrying functions. Overflow stays a clean
-    // abort. The tables are zero-filled .data, so growing them grows
-    // every emitted binary — keep proportionate.
-    const GC_SHADOW_STACK_LEN: usize = 32768;
-    /// How many `clone()`-spawned threads can register their own shadow
-    /// sub-stack (see docs/superpowers/specs/2026-07-24-precise-
-    /// concurrent-gc-design.md, phase 4). The *main* thread never
-    /// occupies a slot here -- it keeps using `gc_shadow_stack`/
-    /// `gc_shadow_stack_top` exactly as before this phase, unconditionally
-    /// and unchanged, so single-threaded programs (the overwhelming
-    /// majority) take the exact same code path as always. A slot is only
-    /// consulted for a thread whose current `rsp` falls inside a
-    /// registered range.
-    const MAX_CLONED_THREADS: usize = 4;
-    /// Shadow-stack depth available to each *individual* cloned thread.
-    /// Deliberately smaller than the main thread's `GC_SHADOW_STACK_LEN`
-    /// -- this phase proves the routing and bookkeeping are race-free,
-    /// not that it scales to deep recursion on a spawned thread.
-    const CLONED_THREAD_SHADOW_LEN: usize = 4096;
-    /// Initial capacity of the forwarding table (see `zgc_forward_count`'s
-    /// doc comment). `zgc_forward_grow` doubles it on demand, so this
-    /// only controls how soon the first growth happens, not a hard cap.
-    const ZGC_FORWARD_INITIAL_CAPACITY: usize = 64;
-    /// How many objects `__native_zgc_relocate_many_test` relocates in
-    /// one (single-threaded, deterministic) run. Deliberately well past
-    /// `ZGC_FORWARD_INITIAL_CAPACITY` so the test forces multiple
-    /// `zgc_forward_grow` doublings (64 -> 128 -> 256).
-    const ZGC_MANY_TEST_COUNT: usize = 200;
-    const GC_MAX_PAYLOAD_SIZE: u64 = i64::MAX as u64 - 31 - 4095;
-    const GC_MAX_STRING_ALLOC_SIZE: u64 = Self::GC_MAX_PAYLOAD_SIZE - 15;
-    const GC_MAX_POINTER_SLOT_COUNT: u64 = Self::GC_MAX_PAYLOAD_SIZE / 8;
-    const GC_MAX_LIST_LENGTH: u64 = (Self::GC_MAX_PAYLOAD_SIZE - 8) / 8;
-    /// Type tag stored in the second header word. 0 marks a free block,
-    /// 1 marks a raw-bytes payload (no pointer fields), 2 marks a
-    /// "pointer record" whose payload is interpreted as a packed array
-    /// of heap pointers that the mark phase recurses into, and 3 marks a
-    /// variable-length pointer array (same tracing as a record).
-    const GC_TYPE_RAW_BYTES: u64 = 1;
-    const GC_TYPE_POINTER_RECORD: u64 = 2;
-    const GC_TYPE_POINTER_ARRAY: u64 = 3;
-    /// Heap-backed pointer list: payload is `[len: i64, ptr_0, ptr_1,
-    /// ...]`. The first qword is an integer length and must be skipped
-    /// by the mark phase; the remaining payload is a packed pointer
-    /// table identical to `GC_TYPE_POINTER_ARRAY` for tracing purposes.
-    const GC_TYPE_POINTER_LIST: u64 = 4;
+    // GC design constants and the object-format ABI (header layout,
+    // pointer coloring, forwarding table, segment table, type tags) now
+    // live in `gc_layout` -- see its module doc comment. These are thin
+    // re-exports, not duplicated values: every `Self::GC_*` call site
+    // below (84 of them, left untouched by this extraction) keeps
+    // working exactly as before, while the canonical values live in one
+    // architecture-independent place any future backend implementing
+    // this same collector design would need to agree on.
+    const GC_HEAP_SIZE: u64 = gc_layout::GC_HEAP_SIZE;
+    const GC_GROW_SIZE: u64 = gc_layout::GC_GROW_SIZE;
+    const GC_MAX_SEGMENTS: usize = gc_layout::GC_MAX_SEGMENTS;
+    const GC_ROOT_TABLE_LEN: usize = gc_layout::GC_ROOT_TABLE_LEN;
+    const GC_TABLES_BYTES: u64 = gc_layout::GC_TABLES_BYTES;
+    const GC_MARK_WORKLIST_LEN: usize = gc_layout::GC_MARK_WORKLIST_LEN;
+    const GC_SHADOW_STACK_LEN: usize = gc_layout::GC_SHADOW_STACK_LEN;
+    const MAX_CLONED_THREADS: usize = gc_layout::MAX_CLONED_THREADS;
+    const CLONED_THREAD_SHADOW_LEN: usize = gc_layout::CLONED_THREAD_SHADOW_LEN;
+    const ZGC_FORWARD_INITIAL_CAPACITY: usize = gc_layout::ZGC_FORWARD_INITIAL_CAPACITY;
+    const ZGC_MANY_TEST_COUNT: usize = gc_layout::ZGC_MANY_TEST_COUNT;
+    const GC_MAX_PAYLOAD_SIZE: u64 = gc_layout::GC_MAX_PAYLOAD_SIZE;
+    const GC_MAX_STRING_ALLOC_SIZE: u64 = gc_layout::GC_MAX_STRING_ALLOC_SIZE;
+    const GC_MAX_POINTER_SLOT_COUNT: u64 = gc_layout::GC_MAX_POINTER_SLOT_COUNT;
+    const GC_MAX_LIST_LENGTH: u64 = gc_layout::GC_MAX_LIST_LENGTH;
+    const GC_TYPE_FREE: u64 = gc_layout::GC_TYPE_FREE;
+    const GC_TYPE_RAW_BYTES: u64 = gc_layout::GC_TYPE_RAW_BYTES;
+    const GC_TYPE_POINTER_RECORD: u64 = gc_layout::GC_TYPE_POINTER_RECORD;
+    const GC_TYPE_POINTER_ARRAY: u64 = gc_layout::GC_TYPE_POINTER_ARRAY;
+    const GC_TYPE_POINTER_LIST: u64 = gc_layout::GC_TYPE_POINTER_LIST;
 
     /// Initialize the GC heap: mmap a private anonymous region and seed the
     /// heap_base / heap_top / heap_end globals.
@@ -41531,11 +41486,11 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(block_dead);
         // Push block onto the free list:
         //   [ptr]    = size (mark bit already clear)
-        //   [ptr+8]  = 0  (type tag = free)
+        //   [ptr+8]  = GC_TYPE_FREE
         //   [ptr+16] = free_head
         //   free_head = ptr
         self.asm.store_ptr_disp32(Reg::R11, 0, Reg::Rcx);
-        self.asm.mov_imm64(Reg::Rdi, 0);
+        self.asm.mov_imm64(Reg::Rdi, Self::GC_TYPE_FREE);
         self.asm.store_ptr_disp32(Reg::R11, 8, Reg::Rdi);
         self.asm.store_ptr_disp32(Reg::R11, 16, Reg::R9);
         self.asm.mov_reg_reg(Reg::R9, Reg::R11);
