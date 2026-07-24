@@ -1141,6 +1141,73 @@ pub fn emit_gc_mark_visit<E: PortableAsm>(
     out.ret();
 }
 
+/// Text labels for the subroutines the synchronous `gc_collect` entry
+/// dispatches to.
+#[derive(Clone, Copy)]
+pub struct CollectTargets<T: Copy> {
+    pub stw_mark_complete: T,
+    pub free_ghost_regions: T,
+    pub sweep: T,
+    pub relocate_quantum: T,
+    pub mark_end: T,
+}
+
+/// Portable version of `gc_collect`: the synchronous collection entry
+/// (do_collect / --gc-stress). If a Mark cycle is in progress finish it
+/// via mark_end (self-bracketing its pause); if Relocate is in progress
+/// drain it synchronously with unbounded quanta; otherwise run a full
+/// from-scratch STW mark + free-ghosts + sweep, bracketed as one pause.
+/// Exactly one sweep runs either way.
+pub fn emit_gc_collect<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    timing: bool,
+    pause: PauseCells<E::DataLabel>,
+    phase: E::DataLabel,
+    targets: CollectTargets<E::TextLabel>,
+) {
+    use crate::gc_layout::{GC_PHASE_MARK, GC_PHASE_RELOCATE};
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    let collect_mark = out.create_text_label();
+    let collect_reloc = out.create_text_label();
+    let collect_done = out.create_text_label();
+    out.mov_data_addr(Reg::V10, phase);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.cmp_reg_imm8(Reg::V0, GC_PHASE_MARK as i8);
+    out.jcc_label(Condition::Equal, collect_mark);
+    out.cmp_reg_imm8(Reg::V0, GC_PHASE_RELOCATE as i8);
+    out.jcc_label(Condition::Equal, collect_reloc);
+    // Idle: a full from-scratch STW mark + sweep, bracketed as one pause.
+    // Free the previous cycle's ghosts first (no-op until evac runs).
+    emit_gc_pause_start(out, timing, pause);
+    out.call_label(targets.stw_mark_complete);
+    out.call_label(targets.free_ghost_regions);
+    out.call_label(targets.sweep);
+    emit_gc_pause_end(out, timing, pause);
+    out.jmp_label(collect_done);
+    // Relocate in progress: drain the remaining evacuation synchronously
+    // (unbounded quanta) until the phase returns to Idle. Unreachable
+    // until the activation step.
+    out.bind_text_label(collect_reloc);
+    let reloc_loop = out.create_text_label();
+    out.bind_text_label(reloc_loop);
+    out.mov_imm64(Reg::V7, i64::MAX as u64);
+    out.call_label(targets.relocate_quantum);
+    out.mov_data_addr(Reg::V10, phase);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.cmp_reg_imm8(Reg::V0, GC_PHASE_RELOCATE as i8);
+    out.jcc_label(Condition::Equal, reloc_loop);
+    out.jmp_label(collect_done);
+    out.bind_text_label(collect_mark);
+    out.call_label(targets.mark_end);
+    out.bind_text_label(collect_done);
+    out.leave();
+    out.ret();
+}
+
 /// Text labels for the subroutines `gc_mark_end` chains through to close
 /// a cycle.
 #[derive(Clone, Copy)]

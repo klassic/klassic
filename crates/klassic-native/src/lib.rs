@@ -38135,29 +38135,19 @@ impl NativeCodeGenerator {
     /// the clock syscall path panics on Windows, and no cell is written
     /// there, so a pause simply reads 0). Emitted at the start of each
     /// STW pause (MarkStart, MarkEnd, and the synchronous full collect).
+    ///
+    /// The STW pauses themselves are now emitted by the portable
+    /// `portable_asm::emit_gc_pause_start` / `emit_gc_pause_end` free
+    /// functions; every GC routine that brackets a pause has been migrated
+    /// onto the trait, so the former inherent wrappers are gone. Callers
+    /// build a `PauseCells` here and compute `timing = gc_log &&
+    /// !is_windows` at the call site.
     fn gc_pause_cells(&self) -> portable_asm::PauseCells<DataLabel> {
         portable_asm::PauseCells {
             start_ns: self.gc_pause_start_ns,
             total_ns: self.gc_pause_total_ns,
             max_ns: self.gc_pause_max_ns,
         }
-    }
-
-    fn emit_gc_pause_start(&mut self) {
-        // Delegated to the portable emitter; the `--gc-log`-and-not-Windows
-        // gate stays here (it is host-config state, not codegen), and the
-        // clock read is a `PortableAsm` platform primitive. Byte-identical.
-        let timing = self.gc_log && !self.is_windows;
-        let cells = self.gc_pause_cells();
-        portable_asm::emit_gc_pause_start(self, timing, cells);
-    }
-
-    /// Fold the elapsed pause (now - gc_pause_start_ns) into the max and
-    /// total pause accumulators. Emitted at the end of each STW pause.
-    fn emit_gc_pause_end(&mut self) {
-        let timing = self.gc_log && !self.is_windows;
-        let cells = self.gc_pause_cells();
-        portable_asm::emit_gc_pause_end(self, timing, cells);
     }
 
     fn emit_gc_alloc_runtime(&mut self) {
@@ -38398,53 +38388,20 @@ impl NativeCodeGenerator {
     }
 
     fn emit_gc_collect_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_collect);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        // (The collection counter is bumped once per cycle inside
-        // gc_sweep.) M6: the synchronous collection entry (do_collect,
-        // --gc-stress). If a cycle is in progress (phase == Mark), finish
-        // it via gc_mark_end (which self-brackets its own pause);
-        // otherwise run a full from-scratch STW mark + sweep, bracketed
-        // as one pause here. Either way exactly one sweep runs.
-        let collect_mark = self.asm.create_text_label();
-        let collect_reloc = self.asm.create_text_label();
-        let collect_done = self.asm.create_text_label();
-        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.cmp_reg_imm8(Reg::Rax, Self::GC_PHASE_MARK as i8);
-        self.asm.jcc_label(Condition::Equal, collect_mark);
-        self.asm
-            .cmp_reg_imm8(Reg::Rax, Self::GC_PHASE_RELOCATE as i8);
-        self.asm.jcc_label(Condition::Equal, collect_reloc);
-        // Idle: a full from-scratch STW mark + sweep, bracketed as one
-        // pause. Free the previous cycle's ghosts first (no-op until
-        // evacuation runs).
-        self.emit_gc_pause_start();
-        self.asm.call_label(self.gc_stw_mark_complete);
-        self.asm.call_label(self.gc_free_ghost_regions);
-        self.asm.call_label(self.gc_sweep);
-        self.emit_gc_pause_end();
-        self.asm.jmp_label(collect_done);
-        // Relocate in progress: drain the remaining evacuation
-        // synchronously (unbounded quanta) until the phase returns to
-        // Idle. Unreachable until the activation step.
-        self.asm.bind_text_label(collect_reloc);
-        let reloc_loop = self.asm.create_text_label();
-        self.asm.bind_text_label(reloc_loop);
-        self.asm.mov_imm64(Reg::Rdi, i64::MAX as u64);
-        self.asm.call_label(self.gc_relocate_quantum);
-        self.asm.mov_data_addr(Reg::R10, self.gc_phase);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm
-            .cmp_reg_imm8(Reg::Rax, Self::GC_PHASE_RELOCATE as i8);
-        self.asm.jcc_label(Condition::Equal, reloc_loop);
-        self.asm.jmp_label(collect_done);
-        self.asm.bind_text_label(collect_mark);
-        self.asm.call_label(self.gc_mark_end);
-        self.asm.bind_text_label(collect_done);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper). The
+        // collection counter is bumped once per cycle inside gc_sweep.
+        let entry = self.gc_collect;
+        let timing = self.gc_log && !self.is_windows;
+        let pause = self.gc_pause_cells();
+        let targets = portable_asm::CollectTargets {
+            stw_mark_complete: self.gc_stw_mark_complete,
+            free_ghost_regions: self.gc_free_ghost_regions,
+            sweep: self.gc_sweep,
+            relocate_quantum: self.gc_relocate_quantum,
+            mark_end: self.gc_mark_end,
+        };
+        portable_asm::emit_gc_collect(self, entry, timing, pause, self.gc_phase, targets);
     }
 
     /// Mark roots: walk the GC shadow stack (the sole root source),
