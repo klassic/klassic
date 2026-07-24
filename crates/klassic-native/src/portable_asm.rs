@@ -110,6 +110,7 @@ pub trait PortableAsm {
 
     fn add_reg_reg(&mut self, dst: Reg, src: Reg);
     fn sub_reg_reg(&mut self, dst: Reg, src: Reg);
+    fn and_reg_reg(&mut self, dst: Reg, src: Reg);
     fn or_reg_reg(&mut self, dst: Reg, src: Reg);
     fn xor_reg_reg(&mut self, dst: Reg, src: Reg);
     fn cmp_reg_reg(&mut self, a: Reg, b: Reg);
@@ -245,6 +246,9 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
     fn sub_reg_reg(&mut self, dst: Reg, src: Reg) {
         self.asm.sub_reg_reg(dst.into(), src.into());
+    }
+    fn and_reg_reg(&mut self, dst: Reg, src: Reg) {
+        self.asm.and_reg_reg(dst.into(), src.into());
     }
     fn or_reg_reg(&mut self, dst: Reg, src: Reg) {
         self.asm.or_reg_reg(dst.into(), src.into());
@@ -554,6 +558,127 @@ pub fn emit_gc_clear_all_marks<E: PortableAsm>(
     out.store_rbp_slot(8, Reg::V0);
     out.jmp_label(region_loop);
     out.bind_text_label(region_done);
+    out.leave();
+    out.ret();
+}
+
+/// Portable version of `gc_trace` (V7/rdi = pop budget): drain the mark
+/// worklist up to the budget, walking each popped pointer object's
+/// payload -- stripping the color off each child slot, following an M7
+/// forwarding word, recoloring the slot to the good/to-space value, then
+/// marking the child (the strong tricolor closure). Handles the
+/// pointer-list tag's leading length qword. Frame slots: 8 = remaining
+/// budget, 24 = field cursor, 32 = field end. Uses the reserved
+/// ColorStrip (R13) and GoodColor (R14) registers.
+pub fn emit_gc_trace<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    mark_worklist_top: E::DataLabel,
+    mark_worklist: E::DataLabel,
+    mark_visit: E::TextLabel,
+) {
+    use crate::gc_layout::{GC_FWD, GC_TYPE_POINTER_LIST, GC_TYPE_POINTER_RECORD};
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    out.sub_reg_imm8(Reg::V4, 32);
+    // rdi = pop budget for this quantum; [rbp-8] holds the remaining
+    // budget, [rbp-24] the field cursor, [rbp-32] the field end.
+    out.store_rbp_slot(8, Reg::V7);
+    let trace_loop = out.create_text_label();
+    let trace_done = out.create_text_label();
+    let trace_field_loop = out.create_text_label();
+    let trace_skip_field = out.create_text_label();
+    out.bind_text_label(trace_loop);
+    // Budget exhausted? (an incremental quantum stops here; gc_drain
+    // passes a large budget and loops until the worklist empties.)
+    out.load_rbp_slot(Reg::V0, 8);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, trace_done);
+    out.mov_data_addr(Reg::V10, mark_worklist_top);
+    out.load_ptr_disp32(Reg::V1, Reg::V10, 0);
+    out.test_reg_reg(Reg::V1, Reg::V1);
+    out.jcc_label(Condition::Equal, trace_done);
+    // We have work: spend one budget unit (rax still holds it).
+    out.sub_reg_imm8(Reg::V0, 1);
+    out.store_rbp_slot(8, Reg::V0);
+    // top--, fetch worklist[top]
+    out.sub_reg_imm8(Reg::V1, 1);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V1);
+    out.mov_data_addr(Reg::V8, mark_worklist);
+    out.load_ptr_disp32(Reg::V8, Reg::V8, 0);
+    out.mov_reg_reg(Reg::V9, Reg::V1);
+    out.shl_reg_imm8(Reg::V9, 3);
+    out.add_reg_reg(Reg::V8, Reg::V9);
+    out.load_ptr_disp32(Reg::V0, Reg::V8, 0);
+    // type at [rax - 8]
+    out.load_ptr_disp32(Reg::V1, Reg::V0, -8);
+    // Save the type tag because the upcoming size load reuses rcx.
+    out.mov_reg_reg(Reg::V8, Reg::V1);
+    // Tags below GC_TYPE_POINTER_RECORD (free / raw bytes) carry no
+    // pointer fields; tags >= it are walked as a packed pointer array,
+    // optionally skipping a leading length qword for the list tag.
+    out.cmp_reg_imm8(Reg::V1, GC_TYPE_POINTER_RECORD as i8);
+    out.jcc_label(Condition::Below, trace_loop);
+    // Pointer record / array / list: payload_size = (size & -16) - 16.
+    out.load_ptr_disp32(Reg::V1, Reg::V0, -16);
+    out.and_reg_imm32(Reg::V1, -16);
+    out.sub_reg_imm8(Reg::V1, 16);
+    // GC_TYPE_POINTER_LIST stores an integer length at payload offset 0 --
+    // skip it so the mark phase does not chase the length as a pointer.
+    let after_list_skip = out.create_text_label();
+    out.cmp_reg_imm8(Reg::V8, GC_TYPE_POINTER_LIST as i8);
+    out.jcc_label(Condition::NotEqual, after_list_skip);
+    out.add_reg_imm32(Reg::V0, 8);
+    out.sub_reg_imm8(Reg::V1, 8);
+    out.bind_text_label(after_list_skip);
+    // trace_end = rax + payload_size; trace_cursor = rax
+    out.mov_reg_reg(Reg::V9, Reg::V0);
+    out.add_reg_reg(Reg::V9, Reg::V1);
+    out.store_rbp_slot(32, Reg::V9);
+    out.store_rbp_slot(24, Reg::V0);
+    out.bind_text_label(trace_field_loop);
+    out.load_rbp_slot(Reg::V10, 24);
+    out.load_rbp_slot(Reg::V11, 32);
+    out.cmp_reg_reg(Reg::V10, Reg::V11);
+    out.jcc_label(Condition::AboveOrEqual, trace_loop);
+    out.load_ptr_disp32(Reg::V7, Reg::V10, 0);
+    // Heap slots hold colored pointers; strip the color before
+    // gc_mark_visit dereferences the block header at [rdi-16].
+    out.and_reg_reg(Reg::V7, Reg::ColorStrip);
+    out.test_reg_reg(Reg::V7, Reg::V7);
+    out.jcc_label(Condition::Equal, trace_skip_field);
+    // M7: follow forwarding BEFORE recoloring/healing the slot. If the
+    // child was already evacuated, its header is a forwarding word; heal
+    // the slot to the TO-SPACE address, not a good-colored ghost pointer
+    // (a later fast-path load would deref it as a forwarding word ->
+    // use-after-free). Inert while evac is off. r11 is scratch here.
+    let trace_child_not_fwd = out.create_text_label();
+    out.load_ptr_disp32(Reg::V11, Reg::V7, -16);
+    out.and_reg_imm32(Reg::V11, GC_FWD as i32);
+    out.test_reg_reg(Reg::V11, Reg::V11);
+    out.jcc_label(Condition::Equal, trace_child_not_fwd);
+    out.load_ptr_disp32(Reg::V11, Reg::V7, -16);
+    out.and_reg_imm32(Reg::V11, -16); // to-space user ptr
+    out.mov_reg_reg(Reg::V7, Reg::V11);
+    out.bind_text_label(trace_child_not_fwd);
+    // Recolor-on-trace: write the good-colored (to-space) child back into
+    // this field slot (r10 = slot address) BEFORE marking, so a later
+    // barriered load of the same field takes the fast path instead of
+    // re-entering the slow path. Must precede the call, which clobbers
+    // r10; the cursor is reloaded afterward. Inert until the mark color
+    // flips (recoloring good->good is a no-op).
+    out.mov_reg_reg(Reg::V11, Reg::V7);
+    out.or_reg_reg(Reg::V11, Reg::GoodColor);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V11);
+    out.call_label(mark_visit);
+    out.bind_text_label(trace_skip_field);
+    out.load_rbp_slot(Reg::V10, 24);
+    out.add_reg_imm32(Reg::V10, 8);
+    out.store_rbp_slot(24, Reg::V10);
+    out.jmp_label(trace_field_loop);
+    out.bind_text_label(trace_done);
     out.leave();
     out.ret();
 }

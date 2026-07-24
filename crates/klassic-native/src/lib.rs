@@ -38466,115 +38466,16 @@ impl NativeCodeGenerator {
     /// Trace: drain the mark worklist, walking each pointer object's
     /// payload and marking its children (the strong tricolor closure).
     fn emit_gc_trace_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_trace);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.asm.sub_reg_imm8(Reg::Rsp, 32);
-        // rdi = pop budget for this quantum; [rbp-8] holds the remaining
-        // budget, [rbp-24] the field cursor, [rbp-32] the field end.
-        self.asm.store_rbp_slot(8, Reg::Rdi);
-        let trace_loop = self.asm.create_text_label();
-        let trace_done = self.asm.create_text_label();
-        let trace_field_loop = self.asm.create_text_label();
-        let trace_skip_field = self.asm.create_text_label();
-        self.asm.bind_text_label(trace_loop);
-        // Budget exhausted? (an incremental quantum stops here; the caller
-        // resumes next time. gc_drain passes a large budget per call and
-        // loops until the worklist empties, so it drains fully.)
-        self.asm.load_rbp_slot(Reg::Rax, 8);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, trace_done);
-        self.asm.mov_data_addr(Reg::R10, self.gc_mark_worklist_top);
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
-        self.asm.jcc_label(Condition::Equal, trace_done);
-        // We have work: spend one budget unit (rax still holds it).
-        self.asm.sub_reg_imm8(Reg::Rax, 1);
-        self.asm.store_rbp_slot(8, Reg::Rax);
-        // top--, fetch worklist[top]
-        self.asm.sub_reg_imm8(Reg::Rcx, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rcx);
-        self.asm.mov_data_addr(Reg::R8, self.gc_mark_worklist);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
-        self.asm.mov_reg_reg(Reg::R9, Reg::Rcx);
-        self.asm.shl_reg_imm8(Reg::R9, 3);
-        self.asm.add_reg_reg(Reg::R8, Reg::R9);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R8, 0);
-        // type at [rax - 8]
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rax, -8);
-        // Save the type tag because the upcoming size load reuses rcx.
-        self.asm.mov_reg_reg(Reg::R8, Reg::Rcx);
-        // Tags below GC_TYPE_POINTER_RECORD (free / raw bytes) carry no
-        // pointer fields; tags >= GC_TYPE_POINTER_RECORD (record, array,
-        // pointer list) are walked as a packed array of heap pointers,
-        // optionally skipping a leading length qword for the list tag.
-        self.asm
-            .cmp_reg_imm8(Reg::Rcx, Self::GC_TYPE_POINTER_RECORD as i8);
-        self.asm.jcc_label(Condition::Below, trace_loop);
-        // Pointer record / array / list: walk payload. payload_size =
-        // (size & -16) - 16 (mask clears the FWD + mark low bits).
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::Rax, -16);
-        self.asm.and_reg_imm32(Reg::Rcx, -16);
-        self.asm.sub_reg_imm8(Reg::Rcx, 16);
-        // GC_TYPE_POINTER_LIST stores an integer length at offset 0 of
-        // the payload — skip it so the mark phase does not try to chase
-        // the length value as a heap pointer.
-        let after_list_skip = self.asm.create_text_label();
-        self.asm
-            .cmp_reg_imm8(Reg::R8, Self::GC_TYPE_POINTER_LIST as i8);
-        self.asm.jcc_label(Condition::NotEqual, after_list_skip);
-        self.asm.add_reg_imm32(Reg::Rax, 8);
-        self.asm.sub_reg_imm8(Reg::Rcx, 8);
-        self.asm.bind_text_label(after_list_skip);
-        // trace_end = rax + payload_size; trace_cursor = rax
-        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
-        self.asm.add_reg_reg(Reg::R9, Reg::Rcx);
-        self.asm.store_rbp_slot(32, Reg::R9);
-        self.asm.store_rbp_slot(24, Reg::Rax);
-        self.asm.bind_text_label(trace_field_loop);
-        self.asm.load_rbp_slot(Reg::R10, 24);
-        self.asm.load_rbp_slot(Reg::R11, 32);
-        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, trace_loop);
-        self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
-        // Heap slots hold colored pointers; strip the color before
-        // gc_mark_visit dereferences the block header at [rdi-16].
-        self.asm.and_reg_reg(Reg::Rdi, Reg::R13);
-        self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
-        self.asm.jcc_label(Condition::Equal, trace_skip_field);
-        // M7: follow forwarding BEFORE recoloring/healing the slot. If the
-        // child was already evacuated, its header is a forwarding word;
-        // we must heal the slot to the TO-SPACE address, not write a
-        // good-colored ghost pointer (which a later fast-path load would
-        // dereference as a forwarding word -> use-after-free). Inert while
-        // evac is off (FWD never set). r11 is scratch here.
-        let trace_child_not_fwd = self.asm.create_text_label();
-        self.asm.load_ptr_disp32(Reg::R11, Reg::Rdi, -16);
-        self.asm.and_reg_imm32(Reg::R11, Self::GC_FWD as i32);
-        self.asm.test_reg_reg(Reg::R11, Reg::R11);
-        self.asm.jcc_label(Condition::Equal, trace_child_not_fwd);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::Rdi, -16);
-        self.asm.and_reg_imm32(Reg::R11, -16); // to-space user ptr
-        self.asm.mov_reg_reg(Reg::Rdi, Reg::R11);
-        self.asm.bind_text_label(trace_child_not_fwd);
-        // Recolor-on-trace: write the good-colored (to-space) child back
-        // into this field slot (r10 = slot address) BEFORE marking, so a
-        // later barriered load of the same field takes the fast path
-        // instead of re-entering the slow path. Must precede the call,
-        // which clobbers r10; the cursor is reloaded afterward. Inert
-        // until the mark color flips (recoloring good->good is a no-op).
-        self.asm.mov_reg_reg(Reg::R11, Reg::Rdi);
-        self.asm.or_reg_reg(Reg::R11, Reg::R14);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
-        self.asm.call_label(self.gc_mark_visit);
-        self.asm.bind_text_label(trace_skip_field);
-        self.asm.load_rbp_slot(Reg::R10, 24);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.store_rbp_slot(24, Reg::R10);
-        self.asm.jmp_label(trace_field_loop);
-        self.asm.bind_text_label(trace_done);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_trace;
+        portable_asm::emit_gc_trace(
+            self,
+            entry,
+            self.gc_mark_worklist_top,
+            self.gc_mark_worklist,
+            self.gc_mark_visit,
+        );
     }
 
     /// Sweep: region-based reclamation -- clear mark bits and reclaim
