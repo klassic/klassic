@@ -886,6 +886,88 @@ pub fn emit_gc_relocate_finish<E: PortableAsm>(
     out.ret();
 }
 
+/// Portable version of `gc_relocate_fix_roots`: at RelocateStart, walk
+/// every shadow-stack root slot and, for each root pointing into a
+/// from-space region, redirect it to the object's to-space copy --
+/// following an existing forwarding word or evacuating on demand. Uses
+/// two frame slots (`[rbp-8]` = cursor, `[rbp-16]` = end). Needs no new
+/// trait methods.
+pub fn emit_gc_relocate_fix_roots<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    shadow_stack: E::DataLabel,
+    shadow_stack_top: E::DataLabel,
+    region_base: E::DataLabel,
+    region_fromspace: E::DataLabel,
+    evacuate: E::TextLabel,
+) {
+    use crate::gc_layout::{GC_FWD, GC_REGION_SHIFT};
+
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5); // rbp
+    out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
+    out.sub_reg_imm8(Reg::V4, 16); // [rbp-8]=cursor, [rbp-16]=end
+    out.mov_data_addr(Reg::V10, shadow_stack);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.store_rbp_slot(8, Reg::V10);
+    out.mov_data_addr(Reg::V8, shadow_stack_top);
+    out.load_ptr_disp32(Reg::V1, Reg::V8, 0);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.store_rbp_slot(16, Reg::V10);
+    let loop_l = out.create_text_label();
+    let done_l = out.create_text_label();
+    let next_l = out.create_text_label();
+    let do_evac = out.create_text_label();
+    let store_root = out.create_text_label();
+    out.bind_text_label(loop_l);
+    out.load_rbp_slot(Reg::V10, 8);
+    out.load_rbp_slot(Reg::V11, 16);
+    out.cmp_reg_reg(Reg::V10, Reg::V11);
+    out.jcc_label(Condition::AboveOrEqual, done_l);
+    // slotaddr = [cursor]; val = [slotaddr].
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.load_ptr_disp32(Reg::V7, Reg::V0, 0);
+    out.test_reg_reg(Reg::V7, Reg::V7);
+    out.jcc_label(Condition::Equal, next_l);
+    // idx = (val - region_base) >> SHIFT ; from-space?
+    out.mov_reg_reg(Reg::V1, Reg::V7);
+    out.mov_data_addr(Reg::V10, region_base);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0);
+    out.sub_reg_reg(Reg::V1, Reg::V10);
+    out.shr_reg_imm8(Reg::V1, GC_REGION_SHIFT);
+    out.shl_reg_imm8(Reg::V1, 3);
+    out.mov_data_addr(Reg::V10, region_fromspace);
+    out.add_reg_reg(Reg::V10, Reg::V1);
+    out.load_ptr_disp32(Reg::V11, Reg::V10, 0);
+    out.test_reg_reg(Reg::V11, Reg::V11);
+    out.jcc_label(Condition::Equal, next_l);
+    // val in from-space: new = (word0 & FWD) ? word0 & -16 : evacuate(val)
+    out.load_ptr_disp32(Reg::V11, Reg::V7, -16);
+    out.mov_reg_reg(Reg::V1, Reg::V11);
+    out.and_reg_imm32(Reg::V1, GC_FWD as i32);
+    out.test_reg_reg(Reg::V1, Reg::V1);
+    out.jcc_label(Condition::Equal, do_evac);
+    out.and_reg_imm32(Reg::V11, -16);
+    out.mov_reg_reg(Reg::V0, Reg::V11); // new
+    out.jmp_label(store_root);
+    out.bind_text_label(do_evac);
+    out.call_label(evacuate); // rdi = val -> rax = to-space
+    out.bind_text_label(store_root);
+    // [slotaddr] = new. slotaddr was clobbered by the call; reload it.
+    out.load_rbp_slot(Reg::V10, 8);
+    out.load_ptr_disp32(Reg::V10, Reg::V10, 0); // slotaddr
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.bind_text_label(next_l);
+    out.load_rbp_slot(Reg::V10, 8);
+    out.add_reg_imm32(Reg::V10, 8);
+    out.store_rbp_slot(8, Reg::V10);
+    out.jmp_label(loop_l);
+    out.bind_text_label(done_l);
+    out.leave();
+    out.ret();
+}
+
 /// Data cells the MarkStart color/phase setup writes and reloads.
 #[derive(Clone, Copy)]
 pub struct MarkStartCells<D: Copy> {

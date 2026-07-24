@@ -39518,69 +39518,18 @@ impl NativeCodeGenerator {
     /// the root points at the to-space copy. Roots are raw (uncolored);
     /// the shadow stack holds slot ADDRESSES, so the rewrite is in place.
     fn emit_gc_relocate_fix_roots_runtime(&mut self) {
-        self.asm.bind_text_label(self.gc_relocate_fix_roots);
-        self.asm.push_reg(Reg::Rbp);
-        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
-        self.asm.sub_reg_imm8(Reg::Rsp, 16); // [rbp-8]=cursor, [rbp-16]=end
-        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.store_rbp_slot(8, Reg::R10);
-        self.asm.mov_data_addr(Reg::R8, self.gc_shadow_stack_top);
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R8, 0);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.store_rbp_slot(16, Reg::R10);
-        let loop_l = self.asm.create_text_label();
-        let done_l = self.asm.create_text_label();
-        let next_l = self.asm.create_text_label();
-        let do_evac = self.asm.create_text_label();
-        let store_root = self.asm.create_text_label();
-        self.asm.bind_text_label(loop_l);
-        self.asm.load_rbp_slot(Reg::R10, 8);
-        self.asm.load_rbp_slot(Reg::R11, 16);
-        self.asm.cmp_reg_reg(Reg::R10, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, done_l);
-        // slotaddr = [cursor]; val = [slotaddr].
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rax, 0);
-        self.asm.test_reg_reg(Reg::Rdi, Reg::Rdi);
-        self.asm.jcc_label(Condition::Equal, next_l);
-        // idx = (val - region_base) >> SHIFT ; from-space?
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_base);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
-        self.asm.sub_reg_reg(Reg::Rcx, Reg::R10);
-        self.asm.shr_reg_imm8(Reg::Rcx, Self::GC_REGION_SHIFT);
-        self.asm.shl_reg_imm8(Reg::Rcx, 3);
-        self.asm.mov_data_addr(Reg::R10, self.gc_region_fromspace);
-        self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.asm.test_reg_reg(Reg::R11, Reg::R11);
-        self.asm.jcc_label(Condition::Equal, next_l);
-        // val in from-space: new = (word0 & FWD) ? word0 & -16 : evacuate(val)
-        self.asm.load_ptr_disp32(Reg::R11, Reg::Rdi, -16);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::R11);
-        self.asm.and_reg_imm32(Reg::Rcx, Self::GC_FWD as i32);
-        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
-        self.asm.jcc_label(Condition::Equal, do_evac);
-        self.asm.and_reg_imm32(Reg::R11, -16);
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R11); // new
-        self.asm.jmp_label(store_root);
-        self.asm.bind_text_label(do_evac);
-        self.asm.call_label(self.gc_evacuate); // rdi = val -> rax = to-space
-        self.asm.bind_text_label(store_root);
-        // [slotaddr] = new. slotaddr was clobbered by the call; reload it.
-        self.asm.load_rbp_slot(Reg::R10, 8);
-        self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0); // slotaddr
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.bind_text_label(next_l);
-        self.asm.load_rbp_slot(Reg::R10, 8);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.store_rbp_slot(8, Reg::R10);
-        self.asm.jmp_label(loop_l);
-        self.asm.bind_text_label(done_l);
-        self.asm.leave();
-        self.asm.ret();
+        // Migrated onto the portable `PortableAsm` emitter trait; behavior
+        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
+        let entry = self.gc_relocate_fix_roots;
+        portable_asm::emit_gc_relocate_fix_roots(
+            self,
+            entry,
+            self.gc_shadow_stack,
+            self.gc_shadow_stack_top,
+            self.gc_region_base,
+            self.gc_region_fromspace,
+            self.gc_evacuate,
+        );
     }
 
     /// One incremental relocation quantum: rdi = byte budget. Linearly
