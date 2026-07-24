@@ -12940,6 +12940,18 @@ impl NativeCodeGenerator {
         span: Span,
         overflow_context: &str,
     ) -> NativeValue {
+        // Resolve both slots through the load barrier and write the
+        // resolved address back into each slot: every subsequent read
+        // in this function (there are several, below) then sees a
+        // plain, already-current address, so nothing past this point
+        // needs to change.
+        self.asm.load_rbp_slot(Reg::Rax, a_slot.offset);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
+        self.asm.load_rbp_slot(Reg::Rax, b_slot.offset);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.store_rbp_slot(b_slot.offset, Reg::Rax);
+
         // total_len = len_a + len_b
         self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
@@ -12975,6 +12987,10 @@ impl NativeCodeGenerator {
         self.asm.and_reg_imm32(Reg::Rdi, -8);
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
+        // Mask defensively before writing the payload -- see the
+        // matching comment in compile_gc_string.
+        self.asm.mov_imm64(Reg::Rcx, 0x7fff_ffff_ffff_ffff_u64);
+        self.asm.and_reg_reg(Reg::Rax, Reg::Rcx);
 
         // Stash the new pointer in its own tracked slot — defensive in
         // case future reorganization adds another collection point
@@ -13013,6 +13029,20 @@ impl NativeCodeGenerator {
     }
 
     fn emit_heap_string_equality_from_regs(&mut self, lhs: Reg, rhs: Reg, span: Span, name: &str) {
+        // Resolve both operands through the load barrier before
+        // dereferencing them for length. Every call site passes
+        // R10/R11 here, never rax, so rax is free as scratch -- but
+        // the barrier itself clobbers r11, so rhs must be stashed
+        // across the call that resolves lhs.
+        self.asm.push_reg(rhs);
+        self.asm.mov_reg_reg(Reg::Rax, lhs);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_reg_reg(lhs, Reg::Rax);
+        self.asm.pop_reg(rhs);
+        self.asm.mov_reg_reg(Reg::Rax, rhs);
+        self.asm.call_label(self.zgc_load_barrier);
+        self.asm.mov_reg_reg(rhs, Reg::Rax);
+
         let false_branch = self.asm.create_text_label();
         let true_branch = self.asm.create_text_label();
         let done = self.asm.create_text_label();
@@ -35813,8 +35843,10 @@ impl NativeCodeGenerator {
                 self.asm.call_label(self.print_i64);
             }
             NativeValue::HeapString => {
-                // rax = heap pointer to [len: i64][bytes]. Emit
-                // write(fd, ptr+8, [ptr]).
+                // rax = heap pointer to [len: i64][bytes]. Resolve
+                // through the barrier before dereferencing the length.
+                self.asm.call_label(self.zgc_load_barrier);
+                // Emit write(fd, ptr+8, [ptr]).
                 self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
                 self.asm.add_reg_imm32(Reg::Rsi, 8);
                 self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rax, 0);
@@ -38939,6 +38971,10 @@ impl NativeCodeGenerator {
         span: Span,
         overflow_message: &str,
     ) {
+        // rax holds the heap-string pointer to convert (every call site
+        // sets it up just before calling this); resolve it through the
+        // barrier before dereferencing its length header below.
+        self.asm.call_label(self.zgc_load_barrier);
         self.asm.mov_data_addr(Reg::Rbx, output);
         self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
         self.asm.add_reg_imm32(Reg::Rsi, 8);
