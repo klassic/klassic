@@ -680,6 +680,41 @@ impl Assembler {
         self.word(0x1e60_1800 | (dm << 16) | (dn << 5) | dd);
     }
 
+    /// `fsqrt dd, dn`
+    fn fsqrt_d(&mut self, dd: u32, dn: u32) {
+        self.word(0x1e61_c000 | (dn << 5) | dd);
+    }
+
+    /// `fneg dd, dn`
+    fn fneg_d(&mut self, dd: u32, dn: u32) {
+        self.word(0x1e61_4000 | (dn << 5) | dd);
+    }
+
+    /// `fabs dd, dn`
+    fn fabs_d(&mut self, dd: u32, dn: u32) {
+        self.word(0x1e60_c000 | (dn << 5) | dd);
+    }
+
+    /// `scvtf dd, xn` — signed 64-bit integer to double.
+    fn scvtf_d_from_x(&mut self, dd: u32, x: Reg) {
+        self.word(0x9e62_0000 | ((x as u32) << 5) | dd);
+    }
+
+    /// `fcvtzs xd, dn` — double to signed 64-bit integer, truncating.
+    fn fcvtzs_x_from_d(&mut self, x: Reg, dn: u32) {
+        self.word(0x9e78_0000 | (dn << 5) | x as u32);
+    }
+
+    /// `frintm dd, dn` — round toward minus infinity (floor).
+    fn frintm_d(&mut self, dd: u32, dn: u32) {
+        self.word(0x1e65_4000 | (dn << 5) | dd);
+    }
+
+    /// `frintp dd, dn` — round toward plus infinity (ceil).
+    fn frintp_d(&mut self, dd: u32, dn: u32) {
+        self.word(0x1e64_c000 | (dn << 5) | dd);
+    }
+
     /// `fcmp dn, dm` — sets NZCV for a conditional-set.
     fn fcmp_d(&mut self, dn: u32, dm: u32) {
         self.word(0x1e60_2000 | (dm << 16) | (dn << 5));
@@ -1509,6 +1544,12 @@ impl Emitter {
                 let ty = self.expression(expr)?;
                 match (op, ty) {
                     (UnaryOp::Plus, ValueType::Int | ValueType::Double) => Ok(ty),
+                    (UnaryOp::Minus, ValueType::Double) => {
+                        self.asm.fmov_d_from_x(0, Reg::X0);
+                        self.asm.fneg_d(0, 0);
+                        self.asm.fmov_x_from_d(Reg::X0, 0);
+                        Ok(ValueType::Double)
+                    }
                     (UnaryOp::Minus, ValueType::Int) => {
                         // 0 - value, which is also how the evaluator negates.
                         self.asm.mov_reg(Reg::X1, Reg::X0);
@@ -4451,6 +4492,80 @@ impl Emitter {
                     return Err(unsupported(span, "__gc_string of a non-string"));
                 }
                 Ok(Some(ValueType::Str))
+            }
+            // ---- numeric builtins ----
+            // Doubles travel as their raw bits in a general register, so each
+            // of these moves through d0 and back. `abs` is the only one that
+            // also has an integer form.
+            ("double", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                match ty {
+                    ValueType::Int => {
+                        self.asm.scvtf_d_from_x(0, Reg::X0);
+                        self.asm.fmov_x_from_d(Reg::X0, 0);
+                        Ok(Some(ValueType::Double))
+                    }
+                    ValueType::Double => Ok(Some(ValueType::Double)),
+                    _ => Err(unsupported(span, "double of this type")),
+                }
+            }
+            ("sqrt", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                match ty {
+                    ValueType::Double => {
+                        self.asm.fmov_d_from_x(0, Reg::X0);
+                        self.asm.fsqrt_d(0, 0);
+                        self.asm.fmov_x_from_d(Reg::X0, 0);
+                        Ok(Some(ValueType::Double))
+                    }
+                    // The evaluator's sqrt is Double-valued for an Int too.
+                    ValueType::Int => {
+                        self.asm.scvtf_d_from_x(0, Reg::X0);
+                        self.asm.fsqrt_d(0, 0);
+                        self.asm.fmov_x_from_d(Reg::X0, 0);
+                        Ok(Some(ValueType::Double))
+                    }
+                    _ => Err(unsupported(span, "sqrt of this type")),
+                }
+            }
+            ("floor", 1) | ("ceil", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                if ty != ValueType::Double {
+                    return Err(unsupported(span, &format!("{name} of a non-Double")));
+                }
+                self.asm.fmov_d_from_x(0, Reg::X0);
+                if name == "floor" {
+                    self.asm.frintm_d(0, 0);
+                } else {
+                    self.asm.frintp_d(0, 0);
+                }
+                // The evaluator's floor/ceil are Int-valued.
+                self.asm.fcvtzs_x_from_d(Reg::X0, 0);
+                Ok(Some(ValueType::Int))
+            }
+            ("abs", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                match ty {
+                    ValueType::Double => {
+                        self.asm.fmov_d_from_x(0, Reg::X0);
+                        self.asm.fabs_d(0, 0);
+                        self.asm.fmov_x_from_d(Reg::X0, 0);
+                        Ok(Some(ValueType::Double))
+                    }
+                    ValueType::Int => {
+                        // negative ? 0 - value : value
+                        let non_negative = self.asm.new_label();
+                        self.asm.cmp_imm(Reg::X0, 0);
+                        self.asm
+                            .branch(non_negative, BranchKind::Conditional(Cond::Ge));
+                        self.asm.mov_reg(Reg::X1, Reg::X0);
+                        self.asm.mov_imm64(Reg::X0, 0);
+                        self.asm.sub_reg(Reg::X0, Reg::X0, Reg::X1);
+                        self.asm.bind(non_negative);
+                        Ok(Some(ValueType::Int))
+                    }
+                    _ => Err(unsupported(span, "abs of this type")),
+                }
             }
             ("__match_fail", 0) => {
                 self.asm
