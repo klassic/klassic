@@ -28491,13 +28491,82 @@ fn build_target_aarch64_apple_darwin_gc_log_reports_real_collections() {
         field("allocs=") > 0,
         "no allocations were counted: {stderr}"
     );
-    // M9: compaction really happening is what separates the moving collector
-    // from the non-moving one. A relocated count of zero would mean
-    // evacuation never ran, leaving the forwarding-word paths -- the part of
-    // the design that only exists once evacuation is on -- untested no
-    // matter how green everything else looks.
+}
+
+/// M9: the moving collector really moves things. Compaction needs *sparse*
+/// regions, which the corpus above cannot produce -- it fits in a single
+/// region, and under `--gc-stress` every collection reclaims everything, so
+/// no region ever ends up mostly-garbage-with-a-few-survivors. This workload
+/// does: a long-lived tree held across a long garbage churn, on the default
+/// incremental schedule, mirroring the x86-64 backend's evacuation test.
+///
+/// A non-zero `relocated=` is the only evidence that the forwarding-word
+/// paths -- the part of the design that exists only once evacuation is on --
+/// ran at all, and the survivor still printing correctly is the evidence
+/// that the moves were sound: every reference to it was remapped wherever
+/// the mutator kept one.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_gc_evacuation_moves_objects() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_gc_evac_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_gc_evac_{stamp}.bin"));
+    let program = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+         def sz(t: Tree): Int = t match { case Leaf(v) => v; case Branch(l, r) => sz(l) + sz(r) }\n\
+         val keeper = Branch(Leaf(100), Branch(Leaf(20), Leaf(3)))\n\
+         mutable i = 0\n\
+         while (i < 200000) {\n\
+           val garbage = Branch(Leaf(i), Leaf(i))\n\
+           i = i + 1\n\
+         }\n\
+         println(sz(keeper))\n";
+    fs::write(&source_path, program).expect("temp source file should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "--gc-log",
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
     assert!(
-        field("relocated=") > 0,
-        "the collector never relocated an object: {stderr}"
+        build.status.success(),
+        "evacuation build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run.status.success(),
+        "evacuation run exited with {:?}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "123\n",
+        "the moving collector must preserve the survivor"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let relocated = stderr
+        .split(" relocated=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("stats line should report relocated=<n>:\n{stderr}"));
+    assert!(
+        relocated > 0,
+        "evacuation should move live objects out of sparse regions: {stderr}"
     );
 }
