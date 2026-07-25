@@ -4886,6 +4886,36 @@ impl Emitter {
                 self.emit_substring();
                 Ok(Some(ValueType::Str))
             }
+            // `println` in expression position, which is where it lands when it
+            // is the last thing in a block -- the body of a timed or mapped
+            // block, say. It answers with unit, like every other statement.
+            ("println", 1) => {
+                self.println_call(arguments, span)?;
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(Some(ValueType::Unit))
+            }
+            // The same line on standard error.
+            ("printlnError", 1) => {
+                if let Some(line) = Self::literal_line(&arguments[0])? {
+                    self.asm.emit_write_rodata(STDERR_FD, line.as_bytes());
+                    self.asm.mov_imm64(Reg::X0, 0);
+                    return Ok(Some(ValueType::Unit));
+                }
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(
+                        arguments[0].span(),
+                        "printing this to standard error",
+                    ));
+                }
+                self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+                self.asm.add_reg_imm(Reg::X1, Reg::X0, 8); // bytes
+                self.asm.mov_imm64(Reg::X0, STDERR_FD);
+                self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+                self.asm.svc_0x80();
+                self.asm.emit_write_rodata(STDERR_FD, b"\n");
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(Some(ValueType::Unit))
+            }
             ("assert", 1) => {
                 if self.expression(&arguments[0])? != ValueType::Bool {
                     return Err(unsupported(span, "assert of a non-Bool"));
@@ -5128,6 +5158,67 @@ impl Emitter {
                 }
                 self.asm.bind(end);
                 Ok(Some(value_ty))
+            }
+            // `sleep(millis)` without a sleep syscall: this backend only issues
+            // syscalls whose numbers it can verify, and Darwin does not publish
+            // them in headers, so the wait is spun on the clock that is already
+            // verified here. That costs the CPU it holds for the duration --
+            // worth being explicit about -- but it is exact and it is honest,
+            // where a guessed syscall number would break only on the machine
+            // that runs the program.
+            ("sleep", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(arguments[0].span(), "sleeping for a non-Int"));
+                }
+                self.asm.push(Reg::X0); // millis
+                self.emit_time_now_millis(); // x0 = now
+                self.asm.pop(Reg::X1); // millis
+                // The evaluator rejects a negative duration at run time.
+                let non_negative = self.asm.new_label();
+                self.asm.cmp_imm(Reg::X1, 0);
+                self.asm
+                    .branch(non_negative, BranchKind::Conditional(Cond::Ge));
+                self.asm
+                    .emit_write_rodata(STDERR_FD, b"klassic: sleep expects a non-negative Int\n");
+                self.asm.emit_exit(1);
+                self.asm.bind(non_negative);
+                self.asm.add_reg(Reg::X1, Reg::X0, Reg::X1); // deadline
+                self.asm.push(Reg::X1);
+                let wait = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(wait);
+                self.emit_time_now_millis(); // x0 = now
+                self.asm.add_reg_sp_imm(Reg::X1, 0);
+                self.asm.ldr_imm(Reg::X1, Reg::X1, 0); // deadline
+                self.asm.cmp_reg(Reg::X0, Reg::X1);
+                self.asm.branch(done, BranchKind::Conditional(Cond::Ge));
+                self.asm.branch(wait, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.pop(Reg::X1); // deadline, discarded
+                self.asm.mov_imm64(Reg::X0, 0); // Unit
+                Ok(Some(ValueType::Unit))
+            }
+            // `stopwatch(block)`: how many milliseconds the block took. Its
+            // value is discarded, like the evaluator's.
+            ("stopwatch", 1) => {
+                let Some((params, body)) = self.lambda_argument(&arguments[0]) else {
+                    return Err(unsupported(arguments[0].span(), "timing this argument"));
+                };
+                if !params.is_empty() {
+                    return Err(unsupported(
+                        arguments[0].span(),
+                        "timing a block that takes arguments",
+                    ));
+                }
+                self.emit_time_now_millis(); // x0 = start
+                self.asm.push(Reg::X0);
+                let index = self.lambdas.len();
+                self.lambdas.push((params, body));
+                self.emit_inline_lambda_call(index, &[], span)?;
+                self.emit_time_now_millis(); // x0 = end
+                self.asm.pop(Reg::X1); // start
+                self.asm.sub_reg(Reg::X0, Reg::X0, Reg::X1);
+                Ok(Some(ValueType::Int))
             }
             ("Map#containsKey", 2) | ("containsKey", 2) | ("Map#get", 2) | ("get", 2) => {
                 let map_ty = self.expression(&arguments[0])?;
