@@ -1,0 +1,43 @@
+// Cross-target fixture: the `std.json` module, parsed and rendered.
+//
+// This is the stdlib module that took the longest to become portable, and the
+// reason is in its own shape: an array's elements are a cons-style enum rather
+// than a list, because a list of heap values built as it is walked is not
+// something every native target can represent. What every target *does* have
+// to agree on is the document that comes back and the error position when one
+// does not.
+
+import std.json.{parse, stringify}
+
+def show(text: String): String = parse(text) match {
+  case Ok(json) => stringify(json)
+  case Err(message) => "ERR: " + message
+}
+
+println(show("null"))
+println(show("true"))
+println(show("123"))
+println(show("-45"))
+println(show("\"hi\""))
+println(show("[]"))
+println(show("[1, 2, 3]"))
+println(show("[[1], [2, 3]]"))
+println(show("{}"))
+println(show("{\"a\": 1}"))
+println(show("{\"name\": \"klassic\", \"tags\": [\"compiler\", \"adt\"], \"stars\": 230, \"ok\": true}"))
+println(show("  [ 1 , 2 ]  "))
+assertResult("[1,2,3]")(show("[1, 2, 3]"))
+assertResult("{\"a\":1}")(show("{\"a\": 1}"))
+
+// Errors report where they happened, which is part of the module's contract.
+println(show("[1, 2"))
+println(show("{\"a\" 1}"))
+println(show("tru"))
+println(show("[1] junk"))
+println(show(""))
+
+// Escapes, in and out.
+println(show("\"a\\nb\""))
+println(show("\"quote: \\\"\""))
+assertResult("\"a\\nb\"")(show("\"a\\nb\""))
+println("done")

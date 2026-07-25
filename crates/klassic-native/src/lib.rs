@@ -4577,6 +4577,8 @@ struct NativeCodeGenerator {
     /// (tracks where a top-level fold attempt begins so the fuel tank
     /// refills there).
     static_eval_call_depth: usize,
+    /// What is left of `STATIC_EVAL_BUDGET` for this compilation.
+    static_eval_budget: usize,
     /// Remaining call-body evaluations for the current top-level fold
     /// attempt. Static folding of a recursive call re-evaluates the
     /// body per level — unbounded, that walks the compiler off its own
@@ -4902,6 +4904,7 @@ impl NativeCodeGenerator {
             pending_enum_shape: None,
             generic_enum_counter: 0,
             static_eval_call_depth: 0,
+            static_eval_budget: Self::STATIC_EVAL_BUDGET,
             static_eval_fuel: 0,
         }
     }
@@ -4918,10 +4921,16 @@ impl NativeCodeGenerator {
     /// bounds total *time*, including the re-evaluation that sibling
     /// fold strategies perform.
     const STATIC_EVAL_FUEL: usize = 1024;
+    /// How many folded calls one compilation may make in total.
+    const STATIC_EVAL_BUDGET: usize = 200_000;
     /// Maximum nesting of call-body evaluation — bounds the compiler's
     /// own *stack* (each level costs several deep Rust frames,
     /// especially in debug builds).
-    const STATIC_EVAL_MAX_CALL_DEPTH: usize = 128;
+    /// How deep one fold may go. Bounded well below what the compiler's own
+    /// stack allows: each level of folding is many native frames -- an
+    /// expression tree walked recursively -- so a deep fold overflowed the
+    /// stack outright on a recursive parser applied to a literal document.
+    const STATIC_EVAL_MAX_CALL_DEPTH: usize = 24;
 
     /// Enter one level of compile-time call-body evaluation, or `None`
     /// when the current attempt's budget is spent. The fuel tank
@@ -4933,6 +4942,18 @@ impl NativeCodeGenerator {
         if self.static_eval_call_depth == 0 {
             self.static_eval_fuel = Self::STATIC_EVAL_FUEL;
         }
+        // A budget for the whole compilation as well as one per top-level
+        // fold. The per-call fuel bounds one attempt, but a program can make
+        // many, and folding is re-entrant without memoisation: a recursive
+        // parser applied to a literal document explores the same sub-calls
+        // over and over, which turned minutes of compile time into an
+        // apparently hung compiler. Running out is not an error -- it means
+        // the rest of the program is compiled as code instead of being
+        // evaluated here, which is always a valid answer.
+        if self.static_eval_budget == 0 {
+            return None;
+        }
+        self.static_eval_budget -= 1;
         if self.static_eval_fuel == 0
             || self.static_eval_call_depth >= Self::STATIC_EVAL_MAX_CALL_DEPTH
         {
@@ -5299,10 +5320,33 @@ impl NativeCodeGenerator {
         arms: &[MatchArm],
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
-        if !arms
+        // An arm for a variant the scrutinee's shape does not have cannot be
+        // taken -- the shape is what this value *can* be -- so it is dropped
+        // rather than rejected. That is what makes `parse("[1, 2") match { case
+        // Ok(..) => ...; case Err(..) => ... }` compile: the parse is known to
+        // fail here, so the shape says `Err` and the `Ok` arm is dead code. An
+        // arm this lowering cannot handle for any *other* reason is still an
+        // error, since dropping that one would change what the program does.
+        let live: Vec<MatchArm> = arms
             .iter()
-            .all(|arm| en_pattern_supported_shaped(shape, &arm.pattern))
+            .filter(|arm| match &arm.pattern {
+                Pattern::Constructor { name, .. } => shape.variants.contains_key(name),
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        if live.is_empty()
+            || !live
+                .iter()
+                .all(|arm| en_pattern_supported_shaped(shape, &arm.pattern))
         {
+            eprintln!(
+                "DBG shape variants={:?} arms={:?}",
+                shape.variants.keys().collect::<Vec<_>>(),
+                arms.iter()
+                    .map(|a| format!("{:?}", a.pattern))
+                    .collect::<Vec<_>>()
+            );
             return Err(unsupported(
                 span,
                 "native generic enum match: a pattern variant is not in the scrutinee shape",
@@ -5312,7 +5356,7 @@ impl NativeCodeGenerator {
             &mut self.generic_enum_counter,
             shape,
             scrutinee,
-            arms.to_vec(),
+            live,
             span,
             &mut self.enum_shape_hints,
         );
@@ -5799,6 +5843,7 @@ impl NativeCodeGenerator {
             other => std::slice::from_ref(other),
         };
         let thread_aliases = top_level_thread_aliases(expressions);
+        let recursive_names = recursive_def_names(expressions);
         let top_level_value_names = top_level_value_names(expressions);
         self.top_level_mutable_names = top_level_mutable_names(expressions);
         for expression in expressions {
@@ -5869,10 +5914,8 @@ impl NativeCodeGenerator {
                     let captured_top_level_names =
                         referenced_top_level_names(body, &top_level_value_names);
                     let captures_top_level_values = !captured_top_level_names.is_empty();
-                    let self_recursive = {
-                        let names = HashSet::from([name.clone()]);
-                        expr_references_any_name(body, &names)
-                    };
+                    // Recursive through *any* path, not only its own name.
+                    let self_recursive = recursive_names.contains(name);
                     let requires_call_site_inline = !type_params.is_empty()
                         || !constraints.is_empty()
                         || flexible_params.iter().any(|flexible| *flexible)
@@ -8458,6 +8501,7 @@ impl NativeCodeGenerator {
             return Ok(self.emit_static_value(&value));
         }
         if function.unsupported_recursive_inline {
+            eprintln!("DBG unsupported_recursive_inline: {name}");
             return Err(unsupported(
                 span,
                 "native recursive function requiring call-site inlining",
@@ -39948,6 +39992,62 @@ fn top_level_mutable_names(expressions: &[Expr]) -> HashSet<String> {
             } => Some(name.clone()),
             _ => None,
         })
+        .collect()
+}
+
+/// The top-level defs that can reach themselves through calls -- directly or
+/// through each other.
+///
+/// Whether a function recurses decides whether it may be inlined at its call
+/// sites, and *mutual* recursion counts: `jsonParseValue` calls
+/// `jsonParseArrayItems`, which calls it back, so inlining either one expands
+/// forever. Looking only for a body that names itself missed that and the
+/// expansion ran the compiler out of stack.
+fn recursive_def_names(expressions: &[Expr]) -> HashSet<String> {
+    let names: HashSet<String> = expressions
+        .iter()
+        .filter_map(|expression| match expression {
+            Expr::DefDecl { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut calls: HashMap<String, HashSet<String>> = HashMap::new();
+    for expression in expressions {
+        if let Expr::DefDecl { name, body, .. } = expression {
+            calls.insert(name.clone(), referenced_top_level_names(body, &names));
+        }
+    }
+    // Reachability, grown until it stops growing: a name that reaches itself
+    // is in a cycle.
+    loop {
+        let mut grew = false;
+        for name in &names {
+            let reached = calls.get(name).cloned().unwrap_or_default();
+            let mut extended = reached.clone();
+            for step in &reached {
+                if let Some(next) = calls.get(step) {
+                    for further in next {
+                        extended.insert(further.clone());
+                    }
+                }
+            }
+            if extended.len() != reached.len() {
+                calls.insert(name.clone(), extended);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    names
+        .iter()
+        .filter(|name| {
+            calls
+                .get(*name)
+                .is_some_and(|reached| reached.contains(*name))
+        })
+        .cloned()
         .collect()
 }
 

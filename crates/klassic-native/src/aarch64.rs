@@ -1691,6 +1691,8 @@ struct Emitter {
     /// Whether each enum has type parameters, i.e. whether its payloads vary
     /// per value rather than being fixed by the declaration.
     enum_is_generic: Vec<bool>,
+    /// Each enum's type parameters, for instantiating an applied one.
+    enum_type_params: Vec<Vec<String>>,
     /// Payload annotations per enum, per variant, as written -- what a
     /// canonical shape is built from.
     enum_annotations: Vec<Vec<Vec<String>>>,
@@ -1748,6 +1750,12 @@ impl Emitter {
             .position(|(declared, _)| declared == bare)
             && !self.enum_is_generic[enum_index]
             && let Some(shape) = self.canonical_enum_shape(enum_index, span)
+        {
+            return Ok(ValueType::Enum(shape));
+        }
+        // `Result<JsonStep, String>`: a generic enum applied to concrete types.
+        if let Some((head, arguments)) = split_type_arguments(bare)
+            && let Some(shape) = self.instantiate_generic_enum(head, &arguments, span)
         {
             return Ok(ValueType::Enum(shape));
         }
@@ -1875,6 +1883,52 @@ impl Emitter {
         }
         self.enum_shapes[shape as usize].1 = payloads;
         Some(shape)
+    }
+
+    /// The shape of a generic enum named with its arguments -- `Result<JsonStep,
+    /// String>`. Applied to concrete types the declaration says everything, so
+    /// the shape is built once from it rather than accumulated per value, which
+    /// is what lets an annotated function's return type be complete instead of
+    /// as much as the first constructor happened to reveal.
+    fn instantiate_generic_enum(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        span: Span,
+    ) -> Option<u32> {
+        let enum_index = self
+            .generic_enums
+            .iter()
+            .position(|(declared, _)| declared == name)?;
+        if !self.enum_is_generic[enum_index] {
+            return None;
+        }
+        let params = self.enum_type_params[enum_index].clone();
+        if params.len() != arguments.len() {
+            return None;
+        }
+        let annotations = self.enum_annotations[enum_index].clone();
+        let mut payloads = Vec::with_capacity(annotations.len());
+        for fields in &annotations {
+            let mut typed = Vec::with_capacity(fields.len());
+            for annotation in fields {
+                let text = match params.iter().position(|param| param == annotation.trim()) {
+                    Some(at) => arguments[at].clone(),
+                    None => annotation.clone(),
+                };
+                typed.push(self.annotation_type(&text, span).ok()?);
+            }
+            payloads.push(typed);
+        }
+        if let Some(index) = self
+            .enum_shapes
+            .iter()
+            .position(|(which, known)| *which == enum_index && *known == payloads)
+        {
+            return Some(index as u32);
+        }
+        self.enum_shapes.push((enum_index, payloads));
+        Some((self.enum_shapes.len() - 1) as u32)
     }
 
     /// The enum and variant a constructor name belongs to, with the variant's
@@ -8672,6 +8726,7 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
             // Only an enum with no parameters has one shape for every value.
             emitter.canonical_enum_shapes.push(None);
             emitter.enum_is_generic.push(!type_params.is_empty());
+            emitter.enum_type_params.push(type_params.clone());
         }
     }
     // Pass 2: field types; undecodable declarations are marked
