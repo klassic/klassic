@@ -79,6 +79,17 @@ println(stdlibRangeInclusive(1, 3))
 println([1 2 3] reduce 0 => r + e)
 println(["a" "b" "c"] reduce "" => r + e)
 println(foldLeft([1 2 3 4])(1)((a, x) => a * x))
+// A lambda passed to a def, including through recursion: the parameter is
+// bound to the lambda at compile time, so a higher-order function needs no
+// closure -- and the prelude threads its function argument through its own
+// recursive calls, which has to keep resolving to the same lambda.
+def applyTwice(f, x) = f(f(x))
+println(applyTwice((n) => n + 3, 10))
+println(stdlibFilter([1, 2, 3, 4, 5, 6], (x) => x > 3))
+println(stdlibMap([1, 2, 3], (x) => x * 10))
+val nothing = null
+assertResult(16)(applyTwice((n) => n + 3, 10))
+
 assertResult(6)([1 2 3] reduce 0 => r + e)
 assertResult(24)(foldLeft([1 2 3 4])(1)((a, x) => a * x))
 

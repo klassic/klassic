@@ -1350,6 +1350,12 @@ fn list_elem_of(ty: ValueType) -> Option<ListElem> {
 struct FunctionInfo {
     label: Label,
     params: Vec<(String, ValueType)>,
+    /// Parameters bound to a lambda rather than to a runtime slot. A lambda
+    /// has no representation at run time in this backend -- it is compiled
+    /// where it is called -- so a higher-order def is specialised for the
+    /// particular lambda it was handed, and inside the body the parameter
+    /// name simply resolves to that lambda.
+    lambda_params: Vec<(String, usize)>,
     ret: ValueType,
     body: Expr,
 }
@@ -1546,6 +1552,14 @@ impl Emitter {
                 Ok(ty)
             }
             Expr::Binary { lhs, op, rhs, span } => self.binary(lhs, *op, rhs, *span),
+            // `null` is the null pointer. Typed as a heap reference so a
+            // binding holding it is rooted like any other -- the root scan and
+            // both barriers already treat 0 as "nothing here", so a null slot
+            // costs nothing and needs no special case.
+            Expr::Null { .. } => {
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(ValueType::Ptr)
+            }
             Expr::Unary { op, expr, span } => {
                 let ty = self.expression(expr)?;
                 match (op, ty) {
@@ -5149,6 +5163,22 @@ impl Emitter {
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return None;
                 };
+                // A name bound to a lambda: its result is the lambda body's,
+                // with the lambda's parameters bound to these arguments. This
+                // is what types a higher-order def like
+                // `def applyTwice(f, x) = f(f(x))`.
+                if let Some(lambda) = self.lookup_lambda(name) {
+                    let (lambda_params, lambda_body) = &self.lambdas[lambda];
+                    if lambda_params.len() != arguments.len() {
+                        return None;
+                    }
+                    let mut lambda_locals = Vec::with_capacity(lambda_params.len());
+                    for (param, argument) in lambda_params.iter().zip(arguments.iter()) {
+                        let ty = self.static_type_under(argument, locals, depth + 1)?;
+                        lambda_locals.push((param.clone(), ty));
+                    }
+                    return self.static_type_under(lambda_body, &mut lambda_locals, depth + 1);
+                }
                 // A builtin's result, for the handful whose type the inference
                 // path actually meets. Anything else falls through to the
                 // function table.
@@ -5156,6 +5186,32 @@ impl Emitter {
                     .first()
                     .and_then(|argument| self.static_type_under(argument, locals, depth + 1));
                 match name.as_str() {
+                    // head/tail matter more than they look: they are how the
+                    // prelude's recursive list functions are written, so
+                    // without them a body like `cons(head(xs))(rest)` cannot
+                    // be typed and the whole inference collapses to the empty
+                    // list its base case shows.
+                    "head" => {
+                        return arguments
+                            .first()
+                            .and_then(|argument| {
+                                self.static_type_under(argument, locals, depth + 1)
+                            })
+                            .and_then(|ty| match ty {
+                                ValueType::List(elem) | ValueType::Set(elem) => {
+                                    Some(elem_value_type(elem))
+                                }
+                                _ => None,
+                            });
+                    }
+                    "tail" => {
+                        return arguments
+                            .first()
+                            .and_then(|argument| {
+                                self.static_type_under(argument, locals, depth + 1)
+                            })
+                            .filter(|ty| matches!(ty, ValueType::List(_) | ValueType::EmptyList));
+                    }
                     "println" | "print" => return Some(ValueType::Unit),
                     "double" | "sqrt" | "floor" | "ceil" => return Some(ValueType::Double),
                     "abs" => return first_type,
@@ -5216,7 +5272,34 @@ impl Emitter {
         // and a heap-reference one is rooted while the rest are evaluated.
         let mut argument_types = Vec::with_capacity(arguments.len());
         let mut rooted = Vec::with_capacity(arguments.len());
-        for argument in arguments {
+        let mut value_params: Vec<(String, ValueType)> = Vec::new();
+        let mut lambda_params: Vec<(String, usize)> = Vec::new();
+        for (param, argument) in params.iter().zip(arguments.iter()) {
+            // A lambda argument is not a value: it is interned and the
+            // parameter name is bound to it inside the specialisation, so a
+            // higher-order def is specialised per lambda as well as per type.
+            if let Expr::Lambda {
+                params: lambda_args,
+                body: lambda_body,
+                ..
+            } = argument
+            {
+                let index = self.lambdas.len();
+                self.lambdas
+                    .push((lambda_args.clone(), lambda_body.as_ref().clone()));
+                lambda_params.push((param.clone(), index));
+                continue;
+            }
+            // A name that is itself bound to a lambda passes the binding
+            // along rather than a value -- which is how the prelude's
+            // recursive higher-order functions thread their function
+            // argument (`stdlibFilter(tail(xs), p)`).
+            if let Expr::Identifier { name, .. } = argument
+                && let Some(index) = self.lookup_lambda(name)
+            {
+                lambda_params.push((param.clone(), index));
+                continue;
+            }
             let ty = self.expression(argument)?;
             if ty == ValueType::Unit {
                 return Err(unsupported(argument.span(), "a unit-typed argument"));
@@ -5229,21 +5312,30 @@ impl Emitter {
                 rooted.push(false);
             }
             argument_types.push(ty);
+            value_params.push((param.clone(), ty));
         }
-        let key = (generic, argument_types.clone());
+        // The lambda identities are part of what makes a specialisation
+        // distinct, so they join the argument types in the key.
+        let mut key_types = argument_types.clone();
+        for (_, index) in &lambda_params {
+            key_types.push(ValueType::Record(*index as u32));
+        }
+        let key = (generic, key_types);
         let index = match self.specializations.get(&key) {
             Some(&index) => index,
             None => {
-                let signature: Vec<(String, ValueType)> = params
-                    .iter()
-                    .cloned()
-                    .zip(argument_types.iter().copied())
-                    .collect();
+                let signature = value_params.clone();
                 // A declared return type is the answer when there is one --
                 // only the *parameters* were generic in that case.
                 let mut locals = signature.clone();
+                // The lambda parameters must be visible while the body's type
+                // is worked out, or a higher-order def's result could not be
+                // typed at all.
+                self.lambda_bindings
+                    .push(lambda_params.iter().cloned().collect());
                 let inferred =
                     declared_return.or_else(|| self.static_type_under(&body, &mut locals, 0));
+                self.lambda_bindings.pop();
                 let Some(ret) = inferred else {
                     return Err(unsupported(
                         span,
@@ -5259,6 +5351,7 @@ impl Emitter {
                     FunctionInfo {
                         label,
                         params: signature,
+                        lambda_params: lambda_params.clone(),
                         ret,
                         body,
                     },
@@ -5272,7 +5365,7 @@ impl Emitter {
             let info = &self.functions[index].1;
             (info.label, info.ret)
         };
-        for (position, register) in ARG_REGS.iter().take(arguments.len()).enumerate().rev() {
+        for (position, register) in ARG_REGS.iter().take(argument_types.len()).enumerate().rev() {
             if rooted[position] {
                 self.pop_rooted(*register);
             } else {
@@ -5557,9 +5650,15 @@ impl Emitter {
     /// and binds parameters to frame-pointer slots, the body is a
     /// single expression whose value stays in x0.
     fn emit_function(&mut self, index: usize) -> Result<(), Diagnostic> {
-        let (label, params, ret, body) = {
+        let (label, params, lambda_params, ret, body) = {
             let info = &self.functions[index].1;
-            (info.label, info.params.clone(), info.ret, info.body.clone())
+            (
+                info.label,
+                info.params.clone(),
+                info.lambda_params.clone(),
+                info.ret,
+                info.body.clone(),
+            )
         };
         self.asm.bind(label);
         self.asm.push_frame_record();
@@ -5575,6 +5674,12 @@ impl Emitter {
         self.scopes.push(HashMap::new());
         self.lambda_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
+        for (param, lambda) in &lambda_params {
+            self.lambda_bindings
+                .last_mut()
+                .expect("emitter lambda scope")
+                .insert(param.clone(), *lambda);
+        }
         let saved_offset = self.next_local_offset;
         self.next_local_offset = 0;
         let mut param_slots = Vec::new();
@@ -5995,6 +6100,7 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
             FunctionInfo {
                 label,
                 params: signature,
+                lambda_params: Vec::new(),
                 ret,
                 body: body.as_ref().clone(),
             },
