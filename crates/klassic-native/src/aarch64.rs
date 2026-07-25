@@ -400,6 +400,24 @@ impl Assembler {
         self.word(0xd100_03ff | (imm << 10));
     }
 
+    /// Reserve the frame now and fill in its size later. How many slots a body
+    /// needs is only known once it has been compiled -- temporaries for a fold,
+    /// a map, a collection literal and an inlined lambda are all taken as the
+    /// emission goes -- and predicting it from the syntax got the answer wrong
+    /// in a way that overwrote the saved frame record. So the instruction is
+    /// emitted with a zero immediate and patched from the high-water mark.
+    fn sub_sp_placeholder(&mut self) -> usize {
+        let at = self.code.len();
+        self.sub_sp_imm(0);
+        at
+    }
+
+    fn patch_sub_sp(&mut self, at: usize, imm: u32) {
+        debug_assert!(imm < 4096);
+        let instruction: u32 = 0xd100_03ff | (imm << 10);
+        self.code[at..at + 4].copy_from_slice(&instruction.to_le_bytes());
+    }
+
     /// `add sp, sp, #imm12`
     fn add_sp_imm(&mut self, imm: u32) {
         debug_assert!(imm < 4096);
@@ -1580,6 +1598,10 @@ struct Emitter {
     /// resolves the field to its lambda and compiles the body at the call.
     dict_bindings: Vec<HashMap<String, Vec<(String, usize)>>>,
     next_local_offset: u32,
+    /// The deepest `next_local_offset` reached in the function being emitted.
+    /// Slots are handed back when an inlined lambda's parameters die, so the
+    /// current offset is not the frame's size -- this is.
+    max_local_offset: u32,
 }
 
 impl Emitter {
@@ -1641,9 +1663,22 @@ impl Emitter {
         (self.records.len() - 1) as u32
     }
 
-    fn declare_local(&mut self, name: &str, ty: ValueType) -> u32 {
+    /// Hand out `bytes` of frame space, remembering the high-water mark so the
+    /// prologue's reservation can be patched to the real size.
+    fn reserve_locals(&mut self, bytes: u32) -> u32 {
         let offset = self.next_local_offset;
-        self.next_local_offset += 8;
+        self.next_local_offset += bytes;
+        self.max_local_offset = self.max_local_offset.max(self.next_local_offset);
+        offset
+    }
+
+    /// Hand slots back: the offset shrinks, the high-water mark does not.
+    fn release_locals_to(&mut self, offset: u32) {
+        self.next_local_offset = offset;
+    }
+
+    fn declare_local(&mut self, name: &str, ty: ValueType) -> u32 {
+        let offset = self.reserve_locals(8);
         self.scopes
             .last_mut()
             .expect("emitter scope")
@@ -2160,6 +2195,29 @@ impl Emitter {
                     ValueType::Str => {}
                     ValueType::Int => self.emit_int_to_str(),
                     ValueType::Bool => self.emit_bool_to_str(),
+                    // A collection renders into the hole the way `println`
+                    // renders it, through the same builder.
+                    ValueType::List(elem) => {
+                        self.emit_list_to_str(elem, "[", "]", hole.span())?;
+                    }
+                    ValueType::Set(elem) => {
+                        self.emit_list_to_str(elem, "%(", ")", hole.span())?;
+                    }
+                    ValueType::EmptyList => {
+                        let offset = self.asm.intern_string_object("[]");
+                        self.asm.load_rodata_address(Reg::X0, offset);
+                        self.emit_heap_string_copy();
+                    }
+                    ValueType::EmptySet => {
+                        let offset = self.asm.intern_string_object("%()");
+                        self.asm.load_rodata_address(Reg::X0, offset);
+                        self.emit_heap_string_copy();
+                    }
+                    ValueType::EmptyMap => {
+                        let offset = self.asm.intern_string_object("%[]");
+                        self.asm.load_rodata_address(Reg::X0, offset);
+                        self.emit_heap_string_copy();
+                    }
                     other => {
                         return Err(unsupported(
                             hole.span(),
@@ -4133,8 +4191,7 @@ impl Emitter {
         // It holds a heap reference across the cons allocations, so it is
         // rooted like a named binding (its root is dropped with the
         // enclosing scope; the slot is never reused).
-        let acc = self.next_local_offset;
-        self.next_local_offset += 8;
+        let acc = self.reserve_locals(8);
         self.asm.mov_imm64(Reg::X0, 0); // nil
         self.asm.store_local(Reg::X0, acc);
         self.emit_root_frame_slot(acc);
@@ -4214,8 +4271,7 @@ impl Emitter {
 
         // Frame slot for the partial map, rooted like the set literal's: it
         // holds a heap reference across every allocation below.
-        let acc = self.next_local_offset;
-        self.next_local_offset += 8;
+        let acc = self.reserve_locals(8);
         self.asm.mov_imm64(Reg::X0, 0); // nil
         self.asm.store_local(Reg::X0, acc);
         self.emit_root_frame_slot(acc);
@@ -5294,6 +5350,115 @@ impl Emitter {
                 self.emit_file_write(path_offset, name == "FileOutput#append");
                 Ok(Some(ValueType::Unit))
             }
+            // `writeLines(path, lines)` is the lines joined with newlines and
+            // written -- no trailing one, which is what the evaluator's own
+            // `join` does. Building that call rather than a second string
+            // walker keeps the two spellings the same code.
+            ("FileOutput#writeLines", 2) => {
+                let Expr::String {
+                    value: path,
+                    span: path_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if path.contains("#{") {
+                    return Err(unsupported(*path_span, "string interpolation"));
+                }
+                let path_offset = self.asm.intern_nul_terminated(path);
+                let joined = Expr::Call {
+                    callee: Box::new(Expr::Identifier {
+                        name: "join".to_string(),
+                        span,
+                    }),
+                    arguments: vec![
+                        arguments[1].clone(),
+                        Expr::String {
+                            value: "\n".to_string(),
+                            span,
+                        },
+                    ],
+                    span,
+                };
+                if self.expression(&joined)? != ValueType::Str {
+                    return Err(unsupported(span, "writeLines of a non-string list"));
+                }
+                self.emit_file_write(path_offset, false);
+                Ok(Some(ValueType::Unit))
+            }
+            // `lines(path)` splits the file on newlines *without* a trailing
+            // empty line, which is what the evaluator gets from Rust's
+            // `str::lines`. Built here as the same expression `std.string`'s
+            // own `lines` is written as, over two hidden locals so the text and
+            // the split are each computed once.
+            ("FileInput#lines", 1) => {
+                let Expr::String {
+                    value: path,
+                    span: path_span,
+                } = &arguments[0]
+                else {
+                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                };
+                if path.contains("#{") {
+                    return Err(unsupported(*path_span, "string interpolation"));
+                }
+                let path_offset = self.asm.intern_nul_terminated(path);
+                self.emit_file_read_all(path_offset);
+                let text = self.declare_local("__file_lines_text", ValueType::Str);
+                self.asm.store_local(Reg::X0, text);
+                self.emit_root_frame_slot(text);
+                let name_expr = |name: &str| Expr::Identifier {
+                    name: name.to_string(),
+                    span,
+                };
+                let call = |name: &str, args: Vec<Expr>| Expr::Call {
+                    callee: Box::new(Expr::Identifier {
+                        name: name.to_string(),
+                        span,
+                    }),
+                    arguments: args,
+                    span,
+                };
+                let split = call(
+                    "split",
+                    vec![
+                        name_expr("__file_lines_text"),
+                        Expr::String {
+                            value: "\n".to_string(),
+                            span,
+                        },
+                    ],
+                );
+                let parts_ty = self.expression(&split)?;
+                let parts = self.declare_local("__file_lines_parts", parts_ty);
+                self.asm.store_local(Reg::X0, parts);
+                self.emit_root_frame_slot(parts);
+                let trimmed = Expr::If {
+                    condition: Box::new(call(
+                        "isEmptyString",
+                        vec![call("stdlibLast", vec![name_expr("__file_lines_parts")])],
+                    )),
+                    then_branch: Box::new(call(
+                        "stdlibTake",
+                        vec![
+                            name_expr("__file_lines_parts"),
+                            Expr::Binary {
+                                op: BinaryOp::Subtract,
+                                lhs: Box::new(call("size", vec![name_expr("__file_lines_parts")])),
+                                rhs: Box::new(Expr::Int {
+                                    value: 1,
+                                    kind: klassic_syntax::IntLiteralKind::Int,
+                                    span,
+                                }),
+                                span,
+                            },
+                        ],
+                    )),
+                    else_branch: Some(Box::new(name_expr("__file_lines_parts"))),
+                    span,
+                };
+                Ok(Some(self.expression(&trimmed)?))
+            }
             ("FileInput#all", 1) => {
                 let Expr::String {
                     value: path,
@@ -5504,10 +5669,9 @@ impl Emitter {
         close: &str,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        let cursor = self.next_local_offset;
+        let cursor = self.reserve_locals(24);
         let acc = cursor + 8;
         let sep = acc + 8;
-        self.next_local_offset += 24;
         self.asm.store_local(Reg::X0, cursor);
         self.emit_root_frame_slot(cursor);
         let open_offset = self.asm.intern_string_object(open);
@@ -5809,10 +5973,9 @@ impl Emitter {
         // references across the allocations the body and the cons perform, so
         // both are rooted; the parameter slot is rooted only when its type is
         // a reference.
-        let cursor = self.next_local_offset;
+        let cursor = self.reserve_locals(24);
         let acc = cursor + 8;
         let param_slot = acc + 8;
-        self.next_local_offset += 24;
         self.asm.store_local(Reg::X0, cursor);
         self.emit_root_frame_slot(cursor);
         self.asm.mov_imm64(Reg::X0, 0); // acc = nil
@@ -6456,11 +6619,10 @@ impl Emitter {
         if initial_ty == ValueType::Unit {
             return Err(unsupported(initial.span(), "a unit-typed accumulator"));
         }
-        let acc = self.next_local_offset;
+        let acc = self.reserve_locals(32);
         let cursor = acc + 8;
         let acc_slot = cursor + 8;
         let elem_slot = acc_slot + 8;
-        self.next_local_offset += 32;
         self.asm.store_local(Reg::X0, acc);
         if is_heap_pointer(initial_ty) {
             self.emit_root_frame_slot(acc);
@@ -6665,8 +6827,7 @@ impl Emitter {
             if ty == ValueType::Unit {
                 return Err(unsupported(argument.span(), "a unit-typed argument"));
             }
-            let offset = self.next_local_offset;
-            self.next_local_offset += 8;
+            let offset = self.reserve_locals(8);
             self.asm.store_local(Reg::X0, offset);
             bound.push((offset, ty));
         }
@@ -6688,7 +6849,7 @@ impl Emitter {
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         // The parameter slots are dead now; let the next call reuse them.
-        self.next_local_offset = saved_offset;
+        self.release_locals_to(saved_offset);
         Ok(result)
     }
 
@@ -6816,13 +6977,7 @@ impl Emitter {
         };
         self.asm.bind(label);
         self.asm.push_frame_record();
-        let frame_size = ((params.len() as u32 + count_var_decls(&body)) * 8).div_ceil(16) * 16;
-        if frame_size >= 4096 {
-            return Err(unsupported(body.span(), "this many local variables"));
-        }
-        if frame_size > 0 {
-            self.asm.sub_sp_imm(frame_size);
-        }
+        let frame_patch = self.asm.sub_sp_placeholder();
         self.asm.mov_fp_sp();
 
         self.push_binding_scopes();
@@ -6840,7 +6995,9 @@ impl Emitter {
                 .insert(param.clone(), fields.clone());
         }
         let saved_offset = self.next_local_offset;
+        let saved_max = self.max_local_offset;
         self.next_local_offset = 0;
+        self.max_local_offset = 0;
         let mut param_slots = Vec::new();
         for (position, (param, ty)) in params.iter().enumerate() {
             let offset = self.declare_local(param, *ty);
@@ -6860,7 +7017,15 @@ impl Emitter {
         // x0, which the pop helper preserves.
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
+        // The body is compiled, so the frame's real size is known: fill in the
+        // reservation and take it back down the same amount.
+        let frame_size = self.max_local_offset.div_ceil(16) * 16;
+        if frame_size >= 4096 {
+            return Err(unsupported(body.span(), "this many local variables"));
+        }
+        self.asm.patch_sub_sp(frame_patch, frame_size);
         self.next_local_offset = saved_offset;
+        self.max_local_offset = saved_max;
         if !assignable(body_ty, ret) {
             return Err(unsupported(
                 body.span(),
@@ -7165,55 +7330,6 @@ impl Emitter {
                 Ok(())
             }
         }
-    }
-}
-
-/// Count every local the program can declare so the frame can be
-/// reserved once up front (slots are never reused; fine at this
-/// scale). The recursion mirrors exactly the expression shapes the
-/// code generator walks — the enum lowering plants `val`s inside
-/// expression-position blocks — so it never undercounts a compilable
-/// program; anything it cannot see fails compilation before a slot
-/// is touched.
-fn count_var_decls(expr: &Expr) -> u32 {
-    match expr {
-        // A lambda's parameters and locals become frame slots of whichever
-        // function inlines it; the slots are released again after the call
-        // (see emit_inline_lambda_call), so counting each lambda once is
-        // enough for the frame to hold the deepest single call.
-        Expr::Lambda { params, body, .. } => params.len() as u32 + count_var_decls(body),
-        Expr::VarDecl { value, .. } => 1 + count_var_decls(value),
-        Expr::Assign { value, .. } => count_var_decls(value),
-        Expr::Block { expressions, .. } => expressions.iter().map(count_var_decls).sum(),
-        Expr::While {
-            condition, body, ..
-        } => count_var_decls(condition) + count_var_decls(body),
-        Expr::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            count_var_decls(condition)
-                + count_var_decls(then_branch)
-                + else_branch
-                    .as_ref()
-                    .map_or(0, |branch| count_var_decls(branch))
-        }
-        Expr::Binary { lhs, rhs, .. } => count_var_decls(lhs) + count_var_decls(rhs),
-        Expr::Call {
-            callee, arguments, ..
-        } => count_var_decls(callee) + arguments.iter().map(count_var_decls).sum::<u32>(),
-        Expr::ListLiteral { elements, .. } => elements.iter().map(count_var_decls).sum(),
-        // A set literal reserves one frame slot for its accumulator,
-        // plus whatever its elements declare.
-        Expr::SetLiteral { elements, .. } => 1 + elements.iter().map(count_var_decls).sum::<u32>(),
-        Expr::RecordConstructor { arguments, .. } => arguments.iter().map(count_var_decls).sum(),
-        Expr::RecordLiteral { fields, .. } => {
-            fields.iter().map(|(_, value)| count_var_decls(value)).sum()
-        }
-        Expr::FieldAccess { target, .. } => count_var_decls(target),
-        _ => 0,
     }
 }
 
@@ -8053,16 +8169,17 @@ pub(crate) fn emit_macho_program(
     emitter.emit_gc_init_heap(&gc);
     emitter.emit_gc_init_colors(&gc, GC_EVAC_OFF);
 
-    let frame_size = (count_var_decls(expr) * 8).div_ceil(16) * 16;
-    if frame_size >= 4096 {
-        return Err(unsupported(expr.span(), "this many local variables"));
-    }
-    if frame_size > 0 {
-        emitter.asm.sub_sp_imm(frame_size);
-    }
+    // Reserved now, sized once the program has been compiled -- see
+    // `sub_sp_placeholder`.
+    let frame_patch = emitter.asm.sub_sp_placeholder();
     emitter.asm.mov_fp_sp();
 
     emitter.statement(expr)?;
+    let frame_size = emitter.max_local_offset.div_ceil(16) * 16;
+    if frame_size >= 4096 {
+        return Err(unsupported(expr.span(), "this many local variables"));
+    }
+    emitter.asm.patch_sub_sp(frame_patch, frame_size);
     if gc_log {
         emitter.emit_gc_log_report(&gc);
     }
