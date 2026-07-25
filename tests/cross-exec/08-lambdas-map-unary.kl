@@ -64,6 +64,12 @@ println(label("kota"))
 println(fact(bigger(2, 4)))
 
 assertResult(7)(add(3, 4))
+// A recursive prelude function that builds a list: the inference has to
+// merge the empty-list branch with the cons branch to get List<Int> rather
+// than the empty list the first branch alone suggests.
+println(stdlibRange(0, 5))
+println(stdlibRangeInclusive(1, 3))
+
 assertResult(120)(fact(5))
 assertResult(9)(bigger(9, 1))
 assertResult(-10)(-ten)

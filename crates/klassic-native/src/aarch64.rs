@@ -4876,7 +4876,16 @@ impl Emitter {
         &self,
         expr: &Expr,
         locals: &mut Vec<(String, ValueType)>,
+        depth: u32,
     ) -> Option<ValueType> {
+        // Inferring through a call means inferring that callee's body too, so
+        // a bound keeps a recursive or mutually recursive chain finite. The
+        // `if` merge below is what still gets a useful answer out of a
+        // recursive function: the branch that bottoms out types, and the one
+        // that recurses contributes nothing.
+        if depth > 6 {
+            return None;
+        }
         match expr {
             Expr::Identifier { name, .. } => locals
                 .iter()
@@ -4885,17 +4894,17 @@ impl Emitter {
                 .map(|(_, ty)| *ty)
                 .or_else(|| self.lookup(name).map(|(_, ty)| ty)),
             Expr::Block { expressions, .. } => {
-                let depth = locals.len();
+                let mark = locals.len();
                 let (last, init) = expressions.split_last()?;
                 for expression in init {
                     if let Expr::VarDecl { name, value, .. } = expression
-                        && let Some(ty) = self.static_type_under(value, locals)
+                        && let Some(ty) = self.static_type_under(value, locals, depth + 1)
                     {
                         locals.push((name.clone(), ty));
                     }
                 }
-                let ty = self.static_type_under(last, locals);
-                locals.truncate(depth);
+                let ty = self.static_type_under(last, locals, depth + 1);
+                locals.truncate(mark);
                 ty
             }
             Expr::If {
@@ -4903,19 +4912,22 @@ impl Emitter {
                 else_branch,
                 ..
             } => {
-                let then_ty = self.static_type_under(then_branch, locals);
-                match else_branch {
-                    // A branch whose type is unknown (a recursive call) does
-                    // not veto the one that is known.
-                    Some(else_branch) => {
-                        then_ty.or_else(|| self.static_type_under(else_branch, locals))
-                    }
-                    None => then_ty,
+                let then_ty = self.static_type_under(then_branch, locals, depth + 1);
+                let else_ty = else_branch
+                    .as_ref()
+                    .and_then(|branch| self.static_type_under(branch, locals, depth + 1));
+                match (then_ty, else_ty) {
+                    // Merged, so `if (done) [] else cons(x)(rest)` is a list
+                    // of x rather than the empty list the first branch shows.
+                    (Some(then_ty), Some(else_ty)) => merge_branch_types(then_ty, else_ty),
+                    // A branch whose type is unknown -- the recursive one --
+                    // does not veto the branch that is known.
+                    (known, None) | (None, known) => known,
                 }
             }
             Expr::Unary { op, expr, .. } => match op {
                 UnaryOp::Not => Some(ValueType::Bool),
-                _ => self.static_type_under(expr, locals),
+                _ => self.static_type_under(expr, locals, depth + 1),
             },
             Expr::Binary { lhs, op, rhs, .. } => match op {
                 BinaryOp::Equal
@@ -4929,16 +4941,17 @@ impl Emitter {
                 // Arithmetic keeps the operand type; appending to a string
                 // yields a string whatever the right side was.
                 _ => {
-                    let lhs_ty = self.static_type_under(lhs, locals);
+                    let lhs_ty = self.static_type_under(lhs, locals, depth + 1);
                     match lhs_ty {
                         Some(ValueType::Str) => Some(ValueType::Str),
                         Some(ty) => Some(ty),
-                        None => self.static_type_under(rhs, locals),
+                        None => self.static_type_under(rhs, locals, depth + 1),
                     }
                 }
             },
             Expr::FieldAccess { target, field, .. } => {
-                let ValueType::Record(index) = self.static_type_under(target, locals)? else {
+                let ValueType::Record(index) = self.static_type_under(target, locals, depth + 1)?
+                else {
                     return None;
                 };
                 let info = self.records.get(index as usize)?;
@@ -4950,6 +4963,19 @@ impl Emitter {
             Expr::Call {
                 callee, arguments, ..
             } => {
+                // Curried `cons(head)(tail)` builds a list of the head's type.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: head_args,
+                        ..
+                    } = callee.as_ref()
+                    && head_args.len() == 1
+                    && matches!(inner.as_ref(), Expr::Identifier { name, .. } if name == "cons")
+                {
+                    let head_ty = self.static_type_under(&head_args[0], locals, depth + 1)?;
+                    return list_elem_of(head_ty).map(ValueType::List);
+                }
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return None;
                 };
@@ -4958,7 +4984,7 @@ impl Emitter {
                 // function table.
                 let first_type = arguments
                     .first()
-                    .and_then(|argument| self.static_type_under(argument, locals));
+                    .and_then(|argument| self.static_type_under(argument, locals, depth + 1));
                 match name.as_str() {
                     "println" | "print" => return Some(ValueType::Unit),
                     "double" | "sqrt" | "floor" | "ceil" => return Some(ValueType::Double),
@@ -4968,6 +4994,25 @@ impl Emitter {
                     "toString" | "substring" | "trim" | "toUpperCase" | "toLowerCase"
                     | "reverse" | "join" | "replaceAll" | "at" => return Some(ValueType::Str),
                     _ => {}
+                }
+                // A generic def's result is its body's, inferred with the
+                // parameters bound to these argument types -- the same thing
+                // the specialisation itself will do.
+                if let Some(generic) = self
+                    .generic_functions
+                    .iter()
+                    .rposition(|(n, params, _, _)| n == name && params.len() == arguments.len())
+                {
+                    let (_, params, body, declared) = &self.generic_functions[generic];
+                    if let Some(declared) = declared {
+                        return Some(*declared);
+                    }
+                    let mut callee_locals = Vec::with_capacity(params.len());
+                    for (param, argument) in params.iter().zip(arguments.iter()) {
+                        let ty = self.static_type_under(argument, locals, depth + 1)?;
+                        callee_locals.push((param.clone(), ty));
+                    }
+                    return self.static_type_under(body, &mut callee_locals, depth + 1);
                 }
                 self.static_type_of(expr)
             }
@@ -5028,7 +5073,7 @@ impl Emitter {
                 // only the *parameters* were generic in that case.
                 let mut locals = signature.clone();
                 let inferred =
-                    declared_return.or_else(|| self.static_type_under(&body, &mut locals));
+                    declared_return.or_else(|| self.static_type_under(&body, &mut locals, 0));
                 let Some(ret) = inferred else {
                     return Err(unsupported(
                         span,
