@@ -1263,6 +1263,24 @@ fn rename_scope_expr(expr: Expr, scope: &RenameScope, locals: &HashSet<String>) 
                 .collect(),
             span,
         },
+        // A `#{...}` hole is ordinary code and can reference anything the
+        // surrounding scope can, so the rewrite has to descend into it. Not
+        // doing so left every interpolated reference inside an inlined module
+        // pointing at a name that no longer exists -- std.json's `stringify`
+        // calls its `jsonJoin` helper from inside an interpolation, and that
+        // is what made the whole module unusable from a compiled program.
+        Expr::StringInterpolation { parts, span } => Expr::StringInterpolation {
+            parts: parts
+                .into_iter()
+                .map(|part| match part {
+                    StringPart::Literal(text) => StringPart::Literal(text),
+                    StringPart::Interpolation(inner) => StringPart::Interpolation(Box::new(
+                        rename_scope_expr(*inner, scope, locals),
+                    )),
+                })
+                .collect(),
+            span,
+        },
         other => other,
     }
 }
