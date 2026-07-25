@@ -2466,6 +2466,18 @@ impl Emitter {
                 Ok(ValueType::Bool)
             }
             BinaryOp::Equal | BinaryOp::NotEqual => {
+                // Two collections are equal when their *contents* are, which
+                // is what the evaluator says and what `assertResult([1 2 3])(xs)`
+                // in the sample programs relies on. Comparing the pointers
+                // would call two separately built lists different.
+                if let ValueType::List(elem) | ValueType::Set(elem) = lhs_ty {
+                    self.emit_list_eq(elem, span)?;
+                    if op == BinaryOp::NotEqual {
+                        self.asm.cmp_imm(Reg::X0, 0);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                    }
+                    return Ok(ValueType::Bool);
+                }
                 let cond = if op == BinaryOp::Equal {
                     Cond::Eq
                 } else {
@@ -4978,6 +4990,91 @@ impl Emitter {
         self.asm.mov_reg(Reg::X1, Reg::X0);
         self.asm.load_local(Reg::X0, acc);
         self.emit_str_concat();
+        Ok(())
+    }
+
+    /// Content equality for two cons chains: x0 and x1 are the heads, x0
+    /// becomes the Bool.
+    ///
+    /// Walks both at once -- equal length, equal elements, in order. The
+    /// element comparison is by type: a boxed scalar is unboxed and compared
+    /// by value, a string by its bytes. Nothing here allocates, so no rooting
+    /// is needed, but the string comparison clobbers x0-x7, so both cursors
+    /// live on the machine stack across it.
+    fn emit_list_eq(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
+        let elem_ty = elem_value_type(elem);
+        if matches!(elem, ListElem::Double) {
+            // Comparing the raw bits is not IEEE equality, and no sample
+            // program asks for it, so it is refused rather than quietly wrong.
+            return Err(unsupported(span, "comparing lists of Double"));
+        }
+        let loop_start = self.asm.new_label();
+        let equal = self.asm.new_label();
+        let different = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(loop_start);
+        // Either chain ending decides it: both nil is equal, one nil is not.
+        let lhs_more = self.asm.new_label();
+        self.asm
+            .branch(lhs_more, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.branch(equal, BranchKind::CompareZero(Reg::X1));
+        self.asm.branch(different, BranchKind::Unconditional);
+        self.asm.bind(lhs_more);
+        self.asm.branch(different, BranchKind::CompareZero(Reg::X1));
+
+        // Park both cursors: the element reads and the string comparison
+        // below clobber the registers holding them.
+        self.asm.push(Reg::X0); // lhs cursor, at [sp + 16] after the next push
+        self.asm.push(Reg::X1); // rhs cursor, at [sp]
+        self.asm.add_reg_sp_imm(Reg::X3, 16);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        self.asm.mov_reg(Reg::X2, Reg::X0); // the left element
+        self.asm.add_reg_sp_imm(Reg::X3, 0);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        self.asm.mov_reg(Reg::X1, Reg::X0); // the right element
+        self.asm.mov_reg(Reg::X0, Reg::X2);
+        if elem_ty == ValueType::Str {
+            self.emit_str_eq(); // x0 = Bool
+        } else {
+            self.asm.cmp_reg(Reg::X0, Reg::X1);
+            self.asm.cset(Reg::X0, Cond::Eq);
+        }
+        // Take the cursors back on both paths, so the stack stays balanced.
+        let same = self.asm.new_label();
+        self.asm.branch(same, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.pop(Reg::X1);
+        self.asm.pop(Reg::X0);
+        self.asm.branch(different, BranchKind::Unconditional);
+        self.asm.bind(same);
+        self.asm.pop(Reg::X1);
+        self.asm.pop(Reg::X0);
+
+        // Advance both cursors. The barrier preserves x1-x7, so the right
+        // cursor survives the left read.
+        self.asm.push(Reg::X1);
+        self.emit_gc_load_ptr(Reg::X0, 8);
+        self.asm.mov_reg(Reg::X2, Reg::X0); // the left next
+        self.asm.pop(Reg::X1);
+        self.asm.push(Reg::X2);
+        self.emit_gc_load_ptr(Reg::X1, 8);
+        self.asm.mov_reg(Reg::X1, Reg::X0); // the right next
+        self.asm.pop(Reg::X0);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+
+        self.asm.bind(equal);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(different);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
         Ok(())
     }
 

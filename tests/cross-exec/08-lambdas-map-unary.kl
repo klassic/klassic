@@ -99,6 +99,16 @@ assertResult(16)(applyTwice((n) => n + 3, 10))
 assertResult(7)(id(7))
 assertResult("hi")(id("hi"))
 
+// Collections compare by content, not by identity: these lists are built
+// separately, so a pointer comparison would call them different. This is what
+// every assertResult on a list in the sample programs depends on.
+println([1 2 3] == [1 2 3])
+println([1 2 3] == [1 2 4])
+println(["x" "y"] == ["x" "y"])
+println([1 2] == [1 2 3])
+assertResult([1, 2, 3])([1 2 3])
+assertResult([2, 3, 4])(map([1 2 3])((x) => x + 1))
+
 assertResult(6)([1 2 3] reduce 0 => r + e)
 assertResult(24)(foldLeft([1 2 3 4])(1)((a, x) => a * x))
 
