@@ -1331,9 +1331,8 @@ struct Emitter {
     /// Label of `gc_alloc`, shared between the mutator's allocation sites
     /// and the GC runtime that defines it.
     gc_alloc_label: Option<Label>,
-    /// `--gc-stress` / `--gc-poison`, threaded in from the CLI. (`--gc-log`
-    /// is only needed at the one site that emits the exit report, so it
-    /// stays a parameter of `emit_macho_program`.)
+    /// `--gc-log` / `--gc-stress` / `--gc-poison`, threaded in from the CLI.
+    gc_log: bool,
     gc_stress: bool,
     gc_poison: bool,
     /// Number of shadow-stack roots pushed in each open scope, so leaving
@@ -5345,7 +5344,9 @@ impl Emitter {
             },
             pa::AllocFlags {
                 stress: self.gc_stress,
-                log: false,
+                // Counting allocations and bytes is what makes the exit
+                // report's `allocs=` / `bytes=` fields meaningful.
+                log: self.gc_log,
             },
             gc.oom.1,
             stderr_fd,
@@ -5554,6 +5555,7 @@ pub(crate) fn emit_macho_program(
 ) -> Result<Vec<u8>, Diagnostic> {
     let mut emitter = Emitter {
         lowered_enums,
+        gc_log,
         gc_stress,
         gc_poison,
         ..Emitter::default()
