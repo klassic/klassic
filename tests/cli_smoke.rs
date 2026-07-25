@@ -28475,15 +28475,29 @@ fn build_target_aarch64_apple_darwin_gc_log_reports_real_collections() {
         collections > 0,
         "the collector never ran, so the corpus proves nothing: {stderr}"
     );
-    let allocs = stderr
-        .split("allocs=")
-        .nth(1)
-        .and_then(|rest| {
-            rest.split(|c: char| !c.is_ascii_digit())
-                .next()
-                .filter(|digits| !digits.is_empty())
-        })
-        .and_then(|digits| digits.parse::<u64>().ok())
-        .unwrap_or(0);
-    assert!(allocs > 0, "no allocations were counted: {stderr}");
+    let field = |name: &str| -> u64 {
+        stderr
+            .split(name)
+            .nth(1)
+            .and_then(|rest| {
+                rest.split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .filter(|digits| !digits.is_empty())
+            })
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    assert!(
+        field("allocs=") > 0,
+        "no allocations were counted: {stderr}"
+    );
+    // M9: compaction really happening is what separates the moving collector
+    // from the non-moving one. A relocated count of zero would mean
+    // evacuation never ran, leaving the forwarding-word paths -- the part of
+    // the design that only exists once evacuation is on -- untested no
+    // matter how green everything else looks.
+    assert!(
+        field("relocated=") > 0,
+        "the collector never relocated an object: {stderr}"
+    );
 }
