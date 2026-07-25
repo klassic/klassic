@@ -2937,6 +2937,31 @@ impl Emitter {
     ///
     /// Only x0 and x30 are touched at the call site (x0 is restored), so
     /// this is safe to emit anywhere regardless of what is live.
+    /// Note where the current scope's roots stand, so temporaries rooted from
+    /// here can be dropped again by `close_temp_roots`.
+    ///
+    /// A helper called *inside* an expression has to leave the shadow stack
+    /// exactly as it found it. The stack is strictly last-in-first-out and its
+    /// entries are slot *addresses*, so a frame-slot root left behind is popped
+    /// by whatever `pop_rooted` comes next -- which then leaves that machine
+    /// stack slot rooted after its value is gone, and the next collection reads
+    /// whatever has since been pushed there as a heap reference.
+    fn open_temp_roots(&self) -> usize {
+        *self.scope_root_counts.last().expect("emitter root scope")
+    }
+
+    /// Drop every root taken since `mark`. Preserves x0, so a result being
+    /// returned survives.
+    fn close_temp_roots(&mut self, mark: usize) {
+        let count = self.open_temp_roots();
+        debug_assert!(count >= mark);
+        self.emit_shadow_pop(count - mark);
+        *self
+            .scope_root_counts
+            .last_mut()
+            .expect("emitter root scope") = mark;
+    }
+
     fn emit_root_frame_slot(&mut self, offset: u32) {
         let push = self.shadow_push_routine_label();
         self.asm.push(Reg::X0); // x0 is the argument register below
@@ -4223,6 +4248,7 @@ impl Emitter {
     /// accumulator ends up in reverse-insertion order, so a final
     /// reverse restores insertion order for printing.
     fn set_literal(&mut self, elements: &[Expr], span: Span) -> Result<ValueType, Diagnostic> {
+        let mark = self.open_temp_roots();
         // Frame slot for the partial set; survives the bl calls below.
         // It holds a heap reference across the cons allocations, so it is
         // rooted like a named binding (its root is dropped with the
@@ -4270,6 +4296,7 @@ impl Emitter {
         self.asm.load_local(Reg::X0, acc);
         let reverse = self.reverse_label();
         self.asm.branch(reverse, BranchKind::Link);
+        self.close_temp_roots(mark);
         Ok(match elem_ty {
             Some(elem) => ValueType::Set(elem),
             None => ValueType::EmptySet,
@@ -4290,6 +4317,7 @@ impl Emitter {
         entries: &[(Expr, Expr)],
         span: Span,
     ) -> Result<ValueType, Diagnostic> {
+        let mark = self.open_temp_roots();
         let mut ordered: Vec<(&Expr, &Expr)> = Vec::new();
         let mut seen: Vec<String> = Vec::new();
         for (key, value) in entries {
@@ -4348,6 +4376,7 @@ impl Emitter {
         self.asm.load_local(Reg::X0, acc);
         let reverse = self.reverse_label();
         self.asm.branch(reverse, BranchKind::Link);
+        self.close_temp_roots(mark);
         Ok(match (key_elem, value_elem) {
             (Some(key), Some(value)) => ValueType::Map(key, value),
             _ => ValueType::EmptyMap,
@@ -5401,6 +5430,7 @@ impl Emitter {
             // own `lines` is written as, over two hidden locals so the text and
             // the split are each computed once.
             ("FileInput#lines", 1) | ("FileInput#readLines", 1) => {
+                let mark = self.open_temp_roots();
                 self.emit_path_cstring(&arguments[0])?;
                 self.emit_file_read_all();
                 let text = self.declare_local("__file_lines_text", ValueType::Str);
@@ -5456,7 +5486,9 @@ impl Emitter {
                     else_branch: Some(Box::new(name_expr("__file_lines_parts"))),
                     span,
                 };
-                Ok(Some(self.expression(&trimmed)?))
+                let lines = self.expression(&trimmed)?;
+                self.close_temp_roots(mark);
+                Ok(Some(lines))
             }
             // `path FileInput#open { stream => ... }`: the evaluator hands the
             // block the path itself and answers with the block's value, so this
@@ -5622,6 +5654,7 @@ impl Emitter {
         close: &str,
         span: Span,
     ) -> Result<(), Diagnostic> {
+        let mark = self.open_temp_roots();
         let cursor = self.reserve_locals(24);
         let acc = cursor + 8;
         let sep = acc + 8;
@@ -5694,6 +5727,7 @@ impl Emitter {
         self.asm.mov_reg(Reg::X1, Reg::X0);
         self.asm.load_local(Reg::X0, acc);
         self.emit_str_concat();
+        self.close_temp_roots(mark);
         Ok(())
     }
 
@@ -5914,6 +5948,7 @@ impl Emitter {
         body: &Expr,
         span: Span,
     ) -> Result<ValueType, Diagnostic> {
+        let mark = self.open_temp_roots();
         let list_ty = self.expression(list)?;
         let elem = match list_ty {
             ValueType::List(elem) => elem,
@@ -5984,6 +6019,7 @@ impl Emitter {
         self.asm.push_frame_record(); // the bl clobbers x30
         self.asm.branch(reverse, BranchKind::Link);
         self.asm.pop_frame_record();
+        self.close_temp_roots(mark);
         let _ = span;
         Ok(ValueType::List(mapped_elem))
     }
@@ -6568,6 +6604,7 @@ impl Emitter {
         body: &Expr,
         span: Span,
     ) -> Result<ValueType, Diagnostic> {
+        let mark = self.open_temp_roots();
         let initial_ty = self.expression(initial)?;
         if initial_ty == ValueType::Unit {
             return Err(unsupported(initial.span(), "a unit-typed accumulator"));
@@ -6658,6 +6695,7 @@ impl Emitter {
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(done);
         self.asm.load_local(Reg::X0, acc);
+        self.close_temp_roots(mark);
         let _ = span;
         Ok(acc_ty)
     }
