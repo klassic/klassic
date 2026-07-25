@@ -1230,6 +1230,14 @@ struct RecordInfo {
 }
 
 /// The value type of one list element of element type `elem`.
+/// A scalar value held directly in a GP register (not a heap pointer).
+/// The GC's uniform pointer representation requires these to be boxed
+/// into a single-slot RAW_BYTES object when stored in a POINTER_RECORD
+/// slot (a record field or a cons-cell value), and unboxed on read.
+fn is_boxed_scalar(ty: ValueType) -> bool {
+    matches!(ty, ValueType::Int | ValueType::Double | ValueType::Bool)
+}
+
 fn elem_value_type(elem: ListElem) -> ValueType {
     match elem {
         ListElem::Int => ValueType::Int,
@@ -1424,6 +1432,11 @@ impl Emitter {
                     if *elem.get_or_insert(this_elem) != this_elem {
                         return Err(unsupported(*span, "mixed list element types"));
                     }
+                    // Box a scalar element so the cons cell's head slot is
+                    // a pointer (string/list/record heads already are).
+                    if is_boxed_scalar(ty) {
+                        self.emit_box_scalar();
+                    }
                     self.asm.push(Reg::X0);
                 }
                 self.asm.mov_imm64(Reg::X0, 0); // nil
@@ -1465,6 +1478,9 @@ impl Emitter {
                     if !assignable(ty, *expected) {
                         return Err(unsupported(argument.span(), "a record field of this type"));
                     }
+                    if is_boxed_scalar(ty) {
+                        self.emit_box_scalar();
+                    }
                     self.asm.push(Reg::X0);
                 }
                 self.emit_record_object(arguments.len());
@@ -1480,6 +1496,9 @@ impl Emitter {
                         return Err(unsupported(value.span(), "a record field of this type"));
                     }
                     typed.push((field_name.clone(), ty));
+                    if is_boxed_scalar(ty) {
+                        self.emit_box_scalar();
+                    }
                     self.asm.push(Reg::X0);
                 }
                 let count = fields.len();
@@ -1506,6 +1525,9 @@ impl Emitter {
                 };
                 let ty = info.fields[position].1;
                 self.asm.ldr_imm(Reg::X0, Reg::X0, (position * 8) as u32);
+                if is_boxed_scalar(ty) {
+                    self.emit_unbox_scalar();
+                }
                 Ok(ty)
             }
             Expr::Call {
@@ -1531,6 +1553,10 @@ impl Emitter {
                             "a list element of this type",
                         ));
                     };
+                    // Box a scalar head so the cons cell holds a pointer.
+                    if is_boxed_scalar(head_ty) {
+                        self.emit_box_scalar();
+                    }
                     self.asm.push(Reg::X0);
                     let tail_ty = self.expression(&arguments[0])?;
                     if !assignable(tail_ty, ValueType::List(elem)) {
@@ -1736,10 +1762,7 @@ impl Emitter {
 
         self.asm.push(Reg::X5); // scratch buffer ptr
         self.asm.push(Reg::X2); // bytes_read
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc(); // x5 = result object
+        self.emit_alloc_raw_string(Reg::X2); // x5 = result object
         self.asm.pop(Reg::X2); // bytes_read
         self.asm.pop(Reg::X6); // scratch buffer ptr
 
@@ -2134,6 +2157,76 @@ impl Emitter {
         self.asm.add_reg(Reg::X19, Reg::X19, Reg::X4);
     }
 
+    /// Allocate a GC-shaped heap object: a 16-byte header
+    /// `[size|mark][type_tag]` followed by `words` 8-byte payload slots.
+    /// Bumps the allocator, writes the header, and leaves the *user*
+    /// pointer (block + 16) in x0 -- so every existing `[x0 + off]`
+    /// payload access is unchanged. `size` is the 16-aligned block size;
+    /// its low 4 bits are free for the collector's mark/forward bits (0
+    /// here). The tag distinguishes RAW_BYTES (no inner pointers) from
+    /// POINTER_RECORD (every payload slot a heap pointer), so the
+    /// collector -- once live (M7) -- traces only the latter.
+    ///
+    /// M6: objects are laid out GC-shaped while the bump allocator is
+    /// still live and the collector is still dead, so this changes only
+    /// the object representation, not behavior -- the CI eval-differential
+    /// confirms each conversion is semantics-preserving.
+    fn emit_gc_alloc_object(&mut self, words: usize, tag: u64) {
+        let block = (16 + words * 8).div_ceil(16) * 16;
+        self.asm.mov_imm64(Reg::X4, block as u64);
+        self.emit_alloc(); // block base in x5
+        self.asm.mov_imm64(Reg::X1, block as u64);
+        self.asm.str_imm(Reg::X1, Reg::X5, 0); // [block] = size|mark(0)
+        self.asm.mov_imm64(Reg::X1, tag);
+        self.asm.str_imm(Reg::X1, Reg::X5, 8); // [block+8] = type_tag
+        self.asm.add_reg_imm(Reg::X0, Reg::X5, 16); // x0 = user pointer
+    }
+
+    /// Box a scalar (in x0) into its own single-slot `RAW_BYTES` object,
+    /// leaving the box's user pointer in x0. Every heap slot of a
+    /// `POINTER_RECORD` must be a pointer, so scalar record fields and
+    /// list elements are boxed on write and unboxed on read (the uniform
+    /// representation the shared enum lowering already uses).
+    fn emit_box_scalar(&mut self) {
+        self.asm.push(Reg::X0); // preserve the scalar across the alloc
+        self.emit_gc_alloc_object(1, crate::gc_layout::GC_TYPE_RAW_BYTES);
+        self.asm.pop(Reg::X1);
+        self.asm.str_imm(Reg::X1, Reg::X0, 0); // [box] = scalar
+    }
+
+    /// Unbox a scalar: load it from the single-slot box whose user
+    /// pointer is in x0.
+    fn emit_unbox_scalar(&mut self) {
+        self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+    }
+
+    /// Allocate a GC-shaped heap string whose payload is `[len][bytes...]`,
+    /// with the character count in `len` (a caller register that is not x4,
+    /// x5 or x6). Reserves a 16-byte header `[size|mark][RAW_BYTES]` in
+    /// front and leaves the *user* pointer (block + 16) in x5, so callers
+    /// keep writing the length at `[x5 + 0]` and the bytes at `[x5 + 8]`
+    /// exactly as before -- the only visible change is the header the
+    /// collector reads once it goes live (M7). A string carries no inner
+    /// pointers, hence RAW_BYTES. `len` is preserved across the call
+    /// (emit_alloc keeps x0-x5 over a heap grow, and this only writes x4/
+    /// x5/x6).
+    fn emit_alloc_raw_string(&mut self, len: Reg) {
+        // payload = align8(len + 8): the 8-byte length field plus the bytes.
+        self.asm.add_reg_imm(Reg::X4, len, 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+        // block = align16(payload + 16 header).
+        self.asm.add_reg_imm(Reg::X4, Reg::X4, 16 + 15);
+        self.asm.lsr_imm(Reg::X4, Reg::X4, 4);
+        self.asm.lsl_imm(Reg::X4, Reg::X4, 4);
+        self.emit_alloc(); // x5 = block base, x4 = block size preserved
+        self.asm.str_imm(Reg::X4, Reg::X5, 0); // [block] = size|mark(0)
+        self.asm
+            .mov_imm64(Reg::X6, crate::gc_layout::GC_TYPE_RAW_BYTES);
+        self.asm.str_imm(Reg::X6, Reg::X5, 8); // [block + 8] = type_tag
+        self.asm.add_reg_imm(Reg::X5, Reg::X5, 16); // x5 = user pointer
+    }
+
     /// Copy `[count]` bytes between the byte pointers in `src`/`dst`;
     /// `count` reaches zero, `src`/`dst` advance, `scratch` clobbered.
     fn emit_copy_bytes(&mut self, count: Reg, src: Reg, dst: Reg, scratch: Reg) {
@@ -2155,10 +2248,7 @@ impl Emitter {
         self.asm.ldr_imm(Reg::X3, Reg::X1, 0);
         self.asm.add_reg(Reg::X2, Reg::X2, Reg::X3);
         // size = align8(total + 8 header)
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
@@ -2265,10 +2355,7 @@ impl Emitter {
     fn emit_str_ascii_case(&mut self, to_upper: bool) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
         self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X6, Reg::X5, 8);
         self.asm.mov_reg(Reg::X7, Reg::X2);
@@ -2306,10 +2393,7 @@ impl Emitter {
     fn emit_str_reverse(&mut self) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
         self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X6, Reg::X5, 8);
         self.asm.mov_reg(Reg::X8, Reg::X2);
@@ -2405,10 +2489,7 @@ impl Emitter {
         // and lost it to a heap-grow mmap when the bump allocator's
         // segment was full).
         self.asm.push(Reg::X9);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.pop(Reg::X9);
         self.asm.add_reg(Reg::X6, Reg::X3, Reg::X9);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
@@ -2456,10 +2537,7 @@ impl Emitter {
         // emit_str_trim fix for why this matters once a heap-grow
         // mmap actually fires).
         self.asm.push(Reg::X9);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.pop(Reg::X9);
 
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
@@ -2591,10 +2669,7 @@ impl Emitter {
 
         self.asm.push(Reg::X6);
         self.asm.push(Reg::X0); // total_content_len
-        self.asm.add_reg_imm(Reg::X4, Reg::X0, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc(); // x5 = result object
+        self.emit_alloc_raw_string(Reg::X0); // x5 = result object user pointer
         self.asm.pop(Reg::X12); // total_content_len
         self.asm.pop(Reg::X6); // scratch struct ptr
 
@@ -2667,10 +2742,7 @@ impl Emitter {
         self.asm.push(Reg::X12);
         self.asm.push(Reg::X2); // len
         self.asm.push(start);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc(); // x5 = new segment string object
+        self.emit_alloc_raw_string(Reg::X2); // x5 = new segment string object
         self.asm.pop(Reg::X0); // start offset
         self.asm.pop(Reg::X2); // len
         self.asm.pop(Reg::X12);
@@ -2945,10 +3017,7 @@ impl Emitter {
         self.emit_skip_chars();
         // Slice byte length, then allocate and copy.
         self.asm.sub_reg(Reg::X2, Reg::X3, Reg::X0);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
         self.emit_copy_bytes(Reg::X2, Reg::X0, Reg::X7, Reg::X3);
@@ -2961,10 +3030,7 @@ impl Emitter {
         self.asm.emit_int_digits(false);
         self.asm.add_reg_sp_imm(Reg::X2, 32);
         self.asm.sub_reg(Reg::X2, Reg::X2, Reg::X1);
-        self.asm.add_reg_imm(Reg::X4, Reg::X2, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        self.emit_alloc();
+        self.emit_alloc_raw_string(Reg::X2);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
         self.emit_copy_bytes(Reg::X2, Reg::X1, Reg::X7, Reg::X3);
@@ -2990,24 +3056,36 @@ impl Emitter {
     /// Build a record object from `count` field values pushed onto
     /// the machine stack in declaration order → object pointer in x0.
     fn emit_record_object(&mut self, count: usize) {
-        self.asm.mov_imm64(Reg::X4, (count * 8) as u64);
-        self.emit_alloc();
+        // M6: a GC-shaped POINTER_RECORD -- every field is a heap pointer
+        // (scalar fields were boxed by the caller as they were evaluated),
+        // so the collector can trace the payload uniformly. The 16-byte
+        // header shifts the user pointer to block + 16, but fields still
+        // live at [user_ptr + position*8], so field access is unchanged.
+        self.emit_gc_alloc_object(count, crate::gc_layout::GC_TYPE_POINTER_RECORD); // x0 = user ptr
         for position in (0..count).rev() {
             self.asm.pop(Reg::X1);
-            self.asm.str_imm(Reg::X1, Reg::X5, (position * 8) as u32);
+            self.asm.str_imm(Reg::X1, Reg::X0, (position * 8) as u32);
         }
-        self.asm.mov_reg(Reg::X0, Reg::X5);
     }
 
     /// Prepend a cons cell: head value on top of the machine stack,
     /// tail pointer in x0 → fresh cell pointer in x0.
+    ///
+    /// M6: a GC-shaped `POINTER_RECORD` with two pointer slots
+    /// `[head][next]`. The head on the stack is already a pointer -- a
+    /// scalar head was boxed by the caller, a string/list/record head is
+    /// a pointer already -- and `next` in x0 is a cell pointer or 0
+    /// (nil), so the collector can trace both slots uniformly. The
+    /// 16-byte header shifts the user pointer to block + 16, but the head
+    /// and next still live at `[cell + 0]`/`[cell + 8]`, so every list
+    /// read keeps the same offsets.
     fn emit_cons_cell(&mut self) {
-        self.asm.mov_imm64(Reg::X4, 16);
-        self.emit_alloc();
+        self.asm.push(Reg::X0); // preserve `next` across the alloc
+        self.emit_gc_alloc_object(2, crate::gc_layout::GC_TYPE_POINTER_RECORD); // x0 = user ptr
         self.asm.pop(Reg::X1);
-        self.asm.str_imm(Reg::X1, Reg::X5, 0);
-        self.asm.str_imm(Reg::X0, Reg::X5, 8);
-        self.asm.mov_reg(Reg::X0, Reg::X5);
+        self.asm.str_imm(Reg::X1, Reg::X0, 8); // [cell + 8] = next
+        self.asm.pop(Reg::X1);
+        self.asm.str_imm(Reg::X1, Reg::X0, 0); // [cell + 0] = head
     }
 
     /// Get/create the lazily-emitted membership-scan routine label for
@@ -3068,9 +3146,14 @@ impl Emitter {
             self.asm.branch(member, BranchKind::Link);
             let skip = self.asm.new_label();
             self.asm.branch(skip, BranchKind::CompareNonZero(Reg::X0));
-            // Absent: prepend the candidate to the accumulator.
+            // Absent: prepend the candidate to the accumulator. Box a
+            // scalar candidate so the cons cell's head slot is a pointer.
             self.asm.pop(Reg::X1);
-            self.asm.push(Reg::X1); // head for emit_cons_cell
+            self.asm.mov_reg(Reg::X0, Reg::X1);
+            if is_boxed_scalar(elem_value_type(this)) {
+                self.emit_box_scalar();
+            }
+            self.asm.push(Reg::X0); // head for emit_cons_cell
             self.asm.load_local(Reg::X0, acc);
             self.emit_cons_cell();
             self.asm.store_local(Reg::X0, acc);
@@ -3103,6 +3186,11 @@ impl Emitter {
         self.asm.pop(Reg::X3);
         self.asm.push(Reg::X3);
         self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        // Scalar elements are boxed in the cell; unbox before printing
+        // (string elements are already the pointer).
+        if is_boxed_scalar(elem_value_type(elem)) {
+            self.emit_unbox_scalar();
+        }
         self.emit_print_elem(elem);
         self.asm.pop(Reg::X3);
         self.asm.ldr_imm(Reg::X3, Reg::X3, 8);
@@ -3125,7 +3213,8 @@ impl Emitter {
         let not_found = self.asm.new_label();
         self.asm.bind(loop_start);
         self.asm.branch(not_found, BranchKind::CompareZero(Reg::X2));
-        self.asm.ldr_imm(Reg::X3, Reg::X2, 0);
+        self.asm.ldr_imm(Reg::X3, Reg::X2, 0); // boxed element pointer
+        self.asm.ldr_imm(Reg::X3, Reg::X3, 0); // unbox to the raw scalar
         self.asm.cmp_reg(Reg::X3, Reg::X1);
         self.asm.branch(found, BranchKind::Conditional(Cond::Eq));
         self.asm.ldr_imm(Reg::X2, Reg::X2, 8);
@@ -3184,12 +3273,21 @@ impl Emitter {
         self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // head
         self.asm.ldr_imm(Reg::X0, Reg::X0, 8); // advance input
-        // Build [head][acc]; emit_alloc preserves x0-x5 across grow.
-        self.asm.mov_imm64(Reg::X4, 16);
-        self.emit_alloc();
-        self.asm.str_imm(Reg::X2, Reg::X5, 0); // head
-        self.asm.str_imm(Reg::X1, Reg::X5, 8); // next = acc
-        self.asm.mov_reg(Reg::X1, Reg::X5); // acc = new cell
+        // Build a GC-shaped [header][head][acc] cell. emit_alloc preserves
+        // x0-x5 across grow, so cursor (x0), acc (x1) and head (x2)
+        // survive; x3 is a free scratch. The head copied from the source
+        // cell is already boxed/a pointer, so it needs no re-boxing -- only
+        // the 16-byte header and POINTER_RECORD tag are added.
+        self.asm.mov_imm64(Reg::X4, 32);
+        self.emit_alloc(); // x5 = block base
+        self.asm.mov_imm64(Reg::X3, 32);
+        self.asm.str_imm(Reg::X3, Reg::X5, 0); // [block] = size|mark(0)
+        self.asm
+            .mov_imm64(Reg::X3, crate::gc_layout::GC_TYPE_POINTER_RECORD);
+        self.asm.str_imm(Reg::X3, Reg::X5, 8); // [block + 8] = type_tag
+        self.asm.str_imm(Reg::X2, Reg::X5, 16); // [cell + 0] = head
+        self.asm.str_imm(Reg::X1, Reg::X5, 24); // [cell + 8] = next = acc
+        self.asm.add_reg_imm(Reg::X1, Reg::X5, 16); // acc = user ptr
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(done);
         self.asm.mov_reg(Reg::X0, Reg::X1);
@@ -3253,6 +3351,11 @@ impl Emitter {
             self.asm.pop(Reg::X0);
             self.asm.push(Reg::X0);
             self.asm.ldr_imm(Reg::X0, Reg::X0, (position * 8) as u32);
+            // Scalar fields are boxed in the POINTER_RECORD; unbox before
+            // printing (string fields are already the pointer).
+            if is_boxed_scalar(*ty) {
+                self.emit_unbox_scalar();
+            }
             self.emit_print_elem(list_elem_of(*ty).expect("checked above"));
         }
         self.asm.pop(Reg::X0); // discard the saved object
@@ -3274,6 +3377,11 @@ impl Emitter {
         self.asm.pop(Reg::X3);
         self.asm.push(Reg::X3);
         self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        // Scalar elements are boxed in the cell; unbox before printing
+        // (string elements are already the pointer).
+        if is_boxed_scalar(elem_value_type(elem)) {
+            self.emit_unbox_scalar();
+        }
         self.emit_print_elem(elem);
         self.asm.pop(Reg::X3);
         self.asm.ldr_imm(Reg::X3, Reg::X3, 8);
@@ -3526,6 +3634,11 @@ impl Emitter {
                 self.asm.emit_exit(1);
                 self.asm.bind(non_empty);
                 self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+                // Scalar heads are boxed in the cell; unbox before use
+                // (string/list/record heads are already the pointer).
+                if is_boxed_scalar(elem_value_type(elem)) {
+                    self.emit_unbox_scalar();
+                }
                 Ok(Some(elem_value_type(elem)))
             }
             ("tail", 1) => {
@@ -3606,16 +3719,32 @@ impl Emitter {
                 if self.expression(&arguments[0])? != ValueType::Int {
                     return Err(unsupported(span, &format!("{name} with a non-Int size")));
                 }
-                if name == "__gc_record" {
-                    // n pointer slots → n * 8 bytes.
+                // M6: a GC-shaped object with a 16-byte header. The enum
+                // lowering boxes every scalar/bool/double field and the
+                // discriminant, so a `__gc_record`'s n slots are all heap
+                // pointers (POINTER_RECORD, size = 1 + field_count >= 1); a
+                // `__gc_alloc` cell is raw bytes (RAW_BYTES). Both return the
+                // user pointer (block + 16), so the `__gc_write`/`__gc_read`
+                // payload offsets are unchanged.
+                let tag = if name == "__gc_record" {
+                    // n pointer slots -> n * 8 bytes.
                     self.asm.lsl_imm(Reg::X4, Reg::X0, 3);
+                    crate::gc_layout::GC_TYPE_POINTER_RECORD
                 } else {
                     self.asm.add_reg_imm(Reg::X4, Reg::X0, 7);
                     self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
                     self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-                }
-                self.emit_alloc();
-                self.asm.mov_reg(Reg::X0, Reg::X5);
+                    crate::gc_layout::GC_TYPE_RAW_BYTES
+                };
+                // block = align16(payload + 16 header).
+                self.asm.add_reg_imm(Reg::X4, Reg::X4, 16 + 15);
+                self.asm.lsr_imm(Reg::X4, Reg::X4, 4);
+                self.asm.lsl_imm(Reg::X4, Reg::X4, 4);
+                self.emit_alloc(); // x5 = block base, x4 = block size preserved
+                self.asm.str_imm(Reg::X4, Reg::X5, 0); // [block] = size|mark(0)
+                self.asm.mov_imm64(Reg::X6, tag);
+                self.asm.str_imm(Reg::X6, Reg::X5, 8); // [block + 8] = type_tag
+                self.asm.add_reg_imm(Reg::X0, Reg::X5, 16); // x0 = user pointer
                 Ok(Some(ValueType::Ptr))
             }
             ("__gc_write", 3) => {
@@ -4295,6 +4424,576 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
 /// Compile the whole program to a signed Mach-O arm64 executable.
 /// `lowered_enums` names the enums `desugar_enums` already lowered to
 /// `__gc_record` shape.
+/// Every data cell, diagnostic string, and subroutine label the portable
+/// ZGC needs, reserved in one pass and threaded into the `emit_gc_*`
+/// calls. Mirrors the x86-64 backend's GC field set (lib.rs) one-to-one.
+/// The single-qword cells and the three 512-entry region arrays live in
+/// `__DATA,__bss`; the diagnostic strings live in read-only `__const`.
+struct GcState {
+    heap_base: PortDataAddr,
+    heap_top: PortDataAddr,
+    heap_end: PortDataAddr,
+    free_region_head: PortDataAddr,
+    mark_worklist: PortDataAddr,
+    mark_worklist_top: PortDataAddr,
+    shadow_stack: PortDataAddr,
+    shadow_stack_top: PortDataAddr,
+    region_base: PortDataAddr,
+    committed_count: PortDataAddr,
+    budget_regions: PortDataAddr,
+    phase: PortDataAddr,
+    good_color: PortDataAddr,
+    bad_mask: PortDataAddr,
+    bytes_since_cycle: PortDataAddr,
+    bytes_since_quantum: PortDataAddr,
+    stw_fallback_pending: PortDataAddr,
+    stw_fallbacks: PortDataAddr,
+    header_mark: PortDataAddr,
+    mark_color: PortDataAddr,
+    evac_region_base: PortDataAddr,
+    evac_top: PortDataAddr,
+    evac_end: PortDataAddr,
+    reloc_scan_idx: PortDataAddr,
+    reloc_block: PortDataAddr,
+    relocated_count: PortDataAddr,
+    collect_counter: PortDataAddr,
+    alloc_count: PortDataAddr,
+    bytes_allocated: PortDataAddr,
+    pause_max_ns: PortDataAddr,
+    pause_total_ns: PortDataAddr,
+    pause_start_ns: PortDataAddr,
+    region_top: PortDataAddr,
+    region_live: PortDataAddr,
+    region_fromspace: PortDataAddr,
+    oom: (PortDataAddr, usize),
+    worklist_overflow: (PortDataAddr, usize),
+    bounds_error_text: (PortDataAddr, usize),
+    evac_exhausted: (PortDataAddr, usize),
+    evac_oversized: (PortDataAddr, usize),
+    l_alloc: Label,
+    l_collect: Label,
+    l_mark_roots: Label,
+    l_trace: Label,
+    l_sweep: Label,
+    l_clear_all_marks: Label,
+    l_stw_mark_complete: Label,
+    l_drain: Label,
+    l_evacuate: Label,
+    l_acquire_evac_region: Label,
+    l_relocate_start: Label,
+    l_relocate_quantum: Label,
+    l_relocate_finish: Label,
+    l_free_ghost_regions: Label,
+    l_relocate_fix_roots: Label,
+    l_mark_start: Label,
+    l_mark_end: Label,
+    l_mark_visit: Label,
+    l_deep_equal: Label,
+    l_load_barrier_slow: Label,
+    l_acquire_region: Label,
+    l_alloc_large: Label,
+    l_grow_budget: Label,
+    l_bounds_error: Label,
+}
+
+impl Emitter {
+    /// Store a register's value into a single-qword GC `__bss` cell,
+    /// using X10 as the address scratch.
+    fn emit_store_gc_cell_reg(&mut self, cell: PortDataAddr, value: Reg) {
+        let PortDataAddr::Bss(label) = cell else {
+            unreachable!("GC cells live in __bss");
+        };
+        self.asm.load_data_address(Reg::X10, label);
+        self.asm.str_imm(value, Reg::X10, 0);
+    }
+
+    /// Store a 64-bit immediate into a single-qword GC `__bss` cell
+    /// (X11 holds the value, X10 the address).
+    fn emit_store_gc_cell_imm(&mut self, cell: PortDataAddr, value: u64) {
+        self.asm.mov_imm64(Reg::X11, value);
+        self.emit_store_gc_cell_reg(cell, Reg::X11);
+    }
+
+    /// M7 (infra): bring the GC region heap online at startup -- the
+    /// AArch64 mirror of the x86-64 `emit_initialize_gc_heap`. mmaps the
+    /// whole region reservation (demand-paged) and the runtime tables
+    /// (shadow stack + mark worklist, zero-filled by mmap), then installs
+    /// region-0 metadata. Runs before the bump heap is armed; while
+    /// allocations still bump (pre go-live) these cells are written but
+    /// unread, so this only exercises the startup path.
+    fn emit_gc_init_heap(&mut self, gc: &GcState) {
+        // mmap(NULL, GC_RESERVE_BYTES, RW, MAP_ANON|PRIVATE, -1, 0).
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm
+            .mov_imm64(Reg::X1, crate::gc_layout::GC_RESERVE_BYTES);
+        self.asm.mov_imm64(Reg::X2, PROT_READ_WRITE);
+        self.asm.mov_imm64(Reg::X3, MMAP_ANON_PRIVATE);
+        self.asm.mov_imm64(Reg::X4, u64::MAX); // fd = -1
+        self.asm.mov_imm64(Reg::X5, 0);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_MMAP));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic gc: mmap failed\n");
+        // region_base = heap_base = heap_top = region_top[0] = base (x0).
+        self.emit_store_gc_cell_reg(gc.region_base, Reg::X0);
+        self.emit_store_gc_cell_reg(gc.heap_base, Reg::X0);
+        self.emit_store_gc_cell_reg(gc.heap_top, Reg::X0);
+        self.emit_store_gc_cell_reg(gc.region_top, Reg::X0); // element 0
+        // heap_end = base + GC_REGION_SIZE.
+        self.asm
+            .mov_imm64(Reg::X1, crate::gc_layout::GC_REGION_SIZE);
+        self.asm.add_reg(Reg::X2, Reg::X0, Reg::X1);
+        self.emit_store_gc_cell_reg(gc.heap_end, Reg::X2);
+        // free_region_head = 0; committed_count = 1; budget = initial.
+        self.emit_store_gc_cell_imm(gc.free_region_head, 0);
+        self.emit_store_gc_cell_imm(gc.committed_count, 1);
+        self.emit_store_gc_cell_imm(
+            gc.budget_regions,
+            crate::gc_layout::GC_INITIAL_BUDGET_REGIONS,
+        );
+        // mmap(NULL, GC_TABLES_BYTES, ...) for the shadow stack + worklist.
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm
+            .mov_imm64(Reg::X1, crate::gc_layout::GC_TABLES_BYTES);
+        self.asm.mov_imm64(Reg::X2, PROT_READ_WRITE);
+        self.asm.mov_imm64(Reg::X3, MMAP_ANON_PRIVATE);
+        self.asm.mov_imm64(Reg::X4, u64::MAX);
+        self.asm.mov_imm64(Reg::X5, 0);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_MMAP));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic gc: mmap failed\n");
+        // shadow_stack = tables base; mark_worklist = base + SHADOW_LEN*8.
+        self.emit_store_gc_cell_reg(gc.shadow_stack, Reg::X0);
+        self.asm
+            .mov_imm64(Reg::X1, (crate::gc_layout::GC_SHADOW_STACK_LEN * 8) as u64);
+        self.asm.add_reg(Reg::X0, Reg::X0, Reg::X1);
+        self.emit_store_gc_cell_reg(gc.mark_worklist, Reg::X0);
+    }
+
+    /// M7 (infra): seed the callee-saved colour registers (X24 strip mask,
+    /// X25 good colour, X26 bad-colour test mask) and the colour/mark
+    /// cells -- the AArch64 mirror of `emit_initialize_color_registers`.
+    /// Non-moving, unpoisoned scheme (evac off): good = M0, bad = M1|R.
+    /// X25/X26 cache the cells; MarkStart reloads them each cycle.
+    fn emit_gc_init_colors(&mut self, gc: &GcState) {
+        self.asm
+            .mov_imm64(Reg::X24, crate::gc_layout::GC_COLOR_STRIP);
+        self.emit_store_gc_cell_imm(gc.good_color, crate::gc_layout::GC_COLOR_M0);
+        self.emit_store_gc_cell_imm(gc.bad_mask, crate::gc_layout::GC_COLOR_BAD_MASK);
+        let PortDataAddr::Bss(good) = gc.good_color else {
+            unreachable!("GC cells live in __bss");
+        };
+        self.asm.load_data_address(Reg::X10, good);
+        self.asm.ldr_imm(Reg::X25, Reg::X10, 0);
+        let PortDataAddr::Bss(bad) = gc.bad_mask else {
+            unreachable!("GC cells live in __bss");
+        };
+        self.asm.load_data_address(Reg::X10, bad);
+        self.asm.ldr_imm(Reg::X26, Reg::X10, 0);
+        // Header-mark parity (nonzero so the first mark isn't a no-op) and
+        // the initial mark colour.
+        self.emit_store_gc_cell_imm(gc.header_mark, crate::gc_layout::GC_HMARK1);
+        self.emit_store_gc_cell_imm(gc.mark_color, crate::gc_layout::GC_COLOR_M1);
+    }
+
+    /// Reserve all GC cells (single qwords + the three region arrays) in
+    /// `__DATA,__bss`, intern the diagnostic strings, and create the
+    /// subroutine labels.
+    fn reserve_gc_state(&mut self) -> GcState {
+        const REGIONS: usize = crate::gc_layout::GC_RESERVE_REGIONS as usize;
+        let mut cell = || PortDataAddr::Bss(self.asm.reserve_data_cells(1));
+        let heap_base = cell();
+        let heap_top = cell();
+        let heap_end = cell();
+        let free_region_head = cell();
+        let mark_worklist = cell();
+        let mark_worklist_top = cell();
+        let shadow_stack = cell();
+        let shadow_stack_top = cell();
+        let region_base = cell();
+        let committed_count = cell();
+        let budget_regions = cell();
+        let phase = cell();
+        let good_color = cell();
+        let bad_mask = cell();
+        let bytes_since_cycle = cell();
+        let bytes_since_quantum = cell();
+        let stw_fallback_pending = cell();
+        let stw_fallbacks = cell();
+        let header_mark = cell();
+        let mark_color = cell();
+        let evac_region_base = cell();
+        let evac_top = cell();
+        let evac_end = cell();
+        let reloc_scan_idx = cell();
+        let reloc_block = cell();
+        let relocated_count = cell();
+        let collect_counter = cell();
+        let alloc_count = cell();
+        let bytes_allocated = cell();
+        let pause_max_ns = cell();
+        let pause_total_ns = cell();
+        let pause_start_ns = cell();
+        let region_top = PortDataAddr::Bss(self.asm.reserve_data_cells(REGIONS));
+        let region_live = PortDataAddr::Bss(self.asm.reserve_data_cells(REGIONS));
+        let region_fromspace = PortDataAddr::Bss(self.asm.reserve_data_cells(REGIONS));
+
+        let mut string = |bytes: &[u8]| {
+            (
+                PortDataAddr::Rodata(self.asm.intern_rodata(bytes)),
+                bytes.len(),
+            )
+        };
+        let oom = string(b"klassic gc: out of memory\n");
+        let worklist_overflow = string(b"klassic gc: mark worklist overflow\n");
+        let bounds_error_text = string(b"klassic gc: index out of bounds\n");
+        let evac_exhausted = string(b"klassic gc: evacuation exhausted the heap reservation\n");
+        let evac_oversized = string(b"klassic gc: evacuation object exceeds a region\n");
+
+        GcState {
+            heap_base,
+            heap_top,
+            heap_end,
+            free_region_head,
+            mark_worklist,
+            mark_worklist_top,
+            shadow_stack,
+            shadow_stack_top,
+            region_base,
+            committed_count,
+            budget_regions,
+            phase,
+            good_color,
+            bad_mask,
+            bytes_since_cycle,
+            bytes_since_quantum,
+            stw_fallback_pending,
+            stw_fallbacks,
+            header_mark,
+            mark_color,
+            evac_region_base,
+            evac_top,
+            evac_end,
+            reloc_scan_idx,
+            reloc_block,
+            relocated_count,
+            collect_counter,
+            alloc_count,
+            bytes_allocated,
+            pause_max_ns,
+            pause_total_ns,
+            pause_start_ns,
+            region_top,
+            region_live,
+            region_fromspace,
+            oom,
+            worklist_overflow,
+            bounds_error_text,
+            evac_exhausted,
+            evac_oversized,
+            l_alloc: self.asm.new_label(),
+            l_collect: self.asm.new_label(),
+            l_mark_roots: self.asm.new_label(),
+            l_trace: self.asm.new_label(),
+            l_sweep: self.asm.new_label(),
+            l_clear_all_marks: self.asm.new_label(),
+            l_stw_mark_complete: self.asm.new_label(),
+            l_drain: self.asm.new_label(),
+            l_evacuate: self.asm.new_label(),
+            l_acquire_evac_region: self.asm.new_label(),
+            l_relocate_start: self.asm.new_label(),
+            l_relocate_quantum: self.asm.new_label(),
+            l_relocate_finish: self.asm.new_label(),
+            l_free_ghost_regions: self.asm.new_label(),
+            l_relocate_fix_roots: self.asm.new_label(),
+            l_mark_start: self.asm.new_label(),
+            l_mark_end: self.asm.new_label(),
+            l_mark_visit: self.asm.new_label(),
+            l_deep_equal: self.asm.new_label(),
+            l_load_barrier_slow: self.asm.new_label(),
+            l_acquire_region: self.asm.new_label(),
+            l_alloc_large: self.asm.new_label(),
+            l_grow_budget: self.asm.new_label(),
+            l_bounds_error: self.asm.new_label(),
+        }
+    }
+
+    /// Emit all 24 portable GC runtime routines into the code buffer.
+    /// M5: evacuation is off (non-moving) and pause timing is disabled
+    /// (`plat_read_monotonic_ns` is a stub); the `--gc-log`/`--gc-stress`
+    /// flags are threaded in at go-live (M7). Emitted after the program
+    /// body and its exit, so the routines are reachable only once the
+    /// mutator calls `gc_alloc` (M7) -- dead but linked until then.
+    fn emit_gc_runtime(&mut self, gc: &GcState) {
+        use portable_asm as pa;
+        let asm = &mut self.asm;
+        let evac_off = true;
+        let poison = false;
+        let timing = false;
+        let stderr_fd = 2u64;
+        let tables = pa::RegionTables {
+            heap_base: gc.heap_base,
+            heap_top: gc.heap_top,
+            region_base: gc.region_base,
+            region_top: gc.region_top,
+            committed_count: gc.committed_count,
+            region_fromspace: gc.region_fromspace,
+        };
+        let pause = pa::PauseCells {
+            start_ns: gc.pause_start_ns,
+            total_ns: gc.pause_total_ns,
+            max_ns: gc.pause_max_ns,
+        };
+
+        pa::emit_gc_mark_visit(
+            asm,
+            gc.l_mark_visit,
+            pa::MarkWorklist {
+                header_mark: gc.header_mark,
+                worklist: gc.mark_worklist,
+                worklist_top: gc.mark_worklist_top,
+                stw_fallback_pending: gc.stw_fallback_pending,
+            },
+        );
+        pa::emit_gc_deep_equal(asm, gc.l_deep_equal);
+        pa::emit_gc_load_barrier_slow(
+            asm,
+            gc.l_load_barrier_slow,
+            gc.phase,
+            gc.region_base,
+            gc.region_fromspace,
+            gc.l_evacuate,
+            gc.l_mark_visit,
+        );
+        pa::emit_gc_alloc(
+            asm,
+            gc.l_alloc,
+            pa::AllocCells {
+                phase: gc.phase,
+                bytes_since_cycle: gc.bytes_since_cycle,
+                budget_regions: gc.budget_regions,
+                bytes_since_quantum: gc.bytes_since_quantum,
+                mark_worklist_top: gc.mark_worklist_top,
+                header_mark: gc.header_mark,
+                alloc_count: gc.alloc_count,
+                bytes_allocated: gc.bytes_allocated,
+                heap_top: gc.heap_top,
+                heap_end: gc.heap_end,
+                oom_text: gc.oom.0,
+            },
+            pa::AllocTargets {
+                mark_start: gc.l_mark_start,
+                trace: gc.l_trace,
+                mark_end: gc.l_mark_end,
+                relocate_quantum: gc.l_relocate_quantum,
+                collect: gc.l_collect,
+                grow_budget: gc.l_grow_budget,
+                acquire_region: gc.l_acquire_region,
+                alloc_large: gc.l_alloc_large,
+            },
+            pa::AllocFlags {
+                stress: false,
+                log: false,
+            },
+            gc.oom.1,
+            stderr_fd,
+        );
+        pa::emit_gc_collect(
+            asm,
+            gc.l_collect,
+            timing,
+            pause,
+            gc.phase,
+            pa::CollectTargets {
+                stw_mark_complete: gc.l_stw_mark_complete,
+                free_ghost_regions: gc.l_free_ghost_regions,
+                sweep: gc.l_sweep,
+                relocate_quantum: gc.l_relocate_quantum,
+                mark_end: gc.l_mark_end,
+            },
+        );
+        pa::emit_gc_mark_roots(
+            asm,
+            gc.l_mark_roots,
+            gc.shadow_stack,
+            gc.shadow_stack_top,
+            gc.l_mark_visit,
+        );
+        pa::emit_gc_trace(
+            asm,
+            gc.l_trace,
+            gc.mark_worklist_top,
+            gc.mark_worklist,
+            gc.l_mark_visit,
+        );
+        pa::emit_gc_sweep(
+            asm,
+            gc.l_sweep,
+            tables,
+            gc.collect_counter,
+            gc.free_region_head,
+            gc.header_mark,
+            gc.region_live,
+        );
+        pa::emit_gc_clear_all_marks(asm, gc.l_clear_all_marks, tables);
+        pa::emit_gc_stw_mark_complete(
+            asm,
+            gc.l_stw_mark_complete,
+            pa::StwMarkTargets {
+                clear_all_marks: gc.l_clear_all_marks,
+                mark_roots: gc.l_mark_roots,
+                drain: gc.l_drain,
+            },
+            gc.stw_fallback_pending,
+            gc.mark_worklist_top,
+            gc.worklist_overflow.0,
+            gc.worklist_overflow.1,
+        );
+        pa::emit_gc_drain(asm, gc.l_drain, gc.l_trace, gc.mark_worklist_top);
+        pa::emit_gc_evacuate(
+            asm,
+            gc.l_evacuate,
+            pa::EvacBumpCells {
+                evac_top: gc.evac_top,
+                evac_end: gc.evac_end,
+                relocated_count: gc.relocated_count,
+            },
+            gc.l_acquire_evac_region,
+            gc.evac_oversized.0,
+            gc.evac_oversized.1,
+            stderr_fd,
+        );
+        pa::emit_gc_acquire_evac_region(
+            asm,
+            gc.l_acquire_evac_region,
+            pa::EvacRegionCells {
+                evac_region_base: gc.evac_region_base,
+                evac_top: gc.evac_top,
+                evac_end: gc.evac_end,
+                region_base: gc.region_base,
+                region_top: gc.region_top,
+                committed_count: gc.committed_count,
+                free_region_head: gc.free_region_head,
+            },
+            gc.evac_exhausted.0,
+            gc.evac_exhausted.1,
+            stderr_fd,
+        );
+        pa::emit_gc_relocate_start(
+            asm,
+            gc.l_relocate_start,
+            pa::RelocateStartCells {
+                good_color: gc.good_color,
+                bad_mask: gc.bad_mask,
+                free_region_head: gc.free_region_head,
+                budget_regions: gc.budget_regions,
+                committed_count: gc.committed_count,
+                heap_base: gc.heap_base,
+                region_base: gc.region_base,
+                region_top: gc.region_top,
+                region_live: gc.region_live,
+                region_fromspace: gc.region_fromspace,
+                evac_region_base: gc.evac_region_base,
+                evac_top: gc.evac_top,
+                evac_end: gc.evac_end,
+                reloc_scan_idx: gc.reloc_scan_idx,
+                reloc_block: gc.reloc_block,
+                bytes_since_quantum: gc.bytes_since_quantum,
+                phase: gc.phase,
+                bytes_since_cycle: gc.bytes_since_cycle,
+            },
+            gc.l_relocate_fix_roots,
+            evac_off,
+            poison,
+        );
+        pa::emit_gc_relocate_quantum(
+            asm,
+            gc.l_relocate_quantum,
+            tables,
+            pa::RelocQuantumCells {
+                reloc_scan_idx: gc.reloc_scan_idx,
+                reloc_block: gc.reloc_block,
+                header_mark: gc.header_mark,
+            },
+            gc.l_evacuate,
+            gc.l_relocate_finish,
+        );
+        pa::emit_gc_relocate_finish(
+            asm,
+            gc.l_relocate_finish,
+            tables,
+            gc.evac_region_base,
+            gc.evac_top,
+            gc.phase,
+            gc.bytes_since_cycle,
+        );
+        pa::emit_gc_free_ghost_regions(
+            asm,
+            gc.l_free_ghost_regions,
+            tables,
+            gc.free_region_head,
+            gc.region_live,
+        );
+        pa::emit_gc_relocate_fix_roots(
+            asm,
+            gc.l_relocate_fix_roots,
+            gc.shadow_stack,
+            gc.shadow_stack_top,
+            gc.region_base,
+            gc.region_fromspace,
+            gc.l_evacuate,
+        );
+        pa::emit_gc_mark_start(
+            asm,
+            gc.l_mark_start,
+            timing,
+            pause,
+            pa::MarkStartCells {
+                header_mark: gc.header_mark,
+                good_color: gc.good_color,
+                bad_mask: gc.bad_mask,
+                mark_color: gc.mark_color,
+                worklist_top: gc.mark_worklist_top,
+                phase: gc.phase,
+            },
+            gc.l_mark_roots,
+            pa::MarkColorMode { evac_off, poison },
+        );
+        pa::emit_gc_mark_end(
+            asm,
+            gc.l_mark_end,
+            timing,
+            pause,
+            pa::MarkEndTargets {
+                drain: gc.l_drain,
+                stw_mark_complete: gc.l_stw_mark_complete,
+                free_ghost_regions: gc.l_free_ghost_regions,
+                sweep: gc.l_sweep,
+                relocate_start: gc.l_relocate_start,
+            },
+            gc.stw_fallback_pending,
+            gc.stw_fallbacks,
+        );
+        pa::emit_gc_acquire_region(
+            asm,
+            gc.l_acquire_region,
+            tables,
+            gc.free_region_head,
+            gc.budget_regions,
+            gc.heap_end,
+        );
+        pa::emit_gc_alloc_large(asm, gc.l_alloc_large, tables, gc.budget_regions);
+        pa::emit_gc_grow_budget(asm, gc.l_grow_budget, gc.committed_count, gc.budget_regions);
+        pa::emit_gc_bounds_error(
+            asm,
+            gc.l_bounds_error,
+            gc.bounds_error_text.0,
+            gc.bounds_error_text.1,
+        );
+    }
+}
+
 pub(crate) fn emit_macho_program(
     expr: &Expr,
     lowered_enums: std::collections::HashSet<String>,
@@ -4314,6 +5013,17 @@ pub(crate) fn emit_macho_program(
     emitter.asm.mov_reg(Reg::X21, Reg::X0);
     emitter.asm.mov_reg(Reg::X22, Reg::X1);
     emitter.asm.mov_reg(Reg::X23, Reg::X2);
+
+    // M7 (infra): reserve the GC cells/labels and bring the region heap +
+    // colour registers online at startup, before the bump heap is armed.
+    // Allocations still bump below, so the collector stays inert -- this
+    // only exercises the startup mmap/seeding path (validated live on
+    // arm64 CI) ahead of the go-live flip. reserve_gc_state emits no code
+    // (it only reserves __bss cells / rodata / labels), so calling it here
+    // and emitting the routine bodies after main is unchanged.
+    let gc = emitter.reserve_gc_state();
+    emitter.emit_gc_init_heap(&gc);
+    emitter.emit_gc_init_colors(&gc);
 
     // Empty heap: the first allocation's capacity check fails and
     // mmaps the first segment.
@@ -4354,6 +5064,15 @@ pub(crate) fn emit_macho_program(
     if let Some(label) = emitter.heap_grow_label {
         emitter.emit_heap_grow_routine(label);
     }
+
+    // M5: emit all 24 portable ZGC runtime routines after the program's
+    // exit (the cells were reserved and the region heap/colour registers
+    // seeded at startup above). Nothing calls gc_alloc yet (the bump
+    // allocator is still live), so the routines are dead but linked -- they
+    // exercise the __DATA segment, the data fixups, and the whole
+    // PortableAsm lowering end-to-end, and must encode validly. The go-live
+    // (M7) routes the mutator through gc_alloc and adds roots/barriers.
+    emitter.emit_gc_runtime(&gc);
 
     emitter.asm.finish();
     // `bss_len` is 0 for every program today (no codegen reserves GC
