@@ -1703,6 +1703,36 @@ impl Emitter {
                 {
                     return self.emit_assert_result(&first_args[0], &arguments[0], *span);
                 }
+                // Curried `foldLeft(list)(init)(f)` -- which is also what
+                // `xs reduce init => r + e` desugars to -- with a lambda
+                // literal for f.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: with_initial,
+                        arguments: initial_args,
+                        ..
+                    } = callee.as_ref()
+                    && initial_args.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: list_args,
+                        ..
+                    } = with_initial.as_ref()
+                    && list_args.len() == 1
+                    && let Expr::Identifier { name, .. } = inner.as_ref()
+                    && name == "foldLeft"
+                    && let Expr::Lambda { params, body, .. } = &arguments[0]
+                    && params.len() == 2
+                {
+                    return self.emit_list_fold_left(
+                        &list_args[0],
+                        &initial_args[0],
+                        &params[0],
+                        &params[1],
+                        body,
+                        *span,
+                    );
+                }
                 // Curried `map(list)(f)` where the function is a lambda
                 // literal: the list's element type gives the lambda's
                 // parameter type, so the body can be compiled straight into
@@ -5227,6 +5257,96 @@ impl Emitter {
         self.asm.branch(label, BranchKind::Link);
         self.pending.push(index);
         Ok(ret)
+    }
+
+    /// `foldLeft(list)(initial)(f)`: thread an accumulator through the list,
+    /// `acc = f(acc, element)` per element.
+    ///
+    /// Like the map above, the lambda's body is compiled once inside the loop,
+    /// so the fold runs at run time over a list of any length. The
+    /// accumulator's type has to be stable across iterations -- it is the
+    /// initial value's type, and a body that produced something else would be
+    /// a different function on the second iteration -- so that is checked
+    /// rather than assumed.
+    fn emit_list_fold_left(
+        &mut self,
+        list: &Expr,
+        initial: &Expr,
+        acc_param: &str,
+        elem_param: &str,
+        body: &Expr,
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let initial_ty = self.expression(initial)?;
+        if initial_ty == ValueType::Unit {
+            return Err(unsupported(initial.span(), "a unit-typed accumulator"));
+        }
+        let acc = self.next_local_offset;
+        let cursor = acc + 8;
+        let acc_slot = cursor + 8;
+        let elem_slot = acc_slot + 8;
+        self.next_local_offset += 32;
+        self.asm.store_local(Reg::X0, acc);
+        if is_heap_pointer(initial_ty) {
+            self.emit_root_frame_slot(acc);
+        }
+        let list_ty = self.expression(list)?;
+        let elem = match list_ty {
+            ValueType::List(elem) => elem,
+            // Folding an empty list is the initial value.
+            ValueType::EmptyList => return Ok(initial_ty),
+            _ => return Err(unsupported(list.span(), "folding over this value")),
+        };
+        self.asm.store_local(Reg::X0, cursor);
+        self.emit_root_frame_slot(cursor);
+
+        let elem_ty = elem_value_type(elem);
+        let loop_start = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.load_local(Reg::X0, cursor);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        self.asm.store_local(Reg::X0, elem_slot);
+        self.asm.load_local(Reg::X0, acc);
+        self.asm.store_local(Reg::X0, acc_slot);
+        self.scopes.push(HashMap::new());
+        self.lambda_bindings.push(HashMap::new());
+        self.scope_root_counts.push(0);
+        {
+            let scope = self.scopes.last_mut().expect("emitter scope");
+            scope.insert(acc_param.to_string(), (acc_slot, initial_ty));
+            scope.insert(elem_param.to_string(), (elem_slot, elem_ty));
+        }
+        if is_heap_pointer(initial_ty) {
+            self.emit_root_frame_slot(acc_slot);
+        }
+        if is_heap_pointer(elem_ty) {
+            self.emit_root_frame_slot(elem_slot);
+        }
+        let folded = self.expression(body)?;
+        if folded != initial_ty {
+            return Err(unsupported(
+                body.span(),
+                "a fold whose accumulator changes type",
+            ));
+        }
+        self.asm.store_local(Reg::X0, acc);
+        self.scopes.pop();
+        self.lambda_bindings.pop();
+        let roots = self.scope_root_counts.pop().expect("emitter root scope");
+        self.emit_shadow_pop(roots);
+        self.asm.load_local(Reg::X0, cursor);
+        self.emit_gc_load_ptr(Reg::X0, 8);
+        self.asm.store_local(Reg::X0, cursor);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(done);
+        self.asm.load_local(Reg::X0, acc);
+        let _ = span;
+        Ok(initial_ty)
     }
 
     /// A name bound to a lambda, innermost scope first.

@@ -73,6 +73,15 @@ println(stdlibRangeInclusive(1, 3))
 // Numeric builtins. Doubles travel as raw bits in a general register and
 // move through the FP unit for the operation itself, so these also check that
 // round trip. floor/ceil are Int-valued like the evaluator's.
+// foldLeft, and the reduce sugar that desugars to it. The accumulator threads
+// through the loop in a rooted slot, so a string fold also exercises the
+// collector: each concatenation allocates while the list and accumulator live.
+println([1 2 3] reduce 0 => r + e)
+println(["a" "b" "c"] reduce "" => r + e)
+println(foldLeft([1 2 3 4])(1)((a, x) => a * x))
+assertResult(6)([1 2 3] reduce 0 => r + e)
+assertResult(24)(foldLeft([1 2 3 4])(1)((a, x) => a * x))
+
 assertResult(3.0)(sqrt(9.0))
 assertResult(2.5)(abs(-2.5))
 assertResult(7)(abs(-7))
