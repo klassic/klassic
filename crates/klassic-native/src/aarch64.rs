@@ -1597,6 +1597,11 @@ struct Emitter {
     /// such a record has no runtime representation here: `dict.show(x)`
     /// resolves the field to its lambda and compiles the body at the call.
     dict_bindings: Vec<HashMap<String, Vec<(String, usize)>>>,
+    /// Names bound to a string literal. Some builtins need the *text* of an
+    /// argument at compile time -- `Dir#mkdirs` creates each parent directory,
+    /// so it splits the path here -- and a literal put in a `val` first is the
+    /// ordinary way to write one.
+    literal_strings: Vec<HashMap<String, String>>,
     next_local_offset: u32,
     /// The deepest `next_local_offset` reached in the function being emitted.
     /// Slots are handed back when an inlined lambda's parameters die, so the
@@ -2237,10 +2242,7 @@ impl Emitter {
     /// `O_WRONLY|O_CREAT|` (`O_TRUNC` or `O_APPEND`), writes the
     /// content bytes, then closes -- aborting with a source-located
     /// message on any syscall failure (M14, issue #538).
-    fn emit_file_write(&mut self, path_offset: usize, append: bool) {
-        self.asm.push(Reg::X0); // content object
-
-        self.asm.load_rodata_address(Reg::X0, path_offset);
+    fn emit_file_write(&mut self, append: bool) {
         let flags = if append {
             O_WRONLY | O_CREAT | O_APPEND
         } else {
@@ -2253,7 +2255,7 @@ impl Emitter {
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: FileOutput#write failed to open file\n");
         self.asm.mov_reg(Reg::X3, Reg::X0); // fd
-        self.asm.pop(Reg::X4); // content object
+        self.pop_rooted(Reg::X4); // content object
 
         self.asm.ldr_imm(Reg::X2, Reg::X4, 0); // content len
         self.asm.add_reg_imm(Reg::X1, Reg::X4, 8); // content bytes
@@ -2281,10 +2283,9 @@ impl Emitter {
     /// resident in a register, since `emit_alloc` unconditionally
     /// clobbers x6 and only preserves x0-x5 across its heap-grow
     /// path -- the same lesson #563's bug taught for `trim`.
-    fn emit_file_read_all(&mut self, path_offset: usize) {
+    fn emit_file_read_all(&mut self) {
         const READ_CAP: u64 = 1_048_576;
 
-        self.asm.load_rodata_address(Reg::X0, path_offset);
         self.asm.mov_imm64(Reg::X1, O_RDONLY);
         self.asm.mov_imm64(Reg::X2, 0);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_OPEN));
@@ -2342,9 +2343,8 @@ impl Emitter {
     /// errno 2) as success, matching the evaluator's
     /// `std::io::ErrorKind::NotFound` leniency; any other failure
     /// aborts with a source-located message (M14, issue #538).
-    fn emit_file_delete(&mut self, path_offset: usize) {
+    fn emit_file_delete(&mut self) {
         const ENOENT: u32 = 2;
-        self.asm.load_rodata_address(Reg::X0, path_offset);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_UNLINK));
         self.asm.svc_0x80();
         let ok = self.asm.new_label();
@@ -2363,8 +2363,7 @@ impl Emitter {
     /// source-located message on any failure, matching the
     /// evaluator's `fs::create_dir` (which errors on an
     /// already-existing path) (M15, issue #538).
-    fn emit_dir_mkdir(&mut self, path_offset: usize) {
-        self.asm.load_rodata_address(Reg::X0, path_offset);
+    fn emit_dir_mkdir(&mut self) {
         self.asm.mov_imm64(Reg::X1, DEFAULT_DIR_MODE);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_MKDIR));
         self.asm.svc_0x80();
@@ -2381,9 +2380,8 @@ impl Emitter {
     /// message on any other failure. Does not set a return value;
     /// callers run this once per `/`-separated prefix and set the
     /// `Unit` result after the last one (M15, issue #538).
-    fn emit_dir_mkdir_tolerating_eexist(&mut self, path_offset: usize) {
+    fn emit_dir_mkdir_tolerating_eexist(&mut self) {
         const EEXIST: u32 = 17;
-        self.asm.load_rodata_address(Reg::X0, path_offset);
         self.asm.mov_imm64(Reg::X1, DEFAULT_DIR_MODE);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_MKDIR));
         self.asm.svc_0x80();
@@ -2402,8 +2400,7 @@ impl Emitter {
     /// on any failure, matching the evaluator's `fs::remove_dir`
     /// (errors on a non-empty or missing directory) (M15, issue
     /// #538).
-    fn emit_dir_delete(&mut self, path_offset: usize) {
-        self.asm.load_rodata_address(Reg::X0, path_offset);
+    fn emit_dir_delete(&mut self) {
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_RMDIR));
         self.asm.svc_0x80();
         self.asm
@@ -2426,9 +2423,11 @@ impl Emitter {
     /// its own top bits after this shift). A failed stat (e.g. a
     /// missing path) reports `false` rather than aborting, matching
     /// the evaluator's `Path::is_dir()` (M15, issue #538).
-    fn emit_dir_is_directory(&mut self, path_offset: usize) {
+    fn emit_dir_is_directory(&mut self) {
         const STAT_BUF_SIZE: u64 = 144;
         const S_IFDIR_SHIFTED: u32 = 0o4; // S_IFDIR (0o040000) >> 12
+
+        self.asm.mov_reg(Reg::X7, Reg::X0); // the path, past the buffer setup
 
         // A transient syscall buffer, so it lives on the machine stack, not
         // in the GC heap: the collector's sweep walks a region block by
@@ -2438,7 +2437,7 @@ impl Emitter {
         self.asm.add_reg_sp_imm(Reg::X6, 0);
 
         self.asm.mov_imm64(Reg::X0, AT_FDCWD as u64);
-        self.asm.load_rodata_address(Reg::X1, path_offset);
+        self.asm.mov_reg(Reg::X1, Reg::X7);
         self.asm.mov_reg(Reg::X2, Reg::X6);
         self.asm.mov_imm64(Reg::X3, 0);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_FSTATAT64));
@@ -2462,9 +2461,7 @@ impl Emitter {
     /// NUL-terminated paths (rodata, `source_offset`/`target_offset`).
     /// Aborts with a source-located message on any failure, matching
     /// the evaluator's `fs::rename` (M15, issue #538).
-    fn emit_dir_move(&mut self, source_offset: usize, target_offset: usize) {
-        self.asm.load_rodata_address(Reg::X0, source_offset);
-        self.asm.load_rodata_address(Reg::X1, target_offset);
+    fn emit_dir_move(&mut self) {
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_RENAME));
         self.asm.svc_0x80();
         self.asm
@@ -3088,6 +3085,45 @@ impl Emitter {
     /// The source is in the immovable image, so it is parked on the machine
     /// stack *without* a root -- rooting a non-heap pointer would send the
     /// collector into `__const` looking for a header.
+    /// A NUL-terminated copy of the string object in x0, left as a byte pointer
+    /// in x0: the syscalls take C strings, and a Klassic string is
+    /// length-prefixed without a terminator. Used for a path that is only known
+    /// at run time -- a literal one interns into rodata already terminated.
+    fn emit_cstring_copy(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+        self.push_rooted(Reg::X0); // the source survives the allocation
+        self.asm.add_reg_imm(Reg::X2, Reg::X2, 1); // room for the terminator
+        self.emit_alloc_raw_string(Reg::X2); // x5 = buffer, x2 preserved
+        self.pop_rooted(Reg::X6); // source
+        self.asm.str_imm(Reg::X2, Reg::X5, 0); // the buffer's own length
+        self.asm.sub_reg_imm(Reg::X2, Reg::X2, 1); // bytes to copy
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8); // dst payload
+        self.asm.add_reg_imm(Reg::X6, Reg::X6, 8); // src payload
+        // The copy advances x7 past the last byte, which is where the
+        // terminator goes.
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X3);
+        self.asm.mov_imm64(Reg::X3, 0);
+        self.asm.strb_post_increment(Reg::X3, Reg::X7);
+        self.asm.add_reg_imm(Reg::X0, Reg::X5, 8);
+    }
+
+    /// Leave a C string for `path` in x0, whether it is a literal or computed.
+    fn emit_path_cstring(&mut self, path: &Expr) -> Result<(), Diagnostic> {
+        if let Expr::String { value, span } = path {
+            if value.contains("#{") {
+                return Err(unsupported(*span, "string interpolation"));
+            }
+            let offset = self.asm.intern_nul_terminated(value);
+            self.asm.load_rodata_address(Reg::X0, offset);
+            return Ok(());
+        }
+        if self.expression(path)? != ValueType::Str {
+            return Err(unsupported(path.span(), "a path that is not a string"));
+        }
+        self.emit_cstring_copy();
+        Ok(())
+    }
+
     fn emit_heap_string_copy(&mut self) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
         self.asm.push(Reg::X0); // source: rodata never moves
@@ -5311,18 +5347,7 @@ impl Emitter {
             // becomes the Bool result directly — the first user of the
             // M11 syscall-failure convention (issue #538).
             ("Dir#exists", 1) | ("FileOutput#exists", 1) => {
-                let Expr::String {
-                    value,
-                    span: str_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if value.contains("#{") {
-                    return Err(unsupported(*str_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(value);
-                self.asm.load_rodata_address(Reg::X0, path_offset);
+                self.emit_path_cstring(&arguments[0])?;
                 self.asm.mov_imm64(Reg::X1, 0); // F_OK
                 self.asm.mov_imm64(Reg::X16, u64::from(SYS_ACCESS));
                 self.asm.svc_0x80();
@@ -5330,24 +5355,17 @@ impl Emitter {
                 Ok(Some(ValueType::Bool))
             }
             ("FileOutput#write", 2) | ("FileOutput#append", 2) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
                 if self.expression(&arguments[1])? != ValueType::Str {
                     return Err(unsupported(
                         span,
                         &format!("{name} with non-string content"),
                     ));
                 }
-                self.emit_file_write(path_offset, name == "FileOutput#append");
+                // The content waits as a root while the path is built, since
+                // building one from a run-time string allocates.
+                self.push_rooted(Reg::X0);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_file_write(name == "FileOutput#append");
                 Ok(Some(ValueType::Unit))
             }
             // `writeLines(path, lines)` is the lines joined with newlines and
@@ -5355,17 +5373,6 @@ impl Emitter {
             // `join` does. Building that call rather than a second string
             // walker keeps the two spellings the same code.
             ("FileOutput#writeLines", 2) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
                 let joined = Expr::Call {
                     callee: Box::new(Expr::Identifier {
                         name: "join".to_string(),
@@ -5383,7 +5390,9 @@ impl Emitter {
                 if self.expression(&joined)? != ValueType::Str {
                     return Err(unsupported(span, "writeLines of a non-string list"));
                 }
-                self.emit_file_write(path_offset, false);
+                self.push_rooted(Reg::X0);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_file_write(false);
                 Ok(Some(ValueType::Unit))
             }
             // `lines(path)` splits the file on newlines *without* a trailing
@@ -5392,18 +5401,8 @@ impl Emitter {
             // own `lines` is written as, over two hidden locals so the text and
             // the split are each computed once.
             ("FileInput#lines", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_file_read_all(path_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_file_read_all();
                 let text = self.declare_local("__file_lines_text", ValueType::Str);
                 self.asm.store_local(Reg::X0, text);
                 self.emit_root_frame_slot(text);
@@ -5460,76 +5459,35 @@ impl Emitter {
                 Ok(Some(self.expression(&trimmed)?))
             }
             ("FileInput#all", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_file_read_all(path_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_file_read_all();
                 Ok(Some(ValueType::Str))
             }
             ("FileOutput#delete", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_file_delete(path_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_file_delete();
                 Ok(Some(ValueType::Unit))
             }
             ("Dir#mkdir", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_dir_mkdir(path_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_dir_mkdir();
                 Ok(Some(ValueType::Unit))
             }
             ("Dir#delete", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_dir_delete(path_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_dir_delete();
                 Ok(Some(ValueType::Unit))
             }
             ("Dir#mkdirs", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                // Each parent directory is created in turn, so this one needs
+                // the path's text here rather than at run time -- a `val`
+                // holding a literal counts.
+                let Some(path) = self.literal_string(&arguments[0]) else {
+                    return Err(unsupported(
+                        arguments[0].span(),
+                        "mkdirs of a path that is not a literal",
+                    ));
                 };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
                 // An empty path is a no-op, matching the evaluator's
                 // `fs::create_dir_all("")` (which succeeds); `mkdir("")`
                 // itself would fail with ENOENT, not EEXIST, and abort.
@@ -5544,50 +5502,26 @@ impl Emitter {
                 }
                 for prefix in prefixes {
                     let prefix_offset = self.asm.intern_nul_terminated(&prefix);
-                    self.emit_dir_mkdir_tolerating_eexist(prefix_offset);
+                    self.asm.load_rodata_address(Reg::X0, prefix_offset);
+                    self.emit_dir_mkdir_tolerating_eexist();
                 }
                 self.asm.mov_imm64(Reg::X0, 0); // Unit
                 Ok(Some(ValueType::Unit))
             }
             ("Dir#isDirectory", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_dir_is_directory(path_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_dir_is_directory();
                 Ok(Some(ValueType::Bool))
             }
             ("Dir#move", 2) => {
-                let Expr::String {
-                    value: source,
-                    span: source_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if source.contains("#{") {
-                    return Err(unsupported(*source_span, "string interpolation"));
-                }
-                let Expr::String {
-                    value: target,
-                    span: target_span,
-                } = &arguments[1]
-                else {
-                    return Err(unsupported(arguments[1].span(), "a non-literal path"));
-                };
-                if target.contains("#{") {
-                    return Err(unsupported(*target_span, "string interpolation"));
-                }
-                let source_offset = self.asm.intern_nul_terminated(source);
-                let target_offset = self.asm.intern_nul_terminated(target);
-                self.emit_dir_move(source_offset, target_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                // The source waits as a root: a run-time target path allocates,
+                // and a collection would move the buffer it is parked in.
+                self.push_rooted(Reg::X0);
+                self.emit_path_cstring(&arguments[1])?;
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.pop_rooted(Reg::X0);
+                self.emit_dir_move();
                 Ok(Some(ValueType::Unit))
             }
             ("Environment#exists", 1) => {
@@ -6721,6 +6655,7 @@ impl Emitter {
         self.lambda_bindings.push(HashMap::new());
         self.dict_bindings.push(HashMap::new());
         self.alias_bindings.push(HashMap::new());
+        self.literal_strings.push(HashMap::new());
     }
 
     /// Close the scopes `push_binding_scopes` opened.
@@ -6729,6 +6664,7 @@ impl Emitter {
         self.lambda_bindings.pop();
         self.dict_bindings.pop();
         self.alias_bindings.pop();
+        self.literal_strings.pop();
     }
 
     /// A name aliasing another name, innermost scope first.
@@ -6748,6 +6684,22 @@ impl Emitter {
     }
 
     /// A name bound to a lambda, innermost scope first.
+    /// The text of an argument that is a string literal, directly or through a
+    /// `val` bound to one. Interpolation is deliberately excluded: its value is
+    /// not known until it runs.
+    fn literal_string(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::String { value, .. } if !value.contains("#{") => Some(value.clone()),
+            Expr::Identifier { name, .. } => self
+                .literal_strings
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(name))
+                .cloned(),
+            _ => None,
+        }
+    }
+
     fn lookup_lambda(&self, name: &str) -> Option<usize> {
         self.lambda_bindings
             .iter()
@@ -7197,6 +7149,23 @@ impl Emitter {
             | Expr::TypeClassDeclaration { .. }
             | Expr::InstanceDeclaration { .. } => Ok(()),
             Expr::VarDecl { name, value, .. } => {
+                // Remember a string literal's text for the builtins that need
+                // it at compile time, and forget any older binding of this name
+                // so a shadowing one does not inherit the wrong text.
+                {
+                    let literal = match value.as_ref() {
+                        Expr::String { value, .. } if !value.contains("#{") => Some(value.clone()),
+                        _ => None,
+                    };
+                    let scope = self
+                        .literal_strings
+                        .last_mut()
+                        .expect("emitter literal scope");
+                    match literal {
+                        Some(text) => scope.insert(name.clone(), text),
+                        None => scope.remove(name),
+                    };
+                }
                 // `val f = (x) => ...`: bind the name to the lambda body
                 // instead of to a slot. There is nothing to store -- the body
                 // is compiled at each call site, where the parameter types
