@@ -1723,6 +1723,16 @@ impl Emitter {
                 {
                     return self.emit_assert_result(&first_args[0], &arguments[0], *span);
                 }
+                // `map(list, f)` -- the same operation as the curried form,
+                // spelled the way the evaluator's own builtin takes it.
+                if arguments.len() == 2
+                    && let Expr::Identifier { name, .. } = callee.as_ref()
+                    && name == "map"
+                    && let Expr::Lambda { params, body, .. } = &arguments[1]
+                    && params.len() == 1
+                {
+                    return self.emit_list_map(&arguments[0], &params[0], body, *span);
+                }
                 // Curried `foldLeft(list)(init)(f)` -- which is also what
                 // `xs reduce init => r + e` desugars to -- with a lambda
                 // literal for f.
@@ -5147,6 +5157,21 @@ impl Emitter {
             Expr::Call {
                 callee, arguments, ..
             } => {
+                // Curried `foldLeft(list)(init)(f)` has the accumulator's type,
+                // which is the initial value's -- this is what types the
+                // prelude's fold-based helpers.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: with_initial,
+                        arguments: initial_args,
+                        ..
+                    } = callee.as_ref()
+                    && initial_args.len() == 1
+                    && let Expr::Call { callee: inner, .. } = with_initial.as_ref()
+                    && matches!(inner.as_ref(), Expr::Identifier { name, .. } if name == "foldLeft")
+                {
+                    return self.static_type_under(&initial_args[0], locals, depth + 1);
+                }
                 // Curried `cons(head)(tail)` builds a list of the head's type.
                 if arguments.len() == 1
                     && let Expr::Call {

@@ -88,7 +88,10 @@ println(applyTwice((n) => n + 3, 10))
 println(stdlibFilter([1, 2, 3, 4, 5, 6], (x) => x > 3))
 println(stdlibMap([1, 2, 3], (x) => x * 10))
 val nothing = null
+println(map([1 2 3], (x) => x * 2))
+println(stdlibCount([1 2 3 4], (x) => x > 2))
 assertResult(16)(applyTwice((n) => n + 3, 10))
+assertResult(2)(stdlibCount([1 2 3 4], (x) => x > 2))
 
 assertResult(6)([1 2 3] reduce 0 => r + e)
 assertResult(24)(foldLeft([1 2 3 4])(1)((a, x) => a * x))
