@@ -28257,3 +28257,233 @@ fn native_refuses_closure_escaping_map_lambda_windows_cross_build() {
         "expected a clean unsupported diagnostic, got:\n{stderr}"
     );
 }
+
+/// The GC stress harness, macOS/arm64-gated: the AArch64 backend's
+/// collector is only meaningfully tested when collections actually fire at
+/// awkward moments, and no amount of local inspection on a non-arm64 host
+/// can show that. `--gc-stress` makes `gc_alloc` collect before *every*
+/// allocation, so each of these programs runs a full mark/sweep between any
+/// two allocations: a heap reference the mutator failed to root, or a read
+/// that skipped the load barrier, becomes an immediate wrong answer or
+/// crash instead of a once-in-a-million corruption.
+///
+/// The corpus deliberately spans every object shape the backend builds --
+/// records, cons lists, sets, heap strings, boxed scalars and enum records
+/// -- and every routine that holds a reference across an allocation.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_gc_corpus_program(tag: &str, flags: &[&str], source: &str, expected: &str) {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_gc_{tag}_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_gc_{tag}_{stamp}.bin"));
+    fs::write(&source_path, source).expect("temp source file should write");
+    let mut args: Vec<&str> = flags.to_vec();
+    args.extend_from_slice(&["--target", "aarch64-apple-darwin", "build"]);
+    let source_arg = source_path
+        .to_str()
+        .expect("path should be utf-8")
+        .to_string();
+    let bin_arg = bin_path.to_str().expect("path should be utf-8").to_string();
+    args.push(&source_arg);
+    args.push("-o");
+    args.push(&bin_arg);
+    let build = Command::new(klassic_bin())
+        .args(&args)
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "gc corpus build ({tag}, {flags:?}) should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run.status.success(),
+        "gc corpus ({tag}, {flags:?}) exited with {:?} -- a crash here is an \
+         unrooted reference, a missing load barrier or an uncoloured store\n\
+         stderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected,
+        "gc corpus ({tag}, {flags:?}) output diverged from the evaluator's"
+    );
+}
+
+/// The corpus itself: allocation-heavy, retains long-lived structures while
+/// churning short-lived ones (so marking has real work and sweeping has
+/// real garbage), and prints only values that had to survive collections.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GC_CORPUS_SOURCE: &str = "\
+record Point { x: Int; y: Int }\n\
+enum Tree { case Leaf(v: Int); case Node(l: Tree, r: Tree) }\n\
+def build(n: Int): Tree = if (n <= 0) Leaf(1) else Node(build(n - 1), Leaf(n))\n\
+def total(t: Tree): Int = t match { case Leaf(v) => v; case Node(l, r) => total(l) + total(r) }\n\
+val keep = #Point(7, 11)\n\
+val keptList = [\"alpha\", \"beta\", \"gamma\"]\n\
+val keptTree = build(6)\n\
+mutable acc = 0\n\
+mutable i = 0\n\
+while (i < 60) {\n\
+\x20 val p = #Point(i, i + 1)\n\
+\x20 acc = acc + p.x + p.y\n\
+\x20 val a = i + 1\n\
+\x20 val xs = [i, a]\n\
+\x20 acc = acc + head(xs) + size(xs)\n\
+\x20 val s = \"n=\" + i.toString()\n\
+\x20 acc = acc + s.length()\n\
+\x20 val parts = \"a,b,c,d\".split(\",\")\n\
+\x20 acc = acc + size(parts) + parts.join(\"-\").length()\n\
+\x20 val st = %(i, a, i)\n\
+\x20 acc = acc + (if (st.contains(a)) 1 else 0)\n\
+\x20 acc = acc + total(build(3))\n\
+\x20 acc = acc + \"  pad  \".trim().length()\n\
+\x20 acc = acc + \"banana\".replaceAll(\"a\", \"oo\").length()\n\
+\x20 acc = acc + \"hello\".toUpperCase().substring(1, 3).length()\n\
+\x20 acc = acc + \"abc\".reverse().length()\n\
+\x20 i = i + 1\n\
+}\n\
+println(acc)\n\
+println(keep)\n\
+println(keptList)\n\
+println(keptList.join(\"/\"))\n\
+println(total(keptTree))\n\
+";
+
+/// What the evaluator -- the semantic oracle -- prints for the corpus.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GC_CORPUS_EXPECTED: &str =
+    "7880\n#Point(7, 11)\n[alpha, beta, gamma]\nalpha/beta/gamma\n22\n";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_gc_corpus_runs_clean() {
+    run_gc_corpus_program("plain", &[], GC_CORPUS_SOURCE, GC_CORPUS_EXPECTED);
+}
+
+/// Collect before every single allocation: any reference the mutator holds
+/// without a root dies under this, and any read that skipped the barrier
+/// sees a stale object.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_gc_corpus_survives_stress() {
+    run_gc_corpus_program(
+        "stress",
+        &["--gc-stress"],
+        GC_CORPUS_SOURCE,
+        GC_CORPUS_EXPECTED,
+    );
+}
+
+/// Colour every reference badly, so a load that skipped the barrier
+/// dereferences a non-canonical address and faults immediately. This is the
+/// barrier-coverage canary: it cannot pass unless every heap read goes
+/// through the barrier and every heap store is coloured.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_gc_corpus_survives_poison() {
+    run_gc_corpus_program(
+        "poison",
+        &["--gc-poison"],
+        GC_CORPUS_SOURCE,
+        GC_CORPUS_EXPECTED,
+    );
+}
+
+/// Both at once -- collect constantly *and* poison every colour.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_gc_corpus_survives_stress_and_poison() {
+    run_gc_corpus_program(
+        "stress_poison",
+        &["--gc-stress", "--gc-poison"],
+        GC_CORPUS_SOURCE,
+        GC_CORPUS_EXPECTED,
+    );
+}
+
+/// `--gc-log` proves the collector is not silently idle: the corpus must
+/// report a non-zero collection count (and a non-zero allocation count) on
+/// stderr while still printing the right answers on stdout. A collector
+/// that never runs would pass every other test here.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_gc_log_reports_real_collections() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_gc_log_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_gc_log_{stamp}.bin"));
+    fs::write(&source_path, GC_CORPUS_SOURCE).expect("temp source file should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "--gc-log",
+            "--gc-stress",
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "gc-log build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run.status.success(),
+        "gc-log run exited with {:?}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        GC_CORPUS_EXPECTED,
+        "gc-log run's output diverged from the evaluator's"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let collections = stderr
+        .split("collections=")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .filter(|digits| !digits.is_empty())
+        })
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("gc-log line should report collections=<n>, got:\n{stderr}"));
+    assert!(
+        collections > 0,
+        "the collector never ran, so the corpus proves nothing: {stderr}"
+    );
+    let allocs = stderr
+        .split("allocs=")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .filter(|digits| !digits.is_empty())
+        })
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(allocs > 0, "no allocations were counted: {stderr}");
+}
