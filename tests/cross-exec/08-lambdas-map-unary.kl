@@ -114,6 +114,10 @@ println(head(grid))
 println([["a" "b"] ["c"]])
 println("grid=" + grid)
 assertResult([[1, 2, 3], [4, 5, 6]])(grid)
+// Nested content equality both ways, on lists built separately.
+println(grid == [[1 2 3] [4 5 6]])
+println(grid == [[1 2 3] [4 5 7]])
+println([["a"] ["b"]] == [["a"] ["b"]])
 
 assertResult([1, 2, 3])([1 2 3])
 assertResult([2, 3, 4])(map([1 2 3])((x) => x + 1))

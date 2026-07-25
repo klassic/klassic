@@ -5295,6 +5295,13 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X2);
         if elem_ty == ValueType::Str {
             self.emit_str_eq(); // x0 = Bool
+        } else if let Some(inner) = elem.nested_inner() {
+            // The elements are themselves lists, so they compare by content
+            // too -- a pointer comparison here would call two separately built
+            // inner lists different, which is what it did before the nested
+            // element type existed. The recursion is at codegen time and
+            // terminates because the depth decreases.
+            self.emit_list_eq(inner, span)?;
         } else {
             self.asm.cmp_reg(Reg::X0, Reg::X1);
             self.asm.cset(Reg::X0, Cond::Eq);
