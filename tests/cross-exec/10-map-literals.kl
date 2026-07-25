@@ -1,0 +1,58 @@
+// Cross-target fixture: map literals and the map builtins.
+//
+// A map is an insertion-ordered chain of `[key][value]` entries, and the order
+// is the observable part: `%["b": 1 "a": 2]` prints in that order, not sorted,
+// and a repeated key keeps its *first* position while taking its *last* value.
+// Every backend has to agree with the evaluator on both, which is what the
+// duplicate-key cases below are for.
+//
+// Each entry allocates twice (the entry, then the chain cell) while the keys,
+// values and partial map are all live, so this leans on the collector as well.
+
+import std.map
+
+val m = %["A": 1 "B": 2]
+println(m)
+println(%["x": 10, "y": 20])
+println(%[1: "one" 2: "two"])
+println(%[true: "yes" false: "no"])
+println(%[])
+
+// A repeated key: the last value wins, at the first occurrence's position.
+println(%["A": 1 "B": 2 "A": 3])
+println(%["z": 1 "z": 2 "z": 3])
+
+// Newline-separated entries are the same literal.
+val spread = %[
+    "one": 1
+    "two": 2
+    "three": 3
+]
+println(spread)
+
+// Lookup, in the two spellings that reach the same scan: the `Map#` builtin
+// the stdlib's own methods call, and the dot form a caller writes.
+println(Map#size(m))
+println(Map#containsKey(m, "A"))
+println(Map#containsKey(m, "Z"))
+println(Map#get(m, "B"))
+println(Map#get(m, "Z"))
+println(m.sizeOf())
+println(m.containsKey("B"))
+println(m.getOrElse("A", 0))
+println(m.getOrElse("Z", 99))
+println(m.isEmptyMap())
+
+// A longer chain, so the scan runs past the head in both directions.
+println(spread.containsKey("three"))
+println(spread.getOrElse("three", 0))
+println(spread.getOrElse("four", -1))
+println(spread.sizeOf())
+
+// Int keys and string values, i.e. the boxing the other way round.
+val codes = %[200: "ok" 404: "missing" 500: "broken"]
+println(codes)
+println(codes.containsKey(404))
+println(codes.getOrElse(404, "?"))
+println(codes.getOrElse(418, "?"))
+println("done")
