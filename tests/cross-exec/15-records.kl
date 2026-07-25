@@ -1,0 +1,86 @@
+// Cross-target fixture: records whose layout is not written down.
+//
+// Three kinds appear here and none of them has a layout until something builds
+// one: a generic record, a record with a field typed `*`, and a record with a
+// *function* field, which on a backend with no runtime functions is resolved
+// from the binding that constructed it. `#Point` is built in and declared
+// nowhere at all.
+
+record GPoint<'x, 'y> {
+  x: 'x
+  y: 'y
+}
+
+record Pair<'a, 'b> {
+  _1: 'a
+  _2: 'b
+}
+
+record Holder {
+  p: #GPoint<Int, Int>
+}
+
+record Profile {
+  description: *
+  hobby: *
+}
+
+record Person {
+  name: *
+  age: Int
+  profile: #Profile
+}
+
+record S {
+  v: Int
+  to_string: (*) => *
+}
+
+// The same generic record at two different instantiations, which have to stay
+// distinct: one built from the other's types would take the wrong field types.
+val ints = #GPoint(3, 5)
+val strs = #GPoint("a", "b")
+println(ints.x)
+println(ints.y)
+println(strs.x)
+assertResult(3)(ints.x)
+assertResult("b")(strs.y)
+
+val pair = #Pair(1, "one")
+println(pair._1)
+println(pair._2)
+assertResult(1)(pair._1)
+assertResult("one")(pair._2)
+val flipped = #Pair(true, 2)
+println(flipped._1)
+assertResult(2)(flipped._2)
+
+// Nested: the field's declared type names an instantiation.
+val held = #Holder(#GPoint(7, 11))
+println(held.p.x)
+println(held.p.y)
+assertResult(7)(held.p.x)
+
+// Fields typed `*`, including one holding another such record.
+val person = #Person("Kota", 33, #Profile("Engineer", "Running"))
+println(person.name)
+println(person.age)
+println(person.profile.description)
+println(person.profile.hobby)
+assertResult("Kota")(person.name)
+assertResult("Engineer")(person.profile.description)
+
+// A function field, called as a method: the record is the `this` it declares.
+val s = #S(100, (this) => {
+  "v=#{(this :> #S).v}"
+})
+println(s.to_string())
+println(s.v)
+assertResult("v=100")(s.to_string())
+
+// The built-in Point, which no program declares.
+val point = #Point(1000, 2000)
+println(point.x)
+println(point.y)
+assertResult(1000)(point.x)
+println("done")

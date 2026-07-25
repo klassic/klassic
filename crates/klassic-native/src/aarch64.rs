@@ -1403,6 +1403,11 @@ fn assignable(actual: ValueType, expected: ValueType) -> bool {
 struct RecordInfo {
     name: String,
     fields: Vec<(String, ValueType)>,
+    /// Fields whose type is a function, as (name, position among *all* the
+    /// declared fields). A function has no runtime representation here, so such
+    /// a field is not part of the object -- it is resolved at compile time from
+    /// the binding that constructed it, exactly like a dictionary's.
+    lambda_fields: Vec<(String, usize)>,
     /// False when the declaration could not be typed (generics,
     /// function-typed fields): the entry stays so `Record` indices
     /// remain stable, but every lookup skips it.
@@ -1453,6 +1458,32 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 }
 
 /// The element type a value of type `ty` can be a list element of.
+/// `Name<A, B>` split into its head and its arguments, if it is written that
+/// way. Nesting is respected, so `Pair<List<Int>, Int>` gives two arguments.
+fn split_type_arguments(text: &str) -> Option<(&str, Vec<String>)> {
+    let open = text.find('<')?;
+    let inner = text.strip_suffix('>')?.get(open + 1..)?;
+    let mut arguments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (at, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(inner[start..at].trim().to_string());
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    arguments.push(inner[start..].trim().to_string());
+    if arguments.iter().any(|argument| argument.is_empty()) {
+        return None;
+    }
+    Some((&text[..open], arguments))
+}
+
 /// The compile-time identity of a literal map key, if the expression is one.
 /// Only used to resolve duplicate keys in a map literal, so it just has to
 /// tell two different keys apart.
@@ -1529,6 +1560,18 @@ struct FunctionInfo {
     dict_params: Vec<(String, Vec<(String, usize)>)>,
     ret: ValueType,
     body: Expr,
+}
+
+/// A record declaration with no layout of its own: either generic, or with a
+/// field whose type cannot be written down (`name: *`). Its constructor is what
+/// pins the fields down, so the declaration is kept as text and instantiated
+/// per set of argument types.
+#[derive(Clone)]
+struct GenericRecord {
+    name: String,
+    params: Vec<String>,
+    /// Field names with their annotations, as written.
+    fields: Vec<(String, String)>,
 }
 
 /// The compile-time bindings a lambda was written under.
@@ -1615,6 +1658,11 @@ struct Emitter {
     /// such a record has no runtime representation here: `dict.show(x)`
     /// resolves the field to its lambda and compiles the body at the call.
     dict_bindings: Vec<HashMap<String, Vec<(String, usize)>>>,
+    /// Generic record declarations, kept as text: `record GPoint<'x, 'y>` has
+    /// no single layout, so an instantiation is interned when one is named --
+    /// `#GPoint<Int, Int>` in a field's type, or a constructor whose arguments
+    /// pin the parameters down.
+    generic_records: Vec<GenericRecord>,
     /// Names bound to a string literal. Some builtins need the *text* of an
     /// argument at compile time -- `Dir#mkdirs` creates each parent directory,
     /// so it splits the path here -- and a literal put in a `val` first is the
@@ -1637,7 +1685,7 @@ impl Emitter {
 
     /// Resolve a type annotation against scalars, list types, lowered
     /// enums, and declared records (`#Point` or `Point`).
-    fn annotation_type(&self, text: &str, span: Span) -> Result<ValueType, Diagnostic> {
+    fn annotation_type(&mut self, text: &str, span: Span) -> Result<ValueType, Diagnostic> {
         let trimmed = text.trim();
         let bare = trimmed.trim_start_matches('#');
         // Lowered monomorphic enum values travel as plain heap
@@ -1651,6 +1699,17 @@ impl Emitter {
             .position(|record| record.usable && !record.name.is_empty() && record.name == bare)
         {
             return Ok(ValueType::Record(index as u32));
+        }
+        if bare == "Point" {
+            let point = self.instantiate_builtin_point();
+            return Ok(ValueType::Record(point));
+        }
+        // `#GPoint<Int, Int>`: a generic record named with its arguments. The
+        // parameters are substituted into the field types and the result is
+        // interned under the same name, so two mentions of the same
+        // instantiation are the same type.
+        if let Some((head, arguments)) = split_type_arguments(bare) {
+            return self.instantiate_generic_record(head, &arguments, span);
         }
         match trimmed {
             "Int" | "Long" | "Short" | "Byte" => Ok(ValueType::Int),
@@ -1670,6 +1729,72 @@ impl Emitter {
 
     /// Intern a structural record shape, reusing an existing entry so
     /// equal shapes share one `ValueType::Record` index.
+    /// Intern the instantiation of a generic record for these type arguments,
+    /// answering with its type. Interned by name *and* field types, so the
+    /// same instantiation named twice is one record.
+    fn instantiate_generic_record(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let Some(GenericRecord { params, fields, .. }) = self
+            .generic_records
+            .iter()
+            .find(|record| record.name == name && record.params.len() == arguments.len())
+            .cloned()
+        else {
+            return Err(unsupported(span, &format!("record `{name}`")));
+        };
+        let mut typed = Vec::with_capacity(fields.len());
+        for (field, annotation) in &fields {
+            // A field named by a parameter takes that argument's type; any
+            // other annotation resolves as it stands (including a nested
+            // instantiation, which recurses through here).
+            let text = match params.iter().position(|param| param == annotation.trim()) {
+                Some(at) => arguments[at].clone(),
+                None => annotation.clone(),
+            };
+            typed.push((field.clone(), self.annotation_type(&text, span)?));
+        }
+        if let Some(index) = self
+            .records
+            .iter()
+            .position(|record| record.usable && record.name == name && record.fields == typed)
+        {
+            return Ok(ValueType::Record(index as u32));
+        }
+        self.records.push(RecordInfo {
+            name: name.to_string(),
+            fields: typed,
+            lambda_fields: Vec::new(),
+            usable: true,
+        });
+        Ok(ValueType::Record((self.records.len() - 1) as u32))
+    }
+
+    /// The built-in `Point`: two Int fields, known without a declaration.
+    fn instantiate_builtin_point(&mut self) -> u32 {
+        let fields = vec![
+            ("x".to_string(), ValueType::Int),
+            ("y".to_string(), ValueType::Int),
+        ];
+        if let Some(index) = self
+            .records
+            .iter()
+            .position(|record| record.usable && record.name == "Point" && record.fields == fields)
+        {
+            return index as u32;
+        }
+        self.records.push(RecordInfo {
+            name: "Point".to_string(),
+            fields,
+            lambda_fields: Vec::new(),
+            usable: true,
+        });
+        (self.records.len() - 1) as u32
+    }
+
     fn intern_structural_record(&mut self, fields: Vec<(String, ValueType)>) -> u32 {
         if let Some(index) = self
             .records
@@ -1681,6 +1806,7 @@ impl Emitter {
         self.records.push(RecordInfo {
             name: String::new(),
             fields,
+            lambda_fields: Vec::new(),
             usable: true,
         });
         (self.records.len() - 1) as u32
@@ -1844,25 +1970,111 @@ impl Emitter {
                 arguments,
                 span,
             } => {
-                let Some(index) = self
-                    .records
+                // A declaration whose layout depends on its arguments always
+                // goes through the inference below, even after one
+                // instantiation has been interned under the same name --
+                // otherwise `#Pair(true, 1)` would be checked against whatever
+                // `#Pair(1.5, 2.5)` made of it.
+                let inferred = self
+                    .generic_records
                     .iter()
-                    .position(|record| record.usable && record.name == *name)
-                else {
+                    .any(|record| record.name == *name && record.fields.len() == arguments.len());
+                let concrete = if inferred {
+                    None
+                } else {
+                    self.records
+                        .iter()
+                        .position(|record| record.usable && record.name == *name)
+                };
+                let Some(index) = concrete else {
+                    // A generic record's constructor pins its parameters down
+                    // by what it is given: the arguments' own types become the
+                    // instantiation's field types.
+                    if let Some(GenericRecord {
+                        fields: declared, ..
+                    }) = self
+                        .generic_records
+                        .iter()
+                        .find(|record| {
+                            record.name == *name && record.fields.len() == arguments.len()
+                        })
+                        .cloned()
+                    {
+                        let mut typed = Vec::with_capacity(arguments.len());
+                        for (argument, (field, _)) in arguments.iter().zip(declared.iter()) {
+                            let ty = self.expression(argument)?;
+                            if ty == ValueType::Unit || ty == ValueType::Never {
+                                return Err(unsupported(
+                                    argument.span(),
+                                    "a record field of this type",
+                                ));
+                            }
+                            typed.push((field.clone(), ty));
+                            if is_boxed_scalar(ty) {
+                                self.emit_box_scalar();
+                            }
+                            self.push_rooted(Reg::X0);
+                        }
+                        let count = arguments.len();
+                        let index = match self.records.iter().position(|record| {
+                            record.usable && record.name == *name && record.fields == typed
+                        }) {
+                            Some(index) => index,
+                            None => {
+                                self.records.push(RecordInfo {
+                                    name: name.clone(),
+                                    fields: typed,
+                                    lambda_fields: Vec::new(),
+                                    usable: true,
+                                });
+                                self.records.len() - 1
+                            }
+                        };
+                        self.emit_record_object(count);
+                        return Ok(ValueType::Record(index as u32));
+                    }
+                    // `#Point(x, y)` is built in: the evaluator and the type
+                    // checker both know it without a declaration, so this
+                    // backend has to as well.
+                    if name == "Point" && arguments.len() == 2 {
+                        let point = self.instantiate_builtin_point();
+                        for argument in arguments {
+                            if self.expression(argument)? != ValueType::Int {
+                                return Err(unsupported(
+                                    argument.span(),
+                                    "a Point field that is not an Int",
+                                ));
+                            }
+                            self.emit_box_scalar();
+                            self.push_rooted(Reg::X0);
+                        }
+                        self.emit_record_object(2);
+                        return Ok(ValueType::Record(point));
+                    }
                     return Err(unsupported(*span, &format!("record `{name}`")));
                 };
                 let fields = self.records[index].fields.clone();
-                if fields.len() != arguments.len() {
+                let lambda_fields = self.records[index].lambda_fields.clone();
+                let declared = fields.len() + lambda_fields.len();
+                if declared != arguments.len() {
                     return Err(Diagnostic::compile(
                         *span,
                         format!(
-                            "{name} expects {} fields but got {}",
-                            fields.len(),
+                            "{name} expects {declared} fields but got {}",
                             arguments.len()
                         ),
                     ));
                 }
-                for (argument, (_, expected)) in arguments.iter().zip(fields.iter()) {
+                // The function-typed fields are not part of the object; they
+                // are resolved from the binding that constructed it, so only
+                // the stored fields are evaluated here -- in declaration order,
+                // with the compile-time ones skipped.
+                let stored = arguments
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| !lambda_fields.iter().any(|(_, at)| at == position))
+                    .map(|(_, argument)| argument);
+                for (argument, (_, expected)) in stored.zip(fields.iter()) {
                     let ty = self.expression(argument)?;
                     if !assignable(ty, *expected) {
                         return Err(unsupported(argument.span(), "a record field of this type"));
@@ -1872,7 +2084,7 @@ impl Emitter {
                     }
                     self.push_rooted(Reg::X0);
                 }
-                self.emit_record_object(arguments.len());
+                self.emit_record_object(fields.len());
                 Ok(ValueType::Record(index as u32))
             }
             // Structural literal `record { x: 1; y: 2 }`: the shape
@@ -2054,7 +2266,19 @@ impl Emitter {
                             &format!("field `{field}` on this dictionary"),
                         ));
                     };
-                    return self.emit_inline_lambda_call(*index, arguments, *span);
+                    let index = *index;
+                    // A function-typed *record* field is called as a method:
+                    // `s.to_string()` passes the record itself as the `this`
+                    // the lambda declares. A dictionary's field takes only
+                    // what the call site writes, so the receiver is prepended
+                    // exactly when the arities say it is expected.
+                    if self.lambdas[index].0.len() == arguments.len() + 1 {
+                        let mut with_receiver = Vec::with_capacity(arguments.len() + 1);
+                        with_receiver.push((**target).clone());
+                        with_receiver.extend(arguments.iter().cloned());
+                        return self.emit_inline_lambda_call(index, &with_receiver, *span);
+                    }
+                    return self.emit_inline_lambda_call(index, arguments, *span);
                 }
                 if let Expr::FieldAccess { target, field, .. } = callee.as_ref() {
                     let mut all = Vec::with_capacity(arguments.len() + 1);
@@ -7518,6 +7742,40 @@ impl Emitter {
                         .insert(name.clone(), mapping);
                     return Ok(());
                 }
+                // A nominal record with function-typed fields: the stored
+                // fields become the object, and the functions are remembered
+                // against this name so `s.to_string()` can find one.
+                if let Expr::RecordConstructor {
+                    name: record,
+                    arguments,
+                    ..
+                } = value.as_ref()
+                    && let Some(index) = self
+                        .records
+                        .iter()
+                        .position(|info| info.usable && info.name == *record)
+                    && !self.records[index].lambda_fields.is_empty()
+                {
+                    let lambda_fields = self.records[index].lambda_fields.clone();
+                    let mut mapping = Vec::with_capacity(lambda_fields.len());
+                    for (field, position) in lambda_fields {
+                        let Some((params, body)) = arguments
+                            .get(position)
+                            .and_then(|argument| self.lambda_argument(argument))
+                        else {
+                            return Err(unsupported(
+                                value.span(),
+                                "a function-typed field that is not a function",
+                            ));
+                        };
+                        mapping.push((field, self.intern_lambda(params, body)));
+                    }
+                    self.dict_bindings
+                        .last_mut()
+                        .expect("emitter dict scope")
+                        .insert(name.clone(), mapping);
+                    // The object itself is still a value binding.
+                }
                 // ...and so is a call that answers with one, which is how a
                 // dictionary parameterised by another is bound to a name.
                 if matches!(value.as_ref(), Expr::Call { .. })
@@ -7622,6 +7880,34 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
     // Pass 1: names, so field annotations can reference any record.
     for expression in expressions {
         if let Expr::RecordDeclaration {
+            name,
+            type_params,
+            fields,
+            ..
+        } = expression
+            && !type_params.is_empty()
+        {
+            // No single layout, so nothing is registered yet: an instantiation
+            // is interned when one is named.
+            emitter.generic_records.push(GenericRecord {
+                name: name.clone(),
+                params: type_params.clone(),
+                fields: fields
+                    .iter()
+                    .map(|field| {
+                        (
+                            field.name.clone(),
+                            field
+                                .annotation
+                                .as_ref()
+                                .map(|annotation| annotation.text.clone())
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        if let Expr::RecordDeclaration {
             name, type_params, ..
         } = expression
             && type_params.is_empty()
@@ -7631,6 +7917,7 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
             emitter.records.push(RecordInfo {
                 name: name.clone(),
                 fields: Vec::new(),
+                lambda_fields: Vec::new(),
                 usable: true,
             });
         }
@@ -7651,12 +7938,19 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
             continue;
         }
         let mut typed = Vec::with_capacity(fields.len());
+        let mut lambda_fields = Vec::new();
         let mut usable = true;
-        for field in fields {
+        for (position, field) in fields.iter().enumerate() {
             let Some(annotation) = &field.annotation else {
                 usable = false;
                 break;
             };
+            // A function-typed field is compile-time only, so the record is
+            // still perfectly usable -- that field simply is not stored.
+            if annotation.text.contains("=>") {
+                lambda_fields.push((field.name.clone(), position));
+                continue;
+            }
             let Ok(ty) = emitter.annotation_type(&annotation.text, *span) else {
                 usable = false;
                 break;
@@ -7669,7 +7963,31 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
             .position(|record| record.name == *name)
             .expect("registered in pass 1");
         emitter.records[index].fields = typed;
+        emitter.records[index].lambda_fields = lambda_fields;
         emitter.records[index].usable = usable;
+        // A declaration whose field types cannot be written down -- `name: *`,
+        // say -- has no layout of its own, but its *constructor* pins every
+        // field down. So it is remembered the way a generic declaration is, and
+        // instantiated from the arguments when one is built.
+        if !usable {
+            emitter.generic_records.push(GenericRecord {
+                name: name.clone(),
+                params: Vec::new(),
+                fields: fields
+                    .iter()
+                    .map(|field| {
+                        (
+                            field.name.clone(),
+                            field
+                                .annotation
+                                .as_ref()
+                                .map(|annotation| annotation.text.clone())
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+            });
+        }
     }
 }
 
