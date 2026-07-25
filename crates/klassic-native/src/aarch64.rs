@@ -1901,10 +1901,15 @@ impl Emitter {
                 if arguments.len() == 2
                     && let Expr::Identifier { name, .. } = callee.as_ref()
                     && name == "map"
-                    && let Expr::Lambda { params, body, .. } = &arguments[1]
+                    // The builtin's shape is `map(list, f)`. A *function* first
+                    // means this is something else called `map` -- a `Functor`
+                    // instance's own `map(f, xs)`, say -- so leave it to the
+                    // function resolution below.
+                    && self.lambda_argument(&arguments[0]).is_none()
+                    && let Some((params, body)) = self.lambda_argument(&arguments[1])
                     && params.len() == 1
                 {
-                    return self.emit_list_map(&arguments[0], &params[0], body, *span);
+                    return self.emit_list_map(&arguments[0], &params[0], &body, *span);
                 }
                 // Curried `foldLeft(list)(init)(f)` -- which is also what
                 // `xs reduce init => r + e` desugars to -- with a lambda
@@ -1936,10 +1941,11 @@ impl Emitter {
                         *span,
                     );
                 }
-                // Curried `map(list)(f)` where the function is a lambda
-                // literal: the list's element type gives the lambda's
-                // parameter type, so the body can be compiled straight into
-                // the loop.
+                // Curried `map(list)(f)`: the list's element type gives the
+                // lambda's parameter type, so the body can be compiled straight
+                // into the loop. The lambda is either written here or passed in
+                // under a name, which is how a higher-order def hands its own
+                // function parameter on.
                 if arguments.len() == 1
                     && let Expr::Call {
                         callee: inner,
@@ -1949,10 +1955,10 @@ impl Emitter {
                     && list_args.len() == 1
                     && let Expr::Identifier { name, .. } = inner.as_ref()
                     && name == "map"
-                    && let Expr::Lambda { params, body, .. } = &arguments[0]
+                    && let Some((params, body)) = self.lambda_argument(&arguments[0])
                     && params.len() == 1
                 {
-                    return self.emit_list_map(&list_args[0], &params[0], body, *span);
+                    return self.emit_list_map(&list_args[0], &params[0], &body, *span);
                 }
                 // Curried `cons(head)(tail)` — the evaluator's list
                 // prepend builtin.
@@ -4891,6 +4897,30 @@ impl Emitter {
                 self.asm.cset(Reg::X0, Cond::Eq);
                 Ok(Some(ValueType::Bool))
             }
+            // `xs.map(f)`: the method spelling is dispatched as a builtin
+            // call, so it lands here rather than in the two-argument and
+            // curried forms the function spelling matches.
+            ("map", 2) => {
+                // Declining rather than failing here matters: a `Functor`
+                // instance declares its own `map(f, xs)`, and that call has to
+                // reach the function resolution instead of stopping at the
+                // builtin table.
+                if self.lambda_argument(&arguments[0]).is_some() {
+                    return Ok(None);
+                }
+                let Some((params, body)) = self.lambda_argument(&arguments[1]) else {
+                    return Ok(None);
+                };
+                if params.len() != 1 {
+                    return Err(unsupported(span, "mapping with a function of this arity"));
+                }
+                Ok(Some(self.emit_list_map(
+                    &arguments[0],
+                    &params[0],
+                    &body,
+                    span,
+                )?))
+            }
             ("size", 1) | ("Map#size", 1) => {
                 let ty = self.expression(&arguments[0])?;
                 if !matches!(
@@ -5860,6 +5890,27 @@ impl Emitter {
             // Typed the way the emitter types it, so an `if` with a `null`
             // branch predicts the nullable join rather than the other branch.
             Expr::Null { .. } => Some(ValueType::Null),
+            // Collection literals over locals: the whole-program inference
+            // cannot see these bindings, so the element type is inferred here.
+            // `unit(x) = [x]` in a Monad instance is exactly this shape.
+            Expr::ListLiteral { elements, .. } => match elements.first() {
+                None => Some(ValueType::EmptyList),
+                Some(first) => list_elem_of(self.static_type_under(first, locals, depth + 1)?)
+                    .map(ValueType::List),
+            },
+            Expr::SetLiteral { elements, .. } => match elements.first() {
+                None => Some(ValueType::EmptySet),
+                Some(first) => list_elem_of(self.static_type_under(first, locals, depth + 1)?)
+                    .map(ValueType::Set),
+            },
+            Expr::MapLiteral { entries, .. } => match entries.first() {
+                None => Some(ValueType::EmptyMap),
+                Some((key, value)) => {
+                    let key = list_elem_of(self.static_type_under(key, locals, depth + 1)?)?;
+                    let value = list_elem_of(self.static_type_under(value, locals, depth + 1)?)?;
+                    Some(ValueType::Map(key, value))
+                }
+            },
             Expr::Block { expressions, .. } => {
                 let mark = locals.len();
                 let (last, init) = expressions.split_last()?;
@@ -5992,6 +6043,41 @@ impl Emitter {
                     let head_ty = self.static_type_under(&head_args[0], locals, depth + 1)?;
                     return list_elem_of(head_ty).map(ValueType::List);
                 }
+                // Curried `map(list)(f)`, the spelling `xs.map(f)` also
+                // becomes: a list of whatever the lambda produces.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: list_args,
+                        ..
+                    } = callee.as_ref()
+                    && list_args.len() == 1
+                    && matches!(inner.as_ref(), Expr::Identifier { name, .. } if name == "map")
+                {
+                    return self.mapped_list_type(&list_args[0], &arguments[0], locals, depth);
+                }
+                // Method-style `target.m(args)`: the emitter dispatches it as
+                // `m(target, args)`, so predict that call instead. This is what
+                // types an instance method whose body is `xs.map(f)`.
+                if let Expr::FieldAccess {
+                    target,
+                    field,
+                    span: access,
+                } = callee.as_ref()
+                {
+                    let mut all = Vec::with_capacity(arguments.len() + 1);
+                    all.push((**target).clone());
+                    all.extend(arguments.iter().cloned());
+                    let dispatched = Expr::Call {
+                        callee: Box::new(Expr::Identifier {
+                            name: field.clone(),
+                            span: *access,
+                        }),
+                        arguments: all,
+                        span: *access,
+                    };
+                    return self.static_type_under(&dispatched, locals, depth + 1);
+                }
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return None;
                 };
@@ -6061,6 +6147,11 @@ impl Emitter {
                     // `words` start, so the inference has to get through it to
                     // type them at all.
                     "split" => return Some(ValueType::List(ListElem::Str)),
+                    // `map(list, f)`, the spelling the evaluator's own builtin
+                    // takes.
+                    "map" if arguments.len() == 2 => {
+                        return self.mapped_list_type(&arguments[0], &arguments[1], locals, depth);
+                    }
                     // Looking a key up answers with the value or nothing, so
                     // the inference needs the map's own value type -- which is
                     // what types `std.map`'s `getOrElse`, whose body merges a
@@ -6452,6 +6543,45 @@ impl Emitter {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).copied())
+    }
+
+    /// The parameters and body of a lambda argument, whether it was written
+    /// out at the call site or passed in under a name -- a higher-order def
+    /// hands its own lambda parameter on, so both spellings turn up.
+    fn lambda_argument(&self, expr: &Expr) -> Option<(Vec<String>, Expr)> {
+        match expr {
+            Expr::Lambda { params, body, .. } => Some((params.clone(), (**body).clone())),
+            Expr::Identifier { name, .. } => {
+                let index = self.lookup_lambda(name)?;
+                let (params, body) = &self.lambdas[index];
+                Some((params.clone(), body.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The type of mapping `list` through `f`: a list of whatever the lambda's
+    /// body produces with its parameter bound to the element type. Inference
+    /// only -- nothing is emitted.
+    fn mapped_list_type(
+        &self,
+        list: &Expr,
+        f: &Expr,
+        locals: &mut Vec<(String, ValueType)>,
+        depth: u32,
+    ) -> Option<ValueType> {
+        let elem = match self.static_type_under(list, locals, depth + 1)? {
+            ValueType::List(elem) => elem,
+            _ => return None,
+        };
+        let (params, body) = self.lambda_argument(f)?;
+        if params.len() != 1 {
+            return None;
+        }
+        locals.push((params[0].clone(), elem_value_type(elem)));
+        let result = self.static_type_under(&body, locals, depth + 1);
+        locals.pop();
+        list_elem_of(result?).map(ValueType::List)
     }
 
     /// Compile a call to a lambda-bound name by compiling the lambda's body
