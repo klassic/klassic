@@ -1315,6 +1315,16 @@ enum ValueType {
     /// the enum desugaring builds around scalars.
     Ptr,
     Unit,
+    /// `null` itself, before anything pins down what it stands in for. It is
+    /// the null pointer, so it goes into any reference slot; joined with a
+    /// value in an `if` it becomes a `Nullable`.
+    Null,
+    /// `null` *or* a value: the prelude's `stdlibFind` returns the element it
+    /// found or nothing, and one machine word has to carry both. Null is 0 and
+    /// the value is boxed exactly the way a list element is, so a null test
+    /// tells them apart -- which is also why the collector can trace this
+    /// like any other reference.
+    Nullable(ListElem),
     /// The "type" of diverging expressions (`__match_fail()`): merges
     /// with anything in an if join.
     Never,
@@ -1326,6 +1336,18 @@ enum ValueType {
 fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueType> {
     match (then_ty, else_ty) {
         (ValueType::Never, other) | (other, ValueType::Never) => Some(other),
+        // `null` joined with a value. The value's branch boxes it on the way
+        // out (see the `if` codegen), so the join is one word either way.
+        (ValueType::Null, other) | (other, ValueType::Null)
+            if nullable_elem(other).is_some() =>
+        {
+            nullable_elem(other).map(ValueType::Nullable)
+        }
+        (ValueType::Nullable(elem), other) | (other, ValueType::Nullable(elem))
+            if nullable_elem(other) == Some(elem) =>
+        {
+            Some(ValueType::Nullable(elem))
+        }
         (ValueType::EmptyList, other @ ValueType::List(_))
         | (other @ ValueType::List(_), ValueType::EmptyList) => Some(other),
         (ValueType::EmptySet, other @ ValueType::Set(_))
@@ -1335,11 +1357,22 @@ fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueTyp
     }
 }
 
+/// Does this branch of an `if` have to box its value on the way out? Only when
+/// the branch holds an unboxed scalar and the other branch makes the join a
+/// nullable -- either by being `null` itself or by already being one.
+fn joins_as_nullable(ty: ValueType, other: Option<ValueType>) -> bool {
+    is_boxed_scalar(ty)
+        && matches!(other, Some(ValueType::Null) | Some(ValueType::Nullable(_)))
+        && merge_branch_types(ty, other.expect("checked just above")).is_some()
+}
+
 /// Whether a value of type `actual` can flow into a slot of type
 /// `expected` (locals, arguments, returns): exact match, or the
 /// polymorphic empty list into any list slot.
 fn assignable(actual: ValueType, expected: ValueType) -> bool {
     actual == expected
+        // `null` into any reference slot, including one that may hold nothing.
+        || (actual == ValueType::Null && is_heap_pointer(expected))
         || (actual == ValueType::EmptyList
             && matches!(expected, ValueType::List(_) | ValueType::EmptyList))
         || (actual == ValueType::EmptySet
@@ -1381,6 +1414,8 @@ fn is_heap_pointer(ty: ValueType) -> bool {
             | ValueType::EmptySet
             | ValueType::Record(_)
             | ValueType::Ptr
+            | ValueType::Null
+            | ValueType::Nullable(_)
     )
 }
 
@@ -1398,6 +1433,15 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 }
 
 /// The element type a value of type `ty` can be a list element of.
+/// The value a nullable join carries, if this type can be one half of one.
+/// A nullable is already that join; anything a list can hold can become one.
+fn nullable_elem(ty: ValueType) -> Option<ListElem> {
+    match ty {
+        ValueType::Nullable(elem) => Some(elem),
+        other => list_elem_of(other),
+    }
+}
+
 fn list_elem_of(ty: ValueType) -> Option<ListElem> {
     match ty {
         ValueType::Int => Some(ListElem::Int),
@@ -1663,7 +1707,7 @@ impl Emitter {
             // costs nothing and needs no special case.
             Expr::Null { .. } => {
                 self.asm.mov_imm64(Reg::X0, 0);
-                Ok(ValueType::Ptr)
+                Ok(ValueType::Null)
             }
             Expr::Unary { op, expr, span } => {
                 let ty = self.expression(expr)?;
@@ -2003,9 +2047,22 @@ impl Emitter {
                 self.asm
                     .branch(else_label, BranchKind::CompareZero(Reg::X0));
                 let then_ty = self.expression(then_branch)?;
+                // If the other branch yields `null`, this branch's value has
+                // to leave boxed so the join is one word either way. That
+                // decision needs the other branch's type *before* it is
+                // compiled, which is what the inference is for; when it cannot
+                // tell, nothing is boxed and the merge below reports the
+                // mismatch instead of miscompiling it.
+                if joins_as_nullable(then_ty, self.static_type_under(else_branch, &mut Vec::new(), 0))
+                {
+                    self.emit_box_scalar();
+                }
                 self.asm.branch(end_label, BranchKind::Unconditional);
                 self.asm.bind(else_label);
                 let else_ty = self.expression(else_branch)?;
+                if joins_as_nullable(else_ty, Some(then_ty)) {
+                    self.emit_box_scalar();
+                }
                 self.asm.bind(end_label);
                 merge_branch_types(then_ty, else_ty)
                     .ok_or_else(|| unsupported(*span, "if branches with different types"))
@@ -5479,6 +5536,9 @@ impl Emitter {
                 .find(|(n, _)| n == name)
                 .map(|(_, ty)| *ty)
                 .or_else(|| self.lookup(name).map(|(_, ty)| ty)),
+            // Typed the way the emitter types it, so an `if` with a `null`
+            // branch predicts the nullable join rather than the other branch.
+            Expr::Null { .. } => Some(ValueType::Null),
             Expr::Block { expressions, .. } => {
                 let mark = locals.len();
                 let (last, init) = expressions.split_last()?;
@@ -5559,10 +5619,44 @@ impl Emitter {
                         ..
                     } = callee.as_ref()
                     && initial_args.len() == 1
-                    && let Expr::Call { callee: inner, .. } = with_initial.as_ref()
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: list_args,
+                        ..
+                    } = with_initial.as_ref()
                     && matches!(inner.as_ref(), Expr::Identifier { name, .. } if name == "foldLeft")
                 {
-                    return self.static_type_under(&initial_args[0], locals, depth + 1);
+                    let initial_ty = self.static_type_under(&initial_args[0], locals, depth + 1)?;
+                    // ...but the body can widen it, exactly as the emitter's
+                    // own fold does: starting from `[]` and appending lists
+                    // ends up a list. Take the same fixpoint here so a
+                    // fold-based function's return type is the settled one.
+                    if let Expr::Lambda { params, body, .. } = &arguments[0]
+                        && params.len() == 2
+                        && list_args.len() == 1
+                        && let Some(ValueType::List(elem)) =
+                            self.static_type_under(&list_args[0], locals, depth + 1)
+                    {
+                        let elem_ty = elem_value_type(elem);
+                        let mut acc_ty = initial_ty;
+                        for _ in 0..3 {
+                            locals.push((params[0].clone(), acc_ty));
+                            locals.push((params[1].clone(), elem_ty));
+                            let folded = self.static_type_under(body, locals, depth + 1);
+                            locals.pop();
+                            locals.pop();
+                            let Some(merged) = folded.and_then(|f| merge_branch_types(acc_ty, f))
+                            else {
+                                break;
+                            };
+                            if merged == acc_ty {
+                                break;
+                            }
+                            acc_ty = merged;
+                        }
+                        return Some(acc_ty);
+                    }
+                    return Some(initial_ty);
                 }
                 // Curried `cons(head)(tail)` builds a list of the head's type.
                 if arguments.len() == 1
@@ -5887,6 +5981,31 @@ impl Emitter {
         self.emit_root_frame_slot(cursor);
 
         let elem_ty = elem_value_type(elem);
+        // The accumulator's type can be *widened* by the body:
+        // `foldLeft(xss)([])((acc, xs) => concat(acc, xs))` starts from the
+        // polymorphic empty list and ends up holding a real list, so typing the
+        // body against the initial value alone would reject the fold. Settle
+        // the type first by inference -- this emits nothing -- and compile the
+        // body once against the settled type. Widening only ever turns the
+        // empty list/set into a list/set, both of which are heap pointers
+        // already, so the accumulator's rooting above is unaffected.
+        let mut acc_ty = initial_ty;
+        for _ in 0..3 {
+            let mut locals = vec![
+                (acc_param.to_string(), acc_ty),
+                (elem_param.to_string(), elem_ty),
+            ];
+            let Some(folded) = self.static_type_under(body, &mut locals, 0) else {
+                break;
+            };
+            let Some(merged) = merge_branch_types(acc_ty, folded) else {
+                break;
+            };
+            if merged == acc_ty {
+                break;
+            }
+            acc_ty = merged;
+        }
         let loop_start = self.asm.new_label();
         let done = self.asm.new_label();
         self.asm.bind(loop_start);
@@ -5903,17 +6022,17 @@ impl Emitter {
         self.scope_root_counts.push(0);
         {
             let scope = self.scopes.last_mut().expect("emitter scope");
-            scope.insert(acc_param.to_string(), (acc_slot, initial_ty));
+            scope.insert(acc_param.to_string(), (acc_slot, acc_ty));
             scope.insert(elem_param.to_string(), (elem_slot, elem_ty));
         }
-        if is_heap_pointer(initial_ty) {
+        if is_heap_pointer(acc_ty) {
             self.emit_root_frame_slot(acc_slot);
         }
         if is_heap_pointer(elem_ty) {
             self.emit_root_frame_slot(elem_slot);
         }
         let folded = self.expression(body)?;
-        if folded != initial_ty {
+        if !assignable(folded, acc_ty) {
             return Err(unsupported(
                 body.span(),
                 "a fold whose accumulator changes type",
@@ -5930,7 +6049,7 @@ impl Emitter {
         self.asm.bind(done);
         self.asm.load_local(Reg::X0, acc);
         let _ = span;
-        Ok(initial_ty)
+        Ok(acc_ty)
     }
 
     /// Open a scope for all four kinds of compile-time binding at once.
@@ -6289,6 +6408,48 @@ impl Emitter {
                 self.asm.branch(end_label, BranchKind::Unconditional);
                 self.asm.bind(false_label);
                 self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
+                self.asm.bind(end_label);
+                Ok(())
+            }
+            ValueType::Null => {
+                self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
+                Ok(())
+            }
+            // `null` or a value: the evaluator prints the word `null` for the
+            // empty case, and the value itself otherwise.
+            ValueType::Nullable(elem) => {
+                let null_label = self.asm.new_label();
+                let end_label = self.asm.new_label();
+                self.asm
+                    .branch(null_label, BranchKind::CompareZero(Reg::X0));
+                let inner = elem_value_type(elem);
+                if is_boxed_scalar(inner) {
+                    self.emit_unbox_scalar();
+                }
+                match elem {
+                    ListElem::Int => self.asm.emit_print_int_line(),
+                    ListElem::Str => self.emit_println_str(),
+                    ListElem::Bool => {
+                        let false_label = self.asm.new_label();
+                        let bool_end = self.asm.new_label();
+                        self.asm
+                            .branch(false_label, BranchKind::CompareZero(Reg::X0));
+                        self.asm.emit_write_rodata(STDOUT_FD, b"true\n");
+                        self.asm.branch(bool_end, BranchKind::Unconditional);
+                        self.asm.bind(false_label);
+                        self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
+                        self.asm.bind(bool_end);
+                    }
+                    ListElem::Double | ListElem::Nested { .. } => {
+                        return Err(unsupported(
+                            argument.span(),
+                            &format!("printing a nullable {elem:?}"),
+                        ));
+                    }
+                }
+                self.asm.branch(end_label, BranchKind::Unconditional);
+                self.asm.bind(null_label);
+                self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
                 self.asm.bind(end_label);
                 Ok(())
             }
@@ -7364,6 +7525,13 @@ pub(crate) fn emit_macho_program(
     // Emit reached functions; their bodies may reach more.
     let mut emitted = vec![false; emitter.functions.len()];
     while let Some(index) = emitter.pending.pop() {
+        // Emitting a body can *add* functions: a generic def reached from
+        // here gets a fresh specialisation per argument-type tuple, appended
+        // to `functions` and queued. So the seen-set has to grow with the
+        // list rather than being sized once up front.
+        if emitted.len() < emitter.functions.len() {
+            emitted.resize(emitter.functions.len(), false);
+        }
         if !emitted[index] {
             emitted[index] = true;
             emitter.emit_function(index)?;
