@@ -1285,6 +1285,11 @@ struct Emitter {
     member_scalar_label: Option<Label>,
     member_string_label: Option<Label>,
     list_reverse_label: Option<Label>,
+    /// Label of the GC load barrier's slow path (`gc_load_barrier_slow`).
+    /// Created lazily so the first user -- a barriered read or
+    /// `reserve_gc_state`, whichever comes first -- owns it; the routine
+    /// body itself is always emitted with the rest of the GC runtime.
+    gc_load_barrier_label: Option<Label>,
     /// Names of enums `desugar_enums` lowered to `__gc_record` shape;
     /// annotations naming them type as plain heap pointers.
     lowered_enums: std::collections::HashSet<String>,
@@ -1524,7 +1529,10 @@ impl Emitter {
                     return Err(unsupported(*span, &format!("field `{field}`")));
                 };
                 let ty = info.fields[position].1;
-                self.asm.ldr_imm(Reg::X0, Reg::X0, (position * 8) as u32);
+                // Every record slot is a heap pointer (M6), so the read goes
+                // through the load barrier; the scalar inside its box is
+                // then a plain unbarriered load.
+                self.emit_gc_load_ptr(Reg::X0, (position * 8) as u32);
                 if is_boxed_scalar(ty) {
                     self.emit_unbox_scalar();
                 }
@@ -2200,6 +2208,92 @@ impl Emitter {
         self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
     }
 
+    fn load_barrier_label(&mut self) -> Label {
+        match self.gc_load_barrier_label {
+            Some(label) => label,
+            None => {
+                let label = self.asm.new_label();
+                self.gc_load_barrier_label = Some(label);
+                label
+            }
+        }
+    }
+
+    /// M7: load a heap *pointer* out of `[base + offset]` through the GC
+    /// load barrier, leaving the raw (colour-stripped) pointer in x0.
+    ///
+    /// This is the read half of the collector's mutator contract, and it is
+    /// what makes incremental marking sound: a load of a
+    /// not-currently-good-coloured reference takes the slow path, which
+    /// follows forwarding, self-heals the field, and -- during Mark -- marks
+    /// the loaded object. Without it a mutator could move the last reference
+    /// to an object from an untraced slot into an already-traced one and
+    /// hide it from the marker.
+    ///
+    /// Fast path (4 instructions):
+    /// ```text
+    ///   add x8, base, #offset   ; field address, also the slow-path arg
+    ///   ldr x0, [x8]            ; the colour-tagged value
+    ///   tst x0, x26             ; bad colour? (BadMask)
+    ///   b.eq fast               ; good / raw / null -> no slow path
+    ///   ...slow...
+    /// fast:
+    ///   and x0, x0, x24         ; strip the colour (ColorStrip)
+    /// ```
+    /// Until go-live nothing colours a stored pointer, so `tst` always sees
+    /// zero and `and` changes nothing: the barrier is a semantic no-op that
+    /// can land and be CI-validated ahead of the flip.
+    ///
+    /// Contract: result in x0; clobbers x0 and x8 only. The rare slow path
+    /// saves x29/x30 (it makes a `bl`) plus every caller-saved register the
+    /// portable routine may touch, so leaf helpers can barrier without
+    /// building a frame.
+    fn emit_gc_load_ptr(&mut self, base: Reg, offset: u32) {
+        self.asm.add_reg_imm(Reg::X8, base, offset);
+        self.emit_gc_load_barriered();
+    }
+
+    /// `emit_gc_load_ptr` for a *dynamic* offset: the field address is
+    /// `base + offset` with both in registers.
+    fn emit_gc_load_ptr_reg_offset(&mut self, base: Reg, offset: Reg) {
+        self.asm.add_reg(Reg::X8, base, offset);
+        self.emit_gc_load_barriered();
+    }
+
+    /// The barrier proper: x8 = field address on entry, x0 = the raw
+    /// pointer on exit.
+    fn emit_gc_load_barriered(&mut self) {
+        const SAVED: [Reg; 11] = [
+            Reg::X1,
+            Reg::X2,
+            Reg::X3,
+            Reg::X4,
+            Reg::X5,
+            Reg::X6,
+            Reg::X7,
+            Reg::X9,
+            Reg::X10,
+            Reg::X11,
+            Reg::X12,
+        ];
+        self.asm.ldr_imm(Reg::X0, Reg::X8, 0);
+        let fast = self.asm.new_label();
+        self.asm.tst_reg(Reg::X0, Reg::X26);
+        self.asm.branch(fast, BranchKind::Conditional(Cond::Eq));
+        let slow = self.load_barrier_label();
+        self.asm.push_frame_record(); // the bl below clobbers x30
+        for reg in SAVED {
+            self.asm.push(reg);
+        }
+        self.asm.branch(slow, BranchKind::Link); // x0 = value, x8 = field
+        for reg in SAVED.into_iter().rev() {
+            self.asm.pop(reg);
+        }
+        self.asm.pop_frame_record();
+        self.asm.bind(fast);
+        self.asm.and_reg(Reg::X0, Reg::X0, Reg::X24);
+    }
+
     /// Allocate a GC-shaped heap string whose payload is `[len][bytes...]`,
     /// with the character count in `len` (a caller register that is not x4,
     /// x5 or x6). Reserves a 16-byte header `[size|mark][RAW_BYTES]` in
@@ -2508,6 +2602,9 @@ impl Emitter {
     /// (never before the first or after the last).
     fn emit_str_join(&mut self) {
         self.asm.mov_reg(Reg::X10, Reg::X0);
+        // The barriered cell reads below clobber x0, so the list head is
+        // parked on the machine stack for the second pass.
+        self.asm.push(Reg::X0);
         self.asm.mov_imm64(Reg::X2, 0);
         self.asm.mov_imm64(Reg::X9, 0);
         let count_loop = self.asm.new_label();
@@ -2515,13 +2612,16 @@ impl Emitter {
         self.asm.bind(count_loop);
         self.asm
             .branch(count_done, BranchKind::CompareZero(Reg::X10));
-        self.asm.ldr_imm(Reg::X11, Reg::X10, 0);
-        self.asm.ldr_imm(Reg::X12, Reg::X11, 0);
+        self.emit_gc_load_ptr(Reg::X10, 0); // x0 = element (barriered)
+        self.asm.mov_reg(Reg::X11, Reg::X0);
+        self.asm.ldr_imm(Reg::X12, Reg::X11, 0); // its length (a scalar)
         self.asm.add_reg(Reg::X2, Reg::X2, Reg::X12);
         self.asm.add_reg_imm(Reg::X9, Reg::X9, 1);
-        self.asm.ldr_imm(Reg::X10, Reg::X10, 8);
+        self.emit_gc_load_ptr(Reg::X10, 8); // x0 = next (barriered)
+        self.asm.mov_reg(Reg::X10, Reg::X0);
         self.asm.branch(count_loop, BranchKind::Unconditional);
         self.asm.bind(count_done);
+        self.asm.pop(Reg::X0); // the list head again
 
         let no_sep = self.asm.new_label();
         self.asm.cmp_imm(Reg::X9, 0);
@@ -2557,12 +2657,14 @@ impl Emitter {
         self.asm.add_reg_imm(Reg::X3, Reg::X1, 8);
         self.emit_copy_bytes(Reg::X2, Reg::X3, Reg::X6, Reg::X4);
         self.asm.bind(skip_sep);
-        self.asm.ldr_imm(Reg::X11, Reg::X10, 0);
+        self.emit_gc_load_ptr(Reg::X10, 0); // x0 = element (barriered)
+        self.asm.mov_reg(Reg::X11, Reg::X0);
         self.asm.ldr_imm(Reg::X2, Reg::X11, 0);
         self.asm.add_reg_imm(Reg::X3, Reg::X11, 8);
         self.emit_copy_bytes(Reg::X2, Reg::X3, Reg::X6, Reg::X4);
         self.asm.add_reg_imm(Reg::X12, Reg::X12, 1);
-        self.asm.ldr_imm(Reg::X10, Reg::X10, 8);
+        self.emit_gc_load_ptr(Reg::X10, 8); // x0 = next (barriered)
+        self.asm.mov_reg(Reg::X10, Reg::X0);
         self.asm.branch(copy_loop, BranchKind::Unconditional);
         self.asm.bind(copy_done);
 
@@ -3185,7 +3287,7 @@ impl Emitter {
         self.asm.bind(loop_start);
         self.asm.pop(Reg::X3);
         self.asm.push(Reg::X3);
-        self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        self.emit_gc_load_ptr(Reg::X3, 0); // x0 = element (barriered)
         // Scalar elements are boxed in the cell; unbox before printing
         // (string elements are already the pointer).
         if is_boxed_scalar(elem_value_type(elem)) {
@@ -3193,7 +3295,8 @@ impl Emitter {
         }
         self.emit_print_elem(elem);
         self.asm.pop(Reg::X3);
-        self.asm.ldr_imm(Reg::X3, Reg::X3, 8);
+        self.emit_gc_load_ptr(Reg::X3, 8); // x0 = next (barriered)
+        self.asm.mov_reg(Reg::X3, Reg::X0);
         self.asm.push(Reg::X3);
         self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
         self.asm.emit_write_rodata(STDOUT_FD, b", ");
@@ -3213,11 +3316,15 @@ impl Emitter {
         let not_found = self.asm.new_label();
         self.asm.bind(loop_start);
         self.asm.branch(not_found, BranchKind::CompareZero(Reg::X2));
-        self.asm.ldr_imm(Reg::X3, Reg::X2, 0); // boxed element pointer
-        self.asm.ldr_imm(Reg::X3, Reg::X3, 0); // unbox to the raw scalar
+        // Both cell slots are heap pointers, so both reads are barriered
+        // (x0/x8 clobbered, the cursor x2 and candidate x1 preserved). The
+        // scalar inside the box is a plain load.
+        self.emit_gc_load_ptr(Reg::X2, 0); // x0 = boxed element pointer
+        self.asm.ldr_imm(Reg::X3, Reg::X0, 0); // unbox to the raw scalar
         self.asm.cmp_reg(Reg::X3, Reg::X1);
         self.asm.branch(found, BranchKind::Conditional(Cond::Eq));
-        self.asm.ldr_imm(Reg::X2, Reg::X2, 8);
+        self.emit_gc_load_ptr(Reg::X2, 8); // x0 = next
+        self.asm.mov_reg(Reg::X2, Reg::X0);
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(found);
         self.asm.mov_imm64(Reg::X0, 1);
@@ -3243,12 +3350,13 @@ impl Emitter {
         self.asm.bind(loop_start);
         self.asm.branch(not_found, BranchKind::CompareZero(Reg::X2));
         self.asm.str_imm(Reg::X2, Reg::X5, 8); // save cursor
-        self.asm.ldr_imm(Reg::X0, Reg::X2, 0); // element
+        self.emit_gc_load_ptr(Reg::X2, 0); // x0 = element (barriered)
         self.asm.ldr_imm(Reg::X1, Reg::X5, 0); // candidate
         self.emit_str_eq();
         self.asm.branch(found, BranchKind::CompareNonZero(Reg::X0));
         self.asm.ldr_imm(Reg::X2, Reg::X5, 8); // restore cursor
-        self.asm.ldr_imm(Reg::X2, Reg::X2, 8); // next
+        self.emit_gc_load_ptr(Reg::X2, 8); // x0 = next (barriered)
+        self.asm.mov_reg(Reg::X2, Reg::X0);
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(found);
         self.asm.add_sp_imm(16);
@@ -3271,8 +3379,14 @@ impl Emitter {
         let done = self.asm.new_label();
         self.asm.bind(loop_start);
         self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
-        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // head
-        self.asm.ldr_imm(Reg::X0, Reg::X0, 8); // advance input
+        // Both cell slots are heap pointers: read them through the barrier,
+        // holding the cursor in x9 (which the barrier preserves and which is
+        // dead again before the allocation below, whose grow path only keeps
+        // x0-x5).
+        self.asm.mov_reg(Reg::X9, Reg::X0); // cursor
+        self.emit_gc_load_ptr(Reg::X9, 0); // x0 = head
+        self.asm.mov_reg(Reg::X2, Reg::X0); // head
+        self.emit_gc_load_ptr(Reg::X9, 8); // x0 = next -- advance input
         // Build a GC-shaped [header][head][acc] cell. emit_alloc preserves
         // x0-x5 across grow, so cursor (x0), acc (x1) and head (x2)
         // survive; x3 is a free scratch. The head copied from the source
@@ -3350,7 +3464,7 @@ impl Emitter {
             }
             self.asm.pop(Reg::X0);
             self.asm.push(Reg::X0);
-            self.asm.ldr_imm(Reg::X0, Reg::X0, (position * 8) as u32);
+            self.emit_gc_load_ptr(Reg::X0, (position * 8) as u32); // barriered
             // Scalar fields are boxed in the POINTER_RECORD; unbox before
             // printing (string fields are already the pointer).
             if is_boxed_scalar(*ty) {
@@ -3376,7 +3490,7 @@ impl Emitter {
         self.asm.bind(loop_start);
         self.asm.pop(Reg::X3);
         self.asm.push(Reg::X3);
-        self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        self.emit_gc_load_ptr(Reg::X3, 0); // x0 = element (barriered)
         // Scalar elements are boxed in the cell; unbox before printing
         // (string elements are already the pointer).
         if is_boxed_scalar(elem_value_type(elem)) {
@@ -3384,7 +3498,8 @@ impl Emitter {
         }
         self.emit_print_elem(elem);
         self.asm.pop(Reg::X3);
-        self.asm.ldr_imm(Reg::X3, Reg::X3, 8);
+        self.emit_gc_load_ptr(Reg::X3, 8); // x0 = next (barriered)
+        self.asm.mov_reg(Reg::X3, Reg::X0);
         self.asm.push(Reg::X3);
         self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
         self.asm.emit_write_rodata(STDOUT_FD, b", ");
@@ -3633,7 +3748,7 @@ impl Emitter {
                     .emit_write_rodata(STDERR_FD, b"klassic: head expects a non-empty list\n");
                 self.asm.emit_exit(1);
                 self.asm.bind(non_empty);
-                self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+                self.emit_gc_load_ptr(Reg::X0, 0); // barriered: head is a pointer
                 // Scalar heads are boxed in the cell; unbox before use
                 // (string/list/record heads are already the pointer).
                 if is_boxed_scalar(elem_value_type(elem)) {
@@ -3649,7 +3764,7 @@ impl Emitter {
                 // The evaluator's tail([]) is [] — nil stays nil.
                 let end = self.asm.new_label();
                 self.asm.branch(end, BranchKind::CompareZero(Reg::X0));
-                self.asm.ldr_imm(Reg::X0, Reg::X0, 8);
+                self.emit_gc_load_ptr(Reg::X0, 8); // barriered: next is a pointer
                 self.asm.bind(end);
                 Ok(Some(ty))
             }
@@ -3678,13 +3793,17 @@ impl Emitter {
                 let count_loop = self.asm.new_label();
                 let done = self.asm.new_label();
                 self.asm.mov_reg(Reg::X1, Reg::X0);
-                self.asm.mov_imm64(Reg::X0, 0);
+                // The barriered next-reads clobber x0, so the running count
+                // lives in x2 (which the barrier preserves) until the end.
+                self.asm.mov_imm64(Reg::X2, 0);
                 self.asm.bind(count_loop);
                 self.asm.branch(done, BranchKind::CompareZero(Reg::X1));
-                self.asm.ldr_imm(Reg::X1, Reg::X1, 8);
-                self.asm.add_reg_imm(Reg::X0, Reg::X0, 1);
+                self.emit_gc_load_ptr(Reg::X1, 8); // x0 = next (barriered)
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.add_reg_imm(Reg::X2, Reg::X2, 1);
                 self.asm.branch(count_loop, BranchKind::Unconditional);
                 self.asm.bind(done);
+                self.asm.mov_reg(Reg::X0, Reg::X2);
                 Ok(Some(ValueType::Int))
             }
             ("contains", 2) => {
@@ -3775,7 +3894,13 @@ impl Emitter {
                 }
                 self.asm.mov_reg(Reg::X1, Reg::X0);
                 self.asm.pop(Reg::X0);
-                self.asm.ldr_reg_offset(Reg::X0, Reg::X0, Reg::X1);
+                if name == "__gc_read" {
+                    // A scalar out of a RAW_BYTES box: no barrier (the box
+                    // pointer itself was read through one).
+                    self.asm.ldr_reg_offset(Reg::X0, Reg::X0, Reg::X1);
+                } else {
+                    self.emit_gc_load_ptr_reg_offset(Reg::X0, Reg::X1);
+                }
                 Ok(Some(match name {
                     "__gc_read" => ValueType::Int,
                     "__gc_read_string" => ValueType::Str,
@@ -4650,6 +4775,9 @@ impl Emitter {
         let bounds_error_text = string(b"klassic gc: index out of bounds\n");
         let evac_exhausted = string(b"klassic gc: evacuation exhausted the heap reservation\n");
         let evac_oversized = string(b"klassic gc: evacuation object exceeds a region\n");
+        // Share one label with the mutator's barriered reads (whichever
+        // side runs first creates it) so their `bl` lands on this body.
+        let l_load_barrier_slow = self.load_barrier_label();
 
         GcState {
             heap_base,
@@ -4711,7 +4839,7 @@ impl Emitter {
             l_mark_end: self.asm.new_label(),
             l_mark_visit: self.asm.new_label(),
             l_deep_equal: self.asm.new_label(),
-            l_load_barrier_slow: self.asm.new_label(),
+            l_load_barrier_slow,
             l_acquire_region: self.asm.new_label(),
             l_alloc_large: self.asm.new_label(),
             l_grow_budget: self.asm.new_label(),
