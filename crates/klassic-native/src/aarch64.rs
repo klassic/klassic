@@ -1347,6 +1347,24 @@ fn list_elem_of(ty: ValueType) -> Option<ListElem> {
 /// A top-level annotated `def` compiled as a real AAPCS64 function:
 /// arguments in x0..x7, result in x0, frame record saved by the
 /// callee prologue (which is what makes recursion per-frame safe).
+/// A def whose signature is not fully concrete, kept whole so each call site
+/// can specialise it.
+#[derive(Clone)]
+struct GenericFunction {
+    name: String,
+    params: Vec<String>,
+    body: Expr,
+    /// The return type when the annotation names one this backend models.
+    declared_return: Option<ValueType>,
+    /// The annotations as written. A return type this backend cannot model on
+    /// its own -- a type variable, or one applied to something like `'m<Int>`
+    /// -- is still pinned down when it is *the same annotation* as a
+    /// parameter's: the result is then that argument's type, which is exactly
+    /// what `def pairWithNext<'m>(xs: 'm<Int>): 'm<Int>` says.
+    param_annotations: Vec<Option<String>>,
+    return_annotation: Option<String>,
+}
+
 struct FunctionInfo {
     label: Label,
     params: Vec<(String, ValueType)>,
@@ -1412,7 +1430,7 @@ struct Emitter {
     /// They are compiled once per distinct tuple of argument types, keyed in
     /// `specializations`, because the parameter types only exist at the call
     /// site.
-    generic_functions: Vec<(String, Vec<String>, Expr, Option<ValueType>)>,
+    generic_functions: Vec<GenericFunction>,
     specializations: HashMap<(usize, Vec<ValueType>), usize>,
     lambdas: Vec<(Vec<String>, Expr)>,
     lambda_bindings: Vec<HashMap<String, usize>>,
@@ -5249,15 +5267,15 @@ impl Emitter {
                 // A generic def's result is its body's, inferred with the
                 // parameters bound to these argument types -- the same thing
                 // the specialisation itself will do.
-                if let Some(generic) = self
-                    .generic_functions
-                    .iter()
-                    .rposition(|(n, params, _, _)| n == name && params.len() == arguments.len())
-                {
-                    let (_, params, body, declared) = &self.generic_functions[generic];
-                    if let Some(declared) = declared {
-                        return Some(*declared);
+                if let Some(generic) = self.generic_functions.iter().rposition(|generic| {
+                    generic.name == *name && generic.params.len() == arguments.len()
+                }) {
+                    let generic = self.generic_functions[generic].clone();
+                    if let Some(declared) = generic.declared_return {
+                        return Some(declared);
                     }
+                    let params = &generic.params;
+                    let body = &generic.body;
                     let mut callee_locals = Vec::with_capacity(params.len());
                     for (param, argument) in params.iter().zip(arguments.iter()) {
                         let ty = self.static_type_under(argument, locals, depth + 1)?;
@@ -5279,7 +5297,14 @@ impl Emitter {
         arguments: &[Expr],
         span: Span,
     ) -> Result<ValueType, Diagnostic> {
-        let (name, params, body, declared_return) = self.generic_functions[generic].clone();
+        let GenericFunction {
+            name,
+            params,
+            body,
+            declared_return,
+            param_annotations,
+            return_annotation,
+        } = self.generic_functions[generic].clone();
         if params.len() != arguments.len() {
             return Err(Diagnostic::compile(
                 span,
@@ -5352,14 +5377,29 @@ impl Emitter {
                 let signature = value_params.clone();
                 // A declared return type is the answer when there is one --
                 // only the *parameters* were generic in that case.
+                //
+                // Failing that, a return annotation this backend cannot model
+                // on its own is still decided when it is *the same
+                // annotation* as one of the parameters: the result is that
+                // argument's type. `def id(x: 'a): 'a` and
+                // `def pairWithNext<'m>(xs: 'm<Int>): 'm<Int>` both say so
+                // without naming a type this backend knows.
+                let matched_return = return_annotation.as_ref().and_then(|wanted| {
+                    param_annotations
+                        .iter()
+                        .zip(arguments.iter())
+                        .position(|(annotation, _)| annotation.as_deref() == Some(wanted.as_str()))
+                        .and_then(|position| argument_types.get(position).copied())
+                });
                 let mut locals = signature.clone();
                 // The lambda parameters must be visible while the body's type
                 // is worked out, or a higher-order def's result could not be
                 // typed at all.
                 self.lambda_bindings
                     .push(lambda_params.iter().cloned().collect());
-                let inferred =
-                    declared_return.or_else(|| self.static_type_under(&body, &mut locals, 0));
+                let inferred = declared_return
+                    .or(matched_return)
+                    .or_else(|| self.static_type_under(&body, &mut locals, 0));
                 self.lambda_bindings.pop();
                 let Some(ret) = inferred else {
                     return Err(unsupported(
@@ -5590,11 +5630,9 @@ impl Emitter {
         let Some(&fallback) = candidates.last() else {
             // No concrete definition: a def whose signature was not fully
             // annotated is compiled per call site instead.
-            if let Some(generic) = self
-                .generic_functions
-                .iter()
-                .rposition(|(n, params, _, _)| n == name && params.len() == arguments.len())
-            {
+            if let Some(generic) = self.generic_functions.iter().rposition(|generic| {
+                generic.name == name && generic.params.len() == arguments.len()
+            }) {
                 return self.emit_generic_function_call(generic, arguments, span);
             }
             return Err(unsupported(span, &format!("function `{name}`")));
@@ -6110,12 +6148,23 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
             .as_ref()
             .and_then(|annotation| emitter.annotation_type(&annotation.text, *span).ok());
         if signature.len() != params.len() || concrete_return.is_none() {
-            emitter.generic_functions.push((
-                name.clone(),
-                params.clone(),
-                body.as_ref().clone(),
-                concrete_return,
-            ));
+            emitter.generic_functions.push(GenericFunction {
+                name: name.clone(),
+                params: params.clone(),
+                body: body.as_ref().clone(),
+                declared_return: concrete_return,
+                param_annotations: param_annotations
+                    .iter()
+                    .map(|annotation| {
+                        annotation
+                            .as_ref()
+                            .map(|annotation| annotation.text.clone())
+                    })
+                    .collect(),
+                return_annotation: return_annotation
+                    .as_ref()
+                    .map(|annotation| annotation.text.clone()),
+            });
             continue;
         }
         let ret = concrete_return.expect("checked above");

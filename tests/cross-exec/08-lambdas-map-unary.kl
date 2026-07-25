@@ -88,7 +88,16 @@ println(applyTwice((n) => n + 3, 10))
 println(stdlibFilter([1, 2, 3, 4, 5, 6], (x) => x > 3))
 println(stdlibMap([1, 2, 3], (x) => x * 10))
 val nothing = null
+// A polymorphic signature the backend cannot model directly: the result is
+// decided by the return annotation being the *same* annotation as a
+// parameter's, so it is that argument's type. Two instantiations from one def.
+def id(x: 'a): 'a = x
+println(id(7))
+println(id("hi"))
+
 assertResult(16)(applyTwice((n) => n + 3, 10))
+assertResult(7)(id(7))
+assertResult("hi")(id("hi"))
 
 assertResult(6)([1 2 3] reduce 0 => r + e)
 assertResult(24)(foldLeft([1 2 3 4])(1)((a, x) => a * x))
