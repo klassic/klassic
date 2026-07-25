@@ -5400,7 +5400,7 @@ impl Emitter {
             // `str::lines`. Built here as the same expression `std.string`'s
             // own `lines` is written as, over two hidden locals so the text and
             // the split are each computed once.
-            ("FileInput#lines", 1) => {
+            ("FileInput#lines", 1) | ("FileInput#readLines", 1) => {
                 self.emit_path_cstring(&arguments[0])?;
                 self.emit_file_read_all();
                 let text = self.declare_local("__file_lines_text", ValueType::Str);
@@ -5458,7 +5458,26 @@ impl Emitter {
                 };
                 Ok(Some(self.expression(&trimmed)?))
             }
-            ("FileInput#all", 1) => {
+            // `path FileInput#open { stream => ... }`: the evaluator hands the
+            // block the path itself and answers with the block's value, so this
+            // is the block inlined with its parameter bound to the path. There
+            // is no descriptor to keep or close -- reading happens inside.
+            ("FileInput#open", 2) => {
+                let Some((params, body)) = self.lambda_argument(&arguments[1]) else {
+                    return Err(unsupported(arguments[1].span(), "opening with this block"));
+                };
+                if params.len() != 1 {
+                    return Err(unsupported(
+                        arguments[1].span(),
+                        "an open block taking other than one stream",
+                    ));
+                }
+                let index = self.lambdas.len();
+                self.lambdas.push((params, body));
+                let opened = self.emit_inline_lambda_call(index, &arguments[0..1], span)?;
+                Ok(Some(opened))
+            }
+            ("FileInput#all", 1) | ("FileInput#readAll", 1) => {
                 self.emit_path_cstring(&arguments[0])?;
                 self.emit_file_read_all();
                 Ok(Some(ValueType::Str))
@@ -6717,6 +6736,12 @@ impl Emitter {
                 let index = self.lookup_lambda(name)?;
                 let (params, body) = &self.lambdas[index];
                 Some((params.clone(), body.clone()))
+            }
+            // `{ (x) => ... }` and `{x, y => ...}`: a braced block whose only
+            // expression is the lambda, which is how a trailing block argument
+            // is written.
+            Expr::Block { expressions, .. } if expressions.len() == 1 => {
+                self.lambda_argument(&expressions[0])
             }
             _ => None,
         }

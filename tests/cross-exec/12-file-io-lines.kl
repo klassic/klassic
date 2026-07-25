@@ -42,6 +42,22 @@ println("nested=#{[[1, 2], [3]]}")
 println(ns)
 assertResult("ns=[1, 2, 3]")("ns=#{ns}")
 
+// The block form: `path FileInput#open { stream => ... }` hands the block the
+// path and answers with the block's value, and a braced block is how a trailing
+// function argument is written -- for a fold just as much as for a stream.
+val opened = "cross-exec-all.txt" FileInput#open {(stream) => FileInput#readAll(stream)}
+println(opened)
+println(FileInput#readLines("cross-exec-all.txt"))
+println(foldLeft([1, 2, 3, 4])(0){a, x => a + x})
+assertResult("first\nsecond")(opened)
+assertResult(10)(foldLeft([1, 2, 3, 4])(0){a, x => a + x})
+
+// A path in a binding rather than written at the call site: the same file, read
+// through a name.
+val named = "cross-exec-all.txt"
+println(FileOutput#exists(named))
+println(FileInput#all(named))
+
 FileOutput#delete("cross-exec-lines.txt")
 FileOutput#delete("cross-exec-one.txt")
 FileOutput#delete("cross-exec-all.txt")
