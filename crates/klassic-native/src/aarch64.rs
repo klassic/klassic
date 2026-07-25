@@ -4497,6 +4497,106 @@ struct GcState {
 }
 
 impl Emitter {
+    /// Store a register's value into a single-qword GC `__bss` cell,
+    /// using X10 as the address scratch.
+    fn emit_store_gc_cell_reg(&mut self, cell: PortDataAddr, value: Reg) {
+        let PortDataAddr::Bss(label) = cell else {
+            unreachable!("GC cells live in __bss");
+        };
+        self.asm.load_data_address(Reg::X10, label);
+        self.asm.str_imm(value, Reg::X10, 0);
+    }
+
+    /// Store a 64-bit immediate into a single-qword GC `__bss` cell
+    /// (X11 holds the value, X10 the address).
+    fn emit_store_gc_cell_imm(&mut self, cell: PortDataAddr, value: u64) {
+        self.asm.mov_imm64(Reg::X11, value);
+        self.emit_store_gc_cell_reg(cell, Reg::X11);
+    }
+
+    /// M7 (infra): bring the GC region heap online at startup -- the
+    /// AArch64 mirror of the x86-64 `emit_initialize_gc_heap`. mmaps the
+    /// whole region reservation (demand-paged) and the runtime tables
+    /// (shadow stack + mark worklist, zero-filled by mmap), then installs
+    /// region-0 metadata. Runs before the bump heap is armed; while
+    /// allocations still bump (pre go-live) these cells are written but
+    /// unread, so this only exercises the startup path.
+    fn emit_gc_init_heap(&mut self, gc: &GcState) {
+        // mmap(NULL, GC_RESERVE_BYTES, RW, MAP_ANON|PRIVATE, -1, 0).
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm
+            .mov_imm64(Reg::X1, crate::gc_layout::GC_RESERVE_BYTES);
+        self.asm.mov_imm64(Reg::X2, PROT_READ_WRITE);
+        self.asm.mov_imm64(Reg::X3, MMAP_ANON_PRIVATE);
+        self.asm.mov_imm64(Reg::X4, u64::MAX); // fd = -1
+        self.asm.mov_imm64(Reg::X5, 0);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_MMAP));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic gc: mmap failed\n");
+        // region_base = heap_base = heap_top = region_top[0] = base (x0).
+        self.emit_store_gc_cell_reg(gc.region_base, Reg::X0);
+        self.emit_store_gc_cell_reg(gc.heap_base, Reg::X0);
+        self.emit_store_gc_cell_reg(gc.heap_top, Reg::X0);
+        self.emit_store_gc_cell_reg(gc.region_top, Reg::X0); // element 0
+        // heap_end = base + GC_REGION_SIZE.
+        self.asm
+            .mov_imm64(Reg::X1, crate::gc_layout::GC_REGION_SIZE);
+        self.asm.add_reg(Reg::X2, Reg::X0, Reg::X1);
+        self.emit_store_gc_cell_reg(gc.heap_end, Reg::X2);
+        // free_region_head = 0; committed_count = 1; budget = initial.
+        self.emit_store_gc_cell_imm(gc.free_region_head, 0);
+        self.emit_store_gc_cell_imm(gc.committed_count, 1);
+        self.emit_store_gc_cell_imm(
+            gc.budget_regions,
+            crate::gc_layout::GC_INITIAL_BUDGET_REGIONS,
+        );
+        // mmap(NULL, GC_TABLES_BYTES, ...) for the shadow stack + worklist.
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm
+            .mov_imm64(Reg::X1, crate::gc_layout::GC_TABLES_BYTES);
+        self.asm.mov_imm64(Reg::X2, PROT_READ_WRITE);
+        self.asm.mov_imm64(Reg::X3, MMAP_ANON_PRIVATE);
+        self.asm.mov_imm64(Reg::X4, u64::MAX);
+        self.asm.mov_imm64(Reg::X5, 0);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_MMAP));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic gc: mmap failed\n");
+        // shadow_stack = tables base; mark_worklist = base + SHADOW_LEN*8.
+        self.emit_store_gc_cell_reg(gc.shadow_stack, Reg::X0);
+        self.asm
+            .mov_imm64(Reg::X1, (crate::gc_layout::GC_SHADOW_STACK_LEN * 8) as u64);
+        self.asm.add_reg(Reg::X0, Reg::X0, Reg::X1);
+        self.emit_store_gc_cell_reg(gc.mark_worklist, Reg::X0);
+    }
+
+    /// M7 (infra): seed the callee-saved colour registers (X24 strip mask,
+    /// X25 good colour, X26 bad-colour test mask) and the colour/mark
+    /// cells -- the AArch64 mirror of `emit_initialize_color_registers`.
+    /// Non-moving, unpoisoned scheme (evac off): good = M0, bad = M1|R.
+    /// X25/X26 cache the cells; MarkStart reloads them each cycle.
+    fn emit_gc_init_colors(&mut self, gc: &GcState) {
+        self.asm
+            .mov_imm64(Reg::X24, crate::gc_layout::GC_COLOR_STRIP);
+        self.emit_store_gc_cell_imm(gc.good_color, crate::gc_layout::GC_COLOR_M0);
+        self.emit_store_gc_cell_imm(gc.bad_mask, crate::gc_layout::GC_COLOR_BAD_MASK);
+        let PortDataAddr::Bss(good) = gc.good_color else {
+            unreachable!("GC cells live in __bss");
+        };
+        self.asm.load_data_address(Reg::X10, good);
+        self.asm.ldr_imm(Reg::X25, Reg::X10, 0);
+        let PortDataAddr::Bss(bad) = gc.bad_mask else {
+            unreachable!("GC cells live in __bss");
+        };
+        self.asm.load_data_address(Reg::X10, bad);
+        self.asm.ldr_imm(Reg::X26, Reg::X10, 0);
+        // Header-mark parity (nonzero so the first mark isn't a no-op) and
+        // the initial mark colour.
+        self.emit_store_gc_cell_imm(gc.header_mark, crate::gc_layout::GC_HMARK1);
+        self.emit_store_gc_cell_imm(gc.mark_color, crate::gc_layout::GC_COLOR_M1);
+    }
+
     /// Reserve all GC cells (single qwords + the three region arrays) in
     /// `__DATA,__bss`, intern the diagnostic strings, and create the
     /// subroutine labels.
@@ -4914,6 +5014,17 @@ pub(crate) fn emit_macho_program(
     emitter.asm.mov_reg(Reg::X22, Reg::X1);
     emitter.asm.mov_reg(Reg::X23, Reg::X2);
 
+    // M7 (infra): reserve the GC cells/labels and bring the region heap +
+    // colour registers online at startup, before the bump heap is armed.
+    // Allocations still bump below, so the collector stays inert -- this
+    // only exercises the startup mmap/seeding path (validated live on
+    // arm64 CI) ahead of the go-live flip. reserve_gc_state emits no code
+    // (it only reserves __bss cells / rodata / labels), so calling it here
+    // and emitting the routine bodies after main is unchanged.
+    let gc = emitter.reserve_gc_state();
+    emitter.emit_gc_init_heap(&gc);
+    emitter.emit_gc_init_colors(&gc);
+
     // Empty heap: the first allocation's capacity check fails and
     // mmaps the first segment.
     emitter.asm.mov_imm64(Reg::X19, 0);
@@ -4954,14 +5065,13 @@ pub(crate) fn emit_macho_program(
         emitter.emit_heap_grow_routine(label);
     }
 
-    // M5: reserve the GC's __DATA,__bss cells and emit all 24 portable
-    // ZGC runtime routines after the program's exit. Nothing calls
-    // gc_alloc yet (the bump allocator is still live), so this is dead
-    // but linked -- it exercises the __DATA segment, the data fixups, and
-    // the whole PortableAsm lowering end-to-end, and must encode validly.
-    // The go-live (M7) routes the mutator through gc_alloc and adds the
-    // startup mmap/colour seeding.
-    let gc = emitter.reserve_gc_state();
+    // M5: emit all 24 portable ZGC runtime routines after the program's
+    // exit (the cells were reserved and the region heap/colour registers
+    // seeded at startup above). Nothing calls gc_alloc yet (the bump
+    // allocator is still live), so the routines are dead but linked -- they
+    // exercise the __DATA segment, the data fixups, and the whole
+    // PortableAsm lowering end-to-end, and must encode validly. The go-live
+    // (M7) routes the mutator through gc_alloc and adds roots/barriers.
     emitter.emit_gc_runtime(&gc);
 
     emitter.asm.finish();
