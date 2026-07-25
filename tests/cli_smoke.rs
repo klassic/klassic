@@ -22637,6 +22637,81 @@ fn build_target_aarch64_apple_darwin_binary_runs() {
     );
 }
 
+/// `std.json` on Apple Silicon: parsing and rendering a document through the
+/// stdlib module, which is the only stdlib module whose enums this backend
+/// compiles itself -- `Json` describes itself (`JArr(items: List<Json>)`), so
+/// its shape comes from its declaration rather than from each value. Asserted
+/// against the evaluator's own output, on the arm64 runner, because that is the
+/// only place a Mach-O runs.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_json_module_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_json_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_json_{stamp}.bin"));
+    let source = concat!(
+        "import std.json.{parse, stringify}\n",
+        "val text = \"{\\\"name\\\": \\\"klassic\\\", \\\"tags\\\": [\\\"compiler\\\"], \\\"stars\\\": 230, \\\"ok\\\": true}\"\n",
+        "parse(text) match {\n",
+        "  case Ok(json) => {\n",
+        "    println(\"parsed\")\n",
+        "    println(stringify(json))\n",
+        "  }\n",
+        "  case Err(message) => println(\"failed: \" + message)\n",
+        "}\n",
+        "parse(\"[1, 2\") match {\n",
+        "  case Ok(json) => println(\"unexpected\")\n",
+        "  case Err(message) => println(message)\n",
+        "}\n",
+    );
+    fs::write(&source_path, source).expect("temp source file should write");
+    let expected = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("evaluator should run");
+    assert!(
+        expected.status.success(),
+        "the evaluator should run this program\nstderr:\n{}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    let build_output = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build_output.status.success(),
+        "darwin native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let run_output = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run_output.status.success(),
+        "Mach-O exited with {:?}\nstderr:\n{}",
+        run_output.status,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&expected.stdout),
+        "native JSON output should match the evaluator's"
+    );
+}
+
 /// Annotated top-level functions on the direct aarch64 backend:
 /// AAPCS64 calls, deep recursion, mutual recursion with forward
 /// references, multi-argument calls — asserted against the

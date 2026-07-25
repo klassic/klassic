@@ -1244,6 +1244,9 @@ enum ListElem {
     Int,
     Bool,
     Str,
+    /// An element that is one of this backend's own enums, which is a pointer
+    /// like a string is -- `JArr(items: List<Json>)` is a list of them.
+    Enum(u32),
     /// An element that is itself a list: `depth` levels of list over `base`.
     /// `List<List<Int>>`'s element is `Nested { depth: 1, base: Int }` and
     /// `List<List<List<Int>>>`'s is `depth: 2`.
@@ -1285,7 +1288,7 @@ impl ListElem {
             ListElem::Int => Some(ScalarElem::Int),
             ListElem::Bool => Some(ScalarElem::Bool),
             ListElem::Str => Some(ScalarElem::Str),
-            ListElem::Nested { .. } => None,
+            ListElem::Enum(_) | ListElem::Nested { .. } => None,
         }
     }
 
@@ -1458,6 +1461,7 @@ fn elem_value_type(elem: ListElem) -> ValueType {
         ListElem::Double => ValueType::Double,
         ListElem::Bool => ValueType::Bool,
         ListElem::Str => ValueType::Str,
+        ListElem::Enum(shape) => ValueType::Enum(shape),
         ListElem::Nested { .. } => ValueType::List(
             elem.nested_inner()
                 .expect("a nested element is a list of its inner element"),
@@ -1527,6 +1531,7 @@ fn list_elem_of(ty: ValueType) -> Option<ListElem> {
         ValueType::Double => Some(ListElem::Double),
         ValueType::Bool => Some(ListElem::Bool),
         ValueType::Str => Some(ListElem::Str),
+        ValueType::Enum(shape) => Some(ListElem::Enum(shape)),
         // A list of lists: one more level over whatever the inner list holds.
         ValueType::List(inner) => Some(match inner.as_scalar() {
             Some(base) => ListElem::Nested { depth: 1, base },
@@ -1683,6 +1688,14 @@ struct Emitter {
     /// declaration order, each with how many fields it carries. The order is
     /// the tag, so it has to be the declaration's.
     generic_enums: Vec<(String, Vec<(String, usize)>)>,
+    /// Whether each enum has type parameters, i.e. whether its payloads vary
+    /// per value rather than being fixed by the declaration.
+    enum_is_generic: Vec<bool>,
+    /// Payload annotations per enum, per variant, as written -- what a
+    /// canonical shape is built from.
+    enum_annotations: Vec<Vec<Vec<String>>>,
+    /// The canonical shape of each enum that has one (no type parameters).
+    canonical_enum_shapes: Vec<Option<u32>>,
     /// Interned shapes: the enum's index in `generic_enums`, and what each
     /// variant carries here. `Never` means "not known from this value", which
     /// is what a nullary constructor says about the other variants' payloads.
@@ -1727,6 +1740,30 @@ impl Emitter {
             .position(|record| record.usable && !record.name.is_empty() && record.name == bare)
         {
             return Ok(ValueType::Record(index as u32));
+        }
+        // An enum this backend compiles itself, named by its declaration.
+        if let Some(enum_index) = self
+            .generic_enums
+            .iter()
+            .position(|(declared, _)| declared == bare)
+            && !self.enum_is_generic[enum_index]
+            && let Some(shape) = self.canonical_enum_shape(enum_index, span)
+        {
+            return Ok(ValueType::Enum(shape));
+        }
+        // `List<X>` / `Set<X>` over anything nameable, not just the three
+        // spellings written out below.
+        if let Some((head, arguments)) = split_type_arguments(trimmed)
+            && arguments.len() == 1
+            && (head == "List" || head == "Set")
+            && let Ok(inner) = self.annotation_type(&arguments[0], span)
+            && let Some(elem) = list_elem_of(inner)
+        {
+            return Ok(if head == "List" {
+                ValueType::List(elem)
+            } else {
+                ValueType::Set(elem)
+            });
         }
         if bare == "Point" {
             let point = self.instantiate_builtin_point();
@@ -1801,6 +1838,45 @@ impl Emitter {
         Ok(ValueType::Record((self.records.len() - 1) as u32))
     }
 
+    /// The canonical shape of an enum with no type parameters, whose payloads
+    /// come from its declaration rather than from each value.
+    ///
+    /// A recursive enum needs this: `JArr(items: List<Json>)` describes itself,
+    /// so shapes taken per value would grow one level deeper on every merge and
+    /// never settle. With no type parameters there is nothing to vary anyway --
+    /// the declaration says everything -- so the shape is allocated first,
+    /// empty, and then filled in, which lets a payload name the enum it is
+    /// part of.
+    fn canonical_enum_shape(&mut self, enum_index: usize, span: Span) -> Option<u32> {
+        if let Some(shape) = self.canonical_enum_shapes[enum_index] {
+            return Some(shape);
+        }
+        let variants = self.generic_enums[enum_index].1.clone();
+        let empty: Vec<Vec<ValueType>> = variants.iter().map(|_| Vec::new()).collect();
+        self.enum_shapes.push((enum_index, empty));
+        let shape = (self.enum_shapes.len() - 1) as u32;
+        self.canonical_enum_shapes[enum_index] = Some(shape);
+        let annotations = self.enum_annotations[enum_index].clone();
+        let mut payloads = Vec::with_capacity(variants.len());
+        for fields in &annotations {
+            let mut typed = Vec::with_capacity(fields.len());
+            for annotation in fields {
+                match self.annotation_type(annotation, span) {
+                    Ok(ty) => typed.push(ty),
+                    Err(_) => {
+                        // A payload this backend cannot name: leave the shape
+                        // unfilled and let the constructor report it.
+                        self.canonical_enum_shapes[enum_index] = None;
+                        return None;
+                    }
+                }
+            }
+            payloads.push(typed);
+        }
+        self.enum_shapes[shape as usize].1 = payloads;
+        Some(shape)
+    }
+
     /// The enum and variant a constructor name belongs to, with the variant's
     /// tag and how many fields it carries.
     fn enum_variant(&self, name: &str) -> Option<(usize, usize, usize)> {
@@ -1847,6 +1923,7 @@ impl Emitter {
         enum_index: usize,
         tag: usize,
         arguments: &[Expr],
+        span: Span,
     ) -> Result<ValueType, Diagnostic> {
         self.asm.mov_imm64(Reg::X0, tag as u64);
         self.emit_box_scalar();
@@ -1864,6 +1941,13 @@ impl Emitter {
             payload.push(ty);
         }
         self.emit_record_object(arguments.len() + 1);
+        // An enum with no type parameters has one shape for every value, taken
+        // from its declaration; only a generic one varies per value.
+        if !self.enum_is_generic[enum_index]
+            && let Some(shape) = self.canonical_enum_shape(enum_index, span)
+        {
+            return Ok(ValueType::Enum(shape));
+        }
         let shape = self.intern_enum_shape(enum_index, tag, payload);
         Ok(ValueType::Enum(shape))
     }
@@ -1965,7 +2049,10 @@ impl Emitter {
             for (left_payload, right_payload) in left_shape.iter().zip(right_shape.iter()) {
                 let mut fields = Vec::with_capacity(left_payload.len());
                 for (left_field, right_field) in left_payload.iter().zip(right_payload.iter()) {
-                    fields.push(merge_branch_types(*left_field, *right_field)?);
+                    // Payloads can be enums themselves -- `Ok(Step(...))` --
+                    // so this recurses. It terminates because a payload's
+                    // shape is always interned before the shape holding it.
+                    fields.push(self.merge_types(*left_field, *right_field)?);
                 }
                 merged.push(fields);
             }
@@ -1982,7 +2069,113 @@ impl Emitter {
         merge_branch_types(left, right)
     }
 
-    /// `o match { case Some(v) => ...; case None => ... }` on a generic enum.
+    /// The bindings a pattern makes, as types: the inference's half of
+    /// `emit_pattern`. Answers false when the pattern cannot match this shape,
+    /// which is how an unreachable arm is skipped rather than typed.
+    fn bind_pattern_types(
+        &mut self,
+        ty: ValueType,
+        pattern: &Pattern,
+        locals: &mut Vec<(String, ValueType)>,
+    ) -> bool {
+        match pattern {
+            Pattern::Wildcard { .. } => true,
+            Pattern::Variable { name, .. } => {
+                locals.push((name.clone(), ty));
+                true
+            }
+            Pattern::Constructor { name, args, .. } => {
+                let ValueType::Enum(shape) = ty else {
+                    return false;
+                };
+                let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
+                let Some((which, tag, arity)) = self.enum_variant(name) else {
+                    return false;
+                };
+                if which != enum_index || arity != args.len() {
+                    return false;
+                }
+                if payloads[tag].contains(&ValueType::Never) && !args.is_empty() {
+                    return false;
+                }
+                for (position, argument) in args.iter().enumerate() {
+                    if !self.bind_pattern_types(payloads[tag][position], argument, locals) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Test one pattern against the value in `slot`, jumping to `next` when it
+    /// does not match, and answer with the slots it bound.
+    ///
+    /// Recursive, because patterns are: `case Ok(Step(value, next))` tests two
+    /// tags and binds from the inner value. Nothing is rooted here -- a test
+    /// that fails jumps out, and a root pushed on the way would never be
+    /// dropped -- so the caller roots the slots once the whole pattern held.
+    /// Between the tests only loads happen, so nothing can move in between.
+    fn emit_pattern(
+        &mut self,
+        slot: u32,
+        ty: ValueType,
+        pattern: &Pattern,
+        next: Label,
+        bound: &mut Vec<(String, u32, ValueType)>,
+        span: Span,
+    ) -> Result<bool, Diagnostic> {
+        match pattern {
+            Pattern::Wildcard { .. } => Ok(true),
+            Pattern::Variable { name, .. } => {
+                bound.push((name.clone(), slot, ty));
+                Ok(true)
+            }
+            Pattern::Constructor { name, args, .. } => {
+                let ValueType::Enum(shape) = ty else {
+                    return Err(unsupported(span, "a constructor pattern on this value"));
+                };
+                let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
+                let Some((which, tag, arity)) = self.enum_variant(name) else {
+                    return Err(unsupported(span, "a pattern of this kind"));
+                };
+                if which != enum_index || arity != args.len() {
+                    return Err(unsupported(span, "a pattern from another enum"));
+                }
+                // A payload this shape never carries means the arm is dead.
+                if payloads[tag].contains(&ValueType::Never) && !args.is_empty() {
+                    return Ok(false);
+                }
+                self.asm.load_local(Reg::X0, slot);
+                self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
+                self.emit_unbox_scalar();
+                self.asm.cmp_imm(Reg::X0, tag as u32);
+                self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
+                for (position, argument) in args.iter().enumerate() {
+                    let field_ty = payloads[tag][position];
+                    if matches!(argument, Pattern::Wildcard { .. }) {
+                        continue;
+                    }
+                    self.asm.load_local(Reg::X0, slot);
+                    self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
+                    if is_boxed_scalar(field_ty) {
+                        self.emit_unbox_scalar();
+                    }
+                    let field_slot = self.reserve_locals(8);
+                    self.asm.store_local(Reg::X0, field_slot);
+                    if !self.emit_pattern(field_slot, field_ty, argument, next, bound, span)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Err(unsupported(span, "a pattern of this kind")),
+        }
+    }
+
+    /// `o match { case Some(v) => ...; case None => ... }` on an enum this
+    /// backend compiles itself.
     ///
     /// The value carries its tag in its first slot, so an arm is a comparison
     /// against that and, when it matches, its fields bound to locals. The
@@ -1994,10 +2187,10 @@ impl Emitter {
         span: Span,
     ) -> Result<ValueType, Diagnostic> {
         let mark = self.open_temp_roots();
-        let ValueType::Enum(shape) = self.expression(scrutinee)? else {
+        let scrutinee_ty = self.expression(scrutinee)?;
+        if !matches!(scrutinee_ty, ValueType::Enum(_)) {
             return Err(unsupported(scrutinee.span(), "matching on this value"));
-        };
-        let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
+        }
         let value = self.reserve_locals(8);
         self.asm.store_local(Reg::X0, value);
         self.emit_root_frame_slot(value);
@@ -2009,67 +2202,37 @@ impl Emitter {
             if arm.guard.is_some() {
                 return Err(unsupported(arm.span, "a match arm with a guard"));
             }
+            if matches!(
+                arm.pattern,
+                Pattern::Wildcard { .. } | Pattern::Variable { .. }
+            ) {
+                exhaustive = true;
+            }
             let next = self.asm.new_label();
-            let bindings: Vec<(String, ValueType)> = match &arm.pattern {
-                Pattern::Constructor { name, args, .. } => {
-                    let Some((which, tag, arity)) = self.enum_variant(name) else {
-                        return Err(unsupported(arm.span, "a pattern of this kind"));
-                    };
-                    if which != enum_index || arity != args.len() {
-                        return Err(unsupported(arm.span, "a pattern from another enum"));
-                    }
-                    // The tag is boxed in the first slot.
-                    self.asm.load_local(Reg::X0, value);
-                    self.emit_gc_load_ptr(Reg::X0, 0);
-                    self.emit_unbox_scalar();
-                    self.asm.cmp_imm(Reg::X0, tag as u32);
-                    self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
-                    let mut bindings = Vec::with_capacity(args.len());
-                    for (position, argument) in args.iter().enumerate() {
-                        let ty = payloads[tag][position];
-                        match argument {
-                            Pattern::Variable { name, .. } => {
-                                bindings.push((name.clone(), ty));
-                            }
-                            Pattern::Wildcard { .. } => {
-                                bindings.push((String::new(), ty));
-                            }
-                            _ => {
-                                return Err(unsupported(arm.span, "a nested pattern"));
-                            }
-                        }
-                    }
-                    bindings
-                }
-                Pattern::Wildcard { .. } | Pattern::Variable { .. } => {
-                    exhaustive = true;
-                    Vec::new()
-                }
-                _ => return Err(unsupported(arm.span, "a pattern of this kind")),
-            };
-            // A payload typed `Never` is one no value of this shape carries,
-            // so this arm cannot be taken: the comparison above is emitted (it
-            // always falls through) and the body is left uncompiled, which is
-            // what lets `None` be matched against a `Some` pattern.
-            if bindings.iter().any(|(_, ty)| *ty == ValueType::Never) {
+            let mut bound = Vec::new();
+            let reachable = self.emit_pattern(
+                value,
+                scrutinee_ty,
+                &arm.pattern,
+                next,
+                &mut bound,
+                arm.span,
+            )?;
+            if !reachable {
+                // An arm the shape says cannot be taken: its comparison stands
+                // (it always falls through) and its body is left uncompiled.
                 self.asm.bind(next);
                 continue;
             }
             self.push_binding_scopes();
             self.scope_root_counts.push(0);
-            for (position, (name, ty)) in bindings.iter().enumerate() {
-                if name.is_empty() {
-                    continue;
-                }
-                self.asm.load_local(Reg::X0, value);
-                self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
-                if is_boxed_scalar(*ty) {
-                    self.emit_unbox_scalar();
-                }
-                let slot = self.declare_local(name, *ty);
-                self.asm.store_local(Reg::X0, slot);
+            for (name, slot, ty) in &bound {
+                self.scopes
+                    .last_mut()
+                    .expect("emitter scope")
+                    .insert(name.clone(), (*slot, *ty));
                 if is_heap_pointer(*ty) {
-                    self.emit_root_frame_slot(slot);
+                    self.emit_root_frame_slot(*slot);
                 }
             }
             let arm_ty = self.expression(&arm.body)?;
@@ -2219,7 +2382,7 @@ impl Emitter {
                 if self.lookup(name).is_none()
                     && let Some((enum_index, tag, 0)) = self.enum_variant(name)
                 {
-                    return self.emit_enum_value(enum_index, tag, &[]);
+                    return self.emit_enum_value(enum_index, tag, &[], *span);
                 }
                 let Some((offset, ty)) = self.lookup(name) else {
                     return Err(unsupported(*span, &format!("identifier `{name}`")));
@@ -2598,7 +2761,7 @@ impl Emitter {
                             ),
                         ));
                     }
-                    return self.emit_enum_value(enum_index, tag, arguments);
+                    return self.emit_enum_value(enum_index, tag, arguments, *span);
                 }
                 // Method-style builtin call `target.method(args)`:
                 // dispatch as `method(target, args)`, the same way the
@@ -2712,7 +2875,7 @@ impl Emitter {
                     self.static_type_under(then_branch, &mut Vec::new(), 0),
                     self.static_type_under(else_branch, &mut Vec::new(), 0),
                 ) {
-                    (Some(then_ty), Some(else_ty)) => merge_branch_types(then_ty, else_ty),
+                    (Some(then_ty), Some(else_ty)) => self.merge_types(then_ty, else_ty),
                     _ => None,
                 };
                 let nullable_join = matches!(predicted, Some(ValueType::Nullable(_)));
@@ -2729,7 +2892,8 @@ impl Emitter {
                     self.emit_box_scalar();
                 }
                 self.asm.bind(end_label);
-                let merged = merge_branch_types(then_ty, else_ty)
+                let merged = self
+                    .merge_types(then_ty, else_ty)
                     .ok_or_else(|| unsupported(*span, "if branches with different types"))?;
                 // The prediction has to have been right about the boxing, or
                 // the value and its type disagree: a nullable holding an
@@ -5244,6 +5408,11 @@ impl Emitter {
             ListElem::Double => {
                 return Err(unsupported(span, "printing a Double element"));
             }
+            // An enum element would need this backend to know how the
+            // evaluator renders that enum, which it does not.
+            ListElem::Enum(_) => {
+                return Err(unsupported(span, "printing an enum element"));
+            }
             // A nested element is a list: build its text with the same
             // renderer and write that. The recursion is at codegen time and
             // terminates because the depth decreases.
@@ -6402,6 +6571,9 @@ impl Emitter {
             ListElem::Int => self.emit_int_to_str(),
             ListElem::Bool => self.emit_bool_to_str(),
             ListElem::Str => {}
+            ListElem::Enum(_) => {
+                return Err(unsupported(span, "rendering an enum element"));
+            }
             // Same renderer one level down; the element pointer is already in
             // x0, and the result replaces it.
             ListElem::Nested { .. } => {
@@ -6750,7 +6922,7 @@ impl Emitter {
         // `if` merge below is what still gets a useful answer out of a
         // recursive function: the branch that bottoms out types, and the one
         // that recurses contributes nothing.
-        if depth > 6 {
+        if depth > 40 {
             return None;
         }
         match expr {
@@ -6809,28 +6981,18 @@ impl Emitter {
                 else {
                     return None;
                 };
-                let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
                 let mut result: Option<ValueType> = None;
                 for arm in arms {
                     if arm.guard.is_some() {
                         return None;
                     }
                     let mark = locals.len();
-                    if let Pattern::Constructor { name, args, .. } = &arm.pattern {
-                        let (which, tag, _) = self.enum_variant(name)?;
-                        if which != enum_index {
-                            return None;
-                        }
-                        // An arm the shape says is unreachable contributes
-                        // nothing, exactly as in the emitter.
-                        if payloads[tag].contains(&ValueType::Never) {
-                            continue;
-                        }
-                        for (position, argument) in args.iter().enumerate() {
-                            if let Pattern::Variable { name, .. } = argument {
-                                locals.push((name.clone(), payloads[tag][position]));
-                            }
-                        }
+                    // Patterns nest, so the bindings are collected the way the
+                    // emitter collects them; an arm the shape says cannot be
+                    // taken contributes nothing, exactly as there.
+                    if !self.bind_pattern_types(ValueType::Enum(shape), &arm.pattern, locals) {
+                        locals.truncate(mark);
+                        continue;
                     }
                     let arm_ty = self.static_type_under(&arm.body, locals, depth + 1);
                     locals.truncate(mark);
@@ -6854,7 +7016,7 @@ impl Emitter {
                 match (then_ty, else_ty) {
                     // Merged, so `if (done) [] else cons(x)(rest)` is a list
                     // of x rather than the empty list the first branch shows.
-                    (Some(then_ty), Some(else_ty)) => merge_branch_types(then_ty, else_ty),
+                    (Some(then_ty), Some(else_ty)) => self.merge_types(then_ty, else_ty),
                     // A branch whose type is unknown -- the recursive one --
                     // does not veto the branch that is known.
                     (known, None) | (None, known) => known,
@@ -6934,7 +7096,7 @@ impl Emitter {
                             let folded = self.static_type_under(body, locals, depth + 1);
                             locals.pop();
                             locals.pop();
-                            let Some(merged) = folded.and_then(|f| merge_branch_types(acc_ty, f))
+                            let Some(merged) = folded.and_then(|f| self.merge_types(acc_ty, f))
                             else {
                                 break;
                             };
@@ -7161,6 +7323,11 @@ impl Emitter {
                     for argument in arguments {
                         payload.push(self.static_type_under(argument, locals, depth + 1)?);
                     }
+                    if !self.enum_is_generic[enum_index]
+                        && let Some(shape) = self.canonical_enum_shape(enum_index, expr.span())
+                    {
+                        return Some(ValueType::Enum(shape));
+                    }
                     let shape = self.intern_enum_shape(enum_index, tag, payload);
                     return Some(ValueType::Enum(shape));
                 }
@@ -7357,12 +7524,15 @@ impl Emitter {
                 self.lambda_bindings.pop();
                 self.dict_bindings.pop();
                 self.alias_bindings.pop();
-                let Some(ret) = inferred else {
-                    return Err(unsupported(
-                        span,
-                        &format!("a call to `{name}`, whose result type cannot be determined"),
-                    ));
-                };
+                // No answer yet is not the same as no answer: a body that calls
+                // *another* function which calls back into this one cannot be
+                // typed until this specialisation exists to be found. So it is
+                // registered with a provisional `Never` -- which merges with
+                // anything, so a recursive call contributes nothing rather than
+                // poisoning the merge -- and the fixpoint below settles it. If
+                // it is still `Never` afterwards, the call really cannot be
+                // typed and that is reported there.
+                let ret = inferred.unwrap_or(ValueType::Never);
                 let label = self.asm.new_label();
                 // Registered *before* its body is emitted, so a recursive
                 // call inside the body finds this specialisation instead of
@@ -7391,7 +7561,7 @@ impl Emitter {
             // registered the recursion resolves, so take the fixpoint and
             // correct the registration -- before the body is compiled, since
             // the body is checked against it.
-            for _ in 0..3 {
+            for _ in 0..8 {
                 let (params, body, current) = {
                     let info = &self.functions[index].1;
                     (info.params.clone(), info.body.clone(), info.ret)
@@ -7431,6 +7601,12 @@ impl Emitter {
             let info = &self.functions[index].1;
             (info.label, info.ret)
         };
+        if ret == ValueType::Never {
+            return Err(unsupported(
+                span,
+                &format!("a call to `{name}`, whose result type cannot be determined"),
+            ));
+        }
         for (position, register) in ARG_REGS.iter().take(argument_types.len()).enumerate().rev() {
             if rooted[position] {
                 self.pop_rooted(*register);
@@ -7502,7 +7678,7 @@ impl Emitter {
             let Some(folded) = self.static_type_under(body, &mut locals, 0) else {
                 break;
             };
-            let Some(merged) = merge_branch_types(acc_ty, folded) else {
+            let Some(merged) = self.merge_types(acc_ty, folded) else {
                 break;
             };
             if merged == acc_ty {
@@ -8038,7 +8214,12 @@ impl Emitter {
         self.asm.patch_sub_sp(frame_patch, frame_size);
         self.next_local_offset = saved_offset;
         self.max_local_offset = saved_max;
-        if !assignable(body_ty, ret) {
+        // A body narrower than the registered return type is fine: two shapes
+        // of one enum have the same representation, and the wider one is what
+        // callers were told. Merging is how "narrower" is decided, since what a
+        // shape knows lives in a table here.
+        let fits = assignable(body_ty, ret) || self.merge_types(body_ty, ret) == Some(ret);
+        if !fits {
             return Err(unsupported(
                 body.span(),
                 "a function body of a different type than its return annotation",
@@ -8159,7 +8340,7 @@ impl Emitter {
                         self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
                         self.asm.bind(bool_end);
                     }
-                    ListElem::Double | ListElem::Nested { .. } => {
+                    ListElem::Double | ListElem::Enum(_) | ListElem::Nested { .. } => {
                         return Err(unsupported(
                             argument.span(),
                             &format!("printing a nullable {elem:?}"),
@@ -8459,13 +8640,15 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
     // are still here: remember the variants in order, since that order is the
     // tag every value carries.
     for expression in expressions {
+        // Every declaration that is still here is one the shared pass did not
+        // lower -- a generic enum, or one whose payload names an applied type
+        // like `List<Json>`. Either way this backend compiles it itself.
         if let Expr::EnumDeclaration {
             name,
             type_params,
             variants,
             ..
         } = expression
-            && !type_params.is_empty()
         {
             emitter.generic_enums.push((
                 name.clone(),
@@ -8474,6 +8657,21 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
                     .map(|variant| (variant.name.clone(), variant.params.len()))
                     .collect(),
             ));
+            emitter.enum_annotations.push(
+                variants
+                    .iter()
+                    .map(|variant| {
+                        variant
+                            .params
+                            .iter()
+                            .map(|(_, annotation)| annotation.text.clone())
+                            .collect()
+                    })
+                    .collect(),
+            );
+            // Only an enum with no parameters has one shape for every value.
+            emitter.canonical_enum_shapes.push(None);
+            emitter.enum_is_generic.push(!type_params.is_empty());
         }
     }
     // Pass 2: field types; undecodable declarations are marked
