@@ -1338,9 +1338,7 @@ fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueTyp
         (ValueType::Never, other) | (other, ValueType::Never) => Some(other),
         // `null` joined with a value. The value's branch boxes it on the way
         // out (see the `if` codegen), so the join is one word either way.
-        (ValueType::Null, other) | (other, ValueType::Null)
-            if nullable_elem(other).is_some() =>
-        {
+        (ValueType::Null, other) | (other, ValueType::Null) if nullable_elem(other).is_some() => {
             nullable_elem(other).map(ValueType::Nullable)
         }
         (ValueType::Nullable(elem), other) | (other, ValueType::Nullable(elem))
@@ -2053,8 +2051,10 @@ impl Emitter {
                 // compiled, which is what the inference is for; when it cannot
                 // tell, nothing is boxed and the merge below reports the
                 // mismatch instead of miscompiling it.
-                if joins_as_nullable(then_ty, self.static_type_under(else_branch, &mut Vec::new(), 0))
-                {
+                if joins_as_nullable(
+                    then_ty,
+                    self.static_type_under(else_branch, &mut Vec::new(), 0),
+                ) {
                     self.emit_box_scalar();
                 }
                 self.asm.branch(end_label, BranchKind::Unconditional);
