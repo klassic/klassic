@@ -4443,6 +4443,19 @@ impl Emitter {
                 self.emit_substring();
                 Ok(Some(ValueType::Str))
             }
+            ("matches", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "matches on a non-string"));
+                }
+                self.push_rooted(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "matches with a non-string pattern"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.pop_rooted(Reg::X0);
+                self.emit_str_matches();
+                Ok(Some(ValueType::Bool))
+            }
             ("startsWith", 2) => {
                 if self.expression(&arguments[0])? != ValueType::Str {
                     return Err(unsupported(span, "startsWith of a non-string"));
@@ -5107,6 +5120,116 @@ impl Emitter {
         self.asm.load_local(Reg::X0, acc);
         self.emit_str_concat();
         Ok(())
+    }
+
+    /// Is every byte of the string in x0 an ASCII digit? x0 becomes the Bool.
+    /// An empty string answers false, which is what both digit patterns want.
+    fn emit_str_all_digits(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8); // bytes
+        let loop_start = self.asm.new_label();
+        let no = self.asm.new_label();
+        let yes = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.branch(no, BranchKind::CompareZero(Reg::X2));
+        self.asm.bind(loop_start);
+        self.asm.branch(yes, BranchKind::CompareZero(Reg::X2));
+        self.asm.ldrb_post_increment(Reg::X4, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm.branch(no, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'9'));
+        self.asm.branch(no, BranchKind::Conditional(Cond::Gt));
+        self.asm.sub_reg_imm(Reg::X2, Reg::X2, 1);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(yes);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(no);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
+    }
+
+    /// `matches(input, pattern)`: the language's deliberately tiny regex --
+    /// `.*` matches anything, `[0-9]+` a non-empty run of digits, `[0-9]` a
+    /// single digit, and any other pattern is a literal to compare against.
+    ///
+    /// Decided at run time by comparing the pattern string, where the x86-64
+    /// backend folds it at compile time from a static string; doing it this way
+    /// costs three string comparisons and works for a pattern that is not a
+    /// literal.
+    fn emit_str_matches(&mut self) {
+        // x0 = input, x1 = pattern. Both are parked as roots: building each
+        // literal below allocates.
+        self.push_rooted(Reg::X0); // input, at [sp + 16] after the next push
+        self.push_rooted(Reg::X1); // pattern, at [sp]
+        let matched = self.asm.new_label();
+        let unmatched = self.asm.new_label();
+        let done = self.asm.new_label();
+        let literal = self.asm.new_label();
+        let digits_plus = self.asm.new_label();
+        let single_digit = self.asm.new_label();
+
+        // Each test compares the pattern against one of the three forms.
+        for (text, target) in [
+            (".*", matched),
+            ("[0-9]+", digits_plus),
+            ("[0-9]", single_digit),
+        ] {
+            self.asm.add_reg_sp_imm(Reg::X3, 0);
+            self.asm.ldr_imm(Reg::X0, Reg::X3, 0); // the pattern
+            let offset = self.asm.intern_string_object(text);
+            self.asm.load_rodata_address(Reg::X1, offset);
+            self.asm.push(Reg::X0);
+            self.asm.mov_reg(Reg::X0, Reg::X1);
+            self.emit_heap_string_copy(); // the literal, as a heap string
+            self.asm.mov_reg(Reg::X1, Reg::X0);
+            self.asm.pop(Reg::X0);
+            self.emit_str_eq();
+            self.asm.branch(target, BranchKind::CompareNonZero(Reg::X0));
+        }
+        self.asm.branch(literal, BranchKind::Unconditional);
+
+        // `[0-9]+`: a non-empty run of digits.
+        self.asm.bind(digits_plus);
+        self.asm.add_reg_sp_imm(Reg::X3, 16);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0); // the input
+        self.emit_str_all_digits();
+        self.asm
+            .branch(matched, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.branch(unmatched, BranchKind::Unconditional);
+
+        // `[0-9]`: exactly one digit.
+        self.asm.bind(single_digit);
+        self.asm.add_reg_sp_imm(Reg::X3, 16);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+        self.asm.cmp_imm(Reg::X2, 1);
+        self.asm
+            .branch(unmatched, BranchKind::Conditional(Cond::Ne));
+        self.emit_str_all_digits();
+        self.asm
+            .branch(matched, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.branch(unmatched, BranchKind::Unconditional);
+
+        // Anything else is a literal to equal.
+        self.asm.bind(literal);
+        self.asm.add_reg_sp_imm(Reg::X3, 16);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0); // the input
+        self.asm.add_reg_sp_imm(Reg::X3, 0);
+        self.asm.ldr_imm(Reg::X1, Reg::X3, 0); // the pattern
+        self.emit_str_eq();
+        self.asm
+            .branch(matched, BranchKind::CompareNonZero(Reg::X0));
+
+        self.asm.bind(unmatched);
+        self.asm.mov_imm64(Reg::X2, 0);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(matched);
+        self.asm.mov_imm64(Reg::X2, 1);
+        self.asm.bind(done);
+        self.pop_rooted(Reg::X1);
+        self.pop_rooted(Reg::X0);
+        self.asm.mov_reg(Reg::X0, Reg::X2);
     }
 
     /// Content equality for two cons chains: x0 and x1 are the heads, x0
