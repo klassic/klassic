@@ -705,7 +705,11 @@ impl Assembler {
         self.word(0x9e78_0000 | (dn << 5) | x as u32);
     }
 
-    /// `frintm dd, dn` — round toward minus infinity (floor).
+    /// `frintm dd, dn` — round toward minus infinity. Unused: this language's
+    /// `floor` truncates toward zero (see the `floor` builtin), so `fcvtzs`
+    /// alone is the whole operation. Kept because it is the natural companion
+    /// to `frintp` and the next rounding builtin will want it.
+    #[allow(dead_code)]
     fn frintm_d(&mut self, dd: u32, dn: u32) {
         self.word(0x1e65_4000 | (dn << 5) | dd);
     }
@@ -4456,6 +4460,18 @@ impl Emitter {
                 self.emit_substring();
                 Ok(Some(ValueType::Str))
             }
+            ("assert", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Bool {
+                    return Err(unsupported(span, "assert of a non-Bool"));
+                }
+                let ok = self.asm.new_label();
+                self.asm.branch(ok, BranchKind::CompareNonZero(Reg::X0));
+                self.asm
+                    .emit_write_rodata(STDERR_FD, b"klassic: assertion failed\n");
+                self.asm.emit_exit(1);
+                self.asm.bind(ok);
+                Ok(Some(ValueType::Unit))
+            }
             ("matches", 2) => {
                 if self.expression(&arguments[0])? != ValueType::Str {
                     return Err(unsupported(span, "matches on a non-string"));
@@ -4761,18 +4777,22 @@ impl Emitter {
                     _ => Err(unsupported(span, "sqrt of this type")),
                 }
             }
-            ("floor", 1) | ("ceil", 1) => {
+            // `int` and `floor` are the same builtin in this language and
+            // both *truncate toward zero* -- `floor(-4.7)` is -4, not -5 --
+            // which is exactly what `fcvtzs` does on its own. `ceil` is a true
+            // ceiling, so it rounds up first. Both are Int-valued.
+            ("floor", 1) | ("int", 1) | ("ceil", 1) => {
                 let ty = self.expression(&arguments[0])?;
-                if ty != ValueType::Double {
-                    return Err(unsupported(span, &format!("{name} of a non-Double")));
+                match ty {
+                    ValueType::Double => {}
+                    // An integer is already the answer.
+                    ValueType::Int => return Ok(Some(ValueType::Int)),
+                    _ => return Err(unsupported(span, &format!("{name} of this type"))),
                 }
                 self.asm.fmov_d_from_x(0, Reg::X0);
-                if name == "floor" {
-                    self.asm.frintm_d(0, 0);
-                } else {
+                if name == "ceil" {
                     self.asm.frintp_d(0, 0);
                 }
-                // The evaluator's floor/ceil are Int-valued.
                 self.asm.fcvtzs_x_from_d(Reg::X0, 0);
                 Ok(Some(ValueType::Int))
             }
