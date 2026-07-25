@@ -1,0 +1,36 @@
+// Cross-target fixture: a def whose body is a chain of lambdas, applied all the
+// way down and recursing through itself.
+//
+// `myFoldLeft(list)(z)(f)` cannot be compiled by inlining one lambda at a time:
+// the recursion would have to be unrolled, and how many times is a run-time
+// answer. So the curried levels are parameters like any other and the whole
+// chain is one call -- and the accumulator type has to settle, since starting
+// from `[]` looks like it returns the empty list until the recursion says
+// otherwise.
+
+def myFoldLeft(list) = (z) => (f) => {
+  if(isEmpty(list)) z else myFoldLeft(tail(list))(f(z, head(list)))(f)
+}
+
+println(myFoldLeft([1, 2, 3, 4])(0)((x, y) => x + y))
+println(myFoldLeft(["A", "B", "C"])("")((x, y) => x + y))
+println(myFoldLeft([1, 2, 3, 4])([])((x, y) => y #cons x))
+assertResult(10)(myFoldLeft([1, 2, 3, 4])(0)((x, y) => x + y))
+assertResult("ABC")(myFoldLeft(["A", "B", "C"])("")((x, y) => x + y))
+assertResult([4, 3, 2, 1])(myFoldLeft([1, 2, 3, 4])([])((x, y) => y #cons x))
+
+// The braced spelling of the trailing function, and the result bound rather
+// than asserted straight away.
+val sum = myFoldLeft([1, 2, 3, 4, 5])(0){x, y => x + y}
+println(sum)
+assertResult(15)(sum)
+assertResult([4, 3, 2, 1])(myFoldLeft([1, 2, 3, 4])([]){x, y => y #cons x})
+
+// Two levels rather than three, and a level that takes two parameters.
+def add(x) = (y) => x + y
+println(add(3)(4))
+assertResult(7)(add(3)(4))
+def between(low) = (high, step) => low + high + step
+println(between(1)(2, 3))
+assertResult(6)(between(1)(2, 3))
+println("done")

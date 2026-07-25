@@ -1466,6 +1466,14 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 }
 
 /// The element type a value of type `ty` can be a list element of.
+/// A lambda written as the only thing in a block is that lambda.
+fn peel_block(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Block { expressions, .. } if expressions.len() == 1 => peel_block(&expressions[0]),
+        other => other,
+    }
+}
+
 /// `Name<A, B>` split into its head and its arguments, if it is written that
 /// way. Nesting is respected, so `Pair<List<Int>, Int>` gives two arguments.
 fn split_type_arguments(text: &str) -> Option<(&str, Vec<String>)> {
@@ -1854,6 +1862,85 @@ impl Emitter {
         self.emit_record_object(arguments.len() + 1);
         let shape = self.intern_enum_shape(enum_index, tag, payload);
         Ok(ValueType::Enum(shape))
+    }
+
+    /// `f(a)(b)(c)` where `f` is a def whose body is `(b) => (c) => ...`.
+    ///
+    /// The curried levels are parameters like any other, so the whole chain is
+    /// compiled as one call taking all of them. That is what lets such a def
+    /// *recurse*: inlining the lambdas one level at a time would have to unroll
+    /// the recursion, and how many times is a run-time answer.
+    ///
+    /// Answers `None` when the shape does not fit, so the ordinary paths run.
+    fn curried_generic_call(
+        &mut self,
+        callee: &Expr,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Option<Result<ValueType, Diagnostic>> {
+        let mut spine: Vec<&[Expr]> = vec![arguments];
+        let mut head = callee;
+        while let Expr::Call {
+            callee, arguments, ..
+        } = head
+        {
+            spine.push(arguments);
+            head = callee;
+        }
+        if spine.len() < 2 {
+            return None;
+        }
+        spine.reverse();
+        let Expr::Identifier { name, .. } = head else {
+            return None;
+        };
+        let generic = self
+            .generic_functions
+            .iter()
+            .rposition(|generic| generic.name == *name && generic.params.len() == spine[0].len())?;
+        // Peel one lambda per applied level, collecting their parameters.
+        let mut params = self.generic_functions[generic].params.clone();
+        let mut body = self.generic_functions[generic].body.clone();
+        for group in &spine[1..] {
+            let Expr::Lambda {
+                params: level,
+                body: inner,
+                ..
+            } = peel_block(&body)
+            else {
+                return None;
+            };
+            if level.len() != group.len() {
+                return None;
+            }
+            params.extend(level.iter().cloned());
+            body = (**inner).clone();
+        }
+        let flattened: Vec<Expr> = spine
+            .iter()
+            .flat_map(|group| group.iter().cloned())
+            .collect();
+        let curried = format!("{name}#curried{}", params.len());
+        let index = match self
+            .generic_functions
+            .iter()
+            .position(|generic| generic.name == curried && generic.params.len() == params.len())
+        {
+            Some(index) => index,
+            None => {
+                let annotations = vec![None; params.len()];
+                self.generic_functions.push(GenericFunction {
+                    name: curried,
+                    params,
+                    body,
+                    declared_return: None,
+                    param_annotations: annotations,
+                    return_annotation: None,
+                });
+                self.generic_functions.len() - 1
+            }
+        };
+        Some(self.emit_generic_function_call(index, &flattened, span))
     }
 
     /// Merge two branch types, including two shapes of the same enum -- which
@@ -2546,6 +2633,11 @@ impl Emitter {
                         return Ok(ty);
                     }
                     return Err(unsupported(*span, &format!("method `{field}`")));
+                }
+                // `myFoldLeft(list)(z)(f)`: a def whose body is a chain of
+                // lambdas, applied all the way down.
+                if let Some(result) = self.curried_generic_call(callee, arguments, *span) {
+                    return result;
                 }
                 // An immediately applied lambda literal, `((x) => x + 1)(3)`.
                 if let Expr::Lambda { params, body, .. } = callee.as_ref() {
@@ -6857,6 +6949,62 @@ impl Emitter {
                 {
                     return self.mapped_list_type(&list_args[0], &arguments[0], locals, depth);
                 }
+                // A curried call `f(a)(b)(c)`: the emitter compiles it as one
+                // call to a flattened function, so predict that -- which is
+                // what types such a function's *recursion*, and so what its
+                // result widens to.
+                if let Expr::Call { .. } = callee.as_ref() {
+                    let mut spine: Vec<&[Expr]> = vec![arguments];
+                    let mut head = callee.as_ref();
+                    while let Expr::Call {
+                        callee, arguments, ..
+                    } = head
+                    {
+                        spine.push(arguments);
+                        head = callee;
+                    }
+                    spine.reverse();
+                    if let Expr::Identifier { name, .. } = head {
+                        let flattened: Vec<Expr> = spine
+                            .iter()
+                            .flat_map(|group| group.iter().cloned())
+                            .collect();
+                        let curried = format!("{name}#curried{}", flattened.len());
+                        if let Some(generic) = self.generic_functions.iter().rposition(|generic| {
+                            generic.name == curried && generic.params.len() == flattened.len()
+                        }) {
+                            let (params, body) = {
+                                let generic = &self.generic_functions[generic];
+                                (generic.params.clone(), generic.body.clone())
+                            };
+                            let mark = locals.len();
+                            self.lambda_bindings.push(HashMap::new());
+                            for (param, argument) in params.iter().zip(flattened.iter()) {
+                                // A function argument is bound as one; anything
+                                // else contributes its type.
+                                if let Some((lambda_params, lambda_body)) =
+                                    self.lambda_argument(argument)
+                                {
+                                    let lambda = self.intern_lambda(lambda_params, lambda_body);
+                                    self.lambda_bindings
+                                        .last_mut()
+                                        .expect("emitter lambda scope")
+                                        .insert(param.clone(), lambda);
+                                    continue;
+                                }
+                                if let Some(ty) =
+                                    self.static_type_under(argument, locals, depth + 1)
+                                {
+                                    locals.push((param.clone(), ty));
+                                }
+                            }
+                            let predicted = self.static_type_under(&body, locals, depth + 1);
+                            self.lambda_bindings.pop();
+                            locals.truncate(mark);
+                            return predicted;
+                        }
+                    }
+                }
                 // Method-style `target.m(args)`: the emitter dispatches it as
                 // `m(target, args)`, so predict that call instead. This is what
                 // types an instance method whose body is `xs.map(f)`.
@@ -7144,6 +7292,7 @@ impl Emitter {
             }
         }
         let key = (generic, key_types);
+        let fresh = !self.specializations.contains_key(&key);
         let index = match self.specializations.get(&key) {
             Some(&index) => index,
             None => {
@@ -7210,6 +7359,50 @@ impl Emitter {
                 index
             }
         };
+        if fresh {
+            // The first guess at the return type came from a body in which the
+            // recursive call had nothing to resolve to yet, so it is the base
+            // case's answer alone: `myFoldLeft` starting from `[]` looked like
+            // it returned the empty list. Now that the specialisation is
+            // registered the recursion resolves, so take the fixpoint and
+            // correct the registration -- before the body is compiled, since
+            // the body is checked against it.
+            for _ in 0..3 {
+                let (params, body, current) = {
+                    let info = &self.functions[index].1;
+                    (info.params.clone(), info.body.clone(), info.ret)
+                };
+                let mut locals: Vec<(String, ValueType)> = params
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), *ty))
+                    .collect();
+                self.push_binding_scopes();
+                for (param, lambda) in &lambda_params {
+                    self.lambda_bindings
+                        .last_mut()
+                        .expect("emitter lambda scope")
+                        .insert(param.clone(), *lambda);
+                }
+                for (param, fields) in &dict_params {
+                    self.dict_bindings
+                        .last_mut()
+                        .expect("emitter dict scope")
+                        .insert(param.clone(), fields.clone());
+                }
+                let predicted = self.static_type_under(&body, &mut locals, 0);
+                self.pop_binding_scopes();
+                let Some(predicted) = predicted else {
+                    break;
+                };
+                let Some(merged) = self.merge_types(current, predicted) else {
+                    break;
+                };
+                if merged == current {
+                    break;
+                }
+                self.functions[index].1.ret = merged;
+            }
+        }
         let (label, ret) = {
             let info = &self.functions[index].1;
             (info.label, info.ret)
