@@ -75,7 +75,6 @@ const STDERR_FD: u64 = 2;
 /// One bump-allocator segment. Exhaustion mmaps a fresh segment (the
 /// old one leaks until the backend grows a collector — same place the
 /// x86_64 backend started).
-const HEAP_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Darwin MAP_ANON | MAP_PRIVATE.
 const MMAP_ANON_PRIVATE: u64 = 0x1002;
 const PROT_READ_WRITE: u64 = 3;
@@ -101,11 +100,12 @@ enum Reg {
     X12 = 12,
     /// Darwin syscall number register.
     X16 = 16,
-    /// Callee-saved: bump-allocator next pointer. The generated code
-    /// never spills it, which is exactly why a heap exists without a
-    /// writable data segment.
+    /// Reserved (formerly the bump allocator's next/end pointers, which
+    /// the garbage collector's `gc_alloc` and its `__DATA` cells replaced).
+    #[allow(dead_code)]
     X19 = 19,
-    /// Callee-saved: bump-allocator end pointer.
+    /// Reserved; see `X19`.
+    #[allow(dead_code)]
     X20 = 20,
     /// Callee-saved: `argc`, captured from dyld's `LC_MAIN` entry.
     X21 = 21,
@@ -1294,9 +1294,6 @@ struct Emitter {
     /// Nominal record declarations plus interned structural shapes;
     /// `ValueType::Record` carries an index into this table.
     records: Vec<RecordInfo>,
-    /// Lazily created label of the shared heap-segment mmap routine;
-    /// emitted at the end only when some allocation referenced it.
-    heap_grow_label: Option<Label>,
     /// Lazily emitted set helpers (called via `bl`): scalar / string
     /// membership scans and a cons-list reverse.
     member_scalar_label: Option<Label>,
@@ -1313,6 +1310,14 @@ struct Emitter {
     /// Labels of the two tiny shadow-stack helpers, emitted on demand.
     shadow_push_label: Option<Label>,
     shadow_pop_label: Option<Label>,
+    /// Label of `gc_alloc`, shared between the mutator's allocation sites
+    /// and the GC runtime that defines it.
+    gc_alloc_label: Option<Label>,
+    /// `--gc-stress` / `--gc-poison`, threaded in from the CLI. (`--gc-log`
+    /// is only needed at the one site that emits the exit report, so it
+    /// stays a parameter of `emit_macho_program`.)
+    gc_stress: bool,
+    gc_poison: bool,
     /// Number of shadow-stack roots pushed in each open scope, so leaving
     /// a scope pops exactly its own.
     scope_root_counts: Vec<usize>,
@@ -2205,51 +2210,66 @@ impl Emitter {
         }
     }
 
-    /// Bump-allocate `x4` bytes (already 8-aligned): result pointer in
-    /// x5, x19 advanced. Calls the shared mmap routine when the
-    /// current segment is too small; that routine preserves x0-x5.
-    fn emit_alloc(&mut self) {
-        let fits = self.asm.new_label();
-        self.asm.sub_reg(Reg::X6, Reg::X20, Reg::X19);
-        self.asm.cmp_reg(Reg::X6, Reg::X4);
-        self.asm.branch(fits, BranchKind::Conditional(Cond::Ge));
-        let grow = match self.heap_grow_label {
+    fn gc_alloc_entry_label(&mut self) -> Label {
+        match self.gc_alloc_label {
             Some(label) => label,
             None => {
                 let label = self.asm.new_label();
-                self.heap_grow_label = Some(label);
+                self.gc_alloc_label = Some(label);
                 label
             }
-        };
-        self.asm.branch(grow, BranchKind::Link);
-        self.asm.bind(fits);
-        self.asm.mov_reg(Reg::X5, Reg::X19);
-        self.asm.add_reg(Reg::X19, Reg::X19, Reg::X4);
+        }
+    }
+
+    /// M7 (go-live): call the collector's `gc_alloc` -- payload size in x5,
+    /// type tag in x4, user pointer (block + 16) back in x0.
+    ///
+    /// This replaces the old bump allocator, so an allocation is now a
+    /// *collection point*: it can mark, sweep and (from M9) relocate. Two
+    /// consequences shape every caller. The portable routine works in
+    /// x0-x9 plus the x10 immediate scratch, so this saves x1-x3 and x6-x12
+    /// around it (x4/x5 are the arguments, x0 the result) -- callers keep
+    /// their scalars and interior pointers. And a heap *reference* the
+    /// caller still needs must be rooted across the call, because being in
+    /// a register (or on the invisible machine stack) is not reachability:
+    /// callers park those with `push_rooted` and take them back afterwards,
+    /// which also picks up the new address once the collector moves objects.
+    fn emit_gc_alloc_call(&mut self) {
+        const SAVED: [Reg; 10] = [
+            Reg::X1,
+            Reg::X2,
+            Reg::X3,
+            Reg::X6,
+            Reg::X7,
+            Reg::X8,
+            Reg::X9,
+            Reg::X10,
+            Reg::X11,
+            Reg::X12,
+        ];
+        let entry = self.gc_alloc_entry_label();
+        self.asm.push_frame_record(); // the bl clobbers x30
+        for reg in SAVED {
+            self.asm.push(reg);
+        }
+        self.asm.branch(entry, BranchKind::Link);
+        for reg in SAVED.into_iter().rev() {
+            self.asm.pop(reg);
+        }
+        self.asm.pop_frame_record();
     }
 
     /// Allocate a GC-shaped heap object: a 16-byte header
     /// `[size|mark][type_tag]` followed by `words` 8-byte payload slots.
-    /// Bumps the allocator, writes the header, and leaves the *user*
-    /// pointer (block + 16) in x0 -- so every existing `[x0 + off]`
-    /// payload access is unchanged. `size` is the 16-aligned block size;
-    /// its low 4 bits are free for the collector's mark/forward bits (0
-    /// here). The tag distinguishes RAW_BYTES (no inner pointers) from
-    /// POINTER_RECORD (every payload slot a heap pointer), so the
-    /// collector -- once live (M7) -- traces only the latter.
-    ///
-    /// M6: objects are laid out GC-shaped while the bump allocator is
-    /// still live and the collector is still dead, so this changes only
-    /// the object representation, not behavior -- the CI eval-differential
-    /// confirms each conversion is semantics-preserving.
+    /// `gc_alloc` writes the header and hands back the *user* pointer
+    /// (block + 16) in x0, so every `[x0 + off]` payload access is
+    /// unchanged. The tag distinguishes RAW_BYTES (no inner pointers) from
+    /// POINTER_RECORD (every payload slot a heap pointer), so the collector
+    /// traces only the latter.
     fn emit_gc_alloc_object(&mut self, words: usize, tag: u64) {
-        let block = (16 + words * 8).div_ceil(16) * 16;
-        self.asm.mov_imm64(Reg::X4, block as u64);
-        self.emit_alloc(); // block base in x5
-        self.asm.mov_imm64(Reg::X1, block as u64);
-        self.asm.str_imm(Reg::X1, Reg::X5, 0); // [block] = size|mark(0)
-        self.asm.mov_imm64(Reg::X1, tag);
-        self.asm.str_imm(Reg::X1, Reg::X5, 8); // [block+8] = type_tag
-        self.asm.add_reg_imm(Reg::X0, Reg::X5, 16); // x0 = user pointer
+        self.asm.mov_imm64(Reg::X5, (words * 8) as u64); // payload bytes
+        self.asm.mov_imm64(Reg::X4, tag);
+        self.emit_gc_alloc_call(); // x0 = user pointer
     }
 
     /// Box a scalar (in x0) into its own single-slot `RAW_BYTES` object,
@@ -2268,6 +2288,29 @@ impl Emitter {
     /// pointer is in x0.
     fn emit_unbox_scalar(&mut self) {
         self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+    }
+
+    /// M7: colour a heap reference on its way into a heap slot --
+    /// `dst = src == 0 ? 0 : src | GoodColor`.
+    ///
+    /// The write half of the mutator contract, and the dual of the load
+    /// barrier. Stored references carry the cycle's good colour, so when
+    /// MarkStart flips the colours every reference already in the heap
+    /// becomes "bad" and the next load of it takes the slow path, which is
+    /// how the collector observes -- and marks -- what the mutator reaches.
+    /// A raw, uncoloured pointer would always look good and never be
+    /// marked, so this is what makes the barrier work at all.
+    ///
+    /// Null stays raw zero: `0 | colour` would be a bogus pointer, and the
+    /// root scan and barriers all treat 0 as "nothing here".
+    fn emit_color_ptr(&mut self, dst: Reg, src: Reg) {
+        let raw = self.asm.new_label();
+        if dst != src {
+            self.asm.mov_reg(dst, src);
+        }
+        self.asm.branch(raw, BranchKind::CompareZero(dst));
+        self.asm.orr_reg(dst, dst, Reg::X25); // | good colour
+        self.asm.bind(raw);
     }
 
     /// The two shadow-stack cells, reserved on first use.
@@ -2540,31 +2583,25 @@ impl Emitter {
         self.asm.and_reg(Reg::X0, Reg::X0, Reg::X24);
     }
 
-    /// Allocate a GC-shaped heap string whose payload is `[len][bytes...]`,
-    /// with the character count in `len` (a caller register that is not x4,
-    /// x5 or x6). Reserves a 16-byte header `[size|mark][RAW_BYTES]` in
-    /// front and leaves the *user* pointer (block + 16) in x5, so callers
-    /// keep writing the length at `[x5 + 0]` and the bytes at `[x5 + 8]`
-    /// exactly as before -- the only visible change is the header the
-    /// collector reads once it goes live (M7). A string carries no inner
-    /// pointers, hence RAW_BYTES. `len` is preserved across the call
-    /// (emit_alloc keeps x0-x5 over a heap grow, and this only writes x4/
-    /// x5/x6).
+    /// Allocate a GC heap string whose payload is `[len][bytes...]`, with
+    /// the character count in `len` (any register other than x4/x5). The
+    /// object gets the usual 16-byte header from `gc_alloc` and the *user*
+    /// pointer lands in x5, so callers keep writing the length at
+    /// `[x5 + 0]` and the bytes from `[x5 + 8]`. A string has no inner
+    /// pointers, hence RAW_BYTES.
+    ///
+    /// `len` survives the call unless it is x0 (the result register the
+    /// allocator returns in). Callers holding a heap reference across this
+    /// must root it -- allocating can now collect.
     fn emit_alloc_raw_string(&mut self, len: Reg) {
         // payload = align8(len + 8): the 8-byte length field plus the bytes.
-        self.asm.add_reg_imm(Reg::X4, len, 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
-        // block = align16(payload + 16 header).
-        self.asm.add_reg_imm(Reg::X4, Reg::X4, 16 + 15);
-        self.asm.lsr_imm(Reg::X4, Reg::X4, 4);
-        self.asm.lsl_imm(Reg::X4, Reg::X4, 4);
-        self.emit_alloc(); // x5 = block base, x4 = block size preserved
-        self.asm.str_imm(Reg::X4, Reg::X5, 0); // [block] = size|mark(0)
+        self.asm.add_reg_imm(Reg::X5, len, 15);
+        self.asm.lsr_imm(Reg::X5, Reg::X5, 3);
+        self.asm.lsl_imm(Reg::X5, Reg::X5, 3);
         self.asm
-            .mov_imm64(Reg::X6, crate::gc_layout::GC_TYPE_RAW_BYTES);
-        self.asm.str_imm(Reg::X6, Reg::X5, 8); // [block + 8] = type_tag
-        self.asm.add_reg_imm(Reg::X5, Reg::X5, 16); // x5 = user pointer
+            .mov_imm64(Reg::X4, crate::gc_layout::GC_TYPE_RAW_BYTES);
+        self.emit_gc_alloc_call(); // x0 = user pointer
+        self.asm.mov_reg(Reg::X5, Reg::X0); // the documented result register
     }
 
     /// Copy `[count]` bytes between the byte pointers in `src`/`dst`;
@@ -2587,8 +2624,13 @@ impl Emitter {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
         self.asm.ldr_imm(Reg::X3, Reg::X1, 0);
         self.asm.add_reg(Reg::X2, Reg::X2, Reg::X3);
-        // size = align8(total + 8 header)
+        // Allocating can collect, so both operands are parked as roots and
+        // taken back (with their post-collection addresses) afterwards.
+        self.push_rooted(Reg::X0);
+        self.push_rooted(Reg::X1);
         self.emit_alloc_raw_string(Reg::X2);
+        self.pop_rooted(Reg::X1);
+        self.pop_rooted(Reg::X0);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
@@ -2694,8 +2736,13 @@ impl Emitter {
     /// convention -- no full Unicode case tables).
     fn emit_str_ascii_case(&mut self, to_upper: bool) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
-        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
+        // The source is a heap object that must survive the allocation, and
+        // its payload pointer is re-derived afterwards rather than carried
+        // across (so a relocating collector cannot leave it dangling).
+        self.push_rooted(Reg::X0);
         self.emit_alloc_raw_string(Reg::X2);
+        self.pop_rooted(Reg::X0);
+        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X6, Reg::X5, 8);
         self.asm.mov_reg(Reg::X7, Reg::X2);
@@ -2732,8 +2779,10 @@ impl Emitter {
     /// writing them in discovery order reverses the string.
     fn emit_str_reverse(&mut self) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
-        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
+        self.push_rooted(Reg::X0); // survives the allocation
         self.emit_alloc_raw_string(Reg::X2);
+        self.pop_rooted(Reg::X0);
+        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8); // re-derived payload
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X6, Reg::X5, 8);
         self.asm.mov_reg(Reg::X8, Reg::X2);
@@ -2828,9 +2877,12 @@ impl Emitter {
         // beforehand (a prior version computed the slice pointer here
         // and lost it to a heap-grow mmap when the bump allocator's
         // segment was full).
-        self.asm.push(Reg::X9);
+        self.asm.push(Reg::X9); // a scalar index
+        self.push_rooted(Reg::X0); // the source object
         self.emit_alloc_raw_string(Reg::X2);
+        self.pop_rooted(Reg::X0);
         self.asm.pop(Reg::X9);
+        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8); // re-derived payload
         self.asm.add_reg(Reg::X6, Reg::X3, Reg::X9);
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
@@ -2849,8 +2901,9 @@ impl Emitter {
     fn emit_str_join(&mut self) {
         self.asm.mov_reg(Reg::X10, Reg::X0);
         // The barriered cell reads below clobber x0, so the list head is
-        // parked on the machine stack for the second pass.
-        self.asm.push(Reg::X0);
+        // parked for the second pass -- as a root, since a collection can
+        // now happen while it waits.
+        self.push_rooted(Reg::X0);
         self.asm.mov_imm64(Reg::X2, 0);
         self.asm.mov_imm64(Reg::X9, 0);
         let count_loop = self.asm.new_label();
@@ -2867,7 +2920,7 @@ impl Emitter {
         self.asm.mov_reg(Reg::X10, Reg::X0);
         self.asm.branch(count_loop, BranchKind::Unconditional);
         self.asm.bind(count_done);
-        self.asm.pop(Reg::X0); // the list head again
+        self.pop_rooted(Reg::X0); // the list head again
 
         let no_sep = self.asm.new_label();
         self.asm.cmp_imm(Reg::X9, 0);
@@ -2882,8 +2935,12 @@ impl Emitter {
         // it must be saved across the call explicitly (see the
         // emit_str_trim fix for why this matters once a heap-grow
         // mmap actually fires).
-        self.asm.push(Reg::X9);
+        self.asm.push(Reg::X9); // the element count, a scalar
+        self.push_rooted(Reg::X0); // the list
+        self.push_rooted(Reg::X1); // the separator
         self.emit_alloc_raw_string(Reg::X2);
+        self.pop_rooted(Reg::X1);
+        self.pop_rooted(Reg::X0);
         self.asm.pop(Reg::X9);
 
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
@@ -2915,7 +2972,6 @@ impl Emitter {
         self.asm.bind(copy_done);
 
         self.asm.mov_reg(Reg::X0, Reg::X5);
-        self.asm.add_sp_imm(48);
     }
 
     /// `replaceAll`(input, pattern, replacement): literal-substring
@@ -2941,7 +2997,13 @@ impl Emitter {
     /// every other M13 routine already uses (M13 slice 1's `trim` bug
     /// was exactly a missed instance of it).
     fn emit_str_replace_all(&mut self) {
-        // x0=input, x1=pattern, x2=replacement
+        // x0=input, x1=pattern, x2=replacement. All three end up reachable
+        // only through the interior pointers in the scratch struct, so they
+        // are rooted across the routine's allocation (see
+        // emit_str_split_nonempty_delimiter).
+        self.push_rooted(Reg::X0);
+        self.push_rooted(Reg::X1);
+        self.push_rooted(Reg::X2);
         self.asm.ldr_imm(Reg::X3, Reg::X1, 0); // pattern_len
         let pattern_ok = self.asm.new_label();
         self.asm
@@ -3068,6 +3130,9 @@ impl Emitter {
         self.asm.bind(copy_done);
 
         self.asm.mov_reg(Reg::X0, Reg::X5);
+        self.asm.add_sp_imm(48); // the scratch struct
+        self.emit_shadow_pop(3); // the three input roots
+        self.asm.add_sp_imm(48); // and the slots holding them
     }
 
     /// Build a fresh string object holding `input_bytes_base[start..end]`
@@ -3128,7 +3193,13 @@ impl Emitter {
     /// solved the register-pressure wall that stalled the earlier
     /// `replaceAll` attempt, generalized here to a 32-byte struct.
     fn emit_str_split_nonempty_delimiter(&mut self) {
-        // x0 = input, x1 = delimiter
+        // x0 = input, x1 = delimiter.
+        // After the scratch below caches their interior pointers, the two
+        // objects are not in any register the collector can see, yet the
+        // segment allocations can collect -- so both are rooted for the
+        // whole routine.
+        self.push_rooted(Reg::X0);
+        self.push_rooted(Reg::X1);
         // Machine-stack scratch, not a GC-heap block (see
         // emit_str_replace_all).
         self.asm.sub_sp_imm(32);
@@ -3192,7 +3263,9 @@ impl Emitter {
         self.asm.sub_reg_imm(Reg::X12, Reg::X12, 1);
         self.asm.branch(cons_loop, BranchKind::Unconditional);
         self.asm.bind(cons_done);
-        self.asm.add_sp_imm(32);
+        self.asm.add_sp_imm(32); // the scratch struct
+        self.emit_shadow_pop(2); // the two input roots
+        self.asm.add_sp_imm(32); // and the slots holding them
     }
 
     /// `split`(input, ""): each UTF-8 character becomes its own
@@ -3206,7 +3279,9 @@ impl Emitter {
     /// push/pop round-trip in this path (harmless, since nothing
     /// reads it back).
     fn emit_str_split_chars(&mut self) {
-        // x0 = input
+        // x0 = input; rooted for the routine (see
+        // emit_str_split_nonempty_delimiter).
+        self.push_rooted(Reg::X0);
         self.asm.ldr_imm(Reg::X9, Reg::X0, 0); // input_len
         self.asm.add_reg_imm(Reg::X8, Reg::X0, 8); // input_bytes_base
         self.asm.mov_imm64(Reg::X10, 0); // pos
@@ -3252,6 +3327,8 @@ impl Emitter {
         self.asm.sub_reg_imm(Reg::X12, Reg::X12, 1);
         self.asm.branch(cons_loop, BranchKind::Unconditional);
         self.asm.bind(cons_done);
+        self.emit_shadow_pop(1); // the input root
+        self.asm.add_sp_imm(16); // and the slot holding it
     }
 
     /// `split`(input, delimiter): dispatches to the empty-delimiter
@@ -3345,7 +3422,11 @@ impl Emitter {
             self.asm.mov_imm64(reg, 0);
             self.asm.bind(non_negative);
         }
-        // First scan: skip `start` characters from the payload.
+        // First scan: skip `start` characters from the payload. x9 keeps
+        // the source object itself (emit_skip_chars only touches x3-x6) so
+        // that it stays reachable across the allocation below, from which
+        // the slice pointer is re-derived.
+        self.asm.mov_reg(Reg::X9, Reg::X0);
         self.asm.ldr_imm(Reg::X4, Reg::X0, 0);
         self.asm.add_reg_imm(Reg::X3, Reg::X0, 8);
         self.asm.mov_reg(Reg::X5, Reg::X1);
@@ -3364,9 +3445,16 @@ impl Emitter {
         // Second scan: advance over the characters being taken.
         self.asm.mov_reg(Reg::X5, Reg::X2);
         self.emit_skip_chars();
-        // Slice byte length, then allocate and copy.
+        // Slice byte length and its offset within the source object, then
+        // allocate (which can collect) and copy from the re-derived slice.
         self.asm.sub_reg(Reg::X2, Reg::X3, Reg::X0);
+        self.asm.sub_reg(Reg::X1, Reg::X0, Reg::X9); // slice offset
+        self.asm.push(Reg::X1); // a scalar
+        self.push_rooted(Reg::X9); // the source object
         self.emit_alloc_raw_string(Reg::X2);
+        self.pop_rooted(Reg::X9);
+        self.asm.pop(Reg::X1);
+        self.asm.add_reg(Reg::X0, Reg::X9, Reg::X1); // re-derived slice
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
         self.emit_copy_bytes(Reg::X2, Reg::X0, Reg::X7, Reg::X3);
@@ -3417,6 +3505,7 @@ impl Emitter {
         for position in (0..count).rev() {
             // The caller parked each field as a rooted machine-stack slot.
             self.pop_rooted(Reg::X1);
+            self.emit_color_ptr(Reg::X1, Reg::X1); // colour on store
             self.asm.str_imm(Reg::X1, Reg::X0, (position * 8) as u32);
         }
     }
@@ -3439,8 +3528,10 @@ impl Emitter {
         self.push_rooted(Reg::X0); // `next`
         self.emit_gc_alloc_object(2, crate::gc_layout::GC_TYPE_POINTER_RECORD); // x0 = user ptr
         self.pop_rooted(Reg::X1);
+        self.emit_color_ptr(Reg::X1, Reg::X1); // colour on store
         self.asm.str_imm(Reg::X1, Reg::X0, 8); // [cell + 8] = next
         self.pop_rooted(Reg::X1);
+        self.emit_color_ptr(Reg::X1, Reg::X1);
         self.asm.str_imm(Reg::X1, Reg::X0, 0); // [cell + 0] = head
     }
 
@@ -3638,28 +3729,29 @@ impl Emitter {
         self.asm.bind(loop_start);
         self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
         // Both cell slots are heap pointers: read them through the barrier,
-        // holding the cursor in x9 (which the barrier preserves and which is
-        // dead again before the allocation below, whose grow path only keeps
-        // x0-x5).
+        // holding the cursor in x9 (which the barrier preserves).
         self.asm.mov_reg(Reg::X9, Reg::X0); // cursor
         self.emit_gc_load_ptr(Reg::X9, 0); // x0 = head
         self.asm.mov_reg(Reg::X2, Reg::X0); // head
         self.emit_gc_load_ptr(Reg::X9, 8); // x0 = next -- advance input
-        // Build a GC-shaped [header][head][acc] cell. emit_alloc preserves
-        // x0-x5 across grow, so cursor (x0), acc (x1) and head (x2)
-        // survive; x3 is a free scratch. The head copied from the source
-        // cell is already boxed/a pointer, so it needs no re-boxing -- only
-        // the 16-byte header and POINTER_RECORD tag are added.
-        self.asm.mov_imm64(Reg::X4, 32);
-        self.emit_alloc(); // x5 = block base
-        self.asm.mov_imm64(Reg::X3, 32);
-        self.asm.str_imm(Reg::X3, Reg::X5, 0); // [block] = size|mark(0)
-        self.asm
-            .mov_imm64(Reg::X3, crate::gc_layout::GC_TYPE_POINTER_RECORD);
-        self.asm.str_imm(Reg::X3, Reg::X5, 8); // [block + 8] = type_tag
-        self.asm.str_imm(Reg::X2, Reg::X5, 16); // [cell + 0] = head
-        self.asm.str_imm(Reg::X1, Reg::X5, 24); // [cell + 8] = next = acc
-        self.asm.add_reg_imm(Reg::X1, Reg::X5, 16); // acc = user ptr
+        // Build the reversed cell. All three live values -- the input cursor
+        // (x0), the accumulator (x1) and the head being moved (x2) -- are
+        // heap references that have to survive an allocation that can
+        // collect, so each is parked as a root and taken back afterwards
+        // (which also picks up their post-relocation addresses).
+        self.push_rooted(Reg::X0);
+        self.push_rooted(Reg::X1);
+        self.push_rooted(Reg::X2);
+        self.emit_gc_alloc_object(2, crate::gc_layout::GC_TYPE_POINTER_RECORD);
+        self.asm.mov_reg(Reg::X3, Reg::X0); // the fresh cell
+        self.pop_rooted(Reg::X2); // head
+        self.pop_rooted(Reg::X1); // acc
+        self.pop_rooted(Reg::X0); // cursor
+        self.emit_color_ptr(Reg::X4, Reg::X2);
+        self.asm.str_imm(Reg::X4, Reg::X3, 0); // [cell + 0] = head
+        self.emit_color_ptr(Reg::X4, Reg::X1);
+        self.asm.str_imm(Reg::X4, Reg::X3, 8); // [cell + 8] = next = acc
+        self.asm.mov_reg(Reg::X1, Reg::X3); // acc = the new cell (raw)
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(done);
         self.asm.mov_reg(Reg::X0, Reg::X1);
@@ -3780,31 +3872,6 @@ impl Emitter {
 
     /// The shared heap-grow routine: mmap a fresh segment into
     /// x19/x20. Preserves x0-x5 because allocation sites have live
-    /// operands in them.
-    fn emit_heap_grow_routine(&mut self, label: Label) {
-        self.asm.bind(label);
-        self.asm.push_frame_record();
-        for reg in [Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5] {
-            self.asm.push(reg);
-        }
-        self.asm.mov_imm64(Reg::X0, 0);
-        self.asm.mov_imm64(Reg::X1, HEAP_SEGMENT_BYTES);
-        self.asm.mov_imm64(Reg::X2, PROT_READ_WRITE);
-        self.asm.mov_imm64(Reg::X3, MMAP_ANON_PRIVATE);
-        self.asm.mov_imm64(Reg::X4, u64::MAX); // fd = -1
-        self.asm.mov_imm64(Reg::X5, 0);
-        self.asm.mov_imm64(Reg::X16, u64::from(SYS_MMAP));
-        self.asm.svc_0x80();
-        self.asm.mov_reg(Reg::X19, Reg::X0);
-        self.asm.mov_imm64(Reg::X1, HEAP_SEGMENT_BYTES);
-        self.asm.add_reg(Reg::X20, Reg::X19, Reg::X1);
-        for reg in [Reg::X5, Reg::X4, Reg::X3, Reg::X2, Reg::X1, Reg::X0] {
-            self.asm.pop(reg);
-        }
-        self.asm.pop_frame_record();
-        self.asm.ret();
-    }
-
     /// String / display builtins, mirroring the C backend's surface.
     /// Returns Ok(None) when `name` is not a builtin.
     fn builtin_call(
@@ -4104,24 +4171,17 @@ impl Emitter {
                 // user pointer (block + 16), so the `__gc_write`/`__gc_read`
                 // payload offsets are unchanged.
                 let tag = if name == "__gc_record" {
-                    // n pointer slots -> n * 8 bytes.
-                    self.asm.lsl_imm(Reg::X4, Reg::X0, 3);
+                    // n pointer slots -> n * 8 bytes of payload.
+                    self.asm.lsl_imm(Reg::X5, Reg::X0, 3);
                     crate::gc_layout::GC_TYPE_POINTER_RECORD
                 } else {
-                    self.asm.add_reg_imm(Reg::X4, Reg::X0, 7);
-                    self.asm.lsr_imm(Reg::X4, Reg::X4, 3);
-                    self.asm.lsl_imm(Reg::X4, Reg::X4, 3);
+                    self.asm.add_reg_imm(Reg::X5, Reg::X0, 7);
+                    self.asm.lsr_imm(Reg::X5, Reg::X5, 3);
+                    self.asm.lsl_imm(Reg::X5, Reg::X5, 3);
                     crate::gc_layout::GC_TYPE_RAW_BYTES
                 };
-                // block = align16(payload + 16 header).
-                self.asm.add_reg_imm(Reg::X4, Reg::X4, 16 + 15);
-                self.asm.lsr_imm(Reg::X4, Reg::X4, 4);
-                self.asm.lsl_imm(Reg::X4, Reg::X4, 4);
-                self.emit_alloc(); // x5 = block base, x4 = block size preserved
-                self.asm.str_imm(Reg::X4, Reg::X5, 0); // [block] = size|mark(0)
-                self.asm.mov_imm64(Reg::X6, tag);
-                self.asm.str_imm(Reg::X6, Reg::X5, 8); // [block + 8] = type_tag
-                self.asm.add_reg_imm(Reg::X0, Reg::X5, 16); // x0 = user pointer
+                self.asm.mov_imm64(Reg::X4, tag);
+                self.emit_gc_alloc_call(); // x0 = user pointer
                 Ok(Some(ValueType::Ptr))
             }
             ("__gc_write", 3) => {
@@ -4133,12 +4193,19 @@ impl Emitter {
                     return Err(unsupported(span, "__gc_write with a non-Int offset"));
                 }
                 self.asm.push(Reg::X0);
-                if self.expression(&arguments[2])? == ValueType::Unit {
+                let value_ty = self.expression(&arguments[2])?;
+                if value_ty == ValueType::Unit {
                     return Err(unsupported(span, "__gc_write of unit"));
                 }
                 self.asm.mov_reg(Reg::X2, Reg::X0);
                 self.asm.pop(Reg::X1);
                 self.pop_rooted(Reg::X0);
+                // Colour a stored heap reference. A boxed scalar's contents
+                // goes through the same primitive and stays raw -- it is a
+                // value, not a pointer.
+                if is_heap_pointer(value_ty) {
+                    self.emit_color_ptr(Reg::X2, Reg::X2);
+                }
                 self.asm.str_reg_offset(Reg::X2, Reg::X0, Reg::X1);
                 Ok(Some(ValueType::Unit))
             }
@@ -4986,8 +5053,23 @@ impl Emitter {
     fn emit_gc_init_colors(&mut self, gc: &GcState) {
         self.asm
             .mov_imm64(Reg::X24, crate::gc_layout::GC_COLOR_STRIP);
-        self.emit_store_gc_cell_imm(gc.good_color, crate::gc_layout::GC_COLOR_M0);
-        self.emit_store_gc_cell_imm(gc.bad_mask, crate::gc_layout::GC_COLOR_BAD_MASK);
+        // --gc-poison makes every colour except the current good one bad, so
+        // any reference read without the barrier -- or stored without being
+        // coloured -- faults or slow-paths immediately. It is the coverage
+        // canary for the two barriers.
+        let (good, bad) = if self.gc_poison {
+            (
+                crate::gc_layout::GC_COLOR_M1,
+                crate::gc_layout::GC_COLOR_MASK,
+            )
+        } else {
+            (
+                crate::gc_layout::GC_COLOR_M0,
+                crate::gc_layout::GC_COLOR_BAD_MASK,
+            )
+        };
+        self.emit_store_gc_cell_imm(gc.good_color, good);
+        self.emit_store_gc_cell_imm(gc.bad_mask, bad);
         let PortDataAddr::Bss(good) = gc.good_color else {
             unreachable!("GC cells live in __bss");
         };
@@ -5002,6 +5084,42 @@ impl Emitter {
         // the initial mark colour.
         self.emit_store_gc_cell_imm(gc.header_mark, crate::gc_layout::GC_HMARK1);
         self.emit_store_gc_cell_imm(gc.mark_color, crate::gc_layout::GC_COLOR_M1);
+    }
+
+    /// `--gc-log`: write one `label=<value>` field of GC statistics to
+    /// stderr, reading the counter out of its `__bss` cell.
+    fn emit_gc_log_field(&mut self, label: &[u8], cell: PortDataAddr) {
+        self.asm.emit_write_rodata(STDERR_FD, label);
+        let PortDataAddr::Bss(dl) = cell else {
+            unreachable!("GC cells live in __bss");
+        };
+        self.asm.load_data_address(Reg::X0, dl);
+        self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+        // Render the value with the shared decimal formatter (which writes
+        // into a 32-byte stack buffer and leaves the first digit in x1 and
+        // the buffer end in x2).
+        self.asm.sub_sp_imm(32);
+        self.asm.emit_int_digits(false);
+        self.asm.add_reg_sp_imm(Reg::X2, 32);
+        self.asm.sub_reg(Reg::X2, Reg::X2, Reg::X1);
+        self.asm.mov_imm64(Reg::X0, STDERR_FD);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+        self.asm.svc_0x80();
+        self.asm.add_sp_imm(32);
+    }
+
+    /// `--gc-log`: the one-line statistics report, written to stderr just
+    /// before a normal exit. `collections` proving non-zero is what shows
+    /// the collector actually ran, which is how the stress corpus asserts
+    /// it is doing work rather than silently never collecting.
+    fn emit_gc_log_report(&mut self, gc: &GcState) {
+        self.emit_gc_log_field(b"gc: collections=", gc.collect_counter);
+        self.emit_gc_log_field(b" allocs=", gc.alloc_count);
+        self.emit_gc_log_field(b" bytes=", gc.bytes_allocated);
+        self.emit_gc_log_field(b" committed=", gc.committed_count);
+        self.emit_gc_log_field(b" relocated=", gc.relocated_count);
+        self.emit_gc_log_field(b" stw_fallbacks=", gc.stw_fallbacks);
+        self.asm.emit_write_rodata(STDERR_FD, b"\n");
     }
 
     /// Reserve all GC cells (single qwords + the three region arrays) in
@@ -5063,6 +5181,8 @@ impl Emitter {
         // Share one label with the mutator's barriered reads (whichever
         // side runs first creates it) so their `bl` lands on this body.
         let l_load_barrier_slow = self.load_barrier_label();
+        // Likewise shared with every mutator allocation site.
+        let l_alloc = self.gc_alloc_entry_label();
 
         GcState {
             heap_base,
@@ -5105,7 +5225,7 @@ impl Emitter {
             bounds_error_text,
             evac_exhausted,
             evac_oversized,
-            l_alloc: self.asm.new_label(),
+            l_alloc,
             l_collect: self.asm.new_label(),
             l_mark_roots: self.asm.new_label(),
             l_trace: self.asm.new_label(),
@@ -5142,7 +5262,7 @@ impl Emitter {
         use portable_asm as pa;
         let asm = &mut self.asm;
         let evac_off = true;
-        let poison = false;
+        let poison = self.gc_poison;
         let timing = false;
         let stderr_fd = 2u64;
         let tables = pa::RegionTables {
@@ -5206,7 +5326,7 @@ impl Emitter {
                 alloc_large: gc.l_alloc_large,
             },
             pa::AllocFlags {
-                stress: false,
+                stress: self.gc_stress,
                 log: false,
             },
             gc.oom.1,
@@ -5410,9 +5530,14 @@ impl Emitter {
 pub(crate) fn emit_macho_program(
     expr: &Expr,
     lowered_enums: std::collections::HashSet<String>,
+    gc_log: bool,
+    gc_stress: bool,
+    gc_poison: bool,
 ) -> Result<Vec<u8>, Diagnostic> {
     let mut emitter = Emitter {
         lowered_enums,
+        gc_stress,
+        gc_poison,
         ..Emitter::default()
     };
     emitter.scopes.push(HashMap::new());
@@ -5439,11 +5564,6 @@ pub(crate) fn emit_macho_program(
     emitter.emit_gc_init_heap(&gc);
     emitter.emit_gc_init_colors(&gc);
 
-    // Empty heap: the first allocation's capacity check fails and
-    // mmaps the first segment.
-    emitter.asm.mov_imm64(Reg::X19, 0);
-    emitter.asm.mov_imm64(Reg::X20, 0);
-
     let frame_size = (count_var_decls(expr) * 8).div_ceil(16) * 16;
     if frame_size >= 4096 {
         return Err(unsupported(expr.span(), "this many local variables"));
@@ -5454,6 +5574,9 @@ pub(crate) fn emit_macho_program(
     emitter.asm.mov_fp_sp();
 
     emitter.statement(expr)?;
+    if gc_log {
+        emitter.emit_gc_log_report(&gc);
+    }
     emitter.asm.emit_exit(0);
 
     // Emit reached functions; their bodies may reach more.
@@ -5474,9 +5597,6 @@ pub(crate) fn emit_macho_program(
     }
     if let Some(label) = emitter.list_reverse_label {
         emitter.emit_list_reverse_routine(label);
-    }
-    if let Some(label) = emitter.heap_grow_label {
-        emitter.emit_heap_grow_routine(label);
     }
     // The shadow-stack helpers the mutator's root pushes call.
     if let Some(label) = emitter.shadow_push_label {
