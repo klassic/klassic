@@ -82,6 +82,12 @@ println(foldLeft([1 2 3 4])(1)((a, x) => a * x))
 assertResult(6)([1 2 3] reduce 0 => r + e)
 assertResult(24)(foldLeft([1 2 3 4])(1)((a, x) => a * x))
 
+// A list of Doubles: folding and comparing work even though rendering one
+// does not, so the element type is carried without a formatter.
+assertResult(10.0)(foldLeft([1.0 2.0 3.0 4.0])(0.0)((x, y) => x + y))
+assertResult(24.0)(foldLeft([1.0 2.0 3.0 4.0])(1.0)((x, y) => x * y))
+assertResult(2)(size([1.5 2.5]))
+
 assertResult(3.0)(sqrt(9.0))
 assertResult(2.5)(abs(-2.5))
 assertResult(7)(abs(-7))

@@ -1215,6 +1215,10 @@ fn unsupported(span: Span, feature: &str) -> Diagnostic {
 /// Element types a list can carry in the current subset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ListElem {
+    /// A `Double`, carried as its raw bits like every other Double here.
+    /// Printing one is still unsupported (that needs the shortest-round-trip
+    /// formatter the x86-64 backend has), but folding and comparing work.
+    Double,
     Int,
     Bool,
     Str,
@@ -1323,6 +1327,7 @@ fn is_heap_pointer(ty: ValueType) -> bool {
 fn elem_value_type(elem: ListElem) -> ValueType {
     match elem {
         ListElem::Int => ValueType::Int,
+        ListElem::Double => ValueType::Double,
         ListElem::Bool => ValueType::Bool,
         ListElem::Str => ValueType::Str,
     }
@@ -1332,6 +1337,7 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 fn list_elem_of(ty: ValueType) -> Option<ListElem> {
     match ty {
         ValueType::Int => Some(ListElem::Int),
+        ValueType::Double => Some(ListElem::Double),
         ValueType::Bool => Some(ListElem::Bool),
         ValueType::Str => Some(ListElem::Str),
         _ => None,
@@ -2291,11 +2297,11 @@ impl Emitter {
                     rhs_ty = ValueType::Str;
                 }
                 ValueType::List(elem) => {
-                    self.emit_list_to_str(elem, "[", "]");
+                    self.emit_list_to_str(elem, "[", "]", rhs.span())?;
                     rhs_ty = ValueType::Str;
                 }
                 ValueType::Set(elem) => {
-                    self.emit_list_to_str(elem, "%(", ")");
+                    self.emit_list_to_str(elem, "%(", ")", rhs.span())?;
                     rhs_ty = ValueType::Str;
                 }
                 ValueType::EmptyList => {
@@ -3907,7 +3913,7 @@ impl Emitter {
     }
 
     /// println of the set in x0 in the evaluator's format: `%(e1, e2)`.
-    fn emit_println_set(&mut self, elem: ListElem) {
+    fn emit_println_set(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         let loop_start = self.asm.new_label();
         let close = self.asm.new_label();
         self.asm.push(Reg::X0);
@@ -3924,7 +3930,7 @@ impl Emitter {
         if is_boxed_scalar(elem_value_type(elem)) {
             self.emit_unbox_scalar();
         }
-        self.emit_print_elem(elem);
+        self.emit_print_elem(elem, span)?;
         self.asm.pop(Reg::X3);
         self.emit_gc_load_ptr(Reg::X3, 8); // x0 = next (barriered)
         self.asm.mov_reg(Reg::X3, Reg::X0);
@@ -3935,6 +3941,7 @@ impl Emitter {
         self.asm.bind(close);
         self.asm.pop(Reg::X3);
         self.asm.emit_write_rodata(STDOUT_FD, b")\n");
+        Ok(())
     }
 
     /// `bl`-called scalar membership scan: x0 = list, x1 = candidate
@@ -4043,8 +4050,14 @@ impl Emitter {
 
     /// Print one element value in x0 without a newline; clobbers
     /// x0-x5/x16.
-    fn emit_print_elem(&mut self, elem: ListElem) {
+    fn emit_print_elem(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         match elem {
+            // Rendering a Double needs the shortest-round-trip formatter this
+            // backend does not have yet; arithmetic and comparison on Doubles
+            // (including inside a list) work regardless.
+            ListElem::Double => {
+                return Err(unsupported(span, "printing a Double element"));
+            }
             ListElem::Int => {
                 self.asm.sub_sp_imm(32);
                 self.asm.emit_int_digits(false);
@@ -4074,6 +4087,7 @@ impl Emitter {
                 self.asm.bind(end_label);
             }
         }
+        Ok(())
     }
 
     /// println of the record object in x0 in the evaluator's format:
@@ -4102,7 +4116,7 @@ impl Emitter {
             if is_boxed_scalar(*ty) {
                 self.emit_unbox_scalar();
             }
-            self.emit_print_elem(list_elem_of(*ty).expect("checked above"));
+            self.emit_print_elem(list_elem_of(*ty).expect("checked above"), span)?;
         }
         self.asm.pop(Reg::X0); // discard the saved object
         self.asm.emit_write_rodata(STDOUT_FD, b")\n");
@@ -4111,7 +4125,7 @@ impl Emitter {
 
     /// println of the list in x0 in the evaluator's format:
     /// `[e1, e2, ...]` (strings unquoted).
-    fn emit_println_list(&mut self, elem: ListElem) {
+    fn emit_println_list(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         let loop_start = self.asm.new_label();
         let close = self.asm.new_label();
         self.asm.push(Reg::X0); // cursor survives the writes below
@@ -4128,7 +4142,7 @@ impl Emitter {
         if is_boxed_scalar(elem_value_type(elem)) {
             self.emit_unbox_scalar();
         }
-        self.emit_print_elem(elem);
+        self.emit_print_elem(elem, span)?;
         self.asm.pop(Reg::X3);
         self.emit_gc_load_ptr(Reg::X3, 8); // x0 = next (barriered)
         self.asm.mov_reg(Reg::X3, Reg::X0);
@@ -4139,6 +4153,7 @@ impl Emitter {
         self.asm.bind(close);
         self.asm.pop(Reg::X3); // discard the cursor slot
         self.asm.emit_write_rodata(STDOUT_FD, b"]\n");
+        Ok(())
     }
 
     /// println of the string object in x0: one write for the payload,
@@ -4849,7 +4864,13 @@ impl Emitter {
     /// Every step allocates -- each element's text, each concatenation -- so
     /// the input cursor and the string being built live in rooted slots and
     /// the loop re-reads them rather than holding them in registers.
-    fn emit_list_to_str(&mut self, elem: ListElem, open: &str, close: &str) {
+    fn emit_list_to_str(
+        &mut self,
+        elem: ListElem,
+        open: &str,
+        close: &str,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
         let cursor = self.next_local_offset;
         let acc = cursor + 8;
         let sep = acc + 8;
@@ -4894,6 +4915,9 @@ impl Emitter {
             ListElem::Int => self.emit_int_to_str(),
             ListElem::Bool => self.emit_bool_to_str(),
             ListElem::Str => {}
+            // Guarded by the callers, which reject a Double element before
+            // building any text (see emit_print_elem).
+            ListElem::Double => return Err(unsupported(span, "rendering a Double element")),
         }
         self.asm.mov_reg(Reg::X1, Reg::X0);
         self.asm.load_local(Reg::X0, acc);
@@ -4912,6 +4936,7 @@ impl Emitter {
         self.asm.mov_reg(Reg::X1, Reg::X0);
         self.asm.load_local(Reg::X0, acc);
         self.emit_str_concat();
+        Ok(())
     }
 
     /// `map(list)(f)`: a fresh list of `f` applied to each element.
@@ -5626,7 +5651,7 @@ impl Emitter {
                 Ok(())
             }
             ValueType::List(elem) => {
-                self.emit_println_list(elem);
+                self.emit_println_list(elem, span)?;
                 Ok(())
             }
             ValueType::EmptyList => {
@@ -5634,7 +5659,7 @@ impl Emitter {
                 Ok(())
             }
             ValueType::Set(elem) => {
-                self.emit_println_set(elem);
+                self.emit_println_set(elem, span)?;
                 Ok(())
             }
             ValueType::EmptySet => {
