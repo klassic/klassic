@@ -1781,8 +1781,11 @@ impl Emitter {
             .emit_abort_if_syscall_failed(b"klassic: FileInput#all failed to open file\n");
         self.asm.push(Reg::X0); // fd
 
-        self.asm.mov_imm64(Reg::X4, READ_CAP + 8);
-        self.emit_alloc(); // x5 = scratch buffer
+        // A megabyte is too big for the machine stack, so the read buffer is
+        // a real GC object (a header + RAW_BYTES payload the sweep can walk)
+        // shaped like a string: length slot at [x5], bytes from [x5 + 8].
+        self.asm.mov_imm64(Reg::X2, READ_CAP);
+        self.emit_alloc_raw_string(Reg::X2); // x5 = buffer
         self.asm.pop(Reg::X3); // fd
 
         self.asm.mov_reg(Reg::X0, Reg::X3);
@@ -1807,11 +1810,13 @@ impl Emitter {
         self.asm.pop(Reg::X5); // scratch buffer ptr
         self.asm.pop(Reg::X2); // bytes_read (content length)
 
-        self.asm.push(Reg::X5); // scratch buffer ptr
+        // The buffer is a heap object waiting across the result's
+        // allocation, so its stack slot is a root for that window.
+        self.push_rooted(Reg::X5); // read buffer
         self.asm.push(Reg::X2); // bytes_read
         self.emit_alloc_raw_string(Reg::X2); // x5 = result object
         self.asm.pop(Reg::X2); // bytes_read
-        self.asm.pop(Reg::X6); // scratch buffer ptr
+        self.pop_rooted(Reg::X6); // read buffer
 
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
@@ -1913,9 +1918,12 @@ impl Emitter {
         const STAT_BUF_SIZE: u64 = 144;
         const S_IFDIR_SHIFTED: u32 = 0o4; // S_IFDIR (0o040000) >> 12
 
-        self.asm.mov_imm64(Reg::X4, STAT_BUF_SIZE);
-        self.emit_alloc(); // x5 = stat buffer
-        self.asm.mov_reg(Reg::X6, Reg::X5);
+        // A transient syscall buffer, so it lives on the machine stack, not
+        // in the GC heap: the collector's sweep walks a region block by
+        // block through object headers, and a raw header-less block would
+        // desynchronise that walk.
+        self.asm.sub_sp_imm(STAT_BUF_SIZE as u32);
+        self.asm.add_reg_sp_imm(Reg::X6, 0);
 
         self.asm.mov_imm64(Reg::X0, AT_FDCWD as u64);
         self.asm.load_rodata_address(Reg::X1, path_offset);
@@ -1935,6 +1943,7 @@ impl Emitter {
         self.asm.cmp_imm(Reg::X0, S_IFDIR_SHIFTED);
         self.asm.cset(Reg::X0, Cond::Eq);
         self.asm.bind(done);
+        self.asm.add_sp_imm(STAT_BUF_SIZE as u32);
     }
 
     /// `Dir#move`(source, target): rename syscall on the two
@@ -2018,9 +2027,10 @@ impl Emitter {
     /// zero), then computes `tv_sec*1000 + tv_usec/1000` (M16, issue
     /// #538 / #570).
     fn emit_time_now_millis(&mut self) {
-        self.asm.mov_imm64(Reg::X4, 16);
-        self.emit_alloc(); // x5 = timeval buffer
-        self.asm.mov_reg(Reg::X6, Reg::X5);
+        // Transient syscall scratch: the machine stack, not the GC heap
+        // (see emit_dir_is_directory).
+        self.asm.sub_sp_imm(16);
+        self.asm.add_reg_sp_imm(Reg::X6, 0);
 
         self.asm.mov_reg(Reg::X0, Reg::X6);
         self.asm.mov_imm64(Reg::X1, 0); // tzp = NULL
@@ -2036,6 +2046,7 @@ impl Emitter {
         self.asm.mul_reg(Reg::X0, Reg::X0, Reg::X2); // tv_sec * 1000
         self.asm.sdiv_reg(Reg::X1, Reg::X1, Reg::X2); // tv_usec / 1000
         self.asm.add_reg(Reg::X0, Reg::X0, Reg::X1);
+        self.asm.add_sp_imm(16);
     }
 
     fn binary(
@@ -2904,6 +2915,7 @@ impl Emitter {
         self.asm.bind(copy_done);
 
         self.asm.mov_reg(Reg::X0, Reg::X5);
+        self.asm.add_sp_imm(48);
     }
 
     /// `replaceAll`(input, pattern, replacement): literal-substring
@@ -2941,15 +2953,13 @@ impl Emitter {
         self.asm.emit_exit(1);
         self.asm.bind(pattern_ok);
 
-        self.asm.push(Reg::X0);
-        self.asm.push(Reg::X1);
-        self.asm.push(Reg::X2);
-        self.asm.mov_imm64(Reg::X4, 48);
-        self.emit_alloc(); // x5 = scratch struct
-        self.asm.mov_reg(Reg::X6, Reg::X5);
-        self.asm.pop(Reg::X2);
-        self.asm.pop(Reg::X1);
-        self.asm.pop(Reg::X0);
+        // The scratch struct lives on the machine stack rather than the GC
+        // heap: the collector's sweep walks each region block by block
+        // through object headers, so a raw header-less block inside the heap
+        // would desynchronise that walk. Stack space also needs no
+        // save/restore of the operands around it.
+        self.asm.sub_sp_imm(48);
+        self.asm.add_reg_sp_imm(Reg::X6, 0);
 
         // Scratch layout: [0]=input_bytes_base [8]=input_len
         // [16]=pattern_bytes_base [24]=pattern_len
@@ -3119,13 +3129,10 @@ impl Emitter {
     /// `replaceAll` attempt, generalized here to a 32-byte struct.
     fn emit_str_split_nonempty_delimiter(&mut self) {
         // x0 = input, x1 = delimiter
-        self.asm.push(Reg::X0);
-        self.asm.push(Reg::X1);
-        self.asm.mov_imm64(Reg::X4, 32);
-        self.emit_alloc(); // x5 = scratch struct
-        self.asm.mov_reg(Reg::X6, Reg::X5);
-        self.asm.pop(Reg::X1);
-        self.asm.pop(Reg::X0);
+        // Machine-stack scratch, not a GC-heap block (see
+        // emit_str_replace_all).
+        self.asm.sub_sp_imm(32);
+        self.asm.add_reg_sp_imm(Reg::X6, 0);
 
         // Scratch layout: [0]=input_bytes_base [8]=input_len
         // [16]=delimiter_bytes_base [24]=delimiter_len
@@ -3185,6 +3192,7 @@ impl Emitter {
         self.asm.sub_reg_imm(Reg::X12, Reg::X12, 1);
         self.asm.branch(cons_loop, BranchKind::Unconditional);
         self.asm.bind(cons_done);
+        self.asm.add_sp_imm(32);
     }
 
     /// `split`(input, ""): each UTF-8 character becomes its own
