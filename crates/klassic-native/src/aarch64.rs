@@ -1364,15 +1364,6 @@ fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueTyp
     }
 }
 
-/// Does this branch of an `if` have to box its value on the way out? Only when
-/// the branch holds an unboxed scalar and the other branch makes the join a
-/// nullable -- either by being `null` itself or by already being one.
-fn joins_as_nullable(ty: ValueType, other: Option<ValueType>) -> bool {
-    is_boxed_scalar(ty)
-        && matches!(other, Some(ValueType::Null) | Some(ValueType::Nullable(_)))
-        && merge_branch_types(ty, other.expect("checked just above")).is_some()
-}
-
 /// Whether a value of type `actual` can flow into a slot of type
 /// `expected` (locals, arguments, returns): exact match, or the
 /// polymorphic empty list into any list slot.
@@ -2076,28 +2067,54 @@ impl Emitter {
                 let end_label = self.asm.new_label();
                 self.asm
                     .branch(else_label, BranchKind::CompareZero(Reg::X0));
-                let then_ty = self.expression(then_branch)?;
-                // If the other branch yields `null`, this branch's value has
-                // to leave boxed so the join is one word either way. That
-                // decision needs the other branch's type *before* it is
-                // compiled, which is what the inference is for; when it cannot
-                // tell, nothing is boxed and the merge below reports the
-                // mismatch instead of miscompiling it.
-                if joins_as_nullable(
-                    then_ty,
+                // Whether this join is a nullable has to be decided *before*
+                // either branch is compiled: a branch yielding a bare scalar
+                // boxes on its way out so the join is one word either way, and
+                // once its code is emitted there is no going back. So both
+                // branches are predicted here, and the decision is checked
+                // against what they actually turn out to be below.
+                let predicted = match (
+                    self.static_type_under(then_branch, &mut Vec::new(), 0),
                     self.static_type_under(else_branch, &mut Vec::new(), 0),
                 ) {
+                    (Some(then_ty), Some(else_ty)) => merge_branch_types(then_ty, else_ty),
+                    _ => None,
+                };
+                let nullable_join = matches!(predicted, Some(ValueType::Nullable(_)));
+                let then_ty = self.expression(then_branch)?;
+                let boxed_then = nullable_join && is_boxed_scalar(then_ty);
+                if boxed_then {
                     self.emit_box_scalar();
                 }
                 self.asm.branch(end_label, BranchKind::Unconditional);
                 self.asm.bind(else_label);
                 let else_ty = self.expression(else_branch)?;
-                if joins_as_nullable(else_ty, Some(then_ty)) {
+                let boxed_else = nullable_join && is_boxed_scalar(else_ty);
+                if boxed_else {
                     self.emit_box_scalar();
                 }
                 self.asm.bind(end_label);
-                merge_branch_types(then_ty, else_ty)
-                    .ok_or_else(|| unsupported(*span, "if branches with different types"))
+                let merged = merge_branch_types(then_ty, else_ty)
+                    .ok_or_else(|| unsupported(*span, "if branches with different types"))?;
+                // The prediction has to have been right about the boxing, or
+                // the value and its type disagree: a nullable holding an
+                // unboxed scalar gets dereferenced as a pointer at the far end,
+                // and an unboxed type holding a box reads the box's address as
+                // the value. Neither is something to compile, so where the
+                // inference could not see the join coming, say so.
+                let boxing_matches = if matches!(merged, ValueType::Nullable(_)) {
+                    (!is_boxed_scalar(then_ty) || boxed_then)
+                        && (!is_boxed_scalar(else_ty) || boxed_else)
+                } else {
+                    !boxed_then && !boxed_else
+                };
+                if !boxing_matches {
+                    return Err(unsupported(
+                        *span,
+                        "an if whose branches join as a nullable the inference could not predict",
+                    ));
+                }
+                Ok(merged)
             }
             // A block in expression position: statements, then the
             // value of the final expression (the enum lowering leans
@@ -6185,10 +6202,41 @@ impl Emitter {
                 if let Some(generic) = self.generic_functions.iter().rposition(|generic| {
                     generic.name == *name && generic.params.len() == arguments.len()
                 }) {
-                    let generic = self.generic_functions[generic].clone();
-                    if let Some(declared) = generic.declared_return {
+                    let specialised = self.generic_functions[generic].clone();
+                    if let Some(declared) = specialised.declared_return {
                         return Some(declared);
                     }
+                    // A specialisation already registered for these arguments
+                    // answers with its own return type. This is what types a
+                    // *recursive* call: the specialisation goes into the table
+                    // before its body is compiled, so a call inside that body
+                    // gets the real answer here instead of descending into the
+                    // body again and running into the depth limit -- and the
+                    // depth limit would answer with the base case alone, which
+                    // for a function returning `null` or a value is exactly the
+                    // half that leaves the other half unboxed.
+                    let values: Vec<ValueType> = arguments
+                        .iter()
+                        .filter_map(|argument| self.static_type_under(argument, locals, depth + 1))
+                        .collect();
+                    let mut registered = self
+                        .specializations
+                        .iter()
+                        .filter(|((which, _), _)| *which == generic)
+                        .map(|(_, index)| &self.functions[*index].1)
+                        .filter(|info| {
+                            info.params
+                                .iter()
+                                .map(|(_, ty)| *ty)
+                                .eq(values.iter().copied())
+                        })
+                        .map(|info| info.ret);
+                    if let Some(first) = registered.next()
+                        && registered.all(|ret| ret == first)
+                    {
+                        return Some(first);
+                    }
+                    let generic = specialised;
                     let params = &generic.params;
                     let body = &generic.body;
                     let mut callee_locals = Vec::with_capacity(params.len());
