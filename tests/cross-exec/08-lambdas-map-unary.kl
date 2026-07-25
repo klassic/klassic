@@ -106,6 +106,15 @@ println([1 2 3] == [1 2 3])
 println([1 2 3] == [1 2 4])
 println(["x" "y"] == ["x" "y"])
 println([1 2] == [1 2 3])
+// Lists of lists, rendered, measured, taken apart and compared by content.
+val grid = [[1 2 3] [4 5 6]]
+println(grid)
+println(size(grid))
+println(head(grid))
+println([["a" "b"] ["c"]])
+println("grid=" + grid)
+assertResult([[1, 2, 3], [4, 5, 6]])(grid)
+
 assertResult([1, 2, 3])([1 2 3])
 assertResult([2, 3, 4])(map([1 2 3])((x) => x + 1))
 

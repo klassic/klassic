@@ -1222,6 +1222,62 @@ enum ListElem {
     Int,
     Bool,
     Str,
+    /// An element that is itself a list: `depth` levels of list over `base`.
+    /// `List<List<Int>>`'s element is `Nested { depth: 1, base: Int }` and
+    /// `List<List<List<Int>>>`'s is `depth: 2`.
+    ///
+    /// Encoding the nesting as a depth rather than a boxed inner element keeps
+    /// `ListElem` `Copy` -- which everything from the specialisation keys to
+    /// the codegen relies on -- while still describing any depth.
+    Nested {
+        depth: u8,
+        base: ScalarElem,
+    },
+}
+
+/// The scalar element types, i.e. `ListElem` minus the nested case. Only used
+/// as `Nested`'s base so the nesting can be a plain depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ScalarElem {
+    Double,
+    Int,
+    Bool,
+    Str,
+}
+
+impl ScalarElem {
+    fn as_elem(self) -> ListElem {
+        match self {
+            ScalarElem::Double => ListElem::Double,
+            ScalarElem::Int => ListElem::Int,
+            ScalarElem::Bool => ListElem::Bool,
+            ScalarElem::Str => ListElem::Str,
+        }
+    }
+}
+
+impl ListElem {
+    fn as_scalar(self) -> Option<ScalarElem> {
+        match self {
+            ListElem::Double => Some(ScalarElem::Double),
+            ListElem::Int => Some(ScalarElem::Int),
+            ListElem::Bool => Some(ScalarElem::Bool),
+            ListElem::Str => Some(ScalarElem::Str),
+            ListElem::Nested { .. } => None,
+        }
+    }
+
+    /// For a nested element, the element type of the list it *is*.
+    fn nested_inner(self) -> Option<ListElem> {
+        match self {
+            ListElem::Nested { depth: 1, base } => Some(base.as_elem()),
+            ListElem::Nested { depth, base } => Some(ListElem::Nested {
+                depth: depth - 1,
+                base,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// The value types the current subset can hold in a register / local.
@@ -1330,6 +1386,10 @@ fn elem_value_type(elem: ListElem) -> ValueType {
         ListElem::Double => ValueType::Double,
         ListElem::Bool => ValueType::Bool,
         ListElem::Str => ValueType::Str,
+        ListElem::Nested { .. } => ValueType::List(
+            elem.nested_inner()
+                .expect("a nested element is a list of its inner element"),
+        ),
     }
 }
 
@@ -1340,6 +1400,17 @@ fn list_elem_of(ty: ValueType) -> Option<ListElem> {
         ValueType::Double => Some(ListElem::Double),
         ValueType::Bool => Some(ListElem::Bool),
         ValueType::Str => Some(ListElem::Str),
+        // A list of lists: one more level over whatever the inner list holds.
+        ValueType::List(inner) => Some(match inner.as_scalar() {
+            Some(base) => ListElem::Nested { depth: 1, base },
+            None => match inner {
+                ListElem::Nested { depth, base } => ListElem::Nested {
+                    depth: depth + 1,
+                    base,
+                },
+                _ => unreachable!("as_scalar covers every non-nested element"),
+            },
+        }),
         _ => None,
     }
 }
@@ -4112,6 +4183,20 @@ impl Emitter {
             ListElem::Double => {
                 return Err(unsupported(span, "printing a Double element"));
             }
+            // A nested element is a list: build its text with the same
+            // renderer and write that. The recursion is at codegen time and
+            // terminates because the depth decreases.
+            ListElem::Nested { .. } => {
+                let inner = elem
+                    .nested_inner()
+                    .expect("a nested element is a list of its inner element");
+                self.emit_list_to_str(inner, "[", "]", span)?;
+                self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+                self.asm.add_reg_imm(Reg::X1, Reg::X0, 8);
+                self.asm.mov_imm64(Reg::X0, STDOUT_FD);
+                self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+                self.asm.svc_0x80();
+            }
             ListElem::Int => {
                 self.asm.sub_sp_imm(32);
                 self.asm.emit_int_digits(false);
@@ -4969,6 +5054,14 @@ impl Emitter {
             ListElem::Int => self.emit_int_to_str(),
             ListElem::Bool => self.emit_bool_to_str(),
             ListElem::Str => {}
+            // Same renderer one level down; the element pointer is already in
+            // x0, and the result replaces it.
+            ListElem::Nested { .. } => {
+                let inner = elem
+                    .nested_inner()
+                    .expect("a nested element is a list of its inner element");
+                self.emit_list_to_str(inner, "[", "]", span)?;
+            }
             // Guarded by the callers, which reject a Double element before
             // building any text (see emit_print_elem).
             ListElem::Double => return Err(unsupported(span, "rendering a Double element")),
