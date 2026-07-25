@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use klassic_span::{Diagnostic, Span};
-use klassic_syntax::{BinaryOp, Expr, StringPart};
+use klassic_syntax::{BinaryOp, Expr, StringPart, UnaryOp};
 
 use crate::macho::{self, DataFixup, FixupSection};
 use crate::portable_asm;
@@ -1354,6 +1354,14 @@ struct Emitter {
     /// annotations naming them type as plain heap pointers.
     lowered_enums: std::collections::HashSet<String>,
     scopes: Vec<HashMap<String, (u32, ValueType)>>,
+    /// Lambda bodies interned by `val f = (x) => ...`, and the names bound to
+    /// them, scoped like ordinary locals. A lambda has no runtime
+    /// representation here: it is compiled where it is *called*, with the
+    /// parameter types taken from the arguments at that site, so no closure
+    /// object or indirect call is needed for the cases the language's own
+    /// programs use.
+    lambdas: Vec<(Vec<String>, Expr)>,
+    lambda_bindings: Vec<HashMap<String, usize>>,
     next_local_offset: u32,
 }
 
@@ -1490,6 +1498,26 @@ impl Emitter {
                 Ok(ty)
             }
             Expr::Binary { lhs, op, rhs, span } => self.binary(lhs, *op, rhs, *span),
+            Expr::Unary { op, expr, span } => {
+                let ty = self.expression(expr)?;
+                match (op, ty) {
+                    (UnaryOp::Plus, ValueType::Int | ValueType::Double) => Ok(ty),
+                    (UnaryOp::Minus, ValueType::Int) => {
+                        // 0 - value, which is also how the evaluator negates.
+                        self.asm.mov_reg(Reg::X1, Reg::X0);
+                        self.asm.mov_imm64(Reg::X0, 0);
+                        self.asm.sub_reg(Reg::X0, Reg::X0, Reg::X1);
+                        Ok(ValueType::Int)
+                    }
+                    (UnaryOp::Not, ValueType::Bool) => {
+                        // Bools are 0/1, so flipping the low bit negates.
+                        self.asm.cmp_imm(Reg::X0, 0);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                        Ok(ValueType::Bool)
+                    }
+                    _ => Err(unsupported(*span, "this unary operator")),
+                }
+            }
             Expr::ListLiteral { elements, span } => {
                 // Build the cons chain back to front: all elements go
                 // onto the machine stack first, then each pop becomes
@@ -1627,6 +1655,24 @@ impl Emitter {
                 {
                     return self.emit_assert_result(&first_args[0], &arguments[0], *span);
                 }
+                // Curried `map(list)(f)` where the function is a lambda
+                // literal: the list's element type gives the lambda's
+                // parameter type, so the body can be compiled straight into
+                // the loop.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: list_args,
+                        ..
+                    } = callee.as_ref()
+                    && list_args.len() == 1
+                    && let Expr::Identifier { name, .. } = inner.as_ref()
+                    && name == "map"
+                    && let Expr::Lambda { params, body, .. } = &arguments[0]
+                    && params.len() == 1
+                {
+                    return self.emit_list_map(&list_args[0], &params[0], body, *span);
+                }
                 // Curried `cons(head)(tail)` — the evaluator's list
                 // prepend builtin.
                 if arguments.len() == 1
@@ -1669,9 +1715,20 @@ impl Emitter {
                     }
                     return Err(unsupported(*span, &format!("method `{field}`")));
                 }
+                // An immediately applied lambda literal, `((x) => x + 1)(3)`.
+                if let Expr::Lambda { params, body, .. } = callee.as_ref() {
+                    let index = self.lambdas.len();
+                    self.lambdas.push((params.clone(), body.as_ref().clone()));
+                    return self.emit_inline_lambda_call(index, arguments, *span);
+                }
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return Err(unsupported(*span, "calling a non-identifier"));
                 };
+                // A name bound to a lambda shadows the function table, the
+                // same way a local shadows a top-level definition.
+                if let Some(index) = self.lookup_lambda(name) {
+                    return self.emit_inline_lambda_call(index, arguments, *span);
+                }
                 // `__enum_shape_named(value, "Variant")` and
                 // `__enum_shape_hint(value, id)` are shape aids the shared
                 // enum-lowering pass wraps around values for the x86_64
@@ -1723,12 +1780,14 @@ impl Emitter {
                     return Ok(ValueType::Unit);
                 };
                 self.scopes.push(HashMap::new());
+                self.lambda_bindings.push(HashMap::new());
                 self.scope_root_counts.push(0);
                 for expression in init {
                     self.statement(expression)?;
                 }
                 let ty = self.expression(last)?;
                 self.scopes.pop();
+                self.lambda_bindings.pop();
                 // The block's value is already in x0 and nothing allocates
                 // between here and its use, so dropping the block's roots
                 // now is safe (and the slots themselves are dead).
@@ -4612,6 +4671,168 @@ impl Emitter {
         }
     }
 
+    /// `map(list)(f)`: a fresh list of `f` applied to each element.
+    ///
+    /// The lambda's body is compiled *once*, inside the loop, with its
+    /// parameter bound to the current element -- so this is a real runtime
+    /// map rather than an unrolling, and it works for a list of any length
+    /// including one whose length is not known until run time. The result is
+    /// built by prepending and then reversed, reusing the cons-list machinery
+    /// the set literal already shares.
+    fn emit_list_map(
+        &mut self,
+        list: &Expr,
+        param: &str,
+        body: &Expr,
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let list_ty = self.expression(list)?;
+        let elem = match list_ty {
+            ValueType::List(elem) => elem,
+            // Mapping over an empty list is an empty list, whatever f is.
+            ValueType::EmptyList => return Ok(ValueType::EmptyList),
+            _ => return Err(unsupported(list.span(), "mapping over this value")),
+        };
+        // Three frame slots: the input cursor, the accumulated output and the
+        // element the lambda parameter names. The first two hold heap
+        // references across the allocations the body and the cons perform, so
+        // both are rooted; the parameter slot is rooted only when its type is
+        // a reference.
+        let cursor = self.next_local_offset;
+        let acc = cursor + 8;
+        let param_slot = acc + 8;
+        self.next_local_offset += 24;
+        self.asm.store_local(Reg::X0, cursor);
+        self.emit_root_frame_slot(cursor);
+        self.asm.mov_imm64(Reg::X0, 0); // acc = nil
+        self.asm.store_local(Reg::X0, acc);
+        self.emit_root_frame_slot(acc);
+
+        let elem_ty = elem_value_type(elem);
+        let loop_start = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.load_local(Reg::X0, cursor);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+        // element = [cursor + 0], unboxed when it is a scalar
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        self.asm.store_local(Reg::X0, param_slot);
+        self.scopes.push(HashMap::new());
+        self.lambda_bindings.push(HashMap::new());
+        self.scope_root_counts.push(0);
+        self.scopes
+            .last_mut()
+            .expect("emitter scope")
+            .insert(param.to_string(), (param_slot, elem_ty));
+        if is_heap_pointer(elem_ty) {
+            self.emit_root_frame_slot(param_slot);
+        }
+        let mapped = self.expression(body)?;
+        let Some(mapped_elem) = list_elem_of(mapped) else {
+            return Err(unsupported(body.span(), "a mapped element of this type"));
+        };
+        if is_boxed_scalar(mapped) {
+            self.emit_box_scalar();
+        }
+        // acc = cons(mapped, acc)
+        self.push_rooted(Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_cons_cell();
+        self.asm.store_local(Reg::X0, acc);
+        self.scopes.pop();
+        self.lambda_bindings.pop();
+        let roots = self.scope_root_counts.pop().expect("emitter root scope");
+        self.emit_shadow_pop(roots);
+        // cursor = [cursor + 8]
+        self.asm.load_local(Reg::X0, cursor);
+        self.emit_gc_load_ptr(Reg::X0, 8);
+        self.asm.store_local(Reg::X0, cursor);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(done);
+
+        // Prepending reversed the order; put it back.
+        self.asm.load_local(Reg::X0, acc);
+        let reverse = self.reverse_label();
+        self.asm.push_frame_record(); // the bl clobbers x30
+        self.asm.branch(reverse, BranchKind::Link);
+        self.asm.pop_frame_record();
+        let _ = span;
+        Ok(ValueType::List(mapped_elem))
+    }
+
+    /// A name bound to a lambda, innermost scope first.
+    fn lookup_lambda(&self, name: &str) -> Option<usize> {
+        self.lambda_bindings
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
+    /// Compile a call to a lambda-bound name by compiling the lambda's body
+    /// here, with its parameters bound to the arguments' slots and types.
+    ///
+    /// This is why no closure object is needed: the body is compiled in the
+    /// caller's frame, so a captured local is simply still in scope. The
+    /// parameter slots are released afterwards, so N call sites reuse them
+    /// rather than each growing the frame.
+    fn emit_inline_lambda_call(
+        &mut self,
+        index: usize,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let (params, body) = self.lambdas[index].clone();
+        if params.len() != arguments.len() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "this lambda expects {} argument(s) but got {}",
+                    params.len(),
+                    arguments.len()
+                ),
+            ));
+        }
+        // Evaluate the arguments in the caller's scope, before the parameters
+        // shadow anything, and park each one in its own slot.
+        let mut bound = Vec::with_capacity(params.len());
+        let saved_offset = self.next_local_offset;
+        for argument in arguments {
+            let ty = self.expression(argument)?;
+            if ty == ValueType::Unit {
+                return Err(unsupported(argument.span(), "a unit-typed argument"));
+            }
+            let offset = self.next_local_offset;
+            self.next_local_offset += 8;
+            self.asm.store_local(Reg::X0, offset);
+            bound.push((offset, ty));
+        }
+        self.scopes.push(HashMap::new());
+        self.lambda_bindings.push(HashMap::new());
+        self.scope_root_counts.push(0);
+        for (param, (offset, ty)) in params.iter().zip(bound.iter()) {
+            self.scopes
+                .last_mut()
+                .expect("emitter scope")
+                .insert(param.clone(), (*offset, *ty));
+            // A heap-reference parameter is a root for the body's duration,
+            // exactly like a binding of the same type would be.
+            if is_heap_pointer(*ty) {
+                self.emit_root_frame_slot(*offset);
+            }
+        }
+        let result = self.expression(&body)?;
+        self.scopes.pop();
+        self.lambda_bindings.pop();
+        let roots = self.scope_root_counts.pop().expect("emitter root scope");
+        self.emit_shadow_pop(roots);
+        // The parameter slots are dead now; let the next call reuse them.
+        self.next_local_offset = saved_offset;
+        Ok(result)
+    }
+
     fn function_call(
         &mut self,
         name: &str,
@@ -4732,6 +4953,7 @@ impl Emitter {
         self.asm.mov_fp_sp();
 
         self.scopes.push(HashMap::new());
+        self.lambda_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
         let saved_offset = self.next_local_offset;
         self.next_local_offset = 0;
@@ -4750,6 +4972,7 @@ impl Emitter {
         }
         let body_ty = self.expression(&body)?;
         self.scopes.pop();
+        self.lambda_bindings.pop();
         // Drop this activation's roots before returning; the result is in
         // x0, which the pop helper preserves.
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
@@ -4850,11 +5073,13 @@ impl Emitter {
         match expr {
             Expr::Block { expressions, .. } => {
                 self.scopes.push(HashMap::new());
+                self.lambda_bindings.push(HashMap::new());
                 self.scope_root_counts.push(0);
                 for expression in expressions {
                     self.statement(expression)?;
                 }
                 self.scopes.pop();
+                self.lambda_bindings.pop();
                 let roots = self.scope_root_counts.pop().expect("emitter root scope");
                 self.emit_shadow_pop(roots);
                 Ok(())
@@ -4872,6 +5097,19 @@ impl Emitter {
             | Expr::TypeClassDeclaration { .. }
             | Expr::InstanceDeclaration { .. } => Ok(()),
             Expr::VarDecl { name, value, .. } => {
+                // `val f = (x) => ...`: bind the name to the lambda body
+                // instead of to a slot. There is nothing to store -- the body
+                // is compiled at each call site, where the parameter types
+                // are known from the arguments.
+                if let Expr::Lambda { params, body, .. } = value.as_ref() {
+                    let index = self.lambdas.len();
+                    self.lambdas.push((params.clone(), body.as_ref().clone()));
+                    self.lambda_bindings
+                        .last_mut()
+                        .expect("emitter lambda scope")
+                        .insert(name.clone(), index);
+                    return Ok(());
+                }
                 let ty = self.expression(value)?;
                 if ty == ValueType::Unit {
                     return Err(unsupported(value.span(), "a unit-typed binding"));
@@ -4963,6 +5201,11 @@ impl Emitter {
 /// is touched.
 fn count_var_decls(expr: &Expr) -> u32 {
     match expr {
+        // A lambda's parameters and locals become frame slots of whichever
+        // function inlines it; the slots are released again after the call
+        // (see emit_inline_lambda_call), so counting each lambda once is
+        // enough for the frame to hold the deepest single call.
+        Expr::Lambda { params, body, .. } => params.len() as u32 + count_var_decls(body),
         Expr::VarDecl { value, .. } => 1 + count_var_decls(value),
         Expr::Assign { value, .. } => count_var_decls(value),
         Expr::Block { expressions, .. } => expressions.iter().map(count_var_decls).sum(),
@@ -5785,6 +6028,7 @@ pub(crate) fn emit_macho_program(
         ..Emitter::default()
     };
     emitter.scopes.push(HashMap::new());
+    emitter.lambda_bindings.push(HashMap::new());
     emitter.scope_root_counts.push(0);
     collect_records(expr, &mut emitter);
     collect_functions(expr, &mut emitter);

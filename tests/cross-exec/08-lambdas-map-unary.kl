@@ -1,0 +1,52 @@
+// Cross-target fixture: lambdas, list mapping and unary operators.
+//
+// A lambda here has no runtime representation -- it is compiled where it is
+// called, with its parameter types taken from the arguments -- so this
+// fixture is what proves the two paths agree with the evaluator: a lambda
+// bound to a name and called later, and a lambda literal handed to `map`.
+//
+// The `map` cases matter for the collector too: the body allocates a fresh
+// element per iteration while the input cursor and the accumulated output are
+// both live, so a missing root would show up here as a wrong list.
+
+val add = (x, y) => x + y
+val twice = (n) => n * 2
+val shout = (s) => s + "!"
+
+println(add(3, 4))
+println(twice(21))
+println(add(twice(5), 1))
+println(shout("hi"))
+
+// Immediately applied lambda literal.
+println(((x) => x * x)(7))
+
+// map over a literal list, over a bound list, and with a string body.
+println(map([1 2 3])((x) => x + 1))
+val nums = [10 20 30]
+println(map(nums)((n) => n - 5))
+println(map(nums)((n) => n * n))
+println(map(["a" "b" "c"])((s) => s + "?"))
+
+// The mapped list is a real list: it can be measured and taken apart.
+val doubled = map(nums)((x) => x * 2)
+println(doubled)
+println(size(doubled))
+println(head(doubled))
+println(tail(doubled))
+
+// Unary operators, including on a bound value and inside arithmetic.
+val ten = 10
+println(-5)
+println(-ten)
+println(-(3 + 4))
+println(+7)
+println(!true)
+println(!false)
+println(6 - -1)
+
+assertResult(7)(add(3, 4))
+assertResult(-10)(-ten)
+assertResult(true)(!false)
+assertResult(49)(((x) => x * x)(7))
+println("assertions held")
