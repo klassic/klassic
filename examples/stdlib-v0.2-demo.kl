@@ -6,6 +6,12 @@
 // (`klassic build`) emits a "not yet supported" diagnostic.
 
 import std.list.{range, sum, filter}
+// The methods this demo calls on String and Map come from these modules'
+// extensions. The evaluator has every stdlib module loaded, so it resolves
+// them without being told; a compiled program only sees the modules it
+// imports, so the imports have to be written down for the demo to build.
+import std.string
+import std.map
 import std.math.{mod, clamp}
 import std.option.{some, none, getOrElse}
 

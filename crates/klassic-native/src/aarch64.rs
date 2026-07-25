@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use klassic_span::{Diagnostic, Span};
-use klassic_syntax::{BinaryOp, Expr, StringPart};
+use klassic_syntax::{BinaryOp, Expr, StringPart, UnaryOp};
 
 use crate::macho::{self, DataFixup, FixupSection};
 use crate::portable_asm;
@@ -680,6 +680,41 @@ impl Assembler {
         self.word(0x1e60_1800 | (dm << 16) | (dn << 5) | dd);
     }
 
+    /// `fsqrt dd, dn`
+    fn fsqrt_d(&mut self, dd: u32, dn: u32) {
+        self.word(0x1e61_c000 | (dn << 5) | dd);
+    }
+
+    /// `fneg dd, dn`
+    fn fneg_d(&mut self, dd: u32, dn: u32) {
+        self.word(0x1e61_4000 | (dn << 5) | dd);
+    }
+
+    /// `fabs dd, dn`
+    fn fabs_d(&mut self, dd: u32, dn: u32) {
+        self.word(0x1e60_c000 | (dn << 5) | dd);
+    }
+
+    /// `scvtf dd, xn` — signed 64-bit integer to double.
+    fn scvtf_d_from_x(&mut self, dd: u32, x: Reg) {
+        self.word(0x9e62_0000 | ((x as u32) << 5) | dd);
+    }
+
+    /// `fcvtzs xd, dn` — double to signed 64-bit integer, truncating.
+    fn fcvtzs_x_from_d(&mut self, x: Reg, dn: u32) {
+        self.word(0x9e78_0000 | (dn << 5) | x as u32);
+    }
+
+    /// `frintm dd, dn` — round toward minus infinity (floor).
+    fn frintm_d(&mut self, dd: u32, dn: u32) {
+        self.word(0x1e65_4000 | (dn << 5) | dd);
+    }
+
+    /// `frintp dd, dn` — round toward plus infinity (ceil).
+    fn frintp_d(&mut self, dd: u32, dn: u32) {
+        self.word(0x1e64_c000 | (dn << 5) | dd);
+    }
+
     /// `fcmp dn, dm` — sets NZCV for a conditional-set.
     fn fcmp_d(&mut self, dn: u32, dm: u32) {
         self.word(0x1e60_2000 | (dm << 16) | (dn << 5));
@@ -1178,18 +1213,78 @@ fn unsupported(span: Span, feature: &str) -> Diagnostic {
 }
 
 /// Element types a list can carry in the current subset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ListElem {
+    /// A `Double`, carried as its raw bits like every other Double here.
+    /// Printing one is still unsupported (that needs the shortest-round-trip
+    /// formatter the x86-64 backend has), but folding and comparing work.
+    Double,
     Int,
     Bool,
     Str,
+    /// An element that is itself a list: `depth` levels of list over `base`.
+    /// `List<List<Int>>`'s element is `Nested { depth: 1, base: Int }` and
+    /// `List<List<List<Int>>>`'s is `depth: 2`.
+    ///
+    /// Encoding the nesting as a depth rather than a boxed inner element keeps
+    /// `ListElem` `Copy` -- which everything from the specialisation keys to
+    /// the codegen relies on -- while still describing any depth.
+    Nested {
+        depth: u8,
+        base: ScalarElem,
+    },
+}
+
+/// The scalar element types, i.e. `ListElem` minus the nested case. Only used
+/// as `Nested`'s base so the nesting can be a plain depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ScalarElem {
+    Double,
+    Int,
+    Bool,
+    Str,
+}
+
+impl ScalarElem {
+    fn as_elem(self) -> ListElem {
+        match self {
+            ScalarElem::Double => ListElem::Double,
+            ScalarElem::Int => ListElem::Int,
+            ScalarElem::Bool => ListElem::Bool,
+            ScalarElem::Str => ListElem::Str,
+        }
+    }
+}
+
+impl ListElem {
+    fn as_scalar(self) -> Option<ScalarElem> {
+        match self {
+            ListElem::Double => Some(ScalarElem::Double),
+            ListElem::Int => Some(ScalarElem::Int),
+            ListElem::Bool => Some(ScalarElem::Bool),
+            ListElem::Str => Some(ScalarElem::Str),
+            ListElem::Nested { .. } => None,
+        }
+    }
+
+    /// For a nested element, the element type of the list it *is*.
+    fn nested_inner(self) -> Option<ListElem> {
+        match self {
+            ListElem::Nested { depth: 1, base } => Some(base.as_elem()),
+            ListElem::Nested { depth, base } => Some(ListElem::Nested {
+                depth: depth - 1,
+                base,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// The value types the current subset can hold in a register / local.
 /// `Str` is a pointer to a `[len: u64][bytes]` object in rodata or on
 /// the bump heap; `List` is a pointer to a `[value: u64][next: ptr]`
 /// cons cell (nil is the null pointer).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ValueType {
     Int,
     /// An IEEE 754 double held as raw bits in a GP register / frame
@@ -1288,8 +1383,13 @@ fn is_heap_pointer(ty: ValueType) -> bool {
 fn elem_value_type(elem: ListElem) -> ValueType {
     match elem {
         ListElem::Int => ValueType::Int,
+        ListElem::Double => ValueType::Double,
         ListElem::Bool => ValueType::Bool,
         ListElem::Str => ValueType::Str,
+        ListElem::Nested { .. } => ValueType::List(
+            elem.nested_inner()
+                .expect("a nested element is a list of its inner element"),
+        ),
     }
 }
 
@@ -1297,8 +1397,20 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 fn list_elem_of(ty: ValueType) -> Option<ListElem> {
     match ty {
         ValueType::Int => Some(ListElem::Int),
+        ValueType::Double => Some(ListElem::Double),
         ValueType::Bool => Some(ListElem::Bool),
         ValueType::Str => Some(ListElem::Str),
+        // A list of lists: one more level over whatever the inner list holds.
+        ValueType::List(inner) => Some(match inner.as_scalar() {
+            Some(base) => ListElem::Nested { depth: 1, base },
+            None => match inner {
+                ListElem::Nested { depth, base } => ListElem::Nested {
+                    depth: depth + 1,
+                    base,
+                },
+                _ => unreachable!("as_scalar covers every non-nested element"),
+            },
+        }),
         _ => None,
     }
 }
@@ -1306,9 +1418,33 @@ fn list_elem_of(ty: ValueType) -> Option<ListElem> {
 /// A top-level annotated `def` compiled as a real AAPCS64 function:
 /// arguments in x0..x7, result in x0, frame record saved by the
 /// callee prologue (which is what makes recursion per-frame safe).
+/// A def whose signature is not fully concrete, kept whole so each call site
+/// can specialise it.
+#[derive(Clone)]
+struct GenericFunction {
+    name: String,
+    params: Vec<String>,
+    body: Expr,
+    /// The return type when the annotation names one this backend models.
+    declared_return: Option<ValueType>,
+    /// The annotations as written. A return type this backend cannot model on
+    /// its own -- a type variable, or one applied to something like `'m<Int>`
+    /// -- is still pinned down when it is *the same annotation* as a
+    /// parameter's: the result is then that argument's type, which is exactly
+    /// what `def pairWithNext<'m>(xs: 'm<Int>): 'm<Int>` says.
+    param_annotations: Vec<Option<String>>,
+    return_annotation: Option<String>,
+}
+
 struct FunctionInfo {
     label: Label,
     params: Vec<(String, ValueType)>,
+    /// Parameters bound to a lambda rather than to a runtime slot. A lambda
+    /// has no representation at run time in this backend -- it is compiled
+    /// where it is called -- so a higher-order def is specialised for the
+    /// particular lambda it was handed, and inside the body the parameter
+    /// name simply resolves to that lambda.
+    lambda_params: Vec<(String, usize)>,
     ret: ValueType,
     body: Expr,
 }
@@ -1354,6 +1490,21 @@ struct Emitter {
     /// annotations naming them type as plain heap pointers.
     lowered_enums: std::collections::HashSet<String>,
     scopes: Vec<HashMap<String, (u32, ValueType)>>,
+    /// Lambda bodies interned by `val f = (x) => ...`, and the names bound to
+    /// them, scoped like ordinary locals. A lambda has no runtime
+    /// representation here: it is compiled where it is *called*, with the
+    /// parameter types taken from the arguments at that site, so no closure
+    /// object or indirect call is needed for the cases the language's own
+    /// programs use.
+    /// Defs whose signature is not fully concrete -- `def fact(n) = ...`, or
+    /// a generic one like `def display<'a>(x: 'a): Unit where Show<'a>`.
+    /// They are compiled once per distinct tuple of argument types, keyed in
+    /// `specializations`, because the parameter types only exist at the call
+    /// site.
+    generic_functions: Vec<GenericFunction>,
+    specializations: HashMap<(usize, Vec<ValueType>), usize>,
+    lambdas: Vec<(Vec<String>, Expr)>,
+    lambda_bindings: Vec<HashMap<String, usize>>,
     next_local_offset: u32,
 }
 
@@ -1490,6 +1641,40 @@ impl Emitter {
                 Ok(ty)
             }
             Expr::Binary { lhs, op, rhs, span } => self.binary(lhs, *op, rhs, *span),
+            // `null` is the null pointer. Typed as a heap reference so a
+            // binding holding it is rooted like any other -- the root scan and
+            // both barriers already treat 0 as "nothing here", so a null slot
+            // costs nothing and needs no special case.
+            Expr::Null { .. } => {
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(ValueType::Ptr)
+            }
+            Expr::Unary { op, expr, span } => {
+                let ty = self.expression(expr)?;
+                match (op, ty) {
+                    (UnaryOp::Plus, ValueType::Int | ValueType::Double) => Ok(ty),
+                    (UnaryOp::Minus, ValueType::Double) => {
+                        self.asm.fmov_d_from_x(0, Reg::X0);
+                        self.asm.fneg_d(0, 0);
+                        self.asm.fmov_x_from_d(Reg::X0, 0);
+                        Ok(ValueType::Double)
+                    }
+                    (UnaryOp::Minus, ValueType::Int) => {
+                        // 0 - value, which is also how the evaluator negates.
+                        self.asm.mov_reg(Reg::X1, Reg::X0);
+                        self.asm.mov_imm64(Reg::X0, 0);
+                        self.asm.sub_reg(Reg::X0, Reg::X0, Reg::X1);
+                        Ok(ValueType::Int)
+                    }
+                    (UnaryOp::Not, ValueType::Bool) => {
+                        // Bools are 0/1, so flipping the low bit negates.
+                        self.asm.cmp_imm(Reg::X0, 0);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                        Ok(ValueType::Bool)
+                    }
+                    _ => Err(unsupported(*span, "this unary operator")),
+                }
+            }
             Expr::ListLiteral { elements, span } => {
                 // Build the cons chain back to front: all elements go
                 // onto the machine stack first, then each pop becomes
@@ -1609,6 +1794,82 @@ impl Emitter {
                 arguments,
                 span,
             } => {
+                // Curried builtins: the callee is itself a call, so the
+                // whole thing reads `f(a)(b)`. The language has no general
+                // first-class application in this backend yet, but several
+                // builtins are *defined* in curried form, and the x86-64
+                // backend recognises them the same way -- by matching the
+                // shape rather than by building closures.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: first_args,
+                        ..
+                    } = callee.as_ref()
+                    && first_args.len() == 1
+                    && let Expr::Identifier { name, .. } = inner.as_ref()
+                    && name == "assertResult"
+                {
+                    return self.emit_assert_result(&first_args[0], &arguments[0], *span);
+                }
+                // `map(list, f)` -- the same operation as the curried form,
+                // spelled the way the evaluator's own builtin takes it.
+                if arguments.len() == 2
+                    && let Expr::Identifier { name, .. } = callee.as_ref()
+                    && name == "map"
+                    && let Expr::Lambda { params, body, .. } = &arguments[1]
+                    && params.len() == 1
+                {
+                    return self.emit_list_map(&arguments[0], &params[0], body, *span);
+                }
+                // Curried `foldLeft(list)(init)(f)` -- which is also what
+                // `xs reduce init => r + e` desugars to -- with a lambda
+                // literal for f.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: with_initial,
+                        arguments: initial_args,
+                        ..
+                    } = callee.as_ref()
+                    && initial_args.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: list_args,
+                        ..
+                    } = with_initial.as_ref()
+                    && list_args.len() == 1
+                    && let Expr::Identifier { name, .. } = inner.as_ref()
+                    && name == "foldLeft"
+                    && let Expr::Lambda { params, body, .. } = &arguments[0]
+                    && params.len() == 2
+                {
+                    return self.emit_list_fold_left(
+                        &list_args[0],
+                        &initial_args[0],
+                        &params[0],
+                        &params[1],
+                        body,
+                        *span,
+                    );
+                }
+                // Curried `map(list)(f)` where the function is a lambda
+                // literal: the list's element type gives the lambda's
+                // parameter type, so the body can be compiled straight into
+                // the loop.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: list_args,
+                        ..
+                    } = callee.as_ref()
+                    && list_args.len() == 1
+                    && let Expr::Identifier { name, .. } = inner.as_ref()
+                    && name == "map"
+                    && let Expr::Lambda { params, body, .. } = &arguments[0]
+                    && params.len() == 1
+                {
+                    return self.emit_list_map(&list_args[0], &params[0], body, *span);
+                }
                 // Curried `cons(head)(tail)` — the evaluator's list
                 // prepend builtin.
                 if arguments.len() == 1
@@ -1651,9 +1912,20 @@ impl Emitter {
                     }
                     return Err(unsupported(*span, &format!("method `{field}`")));
                 }
+                // An immediately applied lambda literal, `((x) => x + 1)(3)`.
+                if let Expr::Lambda { params, body, .. } = callee.as_ref() {
+                    let index = self.lambdas.len();
+                    self.lambdas.push((params.clone(), body.as_ref().clone()));
+                    return self.emit_inline_lambda_call(index, arguments, *span);
+                }
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return Err(unsupported(*span, "calling a non-identifier"));
                 };
+                // A name bound to a lambda shadows the function table, the
+                // same way a local shadows a top-level definition.
+                if let Some(index) = self.lookup_lambda(name) {
+                    return self.emit_inline_lambda_call(index, arguments, *span);
+                }
                 // `__enum_shape_named(value, "Variant")` and
                 // `__enum_shape_hint(value, id)` are shape aids the shared
                 // enum-lowering pass wraps around values for the x86_64
@@ -1705,12 +1977,14 @@ impl Emitter {
                     return Ok(ValueType::Unit);
                 };
                 self.scopes.push(HashMap::new());
+                self.lambda_bindings.push(HashMap::new());
                 self.scope_root_counts.push(0);
                 for expression in init {
                     self.statement(expression)?;
                 }
                 let ty = self.expression(last)?;
                 self.scopes.pop();
+                self.lambda_bindings.pop();
                 // The block's value is already in x0 and nothing allocates
                 // between here and its use, so dropping the block's roots
                 // now is safe (and the slots themselves are dead).
@@ -2120,7 +2394,44 @@ impl Emitter {
         } else {
             self.asm.push(Reg::X0);
         }
-        let rhs_ty = self.expression(rhs)?;
+        let mut rhs_ty = self.expression(rhs)?;
+        // `"n=" + 42` and `"ok=" + true`: appending to a string converts the
+        // right operand, the way the evaluator and the x86-64 backend do. The
+        // conversion allocates, so it happens while the left operand is still
+        // parked as a root, before it is taken back.
+        if lhs_ty == ValueType::Str && op == BinaryOp::Add && rhs_ty != ValueType::Str {
+            match rhs_ty {
+                ValueType::Int => {
+                    self.emit_int_to_str();
+                    rhs_ty = ValueType::Str;
+                }
+                ValueType::Bool => {
+                    self.emit_bool_to_str();
+                    rhs_ty = ValueType::Str;
+                }
+                ValueType::List(elem) => {
+                    self.emit_list_to_str(elem, "[", "]", rhs.span())?;
+                    rhs_ty = ValueType::Str;
+                }
+                ValueType::Set(elem) => {
+                    self.emit_list_to_str(elem, "%(", ")", rhs.span())?;
+                    rhs_ty = ValueType::Str;
+                }
+                ValueType::EmptyList => {
+                    let offset = self.asm.intern_string_object("[]");
+                    self.asm.load_rodata_address(Reg::X0, offset);
+                    self.emit_heap_string_copy();
+                    rhs_ty = ValueType::Str;
+                }
+                ValueType::EmptySet => {
+                    let offset = self.asm.intern_string_object("%()");
+                    self.asm.load_rodata_address(Reg::X0, offset);
+                    self.emit_heap_string_copy();
+                    rhs_ty = ValueType::Str;
+                }
+                _ => return Err(unsupported(rhs.span(), "appending a value of this type")),
+            }
+        }
         self.asm.mov_reg(Reg::X1, Reg::X0);
         if root_lhs {
             self.pop_rooted(Reg::X0);
@@ -2226,6 +2537,18 @@ impl Emitter {
                 Ok(ValueType::Bool)
             }
             BinaryOp::Equal | BinaryOp::NotEqual => {
+                // Two collections are equal when their *contents* are, which
+                // is what the evaluator says and what `assertResult([1 2 3])(xs)`
+                // in the sample programs relies on. Comparing the pointers
+                // would call two separately built lists different.
+                if let ValueType::List(elem) | ValueType::Set(elem) = lhs_ty {
+                    self.emit_list_eq(elem, span)?;
+                    if op == BinaryOp::NotEqual {
+                        self.asm.cmp_imm(Reg::X0, 0);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                    }
+                    return Ok(ValueType::Bool);
+                }
                 let cond = if op == BinaryOp::Equal {
                     Cond::Eq
                 } else {
@@ -2237,6 +2560,33 @@ impl Emitter {
             }
             _ => Err(unsupported(span, "this binary operator")),
         }
+    }
+
+    /// `assertResult(expected)(actual)`: the test-program assertion. Equal
+    /// values yield Unit; unequal ones abort with the evaluator's message
+    /// prefix on stderr, which is what the sample programs rely on to fail
+    /// loudly rather than print a wrong answer.
+    ///
+    /// The comparison reuses the ordinary `==` path, so it inherits its type
+    /// checking and its per-type semantics (byte-wise for strings, value for
+    /// scalars) instead of duplicating them.
+    fn emit_assert_result(
+        &mut self,
+        expected: &Expr,
+        actual: &Expr,
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let ty = self.binary(expected, BinaryOp::Equal, actual, span)?;
+        if ty != ValueType::Bool {
+            return Err(unsupported(span, "assertResult on values of this type"));
+        }
+        let ok = self.asm.new_label();
+        self.asm.branch(ok, BranchKind::CompareNonZero(Reg::X0));
+        self.asm
+            .emit_write_rodata(STDERR_FD, b"klassic: assertResult failed\n");
+        self.asm.emit_exit(1);
+        self.asm.bind(ok);
+        Ok(ValueType::Unit)
     }
 
     fn gc_alloc_entry_label(&mut self) -> Label {
@@ -3688,7 +4038,7 @@ impl Emitter {
     }
 
     /// println of the set in x0 in the evaluator's format: `%(e1, e2)`.
-    fn emit_println_set(&mut self, elem: ListElem) {
+    fn emit_println_set(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         let loop_start = self.asm.new_label();
         let close = self.asm.new_label();
         self.asm.push(Reg::X0);
@@ -3705,7 +4055,7 @@ impl Emitter {
         if is_boxed_scalar(elem_value_type(elem)) {
             self.emit_unbox_scalar();
         }
-        self.emit_print_elem(elem);
+        self.emit_print_elem(elem, span)?;
         self.asm.pop(Reg::X3);
         self.emit_gc_load_ptr(Reg::X3, 8); // x0 = next (barriered)
         self.asm.mov_reg(Reg::X3, Reg::X0);
@@ -3716,6 +4066,7 @@ impl Emitter {
         self.asm.bind(close);
         self.asm.pop(Reg::X3);
         self.asm.emit_write_rodata(STDOUT_FD, b")\n");
+        Ok(())
     }
 
     /// `bl`-called scalar membership scan: x0 = list, x1 = candidate
@@ -3824,8 +4175,28 @@ impl Emitter {
 
     /// Print one element value in x0 without a newline; clobbers
     /// x0-x5/x16.
-    fn emit_print_elem(&mut self, elem: ListElem) {
+    fn emit_print_elem(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         match elem {
+            // Rendering a Double needs the shortest-round-trip formatter this
+            // backend does not have yet; arithmetic and comparison on Doubles
+            // (including inside a list) work regardless.
+            ListElem::Double => {
+                return Err(unsupported(span, "printing a Double element"));
+            }
+            // A nested element is a list: build its text with the same
+            // renderer and write that. The recursion is at codegen time and
+            // terminates because the depth decreases.
+            ListElem::Nested { .. } => {
+                let inner = elem
+                    .nested_inner()
+                    .expect("a nested element is a list of its inner element");
+                self.emit_list_to_str(inner, "[", "]", span)?;
+                self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+                self.asm.add_reg_imm(Reg::X1, Reg::X0, 8);
+                self.asm.mov_imm64(Reg::X0, STDOUT_FD);
+                self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+                self.asm.svc_0x80();
+            }
             ListElem::Int => {
                 self.asm.sub_sp_imm(32);
                 self.asm.emit_int_digits(false);
@@ -3855,6 +4226,7 @@ impl Emitter {
                 self.asm.bind(end_label);
             }
         }
+        Ok(())
     }
 
     /// println of the record object in x0 in the evaluator's format:
@@ -3883,7 +4255,7 @@ impl Emitter {
             if is_boxed_scalar(*ty) {
                 self.emit_unbox_scalar();
             }
-            self.emit_print_elem(list_elem_of(*ty).expect("checked above"));
+            self.emit_print_elem(list_elem_of(*ty).expect("checked above"), span)?;
         }
         self.asm.pop(Reg::X0); // discard the saved object
         self.asm.emit_write_rodata(STDOUT_FD, b")\n");
@@ -3892,7 +4264,7 @@ impl Emitter {
 
     /// println of the list in x0 in the evaluator's format:
     /// `[e1, e2, ...]` (strings unquoted).
-    fn emit_println_list(&mut self, elem: ListElem) {
+    fn emit_println_list(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         let loop_start = self.asm.new_label();
         let close = self.asm.new_label();
         self.asm.push(Reg::X0); // cursor survives the writes below
@@ -3909,7 +4281,7 @@ impl Emitter {
         if is_boxed_scalar(elem_value_type(elem)) {
             self.emit_unbox_scalar();
         }
-        self.emit_print_elem(elem);
+        self.emit_print_elem(elem, span)?;
         self.asm.pop(Reg::X3);
         self.emit_gc_load_ptr(Reg::X3, 8); // x0 = next (barriered)
         self.asm.mov_reg(Reg::X3, Reg::X0);
@@ -3920,6 +4292,7 @@ impl Emitter {
         self.asm.bind(close);
         self.asm.pop(Reg::X3); // discard the cursor slot
         self.asm.emit_write_rodata(STDOUT_FD, b"]\n");
+        Ok(())
     }
 
     /// println of the string object in x0: one write for the payload,
@@ -4304,6 +4677,80 @@ impl Emitter {
                 }
                 Ok(Some(ValueType::Str))
             }
+            // ---- numeric builtins ----
+            // Doubles travel as their raw bits in a general register, so each
+            // of these moves through d0 and back. `abs` is the only one that
+            // also has an integer form.
+            ("double", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                match ty {
+                    ValueType::Int => {
+                        self.asm.scvtf_d_from_x(0, Reg::X0);
+                        self.asm.fmov_x_from_d(Reg::X0, 0);
+                        Ok(Some(ValueType::Double))
+                    }
+                    ValueType::Double => Ok(Some(ValueType::Double)),
+                    _ => Err(unsupported(span, "double of this type")),
+                }
+            }
+            ("sqrt", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                match ty {
+                    ValueType::Double => {
+                        self.asm.fmov_d_from_x(0, Reg::X0);
+                        self.asm.fsqrt_d(0, 0);
+                        self.asm.fmov_x_from_d(Reg::X0, 0);
+                        Ok(Some(ValueType::Double))
+                    }
+                    // The evaluator's sqrt is Double-valued for an Int too.
+                    ValueType::Int => {
+                        self.asm.scvtf_d_from_x(0, Reg::X0);
+                        self.asm.fsqrt_d(0, 0);
+                        self.asm.fmov_x_from_d(Reg::X0, 0);
+                        Ok(Some(ValueType::Double))
+                    }
+                    _ => Err(unsupported(span, "sqrt of this type")),
+                }
+            }
+            ("floor", 1) | ("ceil", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                if ty != ValueType::Double {
+                    return Err(unsupported(span, &format!("{name} of a non-Double")));
+                }
+                self.asm.fmov_d_from_x(0, Reg::X0);
+                if name == "floor" {
+                    self.asm.frintm_d(0, 0);
+                } else {
+                    self.asm.frintp_d(0, 0);
+                }
+                // The evaluator's floor/ceil are Int-valued.
+                self.asm.fcvtzs_x_from_d(Reg::X0, 0);
+                Ok(Some(ValueType::Int))
+            }
+            ("abs", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                match ty {
+                    ValueType::Double => {
+                        self.asm.fmov_d_from_x(0, Reg::X0);
+                        self.asm.fabs_d(0, 0);
+                        self.asm.fmov_x_from_d(Reg::X0, 0);
+                        Ok(Some(ValueType::Double))
+                    }
+                    ValueType::Int => {
+                        // negative ? 0 - value : value
+                        let non_negative = self.asm.new_label();
+                        self.asm.cmp_imm(Reg::X0, 0);
+                        self.asm
+                            .branch(non_negative, BranchKind::Conditional(Cond::Ge));
+                        self.asm.mov_reg(Reg::X1, Reg::X0);
+                        self.asm.mov_imm64(Reg::X0, 0);
+                        self.asm.sub_reg(Reg::X0, Reg::X0, Reg::X1);
+                        self.asm.bind(non_negative);
+                        Ok(Some(ValueType::Int))
+                    }
+                    _ => Err(unsupported(span, "abs of this type")),
+                }
+            }
             ("__match_fail", 0) => {
                 self.asm
                     .emit_write_rodata(STDERR_FD, b"klassic: match: no pattern matched\n");
@@ -4512,6 +4959,839 @@ impl Emitter {
     /// Call a top-level annotated function: arguments are evaluated
     /// left to right onto the machine stack, then popped into the
     /// AAPCS64 argument registers right to left.
+    /// The type of an expression, worked out *without* emitting code, for
+    /// decisions that must happen before compiling anything -- currently
+    /// choosing between same-named typeclass instance methods. Deliberately
+    /// partial: `None` means "cannot tell cheaply", and every caller has a
+    /// defined behaviour for that.
+    fn static_type_of(&self, expr: &Expr) -> Option<ValueType> {
+        match expr {
+            Expr::Int { .. } => Some(ValueType::Int),
+            Expr::Double { .. } => Some(ValueType::Double),
+            Expr::Bool { .. } => Some(ValueType::Bool),
+            Expr::String { .. } | Expr::StringInterpolation { .. } => Some(ValueType::Str),
+            Expr::Identifier { name, .. } => self.lookup(name).map(|(_, ty)| ty),
+            Expr::ListLiteral { elements, .. } => match elements.first() {
+                None => Some(ValueType::EmptyList),
+                Some(first) => list_elem_of(self.static_type_of(first)?).map(ValueType::List),
+            },
+            Expr::SetLiteral { elements, .. } => match elements.first() {
+                None => Some(ValueType::EmptySet),
+                Some(first) => list_elem_of(self.static_type_of(first)?).map(ValueType::Set),
+            },
+            Expr::RecordConstructor { name, .. } => self
+                .records
+                .iter()
+                .position(|record| record.usable && &record.name == name)
+                .map(|index| ValueType::Record(index as u32)),
+            Expr::Call { callee, .. } => {
+                let Expr::Identifier { name, .. } = callee.as_ref() else {
+                    return None;
+                };
+                let mut matching = self.functions.iter().filter(|(n, _)| n == name);
+                let first = matching.next()?;
+                // Only unambiguous when the name has exactly one definition.
+                matching.next().is_none().then_some(first.1.ret)
+            }
+            _ => None,
+        }
+    }
+
+    /// Build the evaluator's textual form of a cons list as a heap string:
+    /// `[1, 2, 3]` for a list, `%(1, 2)` for a set, `[]` when empty.
+    ///
+    /// Every step allocates -- each element's text, each concatenation -- so
+    /// the input cursor and the string being built live in rooted slots and
+    /// the loop re-reads them rather than holding them in registers.
+    fn emit_list_to_str(
+        &mut self,
+        elem: ListElem,
+        open: &str,
+        close: &str,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let cursor = self.next_local_offset;
+        let acc = cursor + 8;
+        let sep = acc + 8;
+        self.next_local_offset += 24;
+        self.asm.store_local(Reg::X0, cursor);
+        self.emit_root_frame_slot(cursor);
+        let open_offset = self.asm.intern_string_object(open);
+        self.asm.load_rodata_address(Reg::X0, open_offset);
+        self.emit_heap_string_copy();
+        self.asm.store_local(Reg::X0, acc);
+        self.emit_root_frame_slot(acc);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.store_local(Reg::X0, sep);
+
+        let loop_start = self.asm.new_label();
+        let done = self.asm.new_label();
+        let no_sep = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.load_local(Reg::X0, cursor);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+        // Separator before every element but the first.
+        self.asm.load_local(Reg::X0, sep);
+        self.asm.branch(no_sep, BranchKind::CompareZero(Reg::X0));
+        let comma_offset = self.asm.intern_string_object(", ");
+        self.asm.load_rodata_address(Reg::X0, comma_offset);
+        self.emit_heap_string_copy();
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_str_concat();
+        self.asm.store_local(Reg::X0, acc);
+        self.asm.bind(no_sep);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.store_local(Reg::X0, sep);
+        // The element's own text.
+        let elem_ty = elem_value_type(elem);
+        self.asm.load_local(Reg::X0, cursor);
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        match elem {
+            ListElem::Int => self.emit_int_to_str(),
+            ListElem::Bool => self.emit_bool_to_str(),
+            ListElem::Str => {}
+            // Same renderer one level down; the element pointer is already in
+            // x0, and the result replaces it.
+            ListElem::Nested { .. } => {
+                let inner = elem
+                    .nested_inner()
+                    .expect("a nested element is a list of its inner element");
+                self.emit_list_to_str(inner, "[", "]", span)?;
+            }
+            // Guarded by the callers, which reject a Double element before
+            // building any text (see emit_print_elem).
+            ListElem::Double => return Err(unsupported(span, "rendering a Double element")),
+        }
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_str_concat();
+        self.asm.store_local(Reg::X0, acc);
+        // Advance.
+        self.asm.load_local(Reg::X0, cursor);
+        self.emit_gc_load_ptr(Reg::X0, 8);
+        self.asm.store_local(Reg::X0, cursor);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(done);
+
+        let close_offset = self.asm.intern_string_object(close);
+        self.asm.load_rodata_address(Reg::X0, close_offset);
+        self.emit_heap_string_copy();
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_str_concat();
+        Ok(())
+    }
+
+    /// Content equality for two cons chains: x0 and x1 are the heads, x0
+    /// becomes the Bool.
+    ///
+    /// Walks both at once -- equal length, equal elements, in order. The
+    /// element comparison is by type: a boxed scalar is unboxed and compared
+    /// by value, a string by its bytes. Nothing here allocates, so no rooting
+    /// is needed, but the string comparison clobbers x0-x7, so both cursors
+    /// live on the machine stack across it.
+    fn emit_list_eq(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
+        let elem_ty = elem_value_type(elem);
+        if matches!(elem, ListElem::Double) {
+            // Comparing the raw bits is not IEEE equality, and no sample
+            // program asks for it, so it is refused rather than quietly wrong.
+            return Err(unsupported(span, "comparing lists of Double"));
+        }
+        let loop_start = self.asm.new_label();
+        let equal = self.asm.new_label();
+        let different = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(loop_start);
+        // Either chain ending decides it: both nil is equal, one nil is not.
+        let lhs_more = self.asm.new_label();
+        self.asm
+            .branch(lhs_more, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.branch(equal, BranchKind::CompareZero(Reg::X1));
+        self.asm.branch(different, BranchKind::Unconditional);
+        self.asm.bind(lhs_more);
+        self.asm.branch(different, BranchKind::CompareZero(Reg::X1));
+
+        // Park both cursors: the element reads and the string comparison
+        // below clobber the registers holding them.
+        self.asm.push(Reg::X0); // lhs cursor, at [sp + 16] after the next push
+        self.asm.push(Reg::X1); // rhs cursor, at [sp]
+        self.asm.add_reg_sp_imm(Reg::X3, 16);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        self.asm.mov_reg(Reg::X2, Reg::X0); // the left element
+        self.asm.add_reg_sp_imm(Reg::X3, 0);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        self.asm.mov_reg(Reg::X1, Reg::X0); // the right element
+        self.asm.mov_reg(Reg::X0, Reg::X2);
+        if elem_ty == ValueType::Str {
+            self.emit_str_eq(); // x0 = Bool
+        } else {
+            self.asm.cmp_reg(Reg::X0, Reg::X1);
+            self.asm.cset(Reg::X0, Cond::Eq);
+        }
+        // Take the cursors back on both paths, so the stack stays balanced.
+        let same = self.asm.new_label();
+        self.asm.branch(same, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.pop(Reg::X1);
+        self.asm.pop(Reg::X0);
+        self.asm.branch(different, BranchKind::Unconditional);
+        self.asm.bind(same);
+        self.asm.pop(Reg::X1);
+        self.asm.pop(Reg::X0);
+
+        // Advance both cursors. The barrier preserves x1-x7, so the right
+        // cursor survives the left read.
+        self.asm.push(Reg::X1);
+        self.emit_gc_load_ptr(Reg::X0, 8);
+        self.asm.mov_reg(Reg::X2, Reg::X0); // the left next
+        self.asm.pop(Reg::X1);
+        self.asm.push(Reg::X2);
+        self.emit_gc_load_ptr(Reg::X1, 8);
+        self.asm.mov_reg(Reg::X1, Reg::X0); // the right next
+        self.asm.pop(Reg::X0);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+
+        self.asm.bind(equal);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(different);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
+        Ok(())
+    }
+
+    /// `map(list)(f)`: a fresh list of `f` applied to each element.
+    ///
+    /// The lambda's body is compiled *once*, inside the loop, with its
+    /// parameter bound to the current element -- so this is a real runtime
+    /// map rather than an unrolling, and it works for a list of any length
+    /// including one whose length is not known until run time. The result is
+    /// built by prepending and then reversed, reusing the cons-list machinery
+    /// the set literal already shares.
+    fn emit_list_map(
+        &mut self,
+        list: &Expr,
+        param: &str,
+        body: &Expr,
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let list_ty = self.expression(list)?;
+        let elem = match list_ty {
+            ValueType::List(elem) => elem,
+            // Mapping over an empty list is an empty list, whatever f is.
+            ValueType::EmptyList => return Ok(ValueType::EmptyList),
+            _ => return Err(unsupported(list.span(), "mapping over this value")),
+        };
+        // Three frame slots: the input cursor, the accumulated output and the
+        // element the lambda parameter names. The first two hold heap
+        // references across the allocations the body and the cons perform, so
+        // both are rooted; the parameter slot is rooted only when its type is
+        // a reference.
+        let cursor = self.next_local_offset;
+        let acc = cursor + 8;
+        let param_slot = acc + 8;
+        self.next_local_offset += 24;
+        self.asm.store_local(Reg::X0, cursor);
+        self.emit_root_frame_slot(cursor);
+        self.asm.mov_imm64(Reg::X0, 0); // acc = nil
+        self.asm.store_local(Reg::X0, acc);
+        self.emit_root_frame_slot(acc);
+
+        let elem_ty = elem_value_type(elem);
+        let loop_start = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.load_local(Reg::X0, cursor);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+        // element = [cursor + 0], unboxed when it is a scalar
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        self.asm.store_local(Reg::X0, param_slot);
+        self.scopes.push(HashMap::new());
+        self.lambda_bindings.push(HashMap::new());
+        self.scope_root_counts.push(0);
+        self.scopes
+            .last_mut()
+            .expect("emitter scope")
+            .insert(param.to_string(), (param_slot, elem_ty));
+        if is_heap_pointer(elem_ty) {
+            self.emit_root_frame_slot(param_slot);
+        }
+        let mapped = self.expression(body)?;
+        let Some(mapped_elem) = list_elem_of(mapped) else {
+            return Err(unsupported(body.span(), "a mapped element of this type"));
+        };
+        if is_boxed_scalar(mapped) {
+            self.emit_box_scalar();
+        }
+        // acc = cons(mapped, acc)
+        self.push_rooted(Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_cons_cell();
+        self.asm.store_local(Reg::X0, acc);
+        self.scopes.pop();
+        self.lambda_bindings.pop();
+        let roots = self.scope_root_counts.pop().expect("emitter root scope");
+        self.emit_shadow_pop(roots);
+        // cursor = [cursor + 8]
+        self.asm.load_local(Reg::X0, cursor);
+        self.emit_gc_load_ptr(Reg::X0, 8);
+        self.asm.store_local(Reg::X0, cursor);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(done);
+
+        // Prepending reversed the order; put it back.
+        self.asm.load_local(Reg::X0, acc);
+        let reverse = self.reverse_label();
+        self.asm.push_frame_record(); // the bl clobbers x30
+        self.asm.branch(reverse, BranchKind::Link);
+        self.asm.pop_frame_record();
+        let _ = span;
+        Ok(ValueType::List(mapped_elem))
+    }
+
+    /// The type of an expression under an overlay of extra bindings, worked
+    /// out without emitting code. This is how a generic def's *return* type
+    /// is found: bind its parameters to the argument types from the call
+    /// site, then read the body's type. `None` means "cannot tell cheaply",
+    /// and callers treat that as unsupported rather than guessing.
+    ///
+    /// The overlay grows as a block's `val`s are walked, so a body that
+    /// computes through locals -- the usual shape -- is covered. A recursive
+    /// call reads as `None`, which an `if` merges away as long as the other
+    /// branch is concrete; that is exactly what makes `def fact(n) = if (n <
+    /// 2) 1 else n * fact(n - 1)` work.
+    fn static_type_under(
+        &self,
+        expr: &Expr,
+        locals: &mut Vec<(String, ValueType)>,
+        depth: u32,
+    ) -> Option<ValueType> {
+        // Inferring through a call means inferring that callee's body too, so
+        // a bound keeps a recursive or mutually recursive chain finite. The
+        // `if` merge below is what still gets a useful answer out of a
+        // recursive function: the branch that bottoms out types, and the one
+        // that recurses contributes nothing.
+        if depth > 6 {
+            return None;
+        }
+        match expr {
+            Expr::Identifier { name, .. } => locals
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .map(|(_, ty)| *ty)
+                .or_else(|| self.lookup(name).map(|(_, ty)| ty)),
+            Expr::Block { expressions, .. } => {
+                let mark = locals.len();
+                let (last, init) = expressions.split_last()?;
+                for expression in init {
+                    if let Expr::VarDecl { name, value, .. } = expression
+                        && let Some(ty) = self.static_type_under(value, locals, depth + 1)
+                    {
+                        locals.push((name.clone(), ty));
+                    }
+                }
+                let ty = self.static_type_under(last, locals, depth + 1);
+                locals.truncate(mark);
+                ty
+            }
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let then_ty = self.static_type_under(then_branch, locals, depth + 1);
+                let else_ty = else_branch
+                    .as_ref()
+                    .and_then(|branch| self.static_type_under(branch, locals, depth + 1));
+                match (then_ty, else_ty) {
+                    // Merged, so `if (done) [] else cons(x)(rest)` is a list
+                    // of x rather than the empty list the first branch shows.
+                    (Some(then_ty), Some(else_ty)) => merge_branch_types(then_ty, else_ty),
+                    // A branch whose type is unknown -- the recursive one --
+                    // does not veto the branch that is known.
+                    (known, None) | (None, known) => known,
+                }
+            }
+            Expr::Unary { op, expr, .. } => match op {
+                UnaryOp::Not => Some(ValueType::Bool),
+                _ => self.static_type_under(expr, locals, depth + 1),
+            },
+            Expr::Binary { lhs, op, rhs, .. } => match op {
+                BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::Less
+                | BinaryOp::LessEqual
+                | BinaryOp::Greater
+                | BinaryOp::GreaterEqual
+                | BinaryOp::LogicalAnd
+                | BinaryOp::LogicalOr => Some(ValueType::Bool),
+                // Arithmetic keeps the operand type; appending to a string
+                // yields a string whatever the right side was.
+                _ => {
+                    let lhs_ty = self.static_type_under(lhs, locals, depth + 1);
+                    match lhs_ty {
+                        Some(ValueType::Str) => Some(ValueType::Str),
+                        Some(ty) => Some(ty),
+                        None => self.static_type_under(rhs, locals, depth + 1),
+                    }
+                }
+            },
+            Expr::FieldAccess { target, field, .. } => {
+                let ValueType::Record(index) = self.static_type_under(target, locals, depth + 1)?
+                else {
+                    return None;
+                };
+                let info = self.records.get(index as usize)?;
+                info.fields
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, ty)| *ty)
+            }
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                // Curried `foldLeft(list)(init)(f)` has the accumulator's type,
+                // which is the initial value's -- this is what types the
+                // prelude's fold-based helpers.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: with_initial,
+                        arguments: initial_args,
+                        ..
+                    } = callee.as_ref()
+                    && initial_args.len() == 1
+                    && let Expr::Call { callee: inner, .. } = with_initial.as_ref()
+                    && matches!(inner.as_ref(), Expr::Identifier { name, .. } if name == "foldLeft")
+                {
+                    return self.static_type_under(&initial_args[0], locals, depth + 1);
+                }
+                // Curried `cons(head)(tail)` builds a list of the head's type.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: head_args,
+                        ..
+                    } = callee.as_ref()
+                    && head_args.len() == 1
+                    && matches!(inner.as_ref(), Expr::Identifier { name, .. } if name == "cons")
+                {
+                    let head_ty = self.static_type_under(&head_args[0], locals, depth + 1)?;
+                    return list_elem_of(head_ty).map(ValueType::List);
+                }
+                let Expr::Identifier { name, .. } = callee.as_ref() else {
+                    return None;
+                };
+                // A name bound to a lambda: its result is the lambda body's,
+                // with the lambda's parameters bound to these arguments. This
+                // is what types a higher-order def like
+                // `def applyTwice(f, x) = f(f(x))`.
+                if let Some(lambda) = self.lookup_lambda(name) {
+                    let (lambda_params, lambda_body) = &self.lambdas[lambda];
+                    if lambda_params.len() != arguments.len() {
+                        return None;
+                    }
+                    let mut lambda_locals = Vec::with_capacity(lambda_params.len());
+                    for (param, argument) in lambda_params.iter().zip(arguments.iter()) {
+                        let ty = self.static_type_under(argument, locals, depth + 1)?;
+                        lambda_locals.push((param.clone(), ty));
+                    }
+                    return self.static_type_under(lambda_body, &mut lambda_locals, depth + 1);
+                }
+                // A builtin's result, for the handful whose type the inference
+                // path actually meets. Anything else falls through to the
+                // function table.
+                let first_type = arguments
+                    .first()
+                    .and_then(|argument| self.static_type_under(argument, locals, depth + 1));
+                match name.as_str() {
+                    // head/tail matter more than they look: they are how the
+                    // prelude's recursive list functions are written, so
+                    // without them a body like `cons(head(xs))(rest)` cannot
+                    // be typed and the whole inference collapses to the empty
+                    // list its base case shows.
+                    "head" => {
+                        return arguments
+                            .first()
+                            .and_then(|argument| {
+                                self.static_type_under(argument, locals, depth + 1)
+                            })
+                            .and_then(|ty| match ty {
+                                ValueType::List(elem) | ValueType::Set(elem) => {
+                                    Some(elem_value_type(elem))
+                                }
+                                _ => None,
+                            });
+                    }
+                    "tail" => {
+                        return arguments
+                            .first()
+                            .and_then(|argument| {
+                                self.static_type_under(argument, locals, depth + 1)
+                            })
+                            .filter(|ty| matches!(ty, ValueType::List(_) | ValueType::EmptyList));
+                    }
+                    "println" | "print" => return Some(ValueType::Unit),
+                    "double" | "sqrt" | "floor" | "ceil" => return Some(ValueType::Double),
+                    "abs" => return first_type,
+                    "size" | "length" | "toInt" => return Some(ValueType::Int),
+                    "isEmpty" | "contains" => return Some(ValueType::Bool),
+                    "toString" | "substring" | "trim" | "toUpperCase" | "toLowerCase"
+                    | "reverse" | "join" | "replaceAll" | "at" => return Some(ValueType::Str),
+                    _ => {}
+                }
+                // A generic def's result is its body's, inferred with the
+                // parameters bound to these argument types -- the same thing
+                // the specialisation itself will do.
+                if let Some(generic) = self.generic_functions.iter().rposition(|generic| {
+                    generic.name == *name && generic.params.len() == arguments.len()
+                }) {
+                    let generic = self.generic_functions[generic].clone();
+                    if let Some(declared) = generic.declared_return {
+                        return Some(declared);
+                    }
+                    let params = &generic.params;
+                    let body = &generic.body;
+                    let mut callee_locals = Vec::with_capacity(params.len());
+                    for (param, argument) in params.iter().zip(arguments.iter()) {
+                        let ty = self.static_type_under(argument, locals, depth + 1)?;
+                        callee_locals.push((param.clone(), ty));
+                    }
+                    return self.static_type_under(body, &mut callee_locals, depth + 1);
+                }
+                self.static_type_of(expr)
+            }
+            _ => self.static_type_of(expr),
+        }
+    }
+
+    /// Compile a call to a def whose signature was not concrete, by
+    /// specialising it for the argument types at this site.
+    fn emit_generic_function_call(
+        &mut self,
+        generic: usize,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let GenericFunction {
+            name,
+            params,
+            body,
+            declared_return,
+            param_annotations,
+            return_annotation,
+        } = self.generic_functions[generic].clone();
+        if params.len() != arguments.len() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "{name} expects {} argument(s) but got {}",
+                    params.len(),
+                    arguments.len()
+                ),
+            ));
+        }
+        if arguments.len() > ARG_REGS.len() {
+            return Err(unsupported(span, "calls with more than 8 arguments"));
+        }
+        // Arguments first: their types are what selects the specialisation,
+        // and a heap-reference one is rooted while the rest are evaluated.
+        let mut argument_types = Vec::with_capacity(arguments.len());
+        let mut rooted = Vec::with_capacity(arguments.len());
+        let mut value_params: Vec<(String, ValueType)> = Vec::new();
+        let mut lambda_params: Vec<(String, usize)> = Vec::new();
+        for (param, argument) in params.iter().zip(arguments.iter()) {
+            // A lambda argument is not a value: it is interned and the
+            // parameter name is bound to it inside the specialisation, so a
+            // higher-order def is specialised per lambda as well as per type.
+            if let Expr::Lambda {
+                params: lambda_args,
+                body: lambda_body,
+                ..
+            } = argument
+            {
+                let index = self.lambdas.len();
+                self.lambdas
+                    .push((lambda_args.clone(), lambda_body.as_ref().clone()));
+                lambda_params.push((param.clone(), index));
+                continue;
+            }
+            // A name that is itself bound to a lambda passes the binding
+            // along rather than a value -- which is how the prelude's
+            // recursive higher-order functions thread their function
+            // argument (`stdlibFilter(tail(xs), p)`).
+            if let Expr::Identifier { name, .. } = argument
+                && let Some(index) = self.lookup_lambda(name)
+            {
+                lambda_params.push((param.clone(), index));
+                continue;
+            }
+            let ty = self.expression(argument)?;
+            if ty == ValueType::Unit {
+                return Err(unsupported(argument.span(), "a unit-typed argument"));
+            }
+            if is_heap_pointer(ty) {
+                self.push_rooted(Reg::X0);
+                rooted.push(true);
+            } else {
+                self.asm.push(Reg::X0);
+                rooted.push(false);
+            }
+            argument_types.push(ty);
+            value_params.push((param.clone(), ty));
+        }
+        // The lambda identities are part of what makes a specialisation
+        // distinct, so they join the argument types in the key.
+        let mut key_types = argument_types.clone();
+        for (_, index) in &lambda_params {
+            key_types.push(ValueType::Record(*index as u32));
+        }
+        let key = (generic, key_types);
+        let index = match self.specializations.get(&key) {
+            Some(&index) => index,
+            None => {
+                let signature = value_params.clone();
+                // A declared return type is the answer when there is one --
+                // only the *parameters* were generic in that case.
+                //
+                // Failing that, a return annotation this backend cannot model
+                // on its own is still decided when it is *the same
+                // annotation* as one of the parameters: the result is that
+                // argument's type. `def id(x: 'a): 'a` and
+                // `def pairWithNext<'m>(xs: 'm<Int>): 'm<Int>` both say so
+                // without naming a type this backend knows.
+                let matched_return = return_annotation.as_ref().and_then(|wanted| {
+                    param_annotations
+                        .iter()
+                        .zip(arguments.iter())
+                        .position(|(annotation, _)| annotation.as_deref() == Some(wanted.as_str()))
+                        .and_then(|position| argument_types.get(position).copied())
+                });
+                let mut locals = signature.clone();
+                // The lambda parameters must be visible while the body's type
+                // is worked out, or a higher-order def's result could not be
+                // typed at all.
+                self.lambda_bindings
+                    .push(lambda_params.iter().cloned().collect());
+                let inferred = declared_return
+                    .or(matched_return)
+                    .or_else(|| self.static_type_under(&body, &mut locals, 0));
+                self.lambda_bindings.pop();
+                let Some(ret) = inferred else {
+                    return Err(unsupported(
+                        span,
+                        &format!("a call to `{name}`, whose result type cannot be determined"),
+                    ));
+                };
+                let label = self.asm.new_label();
+                // Registered *before* its body is emitted, so a recursive
+                // call inside the body finds this specialisation instead of
+                // specialising again forever.
+                self.functions.push((
+                    format!("{name}#{}", self.specializations.len()),
+                    FunctionInfo {
+                        label,
+                        params: signature,
+                        lambda_params: lambda_params.clone(),
+                        ret,
+                        body,
+                    },
+                ));
+                let index = self.functions.len() - 1;
+                self.specializations.insert(key, index);
+                index
+            }
+        };
+        let (label, ret) = {
+            let info = &self.functions[index].1;
+            (info.label, info.ret)
+        };
+        for (position, register) in ARG_REGS.iter().take(argument_types.len()).enumerate().rev() {
+            if rooted[position] {
+                self.pop_rooted(*register);
+            } else {
+                self.asm.pop(*register);
+            }
+        }
+        self.asm.branch(label, BranchKind::Link);
+        self.pending.push(index);
+        Ok(ret)
+    }
+
+    /// `foldLeft(list)(initial)(f)`: thread an accumulator through the list,
+    /// `acc = f(acc, element)` per element.
+    ///
+    /// Like the map above, the lambda's body is compiled once inside the loop,
+    /// so the fold runs at run time over a list of any length. The
+    /// accumulator's type has to be stable across iterations -- it is the
+    /// initial value's type, and a body that produced something else would be
+    /// a different function on the second iteration -- so that is checked
+    /// rather than assumed.
+    fn emit_list_fold_left(
+        &mut self,
+        list: &Expr,
+        initial: &Expr,
+        acc_param: &str,
+        elem_param: &str,
+        body: &Expr,
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let initial_ty = self.expression(initial)?;
+        if initial_ty == ValueType::Unit {
+            return Err(unsupported(initial.span(), "a unit-typed accumulator"));
+        }
+        let acc = self.next_local_offset;
+        let cursor = acc + 8;
+        let acc_slot = cursor + 8;
+        let elem_slot = acc_slot + 8;
+        self.next_local_offset += 32;
+        self.asm.store_local(Reg::X0, acc);
+        if is_heap_pointer(initial_ty) {
+            self.emit_root_frame_slot(acc);
+        }
+        let list_ty = self.expression(list)?;
+        let elem = match list_ty {
+            ValueType::List(elem) => elem,
+            // Folding an empty list is the initial value.
+            ValueType::EmptyList => return Ok(initial_ty),
+            _ => return Err(unsupported(list.span(), "folding over this value")),
+        };
+        self.asm.store_local(Reg::X0, cursor);
+        self.emit_root_frame_slot(cursor);
+
+        let elem_ty = elem_value_type(elem);
+        let loop_start = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.load_local(Reg::X0, cursor);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        self.asm.store_local(Reg::X0, elem_slot);
+        self.asm.load_local(Reg::X0, acc);
+        self.asm.store_local(Reg::X0, acc_slot);
+        self.scopes.push(HashMap::new());
+        self.lambda_bindings.push(HashMap::new());
+        self.scope_root_counts.push(0);
+        {
+            let scope = self.scopes.last_mut().expect("emitter scope");
+            scope.insert(acc_param.to_string(), (acc_slot, initial_ty));
+            scope.insert(elem_param.to_string(), (elem_slot, elem_ty));
+        }
+        if is_heap_pointer(initial_ty) {
+            self.emit_root_frame_slot(acc_slot);
+        }
+        if is_heap_pointer(elem_ty) {
+            self.emit_root_frame_slot(elem_slot);
+        }
+        let folded = self.expression(body)?;
+        if folded != initial_ty {
+            return Err(unsupported(
+                body.span(),
+                "a fold whose accumulator changes type",
+            ));
+        }
+        self.asm.store_local(Reg::X0, acc);
+        self.scopes.pop();
+        self.lambda_bindings.pop();
+        let roots = self.scope_root_counts.pop().expect("emitter root scope");
+        self.emit_shadow_pop(roots);
+        self.asm.load_local(Reg::X0, cursor);
+        self.emit_gc_load_ptr(Reg::X0, 8);
+        self.asm.store_local(Reg::X0, cursor);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(done);
+        self.asm.load_local(Reg::X0, acc);
+        let _ = span;
+        Ok(initial_ty)
+    }
+
+    /// A name bound to a lambda, innermost scope first.
+    fn lookup_lambda(&self, name: &str) -> Option<usize> {
+        self.lambda_bindings
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
+    /// Compile a call to a lambda-bound name by compiling the lambda's body
+    /// here, with its parameters bound to the arguments' slots and types.
+    ///
+    /// This is why no closure object is needed: the body is compiled in the
+    /// caller's frame, so a captured local is simply still in scope. The
+    /// parameter slots are released afterwards, so N call sites reuse them
+    /// rather than each growing the frame.
+    fn emit_inline_lambda_call(
+        &mut self,
+        index: usize,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let (params, body) = self.lambdas[index].clone();
+        if params.len() != arguments.len() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "this lambda expects {} argument(s) but got {}",
+                    params.len(),
+                    arguments.len()
+                ),
+            ));
+        }
+        // Evaluate the arguments in the caller's scope, before the parameters
+        // shadow anything, and park each one in its own slot.
+        let mut bound = Vec::with_capacity(params.len());
+        let saved_offset = self.next_local_offset;
+        for argument in arguments {
+            let ty = self.expression(argument)?;
+            if ty == ValueType::Unit {
+                return Err(unsupported(argument.span(), "a unit-typed argument"));
+            }
+            let offset = self.next_local_offset;
+            self.next_local_offset += 8;
+            self.asm.store_local(Reg::X0, offset);
+            bound.push((offset, ty));
+        }
+        self.scopes.push(HashMap::new());
+        self.lambda_bindings.push(HashMap::new());
+        self.scope_root_counts.push(0);
+        for (param, (offset, ty)) in params.iter().zip(bound.iter()) {
+            self.scopes
+                .last_mut()
+                .expect("emitter scope")
+                .insert(param.clone(), (*offset, *ty));
+            // A heap-reference parameter is a root for the body's duration,
+            // exactly like a binding of the same type would be.
+            if is_heap_pointer(*ty) {
+                self.emit_root_frame_slot(*offset);
+            }
+        }
+        let result = self.expression(&body)?;
+        self.scopes.pop();
+        self.lambda_bindings.pop();
+        let roots = self.scope_root_counts.pop().expect("emitter root scope");
+        self.emit_shadow_pop(roots);
+        // The parameter slots are dead now; let the next call reuse them.
+        self.next_local_offset = saved_offset;
+        Ok(result)
+    }
+
     fn function_call(
         &mut self,
         name: &str,
@@ -4520,8 +5800,52 @@ impl Emitter {
     ) -> Result<ValueType, Diagnostic> {
         // rposition: a later (user) definition shadows an earlier
         // (prelude) one, matching evaluator scoping.
-        let Some(index) = self.functions.iter().rposition(|(n, _)| n == name) else {
+        //
+        // Typeclass instances break the one-name-one-function assumption:
+        // `instance Show<Int>` and `instance Show<String>` both declare
+        // `show`, and which one a call means is decided by the argument's
+        // type. So when a name has several definitions, prefer the one whose
+        // parameters accept the arguments -- typed without emitting code, so
+        // the choice happens before any argument is compiled. A single
+        // definition keeps the old path exactly, and an unresolvable
+        // overload falls back to the innermost one, whose parameter check
+        // then produces the diagnostic.
+        let candidates: Vec<usize> = self
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, (n, _))| n == name)
+            .map(|(index, _)| index)
+            .collect();
+        let Some(&fallback) = candidates.last() else {
+            // No concrete definition: a def whose signature was not fully
+            // annotated is compiled per call site instead.
+            if let Some(generic) = self.generic_functions.iter().rposition(|generic| {
+                generic.name == name && generic.params.len() == arguments.len()
+            }) {
+                return self.emit_generic_function_call(generic, arguments, span);
+            }
             return Err(unsupported(span, &format!("function `{name}`")));
+        };
+        let index = if candidates.len() == 1 {
+            fallback
+        } else {
+            let argument_types: Vec<Option<ValueType>> =
+                arguments.iter().map(|a| self.static_type_of(a)).collect();
+            candidates
+                .iter()
+                .rev()
+                .copied()
+                .find(|&candidate| {
+                    let params = &self.functions[candidate].1.params;
+                    params.len() == arguments.len()
+                        && params.iter().zip(argument_types.iter()).all(
+                            |((_, expected), actual)| {
+                                actual.is_some_and(|actual| assignable(actual, *expected))
+                            },
+                        )
+                })
+                .unwrap_or(fallback)
         };
         let (label, params, ret) = {
             let info = &self.functions[index].1;
@@ -4545,15 +5869,30 @@ impl Emitter {
         if arguments.len() > ARG_REGS.len() {
             return Err(unsupported(span, "calls with more than 8 arguments"));
         }
+        // Each evaluated argument waits on the machine stack while the
+        // remaining ones are evaluated, and those can allocate -- so a
+        // heap-reference argument is parked as a root for that window, the
+        // same discipline every other multi-operand site follows.
+        let mut rooted = Vec::with_capacity(arguments.len());
         for (argument, (_, expected)) in arguments.iter().zip(params.iter()) {
             let ty = self.expression(argument)?;
             if !assignable(ty, *expected) {
                 return Err(unsupported(argument.span(), "an argument of this type"));
             }
-            self.asm.push(Reg::X0);
+            if is_heap_pointer(ty) {
+                self.push_rooted(Reg::X0);
+                rooted.push(true);
+            } else {
+                self.asm.push(Reg::X0);
+                rooted.push(false);
+            }
         }
-        for register in ARG_REGS.iter().take(arguments.len()).rev() {
-            self.asm.pop(*register);
+        for (position, register) in ARG_REGS.iter().take(arguments.len()).enumerate().rev() {
+            if rooted[position] {
+                self.pop_rooted(*register);
+            } else {
+                self.asm.pop(*register);
+            }
         }
         self.asm.branch(label, BranchKind::Link);
         self.pending.push(index);
@@ -4564,9 +5903,15 @@ impl Emitter {
     /// and binds parameters to frame-pointer slots, the body is a
     /// single expression whose value stays in x0.
     fn emit_function(&mut self, index: usize) -> Result<(), Diagnostic> {
-        let (label, params, ret, body) = {
+        let (label, params, lambda_params, ret, body) = {
             let info = &self.functions[index].1;
-            (info.label, info.params.clone(), info.ret, info.body.clone())
+            (
+                info.label,
+                info.params.clone(),
+                info.lambda_params.clone(),
+                info.ret,
+                info.body.clone(),
+            )
         };
         self.asm.bind(label);
         self.asm.push_frame_record();
@@ -4580,7 +5925,14 @@ impl Emitter {
         self.asm.mov_fp_sp();
 
         self.scopes.push(HashMap::new());
+        self.lambda_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
+        for (param, lambda) in &lambda_params {
+            self.lambda_bindings
+                .last_mut()
+                .expect("emitter lambda scope")
+                .insert(param.clone(), *lambda);
+        }
         let saved_offset = self.next_local_offset;
         self.next_local_offset = 0;
         let mut param_slots = Vec::new();
@@ -4598,6 +5950,7 @@ impl Emitter {
         }
         let body_ty = self.expression(&body)?;
         self.scopes.pop();
+        self.lambda_bindings.pop();
         // Drop this activation's roots before returning; the result is in
         // x0, which the pop helper preserves.
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
@@ -4656,7 +6009,7 @@ impl Emitter {
                 Ok(())
             }
             ValueType::List(elem) => {
-                self.emit_println_list(elem);
+                self.emit_println_list(elem, span)?;
                 Ok(())
             }
             ValueType::EmptyList => {
@@ -4664,7 +6017,7 @@ impl Emitter {
                 Ok(())
             }
             ValueType::Set(elem) => {
-                self.emit_println_set(elem);
+                self.emit_println_set(elem, span)?;
                 Ok(())
             }
             ValueType::EmptySet => {
@@ -4698,11 +6051,13 @@ impl Emitter {
         match expr {
             Expr::Block { expressions, .. } => {
                 self.scopes.push(HashMap::new());
+                self.lambda_bindings.push(HashMap::new());
                 self.scope_root_counts.push(0);
                 for expression in expressions {
                     self.statement(expression)?;
                 }
                 self.scopes.pop();
+                self.lambda_bindings.pop();
                 let roots = self.scope_root_counts.pop().expect("emitter root scope");
                 self.emit_shadow_pop(roots);
                 Ok(())
@@ -4710,11 +6065,29 @@ impl Emitter {
             // Declarations have no runtime effect in the current
             // subset; calling a declared function is rejected at the
             // call site.
+            // A typeclass declaration is type-level only, and an instance's
+            // methods were already collected as functions, so neither emits
+            // code here.
             Expr::ModuleHeader { .. }
             | Expr::Import { .. }
             | Expr::DefDecl { .. }
-            | Expr::RecordDeclaration { .. } => Ok(()),
+            | Expr::RecordDeclaration { .. }
+            | Expr::TypeClassDeclaration { .. }
+            | Expr::InstanceDeclaration { .. } => Ok(()),
             Expr::VarDecl { name, value, .. } => {
+                // `val f = (x) => ...`: bind the name to the lambda body
+                // instead of to a slot. There is nothing to store -- the body
+                // is compiled at each call site, where the parameter types
+                // are known from the arguments.
+                if let Expr::Lambda { params, body, .. } = value.as_ref() {
+                    let index = self.lambdas.len();
+                    self.lambdas.push((params.clone(), body.as_ref().clone()));
+                    self.lambda_bindings
+                        .last_mut()
+                        .expect("emitter lambda scope")
+                        .insert(name.clone(), index);
+                    return Ok(());
+                }
                 let ty = self.expression(value)?;
                 if ty == ValueType::Unit {
                     return Err(unsupported(value.span(), "a unit-typed binding"));
@@ -4806,6 +6179,11 @@ impl Emitter {
 /// is touched.
 fn count_var_decls(expr: &Expr) -> u32 {
     match expr {
+        // A lambda's parameters and locals become frame slots of whichever
+        // function inlines it; the slots are released again after the call
+        // (see emit_inline_lambda_call), so counting each lambda once is
+        // enough for the frame to hold the deepest single call.
+        Expr::Lambda { params, body, .. } => params.len() as u32 + count_var_decls(body),
         Expr::VarDecl { value, .. } => 1 + count_var_decls(value),
         Expr::Assign { value, .. } => count_var_decls(value),
         Expr::Block { expressions, .. } => expressions.iter().map(count_var_decls).sum(),
@@ -4911,7 +6289,21 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
     let Expr::Block { expressions, .. } = expr else {
         return;
     };
+    // A typeclass instance is a bundle of ordinary, fully annotated defs:
+    // `instance Show<Int> where { def show(x: Int): String = ... }`. Treated
+    // as plain functions they need no new machinery -- what makes them a
+    // typeclass is that several instances declare the *same* method name for
+    // different parameter types, which `function_call` resolves by argument
+    // type. The `typeclass` declaration itself is type-level only and emits
+    // nothing.
+    let mut flattened: Vec<&Expr> = Vec::new();
     for expression in expressions {
+        match expression {
+            Expr::InstanceDeclaration { methods, .. } => flattened.extend(methods.iter()),
+            other => flattened.push(other),
+        }
+    }
+    for expression in flattened {
         let Expr::DefDecl {
             name,
             params,
@@ -4936,21 +6328,43 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
             };
             signature.push((param.clone(), ty));
         }
-        if signature.len() != params.len() {
+        // A signature the backend cannot spell out concretely -- an
+        // unannotated parameter, a type variable, a return type it does not
+        // model -- becomes a *generic* def instead of being dropped. Its
+        // parameter types exist only at the call site, so it is compiled
+        // once per distinct tuple of argument types (see
+        // emit_generic_function_call).
+        let concrete_return = return_annotation
+            .as_ref()
+            .and_then(|annotation| emitter.annotation_type(&annotation.text, *span).ok());
+        if signature.len() != params.len() || concrete_return.is_none() {
+            emitter.generic_functions.push(GenericFunction {
+                name: name.clone(),
+                params: params.clone(),
+                body: body.as_ref().clone(),
+                declared_return: concrete_return,
+                param_annotations: param_annotations
+                    .iter()
+                    .map(|annotation| {
+                        annotation
+                            .as_ref()
+                            .map(|annotation| annotation.text.clone())
+                    })
+                    .collect(),
+                return_annotation: return_annotation
+                    .as_ref()
+                    .map(|annotation| annotation.text.clone()),
+            });
             continue;
         }
-        let Some(return_annotation) = return_annotation else {
-            continue;
-        };
-        let Ok(ret) = emitter.annotation_type(&return_annotation.text, *span) else {
-            continue;
-        };
+        let ret = concrete_return.expect("checked above");
         let label = emitter.asm.new_label();
         emitter.functions.push((
             name.clone(),
             FunctionInfo {
                 label,
                 params: signature,
+                lambda_params: Vec::new(),
                 ret,
                 body: body.as_ref().clone(),
             },
@@ -5614,6 +7028,7 @@ pub(crate) fn emit_macho_program(
         ..Emitter::default()
     };
     emitter.scopes.push(HashMap::new());
+    emitter.lambda_bindings.push(HashMap::new());
     emitter.scope_root_counts.push(0);
     collect_records(expr, &mut emitter);
     collect_functions(expr, &mut emitter);

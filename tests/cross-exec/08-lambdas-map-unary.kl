@@ -1,0 +1,143 @@
+// Cross-target fixture: lambdas, list mapping and unary operators.
+//
+// A lambda here has no runtime representation -- it is compiled where it is
+// called, with its parameter types taken from the arguments -- so this
+// fixture is what proves the two paths agree with the evaluator: a lambda
+// bound to a name and called later, and a lambda literal handed to `map`.
+//
+// The `map` cases matter for the collector too: the body allocates a fresh
+// element per iteration while the input cursor and the accumulated output are
+// both live, so a missing root would show up here as a wrong list.
+
+val add = (x, y) => x + y
+val twice = (n) => n * 2
+val shout = (s) => s + "!"
+
+println(add(3, 4))
+println(twice(21))
+println(add(twice(5), 1))
+println(shout("hi"))
+
+// Immediately applied lambda literal.
+println(((x) => x * x)(7))
+
+// map over a literal list, over a bound list, and with a string body.
+println(map([1 2 3])((x) => x + 1))
+val nums = [10 20 30]
+println(map(nums)((n) => n - 5))
+println(map(nums)((n) => n * n))
+println(map(["a" "b" "c"])((s) => s + "?"))
+
+// The mapped list is a real list: it can be measured and taken apart.
+val doubled = map(nums)((x) => x * 2)
+println(doubled)
+println(size(doubled))
+println(head(doubled))
+println(tail(doubled))
+
+// Unary operators, including on a bound value and inside arithmetic.
+val ten = 10
+println(-5)
+println(-ten)
+println(-(3 + 4))
+println(+7)
+println(!true)
+println(!false)
+println(6 - -1)
+
+// Appending a collection to a string renders it the way println does.
+println("list=" + nums)
+println("mapped=" + doubled)
+println("strs=" + ["x" "y"])
+println("set=" + %(1 2 2))
+
+// Defs without annotations: the parameter types come from the call site and
+// the result type is read off the body, which is what lets a recursive one
+// work at all -- the specialisation must be registered before its own body is
+// compiled or it would specialise forever.
+def fact(n) = if (n < 2) 1 else n * fact(n - 1)
+def bigger(a, b) = if (a > b) a else b
+def label(who) = "hi " + who
+println(fact(6))
+println(bigger(3, 9))
+println(label("kota"))
+println(fact(bigger(2, 4)))
+
+assertResult(7)(add(3, 4))
+// A recursive prelude function that builds a list: the inference has to
+// merge the empty-list branch with the cons branch to get List<Int> rather
+// than the empty list the first branch alone suggests.
+println(stdlibRange(0, 5))
+println(stdlibRangeInclusive(1, 3))
+
+// Numeric builtins. Doubles travel as raw bits in a general register and
+// move through the FP unit for the operation itself, so these also check that
+// round trip. floor/ceil are Int-valued like the evaluator's.
+// foldLeft, and the reduce sugar that desugars to it. The accumulator threads
+// through the loop in a rooted slot, so a string fold also exercises the
+// collector: each concatenation allocates while the list and accumulator live.
+println([1 2 3] reduce 0 => r + e)
+println(["a" "b" "c"] reduce "" => r + e)
+println(foldLeft([1 2 3 4])(1)((a, x) => a * x))
+// A lambda passed to a def, including through recursion: the parameter is
+// bound to the lambda at compile time, so a higher-order function needs no
+// closure -- and the prelude threads its function argument through its own
+// recursive calls, which has to keep resolving to the same lambda.
+def applyTwice(f, x) = f(f(x))
+println(applyTwice((n) => n + 3, 10))
+println(stdlibFilter([1, 2, 3, 4, 5, 6], (x) => x > 3))
+println(stdlibMap([1, 2, 3], (x) => x * 10))
+val nothing = null
+// A polymorphic signature the backend cannot model directly: the result is
+// decided by the return annotation being the *same* annotation as a
+// parameter's, so it is that argument's type. Two instantiations from one def.
+def id(x: 'a): 'a = x
+println(id(7))
+println(id("hi"))
+
+assertResult(16)(applyTwice((n) => n + 3, 10))
+assertResult(7)(id(7))
+assertResult("hi")(id("hi"))
+
+// Collections compare by content, not by identity: these lists are built
+// separately, so a pointer comparison would call them different. This is what
+// every assertResult on a list in the sample programs depends on.
+println([1 2 3] == [1 2 3])
+println([1 2 3] == [1 2 4])
+println(["x" "y"] == ["x" "y"])
+println([1 2] == [1 2 3])
+// Lists of lists, rendered, measured, taken apart and compared by content.
+val grid = [[1 2 3] [4 5 6]]
+println(grid)
+println(size(grid))
+println(head(grid))
+println([["a" "b"] ["c"]])
+println("grid=" + grid)
+assertResult([[1, 2, 3], [4, 5, 6]])(grid)
+
+assertResult([1, 2, 3])([1 2 3])
+assertResult([2, 3, 4])(map([1 2 3])((x) => x + 1))
+
+assertResult(6)([1 2 3] reduce 0 => r + e)
+assertResult(24)(foldLeft([1 2 3 4])(1)((a, x) => a * x))
+
+// A list of Doubles: folding and comparing work even though rendering one
+// does not, so the element type is carried without a formatter.
+assertResult(10.0)(foldLeft([1.0 2.0 3.0 4.0])(0.0)((x, y) => x + y))
+assertResult(24.0)(foldLeft([1.0 2.0 3.0 4.0])(1.0)((x, y) => x * y))
+assertResult(2)(size([1.5 2.5]))
+
+assertResult(3.0)(sqrt(9.0))
+assertResult(2.5)(abs(-2.5))
+assertResult(7)(abs(-7))
+assertResult(4)(floor(4.7))
+assertResult(5)(ceil(4.2))
+assertResult(3.0)(double(3))
+assertResult(true)(sqrt(25.0) > 4.9)
+
+assertResult(120)(fact(5))
+assertResult(9)(bigger(9, 1))
+assertResult(-10)(-ten)
+assertResult(true)(!false)
+assertResult(49)(((x) => x * x)(7))
+println("assertions held")
