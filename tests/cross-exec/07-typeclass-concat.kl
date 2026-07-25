@@ -1,0 +1,43 @@
+// Cross-target fixture: typeclass instance dispatch and string appending.
+//
+// Every backend must agree with the evaluator here. The interesting part is
+// that `show` is declared once and implemented several times -- which
+// implementation a call means is decided by the argument's type, so this
+// fixture fails loudly on any backend that resolves overloads by declaration
+// order instead. The `"..." + value` forms cover appending an Int and a Bool
+// to a string, which allocate and so also exercise the collector while a
+// live string operand waits.
+
+typeclass Show<'a> where {
+  show: ('a) => String
+}
+
+instance Show<Int> where {
+  def show(x: Int): String = "Int: " + x
+}
+
+instance Show<String> where {
+  def show(x: String): String = "String: " + x
+}
+
+instance Show<Boolean> where {
+  def show(x: Boolean): String = "Bool: " + x
+}
+
+println(show(42))
+println(show("hello"))
+println(show(true))
+
+// Appending, including a chain that builds several intermediate strings.
+println("n=" + 7)
+println("ok=" + false)
+println("a" + 1 + "b" + 2 + "c")
+
+// assertResult is the sample programs' assertion: equal values are silent,
+// so reaching the end means every comparison held.
+assertResult("Int: 1")(show(1))
+assertResult("String: s")(show("s"))
+assertResult("Bool: true")(show(true))
+assertResult(15)(7 + 8)
+assertResult("x=3")("x=" + 3)
+println("assertions held")

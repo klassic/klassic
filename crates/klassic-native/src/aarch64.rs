@@ -1609,6 +1609,24 @@ impl Emitter {
                 arguments,
                 span,
             } => {
+                // Curried builtins: the callee is itself a call, so the
+                // whole thing reads `f(a)(b)`. The language has no general
+                // first-class application in this backend yet, but several
+                // builtins are *defined* in curried form, and the x86-64
+                // backend recognises them the same way -- by matching the
+                // shape rather than by building closures.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: first_args,
+                        ..
+                    } = callee.as_ref()
+                    && first_args.len() == 1
+                    && let Expr::Identifier { name, .. } = inner.as_ref()
+                    && name == "assertResult"
+                {
+                    return self.emit_assert_result(&first_args[0], &arguments[0], *span);
+                }
                 // Curried `cons(head)(tail)` — the evaluator's list
                 // prepend builtin.
                 if arguments.len() == 1
@@ -2120,7 +2138,24 @@ impl Emitter {
         } else {
             self.asm.push(Reg::X0);
         }
-        let rhs_ty = self.expression(rhs)?;
+        let mut rhs_ty = self.expression(rhs)?;
+        // `"n=" + 42` and `"ok=" + true`: appending to a string converts the
+        // right operand, the way the evaluator and the x86-64 backend do. The
+        // conversion allocates, so it happens while the left operand is still
+        // parked as a root, before it is taken back.
+        if lhs_ty == ValueType::Str && op == BinaryOp::Add && rhs_ty != ValueType::Str {
+            match rhs_ty {
+                ValueType::Int => {
+                    self.emit_int_to_str();
+                    rhs_ty = ValueType::Str;
+                }
+                ValueType::Bool => {
+                    self.emit_bool_to_str();
+                    rhs_ty = ValueType::Str;
+                }
+                _ => return Err(unsupported(rhs.span(), "appending a value of this type")),
+            }
+        }
         self.asm.mov_reg(Reg::X1, Reg::X0);
         if root_lhs {
             self.pop_rooted(Reg::X0);
@@ -2237,6 +2272,33 @@ impl Emitter {
             }
             _ => Err(unsupported(span, "this binary operator")),
         }
+    }
+
+    /// `assertResult(expected)(actual)`: the test-program assertion. Equal
+    /// values yield Unit; unequal ones abort with the evaluator's message
+    /// prefix on stderr, which is what the sample programs rely on to fail
+    /// loudly rather than print a wrong answer.
+    ///
+    /// The comparison reuses the ordinary `==` path, so it inherits its type
+    /// checking and its per-type semantics (byte-wise for strings, value for
+    /// scalars) instead of duplicating them.
+    fn emit_assert_result(
+        &mut self,
+        expected: &Expr,
+        actual: &Expr,
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let ty = self.binary(expected, BinaryOp::Equal, actual, span)?;
+        if ty != ValueType::Bool {
+            return Err(unsupported(span, "assertResult on values of this type"));
+        }
+        let ok = self.asm.new_label();
+        self.asm.branch(ok, BranchKind::CompareNonZero(Reg::X0));
+        self.asm
+            .emit_write_rodata(STDERR_FD, b"klassic: assertResult failed\n");
+        self.asm.emit_exit(1);
+        self.asm.bind(ok);
+        Ok(ValueType::Unit)
     }
 
     fn gc_alloc_entry_label(&mut self) -> Label {
@@ -4512,6 +4574,44 @@ impl Emitter {
     /// Call a top-level annotated function: arguments are evaluated
     /// left to right onto the machine stack, then popped into the
     /// AAPCS64 argument registers right to left.
+    /// The type of an expression, worked out *without* emitting code, for
+    /// decisions that must happen before compiling anything -- currently
+    /// choosing between same-named typeclass instance methods. Deliberately
+    /// partial: `None` means "cannot tell cheaply", and every caller has a
+    /// defined behaviour for that.
+    fn static_type_of(&self, expr: &Expr) -> Option<ValueType> {
+        match expr {
+            Expr::Int { .. } => Some(ValueType::Int),
+            Expr::Double { .. } => Some(ValueType::Double),
+            Expr::Bool { .. } => Some(ValueType::Bool),
+            Expr::String { .. } | Expr::StringInterpolation { .. } => Some(ValueType::Str),
+            Expr::Identifier { name, .. } => self.lookup(name).map(|(_, ty)| ty),
+            Expr::ListLiteral { elements, .. } => match elements.first() {
+                None => Some(ValueType::EmptyList),
+                Some(first) => list_elem_of(self.static_type_of(first)?).map(ValueType::List),
+            },
+            Expr::SetLiteral { elements, .. } => match elements.first() {
+                None => Some(ValueType::EmptySet),
+                Some(first) => list_elem_of(self.static_type_of(first)?).map(ValueType::Set),
+            },
+            Expr::RecordConstructor { name, .. } => self
+                .records
+                .iter()
+                .position(|record| record.usable && &record.name == name)
+                .map(|index| ValueType::Record(index as u32)),
+            Expr::Call { callee, .. } => {
+                let Expr::Identifier { name, .. } = callee.as_ref() else {
+                    return None;
+                };
+                let mut matching = self.functions.iter().filter(|(n, _)| n == name);
+                let first = matching.next()?;
+                // Only unambiguous when the name has exactly one definition.
+                matching.next().is_none().then_some(first.1.ret)
+            }
+            _ => None,
+        }
+    }
+
     fn function_call(
         &mut self,
         name: &str,
@@ -4520,8 +4620,45 @@ impl Emitter {
     ) -> Result<ValueType, Diagnostic> {
         // rposition: a later (user) definition shadows an earlier
         // (prelude) one, matching evaluator scoping.
-        let Some(index) = self.functions.iter().rposition(|(n, _)| n == name) else {
+        //
+        // Typeclass instances break the one-name-one-function assumption:
+        // `instance Show<Int>` and `instance Show<String>` both declare
+        // `show`, and which one a call means is decided by the argument's
+        // type. So when a name has several definitions, prefer the one whose
+        // parameters accept the arguments -- typed without emitting code, so
+        // the choice happens before any argument is compiled. A single
+        // definition keeps the old path exactly, and an unresolvable
+        // overload falls back to the innermost one, whose parameter check
+        // then produces the diagnostic.
+        let candidates: Vec<usize> = self
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, (n, _))| n == name)
+            .map(|(index, _)| index)
+            .collect();
+        let Some(&fallback) = candidates.last() else {
             return Err(unsupported(span, &format!("function `{name}`")));
+        };
+        let index = if candidates.len() == 1 {
+            fallback
+        } else {
+            let argument_types: Vec<Option<ValueType>> =
+                arguments.iter().map(|a| self.static_type_of(a)).collect();
+            candidates
+                .iter()
+                .rev()
+                .copied()
+                .find(|&candidate| {
+                    let params = &self.functions[candidate].1.params;
+                    params.len() == arguments.len()
+                        && params.iter().zip(argument_types.iter()).all(
+                            |((_, expected), actual)| {
+                                actual.is_some_and(|actual| assignable(actual, *expected))
+                            },
+                        )
+                })
+                .unwrap_or(fallback)
         };
         let (label, params, ret) = {
             let info = &self.functions[index].1;
@@ -4545,15 +4682,30 @@ impl Emitter {
         if arguments.len() > ARG_REGS.len() {
             return Err(unsupported(span, "calls with more than 8 arguments"));
         }
+        // Each evaluated argument waits on the machine stack while the
+        // remaining ones are evaluated, and those can allocate -- so a
+        // heap-reference argument is parked as a root for that window, the
+        // same discipline every other multi-operand site follows.
+        let mut rooted = Vec::with_capacity(arguments.len());
         for (argument, (_, expected)) in arguments.iter().zip(params.iter()) {
             let ty = self.expression(argument)?;
             if !assignable(ty, *expected) {
                 return Err(unsupported(argument.span(), "an argument of this type"));
             }
-            self.asm.push(Reg::X0);
+            if is_heap_pointer(ty) {
+                self.push_rooted(Reg::X0);
+                rooted.push(true);
+            } else {
+                self.asm.push(Reg::X0);
+                rooted.push(false);
+            }
         }
-        for register in ARG_REGS.iter().take(arguments.len()).rev() {
-            self.asm.pop(*register);
+        for (position, register) in ARG_REGS.iter().take(arguments.len()).enumerate().rev() {
+            if rooted[position] {
+                self.pop_rooted(*register);
+            } else {
+                self.asm.pop(*register);
+            }
         }
         self.asm.branch(label, BranchKind::Link);
         self.pending.push(index);
@@ -4710,10 +4862,15 @@ impl Emitter {
             // Declarations have no runtime effect in the current
             // subset; calling a declared function is rejected at the
             // call site.
+            // A typeclass declaration is type-level only, and an instance's
+            // methods were already collected as functions, so neither emits
+            // code here.
             Expr::ModuleHeader { .. }
             | Expr::Import { .. }
             | Expr::DefDecl { .. }
-            | Expr::RecordDeclaration { .. } => Ok(()),
+            | Expr::RecordDeclaration { .. }
+            | Expr::TypeClassDeclaration { .. }
+            | Expr::InstanceDeclaration { .. } => Ok(()),
             Expr::VarDecl { name, value, .. } => {
                 let ty = self.expression(value)?;
                 if ty == ValueType::Unit {
@@ -4911,7 +5068,21 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
     let Expr::Block { expressions, .. } = expr else {
         return;
     };
+    // A typeclass instance is a bundle of ordinary, fully annotated defs:
+    // `instance Show<Int> where { def show(x: Int): String = ... }`. Treated
+    // as plain functions they need no new machinery -- what makes them a
+    // typeclass is that several instances declare the *same* method name for
+    // different parameter types, which `function_call` resolves by argument
+    // type. The `typeclass` declaration itself is type-level only and emits
+    // nothing.
+    let mut flattened: Vec<&Expr> = Vec::new();
     for expression in expressions {
+        match expression {
+            Expr::InstanceDeclaration { methods, .. } => flattened.extend(methods.iter()),
+            other => flattened.push(other),
+        }
+    }
+    for expression in flattened {
         let Expr::DefDecl {
             name,
             params,
