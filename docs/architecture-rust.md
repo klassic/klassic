@@ -1244,8 +1244,32 @@ cargo run -- -e "1 + 2"
   collector was rewritten milestone by milestone). It is single-mutator
   today, but every single-thread simplification is localized to a named
   routine with a documented multi-thread upgrade path (the plan's
-  thread-readiness table) rather than baked into the codegen. x86_64
-  only for now; aarch64 has no collector yet.
+  thread-readiness table) rather than baked into the codegen.
+
+  Both hand-emitted backends now run it. The aarch64/Mach-O backend
+  reuses the same collector through the `PortableAsm` trait: after the
+  24 runtime routines were made architecture-independent, the AArch64
+  assembler implemented the trait and the backend adopted the object
+  model (16-byte header, type tags, boxed scalars so every record slot
+  is a pointer), the mutator contract (precise shadow-stack roots for
+  bindings, parameters and machine-stack temporaries; a load barrier on
+  every heap-pointer read; colour-on-store) and the moving collector.
+  Two AArch64-specific hazards had to be handled: `bl` overwrites the
+  link register, so the trait's `call_label` brackets every portable
+  call with a frame-record save/restore to restore the x86 property that
+  a nested call cannot destroy the caller's return address; and a 16-byte
+  push stride (x86 pushes 8) makes a routine's frame slots overlap
+  registers it saved in its prologue, which is harmless where it occurs
+  but was found by a mechanical sweep rather than by testing. String
+  literals are materialised as heap copies because image constants have
+  no object header, and transient syscall scratch lives on the machine
+  stack so the sweep's block-by-block region walk never meets a
+  header-less block. Verification is the macOS/arm64 CI: an
+  allocation-heavy corpus spanning every object shape runs under
+  `--gc-stress` (collect before every allocation) and `--gc-poison`
+  (every non-good colour bad, so an unbarriered read faults), with
+  `--gc-log` asserting the collection and relocation counts are non-zero
+  so a silently idle collector cannot pass.
 
   Heap layout. At startup the prologue reserves the whole heap up front:
   one `mmap` of 64 MiB (512 regions of 128 KiB). Linux demand-pages it,

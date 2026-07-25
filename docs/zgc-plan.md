@@ -1,9 +1,11 @@
 # ZGC-Style Low-Latency GC — Implementation Plan (x86_64 native backend)
 
-Status: approved plan, execution starting. Scope decided by the owner:
-x86_64 backend only (the shared Linux/Windows codegen in
-`crates/klassic-native/src/lib.rs`); aarch64 is a separate epic (it has
-no collector at all today). Rollout: direct replacement — no
+Status: complete. Scope decided by the owner: x86_64 backend only (the
+shared Linux/Windows codegen in `crates/klassic-native/src/lib.rs`);
+aarch64 was a separate epic, since finished -- the 24 runtime routines
+were lifted onto a `PortableAsm` trait and the aarch64/Mach-O backend now
+runs this same collector, moving and all (see the aarch64 section of
+`docs/architecture-rust.md`). Rollout: direct replacement — no
 `--gc legacy|zgc` dual mode; the collector is rewritten milestone by
 milestone with the full test suite plus a differential oracle guarding
 every PR. (`--gc-log` / `--gc-stress` / `--gc-poison` are observability
@@ -358,8 +360,9 @@ the semantic oracle everywhere (eval == native differential).
   description in `docs/architecture-rust.md` was replaced with an
   accurate ZGC section (region heap, colored pointers + load barrier,
   the phase machine, no-store-barrier marking, evacuation + the R-color
-  scheme, observability flags). The aarch64 port (no collector there
-  yet) is tracked as a separate epic. The current tuning constants
+  scheme, observability flags). The aarch64 port was tracked as a
+  separate epic and has since landed on the same collector via the
+  `PortableAsm` trait. The current tuning constants
   (quantum 512 pops / 8 KiB, proactive start at half the soft budget,
   sparse-region threshold live &lt; REGION_SIZE/2, headroom cap at half
   the free bytes) compact effectively on the churn/long-lived workloads
