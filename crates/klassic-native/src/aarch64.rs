@@ -931,8 +931,26 @@ impl portable_asm::PortableAsm for Assembler {
         };
         self.branch(label, BranchKind::Conditional(cond));
     }
+    /// A call that cannot destroy the caller's return address.
+    ///
+    /// The portable routines were written against x86-64, where `call`
+    /// pushes the return address onto the stack, so a nested call is
+    /// invisible to the caller's own return. AArch64's `bl` instead
+    /// overwrites x30, so a routine that calls another without having saved
+    /// the link register can never return -- `gc_load_barrier_slow` (which
+    /// calls `mark_visit` and `evacuate`) is exactly that shape, and it
+    /// jumped to a clobbered x30 the first time a mark cycle made the
+    /// barrier take its slow path.
+    ///
+    /// Bracketing every portable call with a frame-record save/restore
+    /// gives back the x86 property globally, instead of auditing each
+    /// routine's frame discipline: two extra instructions per call, and
+    /// x29 is restored too, so a callee that repoints the frame pointer
+    /// cannot leak it either.
     fn call_label(&mut self, label: Label) {
+        self.push_frame_record(); // stp x29, x30, [sp, #-16]!
         self.branch(label, BranchKind::Link);
+        self.pop_frame_record(); // ldp x29, x30, [sp], #16
     }
     fn ret(&mut self) {
         Assembler::ret(self);
