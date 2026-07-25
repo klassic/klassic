@@ -41,3 +41,16 @@ assertResult("Bool: true")(show(true))
 assertResult(15)(7 + 8)
 assertResult("x=3")("x=" + 3)
 println("assertions held")
+
+// Dictionary passing: a record whose fields are lambdas, handed to a function
+// that calls one of them. Two different dictionaries go through the same
+// function, so a backend that specialised on the first would answer the second
+// wrongly.
+val Show_Int_dict = record { show: (x: Int) => "Int(" + x + ")" }
+val Show_Str_dict = record { show: (x: String) => "Str(" + x + ")" }
+def showValue(dict: record { show: ('a) => String }, x: 'a): String = dict.show(x)
+println(showValue(Show_Int_dict, 42))
+println(showValue(Show_Str_dict, "hi"))
+println(Show_Int_dict.show(7))
+assertResult("Int(1)")(showValue(Show_Int_dict, 1))
+assertResult("Str(s)")(showValue(Show_Str_dict, "s"))

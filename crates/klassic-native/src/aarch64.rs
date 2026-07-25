@@ -1445,6 +1445,8 @@ struct FunctionInfo {
     /// particular lambda it was handed, and inside the body the parameter
     /// name simply resolves to that lambda.
     lambda_params: Vec<(String, usize)>,
+    /// Parameters bound to a dictionary of lambdas, for the same reason.
+    dict_params: Vec<(String, Vec<(String, usize)>)>,
     ret: ValueType,
     body: Expr,
 }
@@ -1505,6 +1507,11 @@ struct Emitter {
     specializations: HashMap<(usize, Vec<ValueType>), usize>,
     lambdas: Vec<(Vec<String>, Expr)>,
     lambda_bindings: Vec<HashMap<String, usize>>,
+    /// Names bound to a *record of lambdas* -- the dictionary-passing shape
+    /// `val Show_Int_dict = record { show: (x: Int) => ... }`. Like a lambda,
+    /// such a record has no runtime representation here: `dict.show(x)`
+    /// resolves the field to its lambda and compiles the body at the call.
+    dict_bindings: Vec<HashMap<String, Vec<(String, usize)>>>,
     next_local_offset: u32,
 }
 
@@ -1903,6 +1910,20 @@ impl Emitter {
                 // Method-style builtin call `target.method(args)`:
                 // dispatch as `method(target, args)`, the same way the
                 // evaluator and C backend resolve value methods.
+                // `dict.show(x)` on a dictionary-bound name: the field names a
+                // lambda, so the call is that lambda inlined here.
+                if let Expr::FieldAccess { target, field, .. } = callee.as_ref()
+                    && let Expr::Identifier { name, .. } = target.as_ref()
+                    && let Some(mapping) = self.lookup_dict(name)
+                {
+                    let Some((_, index)) = mapping.iter().find(|(f, _)| f == field) else {
+                        return Err(unsupported(
+                            *span,
+                            &format!("field `{field}` on this dictionary"),
+                        ));
+                    };
+                    return self.emit_inline_lambda_call(*index, arguments, *span);
+                }
                 if let Expr::FieldAccess { target, field, .. } = callee.as_ref() {
                     let mut all = Vec::with_capacity(arguments.len() + 1);
                     all.push((**target).clone());
@@ -1978,6 +1999,7 @@ impl Emitter {
                 };
                 self.scopes.push(HashMap::new());
                 self.lambda_bindings.push(HashMap::new());
+                self.dict_bindings.push(HashMap::new());
                 self.scope_root_counts.push(0);
                 for expression in init {
                     self.statement(expression)?;
@@ -1985,6 +2007,7 @@ impl Emitter {
                 let ty = self.expression(last)?;
                 self.scopes.pop();
                 self.lambda_bindings.pop();
+                self.dict_bindings.pop();
                 // The block's value is already in x0 and nothing allocates
                 // between here and its use, so dropping the block's roots
                 // now is safe (and the slots themselves are dead).
@@ -5222,6 +5245,7 @@ impl Emitter {
         self.asm.store_local(Reg::X0, param_slot);
         self.scopes.push(HashMap::new());
         self.lambda_bindings.push(HashMap::new());
+        self.dict_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
         self.scopes
             .last_mut()
@@ -5244,6 +5268,7 @@ impl Emitter {
         self.asm.store_local(Reg::X0, acc);
         self.scopes.pop();
         self.lambda_bindings.pop();
+        self.dict_bindings.pop();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         // cursor = [cursor + 8]
@@ -5514,6 +5539,7 @@ impl Emitter {
         let mut rooted = Vec::with_capacity(arguments.len());
         let mut value_params: Vec<(String, ValueType)> = Vec::new();
         let mut lambda_params: Vec<(String, usize)> = Vec::new();
+        let mut dict_params: Vec<(String, Vec<(String, usize)>)> = Vec::new();
         for (param, argument) in params.iter().zip(arguments.iter()) {
             // A lambda argument is not a value: it is interned and the
             // parameter name is bound to it inside the specialisation, so a
@@ -5540,6 +5566,14 @@ impl Emitter {
                 lambda_params.push((param.clone(), index));
                 continue;
             }
+            // Likewise a dictionary of lambdas: `showValue(Show_Int_dict, 42)`
+            // hands over the record's field-to-lambda mapping, not a value.
+            if let Expr::Identifier { name, .. } = argument
+                && let Some(dict) = self.lookup_dict(name)
+            {
+                dict_params.push((param.clone(), dict));
+                continue;
+            }
             let ty = self.expression(argument)?;
             if ty == ValueType::Unit {
                 return Err(unsupported(argument.span(), "a unit-typed argument"));
@@ -5559,6 +5593,15 @@ impl Emitter {
         let mut key_types = argument_types.clone();
         for (_, index) in &lambda_params {
             key_types.push(ValueType::Record(*index as u32));
+        }
+        for (_, fields) in &dict_params {
+            for (_, index) in fields {
+                key_types.push(ValueType::Set(ListElem::Nested {
+                    depth: 1,
+                    base: ScalarElem::Int,
+                }));
+                key_types.push(ValueType::Record(*index as u32));
+            }
         }
         let key = (generic, key_types);
         let index = match self.specializations.get(&key) {
@@ -5585,12 +5628,20 @@ impl Emitter {
                 // The lambda parameters must be visible while the body's type
                 // is worked out, or a higher-order def's result could not be
                 // typed at all.
+                // Both kinds of compile-time parameter have to be visible
+                // while the body's type is worked out, and both scopes are
+                // pushed so the pops below stay symmetric -- an unmatched pop
+                // here silently discarded the *enclosing* scope, which is how
+                // a second dictionary at top level stopped being found.
                 self.lambda_bindings
                     .push(lambda_params.iter().cloned().collect());
+                self.dict_bindings
+                    .push(dict_params.iter().cloned().collect());
                 let inferred = declared_return
                     .or(matched_return)
                     .or_else(|| self.static_type_under(&body, &mut locals, 0));
                 self.lambda_bindings.pop();
+                self.dict_bindings.pop();
                 let Some(ret) = inferred else {
                     return Err(unsupported(
                         span,
@@ -5607,6 +5658,7 @@ impl Emitter {
                         label,
                         params: signature,
                         lambda_params: lambda_params.clone(),
+                        dict_params: dict_params.clone(),
                         ret,
                         body,
                     },
@@ -5688,6 +5740,7 @@ impl Emitter {
         self.asm.store_local(Reg::X0, acc_slot);
         self.scopes.push(HashMap::new());
         self.lambda_bindings.push(HashMap::new());
+        self.dict_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
         {
             let scope = self.scopes.last_mut().expect("emitter scope");
@@ -5710,6 +5763,7 @@ impl Emitter {
         self.asm.store_local(Reg::X0, acc);
         self.scopes.pop();
         self.lambda_bindings.pop();
+        self.dict_bindings.pop();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         self.asm.load_local(Reg::X0, cursor);
@@ -5720,6 +5774,14 @@ impl Emitter {
         self.asm.load_local(Reg::X0, acc);
         let _ = span;
         Ok(initial_ty)
+    }
+
+    /// A name bound to a dictionary of lambdas, innermost scope first.
+    fn lookup_dict(&self, name: &str) -> Option<Vec<(String, usize)>> {
+        self.dict_bindings
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
     }
 
     /// A name bound to a lambda, innermost scope first.
@@ -5770,6 +5832,7 @@ impl Emitter {
         }
         self.scopes.push(HashMap::new());
         self.lambda_bindings.push(HashMap::new());
+        self.dict_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
         for (param, (offset, ty)) in params.iter().zip(bound.iter()) {
             self.scopes
@@ -5785,6 +5848,7 @@ impl Emitter {
         let result = self.expression(&body)?;
         self.scopes.pop();
         self.lambda_bindings.pop();
+        self.dict_bindings.pop();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         // The parameter slots are dead now; let the next call reuse them.
@@ -5903,12 +5967,13 @@ impl Emitter {
     /// and binds parameters to frame-pointer slots, the body is a
     /// single expression whose value stays in x0.
     fn emit_function(&mut self, index: usize) -> Result<(), Diagnostic> {
-        let (label, params, lambda_params, ret, body) = {
+        let (label, params, lambda_params, dict_params, ret, body) = {
             let info = &self.functions[index].1;
             (
                 info.label,
                 info.params.clone(),
                 info.lambda_params.clone(),
+                info.dict_params.clone(),
                 info.ret,
                 info.body.clone(),
             )
@@ -5926,12 +5991,19 @@ impl Emitter {
 
         self.scopes.push(HashMap::new());
         self.lambda_bindings.push(HashMap::new());
+        self.dict_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
         for (param, lambda) in &lambda_params {
             self.lambda_bindings
                 .last_mut()
                 .expect("emitter lambda scope")
                 .insert(param.clone(), *lambda);
+        }
+        for (param, fields) in &dict_params {
+            self.dict_bindings
+                .last_mut()
+                .expect("emitter dict scope")
+                .insert(param.clone(), fields.clone());
         }
         let saved_offset = self.next_local_offset;
         self.next_local_offset = 0;
@@ -5951,6 +6023,7 @@ impl Emitter {
         let body_ty = self.expression(&body)?;
         self.scopes.pop();
         self.lambda_bindings.pop();
+        self.dict_bindings.pop();
         // Drop this activation's roots before returning; the result is in
         // x0, which the pop helper preserves.
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
@@ -6052,12 +6125,14 @@ impl Emitter {
             Expr::Block { expressions, .. } => {
                 self.scopes.push(HashMap::new());
                 self.lambda_bindings.push(HashMap::new());
+                self.dict_bindings.push(HashMap::new());
                 self.scope_root_counts.push(0);
                 for expression in expressions {
                     self.statement(expression)?;
                 }
                 self.scopes.pop();
                 self.lambda_bindings.pop();
+                self.dict_bindings.pop();
                 let roots = self.scope_root_counts.pop().expect("emitter root scope");
                 self.emit_shadow_pop(roots);
                 Ok(())
@@ -6086,6 +6161,32 @@ impl Emitter {
                         .last_mut()
                         .expect("emitter lambda scope")
                         .insert(name.clone(), index);
+                    return Ok(());
+                }
+                // `val Show_Int_dict = record { show: (x: Int) => ... }`: a
+                // record whose fields are all lambdas is the dictionary-passing
+                // shape, and like a lambda it lives only at compile time --
+                // the name is bound to its field-to-lambda mapping and
+                // `dict.show(x)` compiles the body at the call.
+                if let Expr::RecordLiteral { fields, .. } = value.as_ref()
+                    && !fields.is_empty()
+                    && fields
+                        .iter()
+                        .all(|(_, value)| matches!(value, Expr::Lambda { .. }))
+                {
+                    let mut mapping = Vec::with_capacity(fields.len());
+                    for (field, value) in fields {
+                        let Expr::Lambda { params, body, .. } = value else {
+                            unreachable!("checked above");
+                        };
+                        let index = self.lambdas.len();
+                        self.lambdas.push((params.clone(), body.as_ref().clone()));
+                        mapping.push((field.clone(), index));
+                    }
+                    self.dict_bindings
+                        .last_mut()
+                        .expect("emitter dict scope")
+                        .insert(name.clone(), mapping);
                     return Ok(());
                 }
                 let ty = self.expression(value)?;
@@ -6365,6 +6466,7 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
                 label,
                 params: signature,
                 lambda_params: Vec::new(),
+                dict_params: Vec::new(),
                 ret,
                 body: body.as_ref().clone(),
             },
@@ -7029,6 +7131,7 @@ pub(crate) fn emit_macho_program(
     };
     emitter.scopes.push(HashMap::new());
     emitter.lambda_bindings.push(HashMap::new());
+    emitter.dict_bindings.push(HashMap::new());
     emitter.scope_root_counts.push(0);
     collect_records(expr, &mut emitter);
     collect_functions(expr, &mut emitter);
