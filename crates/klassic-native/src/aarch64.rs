@@ -1531,6 +1531,22 @@ struct FunctionInfo {
     body: Expr,
 }
 
+/// The compile-time bindings a lambda was written under.
+///
+/// A lambda has no runtime representation in this backend -- its body is
+/// compiled afresh at each call -- so anything it closes over that exists only
+/// at compile time has to travel with it. Value bindings are frame slots and
+/// stay where they are; another lambda, or a dictionary of them, is a name
+/// resolved at compile time, and without carrying those the body would resolve
+/// them at the *call* site instead. That is what makes a dictionary-returning
+/// function work: the record it answers with holds lambdas that close over the
+/// dictionary it was given.
+#[derive(Clone, Default)]
+struct CapturedEnv {
+    lambdas: Vec<(String, usize)>,
+    dicts: Vec<(String, Vec<(String, usize)>)>,
+}
+
 #[derive(Default)]
 struct Emitter {
     asm: Assembler,
@@ -1586,6 +1602,8 @@ struct Emitter {
     generic_functions: Vec<GenericFunction>,
     specializations: HashMap<(usize, Vec<ValueType>), usize>,
     lambdas: Vec<(Vec<String>, Expr)>,
+    /// The environment each lambda was interned under, indexed as `lambdas`.
+    lambda_envs: Vec<CapturedEnv>,
     lambda_bindings: Vec<HashMap<String, usize>>,
     /// Names bound to another name -- `val sub = substring` binds a builtin
     /// (or any function) as a value. There is no function value at run time
@@ -2049,8 +2067,7 @@ impl Emitter {
                 }
                 // An immediately applied lambda literal, `((x) => x + 1)(3)`.
                 if let Expr::Lambda { params, body, .. } = callee.as_ref() {
-                    let index = self.lambdas.len();
-                    self.lambdas.push((params.clone(), body.as_ref().clone()));
+                    let index = self.intern_lambda(params.clone(), body.as_ref().clone());
                     return self.emit_inline_lambda_call(index, arguments, *span);
                 }
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
@@ -5212,8 +5229,7 @@ impl Emitter {
                 }
                 self.emit_time_now_millis(); // x0 = start
                 self.asm.push(Reg::X0);
-                let index = self.lambdas.len();
-                self.lambdas.push((params, body));
+                let index = self.intern_lambda(params, body);
                 self.emit_inline_lambda_call(index, &[], span)?;
                 self.emit_time_now_millis(); // x0 = end
                 self.asm.pop(Reg::X1); // start
@@ -5595,8 +5611,7 @@ impl Emitter {
                         "an open block taking other than one stream",
                     ));
                 }
-                let index = self.lambdas.len();
-                self.lambdas.push((params, body));
+                let index = self.intern_lambda(params, body);
                 let opened = self.emit_inline_lambda_call(index, &arguments[0..1], span)?;
                 Ok(Some(opened))
             }
@@ -6541,9 +6556,7 @@ impl Emitter {
                 ..
             } = argument
             {
-                let index = self.lambdas.len();
-                self.lambdas
-                    .push((lambda_args.clone(), lambda_body.as_ref().clone()));
+                let index = self.intern_lambda(lambda_args.clone(), lambda_body.as_ref().clone());
                 lambda_params.push((param.clone(), index));
                 continue;
             }
@@ -6559,9 +6572,7 @@ impl Emitter {
             }
             // Likewise a dictionary of lambdas: `showValue(Show_Int_dict, 42)`
             // hands over the record's field-to-lambda mapping, not a value.
-            if let Expr::Identifier { name, .. } = argument
-                && let Some(dict) = self.lookup_dict(name)
-            {
+            if let Some(dict) = self.dict_value_of(argument) {
                 dict_params.push((param.clone(), dict));
                 continue;
             }
@@ -6824,6 +6835,132 @@ impl Emitter {
     }
 
     /// A name bound to a dictionary of lambdas, innermost scope first.
+    /// Intern a lambda together with the compile-time environment it was
+    /// written under, and answer with its index.
+    fn intern_lambda(&mut self, params: Vec<String>, body: Expr) -> usize {
+        // Outer scopes first, so an inner binding of the same name wins when
+        // the environment is installed in order.
+        let env = CapturedEnv {
+            lambdas: self
+                .lambda_bindings
+                .iter()
+                .flatten()
+                .map(|(name, index)| (name.clone(), *index))
+                .collect(),
+            dicts: self
+                .dict_bindings
+                .iter()
+                .flatten()
+                .map(|(name, fields)| (name.clone(), fields.clone()))
+                .collect(),
+        };
+        self.lambdas.push((params, body));
+        self.lambda_envs.push(env);
+        self.lambdas.len() - 1
+    }
+
+    /// The field-to-lambda mapping of an expression that denotes a dictionary
+    /// at compile time.
+    ///
+    /// Three shapes, and the third is the point: a name bound to one, a record
+    /// literal whose fields are all lambdas, and a *call* whose result is one
+    /// -- `Show_List_dict(Show_Int_dict)`, a dictionary parameterised by
+    /// another. That call is evaluated here rather than at run time, with the
+    /// argument bound as a dictionary inside, so the lambdas in the record it
+    /// answers with capture it.
+    ///
+    /// Interning lambdas is all this does; it emits no code, so asking whether
+    /// an arbitrary argument happens to be a dictionary costs nothing but a few
+    /// unused table entries.
+    fn dict_value_of(&mut self, expr: &Expr) -> Option<Vec<(String, usize)>> {
+        match expr {
+            Expr::Identifier { name, .. } => self.lookup_dict(name),
+            Expr::RecordLiteral { fields, .. }
+                if !fields.is_empty()
+                    && fields
+                        .iter()
+                        .all(|(_, value)| matches!(value, Expr::Lambda { .. })) =>
+            {
+                let mut mapping = Vec::with_capacity(fields.len());
+                for (field, value) in fields {
+                    let Expr::Lambda { params, body, .. } = value else {
+                        unreachable!("checked in the guard");
+                    };
+                    let index = self.intern_lambda(params.clone(), body.as_ref().clone());
+                    mapping.push((field.clone(), index));
+                }
+                Some(mapping)
+            }
+            Expr::Block { expressions, .. } if expressions.len() == 1 => {
+                self.dict_value_of(&expressions[0])
+            }
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                let Expr::Identifier { name, .. } = callee.as_ref() else {
+                    return None;
+                };
+                let index = self.lookup_lambda(name)?;
+                let (params, body) = self.lambdas[index].clone();
+                if params.len() != arguments.len() {
+                    return None;
+                }
+                self.push_binding_scopes();
+                self.install_captured_env(index);
+                let mut bound = true;
+                for (param, argument) in params.iter().zip(arguments.iter()) {
+                    if let Some(dict) = self.dict_value_of(argument) {
+                        self.dict_bindings
+                            .last_mut()
+                            .expect("emitter dict scope")
+                            .insert(param.clone(), dict);
+                        continue;
+                    }
+                    if let Expr::Identifier { name, .. } = argument
+                        && let Some(lambda) = self.lookup_lambda(name)
+                    {
+                        self.lambda_bindings
+                            .last_mut()
+                            .expect("emitter lambda scope")
+                            .insert(param.clone(), lambda);
+                        continue;
+                    }
+                    // A value argument cannot be bound without emitting code,
+                    // so this is not a compile-time dictionary after all.
+                    bound = false;
+                    break;
+                }
+                let mapping = if bound {
+                    self.dict_value_of(&body)
+                } else {
+                    None
+                };
+                self.pop_binding_scopes();
+                mapping
+            }
+            _ => None,
+        }
+    }
+
+    /// Install a lambda's captured environment in the innermost scope. Adds to
+    /// what is already visible rather than replacing it: the names a lambda
+    /// closed over resolve to what they meant then, and nothing else moves.
+    fn install_captured_env(&mut self, index: usize) {
+        let env = self.lambda_envs[index].clone();
+        for (name, lambda) in env.lambdas {
+            self.lambda_bindings
+                .last_mut()
+                .expect("emitter lambda scope")
+                .insert(name, lambda);
+        }
+        for (name, fields) in env.dicts {
+            self.dict_bindings
+                .last_mut()
+                .expect("emitter dict scope")
+                .insert(name, fields);
+        }
+    }
+
     fn lookup_dict(&self, name: &str) -> Option<Vec<(String, usize)>> {
         self.dict_bindings
             .iter()
@@ -6938,6 +7075,8 @@ impl Emitter {
             bound.push((offset, ty));
         }
         self.push_binding_scopes();
+        // What the lambda closed over, before its parameters shadow anything.
+        self.install_captured_env(index);
         self.scope_root_counts.push(0);
         for (param, (offset, ty)) in params.iter().zip(bound.iter()) {
             self.scopes
@@ -6999,20 +7138,32 @@ impl Emitter {
         } else {
             let argument_types: Vec<Option<ValueType>> =
                 arguments.iter().map(|a| self.static_type_of(a)).collect();
-            candidates
-                .iter()
-                .rev()
-                .copied()
-                .find(|&candidate| {
-                    let params = &self.functions[candidate].1.params;
-                    params.len() == arguments.len()
-                        && params.iter().zip(argument_types.iter()).all(
-                            |((_, expected), actual)| {
-                                actual.is_some_and(|actual| assignable(actual, *expected))
-                            },
-                        )
-                })
-                .unwrap_or(fallback)
+            let accepted = candidates.iter().rev().copied().find(|&candidate| {
+                let params = &self.functions[candidate].1.params;
+                params.len() == arguments.len()
+                    && params
+                        .iter()
+                        .zip(argument_types.iter())
+                        .all(|((_, expected), actual)| {
+                            actual.is_some_and(|actual| assignable(actual, *expected))
+                        })
+            });
+            match accepted {
+                Some(index) => index,
+                // No concrete overload accepts these arguments. One of the
+                // instances may still be the answer without being concrete:
+                // `instance Show<List<'a>>` declares its `show` over a type
+                // variable, so it is compiled per call site like any other
+                // signature that is not fully annotated.
+                None => {
+                    if let Some(generic) = self.generic_functions.iter().rposition(|generic| {
+                        generic.name == name && generic.params.len() == arguments.len()
+                    }) {
+                        return self.emit_generic_function_call(generic, arguments, span);
+                    }
+                    fallback
+                }
+            }
         };
         let (label, params, ret) = {
             let info = &self.functions[index].1;
@@ -7325,8 +7476,7 @@ impl Emitter {
                 // is compiled at each call site, where the parameter types
                 // are known from the arguments.
                 if let Expr::Lambda { params, body, .. } = value.as_ref() {
-                    let index = self.lambdas.len();
-                    self.lambdas.push((params.clone(), body.as_ref().clone()));
+                    let index = self.intern_lambda(params.clone(), body.as_ref().clone());
                     self.lambda_bindings
                         .last_mut()
                         .expect("emitter lambda scope")
@@ -7359,15 +7509,20 @@ impl Emitter {
                         .iter()
                         .all(|(_, value)| matches!(value, Expr::Lambda { .. }))
                 {
-                    let mut mapping = Vec::with_capacity(fields.len());
-                    for (field, value) in fields {
-                        let Expr::Lambda { params, body, .. } = value else {
-                            unreachable!("checked above");
-                        };
-                        let index = self.lambdas.len();
-                        self.lambdas.push((params.clone(), body.as_ref().clone()));
-                        mapping.push((field.clone(), index));
-                    }
+                    let mapping = self
+                        .dict_value_of(value)
+                        .expect("a record of lambdas is a dictionary");
+                    self.dict_bindings
+                        .last_mut()
+                        .expect("emitter dict scope")
+                        .insert(name.clone(), mapping);
+                    return Ok(());
+                }
+                // ...and so is a call that answers with one, which is how a
+                // dictionary parameterised by another is bound to a name.
+                if matches!(value.as_ref(), Expr::Call { .. })
+                    && let Some(mapping) = self.dict_value_of(value)
+                {
                     self.dict_bindings
                         .last_mut()
                         .expect("emitter dict scope")
