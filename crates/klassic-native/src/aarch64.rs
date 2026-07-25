@@ -1415,6 +1415,9 @@ impl Emitter {
                 }
                 let offset = self.asm.intern_string_object(value);
                 self.asm.load_rodata_address(Reg::X0, offset);
+                // Materialise the literal as a real heap object (see
+                // emit_heap_string_copy) so `Str` is always traceable.
+                self.emit_heap_string_copy();
                 Ok(ValueType::Str)
             }
             // `#{...}` holes: fold parts left to right through the
@@ -1430,6 +1433,7 @@ impl Emitter {
                     None => {
                         let offset = self.asm.intern_string_object("");
                         self.asm.load_rodata_address(Reg::X0, offset);
+                        self.emit_heap_string_copy();
                     }
                     Some(first) => self.emit_string_part(first)?,
                 }
@@ -1694,6 +1698,7 @@ impl Emitter {
             StringPart::Literal(text) => {
                 let offset = self.asm.intern_string_object(text);
                 self.asm.load_rodata_address(Reg::X0, offset);
+                self.emit_heap_string_copy();
                 Ok(())
             }
             StringPart::Interpolation(hole) => {
@@ -2411,6 +2416,33 @@ impl Emitter {
         self.asm.ret();
     }
 
+    /// M7: copy the string object in x0 onto the GC heap, leaving the copy
+    /// in x0.
+    ///
+    /// String *literals* live in the read-only `__TEXT,__const` image, so
+    /// they have no object header: the collector cannot size them, and
+    /// marking one would try to write a mark bit into read-only memory.
+    /// Every literal is therefore materialised as a heap copy, which makes
+    /// `Str` mean "heap string" everywhere and keeps every reference the
+    /// mutator can store or root a real, traceable object. (The x86-64
+    /// backend gets the same guarantee by distinguishing StaticString from
+    /// HeapString in its value model and copying at the boundary.)
+    ///
+    /// The source is in the immovable image, so it is parked on the machine
+    /// stack *without* a root -- rooting a non-heap pointer would send the
+    /// collector into `__const` looking for a header.
+    fn emit_heap_string_copy(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+        self.asm.push(Reg::X0); // source: rodata never moves
+        self.emit_alloc_raw_string(Reg::X2); // x5 = copy, x2 preserved
+        self.asm.pop(Reg::X6); // source
+        self.asm.str_imm(Reg::X2, Reg::X5, 0); // copy's length
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8); // dst payload
+        self.asm.add_reg_imm(Reg::X6, Reg::X6, 8); // src payload
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X3);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
     fn load_barrier_label(&mut self) -> Label {
         match self.gc_load_barrier_label {
             Some(label) => label,
@@ -3062,7 +3094,11 @@ impl Emitter {
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8); // dst = new object's payload
         self.emit_copy_bytes(Reg::X2, Reg::X3, Reg::X7, Reg::X1);
         self.asm.mov_reg(Reg::X0, Reg::X5);
-        self.asm.push(Reg::X0);
+        // The finished segments queue on the machine stack while the
+        // remaining ones are built (each allocates) and are consumed by
+        // emit_cons_cell, which pops them as roots -- so they are pushed as
+        // roots here.
+        self.push_rooted(Reg::X0);
         self.asm.add_reg_imm(Reg::X12, Reg::X12, 1);
     }
 
@@ -3356,6 +3392,9 @@ impl Emitter {
         self.asm.bind(false_label);
         self.asm.load_rodata_address(Reg::X0, false_offset);
         self.asm.bind(end_label);
+        // Like any other literal, hand back a heap copy so the result is a
+        // traceable object rather than an image address.
+        self.emit_heap_string_copy();
     }
 
     /// Build a record object from `count` field values pushed onto
