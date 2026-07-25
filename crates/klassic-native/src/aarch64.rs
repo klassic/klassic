@@ -1178,7 +1178,7 @@ fn unsupported(span: Span, feature: &str) -> Diagnostic {
 }
 
 /// Element types a list can carry in the current subset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ListElem {
     Int,
     Bool,
@@ -1189,7 +1189,7 @@ enum ListElem {
 /// `Str` is a pointer to a `[len: u64][bytes]` object in rodata or on
 /// the bump heap; `List` is a pointer to a `[value: u64][next: ptr]`
 /// cons cell (nil is the null pointer).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ValueType {
     Int,
     /// An IEEE 754 double held as raw bits in a GP register / frame
@@ -1360,6 +1360,13 @@ struct Emitter {
     /// parameter types taken from the arguments at that site, so no closure
     /// object or indirect call is needed for the cases the language's own
     /// programs use.
+    /// Defs whose signature is not fully concrete -- `def fact(n) = ...`, or
+    /// a generic one like `def display<'a>(x: 'a): Unit where Show<'a>`.
+    /// They are compiled once per distinct tuple of argument types, keyed in
+    /// `specializations`, because the parameter types only exist at the call
+    /// site.
+    generic_functions: Vec<(String, Vec<String>, Expr, Option<ValueType>)>,
+    specializations: HashMap<(usize, Vec<ValueType>), usize>,
     lambdas: Vec<(Vec<String>, Expr)>,
     lambda_bindings: Vec<HashMap<String, usize>>,
     next_local_offset: u32,
@@ -4854,6 +4861,214 @@ impl Emitter {
         Ok(ValueType::List(mapped_elem))
     }
 
+    /// The type of an expression under an overlay of extra bindings, worked
+    /// out without emitting code. This is how a generic def's *return* type
+    /// is found: bind its parameters to the argument types from the call
+    /// site, then read the body's type. `None` means "cannot tell cheaply",
+    /// and callers treat that as unsupported rather than guessing.
+    ///
+    /// The overlay grows as a block's `val`s are walked, so a body that
+    /// computes through locals -- the usual shape -- is covered. A recursive
+    /// call reads as `None`, which an `if` merges away as long as the other
+    /// branch is concrete; that is exactly what makes `def fact(n) = if (n <
+    /// 2) 1 else n * fact(n - 1)` work.
+    fn static_type_under(
+        &self,
+        expr: &Expr,
+        locals: &mut Vec<(String, ValueType)>,
+    ) -> Option<ValueType> {
+        match expr {
+            Expr::Identifier { name, .. } => locals
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .map(|(_, ty)| *ty)
+                .or_else(|| self.lookup(name).map(|(_, ty)| ty)),
+            Expr::Block { expressions, .. } => {
+                let depth = locals.len();
+                let (last, init) = expressions.split_last()?;
+                for expression in init {
+                    if let Expr::VarDecl { name, value, .. } = expression
+                        && let Some(ty) = self.static_type_under(value, locals)
+                    {
+                        locals.push((name.clone(), ty));
+                    }
+                }
+                let ty = self.static_type_under(last, locals);
+                locals.truncate(depth);
+                ty
+            }
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let then_ty = self.static_type_under(then_branch, locals);
+                match else_branch {
+                    // A branch whose type is unknown (a recursive call) does
+                    // not veto the one that is known.
+                    Some(else_branch) => {
+                        then_ty.or_else(|| self.static_type_under(else_branch, locals))
+                    }
+                    None => then_ty,
+                }
+            }
+            Expr::Unary { op, expr, .. } => match op {
+                UnaryOp::Not => Some(ValueType::Bool),
+                _ => self.static_type_under(expr, locals),
+            },
+            Expr::Binary { lhs, op, rhs, .. } => match op {
+                BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::Less
+                | BinaryOp::LessEqual
+                | BinaryOp::Greater
+                | BinaryOp::GreaterEqual
+                | BinaryOp::LogicalAnd
+                | BinaryOp::LogicalOr => Some(ValueType::Bool),
+                // Arithmetic keeps the operand type; appending to a string
+                // yields a string whatever the right side was.
+                _ => {
+                    let lhs_ty = self.static_type_under(lhs, locals);
+                    match lhs_ty {
+                        Some(ValueType::Str) => Some(ValueType::Str),
+                        Some(ty) => Some(ty),
+                        None => self.static_type_under(rhs, locals),
+                    }
+                }
+            },
+            Expr::FieldAccess { target, field, .. } => {
+                let ValueType::Record(index) = self.static_type_under(target, locals)? else {
+                    return None;
+                };
+                let info = self.records.get(index as usize)?;
+                info.fields
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, ty)| *ty)
+            }
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                let Expr::Identifier { name, .. } = callee.as_ref() else {
+                    return None;
+                };
+                // A builtin's result, for the handful whose type the inference
+                // path actually meets. Anything else falls through to the
+                // function table.
+                let first_type = arguments
+                    .first()
+                    .and_then(|argument| self.static_type_under(argument, locals));
+                match name.as_str() {
+                    "println" | "print" => return Some(ValueType::Unit),
+                    "double" | "sqrt" | "floor" | "ceil" => return Some(ValueType::Double),
+                    "abs" => return first_type,
+                    "size" | "length" | "toInt" => return Some(ValueType::Int),
+                    "isEmpty" | "contains" => return Some(ValueType::Bool),
+                    "toString" | "substring" | "trim" | "toUpperCase" | "toLowerCase"
+                    | "reverse" | "join" | "replaceAll" | "at" => return Some(ValueType::Str),
+                    _ => {}
+                }
+                self.static_type_of(expr)
+            }
+            _ => self.static_type_of(expr),
+        }
+    }
+
+    /// Compile a call to a def whose signature was not concrete, by
+    /// specialising it for the argument types at this site.
+    fn emit_generic_function_call(
+        &mut self,
+        generic: usize,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let (name, params, body, declared_return) = self.generic_functions[generic].clone();
+        if params.len() != arguments.len() {
+            return Err(Diagnostic::compile(
+                span,
+                format!(
+                    "{name} expects {} argument(s) but got {}",
+                    params.len(),
+                    arguments.len()
+                ),
+            ));
+        }
+        if arguments.len() > ARG_REGS.len() {
+            return Err(unsupported(span, "calls with more than 8 arguments"));
+        }
+        // Arguments first: their types are what selects the specialisation,
+        // and a heap-reference one is rooted while the rest are evaluated.
+        let mut argument_types = Vec::with_capacity(arguments.len());
+        let mut rooted = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            let ty = self.expression(argument)?;
+            if ty == ValueType::Unit {
+                return Err(unsupported(argument.span(), "a unit-typed argument"));
+            }
+            if is_heap_pointer(ty) {
+                self.push_rooted(Reg::X0);
+                rooted.push(true);
+            } else {
+                self.asm.push(Reg::X0);
+                rooted.push(false);
+            }
+            argument_types.push(ty);
+        }
+        let key = (generic, argument_types.clone());
+        let index = match self.specializations.get(&key) {
+            Some(&index) => index,
+            None => {
+                let signature: Vec<(String, ValueType)> = params
+                    .iter()
+                    .cloned()
+                    .zip(argument_types.iter().copied())
+                    .collect();
+                // A declared return type is the answer when there is one --
+                // only the *parameters* were generic in that case.
+                let mut locals = signature.clone();
+                let inferred =
+                    declared_return.or_else(|| self.static_type_under(&body, &mut locals));
+                let Some(ret) = inferred else {
+                    return Err(unsupported(
+                        span,
+                        &format!("a call to `{name}`, whose result type cannot be determined"),
+                    ));
+                };
+                let label = self.asm.new_label();
+                // Registered *before* its body is emitted, so a recursive
+                // call inside the body finds this specialisation instead of
+                // specialising again forever.
+                self.functions.push((
+                    format!("{name}#{}", self.specializations.len()),
+                    FunctionInfo {
+                        label,
+                        params: signature,
+                        ret,
+                        body,
+                    },
+                ));
+                let index = self.functions.len() - 1;
+                self.specializations.insert(key, index);
+                index
+            }
+        };
+        let (label, ret) = {
+            let info = &self.functions[index].1;
+            (info.label, info.ret)
+        };
+        for (position, register) in ARG_REGS.iter().take(arguments.len()).enumerate().rev() {
+            if rooted[position] {
+                self.pop_rooted(*register);
+            } else {
+                self.asm.pop(*register);
+            }
+        }
+        self.asm.branch(label, BranchKind::Link);
+        self.pending.push(index);
+        Ok(ret)
+    }
+
     /// A name bound to a lambda, innermost scope first.
     fn lookup_lambda(&self, name: &str) -> Option<usize> {
         self.lambda_bindings
@@ -4950,6 +5165,15 @@ impl Emitter {
             .map(|(index, _)| index)
             .collect();
         let Some(&fallback) = candidates.last() else {
+            // No concrete definition: a def whose signature was not fully
+            // annotated is compiled per call site instead.
+            if let Some(generic) = self
+                .generic_functions
+                .iter()
+                .rposition(|(n, params, _, _)| n == name && params.len() == arguments.len())
+            {
+                return self.emit_generic_function_call(generic, arguments, span);
+            }
             return Err(unsupported(span, &format!("function `{name}`")));
         };
         let index = if candidates.len() == 1 {
@@ -5441,15 +5665,25 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
             };
             signature.push((param.clone(), ty));
         }
-        if signature.len() != params.len() {
+        // A signature the backend cannot spell out concretely -- an
+        // unannotated parameter, a type variable, a return type it does not
+        // model -- becomes a *generic* def instead of being dropped. Its
+        // parameter types exist only at the call site, so it is compiled
+        // once per distinct tuple of argument types (see
+        // emit_generic_function_call).
+        let concrete_return = return_annotation
+            .as_ref()
+            .and_then(|annotation| emitter.annotation_type(&annotation.text, *span).ok());
+        if signature.len() != params.len() || concrete_return.is_none() {
+            emitter.generic_functions.push((
+                name.clone(),
+                params.clone(),
+                body.as_ref().clone(),
+                concrete_return,
+            ));
             continue;
         }
-        let Some(return_annotation) = return_annotation else {
-            continue;
-        };
-        let Ok(ret) = emitter.annotation_type(&return_annotation.text, *span) else {
-            continue;
-        };
+        let ret = concrete_return.expect("checked above");
         let label = emitter.asm.new_label();
         emitter.functions.push((
             name.clone(),

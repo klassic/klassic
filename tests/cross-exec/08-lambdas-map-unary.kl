@@ -51,7 +51,21 @@ println("mapped=" + doubled)
 println("strs=" + ["x" "y"])
 println("set=" + %(1 2 2))
 
+// Defs without annotations: the parameter types come from the call site and
+// the result type is read off the body, which is what lets a recursive one
+// work at all -- the specialisation must be registered before its own body is
+// compiled or it would specialise forever.
+def fact(n) = if (n < 2) 1 else n * fact(n - 1)
+def bigger(a, b) = if (a > b) a else b
+def label(who) = "hi " + who
+println(fact(6))
+println(bigger(3, 9))
+println(label("kota"))
+println(fact(bigger(2, 4)))
+
 assertResult(7)(add(3, 4))
+assertResult(120)(fact(5))
+assertResult(9)(bigger(9, 1))
 assertResult(-10)(-ten)
 assertResult(true)(!false)
 assertResult(49)(((x) => x * x)(7))
