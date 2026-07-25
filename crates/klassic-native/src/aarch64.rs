@@ -2014,19 +2014,13 @@ impl Emitter {
                     self.asm.mov_imm64(Reg::X0, 0);
                     return Ok(ValueType::Unit);
                 };
-                self.scopes.push(HashMap::new());
-                self.lambda_bindings.push(HashMap::new());
-                self.dict_bindings.push(HashMap::new());
-                self.alias_bindings.push(HashMap::new());
+                self.push_binding_scopes();
                 self.scope_root_counts.push(0);
                 for expression in init {
                     self.statement(expression)?;
                 }
                 let ty = self.expression(last)?;
-                self.scopes.pop();
-                self.lambda_bindings.pop();
-                self.dict_bindings.pop();
-                self.alias_bindings.pop();
+                self.pop_binding_scopes();
                 // The block's value is already in x0 and nothing allocates
                 // between here and its use, so dropping the block's roots
                 // now is safe (and the slots themselves are dead).
@@ -5385,10 +5379,7 @@ impl Emitter {
             self.emit_unbox_scalar();
         }
         self.asm.store_local(Reg::X0, param_slot);
-        self.scopes.push(HashMap::new());
-        self.lambda_bindings.push(HashMap::new());
-        self.dict_bindings.push(HashMap::new());
-        self.alias_bindings.push(HashMap::new());
+        self.push_binding_scopes();
         self.scope_root_counts.push(0);
         self.scopes
             .last_mut()
@@ -5409,10 +5400,7 @@ impl Emitter {
         self.asm.load_local(Reg::X0, acc);
         self.emit_cons_cell();
         self.asm.store_local(Reg::X0, acc);
-        self.scopes.pop();
-        self.lambda_bindings.pop();
-        self.dict_bindings.pop();
-        self.alias_bindings.pop();
+        self.pop_binding_scopes();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         // cursor = [cursor + 8]
@@ -5781,6 +5769,7 @@ impl Emitter {
                     .push(lambda_params.iter().cloned().collect());
                 self.dict_bindings
                     .push(dict_params.iter().cloned().collect());
+                self.alias_bindings.push(HashMap::new());
                 let inferred = declared_return
                     .or(matched_return)
                     .or_else(|| self.static_type_under(&body, &mut locals, 0));
@@ -5883,10 +5872,7 @@ impl Emitter {
         self.asm.store_local(Reg::X0, elem_slot);
         self.asm.load_local(Reg::X0, acc);
         self.asm.store_local(Reg::X0, acc_slot);
-        self.scopes.push(HashMap::new());
-        self.lambda_bindings.push(HashMap::new());
-        self.dict_bindings.push(HashMap::new());
-        self.alias_bindings.push(HashMap::new());
+        self.push_binding_scopes();
         self.scope_root_counts.push(0);
         {
             let scope = self.scopes.last_mut().expect("emitter scope");
@@ -5907,10 +5893,7 @@ impl Emitter {
             ));
         }
         self.asm.store_local(Reg::X0, acc);
-        self.scopes.pop();
-        self.lambda_bindings.pop();
-        self.dict_bindings.pop();
-        self.alias_bindings.pop();
+        self.pop_binding_scopes();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         self.asm.load_local(Reg::X0, cursor);
@@ -5921,6 +5904,28 @@ impl Emitter {
         self.asm.load_local(Reg::X0, acc);
         let _ = span;
         Ok(initial_ty)
+    }
+
+    /// Open a scope for all four kinds of compile-time binding at once.
+    ///
+    /// These stacks have to move in lockstep: an unmatched pop discards the
+    /// *enclosing* scope, and the symptom is a binding that silently stops
+    /// existing (or a panic on an empty stack). Two bugs of exactly that shape
+    /// happened while these were pushed one by one, so opening and closing
+    /// them is a single operation now.
+    fn push_binding_scopes(&mut self) {
+        self.scopes.push(HashMap::new());
+        self.lambda_bindings.push(HashMap::new());
+        self.dict_bindings.push(HashMap::new());
+        self.alias_bindings.push(HashMap::new());
+    }
+
+    /// Close the scopes `push_binding_scopes` opened.
+    fn pop_binding_scopes(&mut self) {
+        self.scopes.pop();
+        self.lambda_bindings.pop();
+        self.dict_bindings.pop();
+        self.alias_bindings.pop();
     }
 
     /// A name aliasing another name, innermost scope first.
@@ -5985,10 +5990,7 @@ impl Emitter {
             self.asm.store_local(Reg::X0, offset);
             bound.push((offset, ty));
         }
-        self.scopes.push(HashMap::new());
-        self.lambda_bindings.push(HashMap::new());
-        self.dict_bindings.push(HashMap::new());
-        self.alias_bindings.push(HashMap::new());
+        self.push_binding_scopes();
         self.scope_root_counts.push(0);
         for (param, (offset, ty)) in params.iter().zip(bound.iter()) {
             self.scopes
@@ -6002,10 +6004,7 @@ impl Emitter {
             }
         }
         let result = self.expression(&body)?;
-        self.scopes.pop();
-        self.lambda_bindings.pop();
-        self.dict_bindings.pop();
-        self.alias_bindings.pop();
+        self.pop_binding_scopes();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         // The parameter slots are dead now; let the next call reuse them.
@@ -6146,10 +6145,7 @@ impl Emitter {
         }
         self.asm.mov_fp_sp();
 
-        self.scopes.push(HashMap::new());
-        self.lambda_bindings.push(HashMap::new());
-        self.dict_bindings.push(HashMap::new());
-        self.alias_bindings.push(HashMap::new());
+        self.push_binding_scopes();
         self.scope_root_counts.push(0);
         for (param, lambda) in &lambda_params {
             self.lambda_bindings
@@ -6179,10 +6175,7 @@ impl Emitter {
             self.emit_root_frame_slot(offset);
         }
         let body_ty = self.expression(&body)?;
-        self.scopes.pop();
-        self.lambda_bindings.pop();
-        self.dict_bindings.pop();
-        self.alias_bindings.pop();
+        self.pop_binding_scopes();
         // Drop this activation's roots before returning; the result is in
         // x0, which the pop helper preserves.
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
@@ -6282,18 +6275,12 @@ impl Emitter {
     fn statement(&mut self, expr: &Expr) -> Result<(), Diagnostic> {
         match expr {
             Expr::Block { expressions, .. } => {
-                self.scopes.push(HashMap::new());
-                self.lambda_bindings.push(HashMap::new());
-                self.dict_bindings.push(HashMap::new());
-                self.alias_bindings.push(HashMap::new());
+                self.push_binding_scopes();
                 self.scope_root_counts.push(0);
                 for expression in expressions {
                     self.statement(expression)?;
                 }
-                self.scopes.pop();
-                self.lambda_bindings.pop();
-                self.dict_bindings.pop();
-                self.alias_bindings.pop();
+                self.pop_binding_scopes();
                 let roots = self.scope_root_counts.pop().expect("emitter root scope");
                 self.emit_shadow_pop(roots);
                 Ok(())
