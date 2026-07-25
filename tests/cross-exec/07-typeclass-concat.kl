@@ -67,3 +67,12 @@ println(matches("anything", ".*"))
 println(matches("abc", "abc"))
 assertResult(true)(matches("2026", digits))
 assertResult(false)(matches("", digits))
+
+// A function bound as a value: there is no function value at run time on the
+// aarch64 backend, so the name is an alias resolved at each call.
+val sub = substring
+val up = toUpperCase
+println(sub("BAR", 0, 1))
+println(up("abc"))
+assertResult("B")(sub("BAR", 0, 1))
+assertResult("ABC")(up("abc"))

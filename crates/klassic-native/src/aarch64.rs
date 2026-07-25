@@ -1507,6 +1507,11 @@ struct Emitter {
     specializations: HashMap<(usize, Vec<ValueType>), usize>,
     lambdas: Vec<(Vec<String>, Expr)>,
     lambda_bindings: Vec<HashMap<String, usize>>,
+    /// Names bound to another name -- `val sub = substring` binds a builtin
+    /// (or any function) as a value. There is no function value at run time
+    /// here, so the binding is compile-time and `sub(...)` compiles as a call
+    /// to what it names.
+    alias_bindings: Vec<HashMap<String, String>>,
     /// Names bound to a *record of lambdas* -- the dictionary-passing shape
     /// `val Show_Int_dict = record { show: (x: Int) => ... }`. Like a lambda,
     /// such a record has no runtime representation here: `dict.show(x)`
@@ -1947,6 +1952,18 @@ impl Emitter {
                 if let Some(index) = self.lookup_lambda(name) {
                     return self.emit_inline_lambda_call(index, arguments, *span);
                 }
+                // An alias stands for whatever name it was bound to.
+                if let Some(target) = self.lookup_alias(name) {
+                    let callee = Expr::Identifier {
+                        name: target,
+                        span: *span,
+                    };
+                    return self.expression(&Expr::Call {
+                        callee: Box::new(callee),
+                        arguments: arguments.clone(),
+                        span: *span,
+                    });
+                }
                 // `__enum_shape_named(value, "Variant")` and
                 // `__enum_shape_hint(value, id)` are shape aids the shared
                 // enum-lowering pass wraps around values for the x86_64
@@ -2000,6 +2017,7 @@ impl Emitter {
                 self.scopes.push(HashMap::new());
                 self.lambda_bindings.push(HashMap::new());
                 self.dict_bindings.push(HashMap::new());
+                self.alias_bindings.push(HashMap::new());
                 self.scope_root_counts.push(0);
                 for expression in init {
                     self.statement(expression)?;
@@ -2008,6 +2026,7 @@ impl Emitter {
                 self.scopes.pop();
                 self.lambda_bindings.pop();
                 self.dict_bindings.pop();
+                self.alias_bindings.pop();
                 // The block's value is already in x0 and nothing allocates
                 // between here and its use, so dropping the block's roots
                 // now is safe (and the slots themselves are dead).
@@ -5369,6 +5388,7 @@ impl Emitter {
         self.scopes.push(HashMap::new());
         self.lambda_bindings.push(HashMap::new());
         self.dict_bindings.push(HashMap::new());
+        self.alias_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
         self.scopes
             .last_mut()
@@ -5392,6 +5412,7 @@ impl Emitter {
         self.scopes.pop();
         self.lambda_bindings.pop();
         self.dict_bindings.pop();
+        self.alias_bindings.pop();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         // cursor = [cursor + 8]
@@ -5765,6 +5786,7 @@ impl Emitter {
                     .or_else(|| self.static_type_under(&body, &mut locals, 0));
                 self.lambda_bindings.pop();
                 self.dict_bindings.pop();
+                self.alias_bindings.pop();
                 let Some(ret) = inferred else {
                     return Err(unsupported(
                         span,
@@ -5864,6 +5886,7 @@ impl Emitter {
         self.scopes.push(HashMap::new());
         self.lambda_bindings.push(HashMap::new());
         self.dict_bindings.push(HashMap::new());
+        self.alias_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
         {
             let scope = self.scopes.last_mut().expect("emitter scope");
@@ -5887,6 +5910,7 @@ impl Emitter {
         self.scopes.pop();
         self.lambda_bindings.pop();
         self.dict_bindings.pop();
+        self.alias_bindings.pop();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         self.asm.load_local(Reg::X0, cursor);
@@ -5897,6 +5921,14 @@ impl Emitter {
         self.asm.load_local(Reg::X0, acc);
         let _ = span;
         Ok(initial_ty)
+    }
+
+    /// A name aliasing another name, innermost scope first.
+    fn lookup_alias(&self, name: &str) -> Option<String> {
+        self.alias_bindings
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
     }
 
     /// A name bound to a dictionary of lambdas, innermost scope first.
@@ -5956,6 +5988,7 @@ impl Emitter {
         self.scopes.push(HashMap::new());
         self.lambda_bindings.push(HashMap::new());
         self.dict_bindings.push(HashMap::new());
+        self.alias_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
         for (param, (offset, ty)) in params.iter().zip(bound.iter()) {
             self.scopes
@@ -5972,6 +6005,7 @@ impl Emitter {
         self.scopes.pop();
         self.lambda_bindings.pop();
         self.dict_bindings.pop();
+        self.alias_bindings.pop();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         // The parameter slots are dead now; let the next call reuse them.
@@ -6115,6 +6149,7 @@ impl Emitter {
         self.scopes.push(HashMap::new());
         self.lambda_bindings.push(HashMap::new());
         self.dict_bindings.push(HashMap::new());
+        self.alias_bindings.push(HashMap::new());
         self.scope_root_counts.push(0);
         for (param, lambda) in &lambda_params {
             self.lambda_bindings
@@ -6147,6 +6182,7 @@ impl Emitter {
         self.scopes.pop();
         self.lambda_bindings.pop();
         self.dict_bindings.pop();
+        self.alias_bindings.pop();
         // Drop this activation's roots before returning; the result is in
         // x0, which the pop helper preserves.
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
@@ -6249,6 +6285,7 @@ impl Emitter {
                 self.scopes.push(HashMap::new());
                 self.lambda_bindings.push(HashMap::new());
                 self.dict_bindings.push(HashMap::new());
+                self.alias_bindings.push(HashMap::new());
                 self.scope_root_counts.push(0);
                 for expression in expressions {
                     self.statement(expression)?;
@@ -6256,6 +6293,7 @@ impl Emitter {
                 self.scopes.pop();
                 self.lambda_bindings.pop();
                 self.dict_bindings.pop();
+                self.alias_bindings.pop();
                 let roots = self.scope_root_counts.pop().expect("emitter root scope");
                 self.emit_shadow_pop(roots);
                 Ok(())
@@ -6291,6 +6329,21 @@ impl Emitter {
                 // shape, and like a lambda it lives only at compile time --
                 // the name is bound to its field-to-lambda mapping and
                 // `dict.show(x)` compiles the body at the call.
+                // `val sub = substring`: a bare name on the right that is not
+                // a value in this backend -- a builtin or a function -- becomes
+                // an alias resolved at each call.
+                if let Expr::Identifier { name: target, .. } = value.as_ref()
+                    && self.lookup(target).is_none()
+                    && self.lookup_lambda(target).is_none()
+                    && self.lookup_dict(target).is_none()
+                {
+                    let target = self.lookup_alias(target).unwrap_or_else(|| target.clone());
+                    self.alias_bindings
+                        .last_mut()
+                        .expect("emitter alias scope")
+                        .insert(name.clone(), target);
+                    return Ok(());
+                }
                 if let Expr::RecordLiteral { fields, .. } = value.as_ref()
                     && !fields.is_empty()
                     && fields
@@ -7255,6 +7308,7 @@ pub(crate) fn emit_macho_program(
     emitter.scopes.push(HashMap::new());
     emitter.lambda_bindings.push(HashMap::new());
     emitter.dict_bindings.push(HashMap::new());
+    emitter.alias_bindings.push(HashMap::new());
     emitter.scope_root_counts.push(0);
     collect_records(expr, &mut emitter);
     collect_functions(expr, &mut emitter);
