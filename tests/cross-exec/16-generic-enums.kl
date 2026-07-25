@@ -1,0 +1,68 @@
+// Cross-target fixture: generic enums, which the shared lowering leaves whole.
+//
+// A monomorphic enum is desugared before any backend sees it; a generic one
+// arrives as constructor calls and `match` expressions, and what a variant
+// carries has to be tracked per value -- `Some(42)` and `Some("x")` are the
+// same enum and not the same shape. What every backend has to agree on is
+// which arm runs and what it sees, which is what this checks.
+
+enum Option<a> {
+  case Some(value: a)
+  case None
+}
+
+enum Result<a, b> {
+  case Ok(value: a)
+  case Err(error: b)
+}
+
+def describe(o) = o match {
+  case Some(v) => "got " + v
+  case None => "nothing"
+}
+
+def orElse(o, fallback) = o match {
+  case Some(v) => v
+  case None => fallback
+}
+
+println(describe(Some(42)))
+println(describe(Some(7)))
+println(orElse(Some(3), 0))
+assertResult(10)(orElse(Some(10), 0))
+assertResult("got 1")(describe(Some(1)))
+
+// The same enum at another payload type, which must not take the first one's.
+def show(o) = o match {
+  case Some(v) => "[" + v + "]"
+  case None => "-"
+}
+println(show(Some("text")))
+println(show(Some(5)))
+assertResult("[text]")(show(Some("text")))
+
+// A nullary constructor, and matching one against a pattern that binds: that
+// arm cannot run, and every backend has to reach the other one.
+val nothing = None
+println(describe(nothing))
+println(orElse(nothing, 99))
+assertResult(99)(orElse(nothing, 99))
+
+// Two variants that both carry something.
+def unwrap(r) = r match {
+  case Ok(v) => "ok:" + v
+  case Err(e) => "err:" + e
+}
+println(unwrap(Ok(1)))
+println(unwrap(Err("bad")))
+assertResult("ok:1")(unwrap(Ok(1)))
+assertResult("err:bad")(unwrap(Err("bad")))
+
+// A match written where the value is, rather than through a function.
+val direct = Some(5) match {
+  case Some(v) => v * 2
+  case None => 0
+}
+println(direct)
+assertResult(10)(direct)
+println("done")
