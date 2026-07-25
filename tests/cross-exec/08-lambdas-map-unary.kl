@@ -45,6 +45,12 @@ println(!true)
 println(!false)
 println(6 - -1)
 
+// Appending a collection to a string renders it the way println does.
+println("list=" + nums)
+println("mapped=" + doubled)
+println("strs=" + ["x" "y"])
+println("set=" + %(1 2 2))
+
 assertResult(7)(add(3, 4))
 assertResult(-10)(-ten)
 assertResult(true)(!false)

@@ -2212,6 +2212,26 @@ impl Emitter {
                     self.emit_bool_to_str();
                     rhs_ty = ValueType::Str;
                 }
+                ValueType::List(elem) => {
+                    self.emit_list_to_str(elem, "[", "]");
+                    rhs_ty = ValueType::Str;
+                }
+                ValueType::Set(elem) => {
+                    self.emit_list_to_str(elem, "%(", ")");
+                    rhs_ty = ValueType::Str;
+                }
+                ValueType::EmptyList => {
+                    let offset = self.asm.intern_string_object("[]");
+                    self.asm.load_rodata_address(Reg::X0, offset);
+                    self.emit_heap_string_copy();
+                    rhs_ty = ValueType::Str;
+                }
+                ValueType::EmptySet => {
+                    let offset = self.asm.intern_string_object("%()");
+                    self.asm.load_rodata_address(Reg::X0, offset);
+                    self.emit_heap_string_copy();
+                    rhs_ty = ValueType::Str;
+                }
                 _ => return Err(unsupported(rhs.span(), "appending a value of this type")),
             }
         }
@@ -4669,6 +4689,77 @@ impl Emitter {
             }
             _ => None,
         }
+    }
+
+    /// Build the evaluator's textual form of a cons list as a heap string:
+    /// `[1, 2, 3]` for a list, `%(1, 2)` for a set, `[]` when empty.
+    ///
+    /// Every step allocates -- each element's text, each concatenation -- so
+    /// the input cursor and the string being built live in rooted slots and
+    /// the loop re-reads them rather than holding them in registers.
+    fn emit_list_to_str(&mut self, elem: ListElem, open: &str, close: &str) {
+        let cursor = self.next_local_offset;
+        let acc = cursor + 8;
+        let sep = acc + 8;
+        self.next_local_offset += 24;
+        self.asm.store_local(Reg::X0, cursor);
+        self.emit_root_frame_slot(cursor);
+        let open_offset = self.asm.intern_string_object(open);
+        self.asm.load_rodata_address(Reg::X0, open_offset);
+        self.emit_heap_string_copy();
+        self.asm.store_local(Reg::X0, acc);
+        self.emit_root_frame_slot(acc);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.store_local(Reg::X0, sep);
+
+        let loop_start = self.asm.new_label();
+        let done = self.asm.new_label();
+        let no_sep = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.load_local(Reg::X0, cursor);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+        // Separator before every element but the first.
+        self.asm.load_local(Reg::X0, sep);
+        self.asm.branch(no_sep, BranchKind::CompareZero(Reg::X0));
+        let comma_offset = self.asm.intern_string_object(", ");
+        self.asm.load_rodata_address(Reg::X0, comma_offset);
+        self.emit_heap_string_copy();
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_str_concat();
+        self.asm.store_local(Reg::X0, acc);
+        self.asm.bind(no_sep);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.store_local(Reg::X0, sep);
+        // The element's own text.
+        let elem_ty = elem_value_type(elem);
+        self.asm.load_local(Reg::X0, cursor);
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        match elem {
+            ListElem::Int => self.emit_int_to_str(),
+            ListElem::Bool => self.emit_bool_to_str(),
+            ListElem::Str => {}
+        }
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_str_concat();
+        self.asm.store_local(Reg::X0, acc);
+        // Advance.
+        self.asm.load_local(Reg::X0, cursor);
+        self.emit_gc_load_ptr(Reg::X0, 8);
+        self.asm.store_local(Reg::X0, cursor);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(done);
+
+        let close_offset = self.asm.intern_string_object(close);
+        self.asm.load_rodata_address(Reg::X0, close_offset);
+        self.emit_heap_string_copy();
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_str_concat();
     }
 
     /// `map(list)(f)`: a fresh list of `f` applied to each element.
