@@ -1687,6 +1687,10 @@ struct Emitter {
     /// variant carries here. `Never` means "not known from this value", which
     /// is what a nullary constructor says about the other variants' payloads.
     enum_shapes: Vec<(usize, Vec<Vec<ValueType>>)>,
+    /// Bodies handed to `thread`, run after the program's own statements.
+    /// Not a thread: the hand-emitted x86-64 backend makes the same
+    /// approximation, and matching it keeps the targets' output identical.
+    queued_threads: Vec<(usize, Span)>,
     /// Names bound to a string literal. Some builtins need the *text* of an
     /// argument at compile time -- `Dir#mkdirs` creates each parent directory,
     /// so it splits the path here -- and a literal put in a `val` first is the
@@ -5789,6 +5793,26 @@ impl Emitter {
                 self.asm.mov_imm64(Reg::X0, 0); // Unit
                 Ok(Some(ValueType::Unit))
             }
+            // `thread(block)` runs the block after the program's own statements
+            // rather than beside them. Creating a thread on Darwin needs a
+            // syscall whose number this host cannot verify, and the x86-64
+            // backend queues them the same way, so the targets agree on what a
+            // program prints -- which is what a program can observe here.
+            ("thread", 1) => {
+                let Some((params, body)) = self.lambda_argument(&arguments[0]) else {
+                    return Err(unsupported(arguments[0].span(), "threading this argument"));
+                };
+                if !params.is_empty() {
+                    return Err(unsupported(
+                        arguments[0].span(),
+                        "a thread body that takes arguments",
+                    ));
+                }
+                let index = self.intern_lambda(params, body);
+                self.queued_threads.push((index, span));
+                self.asm.mov_imm64(Reg::X0, 0); // Unit
+                Ok(Some(ValueType::Unit))
+            }
             // `stopwatch(block)`: how many milliseconds the block took. Its
             // value is discarded, like the evaluator's.
             ("stopwatch", 1) => {
@@ -9301,6 +9325,12 @@ pub(crate) fn emit_macho_program(
     emitter.asm.mov_fp_sp();
 
     emitter.statement(expr)?;
+    // The queued `thread` bodies, in the order they were handed over. They run
+    // inside the program's own frame, so anything they closed over is still
+    // where they left it.
+    for (index, span) in std::mem::take(&mut emitter.queued_threads) {
+        emitter.emit_inline_lambda_call(index, &[], span)?;
+    }
     let frame_size = emitter.max_local_offset.div_ceil(16) * 16;
     if frame_size >= 4096 {
         return Err(unsupported(expr.span(), "this many local variables"));

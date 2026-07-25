@@ -27,6 +27,14 @@ println("zero slept")
 
 // Standard error is a separate stream: this line is not part of the stdout
 // the fixture is compared on, which is itself the thing being checked.
+// A `thread` body runs after the program's own statements on every native
+// target, so what a program prints is the same everywhere -- which is the only
+// thing about it a program can observe here.
+thread(() => {
+  println("from the thread")
+})
+println("after handing over the thread")
+
 printlnError("to standard error")
 val message = "also to standard error"
 printlnError(message)
