@@ -69,6 +69,18 @@ const DEFAULT_FILE_MODE: u64 = 0o644;
 /// `0o755`: rwxr-xr-x, the default mode for a newly created directory.
 const DEFAULT_DIR_MODE: u64 = 0o755;
 /// Darwin `mmap`. Heap segments come straight from the kernel.
+/// M9: whether the collector stays non-moving. `false` turns on
+/// evacuation -- `relocate_start` advances into the Relocate phase instead
+/// of returning to Idle, sparse regions become from-space, the load
+/// barrier's slow path evacuates on demand and self-heals, and the
+/// forwarding-word paths in `mark_visit` / `gc_load_barrier_slow` (whose
+/// bit test is the first real user of the AArch64 `bt` lowering) go live.
+/// The mutator is ready for it: every routine re-derives interior pointers
+/// from a rooted slot after an allocation rather than carrying them across,
+/// and the shadow stack holds slot *addresses*, so `relocate_fix_roots`
+/// rewrites a moved reference where the mutator will next read it.
+const GC_EVAC_OFF: bool = false;
+
 const SYS_MMAP: u16 = 197;
 const STDOUT_FD: u64 = 1;
 const STDERR_FD: u64 = 2;
@@ -2388,6 +2400,26 @@ impl Emitter {
             .expect("emitter root scope") += 1;
     }
 
+    /// M9: root the stack slot at `base + offset`, which must hold a heap
+    /// reference (or null).
+    ///
+    /// This is what makes a scratch struct relocation-proof. A routine that
+    /// caches an interior pointer (a string's payload base) across an
+    /// allocation would be left holding a dangling address once the
+    /// collector starts moving objects. Storing the *object* in a rooted
+    /// slot instead lets the collector rewrite it in place, so every
+    /// interior pointer can be re-derived from the slot and is always
+    /// current.
+    fn emit_root_address(&mut self, base: Reg, offset: u32) {
+        let push = self.shadow_push_routine_label();
+        self.asm.push(Reg::X0); // the argument register below
+        self.asm.push_frame_record(); // the bl clobbers x30
+        self.asm.add_reg_imm(Reg::X0, base, offset);
+        self.asm.branch(push, BranchKind::Link);
+        self.asm.pop_frame_record();
+        self.asm.pop(Reg::X0);
+    }
+
     /// Push `reg` onto the machine stack *and* root that stack slot, for a
     /// heap pointer that must stay live while a later subexpression
     /// allocates. The machine stack is invisible to the collector, so a
@@ -3014,13 +3046,10 @@ impl Emitter {
     /// every other M13 routine already uses (M13 slice 1's `trim` bug
     /// was exactly a missed instance of it).
     fn emit_str_replace_all(&mut self) {
-        // x0=input, x1=pattern, x2=replacement. All three end up reachable
-        // only through the interior pointers in the scratch struct, so they
-        // are rooted across the routine's allocation (see
-        // emit_str_split_nonempty_delimiter).
-        self.push_rooted(Reg::X0);
-        self.push_rooted(Reg::X1);
-        self.push_rooted(Reg::X2);
+        // x0=input, x1=pattern, x2=replacement. The scratch struct below
+        // holds all three as rooted slots, which is both what keeps them
+        // alive across the result allocation and what keeps the payload
+        // pointers derived from them current if the collector moves them.
         self.asm.ldr_imm(Reg::X3, Reg::X1, 0); // pattern_len
         let pattern_ok = self.asm.new_label();
         self.asm
@@ -3035,8 +3064,12 @@ impl Emitter {
         // The scratch struct lives on the machine stack rather than the GC
         // heap: the collector's sweep walks each region block by block
         // through object headers, so a raw header-less block inside the heap
-        // would desynchronise that walk. Stack space also needs no
-        // save/restore of the operands around it.
+        // would desynchronise that walk.
+        //
+        // Slots 0/16/32 hold the three *objects* and are GC roots, so the
+        // collector keeps them alive and rewrites them if it moves them;
+        // every payload pointer below is re-derived as `object + 8` at the
+        // point of use and can therefore never go stale.
         self.asm.sub_sp_imm(48);
         self.asm.add_reg_sp_imm(Reg::X6, 0);
 
@@ -3044,20 +3077,21 @@ impl Emitter {
         // [16]=pattern_bytes_base [24]=pattern_len
         // [32]=replacement_bytes_base [40]=replacement_len
         self.asm.ldr_imm(Reg::X7, Reg::X0, 0);
-        self.asm.str_imm(Reg::X7, Reg::X6, 8);
-        self.asm.add_reg_imm(Reg::X7, Reg::X0, 8);
-        self.asm.str_imm(Reg::X7, Reg::X6, 0);
+        self.asm.str_imm(Reg::X7, Reg::X6, 8); // input_len
+        self.asm.str_imm(Reg::X0, Reg::X6, 0); // input object (rooted)
         self.asm.ldr_imm(Reg::X7, Reg::X1, 0);
-        self.asm.str_imm(Reg::X7, Reg::X6, 24);
-        self.asm.add_reg_imm(Reg::X7, Reg::X1, 8);
-        self.asm.str_imm(Reg::X7, Reg::X6, 16);
+        self.asm.str_imm(Reg::X7, Reg::X6, 24); // pattern_len
+        self.asm.str_imm(Reg::X1, Reg::X6, 16); // pattern object (rooted)
         self.asm.ldr_imm(Reg::X7, Reg::X2, 0);
-        self.asm.str_imm(Reg::X7, Reg::X6, 40);
-        self.asm.add_reg_imm(Reg::X7, Reg::X2, 8);
-        self.asm.str_imm(Reg::X7, Reg::X6, 32);
+        self.asm.str_imm(Reg::X7, Reg::X6, 40); // replacement_len
+        self.asm.str_imm(Reg::X2, Reg::X6, 32); // replacement object (rooted)
+        self.emit_root_address(Reg::X6, 0);
+        self.emit_root_address(Reg::X6, 16);
+        self.emit_root_address(Reg::X6, 32);
 
         // Pass 1: count non-overlapping matches.
         self.asm.ldr_imm(Reg::X8, Reg::X6, 0); // input_bytes_base
+        self.asm.add_reg_imm(Reg::X8, Reg::X8, 8); // payload of the rooted object
         self.asm.ldr_imm(Reg::X9, Reg::X6, 8); // input_len
         self.asm.mov_imm64(Reg::X10, 0); // pos
         self.asm.mov_imm64(Reg::X11, 0); // match_count
@@ -3073,6 +3107,7 @@ impl Emitter {
             .branch(count_done, BranchKind::Conditional(Cond::Gt));
         self.asm.add_reg(Reg::X0, Reg::X8, Reg::X10); // a_ptr
         self.asm.ldr_imm(Reg::X1, Reg::X6, 16); // b_ptr = pattern_bytes_base
+        self.asm.add_reg_imm(Reg::X1, Reg::X1, 8); // payload of the rooted object
         self.asm.mov_reg(Reg::X2, Reg::X7); // len = pattern_len
         self.asm
             .bytes_equal(Reg::X2, Reg::X0, Reg::X1, Reg::X3, Reg::X4, Reg::X12);
@@ -3121,8 +3156,10 @@ impl Emitter {
         self.asm
             .branch(copy_no_match, BranchKind::Conditional(Cond::Gt));
         self.asm.ldr_imm(Reg::X0, Reg::X6, 0); // input_bytes_base
+        self.asm.add_reg_imm(Reg::X0, Reg::X0, 8); // payload of the rooted object
         self.asm.add_reg(Reg::X0, Reg::X0, Reg::X10);
         self.asm.ldr_imm(Reg::X1, Reg::X6, 16); // pattern_bytes_base
+        self.asm.add_reg_imm(Reg::X1, Reg::X1, 8); // payload of the rooted object
         self.asm.mov_reg(Reg::X2, Reg::X7);
         self.asm
             .bytes_equal(Reg::X2, Reg::X0, Reg::X1, Reg::X3, Reg::X4, Reg::X12);
@@ -3131,6 +3168,7 @@ impl Emitter {
 
         self.asm.bind(copy_no_match);
         self.asm.ldr_imm(Reg::X0, Reg::X6, 0); // input_bytes_base
+        self.asm.add_reg_imm(Reg::X0, Reg::X0, 8); // payload of the rooted object
         self.asm.add_reg(Reg::X0, Reg::X0, Reg::X10);
         self.asm.ldrb_post_increment(Reg::X1, Reg::X0);
         self.asm.strb_post_increment(Reg::X1, Reg::X11);
@@ -3139,6 +3177,7 @@ impl Emitter {
 
         self.asm.bind(copy_is_match);
         self.asm.ldr_imm(Reg::X0, Reg::X6, 32); // replacement_bytes_base
+        self.asm.add_reg_imm(Reg::X0, Reg::X0, 8); // payload of the rooted object
         self.asm.ldr_imm(Reg::X1, Reg::X6, 40); // replacement_len
         self.emit_copy_bytes(Reg::X1, Reg::X0, Reg::X11, Reg::X2);
         self.asm.ldr_imm(Reg::X7, Reg::X6, 24); // pattern_len
@@ -3147,9 +3186,8 @@ impl Emitter {
         self.asm.bind(copy_done);
 
         self.asm.mov_reg(Reg::X0, Reg::X5);
-        self.asm.add_sp_imm(48); // the scratch struct
-        self.emit_shadow_pop(3); // the three input roots
-        self.asm.add_sp_imm(48); // and the slots holding them
+        self.emit_shadow_pop(3); // the three rooted scratch slots
+        self.asm.add_sp_imm(48); // then the scratch itself
     }
 
     /// Build a fresh string object holding `input_bytes_base[start..end]`
@@ -3182,7 +3220,12 @@ impl Emitter {
         self.asm.pop(Reg::X6);
 
         self.asm.str_imm(Reg::X2, Reg::X5, 0);
-        self.asm.add_reg(Reg::X3, Reg::X8, Reg::X0); // src = input_bytes_base + start
+        // Re-derive the input's payload from the rooted scratch slot: the
+        // allocation above can collect, and once the collector moves objects
+        // the x8 saved across it would be a stale interior pointer.
+        self.asm.ldr_imm(Reg::X8, Reg::X6, 0);
+        self.asm.add_reg_imm(Reg::X8, Reg::X8, 8);
+        self.asm.add_reg(Reg::X3, Reg::X8, Reg::X0); // src = payload + start
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8); // dst = new object's payload
         self.emit_copy_bytes(Reg::X2, Reg::X3, Reg::X7, Reg::X1);
         self.asm.mov_reg(Reg::X0, Reg::X5);
@@ -3210,14 +3253,11 @@ impl Emitter {
     /// solved the register-pressure wall that stalled the earlier
     /// `replaceAll` attempt, generalized here to a 32-byte struct.
     fn emit_str_split_nonempty_delimiter(&mut self) {
-        // x0 = input, x1 = delimiter.
-        // After the scratch below caches their interior pointers, the two
-        // objects are not in any register the collector can see, yet the
-        // segment allocations can collect -- so both are rooted for the
-        // whole routine.
-        self.push_rooted(Reg::X0);
-        self.push_rooted(Reg::X1);
-        // Machine-stack scratch, not a GC-heap block (see
+        // x0 = input, x1 = delimiter. Machine-stack scratch, not a GC-heap
+        // block, and slots 0/16 hold the two *objects* as GC roots: that is
+        // what keeps them alive across the segment allocations and what lets
+        // every payload pointer be re-derived as `object + 8`, so none can
+        // dangle once the collector moves objects (see
         // emit_str_replace_all).
         self.asm.sub_sp_imm(32);
         self.asm.add_reg_sp_imm(Reg::X6, 0);
@@ -3225,15 +3265,16 @@ impl Emitter {
         // Scratch layout: [0]=input_bytes_base [8]=input_len
         // [16]=delimiter_bytes_base [24]=delimiter_len
         self.asm.ldr_imm(Reg::X7, Reg::X0, 0);
-        self.asm.str_imm(Reg::X7, Reg::X6, 8);
-        self.asm.add_reg_imm(Reg::X7, Reg::X0, 8);
-        self.asm.str_imm(Reg::X7, Reg::X6, 0);
+        self.asm.str_imm(Reg::X7, Reg::X6, 8); // input_len
+        self.asm.str_imm(Reg::X0, Reg::X6, 0); // input object (rooted)
         self.asm.ldr_imm(Reg::X7, Reg::X1, 0);
-        self.asm.str_imm(Reg::X7, Reg::X6, 24);
-        self.asm.add_reg_imm(Reg::X7, Reg::X1, 8);
-        self.asm.str_imm(Reg::X7, Reg::X6, 16);
+        self.asm.str_imm(Reg::X7, Reg::X6, 24); // delimiter_len
+        self.asm.str_imm(Reg::X1, Reg::X6, 16); // delimiter object (rooted)
+        self.emit_root_address(Reg::X6, 0);
+        self.emit_root_address(Reg::X6, 16);
 
-        self.asm.ldr_imm(Reg::X8, Reg::X6, 0); // input_bytes_base
+        self.asm.ldr_imm(Reg::X8, Reg::X6, 0); // the rooted input object
+        self.asm.add_reg_imm(Reg::X8, Reg::X8, 8); // its payload
         self.asm.ldr_imm(Reg::X9, Reg::X6, 8); // input_len
         self.asm.mov_imm64(Reg::X10, 0); // pos
         self.asm.mov_imm64(Reg::X11, 0); // segment_start
@@ -3249,7 +3290,8 @@ impl Emitter {
         self.asm
             .branch(scan_done, BranchKind::Conditional(Cond::Gt));
         self.asm.add_reg(Reg::X0, Reg::X8, Reg::X10); // a_ptr
-        self.asm.ldr_imm(Reg::X1, Reg::X6, 16); // b_ptr = delimiter_bytes_base
+        self.asm.ldr_imm(Reg::X1, Reg::X6, 16); // the rooted delimiter object
+        self.asm.add_reg_imm(Reg::X1, Reg::X1, 8); // b_ptr = its payload
         self.asm.ldr_imm(Reg::X2, Reg::X6, 24); // len = delimiter_len
         self.asm
             .bytes_equal(Reg::X2, Reg::X0, Reg::X1, Reg::X3, Reg::X4, Reg::X7);
@@ -3280,9 +3322,8 @@ impl Emitter {
         self.asm.sub_reg_imm(Reg::X12, Reg::X12, 1);
         self.asm.branch(cons_loop, BranchKind::Unconditional);
         self.asm.bind(cons_done);
-        self.asm.add_sp_imm(32); // the scratch struct
-        self.emit_shadow_pop(2); // the two input roots
-        self.asm.add_sp_imm(32); // and the slots holding them
+        self.emit_shadow_pop(2); // the two rooted scratch slots
+        self.asm.add_sp_imm(32); // then the scratch itself
     }
 
     /// `split`(input, ""): each UTF-8 character becomes its own
@@ -3296,9 +3337,14 @@ impl Emitter {
     /// push/pop round-trip in this path (harmless, since nothing
     /// reads it back).
     fn emit_str_split_chars(&mut self) {
-        // x0 = input; rooted for the routine (see
+        // x0 = input. A one-slot machine-stack scratch holds the object as a
+        // GC root, so the segment builder can re-derive the payload pointer
+        // after each allocation instead of carrying a stale one (see
         // emit_str_split_nonempty_delimiter).
-        self.push_rooted(Reg::X0);
+        self.asm.sub_sp_imm(16);
+        self.asm.add_reg_sp_imm(Reg::X6, 0);
+        self.asm.str_imm(Reg::X0, Reg::X6, 0);
+        self.emit_root_address(Reg::X6, 0);
         self.asm.ldr_imm(Reg::X9, Reg::X0, 0); // input_len
         self.asm.add_reg_imm(Reg::X8, Reg::X0, 8); // input_bytes_base
         self.asm.mov_imm64(Reg::X10, 0); // pos
@@ -3344,8 +3390,8 @@ impl Emitter {
         self.asm.sub_reg_imm(Reg::X12, Reg::X12, 1);
         self.asm.branch(cons_loop, BranchKind::Unconditional);
         self.asm.bind(cons_done);
-        self.emit_shadow_pop(1); // the input root
-        self.asm.add_sp_imm(16); // and the slot holding it
+        self.emit_shadow_pop(1); // the rooted scratch slot
+        self.asm.add_sp_imm(16); // then the scratch itself
     }
 
     /// `split`(input, delimiter): dispatches to the empty-delimiter
@@ -5065,25 +5111,32 @@ impl Emitter {
     /// M7 (infra): seed the callee-saved colour registers (X24 strip mask,
     /// X25 good colour, X26 bad-colour test mask) and the colour/mark
     /// cells -- the AArch64 mirror of `emit_initialize_color_registers`.
-    /// Non-moving, unpoisoned scheme (evac off): good = M0, bad = M1|R.
     /// X25/X26 cache the cells; MarkStart reloads them each cycle.
-    fn emit_gc_init_colors(&mut self, gc: &GcState) {
+    ///
+    /// With the moving collector (M9) Idle and Relocate use good = R and
+    /// bad = M0|M1: a reference still carrying a mark colour may point at a
+    /// ghost, so it is "bad" and its next load slow-paths and follows the
+    /// forwarding word. The non-moving scheme keeps the last mark colour
+    /// good instead, so Idle loads stay on the fast path.
+    fn emit_gc_init_colors(&mut self, gc: &GcState, evac_off: bool) {
         self.asm
             .mov_imm64(Reg::X24, crate::gc_layout::GC_COLOR_STRIP);
         // --gc-poison makes every colour except the current good one bad, so
         // any reference read without the barrier -- or stored without being
         // coloured -- faults or slow-paths immediately. It is the coverage
         // canary for the two barriers.
-        let (good, bad) = if self.gc_poison {
-            (
-                crate::gc_layout::GC_COLOR_M1,
-                crate::gc_layout::GC_COLOR_MASK,
-            )
+        let good = match (self.gc_poison, evac_off) {
+            (true, true) => crate::gc_layout::GC_COLOR_M1,
+            (true, false) => crate::gc_layout::GC_COLOR_R,
+            (false, true) => crate::gc_layout::GC_COLOR_M0,
+            (false, false) => crate::gc_layout::GC_COLOR_R,
+        };
+        let bad = if self.gc_poison {
+            crate::gc_layout::GC_COLOR_MASK
+        } else if evac_off {
+            crate::gc_layout::GC_COLOR_BAD_MASK
         } else {
-            (
-                crate::gc_layout::GC_COLOR_M0,
-                crate::gc_layout::GC_COLOR_BAD_MASK,
-            )
+            crate::gc_layout::GC_COLOR_M0 | crate::gc_layout::GC_COLOR_M1
         };
         self.emit_store_gc_cell_imm(gc.good_color, good);
         self.emit_store_gc_cell_imm(gc.bad_mask, bad);
@@ -5278,7 +5331,7 @@ impl Emitter {
     fn emit_gc_runtime(&mut self, gc: &GcState) {
         use portable_asm as pa;
         let asm = &mut self.asm;
-        let evac_off = true;
+        let evac_off = GC_EVAC_OFF;
         let poison = self.gc_poison;
         let timing = false;
         let stderr_fd = 2u64;
@@ -5582,7 +5635,7 @@ pub(crate) fn emit_macho_program(
     // and emitting the routine bodies after main is unchanged.
     let gc = emitter.reserve_gc_state();
     emitter.emit_gc_init_heap(&gc);
-    emitter.emit_gc_init_colors(&gc);
+    emitter.emit_gc_init_colors(&gc, GC_EVAC_OFF);
 
     let frame_size = (count_var_decls(expr) * 8).div_ceil(16) * 16;
     if frame_size >= 4096 {
