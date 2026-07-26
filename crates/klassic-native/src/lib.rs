@@ -487,10 +487,11 @@ pub fn compile_source_to_elf(
     compile_source_for_target(name, text, config)
 }
 
-#[allow(clippy::result_large_err)]
 mod cbackend;
 mod gc_layout;
 mod llvm;
+#[allow(clippy::result_large_err)]
+mod map_chain;
 
 #[allow(clippy::result_large_err)]
 mod aarch64;
@@ -587,6 +588,13 @@ pub fn compile_source_with_prelude_and_modules_for_target(
 ) -> Result<Vec<u8>, NativeCompileError> {
     let mut bundled = String::with_capacity(prelude_text.len() + user_text.len() + 1);
     bundled.push_str(prelude_text);
+    // A map that grows while the program runs is lowered onto a chain, and
+    // the chain's helpers are Klassic source: prepended here so they are
+    // parsed and checked with everything else, and only when a program has a
+    // map to grow.
+    if map_chain::program_creates_runtime_map(user_text) {
+        bundled.push_str(map_chain::HELPERS);
+    }
     if !prelude_text.ends_with('\n') {
         bundled.push('\n');
     }
@@ -634,6 +642,10 @@ fn compile_internal(
             }
         }
     }
+    // Maps that grow while the program runs become chains before the enums
+    // are lowered, so the chain lowers with everything else. Only the user's
+    // own code is rewritten; the stdlib's map functions keep the builtin map.
+    let expr = map_chain::lower_runtime_maps(expr, prelude_offset);
     let (expr, lowered_enum_names, mono_enum_shapes, mono_enum_variants) = desugar_enums(expr);
     // Capture the extension-method registry before the desugar erases the
     // `ExtensionDeclaration`s, so codegen can resolve method names that the
@@ -7047,7 +7059,16 @@ impl NativeCodeGenerator {
                 match slot.value {
                     NativeValue::RuntimeString { data, len } => {
                         let compiled = self.compile_expr(value)?;
-                        let Some(input) = self.native_string_ref(compiled) else {
+                        // A heap string is copied into the binding's buffer,
+                        // like every other shape of string: building one by
+                        // appending in a loop -- `out = out + k + ": " + v` --
+                        // produces a heap string, and refusing it here refused
+                        // the loop.
+                        let Some(input) = self.native_string_ref_or_copy(
+                            compiled,
+                            *span,
+                            "native string assignment for this value type",
+                        ) else {
                             return Err(unsupported(
                                 *span,
                                 "native string assignment for this value type",
@@ -7113,6 +7134,18 @@ impl NativeCodeGenerator {
                     ));
                 }
                 self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                // Assigning a generic enum value merges its shape into the
+                // slot's, resolved reprs winning over defaulted ones. A
+                // binding seeded with a nullary constructor -- `mutable m =
+                // KMNil` -- knows nothing about the payloads until something
+                // is put in it, and that something is what says.
+                if let Some(shape) = self.pending_enum_shape.take() {
+                    let merged =
+                        merge_enum_shapes(self.enum_shapes.get(&slot.id).cloned(), Some(shape));
+                    if let Some(merged) = merged {
+                        self.enum_shapes.insert(slot.id, merged);
+                    }
+                }
                 if self.dynamic_control_depth > 0 {
                     self.remove_static_value(name);
                 } else if static_expr_is_pure(value)

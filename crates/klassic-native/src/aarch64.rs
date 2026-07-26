@@ -10522,6 +10522,11 @@ impl Emitter {
         }
         let saved_offset = self.next_local_offset;
         let saved_max = self.max_local_offset;
+        // Slots are frame offsets, and every function starts its frame at the
+        // same place -- so a slot matched in one function has the same offset
+        // as an unrelated slot in the next, and the widening guard read it as
+        // "already matched". The set belongs to one activation of one body.
+        let saved_matched = std::mem::take(&mut self.matched_enum_slots);
         self.next_local_offset = 0;
         self.max_local_offset = 0;
         let mut param_slots = Vec::new();
@@ -10552,6 +10557,7 @@ impl Emitter {
         self.asm.patch_sub_sp(frame_patch, frame_size);
         self.next_local_offset = saved_offset;
         self.max_local_offset = saved_max;
+        self.matched_enum_slots = saved_matched;
         // A body narrower than the registered return type is fine: two shapes
         // of one enum have the same representation, and the wider one is what
         // callers were told. Merging is how "narrower" is decided, since what a

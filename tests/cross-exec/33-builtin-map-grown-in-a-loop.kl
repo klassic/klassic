@@ -1,0 +1,53 @@
+// Cross-target fixture: the *builtin* map, grown while the program runs.
+//
+// This is the word counter as anyone would write it -- `Map#empty()`, then
+// `Map#put` in a loop -- and it is the program that could not be built on
+// x86-64 at all, because a map there is a compile-time value or a
+// fixed-capacity buffer. It is lowered onto a chain of GC cells now, with
+// helpers that every backend compiles, so the same source builds on all
+// three and prints what the evaluator prints -- including the map itself,
+// which has to render in insertion order with a repeated key keeping its
+// first position and its last value.
+//
+// The lowering is all-or-nothing on purpose: a map used in a way the helpers
+// do not cover is left as the builtin map, which is why this fixture stays
+// inside what they cover.
+
+import std.map
+
+mutable counts = Map#empty()
+foreach (word in ["the", "fox", "the", "dog", "the", "fox"]) {
+  counts = Map#put(counts, word, counts.getOrElse(word, 0) + 1)
+}
+println(counts)
+println(Map#size(counts))
+println(counts.sizeOf())
+println(counts.getOrElse("the", 0))
+println(counts.getOrElse("cat", -1))
+println(counts.containsKey("fox"))
+println(counts.containsKey("cat"))
+assertResult(3)(counts.getOrElse("the", 0))
+assertResult(2)(counts.getOrElse("fox", 0))
+assertResult(1)(counts.getOrElse("dog", 0))
+assertResult(-1)(counts.getOrElse("cat", -1))
+assertResult(3)(Map#size(counts))
+
+// A map with a single entry. (A map that is *only* created and never put
+// into keeps every payload type unknown, so asking it about a key is still
+// refused -- there is nothing in it to say what its keys are.)
+mutable one = Map#empty()
+one = Map#put(one, "only", 42)
+println(one)
+println(one.getOrElse("only", 0))
+
+// Int keys and Boolean values, so the lowering is not tied to one pair.
+mutable seen = Map#empty()
+foreach (n in [3, 1, 3]) {
+  seen = Map#put(seen, n, true)
+}
+println(seen)
+println(Map#size(seen))
+println(seen.getOrElse(1, false))
+println(seen.getOrElse(9, false))
+assertResult(2)(Map#size(seen))
+println("done")
