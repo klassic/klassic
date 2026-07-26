@@ -3117,7 +3117,7 @@ impl Emitter {
                     && list_args.len() == 1
                     && let Expr::Identifier { name, .. } = inner.as_ref()
                     && name == "foldLeft"
-                    && let Expr::Lambda { params, body, .. } = &arguments[0]
+                    && let Some((params, body)) = self.lambda_argument(&arguments[0])
                     && params.len() == 2
                 {
                     return self.emit_list_fold_left(
@@ -3125,7 +3125,7 @@ impl Emitter {
                         &initial_args[0],
                         &params[0],
                         &params[1],
-                        body,
+                        &body,
                         *span,
                     );
                 }
@@ -8709,7 +8709,7 @@ impl Emitter {
                     // own fold does: starting from `[]` and appending lists
                     // ends up a list. Take the same fixpoint here so a
                     // fold-based function's return type is the settled one.
-                    if let Expr::Lambda { params, body, .. } = &arguments[0]
+                    if let Some((params, body)) = self.lambda_argument(&arguments[0])
                         && params.len() == 2
                         && list_args.len() == 1
                         && let Some(ValueType::List(elem)) =
@@ -8720,7 +8720,7 @@ impl Emitter {
                         for _ in 0..3 {
                             locals.push((params[0].clone(), acc_ty));
                             locals.push((params[1].clone(), elem_ty));
-                            let folded = self.static_type_under(body, locals, depth + 1);
+                            let folded = self.static_type_under(&body, locals, depth + 1);
                             locals.pop();
                             locals.pop();
                             let Some(merged) = folded.and_then(|f| self.merge_types(acc_ty, f))
@@ -8905,9 +8905,11 @@ impl Emitter {
                     }
                     "isEmpty" | "contains" | "isEmptyString" | "matches" | "containsKey"
                     | "Map#containsKey" | "Map#isEmpty" | "Map#containsValue" | "Set#isEmpty"
-                    | "Set#contains" => {
+                    | "Set#contains" | "startsWith" | "endsWith" | "String#isInt"
+                    | "String#isDouble" => {
                         return Some(ValueType::Bool);
                     }
+                    "String#parseInt" => return Some(ValueType::Int),
                     // The set builders, so `std.set`'s extension methods can
                     // be typed: two of them answer with a set, and reading one
                     // as a list keeps the element type.
@@ -9008,7 +9010,8 @@ impl Emitter {
                     }
                     "__match_fail" => return Some(ValueType::Never),
                     "toString" | "substring" | "trim" | "toUpperCase" | "toLowerCase"
-                    | "reverse" | "join" | "replaceAll" | "replace" | "repeat" | "at" => {
+                    | "reverse" | "join" | "replaceAll" | "replace" | "repeat" | "at"
+                    | "capitalize" | "stripPrefix" | "stripSuffix" | "trimLeft" | "trimRight" => {
                         return Some(ValueType::Str);
                     }
                     _ => {}
@@ -9723,10 +9726,47 @@ impl Emitter {
     fn lambda_argument(&self, expr: &Expr) -> Option<(Vec<String>, Expr)> {
         match expr {
             Expr::Lambda { params, body, .. } => Some((params.clone(), (**body).clone())),
-            Expr::Identifier { name, .. } => {
-                let index = self.lookup_lambda(name)?;
-                let (params, body) = &self.lambdas[index];
-                Some((params.clone(), body.clone()))
+            Expr::Identifier { name, span } => {
+                if let Some(index) = self.lookup_lambda(name) {
+                    let (params, body) = &self.lambdas[index];
+                    return Some((params.clone(), body.clone()));
+                }
+                // A *definition* passed where a function is expected --
+                // `foldLeft(xs)([])(insertSorted)`, which is how `std.list`'s
+                // sort is written. Wrapping it in a lambda that forwards its
+                // arguments is what makes it a value here, since this backend
+                // has no way to pass one.
+                let arity = self
+                    .functions
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, info)| info.params.len())
+                    .or_else(|| {
+                        self.generic_functions
+                            .iter()
+                            .rev()
+                            .find(|generic| generic.name == *name)
+                            .map(|generic| generic.params.len())
+                    })?;
+                let params: Vec<String> = (0..arity).map(|i| format!("__arg{i}")).collect();
+                let arguments = params
+                    .iter()
+                    .map(|param| Expr::Identifier {
+                        name: param.clone(),
+                        span: *span,
+                    })
+                    .collect();
+                Some((
+                    params,
+                    Expr::Call {
+                        callee: Box::new(Expr::Identifier {
+                            name: name.clone(),
+                            span: *span,
+                        }),
+                        arguments,
+                        span: *span,
+                    },
+                ))
             }
             // `{ (x) => ... }` and `{x, y => ...}`: a braced block whose only
             // expression is the lambda, which is how a trailing block argument

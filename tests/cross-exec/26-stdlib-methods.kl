@@ -1,0 +1,50 @@
+// Cross-target fixture: the stdlib's own list and string methods.
+//
+// `sorted()` is the one to watch. It is written as
+// `foldLeft(xs)([])(insertSorted)` -- the fold's function arrives as a *name*,
+// not as a lambda written at the call site, so a backend that only understands
+// the literal form cannot compile it at all. It is also an insertion sort, so
+// the order of equal elements is observable, and a backend that reversed the
+// accumulator would print the same set in a different order.
+//
+// The rest are ordinary uses of the methods a program actually reaches for,
+// asserted so a wrong answer fails rather than prints.
+
+import std.list
+import std.string
+
+val xs = [3, 1, 2]
+println(xs.lengthOf())
+println(xs.takeN(2))
+println(xs.dropN(1))
+println(xs.reversed())
+println(xs.sorted())
+println(xs.total())
+assertResult([1, 2, 3])(xs.sorted())
+assertResult(6)(xs.total())
+
+// Already sorted, reverse sorted, and with a repeat -- the three shapes an
+// insertion sort walks differently.
+println([1, 2, 3].sorted())
+println([3, 2, 1].sorted())
+println([2, 1, 2].sorted())
+println([5].sorted())
+assertResult([1, 2, 2])([2, 1, 2].sorted())
+
+// The predicate-taking ones.
+println(xs.filterBy((x) => x > 1))
+println(xs.anyMatch((x) => x == 2))
+println(xs.allMatch((x) => x > 0))
+println(xs.countBy((x) => x > 1))
+assertResult([3, 2])(xs.filterBy((x) => x > 1))
+assertResult(2)(xs.countBy((x) => x > 1))
+
+// Strings.
+println("Hello World".upper())
+println("Hello".lower())
+println("  x  ".trimmed())
+println("abc".reverseChars())
+println("abc".lengthChars())
+assertResult("HELLO WORLD")("Hello World".upper())
+assertResult("cba")("abc".reverseChars())
+println("done")

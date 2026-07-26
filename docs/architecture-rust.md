@@ -1576,6 +1576,29 @@ without writing it. `Math#sqrtInt(0)` therefore answered with whatever the
 *previous* square root in the same program left in that register. A single
 call could not show it -- the fixture takes a root of 17 first, then of 0.
 
+### A fold whose function arrives under a name
+
+`std.list`'s sort is `foldLeft(xs)([])(insertSorted)` -- the fold's function is
+a *definition*, not a lambda written at the call site. The aarch64 backend
+only understood the literal form, in the emitter and in the inference alike,
+so `[3, 1, 2].sorted()` could not be compiled. A definition passed where a
+function is expected is now wrapped in a lambda that forwards its arguments,
+which is what makes it a value on a backend with no way to pass one. The
+string side gained the inference cases its extension methods need
+(`startsWith`/`endsWith`, `String#parseInt`, `capitalize`, `stripPrefix`,
+`stripSuffix`), so `words()`, `toInt()` and the rest of `std.string` compile.
+
+Two limits are worth stating plainly, because they are the same limit twice.
+The x86-64 backend cannot pass a runtime list to a function
+(`this backend cannot pass \`xs\` (\`List<'a>\`) by itself`) and cannot grow a
+map while the program runs. Both follow from its design: it partially
+evaluates, holding collections as compile-time values or fixed-capacity
+buffers, where the aarch64 backend holds everything as a boxed pointer and
+passes it like any other. Closing them means giving x86-64 a runtime
+collection ABI, not adding a builtin. `String#isInt` / `String#isDouble` are
+missing on every native backend equally -- matching the evaluator means
+matching `parse::<i64>()`, overflow included.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.
