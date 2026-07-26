@@ -1681,6 +1681,41 @@ string -- and the aarch64 backend only had the first, so `containsText` failed
 there. It dispatches on the receiver now, reusing the byte search `indexOf`
 runs.
 
+### Where the portable collection work resumes
+
+The route to `Map` and `List` values whose size is only known while running,
+on every backend, is to build them out of a self-referential enum -- a chain
+of GC cells, which both hand-emitted backends already allocate and walk. A
+*monomorphic* chain works end to end today: fixture 28 grows one in a loop,
+replaces on a repeated key, renders it, and agrees with the evaluator on all
+three targets under `--gc-stress`. A *generic* chain -- which is what a
+lowering would have to emit, since the desugar does not know the key and
+value types -- stops at two places:
+
+1. **x86-64.** A helper that both destructures and constructs the same
+   generic enum is rejected: `put(empty, k, v)` inlines with the empty case's
+   shape, where the other variant's payload reprs are *defaulted* rather than
+   resolved, so `k == key` compares a defaulted `Scalar` against a string.
+   Shape propagation itself works -- through an inlined generic call, through
+   a `mutable` reassignment, and through a slot read (all measured) -- so what
+   is missing is narrower: a nullary constructor should take its payload reprs
+   from the annotation (`generic_enum_annotation_shape` already derives them)
+   or from the call site, rather than defaulting them.
+
+   Dropping the arm as dead instead is *not* sound: it was tried, and the
+   second call -- whose value really is the other variant -- then died with
+   "match: no pattern matched" at run time. A compile-time rejection is the
+   safer of the two, which is why the rejection stands.
+
+2. **aarch64.** The return type of a generic helper written as a `while` loop
+   (rather than recursion, which is what keeps x86-64 able to inline it) is
+   not predicted, so the body is rejected against its own annotation.
+
+Two language-surface warts turned up alongside them, both worth fixing on
+their own: `x = if (c) a else b` does not parse without parentheses, and a
+`match` arm whose body ends in an assignment takes that assignment's type, so
+two arms ending in assignments to different types disagree.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.
