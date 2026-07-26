@@ -1,0 +1,57 @@
+// Cross-target fixture: the searching and building string builtins, and
+// doubles printed as doubles.
+//
+// `indexOf` answers with a *byte* offset and -1 when the needle is absent,
+// which is what the evaluator's own `find` answers with -- so the empty
+// needle, the needle-longer-than-the-haystack case, and the repeated needle
+// (where `indexOf` and `lastIndexOf` disagree) are the cases worth pinning.
+// `replace` touches the first occurrence only; `replaceAll` is the other one.
+//
+// The doubles matter because a whole number prints as `3.0`, not `3`: a
+// backend formatting with a plain float formatter would drop the decimal and
+// print a Double as if it were an Int.
+
+// Searching.
+println(indexOf("Hello", "l"))
+println(indexOf("Hello", "z"))
+println(indexOf("Hello", "Hello"))
+println(indexOf("Hello", ""))
+println(indexOf("ab", "abc"))
+println(lastIndexOf("abcabc", "b"))
+println(lastIndexOf("abcabc", "c"))
+println(lastIndexOf("abc", "z"))
+assertResult(2)(indexOf("Hello", "l"))
+assertResult(-1)(indexOf("Hello", "z"))
+assertResult(4)(lastIndexOf("abcabc", "b"))
+
+// Building.
+println(repeat("ab", 3))
+println(repeat("x", 1))
+println(repeat("x", 0))
+println(replace("a-b-c", "-", "+"))
+println(replace("a-b-c", "z", "+"))
+println(replace("aaa", "a", ""))
+println(replaceAll("a-b-c", "-", "+"))
+assertResult("ababab")(repeat("ab", 3))
+assertResult("a+b-c")(replace("a-b-c", "-", "+"))
+assertResult("a+b+c")(replaceAll("a-b-c", "-", "+"))
+
+// The method spellings reach the same code.
+println("Hello".indexOf("l"))
+println("ab".repeat(2))
+println("a-b".replace("-", "_"))
+
+// Doubles: a whole number keeps its decimal, a fraction keeps its digits.
+println(3.0)
+println(2.5)
+println(3.5 + 1.25)
+println(2.0 * 3.0)
+println(sqrt(9.0))
+println(-1.5)
+println(double(7))
+val pi = 3.14159
+val r = 2.0
+println(pi * r * r)
+println("area=#{pi * r * r}")
+println("half=#{0.5}")
+println("done")

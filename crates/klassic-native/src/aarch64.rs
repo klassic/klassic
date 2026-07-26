@@ -1613,6 +1613,17 @@ fn nullable_elem(ty: ValueType) -> Option<ListElem> {
     }
 }
 
+/// A `Double` the way the evaluator displays it: a whole number keeps one
+/// decimal (`3.0`), anything else takes Rust's shortest round-trip form. The
+/// x86-64 backend formats static doubles by the same rule.
+fn format_double(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        value.to_string()
+    }
+}
+
 fn list_elem_of(ty: ValueType) -> Option<ListElem> {
     match ty {
         ValueType::Int => Some(ListElem::Int),
@@ -1817,6 +1828,11 @@ struct Emitter {
     /// so it splits the path here -- and a literal put in a `val` first is the
     /// ordinary way to write one.
     literal_strings: Vec<HashMap<String, String>>,
+    /// `val`-bound doubles whose value is known while compiling, which is the
+    /// only kind this backend can print -- the same limit the x86-64 backend
+    /// has, reached a different way. A `mutable` is never recorded: what it
+    /// holds at a given point depends on the paths taken to get there.
+    literal_doubles: Vec<HashMap<String, f64>>,
     next_local_offset: u32,
     /// The deepest `next_local_offset` reached in the function being emitted.
     /// Slots are handed back when an inlined lambda's parameters die, so the
@@ -2715,6 +2731,26 @@ impl Emitter {
                 self.asm.mov_imm64(Reg::X0, *value as u64);
                 Ok(ValueType::Int)
             }
+            // `expr cleanup { ... }`: the clause runs after the expression it
+            // is attached to, and the expression's value is still the value.
+            // A heap result is parked as a root, because the clause can
+            // allocate.
+            Expr::Cleanup { body, cleanup, .. } => {
+                let body_ty = self.expression(body)?;
+                let rooted = is_heap_pointer(body_ty);
+                if rooted {
+                    self.push_rooted(Reg::X0);
+                } else {
+                    self.asm.push(Reg::X0);
+                }
+                self.statement(cleanup)?;
+                if rooted {
+                    self.pop_rooted(Reg::X0);
+                } else {
+                    self.asm.pop(Reg::X0);
+                }
+                Ok(body_ty)
+            }
             Expr::Double { value, .. } => {
                 // The double travels as its raw IEEE 754 bits in x0.
                 self.asm.mov_imm64(Reg::X0, value.to_bits());
@@ -3185,6 +3221,26 @@ impl Emitter {
                     if let Some(ty) = self.builtin_call(field, &all, *span)? {
                         return Ok(ty);
                     }
+                    // A method that is not a builtin is a function taking the
+                    // receiver first -- which is what an extension method on
+                    // an enum is left as when its name is also a builtin's
+                    // (`Result`'s `getOrElse` and a map's are both spelled
+                    // that way, with different arities).
+                    if self.function_exists(field, all.len()) {
+                        return self.function_call(field, &all, *span);
+                    }
+                    // An extension method declared on more than one type is
+                    // left as a method call by the shared desugar, because a
+                    // name alone does not say which extension is meant. The
+                    // receiver's type does: `Result`'s `getOrElse` and
+                    // `Option`'s are two functions, and this picks between
+                    // them the way the checker does.
+                    if let Some(key) = self.extension_type_key_of(target) {
+                        let mangled = format!("__ext_{key}_{field}");
+                        if self.function_exists(&mangled, all.len()) {
+                            return self.function_call(&mangled, &all, *span);
+                        }
+                    }
                     return Err(unsupported(*span, &format!("method `{field}`")));
                 }
                 // `myFoldLeft(list)(z)(f)`: a def whose body is a chain of
@@ -3341,6 +3397,12 @@ impl Emitter {
                 Ok(())
             }
             StringPart::Interpolation(hole) => {
+                if let Some(number) = self.static_double_of(hole) {
+                    let offset = self.asm.intern_string_object(&format_double(number));
+                    self.asm.load_rodata_address(Reg::X0, offset);
+                    self.emit_heap_string_copy();
+                    return Ok(());
+                }
                 match self.expression(hole)? {
                     ValueType::Str => {}
                     ValueType::Int => self.emit_int_to_str(),
@@ -4570,6 +4632,61 @@ impl Emitter {
         self.asm.branch(end, BranchKind::Unconditional);
         self.asm.bind(fail);
         self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(end);
+    }
+
+    /// `indexOf(s, needle)` / `lastIndexOf(s, needle)`: s in x0, needle in x1
+    /// -> the *byte* offset in x0, or -1. Byte rather than character, because
+    /// the evaluator answers with what Rust's `find`/`rfind` answer with.
+    /// Scanning forward and keeping the last match is `rfind`.
+    fn emit_str_index_of(&mut self, last: bool) {
+        let not_found = self.asm.new_label();
+        let done = self.asm.new_label();
+        let end = self.asm.new_label();
+        self.asm.ldr_imm(Reg::X3, Reg::X0, 0); // haystack length
+        self.asm.ldr_imm(Reg::X5, Reg::X1, 0); // needle length
+        self.asm.add_reg_imm(Reg::X2, Reg::X0, 8); // haystack bytes
+        self.asm.add_reg_imm(Reg::X4, Reg::X1, 8); // needle bytes
+        self.asm.cmp_reg(Reg::X5, Reg::X3);
+        self.asm
+            .branch(not_found, BranchKind::Conditional(Cond::Gt));
+        self.asm.mov_imm64(Reg::X6, 0); // start offset
+        self.asm.mov_imm64(Reg::X7, u64::MAX); // best so far = -1
+        let outer = self.asm.new_label();
+        let inner = self.asm.new_label();
+        let matched = self.asm.new_label();
+        let advance = self.asm.new_label();
+        self.asm.bind(outer);
+        // Stop once fewer bytes are left than the needle needs.
+        self.asm.sub_reg(Reg::X11, Reg::X3, Reg::X6);
+        self.asm.cmp_reg(Reg::X11, Reg::X5);
+        self.asm.branch(done, BranchKind::Conditional(Cond::Lt));
+        self.asm.add_reg(Reg::X10, Reg::X2, Reg::X6); // haystack cursor
+        self.asm.mov_reg(Reg::X11, Reg::X4); // needle cursor
+        self.asm.mov_reg(Reg::X8, Reg::X5); // bytes left to compare
+        self.asm.bind(inner);
+        self.asm.branch(matched, BranchKind::CompareZero(Reg::X8));
+        self.asm.ldrb_post_increment(Reg::X9, Reg::X10);
+        self.asm.ldrb_post_increment(Reg::X12, Reg::X11);
+        self.asm.cmp_reg(Reg::X9, Reg::X12);
+        self.asm.branch(advance, BranchKind::Conditional(Cond::Ne));
+        self.asm.sub_reg_imm(Reg::X8, Reg::X8, 1);
+        self.asm.branch(inner, BranchKind::Unconditional);
+        self.asm.bind(matched);
+        if last {
+            self.asm.mov_reg(Reg::X7, Reg::X6);
+        } else {
+            self.asm.mov_reg(Reg::X0, Reg::X6);
+            self.asm.branch(end, BranchKind::Unconditional);
+        }
+        self.asm.bind(advance);
+        self.asm.add_reg_imm(Reg::X6, Reg::X6, 1);
+        self.asm.branch(outer, BranchKind::Unconditional);
+        self.asm.bind(done);
+        self.asm.mov_reg(Reg::X0, Reg::X7);
+        self.asm.branch(end, BranchKind::Unconditional);
+        self.asm.bind(not_found);
+        self.asm.mov_imm64(Reg::X0, u64::MAX);
         self.asm.bind(end);
     }
 
@@ -6306,6 +6423,131 @@ impl Emitter {
                 self.pop_rooted(Reg::X0);
                 self.emit_str_matches();
                 Ok(Some(ValueType::Bool))
+            }
+            ("indexOf", 2) | ("lastIndexOf", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "indexOf of a non-string"));
+                }
+                self.push_rooted(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "indexOf with a non-string needle"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.pop_rooted(Reg::X0);
+                self.emit_str_index_of(name == "lastIndexOf");
+                Ok(Some(ValueType::Int))
+            }
+            // `repeat(s, n)`: n copies of s, built by appending. A count that
+            // is not positive answers with the empty string, which is what
+            // `substring`'s clamping already does with an out-of-range index.
+            ("repeat", 2) => {
+                let mark = self.open_temp_roots();
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "repeat of a non-string"));
+                }
+                let source = self.reserve_locals(24);
+                let acc = source + 8;
+                let count = acc + 8;
+                self.asm.store_local(Reg::X0, source);
+                self.emit_root_frame_slot(source);
+                let empty = self.asm.intern_string_object("");
+                self.asm.load_rodata_address(Reg::X0, empty);
+                self.emit_heap_string_copy();
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                if self.expression(&arguments[1])? != ValueType::Int {
+                    return Err(unsupported(span, "repeat with a non-Int count"));
+                }
+                self.asm.store_local(Reg::X0, count);
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, count);
+                self.asm.cmp_imm(Reg::X0, 0);
+                self.asm.branch(done, BranchKind::Conditional(Cond::Le));
+                self.asm.load_local(Reg::X1, source);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_str_concat();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.load_local(Reg::X0, count);
+                self.asm.sub_reg_imm(Reg::X0, Reg::X0, 1);
+                self.asm.store_local(Reg::X0, count);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Str))
+            }
+            // `replace(s, from, to)`: the *first* occurrence, which is what the
+            // evaluator's `replacen(from, to, 1)` does. `replaceAll` is the
+            // pattern-matching one and lives elsewhere.
+            ("replace", 3) => {
+                let mark = self.open_temp_roots();
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "replace of a non-string"));
+                }
+                let source = self.reserve_locals(40);
+                let from = source + 8;
+                let to = from + 8;
+                let head = to + 8;
+                let at = head + 8;
+                self.asm.store_local(Reg::X0, source);
+                self.emit_root_frame_slot(source);
+                // Every slot that will hold a string is rooted before the
+                // branch below, so both paths have pushed the same roots.
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, from);
+                self.emit_root_frame_slot(from);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, to);
+                self.emit_root_frame_slot(to);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, head);
+                self.emit_root_frame_slot(head);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "replace with a non-string pattern"));
+                }
+                self.asm.store_local(Reg::X0, from);
+                if self.expression(&arguments[2])? != ValueType::Str {
+                    return Err(unsupported(span, "replace with a non-string replacement"));
+                }
+                self.asm.store_local(Reg::X0, to);
+                self.asm.load_local(Reg::X1, from);
+                self.asm.load_local(Reg::X0, source);
+                self.emit_str_index_of(false);
+                self.asm.store_local(Reg::X0, at);
+                let absent = self.asm.new_label();
+                let end = self.asm.new_label();
+                self.asm.cmp_imm(Reg::X0, 0);
+                self.asm.branch(absent, BranchKind::Conditional(Cond::Lt));
+                // head = substring(source, 0, at)
+                self.asm.load_local(Reg::X2, at);
+                self.asm.mov_imm64(Reg::X1, 0);
+                self.asm.load_local(Reg::X0, source);
+                self.emit_substring();
+                self.asm.store_local(Reg::X0, head);
+                // head = head + to
+                self.asm.load_local(Reg::X1, to);
+                self.asm.load_local(Reg::X0, head);
+                self.emit_str_concat();
+                self.asm.store_local(Reg::X0, head);
+                // tail = substring(source, at + len(from), len(source))
+                self.asm.load_local(Reg::X0, from);
+                self.asm.ldr_imm(Reg::X1, Reg::X0, 0);
+                self.asm.load_local(Reg::X0, at);
+                self.asm.add_reg(Reg::X1, Reg::X0, Reg::X1);
+                self.asm.load_local(Reg::X0, source);
+                self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+                self.emit_substring();
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.load_local(Reg::X0, head);
+                self.emit_str_concat();
+                self.asm.branch(end, BranchKind::Unconditional);
+                self.asm.bind(absent);
+                self.asm.load_local(Reg::X0, source);
+                self.asm.bind(end);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Str))
             }
             ("startsWith", 2) => {
                 if self.expression(&arguments[0])? != ValueType::Str {
@@ -8519,7 +8761,7 @@ impl Emitter {
                     // evaluator's -- keeping this in step with the emitter
                     // matters, since a wrong guess is a rejected build.
                     "size" | "length" | "toInt" | "floor" | "int" | "ceil" | "Map#size"
-                    | "Set#size" => {
+                    | "Set#size" | "indexOf" | "lastIndexOf" => {
                         return Some(ValueType::Int);
                     }
                     "isEmpty" | "contains" | "isEmptyString" | "matches" | "containsKey"
@@ -8602,7 +8844,9 @@ impl Emitter {
                     }
                     "__match_fail" => return Some(ValueType::Never),
                     "toString" | "substring" | "trim" | "toUpperCase" | "toLowerCase"
-                    | "reverse" | "join" | "replaceAll" | "at" => return Some(ValueType::Str),
+                    | "reverse" | "join" | "replaceAll" | "replace" | "repeat" | "at" => {
+                        return Some(ValueType::Str);
+                    }
                     _ => {}
                 }
                 // A generic enum's constructor: the payload types the call
@@ -9077,6 +9321,7 @@ impl Emitter {
         self.dict_bindings.push(HashMap::new());
         self.alias_bindings.push(HashMap::new());
         self.literal_strings.push(HashMap::new());
+        self.literal_doubles.push(HashMap::new());
     }
 
     /// Close the scopes `push_binding_scopes` opened.
@@ -9086,6 +9331,60 @@ impl Emitter {
         self.dict_bindings.pop();
         self.alias_bindings.pop();
         self.literal_strings.pop();
+        self.literal_doubles.pop();
+    }
+
+    /// The value of a `Double` expression, when it is one this backend can work
+    /// out while compiling. Only pure shapes are folded -- literals, arithmetic
+    /// on them, and names bound to one by a `val` -- so folding an expression
+    /// away can never skip an effect.
+    fn static_double_of(&self, expr: &Expr) -> Option<f64> {
+        match expr {
+            Expr::Double { value, .. } => Some(*value),
+            Expr::Identifier { name, .. } => self
+                .literal_doubles
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(name))
+                .copied(),
+            Expr::Unary { op, expr, .. } => match op {
+                UnaryOp::Minus => Some(-self.static_double_of(expr)?),
+                UnaryOp::Plus => self.static_double_of(expr),
+                _ => None,
+            },
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let left = self.static_double_of(lhs)?;
+                let right = self.static_double_of(rhs)?;
+                match op {
+                    BinaryOp::Add => Some(left + right),
+                    BinaryOp::Subtract => Some(left - right),
+                    BinaryOp::Multiply => Some(left * right),
+                    BinaryOp::Divide => Some(left / right),
+                    _ => None,
+                }
+            }
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                let Expr::Identifier { name, .. } = callee.as_ref() else {
+                    return None;
+                };
+                if arguments.len() != 1 {
+                    return None;
+                }
+                match name.as_str() {
+                    "sqrt" => Some(self.static_double_of(&arguments[0])?.sqrt()),
+                    "abs" => Some(self.static_double_of(&arguments[0])?.abs()),
+                    // `double(n)` widens an Int, so its argument is one.
+                    "double" => match &arguments[0] {
+                        Expr::Int { value, .. } => Some(*value as f64),
+                        other => self.static_double_of(other),
+                    },
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// A name aliasing another name, innermost scope first.
@@ -9360,6 +9659,41 @@ impl Emitter {
         Ok(result)
     }
 
+    /// The name an `extension (this: T) { ... }` block is keyed by, worked out
+    /// from what the receiver's type turns out to be. Typing it emits nothing,
+    /// so asking costs only the inference.
+    fn extension_type_key_of(&mut self, receiver: &Expr) -> Option<String> {
+        let mut locals = Vec::new();
+        let ty = self.static_type_under(receiver, &mut locals, 0)?;
+        Some(match ty {
+            ValueType::Str => "String".to_string(),
+            ValueType::Int => "Int".to_string(),
+            ValueType::Bool => "Boolean".to_string(),
+            ValueType::Double => "Double".to_string(),
+            ValueType::List(_) | ValueType::EmptyList => "List".to_string(),
+            ValueType::Set(_) | ValueType::EmptySet => "Set".to_string(),
+            ValueType::Map(..) | ValueType::EmptyMap => "Map".to_string(),
+            ValueType::Enum(shape) => {
+                let (enum_index, _) = self.enum_shapes.get(shape as usize)?;
+                self.generic_enums.get(*enum_index)?.0.clone()
+            }
+            ValueType::Record(index) => self.records.get(index as usize)?.name.clone(),
+            _ => return None,
+        })
+    }
+
+    /// Is there a definition of this name that takes this many arguments,
+    /// concrete or generic? Asked before turning a method call into one.
+    fn function_exists(&self, name: &str, arity: usize) -> bool {
+        self.functions
+            .iter()
+            .any(|(n, info)| n == name && info.params.len() == arity)
+            || self
+                .generic_functions
+                .iter()
+                .any(|generic| generic.name == name && generic.params.len() == arity)
+    }
+
     fn function_call(
         &mut self,
         name: &str,
@@ -9579,7 +9913,7 @@ impl Emitter {
                 }
                 Ok(Some(format!("{value}\n")))
             }
-            Expr::Double { value, .. } => Ok(Some(format!("{value}\n"))),
+            Expr::Double { value, .. } => Ok(Some(format!("{}\n", format_double(*value)))),
             _ => Ok(None),
         }
     }
@@ -9593,6 +9927,11 @@ impl Emitter {
         }
         let argument = &arguments[0];
         if let Some(line) = Self::literal_line(argument)? {
+            self.asm.emit_write_rodata(STDOUT_FD, line.as_bytes());
+            return Ok(());
+        }
+        if let Some(number) = self.static_double_of(argument) {
+            let line = format!("{}\n", format_double(number));
             self.asm.emit_write_rodata(STDOUT_FD, line.as_bytes());
             return Ok(());
         }
@@ -9732,7 +10071,12 @@ impl Emitter {
             | Expr::EnumDeclaration { .. }
             | Expr::TypeClassDeclaration { .. }
             | Expr::InstanceDeclaration { .. } => Ok(()),
-            Expr::VarDecl { name, value, .. } => {
+            Expr::VarDecl {
+                name,
+                value,
+                mutable,
+                ..
+            } => {
                 // Remember a string literal's text for the builtins that need
                 // it at compile time, and forget any older binding of this name
                 // so a shadowing one does not inherit the wrong text.
@@ -9747,6 +10091,21 @@ impl Emitter {
                         .expect("emitter literal scope");
                     match literal {
                         Some(text) => scope.insert(name.clone(), text),
+                        None => scope.remove(name),
+                    };
+                }
+                {
+                    let folded = if *mutable {
+                        None
+                    } else {
+                        self.static_double_of(value)
+                    };
+                    let scope = self
+                        .literal_doubles
+                        .last_mut()
+                        .expect("emitter literal scope");
+                    match folded {
+                        Some(number) => scope.insert(name.clone(), number),
                         None => scope.remove(name),
                     };
                 }

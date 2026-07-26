@@ -1512,6 +1512,32 @@ other list. It is a comparison per variant against the tag the constructor
 stored; a variant whose payload the shape records as `Never` is skipped, which
 is the same reading `match` takes of it.
 
+### Strings, doubles, cleanup, and methods that need their receiver
+
+Four more gaps the aarch64 backend had against the other two, all found by
+building the same probes for all three targets:
+
+- **`indexOf` / `lastIndexOf` / `repeat` / `replace`.** The first two answer
+  with a *byte* offset and -1, which is what the evaluator's `find`/`rfind`
+  answer with; scanning forward and keeping the last match is `rfind`.
+  `replace` touches the first occurrence only, like the evaluator's
+  `replacen(from, to, 1)` -- `replaceAll` is the pattern-matching one.
+- **Printing a double.** A whole number prints as `3.0`, and the backend was
+  formatting a printed literal with a plain float formatter, which would have
+  dropped the decimal and printed a Double as if it were an Int. Doubles that
+  can be worked out while compiling now print, through the same rule the
+  x86-64 backend formats static doubles with; only `val` bindings are folded,
+  because what a `mutable` holds depends on the paths taken to reach it.
+- **`cleanup`.** The clause runs after the expression it is attached to and
+  the expression's value is still the value; a heap result is parked as a
+  root, because the clause can allocate.
+- **Methods that need their receiver's type.** The shared desugar rewrites
+  `x.m(...)` to `__ext_<Type>_m(x, ...)` only when `m` is declared on exactly
+  one extension type. `getOrElse` is declared on `Option`, `Result` and
+  `Map`, so it arrives as a method call, and the backend now picks the
+  extension by what the receiver's type turns out to be -- inferred without
+  emitting anything, so asking is free.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.
