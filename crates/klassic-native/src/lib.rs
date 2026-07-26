@@ -4495,6 +4495,11 @@ struct NativeCodeGenerator {
     functions: HashMap<String, NativeFunction>,
     function_order: Vec<String>,
     referenced_functions: HashSet<String>,
+    /// Definitions that reach themselves. A value backed by a buffer chosen
+    /// while compiling has one buffer per *call site*, which is one buffer for
+    /// every activation of a recursive function -- so building one inside a
+    /// recursive definition has to be refused rather than emitted.
+    recursive_function_names: HashSet<String>,
     active_function_name: Option<String>,
     instance_methods: Vec<NativeInstanceMethod>,
     record_schemas: HashMap<String, Vec<NativeRecordFieldSchema>>,
@@ -4870,6 +4875,7 @@ impl NativeCodeGenerator {
             functions: HashMap::new(),
             function_order: Vec::new(),
             referenced_functions: HashSet::new(),
+            recursive_function_names: HashSet::new(),
             active_function_name: None,
             instance_methods: Vec::new(),
             record_schemas,
@@ -5340,13 +5346,6 @@ impl NativeCodeGenerator {
                 .iter()
                 .all(|arm| en_pattern_supported_shaped(shape, &arm.pattern))
         {
-            eprintln!(
-                "DBG shape variants={:?} arms={:?}",
-                shape.variants.keys().collect::<Vec<_>>(),
-                arms.iter()
-                    .map(|a| format!("{:?}", a.pattern))
-                    .collect::<Vec<_>>()
-            );
             return Err(unsupported(
                 span,
                 "native generic enum match: a pattern variant is not in the scrutinee shape",
@@ -5844,6 +5843,8 @@ impl NativeCodeGenerator {
         };
         let thread_aliases = top_level_thread_aliases(expressions);
         let recursive_names = recursive_def_names(expressions);
+        self.recursive_function_names
+            .extend(recursive_names.iter().cloned());
         let top_level_value_names = top_level_value_names(expressions);
         self.top_level_mutable_names = top_level_mutable_names(expressions);
         for expression in expressions {
@@ -5977,6 +5978,14 @@ impl NativeCodeGenerator {
                         unsupported_recursive_inline,
                         inline_reason,
                         captured_top_level_names,
+                        param_annotations
+                            .iter()
+                            .map(|annotation| {
+                                annotation
+                                    .as_ref()
+                                    .map(|annotation| annotation.text.clone())
+                            })
+                            .collect(),
                     );
                 }
                 Expr::VarDecl {
@@ -6035,6 +6044,7 @@ impl NativeCodeGenerator {
                             // reason is never read.
                             String::new(),
                             HashSet::new(),
+                            vec![None; param_count],
                         );
                     }
                 }
@@ -6087,6 +6097,7 @@ impl NativeCodeGenerator {
         unsupported_recursive_inline: bool,
         inline_reason: String,
         captured_top_level_names: HashSet<String>,
+        param_annotation_texts: Vec<Option<String>>,
     ) {
         if self.functions.contains_key(&name) {
             return;
@@ -6102,6 +6113,7 @@ impl NativeCodeGenerator {
                 flexible_params,
                 param_unannotated,
                 param_enum_shapes,
+                param_annotation_texts,
                 return_value,
                 return_enum_shape,
                 body,
@@ -6488,7 +6500,9 @@ impl NativeCodeGenerator {
             | "Dir#current"
             | "Dir#home"
             | "Dir#temp"
-            | "Time#nowMillis" => Some(0),
+            | "Time#nowMillis"
+            | "Map#empty"
+            | "Set#empty" => Some(0),
             "println"
             | "printlnError"
             | "sleep"
@@ -6512,6 +6526,10 @@ impl NativeCodeGenerator {
             | "abs"
             | "size"
             | "Map#size"
+            | "Map#keys"
+            | "Map#values"
+            | "Set#toList"
+            | "Set#fromList"
             | "Set#size"
             | "isEmpty"
             | "Map#isEmpty"
@@ -6538,6 +6556,8 @@ impl NativeCodeGenerator {
             | "Math#sqrtInt"
             | "String#parseInt"
             | "Random#seed"
+            | "String#isInt"
+            | "String#isDouble"
             | "Random#nextInt" => Some(1),
             "at"
             | "matches"
@@ -6550,6 +6570,7 @@ impl NativeCodeGenerator {
             | "join"
             | "contains"
             | "Set#contains"
+            | "Set#add"
             | "Map#containsKey"
             | "containsKey"
             | "Map#containsValue"
@@ -6564,7 +6585,7 @@ impl NativeCodeGenerator {
             | "Dir#move"
             | "Math#powInt"
             | "Math#gcd" => Some(2),
-            "substring" | "replace" | "replaceAll" => Some(3),
+            "substring" | "replace" | "replaceAll" | "Map#put" | "Map#getOrElse" => Some(3),
             _ => None,
         }
     }
@@ -8166,6 +8187,24 @@ impl NativeCodeGenerator {
             "double" | "sqrt" | "int" | "floor" | "ceil" | "abs" => {
                 self.compile_numeric_helper(name.as_str(), arguments, span)
             }
+            // A map's two halves as lists, in insertion order. Both are read
+            // off the compile-time entries, which is what `std.map`'s
+            // `toPairs` and `foldMap` walk.
+            "Map#keys" | "Map#values" => {
+                if arguments.len() != 1 {
+                    return Err(Diagnostic::compile(
+                        span,
+                        format!("{name} expects 1 argument but got {}", arguments.len()),
+                    ));
+                }
+                let entries = self.static_map_entries_from_expr(&arguments[0], span)?;
+                let taken = entries
+                    .into_iter()
+                    .map(|(key, value)| if name == "Map#keys" { key } else { value })
+                    .collect();
+                let label = self.intern_static_list(taken);
+                Ok(NativeValue::StaticList { label })
+            }
             "size" | "Map#size" | "Set#size" => {
                 if arguments.len() != 1 {
                     return Err(Diagnostic::compile(
@@ -8362,6 +8401,58 @@ impl NativeCodeGenerator {
             }
             "Map#get" | "get" => self.compile_static_map_get_direct(arguments, span),
             "Set#contains" => self.compile_static_set_contains_direct(arguments, span),
+            // `String#isInt` / `String#isDouble`: folded when the text is
+            // known while compiling (Rust's own parse decides, so the answer
+            // is the evaluator's by construction), scanned when it is not.
+            "String#isInt" | "String#isDouble" if arguments.len() == 1 => {
+                if self.expr_may_yield_runtime_string(&arguments[0]) {
+                    let input = self.compile_expr(&arguments[0])?;
+                    let Some(input) = self.native_string_ref(input) else {
+                        return Err(unsupported(span, &format!("native {name} for non-string")));
+                    };
+                    return Ok(if name == "String#isInt" {
+                        self.emit_runtime_string_is_int(input)
+                    } else {
+                        self.emit_runtime_string_is_double(input)
+                    });
+                }
+                let text = self.static_string_from_argument_preserving_effects(
+                    &arguments[0],
+                    span,
+                    name.as_str(),
+                )?;
+                let answer = if name == "String#isInt" {
+                    text.trim().parse::<i64>().is_ok()
+                } else {
+                    text.trim().parse::<f64>().is_ok()
+                };
+                self.asm.mov_imm64(Reg::Rax, u64::from(answer));
+                Ok(NativeValue::Bool)
+            }
+            // The function spellings of the set builders. The method forms
+            // (`s.add(x)`, `s.toList()`) were already here; `std.set`'s own
+            // extension methods call these.
+            "Set#toList" if arguments.len() == 1 => self.compile_set_to_list(&arguments[0], span),
+            "Set#add" if arguments.len() == 2 => {
+                self.compile_set_add(&arguments[0], &arguments[1], span)
+            }
+            "Map#getOrElse" if arguments.len() == 3 => {
+                self.compile_map_get_or_else(&arguments[0], &arguments[1], &arguments[2], span)
+            }
+            "Map#put" if arguments.len() == 3 => {
+                self.compile_map_put(&arguments[0], &arguments[1], &arguments[2], span)
+            }
+            "Map#empty" if arguments.is_empty() => {
+                let label = self.intern_static_map(Vec::new());
+                Ok(self.emit_static_value(&StaticValue::StaticMap { label }))
+            }
+            "Set#empty" if arguments.is_empty() => {
+                let label = self.intern_static_set(Vec::new());
+                Ok(self.emit_static_value(&StaticValue::StaticSet { label }))
+            }
+            "Set#fromList" if arguments.len() == 1 => {
+                self.compile_set_from_list(&arguments[0], span)
+            }
             "FileOutput#write" => self.compile_file_output_write(arguments, false, span),
             "FileOutput#append" => self.compile_file_output_write(arguments, true, span),
             "FileOutput#writeLines" => self.compile_file_output_write_lines(arguments, span),
@@ -9646,6 +9737,8 @@ impl NativeCodeGenerator {
             ));
         }
         self.push_scope();
+        let mut solutions: Vec<(String, String)> = Vec::new();
+        let mut open_enum_slots: Vec<(VarSlot, String)> = Vec::new();
         for (index, ((param, expected_value), argument)) in function
             .params
             .iter()
@@ -9653,6 +9746,11 @@ impl NativeCodeGenerator {
             .zip(arguments)
             .enumerate()
         {
+            let annotation_text = function
+                .param_annotation_texts
+                .get(index)
+                .cloned()
+                .flatten();
             let flexible = function
                 .flexible_params
                 .get(index)
@@ -9665,6 +9763,19 @@ impl NativeCodeGenerator {
                 .unwrap_or(false);
             let static_argument = self.static_value_from_pure_expr(argument);
             let value = self.compile_expr(argument)?;
+            // Solved here rather than at any one binding path, because the
+            // paths differ by value kind: a string argument binds as a
+            // constant and never reaches the slot-allocating arm below, and
+            // it is exactly the argument that fixes a `'k`.
+            if let Some(text) = annotation_text.as_deref() {
+                let trimmed = text.trim();
+                if trimmed.starts_with('\'')
+                    && let Some(name) = native_value_annotation_name(value)
+                    && !solutions.iter().any(|(known, _)| known == trimmed)
+                {
+                    solutions.push((trimmed.to_string(), name));
+                }
+            }
             if matches!(expected_value, NativeValue::RuntimeString { .. }) {
                 if self.native_string_ref(value).is_none() {
                     self.pop_scope();
@@ -9746,6 +9857,16 @@ impl NativeCodeGenerator {
                 | NativeValue::RuntimeDouble => {
                     let slot = self.allocate_slot(param.clone(), value);
                     self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                    if let Some(text) = annotation_text
+                        && text.trim().contains('\'')
+                        && !text.trim().starts_with('\'')
+                        && self
+                            .enum_shapes
+                            .get(&slot.id)
+                            .is_none_or(shape_leaves_payloads_open)
+                    {
+                        open_enum_slots.push((slot, text.trim().to_string()));
+                    }
                     if let Some(value) = static_argument {
                         self.bind_static_value(param.clone(), value);
                     }
@@ -9768,6 +9889,22 @@ impl NativeCodeGenerator {
                 | NativeValue::BuiltinFunction { .. }
                 | NativeValue::RuntimeMapCallableDispatch(_) => {
                     self.bind_constant(param.clone(), value);
+                }
+            }
+        }
+        // The solutions are complete now, so an enum-typed parameter whose own
+        // argument left the variables open takes the shape they imply, read
+        // off the annotation it was declared with. `put(KMNil, "a", 1)` says
+        // nothing through its first argument -- the empty case carries no
+        // payloads -- while `key: 'k` and `value: 'v` say everything, and the
+        // body reads the parameter's shape out of its slot.
+        if !solutions.is_empty() {
+            let variables: Vec<String> = solutions.iter().map(|(name, _)| name.clone()).collect();
+            let names: Vec<String> = solutions.iter().map(|(_, name)| name.clone()).collect();
+            for (slot, annotation) in open_enum_slots {
+                let applied = substitute_type_variables(&annotation, &variables, &names);
+                if let Some(shape) = self.generic_enum_annotation_shape(&applied) {
+                    self.enum_shapes.insert(slot.id, shape);
                 }
             }
         }
@@ -9910,6 +10047,13 @@ impl NativeCodeGenerator {
         }
     }
 
+    /// Is the body being compiled part of a definition that reaches itself?
+    fn inside_recursive_function(&self) -> bool {
+        self.active_function_name
+            .as_ref()
+            .is_some_and(|name| self.recursive_function_names.contains(name))
+    }
+
     fn compile_cons(
         &mut self,
         head_arguments: &[Expr],
@@ -9923,6 +10067,16 @@ impl NativeCodeGenerator {
             ));
         }
         if self.expr_may_yield_runtime_lines_list(&tail_arguments[0]) {
+            // The result is a buffer chosen while compiling, so there is one
+            // per call site -- shared by every activation of a recursive
+            // function, which would print the innermost element in every
+            // position. Refuse rather than answer wrongly.
+            if self.inside_recursive_function() {
+                return Err(unsupported(
+                    span,
+                    "building a list inside a recursive function, whose result buffer is chosen while compiling",
+                ));
+            }
             let head = self.compile_expr(&head_arguments[0])?;
             let Some(head) = self.native_string_ref(head) else {
                 return Err(unsupported(
@@ -13708,6 +13862,23 @@ impl NativeCodeGenerator {
                 Ok(())
             }
             NativeValue::HeapPointer if allow_erased_pointer => Ok(()),
+            // A number or a flag appended to a heap string: render it the way
+            // `toString` does, then copy the text onto the heap so the result
+            // is a heap string like the other operand. Without this,
+            // `acc + key + ": " + value` -- the shape every rendering of a
+            // key/value chain takes -- could not be compiled.
+            NativeValue::Int | NativeValue::Bool => {
+                let text = if value == NativeValue::Int {
+                    self.emit_i64_rax_to_runtime_string_ref(span, context)
+                } else {
+                    self.emit_bool_rax_to_runtime_string_ref(span, context)
+                };
+                let NativeStringLen::Runtime(len) = text.len else {
+                    return Err(unsupported(span, context));
+                };
+                self.emit_runtime_string_to_heap_string(text.data, len);
+                Ok(())
+            }
             _ => Err(unsupported(span, context)),
         }
     }
@@ -14695,6 +14866,11 @@ impl NativeCodeGenerator {
         let done = self.asm.create_text_label();
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Greater, nonzero);
+        // The answer is read out of R9 below, so the zero case has to put it
+        // there. Without this the register still holds the previous
+        // `Math#sqrtInt` in the same program, and `Math#sqrtInt(0)` answered
+        // with that instead of 0.
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
         self.asm.jmp_label(done);
         self.asm.bind_text_label(nonzero);
         // R8 = n (preserved across the loop).
@@ -15372,6 +15548,32 @@ impl NativeCodeGenerator {
         let elements = self.static_sets[label.0].elements.clone();
         let list_label = self.intern_static_list(elements);
         Ok(self.emit_static_value(&StaticValue::StaticList { label: list_label }))
+    }
+
+    /// `Set#fromList(xs)` — the list's elements as a set, keeping the first
+    /// occurrence of each in the order they arrive, which is what the
+    /// evaluator does and what a set literal already does here.
+    fn compile_set_from_list(
+        &mut self,
+        target: &Expr,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let elements = self.static_list_values_from_argument_preserving_effects(
+            target,
+            span,
+            "native Set#fromList for non-static list",
+        )?;
+        let mut deduped: Vec<StaticValue> = Vec::with_capacity(elements.len());
+        for element in elements {
+            if !deduped
+                .iter()
+                .any(|seen| self.static_value_equal_user(seen, &element))
+            {
+                deduped.push(element);
+            }
+        }
+        let label = self.intern_static_set(deduped);
+        Ok(self.emit_static_value(&StaticValue::StaticSet { label }))
     }
 
     /// `m.put(k, v)` — a fresh static map with `k -> v` set. An existing key
@@ -26834,12 +27036,13 @@ impl NativeCodeGenerator {
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity(name, arguments, 2, span)?;
         let input = self.compile_expr(&arguments[0])?;
-        let Some(input) = self.native_string_ref(input) else {
-            return Err(unsupported(span, &format!("native {name} for non-string")));
+        let context = format!("native {name} for non-string");
+        let Some(input) = self.native_string_ref_or_copy(input, span, &context) else {
+            return Err(unsupported(span, &context));
         };
         let needle = self.compile_expr(&arguments[1])?;
-        let Some(needle) = self.native_string_ref(needle) else {
-            return Err(unsupported(span, &format!("native {name} for non-string")));
+        let Some(needle) = self.native_string_ref_or_copy(needle, span, &context) else {
+            return Err(unsupported(span, &context));
         };
         match name {
             "startsWith" => self.emit_native_string_starts_with(input, needle),
@@ -34033,6 +34236,26 @@ impl NativeCodeGenerator {
         }
     }
 
+    /// The same as `native_string_ref`, but a heap string is copied into a
+    /// scratch buffer pair first. An extension method's `this: String`
+    /// parameter arrives as a heap string, so without this every string
+    /// builtin written as `this.startsWith(...)` was refused.
+    fn native_string_ref_or_copy(
+        &mut self,
+        value: NativeValue,
+        span: Span,
+        context: &str,
+    ) -> Option<NativeStringRef> {
+        if let Some(reference) = self.native_string_ref(value) {
+            return Some(reference);
+        }
+        if value != NativeValue::HeapString {
+            return None;
+        }
+        let copied = self.emit_heap_string_to_runtime_string_value(span, context);
+        self.native_string_ref(copied)
+    }
+
     fn native_string_ref(&self, value: NativeValue) -> Option<NativeStringRef> {
         match value {
             NativeValue::StaticString { label, len } => Some(NativeStringRef {
@@ -36216,6 +36439,286 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(done);
         self.asm.mov_data_addr(Reg::R10, offset);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
+    }
+
+    /// Leave `[r9, r8)` holding the input with ASCII whitespace trimmed off
+    /// both ends, with `rsi` = bytes and `rdx` = length. The evaluator's
+    /// `is_int`/`is_double` both start with `trim()`, and everything after
+    /// them reads the window this leaves behind.
+    fn emit_trim_window_r9_r8(&mut self, input: NativeStringRef) {
+        self.asm.mov_data_addr(Reg::Rsi, input.data);
+        self.emit_load_native_string_len(Reg::Rdx, input.len);
+        let left_loop = self.asm.create_text_label();
+        let consume_left = self.asm.create_text_label();
+        let left_done = self.asm.create_text_label();
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.bind_text_label(left_loop);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::Rdx);
+        self.asm.jcc_label(Condition::GreaterEqual, left_done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.emit_jump_if_ascii_whitespace(Reg::Rax, consume_left);
+        self.asm.jmp_label(left_done);
+        self.asm.bind_text_label(consume_left);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.jmp_label(left_loop);
+        self.asm.bind_text_label(left_done);
+
+        let right_loop = self.asm.create_text_label();
+        let consume_right = self.asm.create_text_label();
+        let right_done = self.asm.create_text_label();
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rdx);
+        self.asm.bind_text_label(right_loop);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
+        self.asm.jcc_label(Condition::LessEqual, right_done);
+        self.asm.mov_reg_reg(Reg::R10, Reg::R8);
+        self.asm.dec_reg(Reg::R10);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R10);
+        self.emit_jump_if_ascii_whitespace(Reg::Rax, consume_right);
+        self.asm.jmp_label(right_done);
+        self.asm.bind_text_label(consume_right);
+        self.asm.dec_reg(Reg::R8);
+        self.asm.jmp_label(right_loop);
+        self.asm.bind_text_label(right_done);
+    }
+
+    /// `String#isInt(s)` for a string only known at run time: what
+    /// `s.trim().parse::<i64>()` accepts, range included. The range check is a
+    /// digit count and, at exactly nineteen digits, a comparison against the
+    /// limit's own digits -- no 128-bit arithmetic, and exact.
+    fn emit_runtime_string_is_int(&mut self, input: NativeStringRef) -> NativeValue {
+        let positive_limit = self.asm.data_label_with_bytes(b"9223372036854775807");
+        let negative_limit = self.asm.data_label_with_bytes(b"9223372036854775808");
+        let no = self.asm.create_text_label();
+        let yes = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.emit_trim_window_r9_r8(input);
+        // Empty after trimming is not a number.
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, no);
+        // An optional sign, remembered in r11 (1 when negative).
+        let signed = self.asm.create_text_label();
+        let after_sign = self.asm.create_text_label();
+        self.asm.mov_imm64(Reg::R11, 0);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'+' as i8);
+        self.asm.jcc_label(Condition::Equal, signed);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'-' as i8);
+        self.asm.jcc_label(Condition::NotEqual, after_sign);
+        self.asm.mov_imm64(Reg::R11, 1);
+        self.asm.bind_text_label(signed);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.bind_text_label(after_sign);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, no);
+        // Leading zeros do not count towards the range, so drop them -- but
+        // keep the last digit, so "0" stays a number.
+        let zero_loop = self.asm.create_text_label();
+        let zeros_done = self.asm.create_text_label();
+        self.asm.bind_text_label(zero_loop);
+        self.asm.mov_reg_reg(Reg::R10, Reg::R8);
+        self.asm.sub_reg_reg(Reg::R10, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::R10, 1);
+        self.asm.jcc_label(Condition::LessEqual, zeros_done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'0' as i8);
+        self.asm.jcc_label(Condition::NotEqual, zeros_done);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.jmp_label(zero_loop);
+        self.asm.bind_text_label(zeros_done);
+        // Every remaining byte has to be a digit.
+        let digit_loop = self.asm.create_text_label();
+        let digits_done = self.asm.create_text_label();
+        self.asm.mov_reg_reg(Reg::R10, Reg::R9);
+        self.asm.bind_text_label(digit_loop);
+        self.asm.cmp_reg_reg(Reg::R10, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, digits_done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R10);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'0' as i8);
+        self.asm.jcc_label(Condition::Less, no);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'9' as i8);
+        self.asm.jcc_label(Condition::Greater, no);
+        self.asm.inc_reg(Reg::R10);
+        self.asm.jmp_label(digit_loop);
+        self.asm.bind_text_label(digits_done);
+        // Nineteen digits is the only length that needs comparing.
+        self.asm.mov_reg_reg(Reg::R10, Reg::R8);
+        self.asm.sub_reg_reg(Reg::R10, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::R10, 19);
+        self.asm.jcc_label(Condition::Greater, no);
+        self.asm.jcc_label(Condition::Less, yes);
+        let use_negative = self.asm.create_text_label();
+        let limit_ready = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::R11, 0);
+        self.asm.jcc_label(Condition::NotEqual, use_negative);
+        self.asm.mov_data_addr(Reg::R11, positive_limit);
+        self.asm.jmp_label(limit_ready);
+        self.asm.bind_text_label(use_negative);
+        self.asm.mov_data_addr(Reg::R11, negative_limit);
+        self.asm.bind_text_label(limit_ready);
+        let compare_loop = self.asm.create_text_label();
+        self.asm.mov_imm64(Reg::R10, 0);
+        self.asm.bind_text_label(compare_loop);
+        self.asm.cmp_reg_imm8(Reg::R10, 19);
+        self.asm.jcc_label(Condition::GreaterEqual, yes);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.movzx_byte_indexed(Reg::Rcx, Reg::R11, Reg::R10);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::Less, yes);
+        self.asm.jcc_label(Condition::Greater, no);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.inc_reg(Reg::R10);
+        self.asm.jmp_label(compare_loop);
+        self.asm.bind_text_label(yes);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(no);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.bind_text_label(done);
+        NativeValue::Bool
+    }
+
+    /// `String#isDouble(s)` for a string only known at run time: what
+    /// `s.trim().parse::<f64>()` accepts -- an optional sign, then `inf`,
+    /// `infinity` or `nan` (either case), or digits with an optional point
+    /// and an optional exponent. A value too large to represent parses as
+    /// infinity rather than failing, so there is no range check here.
+    fn emit_runtime_string_is_double(&mut self, input: NativeStringRef) -> NativeValue {
+        let no = self.asm.create_text_label();
+        let yes = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.emit_trim_window_r9_r8(input);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, no);
+        // An optional sign.
+        let signed = self.asm.create_text_label();
+        let after_sign = self.asm.create_text_label();
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'+' as i8);
+        self.asm.jcc_label(Condition::Equal, signed);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'-' as i8);
+        self.asm.jcc_label(Condition::NotEqual, after_sign);
+        self.asm.bind_text_label(signed);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.bind_text_label(after_sign);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, no);
+        // `inf`, `infinity` and `nan`, in any case.
+        for word in [b"infinity".as_slice(), b"inf".as_slice(), b"nan".as_slice()] {
+            let label = self.asm.data_label_with_bytes(word);
+            let mismatch = self.asm.create_text_label();
+            let compare = self.asm.create_text_label();
+            // Only when what is left is exactly this long.
+            self.asm.mov_reg_reg(Reg::R10, Reg::R8);
+            self.asm.sub_reg_reg(Reg::R10, Reg::R9);
+            self.asm.cmp_reg_imm8(Reg::R10, word.len() as i8);
+            self.asm.jcc_label(Condition::NotEqual, mismatch);
+            self.asm.mov_data_addr(Reg::R11, label);
+            self.asm.mov_imm64(Reg::R10, 0);
+            self.asm.bind_text_label(compare);
+            self.asm.cmp_reg_imm8(Reg::R10, word.len() as i8);
+            self.asm.jcc_label(Condition::GreaterEqual, yes);
+            self.asm.mov_reg_reg(Reg::Rcx, Reg::R9);
+            self.asm.add_reg_reg(Reg::Rcx, Reg::R10);
+            self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::Rcx);
+            // Lower-case the input byte; the words above are lower-case.
+            self.asm.mov_imm64(Reg::Rcx, 0x20);
+            self.asm.or_reg_reg(Reg::Rax, Reg::Rcx);
+            self.asm.movzx_byte_indexed(Reg::Rcx, Reg::R11, Reg::R10);
+            self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+            self.asm.jcc_label(Condition::NotEqual, mismatch);
+            self.asm.inc_reg(Reg::R10);
+            self.asm.jmp_label(compare);
+            self.asm.bind_text_label(mismatch);
+        }
+        // Digits, an optional point with more digits, and at least one of
+        // the two. r11 counts them.
+        self.asm.mov_imm64(Reg::R11, 0);
+        let int_digits = self.asm.create_text_label();
+        let int_done = self.asm.create_text_label();
+        self.asm.bind_text_label(int_digits);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, int_done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'0' as i8);
+        self.asm.jcc_label(Condition::Less, int_done);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'9' as i8);
+        self.asm.jcc_label(Condition::Greater, int_done);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.inc_reg(Reg::R11);
+        self.asm.jmp_label(int_digits);
+        self.asm.bind_text_label(int_done);
+        let after_point = self.asm.create_text_label();
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, after_point);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'.' as i8);
+        self.asm.jcc_label(Condition::NotEqual, after_point);
+        self.asm.inc_reg(Reg::R9);
+        let frac_digits = self.asm.create_text_label();
+        self.asm.bind_text_label(frac_digits);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, after_point);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'0' as i8);
+        self.asm.jcc_label(Condition::Less, after_point);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'9' as i8);
+        self.asm.jcc_label(Condition::Greater, after_point);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.inc_reg(Reg::R11);
+        self.asm.jmp_label(frac_digits);
+        self.asm.bind_text_label(after_point);
+        self.asm.cmp_reg_imm8(Reg::R11, 0);
+        self.asm.jcc_label(Condition::Equal, no);
+        // An optional exponent, which needs at least one digit of its own.
+        let after_exponent = self.asm.create_text_label();
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, after_exponent);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.mov_imm64(Reg::Rcx, 0x20);
+        self.asm.or_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'e' as i8);
+        self.asm.jcc_label(Condition::NotEqual, after_exponent);
+        self.asm.inc_reg(Reg::R9);
+        let exponent_signed = self.asm.create_text_label();
+        let exponent_digits = self.asm.create_text_label();
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, no);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'+' as i8);
+        self.asm.jcc_label(Condition::Equal, exponent_signed);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'-' as i8);
+        self.asm.jcc_label(Condition::NotEqual, exponent_digits);
+        self.asm.bind_text_label(exponent_signed);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.bind_text_label(exponent_digits);
+        self.asm.mov_imm64(Reg::R11, 0);
+        let exponent_loop = self.asm.create_text_label();
+        let exponent_done = self.asm.create_text_label();
+        self.asm.bind_text_label(exponent_loop);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, exponent_done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'0' as i8);
+        self.asm.jcc_label(Condition::Less, exponent_done);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'9' as i8);
+        self.asm.jcc_label(Condition::Greater, exponent_done);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.inc_reg(Reg::R11);
+        self.asm.jmp_label(exponent_loop);
+        self.asm.bind_text_label(exponent_done);
+        self.asm.cmp_reg_imm8(Reg::R11, 0);
+        self.asm.jcc_label(Condition::Equal, no);
+        self.asm.bind_text_label(after_exponent);
+        // Anything left over means it was not a number.
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::NotEqual, no);
+        self.asm.bind_text_label(yes);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(no);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.bind_text_label(done);
+        NativeValue::Bool
     }
 
     fn emit_jump_if_ascii_whitespace(&mut self, byte_reg: Reg, label: TextLabel) {
@@ -39237,6 +39740,10 @@ struct NativeFunction {
     /// travels by pointer and the callee prologue binds the shape to
     /// its slot so matches inside the body resolve payload reprs.
     param_enum_shapes: Vec<Option<ConcreteEnumShape>>,
+    /// Each parameter's annotation as written, so a call site can solve the
+    /// definition's type variables from the arguments that fix them and read
+    /// the resulting shape off an annotation like `KM<'k, 'v>`.
+    param_annotation_texts: Vec<Option<String>>,
     return_value: NativeValue,
     /// Shape of the returned value when the return annotation names a
     /// fully-applied generic enum; published at call sites so a later
@@ -41013,6 +41520,54 @@ fn numeric_or_comparison_binary_value(
         )),
         _ => None,
     }
+}
+
+fn shape_leaves_payloads_open(shape: &ConcreteEnumShape) -> bool {
+    shape
+        .variants
+        .values()
+        .any(|variant| variant.fields.iter().any(|field| !field.resolved))
+}
+
+fn native_value_annotation_name(value: NativeValue) -> Option<String> {
+    Some(
+        match value {
+            NativeValue::Int => "Int",
+            NativeValue::Bool => "Boolean",
+            NativeValue::RuntimeDouble => "Double",
+            NativeValue::HeapString
+            | NativeValue::StaticString { .. }
+            | NativeValue::RuntimeString { .. } => "String",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+fn substitute_type_variables(text: &str, variables: &[String], names: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch == '\'' || ch.is_alphanumeric() || ch == '_' {
+            token.push(ch);
+            continue;
+        }
+        if !token.is_empty() {
+            match variables.iter().position(|variable| *variable == token) {
+                Some(at) => out.push_str(&names[at]),
+                None => out.push_str(&token),
+            }
+            token.clear();
+        }
+        out.push(ch);
+    }
+    if !token.is_empty() {
+        match variables.iter().position(|variable| *variable == token) {
+            Some(at) => out.push_str(&names[at]),
+            None => out.push_str(&token),
+        }
+    }
+    out
 }
 
 fn format_static_float(bits: u32) -> String {

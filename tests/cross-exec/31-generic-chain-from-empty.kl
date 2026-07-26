@@ -1,0 +1,62 @@
+// Cross-target fixture: a *generic* chain helper called with the empty case
+// of its own enum.
+//
+// `KMNil` carries no type arguments, so nothing fixes `'k` and `'v` through
+// the first argument -- but `key: 'k` given a string and `value: 'v` given an
+// Int fix both, and the parameter's shape follows from them. Solving across
+// all of a call's arguments is what makes this compile; before it, the empty
+// case left the other variant's payloads unknown and the backends rejected
+// reading them.
+//
+// The store is grown from `KMNil` in a loop, which is the case that matters:
+// every turn after the first reads what the previous one wrote.
+
+enum KM<'k, 'v> {
+  case KMNil
+  case KMCons(key: 'k, value: 'v, rest: KM<'k, 'v>)
+}
+
+def kmPut(m: KM<'k, 'v>, key: 'k, value: 'v): KM<'k, 'v> = KMCons(key, value, m)
+
+def kmGet(m: KM<'k, 'v>, key: 'k, fallback: 'v): 'v = {
+  mutable cur = m
+  mutable found = fallback
+  mutable go = true
+  while (go) {
+    cur match {
+      case KMNil => { go = false; 0 }
+      case KMCons(k, v, rest) => {
+        found = (if (k == key) v else found)
+        go = (if (k == key) false else true)
+        cur = rest
+        0
+      }
+    }
+  }
+  found
+}
+
+mutable counts = KMNil
+foreach (w in ["the", "fox", "the", "dog", "the", "fox"]) {
+  counts = kmPut(counts, w, kmGet(counts, w, 0) + 1)
+}
+println(kmGet(counts, "the", 0))
+println(kmGet(counts, "fox", 0))
+println(kmGet(counts, "dog", 0))
+println(kmGet(counts, "cat", -1))
+assertResult(3)(kmGet(counts, "the", 0))
+assertResult(2)(kmGet(counts, "fox", 0))
+assertResult(1)(kmGet(counts, "dog", 0))
+assertResult(-1)(kmGet(counts, "cat", -1))
+
+// The same helpers at another pair of types, so the solving is per call and
+// not remembered from the first one.
+mutable flags = KMNil
+foreach (n in [1, 2, 1]) {
+  flags = kmPut(flags, n, true)
+}
+println(kmGet(flags, 1, false))
+println(kmGet(flags, 9, false))
+assertResult(true)(kmGet(flags, 1, false))
+assertResult(false)(kmGet(flags, 9, false))
+println("done")

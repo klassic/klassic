@@ -1,0 +1,76 @@
+// Cross-target fixture: a key/value store grown while the program runs, out
+// of a generic enum with *fully applied* annotations on its helpers.
+//
+// This is the shape a portable `Map` would be lowered to, and it is the
+// boundary worth pinning: written `KM<String, Int>`, every backend compiles
+// it; written `KM<'k, 'v>`, only arm64 does, because a call that starts from
+// the empty case fixes the type variables through its *other* arguments and
+// the x86-64 side does not solve for them yet. A test that reads the same on
+// three targets is what keeps the working half working while that is fixed.
+//
+// The counting below runs both paths through `put`: a key that is already
+// there (replaced in place) and one that is not (appended), a hundred deep
+// so the chain outgrows anything a compile-time buffer would have reserved.
+
+enum KM<'k, 'v> {
+  case KMNil
+  case KMCons(key: 'k, value: 'v, rest: KM<'k, 'v>)
+}
+
+def kmGet(m: KM<String, Int>, key: String, fallback: Int): Int = {
+  mutable cur = m
+  mutable found = fallback
+  mutable go = true
+  while (go) {
+    cur match {
+      case KMNil => { go = false; 0 }
+      case KMCons(k, v, rest) => {
+        found = (if (k == key) v else found)
+        go = (if (k == key) false else true)
+        cur = rest
+        0
+      }
+    }
+  }
+  found
+}
+
+def kmSize(m: KM<String, Int>): Int = {
+  mutable cur = m
+  mutable n = 0
+  mutable go = true
+  while (go) {
+    cur match {
+      case KMNil => { go = false; 0 }
+      case KMCons(k, v, rest) => { n = n + 1; cur = rest; 0 }
+    }
+  }
+  n
+}
+
+def kmPut(m: KM<String, Int>, key: String, value: Int): KM<String, Int> = KMCons(key, value, m)
+
+mutable counts = KMNil
+foreach (w in ["the", "fox", "the", "dog", "the", "fox"]) {
+  counts = kmPut(counts, w, kmGet(counts, w, 0) + 1)
+}
+println(kmGet(counts, "the", 0))
+println(kmGet(counts, "fox", 0))
+println(kmGet(counts, "dog", 0))
+println(kmGet(counts, "cat", -1))
+assertResult(3)(kmGet(counts, "the", 0))
+assertResult(2)(kmGet(counts, "fox", 0))
+assertResult(-1)(kmGet(counts, "cat", -1))
+
+mutable big = KMNil
+mutable i = 0
+while (i < 100) {
+  i = i + 1
+  big = kmPut(big, "k" + i, i)
+}
+println(kmSize(big))
+println(kmGet(big, "k1", 0))
+println(kmGet(big, "k50", 0))
+println(kmGet(big, "k100", 0))
+assertResult(50)(kmGet(big, "k50", 0))
+println("done")

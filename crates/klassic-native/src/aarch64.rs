@@ -1247,6 +1247,9 @@ enum ListElem {
     /// An element that is one of this backend's own enums, which is a pointer
     /// like a string is -- `JArr(items: List<Json>)` is a list of them.
     Enum(u32),
+    /// An element that is a record, which is a pointer too. A list of them is
+    /// what `toPairs()` hands back.
+    Record(u32),
     /// An element that is itself a list: `depth` levels of list over `base`.
     /// `List<List<Int>>`'s element is `Nested { depth: 1, base: Int }` and
     /// `List<List<List<Int>>>`'s is `depth: 2`.
@@ -1288,7 +1291,7 @@ impl ListElem {
             ListElem::Int => Some(ScalarElem::Int),
             ListElem::Bool => Some(ScalarElem::Bool),
             ListElem::Str => Some(ScalarElem::Str),
-            ListElem::Enum(_) | ListElem::Nested { .. } => None,
+            ListElem::Enum(_) | ListElem::Record(_) | ListElem::Nested { .. } => None,
         }
     }
 
@@ -1462,6 +1465,7 @@ fn elem_value_type(elem: ListElem) -> ValueType {
         ListElem::Bool => ValueType::Bool,
         ListElem::Str => ValueType::Str,
         ListElem::Enum(shape) => ValueType::Enum(shape),
+        ListElem::Record(index) => ValueType::Record(index),
         ListElem::Nested { .. } => ValueType::List(
             elem.nested_inner()
                 .expect("a nested element is a list of its inner element"),
@@ -1473,6 +1477,22 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 /// Replace whole-identifier occurrences of each type parameter in an
 /// annotation with its argument: `Chain<a>` with `a = Int` becomes
 /// `Chain<Int>`, while `Char` is left alone.
+/// The annotation a type would be written as, for the types a type variable
+/// can be solved to from an argument. Anything else answers `None`, which
+/// leaves the variable unsolved rather than guessing.
+fn type_annotation_name(ty: ValueType) -> Option<String> {
+    Some(
+        match ty {
+            ValueType::Int => "Int",
+            ValueType::Str => "String",
+            ValueType::Bool => "Boolean",
+            ValueType::Double => "Double",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
 fn substitute_type_params(text: &str, params: &[String], arguments: &[String]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut token = String::new();
@@ -1609,6 +1629,17 @@ fn nullable_elem(ty: ValueType) -> Option<ListElem> {
     }
 }
 
+/// A `Double` the way the evaluator displays it: a whole number keeps one
+/// decimal (`3.0`), anything else takes Rust's shortest round-trip form. The
+/// x86-64 backend formats static doubles by the same rule.
+fn format_double(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        value.to_string()
+    }
+}
+
 fn list_elem_of(ty: ValueType) -> Option<ListElem> {
     match ty {
         ValueType::Int => Some(ListElem::Int),
@@ -1616,6 +1647,7 @@ fn list_elem_of(ty: ValueType) -> Option<ListElem> {
         ValueType::Bool => Some(ListElem::Bool),
         ValueType::Str => Some(ListElem::Str),
         ValueType::Enum(shape) => Some(ListElem::Enum(shape)),
+        ValueType::Record(index) => Some(ListElem::Record(index)),
         // A list of lists: one more level over whatever the inner list holds.
         ValueType::List(inner) => Some(match inner.as_scalar() {
             Some(base) => ListElem::Nested { depth: 1, base },
@@ -1706,6 +1738,15 @@ struct Emitter {
     /// Nominal record declarations plus interned structural shapes;
     /// `ValueType::Record` carries an index into this table.
     records: Vec<RecordInfo>,
+    /// The records whose rendering is currently being emitted, so a record
+    /// that holds itself is rejected instead of printed forever.
+    printing_records: Vec<u32>,
+    /// The same, for enums: a cons-style one holds its own shape.
+    printing_enums: Vec<u32>,
+    /// The pseudo-random generator's state, reserved the first time a program
+    /// asks for a random number. Zero until seeded, which is where the
+    /// evaluator's own generator starts.
+    random_state_cell: Option<DataLabel>,
     /// Lazily emitted set helpers (called via `bl`): scalar / string
     /// membership scans and a cons-list reverse.
     member_scalar_label: Option<Label>,
@@ -1807,6 +1848,11 @@ struct Emitter {
     /// so it splits the path here -- and a literal put in a `val` first is the
     /// ordinary way to write one.
     literal_strings: Vec<HashMap<String, String>>,
+    /// `val`-bound doubles whose value is known while compiling, which is the
+    /// only kind this backend can print -- the same limit the x86-64 backend
+    /// has, reached a different way. A `mutable` is never recorded: what it
+    /// holds at a given point depends on the paths taken to get there.
+    literal_doubles: Vec<HashMap<String, f64>>,
     next_local_offset: u32,
     /// The deepest `next_local_offset` reached in the function being emitted.
     /// Slots are handed back when an inlined lambda's parameters die, so the
@@ -2531,6 +2577,10 @@ impl Emitter {
         if is_heap_pointer(elem_ty) {
             self.emit_root_frame_slot(element);
         }
+        // The body's reads have to see what the body's writes will make of a
+        // binding, because every turn after the first reads what the previous
+        // one wrote.
+        self.widen_loop_mutables(body);
         self.statement(body)?;
         self.pop_binding_scopes();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
@@ -2704,6 +2754,26 @@ impl Emitter {
             Expr::Int { value, .. } => {
                 self.asm.mov_imm64(Reg::X0, *value as u64);
                 Ok(ValueType::Int)
+            }
+            // `expr cleanup { ... }`: the clause runs after the expression it
+            // is attached to, and the expression's value is still the value.
+            // A heap result is parked as a root, because the clause can
+            // allocate.
+            Expr::Cleanup { body, cleanup, .. } => {
+                let body_ty = self.expression(body)?;
+                let rooted = is_heap_pointer(body_ty);
+                if rooted {
+                    self.push_rooted(Reg::X0);
+                } else {
+                    self.asm.push(Reg::X0);
+                }
+                self.statement(cleanup)?;
+                if rooted {
+                    self.pop_rooted(Reg::X0);
+                } else {
+                    self.asm.pop(Reg::X0);
+                }
+                Ok(body_ty)
             }
             Expr::Double { value, .. } => {
                 // The double travels as its raw IEEE 754 bits in x0.
@@ -3063,7 +3133,7 @@ impl Emitter {
                     && list_args.len() == 1
                     && let Expr::Identifier { name, .. } = inner.as_ref()
                     && name == "foldLeft"
-                    && let Expr::Lambda { params, body, .. } = &arguments[0]
+                    && let Some((params, body)) = self.lambda_argument(&arguments[0])
                     && params.len() == 2
                 {
                     return self.emit_list_fold_left(
@@ -3071,7 +3141,7 @@ impl Emitter {
                         &initial_args[0],
                         &params[0],
                         &params[1],
-                        body,
+                        &body,
                         *span,
                     );
                 }
@@ -3174,6 +3244,26 @@ impl Emitter {
                     all.extend(arguments.iter().cloned());
                     if let Some(ty) = self.builtin_call(field, &all, *span)? {
                         return Ok(ty);
+                    }
+                    // A method that is not a builtin is a function taking the
+                    // receiver first -- which is what an extension method on
+                    // an enum is left as when its name is also a builtin's
+                    // (`Result`'s `getOrElse` and a map's are both spelled
+                    // that way, with different arities).
+                    if self.function_exists(field, all.len()) {
+                        return self.function_call(field, &all, *span);
+                    }
+                    // An extension method declared on more than one type is
+                    // left as a method call by the shared desugar, because a
+                    // name alone does not say which extension is meant. The
+                    // receiver's type does: `Result`'s `getOrElse` and
+                    // `Option`'s are two functions, and this picks between
+                    // them the way the checker does.
+                    if let Some(key) = self.extension_type_key_of(target) {
+                        let mangled = format!("__ext_{key}_{field}");
+                        if self.function_exists(&mangled, all.len()) {
+                            return self.function_call(&mangled, &all, *span);
+                        }
                     }
                     return Err(unsupported(*span, &format!("method `{field}`")));
                 }
@@ -3331,6 +3421,12 @@ impl Emitter {
                 Ok(())
             }
             StringPart::Interpolation(hole) => {
+                if let Some(number) = self.static_double_of(hole) {
+                    let offset = self.asm.intern_string_object(&format_double(number));
+                    self.asm.load_rodata_address(Reg::X0, offset);
+                    self.emit_heap_string_copy();
+                    return Ok(());
+                }
                 match self.expression(hole)? {
                     ValueType::Str => {}
                     ValueType::Int => self.emit_int_to_str(),
@@ -3357,6 +3453,9 @@ impl Emitter {
                         let offset = self.asm.intern_string_object("%[]");
                         self.asm.load_rodata_address(Reg::X0, offset);
                         self.emit_heap_string_copy();
+                    }
+                    ValueType::Enum(shape) => {
+                        self.emit_enum_to_str(shape, hole.span())?;
                     }
                     other => {
                         return Err(unsupported(
@@ -3800,6 +3899,33 @@ impl Emitter {
                     let offset = self.asm.intern_string_object("%()");
                     self.asm.load_rodata_address(Reg::X0, offset);
                     self.emit_heap_string_copy();
+                    rhs_ty = ValueType::Str;
+                }
+                // A value that may not be there appends as the word `null`
+                // when it is not, and as itself when it is -- which is what
+                // reading a map entry's value into a message does.
+                ValueType::Nullable(elem) => {
+                    let null_label = self.asm.new_label();
+                    let end_label = self.asm.new_label();
+                    self.asm
+                        .branch(null_label, BranchKind::CompareZero(Reg::X0));
+                    if is_boxed_scalar(elem_value_type(elem)) {
+                        self.emit_unbox_scalar();
+                    }
+                    match elem {
+                        ListElem::Int => self.emit_int_to_str(),
+                        ListElem::Bool => self.emit_bool_to_str(),
+                        ListElem::Str => self.emit_heap_string_copy(),
+                        _ => {
+                            return Err(unsupported(rhs.span(), "appending a value of this type"));
+                        }
+                    }
+                    self.asm.branch(end_label, BranchKind::Unconditional);
+                    self.asm.bind(null_label);
+                    let offset = self.asm.intern_string_object("null");
+                    self.asm.load_rodata_address(Reg::X0, offset);
+                    self.emit_heap_string_copy();
+                    self.asm.bind(end_label);
                     rhs_ty = ValueType::Str;
                 }
                 _ => return Err(unsupported(rhs.span(), "appending a value of this type")),
@@ -4530,6 +4656,61 @@ impl Emitter {
         self.asm.branch(end, BranchKind::Unconditional);
         self.asm.bind(fail);
         self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(end);
+    }
+
+    /// `indexOf(s, needle)` / `lastIndexOf(s, needle)`: s in x0, needle in x1
+    /// -> the *byte* offset in x0, or -1. Byte rather than character, because
+    /// the evaluator answers with what Rust's `find`/`rfind` answer with.
+    /// Scanning forward and keeping the last match is `rfind`.
+    fn emit_str_index_of(&mut self, last: bool) {
+        let not_found = self.asm.new_label();
+        let done = self.asm.new_label();
+        let end = self.asm.new_label();
+        self.asm.ldr_imm(Reg::X3, Reg::X0, 0); // haystack length
+        self.asm.ldr_imm(Reg::X5, Reg::X1, 0); // needle length
+        self.asm.add_reg_imm(Reg::X2, Reg::X0, 8); // haystack bytes
+        self.asm.add_reg_imm(Reg::X4, Reg::X1, 8); // needle bytes
+        self.asm.cmp_reg(Reg::X5, Reg::X3);
+        self.asm
+            .branch(not_found, BranchKind::Conditional(Cond::Gt));
+        self.asm.mov_imm64(Reg::X6, 0); // start offset
+        self.asm.mov_imm64(Reg::X7, u64::MAX); // best so far = -1
+        let outer = self.asm.new_label();
+        let inner = self.asm.new_label();
+        let matched = self.asm.new_label();
+        let advance = self.asm.new_label();
+        self.asm.bind(outer);
+        // Stop once fewer bytes are left than the needle needs.
+        self.asm.sub_reg(Reg::X11, Reg::X3, Reg::X6);
+        self.asm.cmp_reg(Reg::X11, Reg::X5);
+        self.asm.branch(done, BranchKind::Conditional(Cond::Lt));
+        self.asm.add_reg(Reg::X10, Reg::X2, Reg::X6); // haystack cursor
+        self.asm.mov_reg(Reg::X11, Reg::X4); // needle cursor
+        self.asm.mov_reg(Reg::X8, Reg::X5); // bytes left to compare
+        self.asm.bind(inner);
+        self.asm.branch(matched, BranchKind::CompareZero(Reg::X8));
+        self.asm.ldrb_post_increment(Reg::X9, Reg::X10);
+        self.asm.ldrb_post_increment(Reg::X12, Reg::X11);
+        self.asm.cmp_reg(Reg::X9, Reg::X12);
+        self.asm.branch(advance, BranchKind::Conditional(Cond::Ne));
+        self.asm.sub_reg_imm(Reg::X8, Reg::X8, 1);
+        self.asm.branch(inner, BranchKind::Unconditional);
+        self.asm.bind(matched);
+        if last {
+            self.asm.mov_reg(Reg::X7, Reg::X6);
+        } else {
+            self.asm.mov_reg(Reg::X0, Reg::X6);
+            self.asm.branch(end, BranchKind::Unconditional);
+        }
+        self.asm.bind(advance);
+        self.asm.add_reg_imm(Reg::X6, Reg::X6, 1);
+        self.asm.branch(outer, BranchKind::Unconditional);
+        self.asm.bind(done);
+        self.asm.mov_reg(Reg::X0, Reg::X7);
+        self.asm.branch(end, BranchKind::Unconditional);
+        self.asm.bind(not_found);
+        self.asm.mov_imm64(Reg::X0, u64::MAX);
         self.asm.bind(end);
     }
 
@@ -5601,6 +5782,19 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X2);
     }
 
+    /// Prepend a fresh `[key][value]` entry, taken from those two slots, to
+    /// the chain in `acc`.
+    fn emit_put_entry(&mut self, key_slot: u32, value_slot: u32, acc: u32) {
+        self.asm.load_local(Reg::X0, key_slot);
+        self.push_rooted(Reg::X0);
+        self.asm.load_local(Reg::X0, value_slot);
+        self.emit_cons_cell(); // entry = [key][value]
+        self.push_rooted(Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_cons_cell(); // chain cell = [entry][rest]
+        self.asm.store_local(Reg::X0, acc);
+    }
+
     /// The entry whose key equals the one in x1, or 0 when there is none:
     /// x0 = map chain, x1 = key (a boxed scalar or a string pointer)
     /// -> x0 = entry pointer or 0.
@@ -5848,10 +6042,11 @@ impl Emitter {
             ListElem::Double => {
                 return Err(unsupported(span, "printing a Double element"));
             }
-            // An enum element would need this backend to know how the
-            // evaluator renders that enum, which it does not.
-            ListElem::Enum(_) => {
-                return Err(unsupported(span, "printing an enum element"));
+            ListElem::Enum(shape) => {
+                self.emit_print_enum_inline(shape, span)?;
+            }
+            ListElem::Record(index) => {
+                self.emit_print_record_inline(index, span)?;
             }
             // A nested element is a list: build its text with the same
             // renderer and write that. The recursion is at codegen time and
@@ -5903,11 +6098,31 @@ impl Emitter {
     /// `#Name(v1, v2)` for nominal records, `#(v1, v2)` for
     /// structural shapes. Scalar and string fields only for now.
     fn emit_println_record(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
+        self.emit_print_record_inline(index, span)?;
+        self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+        Ok(())
+    }
+
+    /// The same rendering without the newline, which is what a record nested
+    /// inside a list or another record needs. A record that (transitively)
+    /// holds itself would print forever, so the stack of records being
+    /// rendered is checked rather than recursed into.
+    fn emit_print_record_inline(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
+        if self.printing_records.contains(&index) {
+            return Err(unsupported(span, "printing a record that holds itself"));
+        }
+        self.printing_records.push(index);
+        let result = self.emit_print_record_fields(index, span);
+        self.printing_records.pop();
+        result
+    }
+
+    fn emit_print_record_fields(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
         let info = &self.records[index as usize];
         let opener = format!("#{}(", info.name);
         let fields = info.fields.clone();
         for (_, ty) in &fields {
-            if list_elem_of(*ty).is_none() {
+            if list_elem_of(*ty).is_none() && !matches!(ty, ValueType::Nullable(_)) {
                 return Err(unsupported(span, "printing a record with this field type"));
             }
         }
@@ -5920,6 +6135,24 @@ impl Emitter {
             self.asm.pop(Reg::X0);
             self.asm.push(Reg::X0);
             self.emit_gc_load_ptr(Reg::X0, (position * 8) as u32); // barriered
+            // A field that may not be there -- `Map#get`'s answer is the one
+            // every map entry carries -- prints the word `null` when it is
+            // not, which is what the evaluator prints.
+            if let ValueType::Nullable(elem) = *ty {
+                let null_label = self.asm.new_label();
+                let end_label = self.asm.new_label();
+                self.asm
+                    .branch(null_label, BranchKind::CompareZero(Reg::X0));
+                if is_boxed_scalar(elem_value_type(elem)) {
+                    self.emit_unbox_scalar();
+                }
+                self.emit_print_elem(elem, span)?;
+                self.asm.branch(end_label, BranchKind::Unconditional);
+                self.asm.bind(null_label);
+                self.asm.emit_write_rodata(STDOUT_FD, b"null");
+                self.asm.bind(end_label);
+                continue;
+            }
             // Scalar fields are boxed in the POINTER_RECORD; unbox before
             // printing (string fields are already the pointer).
             if is_boxed_scalar(*ty) {
@@ -5928,7 +6161,77 @@ impl Emitter {
             self.emit_print_elem(list_elem_of(*ty).expect("checked above"), span)?;
         }
         self.asm.pop(Reg::X0); // discard the saved object
-        self.asm.emit_write_rodata(STDOUT_FD, b")\n");
+        self.asm.emit_write_rodata(STDOUT_FD, b")");
+        Ok(())
+    }
+
+    /// The evaluator's rendering of an enum value in x0 -- `Some(3)`, `None`,
+    /// `Ok(1)` -- without a newline, so it reads the same alone, inside a list,
+    /// or inside a record. The value is `[boxed tag][payload...]`, so this is a
+    /// comparison per variant against the tag the constructor stored.
+    fn emit_print_enum_inline(&mut self, shape: u32, span: Span) -> Result<(), Diagnostic> {
+        if self.printing_enums.contains(&shape) {
+            return Err(unsupported(span, "printing an enum that holds itself"));
+        }
+        self.printing_enums.push(shape);
+        let result = self.emit_print_enum_variants(shape, span);
+        self.printing_enums.pop();
+        result
+    }
+
+    fn emit_print_enum_variants(&mut self, shape: u32, span: Span) -> Result<(), Diagnostic> {
+        let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
+        let variants = self.generic_enums[enum_index].1.clone();
+        let end = self.asm.new_label();
+        self.asm.push(Reg::X0); // the value survives the writes below
+        for (tag, (variant, arity)) in variants.iter().enumerate() {
+            // A payload this shape never carries means no value of it is this
+            // variant, which is the same reading `match` takes of `Never`.
+            if payloads[tag].contains(&ValueType::Never) {
+                continue;
+            }
+            let next = self.asm.new_label();
+            self.asm.pop(Reg::X0);
+            self.asm.push(Reg::X0);
+            self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
+            self.emit_unbox_scalar();
+            self.asm.cmp_imm(Reg::X0, tag as u32);
+            self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
+            self.asm.emit_write_rodata(STDOUT_FD, variant.as_bytes());
+            if *arity > 0 {
+                self.asm.emit_write_rodata(STDOUT_FD, b"(");
+                let fields = payloads[tag].clone();
+                for (position, field_ty) in fields.iter().copied().take(*arity).enumerate() {
+                    if position > 0 {
+                        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+                    }
+                    self.asm.pop(Reg::X0);
+                    self.asm.push(Reg::X0);
+                    self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
+                    if is_boxed_scalar(field_ty) {
+                        self.emit_unbox_scalar();
+                    }
+                    match field_ty {
+                        ValueType::Enum(inner) => self.emit_print_enum_inline(inner, span)?,
+                        ValueType::Record(inner) => self.emit_print_record_inline(inner, span)?,
+                        other => {
+                            let Some(elem) = list_elem_of(other) else {
+                                return Err(unsupported(
+                                    span,
+                                    "printing an enum payload of this type",
+                                ));
+                            };
+                            self.emit_print_elem(elem, span)?;
+                        }
+                    }
+                }
+                self.asm.emit_write_rodata(STDOUT_FD, b")");
+            }
+            self.asm.branch(end, BranchKind::Unconditional);
+            self.asm.bind(next);
+        }
+        self.asm.bind(end);
+        self.asm.pop(Reg::X0); // discard the saved value
         Ok(())
     }
 
@@ -6145,6 +6448,279 @@ impl Emitter {
                 self.emit_str_matches();
                 Ok(Some(ValueType::Bool))
             }
+            // `String#isInt` / `String#isDouble`: folded when the text is known
+            // while compiling (Rust's own parse decides, so the answer is the
+            // evaluator's by construction), scanned when it is not.
+            ("String#isInt", 1) | ("String#isDouble", 1) => {
+                if let Some(text) = self.literal_string(&arguments[0]) {
+                    let answer = if name == "String#isInt" {
+                        text.trim().parse::<i64>().is_ok()
+                    } else {
+                        text.trim().parse::<f64>().is_ok()
+                    };
+                    self.asm.mov_imm64(Reg::X0, u64::from(answer));
+                    return Ok(Some(ValueType::Bool));
+                }
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "a string test of a non-string"));
+                }
+                if name == "String#isInt" {
+                    self.emit_str_is_int();
+                } else {
+                    self.emit_str_is_double();
+                }
+                Ok(Some(ValueType::Bool))
+            }
+            ("indexOf", 2) | ("lastIndexOf", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "indexOf of a non-string"));
+                }
+                self.push_rooted(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "indexOf with a non-string needle"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.pop_rooted(Reg::X0);
+                self.emit_str_index_of(name == "lastIndexOf");
+                Ok(Some(ValueType::Int))
+            }
+            // `repeat(s, n)`: n copies of s, built by appending. A count that
+            // is not positive answers with the empty string, which is what
+            // `substring`'s clamping already does with an out-of-range index.
+            ("repeat", 2) => {
+                let mark = self.open_temp_roots();
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "repeat of a non-string"));
+                }
+                let source = self.reserve_locals(24);
+                let acc = source + 8;
+                let count = acc + 8;
+                self.asm.store_local(Reg::X0, source);
+                self.emit_root_frame_slot(source);
+                let empty = self.asm.intern_string_object("");
+                self.asm.load_rodata_address(Reg::X0, empty);
+                self.emit_heap_string_copy();
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                if self.expression(&arguments[1])? != ValueType::Int {
+                    return Err(unsupported(span, "repeat with a non-Int count"));
+                }
+                self.asm.store_local(Reg::X0, count);
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, count);
+                self.asm.cmp_imm(Reg::X0, 0);
+                self.asm.branch(done, BranchKind::Conditional(Cond::Le));
+                self.asm.load_local(Reg::X1, source);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_str_concat();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.load_local(Reg::X0, count);
+                self.asm.sub_reg_imm(Reg::X0, Reg::X0, 1);
+                self.asm.store_local(Reg::X0, count);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Str))
+            }
+            // `replace(s, from, to)`: the *first* occurrence, which is what the
+            // evaluator's `replacen(from, to, 1)` does. `replaceAll` is the
+            // pattern-matching one and lives elsewhere.
+            ("replace", 3) => {
+                let mark = self.open_temp_roots();
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "replace of a non-string"));
+                }
+                let source = self.reserve_locals(40);
+                let from = source + 8;
+                let to = from + 8;
+                let head = to + 8;
+                let at = head + 8;
+                self.asm.store_local(Reg::X0, source);
+                self.emit_root_frame_slot(source);
+                // Every slot that will hold a string is rooted before the
+                // branch below, so both paths have pushed the same roots.
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, from);
+                self.emit_root_frame_slot(from);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, to);
+                self.emit_root_frame_slot(to);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, head);
+                self.emit_root_frame_slot(head);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "replace with a non-string pattern"));
+                }
+                self.asm.store_local(Reg::X0, from);
+                if self.expression(&arguments[2])? != ValueType::Str {
+                    return Err(unsupported(span, "replace with a non-string replacement"));
+                }
+                self.asm.store_local(Reg::X0, to);
+                self.asm.load_local(Reg::X1, from);
+                self.asm.load_local(Reg::X0, source);
+                self.emit_str_index_of(false);
+                self.asm.store_local(Reg::X0, at);
+                let absent = self.asm.new_label();
+                let end = self.asm.new_label();
+                self.asm.cmp_imm(Reg::X0, 0);
+                self.asm.branch(absent, BranchKind::Conditional(Cond::Lt));
+                // head = substring(source, 0, at)
+                self.asm.load_local(Reg::X2, at);
+                self.asm.mov_imm64(Reg::X1, 0);
+                self.asm.load_local(Reg::X0, source);
+                self.emit_substring();
+                self.asm.store_local(Reg::X0, head);
+                // head = head + to
+                self.asm.load_local(Reg::X1, to);
+                self.asm.load_local(Reg::X0, head);
+                self.emit_str_concat();
+                self.asm.store_local(Reg::X0, head);
+                // tail = substring(source, at + len(from), len(source))
+                self.asm.load_local(Reg::X0, from);
+                self.asm.ldr_imm(Reg::X1, Reg::X0, 0);
+                self.asm.load_local(Reg::X0, at);
+                self.asm.add_reg(Reg::X1, Reg::X0, Reg::X1);
+                self.asm.load_local(Reg::X0, source);
+                self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+                self.emit_substring();
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.load_local(Reg::X0, head);
+                self.emit_str_concat();
+                self.asm.branch(end, BranchKind::Unconditional);
+                self.asm.bind(absent);
+                self.asm.load_local(Reg::X0, source);
+                self.asm.bind(end);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Str))
+            }
+            // `Random#seed(n)` / `Random#nextInt(bound)`: the evaluator's
+            // generator, which is a 64-bit LCG whose high half is the answer.
+            // The same constants and the same shift, so a seeded program
+            // prints the same numbers here as it does there.
+            ("Random#seed", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, "Random#seed of a non-Int"));
+                }
+                let cell = self.random_state_cell();
+                self.asm.load_data_address(Reg::X1, cell);
+                self.asm.str_imm(Reg::X0, Reg::X1, 0);
+                Ok(Some(ValueType::Unit))
+            }
+            ("Random#nextInt", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, "Random#nextInt of a non-Int"));
+                }
+                let cell = self.random_state_cell();
+                self.asm.mov_reg(Reg::X4, Reg::X0); // bound
+                self.asm.load_data_address(Reg::X1, cell);
+                self.asm.ldr_imm(Reg::X0, Reg::X1, 0);
+                self.asm.mov_imm64(Reg::X2, 6_364_136_223_846_793_005);
+                self.asm.mul_reg(Reg::X0, Reg::X0, Reg::X2);
+                self.asm.mov_imm64(Reg::X2, 1_442_695_040_888_963_407);
+                self.asm.add_reg(Reg::X0, Reg::X0, Reg::X2);
+                self.asm.str_imm(Reg::X0, Reg::X1, 0);
+                self.asm.lsr_imm(Reg::X0, Reg::X0, 32);
+                self.asm.sdiv_reg(Reg::X2, Reg::X0, Reg::X4);
+                self.asm.msub_reg(Reg::X0, Reg::X2, Reg::X4, Reg::X0);
+                Ok(Some(ValueType::Int))
+            }
+            // The `Math#*` integer helpers, by the evaluator's own algorithms:
+            // Euclid on the absolute values, square-and-multiply, and Newton's
+            // iteration. A negative exponent or radicand is a runtime error in
+            // the evaluator; here they answer 1 and 0, since this backend has
+            // no way to raise one.
+            ("Math#gcd", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, "Math#gcd of a non-Int"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Int {
+                    return Err(unsupported(span, "Math#gcd of a non-Int"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.pop(Reg::X0);
+                for reg in [Reg::X0, Reg::X1] {
+                    let non_negative = self.asm.new_label();
+                    self.asm.cmp_imm(reg, 0);
+                    self.asm
+                        .branch(non_negative, BranchKind::Conditional(Cond::Ge));
+                    self.asm.mov_imm64(Reg::X2, 0);
+                    self.asm.sub_reg(reg, Reg::X2, reg);
+                    self.asm.bind(non_negative);
+                }
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X1));
+                self.asm.sdiv_reg(Reg::X2, Reg::X0, Reg::X1);
+                self.asm.msub_reg(Reg::X2, Reg::X2, Reg::X1, Reg::X0); // a % b
+                self.asm.mov_reg(Reg::X0, Reg::X1);
+                self.asm.mov_reg(Reg::X1, Reg::X2);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                Ok(Some(ValueType::Int))
+            }
+            ("Math#powInt", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, "Math#powInt of a non-Int"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Int {
+                    return Err(unsupported(span, "Math#powInt of a non-Int"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0); // exponent
+                self.asm.pop(Reg::X2); // base
+                self.asm.mov_imm64(Reg::X0, 1); // result
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                let skip = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.cmp_imm(Reg::X1, 0);
+                self.asm.branch(done, BranchKind::Conditional(Cond::Le));
+                self.asm.mov_imm64(Reg::X3, 1);
+                self.asm.tst_reg(Reg::X1, Reg::X3);
+                self.asm.branch(skip, BranchKind::Conditional(Cond::Eq));
+                self.asm.mul_reg(Reg::X0, Reg::X0, Reg::X2);
+                self.asm.bind(skip);
+                self.asm.lsr_imm(Reg::X1, Reg::X1, 1);
+                self.asm.mul_reg(Reg::X2, Reg::X2, Reg::X2);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                Ok(Some(ValueType::Int))
+            }
+            ("Math#sqrtInt", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, "Math#sqrtInt of a non-Int"));
+                }
+                let done = self.asm.new_label();
+                let positive = self.asm.new_label();
+                self.asm.mov_reg(Reg::X1, Reg::X0); // n
+                self.asm.cmp_imm(Reg::X1, 0);
+                self.asm.branch(positive, BranchKind::Conditional(Cond::Gt));
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.branch(done, BranchKind::Unconditional);
+                self.asm.bind(positive);
+                // x = n; y = (x + 1) / 2; while y < x { x = y; y = (x + n/x)/2 }
+                self.asm.mov_reg(Reg::X0, Reg::X1); // x
+                self.asm.add_reg_imm(Reg::X2, Reg::X0, 1);
+                self.asm.mov_imm64(Reg::X3, 2);
+                self.asm.sdiv_reg(Reg::X2, Reg::X2, Reg::X3); // y
+                let loop_start = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.cmp_reg(Reg::X2, Reg::X0);
+                self.asm.branch(done, BranchKind::Conditional(Cond::Ge));
+                self.asm.mov_reg(Reg::X0, Reg::X2); // x = y
+                self.asm.sdiv_reg(Reg::X4, Reg::X1, Reg::X0); // n / x
+                self.asm.add_reg(Reg::X2, Reg::X0, Reg::X4);
+                self.asm.mov_imm64(Reg::X3, 2);
+                self.asm.sdiv_reg(Reg::X2, Reg::X2, Reg::X3);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                Ok(Some(ValueType::Int))
+            }
             ("startsWith", 2) => {
                 if self.expression(&arguments[0])? != ValueType::Str {
                     return Err(unsupported(span, "startsWith of a non-string"));
@@ -6254,12 +6830,175 @@ impl Emitter {
                 self.asm.bind(end);
                 Ok(Some(ty))
             }
-            ("isEmpty", 1) | ("Map#isEmpty", 1) => {
+            // `Map#empty()`: the empty chain, which is the null pointer.
+            ("Map#empty", 0) => {
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(Some(ValueType::EmptyMap))
+            }
+            // `Map#put(m, key, value)`: a fresh map with that binding. An
+            // existing key keeps its position and takes the new value; a new
+            // one goes on the end, which is the evaluator's own order.
+            ("Map#put", 3) => {
+                let mark = self.open_temp_roots();
+                let map_ty = self.expression(&arguments[0])?;
+                let existing = match map_ty {
+                    ValueType::Map(key, value) => Some((key, value)),
+                    ValueType::EmptyMap => None,
+                    _ => return Err(unsupported(span, "a map builtin on a non-map")),
+                };
+                let cursor = self.reserve_locals(24);
+                let acc = cursor + 8;
+                let replaced = cursor + 16;
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                self.asm.store_local(Reg::X0, replaced);
+
+                // The key and value are rooted for the whole walk: every entry
+                // copied along the way allocates.
+                let key_ty = self.expression(&arguments[1])?;
+                let Some(key_elem) = list_elem_of(key_ty) else {
+                    return Err(unsupported(arguments[1].span(), "a map key of this type"));
+                };
+                if let Some((existing_key, _)) = existing
+                    && existing_key != key_elem
+                {
+                    return Err(unsupported(arguments[1].span(), "mixed map key types"));
+                }
+                if is_boxed_scalar(key_ty) {
+                    self.emit_box_scalar();
+                }
+                let key_slot = self.reserve_locals(16);
+                let value_slot = key_slot + 8;
+                self.asm.store_local(Reg::X0, key_slot);
+                self.emit_root_frame_slot(key_slot);
+                let value_ty = self.expression(&arguments[2])?;
+                let Some(value_elem) = list_elem_of(value_ty) else {
+                    return Err(unsupported(arguments[2].span(), "a map value of this type"));
+                };
+                if let Some((_, existing_value)) = existing
+                    && existing_value != value_elem
+                {
+                    return Err(unsupported(arguments[2].span(), "mixed map value types"));
+                }
+                if is_boxed_scalar(value_ty) {
+                    self.emit_box_scalar();
+                }
+                self.asm.store_local(Reg::X0, value_slot);
+                self.emit_root_frame_slot(value_slot);
+
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                let keep = self.asm.new_label();
+                let next = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // this entry
+                self.push_rooted(Reg::X0);
+                self.emit_gc_load_ptr(Reg::X0, 0); // its key
+                if is_boxed_scalar(elem_value_type(key_elem)) {
+                    self.emit_unbox_scalar();
+                }
+                self.asm.load_local(Reg::X1, key_slot);
+                match key_elem {
+                    ListElem::Str => self.emit_str_eq(),
+                    _ => {
+                        if is_boxed_scalar(elem_value_type(key_elem)) {
+                            self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
+                        }
+                        self.asm.cmp_reg(Reg::X0, Reg::X1);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                    }
+                }
+                self.asm.branch(keep, BranchKind::CompareZero(Reg::X0));
+                self.pop_rooted(Reg::X1); // the old entry, replaced
+                self.asm.mov_imm64(Reg::X0, 1);
+                self.asm.store_local(Reg::X0, replaced);
+                self.emit_put_entry(key_slot, value_slot, acc);
+                self.asm.branch(next, BranchKind::Unconditional);
+                self.asm.bind(keep);
+                self.pop_rooted(Reg::X0); // the entry, kept as it is
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.bind(next);
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                // A key that was not there goes on the end, which is the front
+                // of the accumulator before it is reversed.
+                let appended = self.asm.new_label();
+                self.asm.load_local(Reg::X0, replaced);
+                self.asm
+                    .branch(appended, BranchKind::CompareNonZero(Reg::X0));
+                self.emit_put_entry(key_slot, value_slot, acc);
+                self.asm.bind(appended);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Map(key_elem, value_elem)))
+            }
+            // `Map#keys(m)` / `Map#values(m)`: one half of every entry, in
+            // insertion order.
+            ("Map#keys", 1) | ("Map#values", 1) => {
+                let mark = self.open_temp_roots();
+                let map_ty = self.expression(&arguments[0])?;
+                let (key_elem, value_elem) = match map_ty {
+                    ValueType::Map(key, value) => (key, value),
+                    ValueType::EmptyMap => {
+                        self.close_temp_roots(mark);
+                        self.asm.mov_imm64(Reg::X0, 0);
+                        return Ok(Some(ValueType::EmptyList));
+                    }
+                    _ => return Err(unsupported(span, "a map builtin on a non-map")),
+                };
+                let wants_keys = name.ends_with("keys");
+                let field = if wants_keys { 0 } else { 8 };
+                let elem = if wants_keys { key_elem } else { value_elem };
+                let cursor = self.reserve_locals(16);
+                let acc = cursor + 8;
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // entry
+                self.emit_gc_load_ptr(Reg::X0, field); // its key or value
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::List(elem)))
+            }
+            ("isEmpty", 1) | ("Map#isEmpty", 1) | ("Set#isEmpty", 1) => {
                 let ty = self.expression(&arguments[0])?;
                 if !matches!(
                     ty,
                     ValueType::List(_)
                         | ValueType::EmptyList
+                        | ValueType::Set(_)
+                        | ValueType::EmptySet
                         | ValueType::Map(..)
                         | ValueType::EmptyMap
                 ) {
@@ -6293,7 +7032,7 @@ impl Emitter {
                     span,
                 )?))
             }
-            ("size", 1) | ("Map#size", 1) => {
+            ("size", 1) | ("Map#size", 1) | ("Set#size", 1) => {
                 let ty = self.expression(&arguments[0])?;
                 if !matches!(
                     ty,
@@ -6669,8 +7408,23 @@ impl Emitter {
                 self.asm.bind(end);
                 Ok(Some(ValueType::Nullable(value_elem)))
             }
-            ("contains", 2) => {
+            ("contains", 2) | ("Set#contains", 2) => {
                 let set_ty = self.expression(&arguments[0])?;
+                // `contains` reads as membership on a set and as substring
+                // containment on a string -- the evaluator dispatches on the
+                // receiver, and `std.string`'s `containsText` is the second.
+                if set_ty == ValueType::Str {
+                    self.push_rooted(Reg::X0);
+                    if self.expression(&arguments[1])? != ValueType::Str {
+                        return Err(unsupported(span, "contains with a non-string needle"));
+                    }
+                    self.asm.mov_reg(Reg::X1, Reg::X0);
+                    self.pop_rooted(Reg::X0);
+                    self.emit_str_index_of(false);
+                    self.asm.cmp_imm(Reg::X0, 0);
+                    self.asm.cset(Reg::X0, Cond::Ge);
+                    return Ok(Some(ValueType::Bool));
+                }
                 let elem = match set_ty {
                     ValueType::Set(elem) => Some(elem),
                     ValueType::EmptySet => None,
@@ -6692,6 +7446,167 @@ impl Emitter {
                     None => self.asm.mov_imm64(Reg::X0, 0),
                 }
                 Ok(Some(ValueType::Bool))
+            }
+            // The rest of the `Set#*` family `std.set`'s extension methods
+            // delegate to. A set is an insertion-ordered chain with no
+            // duplicates, which is the same chain a list is -- so reading one
+            // as a list is a type change, and the two builders below are the
+            // set literal's own loop over a chain that is only known while
+            // running.
+            ("Set#empty", 0) => {
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(Some(ValueType::EmptySet))
+            }
+            ("Set#toList", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                match ty {
+                    ValueType::Set(elem) => Ok(Some(ValueType::List(elem))),
+                    ValueType::EmptySet => Ok(Some(ValueType::EmptyList)),
+                    ValueType::List(_) | ValueType::EmptyList => Ok(Some(ty)),
+                    _ => Err(unsupported(span, "a set builtin on a non-set")),
+                }
+            }
+            // `Set#add(s, x)`: the same set when `x` is already in it, and
+            // otherwise a fresh chain holding `x` last -- built by copying the
+            // old one backwards, prepending `x`, and reversing, so insertion
+            // order comes out the way the evaluator prints it.
+            ("Set#add", 2) => {
+                let mark = self.open_temp_roots();
+                let set_ty = self.expression(&arguments[0])?;
+                let declared = match set_ty {
+                    ValueType::Set(elem) => Some(elem),
+                    ValueType::EmptySet => None,
+                    _ => return Err(unsupported(span, "a set builtin on a non-set")),
+                };
+                let source = self.reserve_locals(8);
+                self.asm.store_local(Reg::X0, source);
+                self.emit_root_frame_slot(source);
+                let value_ty = self.expression(&arguments[1])?;
+                let Some(elem) = list_elem_of(value_ty) else {
+                    return Err(unsupported(
+                        arguments[1].span(),
+                        "a set element of this type",
+                    ));
+                };
+                if declared.is_some_and(|declared| declared != elem) {
+                    return Err(unsupported(span, "adding an element of another type"));
+                }
+                let raw = self.reserve_locals(8);
+                self.asm.store_local(Reg::X0, raw);
+                if is_heap_pointer(value_ty) {
+                    self.emit_root_frame_slot(raw);
+                }
+                let boxed = self.reserve_locals(8);
+                if is_boxed_scalar(value_ty) {
+                    self.emit_box_scalar();
+                }
+                self.asm.store_local(Reg::X0, boxed);
+                self.emit_root_frame_slot(boxed);
+                // Already a member? Then the set is its own answer.
+                let present = self.asm.new_label();
+                let end = self.asm.new_label();
+                // The copy's two slots are rooted before the branch below, not
+                // inside it. The shadow stack is popped by a count worked out
+                // while compiling, so a root pushed on one path only leaves the
+                // other path popping one that was never pushed -- which is what
+                // `Set#add(s, x)` did when `x` was already there.
+                let acc = self.reserve_locals(8);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                let cursor = self.reserve_locals(8);
+                self.asm.load_local(Reg::X0, source);
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                self.asm.load_local(Reg::X1, raw);
+                self.asm.load_local(Reg::X0, source);
+                let member = self.member_label(elem);
+                self.asm.branch(member, BranchKind::Link);
+                self.asm
+                    .branch(present, BranchKind::CompareNonZero(Reg::X0));
+                let loop_start = self.asm.new_label();
+                let copied = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(copied, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // the element, already boxed
+                self.push_rooted(Reg::X0); // head for the cons below
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(copied);
+                self.asm.load_local(Reg::X0, boxed);
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.asm.branch(end, BranchKind::Unconditional);
+                self.asm.bind(present);
+                self.asm.load_local(Reg::X0, source);
+                self.asm.bind(end);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Set(elem)))
+            }
+            // `Set#fromList(xs)`: the set literal's loop, over a chain that is
+            // only known while running -- keep the first occurrence of each
+            // element, in the order they arrive.
+            ("Set#fromList", 1) => {
+                let mark = self.open_temp_roots();
+                let ty = self.expression(&arguments[0])?;
+                let elem = match ty {
+                    ValueType::List(elem) | ValueType::Set(elem) => elem,
+                    ValueType::EmptyList | ValueType::EmptySet => {
+                        self.close_temp_roots(mark);
+                        return Ok(Some(ValueType::EmptySet));
+                    }
+                    _ => return Err(unsupported(span, "a set builtin on a non-collection")),
+                };
+                let cursor = self.reserve_locals(8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                let acc = self.reserve_locals(8);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // the element, already boxed
+                self.push_rooted(Reg::X0); // survives the scan, and is the head
+                if is_boxed_scalar(elem_value_type(elem)) {
+                    self.emit_unbox_scalar();
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0); // candidate
+                self.asm.load_local(Reg::X0, acc);
+                let member = self.member_label(elem);
+                self.asm.branch(member, BranchKind::Link);
+                let skip = self.asm.new_label();
+                let after = self.asm.new_label();
+                self.asm.branch(skip, BranchKind::CompareNonZero(Reg::X0));
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell(); // takes the parked head
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.branch(after, BranchKind::Unconditional);
+                self.asm.bind(skip);
+                self.pop_rooted(Reg::X0); // a duplicate: drop the parked head
+                self.asm.bind(after);
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Set(elem)))
             }
             // ---- enum-lowering primitives (`desugar_enums`) ----
             // `__gc_record(n)` / `__gc_alloc(bytes)`: zeroed heap
@@ -7195,8 +8110,9 @@ impl Emitter {
             ListElem::Int => self.emit_int_to_str(),
             ListElem::Bool => self.emit_bool_to_str(),
             ListElem::Str => {}
-            ListElem::Enum(_) => {
-                return Err(unsupported(span, "rendering an enum element"));
+            ListElem::Enum(shape) => self.emit_enum_to_str(shape, span)?,
+            ListElem::Record(_) => {
+                return Err(unsupported(span, "rendering a record element"));
             }
             // Same renderer one level down; the element pointer is already in
             // x0, and the result replaces it.
@@ -7229,6 +8145,388 @@ impl Emitter {
         self.emit_str_concat();
         self.close_temp_roots(mark);
         Ok(())
+    }
+
+    /// Append the text of a literal to the string builder in `acc`.
+    fn emit_append_literal(&mut self, acc: u32, text: &str) {
+        let offset = self.asm.intern_string_object(text);
+        self.asm.load_rodata_address(Reg::X0, offset);
+        self.emit_heap_string_copy();
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_str_concat();
+        self.asm.store_local(Reg::X0, acc);
+    }
+
+    /// The rendering `emit_print_enum_inline` writes to stdout, built as a heap
+    /// string instead -- which is what `"#{result}"` and a list of enums need.
+    /// The value is in x0 and the string replaces it.
+    fn emit_enum_to_str(&mut self, shape: u32, span: Span) -> Result<(), Diagnostic> {
+        if self.printing_enums.contains(&shape) {
+            return Err(unsupported(span, "rendering an enum that holds itself"));
+        }
+        self.printing_enums.push(shape);
+        let result = self.emit_enum_to_str_variants(shape, span);
+        self.printing_enums.pop();
+        result
+    }
+
+    fn emit_enum_to_str_variants(&mut self, shape: u32, span: Span) -> Result<(), Diagnostic> {
+        let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
+        let variants = self.generic_enums[enum_index].1.clone();
+        let mark = self.open_temp_roots();
+        let value = self.reserve_locals(16);
+        let acc = value + 8;
+        self.asm.store_local(Reg::X0, value);
+        self.emit_root_frame_slot(value);
+        // The builder starts empty, and is rooted before any branch so every
+        // path through the switch below has pushed the same roots.
+        let empty = self.asm.intern_string_object("");
+        self.asm.load_rodata_address(Reg::X0, empty);
+        self.emit_heap_string_copy();
+        self.asm.store_local(Reg::X0, acc);
+        self.emit_root_frame_slot(acc);
+        let end = self.asm.new_label();
+        for (tag, (variant, arity)) in variants.iter().enumerate() {
+            if payloads[tag].contains(&ValueType::Never) {
+                continue;
+            }
+            let next = self.asm.new_label();
+            self.asm.load_local(Reg::X0, value);
+            self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
+            self.emit_unbox_scalar();
+            self.asm.cmp_imm(Reg::X0, tag as u32);
+            self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
+            self.emit_append_literal(acc, variant);
+            if *arity > 0 {
+                self.emit_append_literal(acc, "(");
+                let fields = payloads[tag].clone();
+                for (position, field_ty) in fields.iter().copied().take(*arity).enumerate() {
+                    if position > 0 {
+                        self.emit_append_literal(acc, ", ");
+                    }
+                    self.asm.load_local(Reg::X0, value);
+                    self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
+                    if is_boxed_scalar(field_ty) {
+                        self.emit_unbox_scalar();
+                    }
+                    match field_ty {
+                        ValueType::Int => self.emit_int_to_str(),
+                        ValueType::Bool => self.emit_bool_to_str(),
+                        ValueType::Str => {}
+                        ValueType::Enum(inner) => self.emit_enum_to_str(inner, span)?,
+                        ValueType::List(elem) => self.emit_list_to_str(elem, "[", "]", span)?,
+                        ValueType::Set(elem) => self.emit_list_to_str(elem, "%(", ")", span)?,
+                        other => {
+                            return Err(unsupported(
+                                span,
+                                &format!("rendering an enum payload of type {other:?}"),
+                            ));
+                        }
+                    }
+                    self.asm.mov_reg(Reg::X1, Reg::X0);
+                    self.asm.load_local(Reg::X0, acc);
+                    self.emit_str_concat();
+                    self.asm.store_local(Reg::X0, acc);
+                }
+                self.emit_append_literal(acc, ")");
+            }
+            self.asm.branch(end, BranchKind::Unconditional);
+            self.asm.bind(next);
+        }
+        self.asm.bind(end);
+        self.asm.load_local(Reg::X0, acc);
+        self.close_temp_roots(mark);
+        Ok(())
+    }
+
+    /// Leave the trimmed window of the string in x0 as `[x3, x2)` over the
+    /// bytes at x1: the evaluator's `is_int`/`is_double` both start with
+    /// `trim()`, and everything after reads that window.
+    fn emit_trim_window(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+        self.asm.add_reg_imm(Reg::X1, Reg::X0, 8); // bytes
+        self.asm.mov_imm64(Reg::X3, 0);
+        let left_loop = self.asm.new_label();
+        let left_done = self.asm.new_label();
+        self.asm.bind(left_loop);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm
+            .branch(left_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.emit_branch_unless_ascii_space(Reg::X4, left_done);
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.branch(left_loop, BranchKind::Unconditional);
+        self.asm.bind(left_done);
+        let right_loop = self.asm.new_label();
+        let right_done = self.asm.new_label();
+        self.asm.bind(right_loop);
+        self.asm.cmp_reg(Reg::X2, Reg::X3);
+        self.asm
+            .branch(right_done, BranchKind::Conditional(Cond::Le));
+        self.asm.sub_reg_imm(Reg::X5, Reg::X2, 1);
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X5);
+        self.emit_branch_unless_ascii_space(Reg::X4, right_done);
+        self.asm.mov_reg(Reg::X2, Reg::X5);
+        self.asm.branch(right_loop, BranchKind::Unconditional);
+        self.asm.bind(right_done);
+    }
+
+    /// Branch to `label` unless the byte in `reg` is ASCII whitespace.
+    fn emit_branch_unless_ascii_space(&mut self, reg: Reg, label: Label) {
+        let is_space = self.asm.new_label();
+        for byte in [b' ', b'\t', b'\n', b'\r', 0x0b, 0x0c] {
+            self.asm.cmp_imm(reg, u32::from(byte));
+            self.asm.branch(is_space, BranchKind::Conditional(Cond::Eq));
+        }
+        self.asm.branch(label, BranchKind::Unconditional);
+        self.asm.bind(is_space);
+    }
+
+    /// `String#isInt(s)` for a string only known at run time: what
+    /// `s.trim().parse::<i64>()` accepts, range included. Nineteen digits is
+    /// the only length that needs comparing, and it compares digits, so no
+    /// 128-bit arithmetic is involved.
+    fn emit_str_is_int(&mut self) {
+        let positive = self.asm.intern_rodata(b"9223372036854775807");
+        let negative = self.asm.intern_rodata(b"9223372036854775808");
+        let no = self.asm.new_label();
+        let yes = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.emit_trim_window();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ge));
+        // An optional sign, remembered in x7.
+        let signed = self.asm.new_label();
+        let after_sign = self.asm.new_label();
+        self.asm.mov_imm64(Reg::X7, 0);
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'+'));
+        self.asm.branch(signed, BranchKind::Conditional(Cond::Eq));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'-'));
+        self.asm
+            .branch(after_sign, BranchKind::Conditional(Cond::Ne));
+        self.asm.mov_imm64(Reg::X7, 1);
+        self.asm.bind(signed);
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.bind(after_sign);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ge));
+        // Leading zeros do not count towards the range; keep the last digit.
+        let zero_loop = self.asm.new_label();
+        let zeros_done = self.asm.new_label();
+        self.asm.bind(zero_loop);
+        self.asm.sub_reg(Reg::X5, Reg::X2, Reg::X3);
+        self.asm.cmp_imm(Reg::X5, 1);
+        self.asm
+            .branch(zeros_done, BranchKind::Conditional(Cond::Le));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm
+            .branch(zeros_done, BranchKind::Conditional(Cond::Ne));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.branch(zero_loop, BranchKind::Unconditional);
+        self.asm.bind(zeros_done);
+        // Every remaining byte has to be a digit.
+        let digit_loop = self.asm.new_label();
+        let digits_done = self.asm.new_label();
+        self.asm.mov_reg(Reg::X5, Reg::X3);
+        self.asm.bind(digit_loop);
+        self.asm.cmp_reg(Reg::X5, Reg::X2);
+        self.asm
+            .branch(digits_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X5);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm.branch(no, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'9'));
+        self.asm.branch(no, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X5, Reg::X5, 1);
+        self.asm.branch(digit_loop, BranchKind::Unconditional);
+        self.asm.bind(digits_done);
+        self.asm.sub_reg(Reg::X5, Reg::X2, Reg::X3);
+        self.asm.cmp_imm(Reg::X5, 19);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Gt));
+        self.asm.branch(yes, BranchKind::Conditional(Cond::Lt));
+        let use_negative = self.asm.new_label();
+        let limit_ready = self.asm.new_label();
+        self.asm.cmp_imm(Reg::X7, 0);
+        self.asm
+            .branch(use_negative, BranchKind::Conditional(Cond::Ne));
+        self.asm.load_rodata_address(Reg::X6, positive);
+        self.asm.branch(limit_ready, BranchKind::Unconditional);
+        self.asm.bind(use_negative);
+        self.asm.load_rodata_address(Reg::X6, negative);
+        self.asm.bind(limit_ready);
+        let compare_loop = self.asm.new_label();
+        self.asm.mov_imm64(Reg::X5, 0);
+        self.asm.bind(compare_loop);
+        self.asm.cmp_imm(Reg::X5, 19);
+        self.asm.branch(yes, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.ldrb_reg_offset(Reg::X8, Reg::X6, Reg::X5);
+        self.asm.cmp_reg(Reg::X4, Reg::X8);
+        self.asm.branch(yes, BranchKind::Conditional(Cond::Lt));
+        self.asm.branch(no, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.add_reg_imm(Reg::X5, Reg::X5, 1);
+        self.asm.branch(compare_loop, BranchKind::Unconditional);
+        self.asm.bind(yes);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(no);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
+    }
+
+    /// `String#isDouble(s)` for a string only known at run time: what
+    /// `s.trim().parse::<f64>()` accepts -- an optional sign, then `inf`,
+    /// `infinity` or `nan` in either case, or digits with an optional point
+    /// and an optional exponent. Too large to represent parses as infinity
+    /// rather than failing, so there is no range check.
+    fn emit_str_is_double(&mut self) {
+        let no = self.asm.new_label();
+        let yes = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.emit_trim_window();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ge));
+        let signed = self.asm.new_label();
+        let after_sign = self.asm.new_label();
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'+'));
+        self.asm.branch(signed, BranchKind::Conditional(Cond::Eq));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'-'));
+        self.asm
+            .branch(after_sign, BranchKind::Conditional(Cond::Ne));
+        self.asm.bind(signed);
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.bind(after_sign);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ge));
+        // `inf`, `infinity` and `nan`, in any case.
+        for word in [b"infinity".as_slice(), b"inf".as_slice(), b"nan".as_slice()] {
+            let offset = self.asm.intern_rodata(word);
+            let mismatch = self.asm.new_label();
+            let compare = self.asm.new_label();
+            self.asm.sub_reg(Reg::X5, Reg::X2, Reg::X3);
+            self.asm.cmp_imm(Reg::X5, word.len() as u32);
+            self.asm.branch(mismatch, BranchKind::Conditional(Cond::Ne));
+            self.asm.load_rodata_address(Reg::X6, offset);
+            self.asm.mov_imm64(Reg::X5, 0);
+            self.asm.bind(compare);
+            self.asm.cmp_imm(Reg::X5, word.len() as u32);
+            self.asm.branch(yes, BranchKind::Conditional(Cond::Ge));
+            self.asm.add_reg(Reg::X9, Reg::X3, Reg::X5);
+            self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X9);
+            // Lower-case the input byte; the words above are lower-case.
+            self.asm.mov_imm64(Reg::X10, 0x20);
+            self.asm.orr_reg(Reg::X4, Reg::X4, Reg::X10);
+            self.asm.ldrb_reg_offset(Reg::X8, Reg::X6, Reg::X5);
+            self.asm.cmp_reg(Reg::X4, Reg::X8);
+            self.asm.branch(mismatch, BranchKind::Conditional(Cond::Ne));
+            self.asm.add_reg_imm(Reg::X5, Reg::X5, 1);
+            self.asm.branch(compare, BranchKind::Unconditional);
+            self.asm.bind(mismatch);
+        }
+        // Digits, an optional point with more digits, at least one of the two.
+        self.asm.mov_imm64(Reg::X7, 0);
+        let int_digits = self.asm.new_label();
+        let int_done = self.asm.new_label();
+        self.asm.bind(int_digits);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(int_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm.branch(int_done, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'9'));
+        self.asm.branch(int_done, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.add_reg_imm(Reg::X7, Reg::X7, 1);
+        self.asm.branch(int_digits, BranchKind::Unconditional);
+        self.asm.bind(int_done);
+        let after_point = self.asm.new_label();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm
+            .branch(after_point, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'.'));
+        self.asm
+            .branch(after_point, BranchKind::Conditional(Cond::Ne));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        let frac_digits = self.asm.new_label();
+        self.asm.bind(frac_digits);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm
+            .branch(after_point, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm
+            .branch(after_point, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'9'));
+        self.asm
+            .branch(after_point, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.add_reg_imm(Reg::X7, Reg::X7, 1);
+        self.asm.branch(frac_digits, BranchKind::Unconditional);
+        self.asm.bind(after_point);
+        self.asm.cmp_imm(Reg::X7, 0);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Eq));
+        // An optional exponent, which needs at least one digit of its own.
+        let after_exponent = self.asm.new_label();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm
+            .branch(after_exponent, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.mov_imm64(Reg::X10, 0x20);
+        self.asm.orr_reg(Reg::X4, Reg::X4, Reg::X10);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'e'));
+        self.asm
+            .branch(after_exponent, BranchKind::Conditional(Cond::Ne));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        let exponent_signed = self.asm.new_label();
+        let exponent_digits = self.asm.new_label();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'+'));
+        self.asm
+            .branch(exponent_signed, BranchKind::Conditional(Cond::Eq));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'-'));
+        self.asm
+            .branch(exponent_digits, BranchKind::Conditional(Cond::Ne));
+        self.asm.bind(exponent_signed);
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.bind(exponent_digits);
+        self.asm.mov_imm64(Reg::X7, 0);
+        let exponent_loop = self.asm.new_label();
+        let exponent_done = self.asm.new_label();
+        self.asm.bind(exponent_loop);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm
+            .branch(exponent_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm
+            .branch(exponent_done, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'9'));
+        self.asm
+            .branch(exponent_done, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.add_reg_imm(Reg::X7, Reg::X7, 1);
+        self.asm.branch(exponent_loop, BranchKind::Unconditional);
+        self.asm.bind(exponent_done);
+        self.asm.cmp_imm(Reg::X7, 0);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Eq));
+        self.asm.bind(after_exponent);
+        // Anything left over means it was not a number.
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ne));
+        self.asm.bind(yes);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(no);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
     }
 
     /// Is every byte of the string in x0 an ASCII digit? x0 becomes the Bool.
@@ -7559,6 +8857,54 @@ impl Emitter {
             // Typed the way the emitter types it, so an `if` with a `null`
             // branch predicts the nullable join rather than the other branch.
             Expr::Null { .. } => Some(ValueType::Null),
+            // `#Name(a, b)`. A generic record's fields take their types from
+            // the arguments, which is the same rule compiling one uses -- so
+            // predicting one interns the shape compilation would intern, and
+            // both agree on the index.
+            Expr::RecordConstructor {
+                name, arguments, ..
+            } => {
+                if let Some(index) = self
+                    .records
+                    .iter()
+                    .position(|record| record.usable && record.name == *name)
+                    .filter(|_| {
+                        !self.generic_records.iter().any(|record| {
+                            record.name == *name && record.fields.len() == arguments.len()
+                        })
+                    })
+                {
+                    return Some(ValueType::Record(index as u32));
+                }
+                let declared = self
+                    .generic_records
+                    .iter()
+                    .find(|record| record.name == *name && record.fields.len() == arguments.len())
+                    .cloned()?;
+                let mut typed = Vec::with_capacity(arguments.len());
+                for (argument, (field, _)) in arguments.iter().zip(declared.fields.iter()) {
+                    let ty = self.static_type_under(argument, locals, depth + 1)?;
+                    if ty == ValueType::Unit || ty == ValueType::Never {
+                        return None;
+                    }
+                    typed.push((field.clone(), ty));
+                }
+                let index = match self.records.iter().position(|record| {
+                    record.usable && record.name == *name && record.fields == typed
+                }) {
+                    Some(index) => index,
+                    None => {
+                        self.records.push(RecordInfo {
+                            name: name.clone(),
+                            fields: typed,
+                            lambda_fields: Vec::new(),
+                            usable: true,
+                        });
+                        self.records.len() - 1
+                    }
+                };
+                Some(ValueType::Record(index as u32))
+            }
             // Collection literals over locals: the whole-program inference
             // cannot see these bindings, so the element type is inferred here.
             // `unit(x) = [x]` in a Monad instance is exactly this shape.
@@ -7706,7 +9052,7 @@ impl Emitter {
                     // own fold does: starting from `[]` and appending lists
                     // ends up a list. Take the same fixpoint here so a
                     // fold-based function's return type is the settled one.
-                    if let Expr::Lambda { params, body, .. } = &arguments[0]
+                    if let Some((params, body)) = self.lambda_argument(&arguments[0])
                         && params.len() == 2
                         && list_args.len() == 1
                         && let Some(ValueType::List(elem)) =
@@ -7717,7 +9063,7 @@ impl Emitter {
                         for _ in 0..3 {
                             locals.push((params[0].clone(), acc_ty));
                             locals.push((params[1].clone(), elem_ty));
-                            let folded = self.static_type_under(body, locals, depth + 1);
+                            let folded = self.static_type_under(&body, locals, depth + 1);
                             locals.pop();
                             locals.pop();
                             let Some(merged) = folded.and_then(|f| self.merge_types(acc_ty, f))
@@ -7895,12 +9241,44 @@ impl Emitter {
                     // `floor`/`int`/`ceil` are Int-valued here, like the
                     // evaluator's -- keeping this in step with the emitter
                     // matters, since a wrong guess is a rejected build.
-                    "size" | "length" | "toInt" | "floor" | "int" | "ceil" | "Map#size" => {
+                    "size" | "length" | "toInt" | "floor" | "int" | "ceil" | "Map#size"
+                    | "Set#size" | "indexOf" | "lastIndexOf" | "Math#gcd" | "Math#powInt"
+                    | "Math#sqrtInt" => {
                         return Some(ValueType::Int);
                     }
                     "isEmpty" | "contains" | "isEmptyString" | "matches" | "containsKey"
-                    | "Map#containsKey" | "Map#isEmpty" | "Map#containsValue" => {
+                    | "Map#containsKey" | "Map#isEmpty" | "Map#containsValue" | "Set#isEmpty"
+                    | "Set#contains" | "startsWith" | "endsWith" | "String#isInt"
+                    | "String#isDouble" => {
                         return Some(ValueType::Bool);
+                    }
+                    "String#parseInt" => return Some(ValueType::Int),
+                    // The set builders, so `std.set`'s extension methods can
+                    // be typed: two of them answer with a set, and reading one
+                    // as a list keeps the element type.
+                    "Set#empty" => return Some(ValueType::EmptySet),
+                    "Set#toList" => {
+                        return match first_type {
+                            Some(ValueType::Set(elem)) => Some(ValueType::List(elem)),
+                            Some(ValueType::EmptySet) => Some(ValueType::EmptyList),
+                            other @ (Some(ValueType::List(_)) | Some(ValueType::EmptyList)) => {
+                                other
+                            }
+                            _ => None,
+                        };
+                    }
+                    "Set#add" | "Set#fromList" => {
+                        return match first_type {
+                            Some(ValueType::Set(elem)) | Some(ValueType::List(elem)) => {
+                                Some(ValueType::Set(elem))
+                            }
+                            Some(ValueType::EmptySet) | Some(ValueType::EmptyList)
+                                if name == "Set#fromList" =>
+                            {
+                                Some(ValueType::EmptySet)
+                            }
+                            _ => None,
+                        };
                     }
                     // Splitting a string is how `std.string`'s `lines` and
                     // `words` start, so the inference has to get through it to
@@ -7921,12 +9299,52 @@ impl Emitter {
                             _ => None,
                         };
                     }
-                    "getOrElse" | "Map#getOrElse" => {
+                    // A map's keys and values are lists of its two halves,
+                    // which is what types every fold that walks a map --
+                    // `std.map`'s `toPairs` among them.
+                    "Map#keys" | "keys" => {
                         return match first_type {
-                            Some(ValueType::Map(_, value)) => Some(elem_value_type(value)),
+                            Some(ValueType::Map(key, _)) => Some(ValueType::List(key)),
                             _ => None,
                         };
                     }
+                    "Map#values" | "values" => {
+                        return match first_type {
+                            Some(ValueType::Map(_, value)) => Some(ValueType::List(value)),
+                            _ => None,
+                        };
+                    }
+                    "getOrElse" | "Map#getOrElse" => {
+                        return match first_type {
+                            Some(ValueType::Map(_, value)) => Some(elem_value_type(value)),
+                            // On a map with nothing in it the answer is the
+                            // fallback, which is what the emitter does -- and
+                            // typing it is what lets a `mutable` map that is
+                            // grown in a loop settle on a type at all.
+                            Some(ValueType::EmptyMap) if arguments.len() == 3 => {
+                                self.static_type_under(&arguments[2], locals, depth + 1)
+                            }
+                            _ => None,
+                        };
+                    }
+                    // `Map#put(m, k, v)`: a map of what the key and value are.
+                    // Without this a map grown in a loop stays typed as the
+                    // empty map it started as, and every lookup inside the loop
+                    // compiles to its fallback.
+                    "Map#put" if arguments.len() == 3 => {
+                        let key = list_elem_of(self.static_type_under(
+                            &arguments[1],
+                            locals,
+                            depth + 1,
+                        )?)?;
+                        let value = list_elem_of(self.static_type_under(
+                            &arguments[2],
+                            locals,
+                            depth + 1,
+                        )?)?;
+                        return Some(ValueType::Map(key, value));
+                    }
+                    "Map#empty" => return Some(ValueType::EmptyMap),
                     // The enum lowering's allocators. A constructor call like
                     // `Some(x)` becomes one of these, so without them a
                     // function that just wraps a constructor cannot be typed.
@@ -7935,7 +9353,10 @@ impl Emitter {
                     }
                     "__match_fail" => return Some(ValueType::Never),
                     "toString" | "substring" | "trim" | "toUpperCase" | "toLowerCase"
-                    | "reverse" | "join" | "replaceAll" | "at" => return Some(ValueType::Str),
+                    | "reverse" | "join" | "replaceAll" | "replace" | "repeat" | "at"
+                    | "capitalize" | "stripPrefix" | "stripSuffix" | "trimLeft" | "trimRight" => {
+                        return Some(ValueType::Str);
+                    }
                     _ => {}
                 }
                 // A generic enum's constructor: the payload types the call
@@ -8004,11 +9425,46 @@ impl Emitter {
                     let params = &generic.params;
                     let body = &generic.body;
                     let mut callee_locals = Vec::with_capacity(params.len());
+                    // A function argument is not a value, so it cannot be
+                    // typed as one: it is bound as a lambda for the callee,
+                    // the way compiling the specialisation binds it. Without
+                    // this a def that hands a lambda on -- `words()` calling
+                    // `stdlibFilter` -- could not be typed at all.
+                    let mut callee_lambdas: Vec<(String, usize)> = Vec::new();
                     for (param, argument) in params.iter().zip(arguments.iter()) {
+                        if let Expr::Lambda {
+                            params: lambda_params,
+                            body: lambda_body,
+                            ..
+                        } = argument
+                        {
+                            let index = self
+                                .intern_lambda(lambda_params.clone(), lambda_body.as_ref().clone());
+                            callee_lambdas.push((param.clone(), index));
+                            continue;
+                        }
+                        if let Expr::Identifier { name, .. } = argument
+                            && let Some(index) = self.lookup_lambda(name)
+                        {
+                            callee_lambdas.push((param.clone(), index));
+                            continue;
+                        }
                         let ty = self.static_type_under(argument, locals, depth + 1)?;
                         callee_locals.push((param.clone(), ty));
                     }
-                    return self.static_type_under(body, &mut callee_locals, depth + 1);
+                    if callee_lambdas.is_empty() {
+                        return self.static_type_under(body, &mut callee_locals, depth + 1);
+                    }
+                    self.push_binding_scopes();
+                    for (param, lambda) in &callee_lambdas {
+                        self.lambda_bindings
+                            .last_mut()
+                            .expect("emitter lambda scope")
+                            .insert(param.clone(), *lambda);
+                    }
+                    let predicted = self.static_type_under(body, &mut callee_locals, depth + 1);
+                    self.pop_binding_scopes();
+                    return predicted;
                 }
                 self.static_type_of(expr)
             }
@@ -8052,7 +9508,8 @@ impl Emitter {
         let mut value_params: Vec<(String, ValueType)> = Vec::new();
         let mut lambda_params: Vec<(String, usize)> = Vec::new();
         let mut dict_params: Vec<(String, Vec<(String, usize)>)> = Vec::new();
-        for (param, argument) in params.iter().zip(arguments.iter()) {
+        let mut value_annotations: Vec<Option<String>> = Vec::new();
+        for (position, (param, argument)) in params.iter().zip(arguments.iter()).enumerate() {
             // A lambda argument is not a value: it is interned and the
             // parameter name is bound to it inside the specialisation, so a
             // higher-order def is specialised per lambda as well as per type.
@@ -8095,6 +9552,57 @@ impl Emitter {
             }
             argument_types.push(ty);
             value_params.push((param.clone(), ty));
+            value_annotations.push(param_annotations.get(position).cloned().flatten());
+        }
+        // Solve the definition's type variables from *all* the arguments, and
+        // give an enum-typed parameter whose own argument left them open the
+        // shape those solutions imply. `put(KMNil, "a", 1)` says nothing
+        // through its first argument -- the empty case carries no payloads --
+        // while `key: 'k` and `value: 'v` say everything, and without this the
+        // body destructures the other variant against payloads it does not
+        // know.
+        let mut bindings: Vec<(String, String)> = Vec::new();
+        for ((_, ty), annotation) in value_params.iter().zip(value_annotations.iter()) {
+            let Some(annotation) = annotation else {
+                continue;
+            };
+            let text = annotation.trim();
+            if !text.starts_with('\'') {
+                continue;
+            }
+            let Some(name) = type_annotation_name(*ty) else {
+                continue;
+            };
+            if !bindings.iter().any(|(known, _)| known == text) {
+                bindings.push((text.to_string(), name));
+            }
+        }
+        if !bindings.is_empty() {
+            let variables: Vec<String> = bindings.iter().map(|(name, _)| name.clone()).collect();
+            let solutions: Vec<String> = bindings.iter().map(|(_, name)| name.clone()).collect();
+            for position in 0..value_params.len() {
+                let ValueType::Enum(shape) = value_params[position].1 else {
+                    continue;
+                };
+                let open = self.enum_shapes[shape as usize]
+                    .1
+                    .iter()
+                    .any(|payload| payload.contains(&ValueType::Never));
+                if !open {
+                    continue;
+                }
+                let Some(annotation) = value_annotations[position].clone() else {
+                    continue;
+                };
+                let applied = substitute_type_params(&annotation, &variables, &solutions);
+                if applied == annotation {
+                    continue;
+                }
+                if let Ok(resolved @ ValueType::Enum(_)) = self.annotation_type(&applied, span) {
+                    value_params[position].1 = resolved;
+                    argument_types[position] = resolved;
+                }
+            }
         }
         // The lambda identities are part of what makes a specialisation
         // distinct, so they join the argument types in the key.
@@ -8375,6 +9883,7 @@ impl Emitter {
         self.dict_bindings.push(HashMap::new());
         self.alias_bindings.push(HashMap::new());
         self.literal_strings.push(HashMap::new());
+        self.literal_doubles.push(HashMap::new());
     }
 
     /// Close the scopes `push_binding_scopes` opened.
@@ -8384,6 +9893,60 @@ impl Emitter {
         self.dict_bindings.pop();
         self.alias_bindings.pop();
         self.literal_strings.pop();
+        self.literal_doubles.pop();
+    }
+
+    /// The value of a `Double` expression, when it is one this backend can work
+    /// out while compiling. Only pure shapes are folded -- literals, arithmetic
+    /// on them, and names bound to one by a `val` -- so folding an expression
+    /// away can never skip an effect.
+    fn static_double_of(&self, expr: &Expr) -> Option<f64> {
+        match expr {
+            Expr::Double { value, .. } => Some(*value),
+            Expr::Identifier { name, .. } => self
+                .literal_doubles
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(name))
+                .copied(),
+            Expr::Unary { op, expr, .. } => match op {
+                UnaryOp::Minus => Some(-self.static_double_of(expr)?),
+                UnaryOp::Plus => self.static_double_of(expr),
+                _ => None,
+            },
+            Expr::Binary { lhs, op, rhs, .. } => {
+                let left = self.static_double_of(lhs)?;
+                let right = self.static_double_of(rhs)?;
+                match op {
+                    BinaryOp::Add => Some(left + right),
+                    BinaryOp::Subtract => Some(left - right),
+                    BinaryOp::Multiply => Some(left * right),
+                    BinaryOp::Divide => Some(left / right),
+                    _ => None,
+                }
+            }
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                let Expr::Identifier { name, .. } = callee.as_ref() else {
+                    return None;
+                };
+                if arguments.len() != 1 {
+                    return None;
+                }
+                match name.as_str() {
+                    "sqrt" => Some(self.static_double_of(&arguments[0])?.sqrt()),
+                    "abs" => Some(self.static_double_of(&arguments[0])?.abs()),
+                    // `double(n)` widens an Int, so its argument is one.
+                    "double" => match &arguments[0] {
+                        Expr::Int { value, .. } => Some(*value as f64),
+                        other => self.static_double_of(other),
+                    },
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// A name aliasing another name, innermost scope first.
@@ -8558,10 +10121,47 @@ impl Emitter {
     fn lambda_argument(&self, expr: &Expr) -> Option<(Vec<String>, Expr)> {
         match expr {
             Expr::Lambda { params, body, .. } => Some((params.clone(), (**body).clone())),
-            Expr::Identifier { name, .. } => {
-                let index = self.lookup_lambda(name)?;
-                let (params, body) = &self.lambdas[index];
-                Some((params.clone(), body.clone()))
+            Expr::Identifier { name, span } => {
+                if let Some(index) = self.lookup_lambda(name) {
+                    let (params, body) = &self.lambdas[index];
+                    return Some((params.clone(), body.clone()));
+                }
+                // A *definition* passed where a function is expected --
+                // `foldLeft(xs)([])(insertSorted)`, which is how `std.list`'s
+                // sort is written. Wrapping it in a lambda that forwards its
+                // arguments is what makes it a value here, since this backend
+                // has no way to pass one.
+                let arity = self
+                    .functions
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, info)| info.params.len())
+                    .or_else(|| {
+                        self.generic_functions
+                            .iter()
+                            .rev()
+                            .find(|generic| generic.name == *name)
+                            .map(|generic| generic.params.len())
+                    })?;
+                let params: Vec<String> = (0..arity).map(|i| format!("__arg{i}")).collect();
+                let arguments = params
+                    .iter()
+                    .map(|param| Expr::Identifier {
+                        name: param.clone(),
+                        span: *span,
+                    })
+                    .collect();
+                Some((
+                    params,
+                    Expr::Call {
+                        callee: Box::new(Expr::Identifier {
+                            name: name.clone(),
+                            span: *span,
+                        }),
+                        arguments,
+                        span: *span,
+                    },
+                ))
             }
             // `{ (x) => ... }` and `{x, y => ...}`: a braced block whose only
             // expression is the lambda, which is how a trailing block argument
@@ -8656,6 +10256,115 @@ impl Emitter {
         // The parameter slots are dead now; let the next call reuse them.
         self.release_locals_to(saved_offset);
         Ok(result)
+    }
+
+    /// Widen the slots of any bindings a loop body assigns to, before that
+    /// body is compiled.
+    ///
+    /// A `mutable` takes its type from what is assigned to it, and the
+    /// declaration site can settle that for straight-line code. A loop cannot
+    /// be settled there: `m = Map#put(m, k, ...)` mentions the loop's own
+    /// variable, which does not exist yet at the declaration. So the same
+    /// fixpoint is taken again here, with the loop variable bound -- otherwise
+    /// the body's *reads* compile against the type the binding started with
+    /// (`Map#empty()` is the empty map, and a lookup on one is its fallback),
+    /// which is correct on the first turn and wrong on every turn after it.
+    fn widen_loop_mutables(&mut self, body: &Expr) {
+        let names: Vec<String> = self
+            .scopes
+            .iter()
+            .flatten()
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            let mut assigned = Vec::new();
+            collect_assignments(body, &name, &mut assigned);
+            if assigned.is_empty() {
+                continue;
+            }
+            let Some((slot, current)) = self.lookup(&name) else {
+                continue;
+            };
+            let mut widened = current;
+            for _ in 0..4 {
+                let mut grew = false;
+                for value in &assigned {
+                    let mut locals = Vec::new();
+                    let Some(ty) = self.static_type_under(value, &mut locals, 0) else {
+                        continue;
+                    };
+                    let Some(merged) = self.merge_types(widened, ty) else {
+                        continue;
+                    };
+                    if merged != widened {
+                        widened = merged;
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            if widened == current {
+                continue;
+            }
+            // Both the old type and the new one are heap references, so the
+            // root the slot already has still covers it.
+            for scope in self.scopes.iter_mut().rev() {
+                if let Some(entry) = scope.get_mut(&name) {
+                    *entry = (slot, widened);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The generator's state cell, reserved on first use so a program that
+    /// never asks for a random number carries no data section for one.
+    fn random_state_cell(&mut self) -> DataLabel {
+        match self.random_state_cell {
+            Some(cell) => cell,
+            None => {
+                let cell = self.asm.reserve_data_cells(1);
+                self.random_state_cell = Some(cell);
+                cell
+            }
+        }
+    }
+
+    /// The name an `extension (this: T) { ... }` block is keyed by, worked out
+    /// from what the receiver's type turns out to be. Typing it emits nothing,
+    /// so asking costs only the inference.
+    fn extension_type_key_of(&mut self, receiver: &Expr) -> Option<String> {
+        let mut locals = Vec::new();
+        let ty = self.static_type_under(receiver, &mut locals, 0)?;
+        Some(match ty {
+            ValueType::Str => "String".to_string(),
+            ValueType::Int => "Int".to_string(),
+            ValueType::Bool => "Boolean".to_string(),
+            ValueType::Double => "Double".to_string(),
+            ValueType::List(_) | ValueType::EmptyList => "List".to_string(),
+            ValueType::Set(_) | ValueType::EmptySet => "Set".to_string(),
+            ValueType::Map(..) | ValueType::EmptyMap => "Map".to_string(),
+            ValueType::Enum(shape) => {
+                let (enum_index, _) = self.enum_shapes.get(shape as usize)?;
+                self.generic_enums.get(*enum_index)?.0.clone()
+            }
+            ValueType::Record(index) => self.records.get(index as usize)?.name.clone(),
+            _ => return None,
+        })
+    }
+
+    /// Is there a definition of this name that takes this many arguments,
+    /// concrete or generic? Asked before turning a method call into one.
+    fn function_exists(&self, name: &str, arity: usize) -> bool {
+        self.functions
+            .iter()
+            .any(|(n, info)| n == name && info.params.len() == arity)
+            || self
+                .generic_functions
+                .iter()
+                .any(|generic| generic.name == name && generic.params.len() == arity)
     }
 
     fn function_call(
@@ -8877,7 +10586,7 @@ impl Emitter {
                 }
                 Ok(Some(format!("{value}\n")))
             }
-            Expr::Double { value, .. } => Ok(Some(format!("{value}\n"))),
+            Expr::Double { value, .. } => Ok(Some(format!("{}\n", format_double(*value)))),
             _ => Ok(None),
         }
     }
@@ -8891,6 +10600,11 @@ impl Emitter {
         }
         let argument = &arguments[0];
         if let Some(line) = Self::literal_line(argument)? {
+            self.asm.emit_write_rodata(STDOUT_FD, line.as_bytes());
+            return Ok(());
+        }
+        if let Some(number) = self.static_double_of(argument) {
+            let line = format!("{}\n", format_double(number));
             self.asm.emit_write_rodata(STDOUT_FD, line.as_bytes());
             return Ok(());
         }
@@ -8972,7 +10686,10 @@ impl Emitter {
                         self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
                         self.asm.bind(bool_end);
                     }
-                    ListElem::Double | ListElem::Enum(_) | ListElem::Nested { .. } => {
+                    ListElem::Double
+                    | ListElem::Enum(_)
+                    | ListElem::Record(_)
+                    | ListElem::Nested { .. } => {
                         return Err(unsupported(
                             argument.span(),
                             &format!("printing a nullable {elem:?}"),
@@ -8983,6 +10700,11 @@ impl Emitter {
                 self.asm.bind(null_label);
                 self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
                 self.asm.bind(end_label);
+                Ok(())
+            }
+            ValueType::Enum(shape) => {
+                self.emit_print_enum_inline(shape, argument.span())?;
+                self.asm.emit_write_rodata(STDOUT_FD, b"\n");
                 Ok(())
             }
             other => Err(unsupported(
@@ -9022,7 +10744,12 @@ impl Emitter {
             | Expr::EnumDeclaration { .. }
             | Expr::TypeClassDeclaration { .. }
             | Expr::InstanceDeclaration { .. } => Ok(()),
-            Expr::VarDecl { name, value, .. } => {
+            Expr::VarDecl {
+                name,
+                value,
+                mutable,
+                ..
+            } => {
                 // Remember a string literal's text for the builtins that need
                 // it at compile time, and forget any older binding of this name
                 // so a shadowing one does not inherit the wrong text.
@@ -9037,6 +10764,21 @@ impl Emitter {
                         .expect("emitter literal scope");
                     match literal {
                         Some(text) => scope.insert(name.clone(), text),
+                        None => scope.remove(name),
+                    };
+                }
+                {
+                    let folded = if *mutable {
+                        None
+                    } else {
+                        self.static_double_of(value)
+                    };
+                    let scope = self
+                        .literal_doubles
+                        .last_mut()
+                        .expect("emitter literal scope");
+                    match folded {
+                        Some(number) => scope.insert(name.clone(), number),
                         None => scope.remove(name),
                     };
                 }
@@ -9203,6 +10945,7 @@ impl Emitter {
                     return Err(unsupported(condition.span(), "a non-Bool condition"));
                 }
                 self.asm.branch(end_label, BranchKind::CompareZero(Reg::X0));
+                self.widen_loop_mutables(body);
                 self.statement(body)?;
                 self.asm.branch(loop_label, BranchKind::Unconditional);
                 self.asm.bind(end_label);

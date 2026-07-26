@@ -1,0 +1,53 @@
+// Cross-target fixture: a map read as entries, and lists of records.
+//
+// `toPairs()` is where several representations meet at once. It walks
+// `Map#keys`, builds a `#MapEntry(k, Map#get(m, k))` per key, and hands back a
+// list of those records -- so a backend has to hold records as list elements,
+// and has to hold a field whose value may not be there, because `Map#get`
+// answers with the value *or* nothing. Reading one back out and appending it
+// to a string is the third half of the same thing: `"a" + entry.value` has to
+// print the value, and the word `null` when there is none.
+//
+// Every line below is compared against the evaluator on real hardware, which
+// is the only way the three targets can be said to agree.
+
+import std.map
+
+val m = %["a": 1 "b": 2 "c": 3]
+
+// The two halves of a map, in insertion order.
+println(Map#keys(m))
+println(Map#values(m))
+assertResult(["a", "b", "c"])(Map#keys(m))
+assertResult([1, 2, 3])(Map#values(m))
+
+// Entries: a list of records, printed as the evaluator prints them.
+println(m.toPairs())
+println(m.entries())
+println(size(m.toPairs()))
+assertResult(3)(size(m.toPairs()))
+
+// Reading an entry's halves, and appending a value that may not be there.
+foreach (entry in m.toPairs()) {
+  println(entry.key + "=" + entry.value)
+}
+
+// A list of records written directly, so the element representation is
+// exercised without a map in the way.
+record Point3 { x: Int; y: Int; z: Int }
+val points = [#Point3(1, 2, 3), #Point3(4, 5, 6)]
+println(points)
+foreach (p in points) { println(p.x + p.y + p.z) }
+assertResult(2)(size(points))
+
+// A record holding a string and a bool alongside numbers.
+record Row { name: String; count: Int; ok: Boolean }
+val rows = [#Row("alpha", 3, true), #Row("beta", 0, false)]
+println(rows)
+foreach (r in rows) { println(r.name + ": " + r.count + " " + r.ok) }
+
+// A single-entry map, i.e. nothing to iterate past.
+val one = %["only": 42]
+println(one.toPairs())
+println(Map#keys(one))
+println("done")

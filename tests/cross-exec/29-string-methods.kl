@@ -1,0 +1,48 @@
+// Cross-target fixture: the string methods whose receiver is the extension's
+// own `this`, and substring containment.
+//
+// An extension method's `this: String` arrives as a heap string, and the
+// string builtins wanted a different shape of string -- so every method
+// written as `this.startsWith(...)` was refused on one target and compiled on
+// another. The prefix/suffix cases below are the ones a command-line program
+// writes, and they are asked both of a literal and of text read back from a
+// file, because those are two different paths through the backend.
+//
+// `contains` is here because it means two things: membership in a set, and a
+// substring in a string. Both spellings are exercised so a backend that only
+// implemented one of them fails here rather than in someone's program.
+
+import std.string
+
+println("prefix-abc".startsWithText("prefix"))
+println("prefix-abc".startsWithText("nope"))
+println("prefix-abc".endsWithText("abc"))
+println("prefix-abc".endsWithText("nope"))
+println("prefix-abc".containsText("fix"))
+println("prefix-abc".containsText("zzz"))
+println("prefix-abc".withoutPrefix("prefix-"))
+println("prefix-abc".withoutPrefix("nope"))
+println("prefix-abc".withoutSuffix("-abc"))
+println("prefix-abc".withoutSuffix("nope"))
+assertResult("abc")("prefix-abc".withoutPrefix("prefix-"))
+assertResult(true)("prefix-abc".containsText("fix"))
+
+// The unprefixed spellings, on strings and on a set.
+println(contains("abc", "b"))
+println(contains("abc", "z"))
+println(contains("abc", ""))
+println(startsWith("abc", "ab"))
+println(endsWith("abc", "bc"))
+println(contains(%(1, 2, 3), 2))
+println(contains(%("a", "b"), "b"))
+assertResult(true)(contains("abc", "b"))
+assertResult(true)(contains(%(1, 2, 3), 2))
+
+// The same questions of text only known while running.
+FileOutput#writeLines("cross-exec-strings.txt", ["prefix-one", "two-suffix", "plain"])
+foreach (line in FileInput#lines("cross-exec-strings.txt")) {
+  val flags = line + "|" + line.startsWithText("prefix") + "|" + line.endsWithText("suffix")
+  println(flags + "|" + line.containsText("i") + "|" + line.withoutPrefix("prefix-"))
+}
+FileOutput#delete("cross-exec-strings.txt")
+println("done")

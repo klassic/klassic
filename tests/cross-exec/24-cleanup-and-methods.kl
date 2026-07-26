@@ -1,0 +1,58 @@
+// Cross-target fixture: `cleanup` clauses, and methods that need the
+// receiver's type to resolve.
+//
+// `cleanup` runs after the expression it is attached to and does not change
+// its value, so the ordering below is the whole point: the clause's output
+// comes before the value is used, and the value is still the value.
+//
+// The methods matter because a name alone does not say which extension is
+// meant. `getOrElse` is declared on `Option`, on `Result` and on `Map`, so
+// the shared desugar leaves it as a method call and the backend has to pick
+// by what the receiver turns out to be. Picking the wrong one would compile
+// and print something plausible, which is why every case here is asserted.
+
+import std.option
+import std.result
+import std.map
+
+// A cleanup clause on a value, and on a value that is used afterwards.
+val x = 1 cleanup { println("after one") }
+println(x)
+assertResult(1)(x)
+
+val name = "abc" cleanup { println("after abc") }
+println(name)
+println(name + "!")
+
+val listed = [1, 2, 3] cleanup { println("after list") }
+println(listed)
+println(size(listed))
+assertResult(3)(size(listed))
+
+// `getOrElse` on each of the three types that declare one.
+val ok: Result<Int, String> = Ok(3)
+val bad: Result<Int, String> = Err("nope")
+println(ok.getOrElse(0))
+println(bad.getOrElse(0))
+assertResult(3)(ok.getOrElse(0))
+assertResult(0)(bad.getOrElse(0))
+
+val some: Option<Int> = Some(5)
+val none: Option<Int> = None
+println(some.getOrElse(-1))
+println(none.getOrElse(-1))
+assertResult(5)(some.getOrElse(-1))
+assertResult(-1)(none.getOrElse(-1))
+
+val m = %["a": 1]
+println(m.getOrElse("a", 0))
+println(m.getOrElse("z", 0))
+assertResult(1)(m.getOrElse("a", 0))
+assertResult(0)(m.getOrElse("z", 0))
+
+// The other methods on those enums, which resolve the same way.
+println(ok.isOk())
+println(bad.isOk())
+println(some.isSome())
+println(none.isNone())
+println("done")

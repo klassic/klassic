@@ -1470,6 +1470,260 @@ cargo run -- -e "1 + 2"
 - REPL
 - Exit-code policy and error presentation
 
+### Map entries, records in lists, and values that may not be there
+
+A map read as entries is where several representations meet, and closing it
+took one change per representation. On the aarch64 backend a list element can
+now be a record (`ListElem::Record`), which is what `toPairs()` hands back; a
+record field can be a nullable, which is what `Map#get` puts in one; printing a
+record is split into an inline form so a nested one renders without a newline
+(a record that transitively holds itself is rejected rather than printed
+forever); and appending a nullable to a string writes the value or the word
+`null`, matching the evaluator. The compile-time inference that decides a
+function's return type gained three cases it was silently failing on --
+`#Name(...)` construction, `Map#keys`/`Map#values`, and a *lambda* passed to a
+def, which is not a value and so could not be typed as one. Without the last
+of those, any function handing a lambda on to another (`words()` calling
+`stdlibFilter`) could not be typed at all. On the x86-64 backend `Map#keys`
+and `Map#values` read the compile-time entries into a static list, which is
+what lets the same `toPairs()` compile there. Runtime-grown maps
+(`Map#empty`/`Map#put` in a loop) remain aarch64-only: x86-64 holds a map as a
+compile-time `StaticMap` or a fixed-capacity `RuntimeList`, neither of which
+can grow by an amount only known while running.
+
+### Sets, and enum values as values
+
+The `Set#*` family the stdlib's extension methods call was uneven across the
+backends: aarch64 had none of it (a set literal worked, but `Set#size` did
+not), and x86-64 had the method spellings (`s.add(x)`, `s.toList()`) without
+the function ones. Both are complete now. On aarch64 a set is the same
+insertion-ordered chain a list is, so `Set#toList` is a type change, `Set#size`
+is the length walk, and `Set#add`/`Set#fromList` are the set literal's own
+dedupe loop over a chain only known while running -- `add` copies the chain
+backwards, prepends, and reverses, so the new element comes out last the way
+the evaluator prints it. On x86-64 the same four are compile-time
+transformations of a `StaticSet`, alongside the function spellings of
+`Map#put`, `Map#empty` and `Map#getOrElse`.
+
+The aarch64 backend can also print an enum value as a value now -- `Some(3)`,
+`None`, `Ok(1)` -- both to stdout and into a string, so `println(result)` and
+`"#{result}"` agree with the evaluator, and a list of enums renders like any
+other list. It is a comparison per variant against the tag the constructor
+stored; a variant whose payload the shape records as `Never` is skipped, which
+is the same reading `match` takes of it.
+
+### Strings, doubles, cleanup, and methods that need their receiver
+
+Four more gaps the aarch64 backend had against the other two, all found by
+building the same probes for all three targets:
+
+- **`indexOf` / `lastIndexOf` / `repeat` / `replace`.** The first two answer
+  with a *byte* offset and -1, which is what the evaluator's `find`/`rfind`
+  answer with; scanning forward and keeping the last match is `rfind`.
+  `replace` touches the first occurrence only, like the evaluator's
+  `replacen(from, to, 1)` -- `replaceAll` is the pattern-matching one.
+- **Printing a double.** A whole number prints as `3.0`, and the backend was
+  formatting a printed literal with a plain float formatter, which would have
+  dropped the decimal and printed a Double as if it were an Int. Doubles that
+  can be worked out while compiling now print, through the same rule the
+  x86-64 backend formats static doubles with; only `val` bindings are folded,
+  because what a `mutable` holds depends on the paths taken to reach it.
+- **`cleanup`.** The clause runs after the expression it is attached to and
+  the expression's value is still the value; a heap result is parked as a
+  root, because the clause can allocate.
+- **Methods that need their receiver's type.** The shared desugar rewrites
+  `x.m(...)` to `__ext_<Type>_m(x, ...)` only when `m` is declared on exactly
+  one extension type. `getOrElse` is declared on `Option`, `Result` and
+  `Map`, so it arrives as a method call, and the backend now picks the
+  extension by what the receiver's type turns out to be -- inferred without
+  emitting anything, so asking is free.
+
+### Two bugs the arm64 runner found, and what they have in common
+
+Both were invisible on a Linux host, and both were found the same way: build
+for arm64, let CI run it, read what the collector said.
+
+- **A root pushed on one path only.** `Set#add(s, x)` rooted the two slots its
+  copy needs *after* the branch that skips the copy when `x` is already in the
+  set. The shadow stack is popped by a count worked out while compiling, so
+  the skip path popped two roots it never pushed: "klassic gc: shadow stack
+  underflow". Every root a function pushes has to be pushed before any
+  runtime branch, or popped again on each path -- checking that is now part of
+  writing one.
+- **A loop body compiled against a stale type.** A `mutable` takes its type
+  from what is assigned to it, and the declaration site settles that by
+  prediction. A loop cannot be settled there: `m = Map#put(m, k, ...)`
+  mentions the loop's own variable, which does not exist yet at the
+  declaration -- so the prediction failed, `m` stayed the empty map it started
+  as, and `Map#getOrElse(m, k, 0)` inside the loop compiled to its fallback.
+  It counted every word as 1. The fixpoint is taken again when the loop body
+  is about to be compiled, with the loop variable bound, because every turn
+  after the first reads what the previous one wrote.
+
+### Integer math, the generator, and a register never written
+
+`Math#gcd` / `Math#powInt` / `Math#sqrtInt` and `Random#seed` /
+`Random#nextInt` are on the aarch64 backend now, by the evaluator's own
+algorithms: Euclid on the absolute values, square-and-multiply, Newton's
+iteration, and the 64-bit LCG whose high half is the answer. The generator's
+state is a `__DATA` cell reserved on first use, so a program that never asks
+for a random number carries no cell for one. A seeded program prints the same
+sequence on every target, which is the whole point of seeding.
+
+Writing the arm64 side turned up a bug in the x86-64 one: `Math#sqrtInt`
+returns its answer out of `r9`, and the `n == 0` fast path jumped to the exit
+without writing it. `Math#sqrtInt(0)` therefore answered with whatever the
+*previous* square root in the same program left in that register. A single
+call could not show it -- the fixture takes a root of 17 first, then of 0.
+
+### A fold whose function arrives under a name
+
+`std.list`'s sort is `foldLeft(xs)([])(insertSorted)` -- the fold's function is
+a *definition*, not a lambda written at the call site. The aarch64 backend
+only understood the literal form, in the emitter and in the inference alike,
+so `[3, 1, 2].sorted()` could not be compiled. A definition passed where a
+function is expected is now wrapped in a lambda that forwards its arguments,
+which is what makes it a value on a backend with no way to pass one. The
+string side gained the inference cases its extension methods need
+(`startsWith`/`endsWith`, `String#parseInt`, `capitalize`, `stripPrefix`,
+`stripSuffix`), so `words()`, `toInt()` and the rest of `std.string` compile.
+
+Two limits are worth stating plainly, because they are the same limit twice.
+The x86-64 backend cannot pass a runtime list to a function
+(`this backend cannot pass \`xs\` (\`List<'a>\`) by itself`) and cannot grow a
+map while the program runs. Both follow from its design: it partially
+evaluates, holding collections as compile-time values or fixed-capacity
+buffers, where the aarch64 backend holds everything as a boxed pointer and
+passes it like any other. Closing them means giving x86-64 a runtime
+collection ABI, not adding a builtin. `String#isInt` / `String#isDouble` are
+missing on every native backend equally -- matching the evaluator means
+matching `parse::<i64>()`, overflow included.
+
+### Asking whether a string is a number
+
+`String#isInt` and `String#isDouble` were missing from every native backend,
+because matching the evaluator means matching `parse::<i64>()` and
+`parse::<f64>()` on the trimmed text -- range included. Both hand-emitted
+backends have them now, twice over: the text known while compiling is decided
+by Rust's own parse, and the text only known while running is decided by a
+byte scanner.
+
+The range needs no wide arithmetic. Leading zeros are dropped, then the digit
+count decides: more than nineteen is out of range, fewer is in, and exactly
+nineteen compares against the limit's own digits -- `9223372036854775807`
+positive, `9223372036854775808` negative, which is why the sign is remembered
+before the digits are read. The double side is the grammar rather than the
+range, since a value too large parses as infinity: an optional sign, then
+`inf`/`infinity`/`nan` in either case, or digits with an optional point and an
+optional exponent that needs a digit of its own. `.5` and `5.` are numbers;
+`1e` is not.
+
+### One buffer per call site is one buffer per recursion
+
+A list built by `cons` out of a list that only exists while the program runs
+has, on the x86-64 backend, a result buffer chosen while compiling -- one per
+call site. A recursive function has one call site and many activations, so
+they all shared it, and
+
+    def copyAll(xs: List<String>): List<String> =
+      if (isEmpty(xs)) [] else cons(head(xs))(copyAll(tail(xs)))
+    println(copyAll(split("a b c", " ")))
+
+printed `[c, c, c]` where the evaluator prints `[a, b, c]`. No warning, no
+crash: a wrong answer. The build is refused now, with a diagnostic that says
+which construct it is, and a cli_smoke test pins that.
+
+Refusing is the fix available today; the fix that would make it *work* is the
+same one the other two open gaps need. Runtime-grown maps, generic recursive
+definitions over collections, and this are one missing piece seen from three
+sides: the x86-64 backend has no heap representation for a collection whose
+size is only known while running. Its collections are compile-time values or
+fixed-capacity buffers addressed by compile-time index, which is why
+`FileInput#lines` can be *passed* to a recursive function (it is a buffer pair
+and reading it is fine) but a list *built* inside one cannot be returned.
+Closing all three means giving the backend a GC-allocated list -- cells,
+rooting, and the load barrier -- not another builtin.
+
+### The heap representation the x86-64 backend already had
+
+Reading the three open gaps as "x86-64 has no heap collection" was one level
+too pessimistic. It has one: a self-referential enum is a chain of
+`__gc_record` cells, built by the shared lowering, and it works under
+recursion -- `CountsCons(k, v, countsPut(rest, ...))` allocates a cell per
+activation, which is exactly what a compile-time buffer cannot do.
+
+What stopped it being *usable* as a key/value store was one missing
+conversion: appending a number to a heap string. `acc + key + ": " + value`
+is the shape every rendering of such a chain takes, and the heap-string
+concatenation refused an `Int` or a `Boolean` operand. It renders them the
+way `toString` does and copies the text onto the heap now, and with that the
+word counter -- grow a chain in a loop, replace on a repeated key, render it
+afterwards -- compiles and runs on all three targets, and agrees with the
+evaluator under `--gc-stress`.
+
+So the remaining gap is narrower than it looked: the builtin `Map` and `List`
+types still use compile-time values or fixed-capacity buffers on x86-64, but
+the representation that would replace them exists and is proven. Routing the
+builtins through it is a middle-end lowering (map operations to an internal
+enum chain plus the helpers that walk it), not new machine code.
+
+### A string the backend held in the wrong shape
+
+An extension method's `this: String` parameter arrives as a *heap* string,
+while the x86-64 string builtins wanted the other shape of string -- a pair of
+data labels. So `def startsWithText(prefix) = this.startsWith(prefix)`, and
+every `std.string` method written that way, was refused there while compiling
+fine on arm64. The predicate helpers copy a heap string into a scratch pair
+now, which is what the environment-key path already did.
+
+`contains` means two things -- membership in a set, and a substring in a
+string -- and the aarch64 backend only had the first, so `containsText` failed
+there. It dispatches on the receiver now, reusing the byte search `indexOf`
+runs.
+
+### Collections whose size is only known while running
+
+A `Map` or `List` that grows while the program runs is built out of a
+self-referential enum -- a chain of GC cells -- and that works on every
+backend now, generically. Fixture 31 grows one from the *empty case* in a
+loop, at two different key/value type pairs, and agrees with the evaluator on
+all three targets, including under `--gc-stress`; fixture 30 does the same
+with fully applied annotations and a hundred entries.
+
+Getting there took one inference, which both hand-emitted backends were
+missing in their own way. A call like `put(KMNil, "a", 1)` fixes nothing
+through its first argument -- the empty case of an enum carries no payloads,
+so the other variant's payload reprs stay open -- and both backends then read
+that variant against defaults: x86-64 compared a defaulted scalar to a
+string, aarch64 derived a return shape its own body did not produce. The
+arguments that *do* fix the type variables sit in the same argument list, so
+both now **solve the definition's type variables across every argument**
+(`key: 'k` given a string fixes `'k`) and give an enum-typed parameter whose
+own argument left them open the shape those solutions imply, read off the
+annotation it was declared with.
+
+The two implementations differ where the backends do. aarch64 specialises per
+argument-type tuple, so the solving happens while the specialisation's
+signature is built. x86-64 inlines, so it happens in the binding loop -- and
+the solving has to sit *before* the per-value-kind binding paths, because a
+string argument binds as a constant and never reaches the slot-allocating arm
+that a heap pointer takes, and a string argument is exactly what fixes a
+`'k`. The body reads a parameter's shape out of its slot's entry, so the
+rewritten shape is published there once the whole argument list has been
+seen.
+
+What is left is not a representation gap any more but a routing one, and it
+splits in two. `Map#put` in a loop needs the *builtin* map lowered to the
+chain above -- a middle-end pass that injects the enum and its helpers and
+rewrites the `Map#*` calls, the map literals and the rendering; the helpers
+can be generic now, so the pass needs no type inference of its own.
+`words()` needs something else: `stdlibFilter` is a *recursive* generic
+function taking `List<'a>`, and a recursive function has to be compiled once,
+so its parameter kinds must be fixed -- measured again after the type-variable
+solving landed, and the reason is still "this backend cannot pass `xs`
+(`List<'a>`) by itself". That one wants monomorphisation of recursive generic
+definitions, which is a separate piece from the map lowering.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.
