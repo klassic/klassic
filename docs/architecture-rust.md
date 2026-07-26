@@ -1738,6 +1738,16 @@ shape (the slot's entry in `enum_shapes`, or the `pending_enum_shape` a slot
 read republishes) and make the rewritten shape reach *that*, rather than
 assuming the slot entry is enough.
 
+**What already works on every target, measured:** the same store written with
+*fully applied* annotations -- `kmGet(m: KM<String, Int>, ...)` rather than
+`KM<'k, 'v>` -- compiles and runs on all three, grown from the empty case in
+a loop, a hundred entries deep, agreeing with the evaluator under
+`--gc-stress` (fixture 30). So the representation, the growth, the lookup and
+the rendering are all portable today; the only thing that is not is writing
+the helpers *generically*. That also says what a lowering would have to
+produce to be portable now: monomorphic helpers, one set per key/value type
+pair it sees.
+
 The idea, restated: **recover the type arguments from the other arguments** -- `key: 'k` against a string fixes `'k`, `value: 'v` against an
 Int fixes `'v` -- rather than only from the enum-typed one. aarch64 already
 has the machinery to build a shape from inferred type arguments
