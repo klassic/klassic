@@ -1712,11 +1712,17 @@ that a heap pointer takes, and a string argument is exactly what fixes a
 rewritten shape is published there once the whole argument list has been
 seen.
 
-What is left is not a representation gap any more but a routing one: the
-*builtin* `Map` and `List` still use compile-time values or fixed-capacity
-buffers on x86-64, so `Map#put` in a loop and `words()` over a runtime list
-stay arm64-only. The chain they would be lowered to is now portable, and a
-lowering can emit its helpers generically rather than one set per type pair.
+What is left is not a representation gap any more but a routing one, and it
+splits in two. `Map#put` in a loop needs the *builtin* map lowered to the
+chain above -- a middle-end pass that injects the enum and its helpers and
+rewrites the `Map#*` calls, the map literals and the rendering; the helpers
+can be generic now, so the pass needs no type inference of its own.
+`words()` needs something else: `stdlibFilter` is a *recursive* generic
+function taking `List<'a>`, and a recursive function has to be compiled once,
+so its parameter kinds must be fixed -- measured again after the type-variable
+solving landed, and the reason is still "this backend cannot pass `xs`
+(`List<'a>`) by itself". That one wants monomorphisation of recursive generic
+definitions, which is a separate piece from the map lowering.
 
 ## Design Notes
 
