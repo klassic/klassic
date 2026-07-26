@@ -1692,24 +1692,35 @@ three targets under `--gc-stress`. A *generic* chain -- which is what a
 lowering would have to emit, since the desugar does not know the key and
 value types -- stops at two places:
 
-1. **x86-64.** A helper that both destructures and constructs the same
-   generic enum is rejected: `put(empty, k, v)` inlines with the empty case's
-   shape, where the other variant's payload reprs are *defaulted* rather than
-   resolved, so `k == key` compares a defaulted `Scalar` against a string.
-   Shape propagation itself works -- through an inlined generic call, through
-   a `mutable` reassignment, and through a slot read (all measured) -- so what
-   is missing is narrower: a nullary constructor should take its payload reprs
-   from the annotation (`generic_enum_annotation_shape` already derives them)
-   or from the call site, rather than defaulting them.
+It is **one** missing inference, and both backends want it. Narrowing the
+repro down to the smallest program that fails shows the same trigger on each:
+a generic helper called with the *empty case of its own enum*.
 
-   Dropping the arm as dead instead is *not* sound: it was tried, and the
-   second call -- whose value really is the other variant -- then died with
-   "match: no pattern matched" at run time. A compile-time rejection is the
-   safer of the two, which is why the rejection stands.
+    def kmPut(m: KM<'k,'v>, key: 'k, value: 'v): KM<'k,'v> = ...
+    kmPut(m, "b", 2)        // fine on both
+    kmPut(KMNil, "a", 1)    // rejected on both
 
-2. **aarch64.** The return type of a generic helper written as a `while` loop
-   (rather than recursion, which is what keeps x86-64 able to inline it) is
-   not predicted, so the body is rejected against its own annotation.
+`KMNil` carries no type arguments, so nothing fixes `'k` and `'v` at that
+call. x86-64 then defaults the other variant's payload reprs and rejects
+`k == key` as comparing a `Scalar` to a string; aarch64 derives a return
+shape that its own body does not produce, and rejects the body against its
+annotation. Everything else measured along the way works: shape propagation
+through an inlined generic call, through a `mutable` reassignment and through
+a slot read on x86-64; the same helper on both backends when the chain starts
+from a `KMCons` rather than the empty case.
+
+The fix is the same on both: **recover the type arguments from the other
+arguments** -- `key: 'k` against a string fixes `'k`, `value: 'v` against an
+Int fixes `'v` -- rather than only from the enum-typed one. aarch64 already
+has the machinery to build a shape from inferred type arguments
+(`canonical_applied_enum_shape`), and x86-64 already has
+`generic_enum_annotation_shape` and `resolve_enum_shape`; what neither does is
+solve for the parameters across *all* of a call's arguments.
+
+Dropping the unresolved arm as dead instead is *not* sound: it was tried, and
+the next call -- whose value really is the other variant -- died with "match:
+no pattern matched" at run time. A compile-time rejection is the safer of the
+two, which is why the rejection stands.
 
 Two language-surface warts turned up alongside them, both worth fixing on
 their own: `x = if (c) a else b` does not parse without parentheses, and a
