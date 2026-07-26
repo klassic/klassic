@@ -32,10 +32,19 @@ def merge(m, other) =
 // the fold-builders below, keeping insertion order.
 def mapReverse(xs) = foldLeft(xs)([])((acc, x) => cons(x)(acc))
 
-// toPairs — convert a map to a list of [key, value] pairs in
-// insertion order. entries is an alias for toPairs.
+// An entry as a value with named halves. It used to be a two-element
+// list, which read badly (`head(tail(pair))`) and typed worse: a list
+// holding a String and an Int at once has no element type, so the
+// checker could only shrug at what came out of it.
+record MapEntry<'k, 'v> {
+  key: 'k
+  value: 'v
+}
+
+// toPairs — convert a map to a list of entries in insertion order.
+// entries is an alias for toPairs.
 def toPairs(m) =
-  mapReverse(foldLeft(Map#keys(m))([])((acc, k) => cons([k, Map#get(m, k)])(acc)))
+  mapReverse(foldLeft(Map#keys(m))([])((acc, k) => cons(#MapEntry(k, Map#get(m, k)))(acc)))
 
 def entries(m) = toPairs(m)
 

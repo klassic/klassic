@@ -26,7 +26,7 @@ fn stdlib_completeness_round_two() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "[1, 2, 3, 4]\n[1, 2]\n[[1, 2], [3, 4], [5]]\n5\n12\n120\ntrue\n1970\n2000-03-01 00:00:00\n[[a, 1], [b, 2]]\n%(2, 4, 6)\n()\n"
+        "[1, 2, 3, 4]\n[1, 2]\n[[1, 2], [3, 4], [5]]\n5\n12\n120\ntrue\n1970\n2000-03-01 00:00:00\n[#MapEntry(a, 1), #MapEntry(b, 2)]\n%(2, 4, 6)\n()\n"
     );
 }
 
@@ -21762,7 +21762,7 @@ fn native_build_reports_recursive_generic_enum_functions() {
     assert!(!build.status.success());
     assert!(
         String::from_utf8_lossy(&build.stderr)
-            .contains("native recursive function requiring call-site inlining"),
+            .contains("would have to be compiled at each call site"),
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );

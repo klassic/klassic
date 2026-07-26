@@ -5924,6 +5924,38 @@ impl NativeCodeGenerator {
                         || contains_thread_call
                         || (captures_top_level_values && !self_recursive);
                     let unsupported_recursive_inline = self_recursive && requires_call_site_inline;
+                    // Why it would have to be inlined, in the order a reader
+                    // would go about fixing it: a type this backend cannot pass
+                    // by itself, then a missing annotation, then the constructs
+                    // that always inline.
+                    let inline_reason = if !type_params.is_empty() || !constraints.is_empty() {
+                        "it is generic".to_string()
+                    } else if let Some(position) = flexible_params.iter().position(|flex| *flex) {
+                        let named = params
+                            .get(position)
+                            .map(|param| format!("`{param}`"))
+                            .unwrap_or_else(|| "a parameter".to_string());
+                        let annotation = param_annotations
+                            .get(position)
+                            .and_then(|annotation| annotation.as_ref())
+                            .map(|annotation| format!(" (`{}`)", annotation.text.trim()))
+                            .unwrap_or_default();
+                        format!("this backend cannot pass {named}{annotation} by itself")
+                    } else if flexible_return {
+                        match return_annotation.as_ref() {
+                            Some(annotation) => format!(
+                                "this backend cannot return `{}` by itself",
+                                annotation.text.trim()
+                            ),
+                            None => {
+                                "its result type is neither annotated nor inferable".to_string()
+                            }
+                        }
+                    } else if contains_thread_call {
+                        "it starts a thread".to_string()
+                    } else {
+                        "it reads a top-level value".to_string()
+                    };
                     let inline_at_call_site =
                         requires_call_site_inline && !unsupported_recursive_inline;
                     let return_value = annotated_return_value
@@ -5943,6 +5975,7 @@ impl NativeCodeGenerator {
                         flexible_return,
                         contains_thread_call,
                         unsupported_recursive_inline,
+                        inline_reason,
                         captured_top_level_names,
                     );
                 }
@@ -5998,6 +6031,9 @@ impl NativeCodeGenerator {
                             false,
                             contains_thread_call,
                             false,
+                            // Always inlined and never recursive here, so the
+                            // reason is never read.
+                            String::new(),
                             HashSet::new(),
                         );
                     }
@@ -6049,6 +6085,7 @@ impl NativeCodeGenerator {
         flexible_return: bool,
         contains_thread_call: bool,
         unsupported_recursive_inline: bool,
+        inline_reason: String,
         captured_top_level_names: HashSet<String>,
     ) {
         if self.functions.contains_key(&name) {
@@ -6072,6 +6109,7 @@ impl NativeCodeGenerator {
                 flexible_return,
                 contains_thread_call,
                 unsupported_recursive_inline,
+                inline_reason,
                 captured_top_level_names,
             },
         );
@@ -8501,10 +8539,18 @@ impl NativeCodeGenerator {
             return Ok(self.emit_static_value(&value));
         }
         if function.unsupported_recursive_inline {
-            eprintln!("DBG unsupported_recursive_inline: {name}");
+            // A recursive function has to be compiled once, as a real
+            // function, so anything that would make it a per-call-site
+            // expansion rules it out entirely. Say which thing: the fix is
+            // usually an annotation, and when it is not, knowing which
+            // parameter the backend cannot pass is the difference between a
+            // wall and a workaround.
             return Err(unsupported(
                 span,
-                "native recursive function requiring call-site inlining",
+                &format!(
+                    "a recursive `{name}`, which would have to be compiled at each call site because {}",
+                    function.inline_reason
+                ),
             ));
         }
         if function.inline_at_call_site {
@@ -39183,6 +39229,9 @@ struct NativeFunction {
     flexible_return: bool,
     contains_thread_call: bool,
     unsupported_recursive_inline: bool,
+    /// Why this function would have to be compiled at each call site, phrased
+    /// for the person reading the diagnostic when it also recurses.
+    inline_reason: String,
     captured_top_level_names: HashSet<String>,
 }
 

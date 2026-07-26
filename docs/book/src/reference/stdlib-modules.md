@@ -358,8 +358,8 @@ println(a.subtract(b).toList())    // [1, 2]
 ```
 
 For traversal and reshaping, `std.map` adds `toPairs(m)` (alias
-`entries(m)`) to materialise the entries as `[key, value]` lists in
-insertion order, `fold(m, init, f)` (alias `foldMap`) to fold over
+`entries(m)`) to materialise the entries as `MapEntry` records --
+read them with `.key` and `.value` -- in insertion order, `fold(m, init, f)` (alias `foldMap`) to fold over
 all entries with `f(acc, key, value)`, and `mapKeys(m, g)` to rewrite
 every key. The method twins are `.toPairs()` / `.entries()`,
 `.mapKeys(g)`, and the curried `.foldMap(init)(f)`:
@@ -368,7 +368,8 @@ every key. The method twins are `.toPairs()` / `.entries()`,
 import std.map.{toPairs, fold, mapKeys}
 
 val m = %["a": 1, "b": 2, "c": 3]
-println(toPairs(m))                              // [[a, 1], [b, 2], [c, 3]]
+println(toPairs(m))                              // [#MapEntry(a, 1), #MapEntry(b, 2), #MapEntry(c, 3)]
+println(head(toPairs(m)).value)                  // 1
 println(fold(m, 0, (acc, k, v) => acc + v))      // 6
 println(mapKeys(m, (k) => k + "!").keys())       // [a!, b!, c!]
 println(m.foldMap(0)((acc, k, v) => acc + v))    // 6

@@ -1,0 +1,38 @@
+// Cross-target fixture: the shapes a command-line program is made of.
+//
+// `foreach` over a list, the arguments the binary was run with, parsing one,
+// and reading standard input -- each of these had a target where it worked and
+// a target where it did not, which is exactly what a fixture is for. The
+// program is run with no arguments and empty stdin by the harness, so what it
+// prints is the same everywhere.
+
+foreach (word in ["alpha", "beta", "gamma"]) {
+  println(word)
+}
+mutable total = 0
+foreach (n in [1, 2, 3, 4]) {
+  total = total + n
+}
+println(total)
+assertResult(10)(total)
+
+// Nested, and over a list built rather than written out.
+foreach (row in [[1, 2], [3, 4]]) {
+  foreach (cell in row) {
+    println(cell)
+  }
+}
+
+val args = CommandLine#args()
+println(size(args))
+assertResult(0)(size(args))
+
+println(String#parseInt("42") + 1)
+println(String#parseInt("-7"))
+println(String#parseInt("0"))
+assertResult(43)(String#parseInt("42") + 1)
+assertResult(-7)(String#parseInt("-7"))
+
+val lines = StandardInput#lines()
+println(size(lines))
+println("done")

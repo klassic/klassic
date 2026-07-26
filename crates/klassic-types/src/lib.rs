@@ -2213,7 +2213,27 @@ impl TypeChecker {
                     }
                     other => Err(type_error(
                         *span,
-                        format!("no method or field `{}` on {}", field, display_type(&other)),
+                        match stdlib_module_defining(field) {
+                            // The evaluator loads every stdlib module, so a
+                            // program that runs can still fail to compile with
+                            // the same source: the native path only sees the
+                            // modules it was told to import. Saying where the
+                            // name lives covers that and the plain typo.
+                            Some(module) => format!(
+                                "no method or field `{}` on {} -- `{module}` defines a `{}`, \
+                                 so check the receiver's type and that `import {module}` is there",
+                                field,
+                                display_type(&other),
+                                field
+                            ),
+                            None => {
+                                format!(
+                                    "no method or field `{}` on {}",
+                                    field,
+                                    display_type(&other)
+                                )
+                            }
+                        },
                     )),
                 }
             }
@@ -6078,6 +6098,16 @@ impl TypeVarNamer {
         self.row_vars.insert(id, name.clone());
         name
     }
+}
+
+/// Which embedded stdlib module defines a `def` with this name, if any.
+/// A text search over the module sources, which is all a diagnostic needs.
+fn stdlib_module_defining(name: &str) -> Option<&'static str> {
+    let needle = format!("def {name}(");
+    klassic_runtime::STDLIB_MODULES
+        .iter()
+        .find(|module| module.source.contains(&needle))
+        .map(|module| module.path)
 }
 
 fn display_type(ty: &Type) -> String {

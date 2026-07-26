@@ -12,7 +12,11 @@ extension (this: String) {
     val parts = split(this, "\n")
     if(isEmptyString(stdlibLast(parts))) stdlibTake(parts, size(parts) - 1) else parts
   }
-  def words() = stdlibFilter(split(this, " "), (w) => if(isEmptyString(w)) false else true)
+  // Split on any run of whitespace, not just spaces: a document is usually
+  // more than one line, and a `words` that only knew about `" "` returned
+  // "fox\nthe" as a single word. Written as one expression rather than with an
+  // intermediate binding, which is what keeps it foldable in a native build.
+  def words() = stdlibFilter(split(replaceAll(replaceAll(replaceAll(this, "\n", " "), "\t", " "), "\r", " "), " "), (w) => if(isEmptyString(w)) false else true)
   def lengthChars() = length(this)
   def reverseChars() = reverse(this)
   def upper() = toUpperCase(this)

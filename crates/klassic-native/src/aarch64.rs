@@ -2228,6 +2228,67 @@ impl Emitter {
         }
     }
 
+    /// `foreach (x in xs) { ... }`: walk a cons chain, binding each element and
+    /// running the body for its effect.
+    ///
+    /// The cursor lives in a rooted slot and is re-read each turn, because the
+    /// body allocates -- the collector may move the chain while the loop is
+    /// halfway along it.
+    fn emit_foreach(
+        &mut self,
+        binding: &str,
+        iterable: &Expr,
+        body: &Expr,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let mark = self.open_temp_roots();
+        let elem = match self.expression(iterable)? {
+            ValueType::List(elem) | ValueType::Set(elem) => elem,
+            // Nothing to walk, but the iterable still had to be evaluated.
+            ValueType::EmptyList | ValueType::EmptySet => {
+                self.close_temp_roots(mark);
+                return Ok(());
+            }
+            _ => return Err(unsupported(iterable.span(), "iterating over this value")),
+        };
+        let cursor = self.reserve_locals(16);
+        let element = cursor + 8;
+        self.asm.store_local(Reg::X0, cursor);
+        self.emit_root_frame_slot(cursor);
+        let elem_ty = elem_value_type(elem);
+        let loop_start = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.load_local(Reg::X0, cursor);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+        self.emit_gc_load_ptr(Reg::X0, 0);
+        if is_boxed_scalar(elem_ty) {
+            self.emit_unbox_scalar();
+        }
+        self.asm.store_local(Reg::X0, element);
+        self.push_binding_scopes();
+        self.scope_root_counts.push(0);
+        self.scopes
+            .last_mut()
+            .expect("emitter scope")
+            .insert(binding.to_string(), (element, elem_ty));
+        if is_heap_pointer(elem_ty) {
+            self.emit_root_frame_slot(element);
+        }
+        self.statement(body)?;
+        self.pop_binding_scopes();
+        let roots = self.scope_root_counts.pop().expect("emitter root scope");
+        self.emit_shadow_pop(roots);
+        self.asm.load_local(Reg::X0, cursor);
+        self.emit_gc_load_ptr(Reg::X0, 8);
+        self.asm.store_local(Reg::X0, cursor);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(done);
+        self.close_temp_roots(mark);
+        let _ = span;
+        Ok(())
+    }
+
     /// `o match { case Some(v) => ...; case None => ... }` on an enum this
     /// backend compiles itself.
     ///
@@ -3097,14 +3158,21 @@ impl Emitter {
     /// clobbers x6 and only preserves x0-x5 across its heap-grow
     /// path -- the same lesson #563's bug taught for `trim`.
     fn emit_file_read_all(&mut self) {
-        const READ_CAP: u64 = 1_048_576;
-
         self.asm.mov_imm64(Reg::X1, O_RDONLY);
         self.asm.mov_imm64(Reg::X2, 0);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_OPEN));
         self.asm.svc_0x80();
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: FileInput#all failed to open file\n");
+        self.emit_read_fd_to_string();
+    }
+
+    /// Read everything left on the descriptor in x0 into a fresh string
+    /// object, left in x0, and close it. Standard input is a descriptor
+    /// nobody opened, which is why this is separate from opening a file.
+    fn emit_read_fd_to_string(&mut self) {
+        const READ_CAP: u64 = 1_048_576;
+
         self.asm.push(Reg::X0); // fd
 
         // A megabyte is too big for the machine stack, so the read buffer is
@@ -3923,6 +3991,33 @@ impl Emitter {
     /// The source is in the immovable image, so it is parked on the machine
     /// stack *without* a root -- rooting a non-heap pointer would send the
     /// collector into `__const` looking for a header.
+    /// A heap string holding the NUL-terminated bytes at the pointer in x0.
+    /// The length is measured first, since a C string does not carry one.
+    fn emit_heap_string_from_cstring(&mut self) {
+        // x9 = the bytes; x2 = length, counted to the terminator.
+        self.asm.mov_reg(Reg::X9, Reg::X0);
+        self.asm.mov_imm64(Reg::X2, 0);
+        let measure = self.asm.new_label();
+        let measured = self.asm.new_label();
+        self.asm.bind(measure);
+        self.asm.ldrb_reg_offset(Reg::X11, Reg::X9, Reg::X2);
+        self.asm.branch(measured, BranchKind::CompareZero(Reg::X11));
+        self.asm.add_reg_imm(Reg::X2, Reg::X2, 1);
+        self.asm.branch(measure, BranchKind::Unconditional);
+        self.asm.bind(measured);
+        // The source is outside the heap (it is argv), so it cannot move
+        // during the allocation and needs no root.
+        self.asm.push(Reg::X9);
+        self.asm.push(Reg::X2);
+        self.emit_alloc_raw_string(Reg::X2); // x5 = object, x2 preserved
+        self.asm.pop(Reg::X2);
+        self.asm.pop(Reg::X6);
+        self.asm.str_imm(Reg::X2, Reg::X5, 0); // length
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8); // destination bytes
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X3);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
     /// A NUL-terminated copy of the string object in x0, left as a byte pointer
     /// in x0: the syscalls take C strings, and a Klassic string is
     /// length-prefixed without a terminator. Used for a path that is only known
@@ -5976,6 +6071,183 @@ impl Emitter {
                 }
                 self.asm.bind(end);
                 Ok(Some(value_ty))
+            }
+            // `CommandLine#args()`: the arguments this binary was run with,
+            // as a list of strings, taken from the `argv` the entry point
+            // stashed. Skips element 0, the program name, like the
+            // evaluator's script arguments do.
+            ("CommandLine#args", 0) => {
+                let acc = self.reserve_locals(8);
+                let mark = self.open_temp_roots();
+                self.asm.mov_imm64(Reg::X0, 0); // nil
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                let index = self.reserve_locals(8);
+                self.asm.mov_imm64(Reg::X0, 1);
+                self.asm.store_local(Reg::X0, index);
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, index);
+                self.asm.cmp_reg(Reg::X0, Reg::X21); // argc
+                self.asm.branch(done, BranchKind::Conditional(Cond::Ge));
+                // argv[index]
+                self.asm.lsl_imm(Reg::X0, Reg::X0, 3);
+                self.asm.add_reg(Reg::X0, Reg::X22, Reg::X0);
+                self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+                self.emit_heap_string_from_cstring();
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.load_local(Reg::X0, index);
+                self.asm.add_reg_imm(Reg::X0, Reg::X0, 1);
+                self.asm.store_local(Reg::X0, index);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::List(ListElem::Str)))
+            }
+            // `String#parseInt(text)`: a decimal integer, with an optional
+            // leading `-`. Anything else stops the program with the same
+            // message the evaluator gives, since there is no value to answer
+            // with that would not be a lie.
+            ("String#parseInt", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(arguments[0].span(), "parsing a non-string"));
+                }
+                let fail = self.asm.new_label();
+                let done = self.asm.new_label();
+                let digits = self.asm.new_label();
+                let negative = self.asm.new_label();
+                let signed = self.asm.new_label();
+                self.asm.ldr_imm(Reg::X10, Reg::X0, 0); // length
+                self.asm.add_reg_imm(Reg::X9, Reg::X0, 8); // bytes
+                self.asm.mov_imm64(Reg::X11, 0); // index
+                self.asm.mov_imm64(Reg::X12, 0); // accumulated value
+                self.asm.mov_imm64(Reg::X1, 0); // negative?
+                self.asm.cmp_imm(Reg::X10, 0);
+                self.asm.branch(fail, BranchKind::Conditional(Cond::Eq));
+                // A leading `-` shifts the first digit along.
+                self.asm.ldrb_reg_offset(Reg::X2, Reg::X9, Reg::X11);
+                self.asm.cmp_imm(Reg::X2, u32::from(b'-'));
+                self.asm.branch(negative, BranchKind::Conditional(Cond::Eq));
+                self.asm.branch(digits, BranchKind::Unconditional);
+                self.asm.bind(negative);
+                self.asm.mov_imm64(Reg::X1, 1);
+                self.asm.mov_imm64(Reg::X11, 1);
+                // `-` on its own is not a number.
+                self.asm.cmp_reg(Reg::X11, Reg::X10);
+                self.asm.branch(fail, BranchKind::Conditional(Cond::Ge));
+                self.asm.bind(digits);
+                let loop_start = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.cmp_reg(Reg::X11, Reg::X10);
+                self.asm.branch(signed, BranchKind::Conditional(Cond::Ge));
+                self.asm.ldrb_reg_offset(Reg::X2, Reg::X9, Reg::X11);
+                self.asm.cmp_imm(Reg::X2, u32::from(b'0'));
+                self.asm.branch(fail, BranchKind::Conditional(Cond::Lt));
+                self.asm.cmp_imm(Reg::X2, u32::from(b'9'));
+                self.asm.branch(fail, BranchKind::Conditional(Cond::Gt));
+                self.asm.mov_imm64(Reg::X3, 10);
+                self.asm.mul_reg(Reg::X12, Reg::X12, Reg::X3);
+                self.asm.sub_reg_imm(Reg::X2, Reg::X2, u32::from(b'0'));
+                self.asm.add_reg(Reg::X12, Reg::X12, Reg::X2);
+                self.asm.add_reg_imm(Reg::X11, Reg::X11, 1);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(signed);
+                self.asm.mov_reg(Reg::X0, Reg::X12);
+                self.asm.cmp_imm(Reg::X1, 0);
+                self.asm.branch(done, BranchKind::Conditional(Cond::Eq));
+                self.asm.mov_imm64(Reg::X3, 0);
+                self.asm.sub_reg(Reg::X0, Reg::X3, Reg::X0);
+                self.asm.branch(done, BranchKind::Unconditional);
+                self.asm.bind(fail);
+                self.asm.emit_write_rodata(
+                    STDERR_FD,
+                    b"klassic: String#parseInt failed to parse a decimal integer\n",
+                );
+                self.asm.emit_exit(1);
+                self.asm.bind(done);
+                Ok(Some(ValueType::Int))
+            }
+            // `Process#exit(code)`: stop here with that status.
+            ("Process#exit", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(arguments[0].span(), "exiting with a non-Int"));
+                }
+                self.asm.mov_reg(Reg::X0, Reg::X0);
+                self.asm.mov_imm64(Reg::X16, u64::from(SYS_EXIT));
+                self.asm.svc_0x80();
+                // Never returns, so the value left behind is unreachable.
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(Some(ValueType::Never))
+            }
+            // `StandardInput#lines()`: everything on standard input, split the
+            // way `FileInput#lines` splits a file -- no trailing empty line.
+            ("StandardInput#lines", 0) => {
+                let mark = self.open_temp_roots();
+                self.asm.mov_imm64(Reg::X0, 0); // fd 0
+                self.emit_read_fd_to_string();
+                let text = self.declare_local("__stdin_text", ValueType::Str);
+                self.asm.store_local(Reg::X0, text);
+                self.emit_root_frame_slot(text);
+                let name_expr = |name: &str| Expr::Identifier {
+                    name: name.to_string(),
+                    span,
+                };
+                let call = |name: &str, args: Vec<Expr>| Expr::Call {
+                    callee: Box::new(Expr::Identifier {
+                        name: name.to_string(),
+                        span,
+                    }),
+                    arguments: args,
+                    span,
+                };
+                let split = call(
+                    "split",
+                    vec![
+                        name_expr("__stdin_text"),
+                        Expr::String {
+                            value: "\n".to_string(),
+                            span,
+                        },
+                    ],
+                );
+                let parts_ty = self.expression(&split)?;
+                let parts = self.declare_local("__stdin_parts", parts_ty);
+                self.asm.store_local(Reg::X0, parts);
+                self.emit_root_frame_slot(parts);
+                let trimmed = Expr::If {
+                    condition: Box::new(call(
+                        "isEmptyString",
+                        vec![call("stdlibLast", vec![name_expr("__stdin_parts")])],
+                    )),
+                    then_branch: Box::new(call(
+                        "stdlibTake",
+                        vec![
+                            name_expr("__stdin_parts"),
+                            Expr::Binary {
+                                op: BinaryOp::Subtract,
+                                lhs: Box::new(call("size", vec![name_expr("__stdin_parts")])),
+                                rhs: Box::new(Expr::Int {
+                                    value: 1,
+                                    kind: klassic_syntax::IntLiteralKind::Int,
+                                    span,
+                                }),
+                                span,
+                            },
+                        ],
+                    )),
+                    else_branch: Some(Box::new(name_expr("__stdin_parts"))),
+                    span,
+                };
+                let lines = self.expression(&trimmed)?;
+                self.close_temp_roots(mark);
+                Ok(Some(lines))
             }
             // `sleep(millis)` without a sleep syscall: this backend only issues
             // syscalls whose numbers it can verify, and Darwin does not publish
@@ -8620,6 +8892,12 @@ impl Emitter {
                 self.asm.bind(end_label);
                 Ok(())
             }
+            Expr::Foreach {
+                binding,
+                iterable,
+                body,
+                span,
+            } => self.emit_foreach(binding, iterable, body, *span),
             Expr::Call {
                 callee, arguments, ..
             } if matches!(callee.as_ref(), Expr::Identifier { name, .. } if name == "println") => {

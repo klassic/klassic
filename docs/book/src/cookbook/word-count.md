@@ -23,8 +23,8 @@ foreach (word in raw.trim().words()) {
   counts = Map#put(counts, word, counts.getOrElse(word, 0) + 1)
 }
 
-foreach (pair in counts.toPairs()) {
-  println(head(pair) + ": " + toString(head(tail(pair))))
+foreach (entry in counts.toPairs()) {
+  println(entry.key + ": " + entry.value)
 }
 ```
 
@@ -47,6 +47,6 @@ klassic wc.kl -- sample.txt
    `counts.getOrElse(word, 0)` reads the running count (defaulting
    to `0` for a word seen for the first time), and each `put`
    returns a fresh map.
-3. `counts.toPairs()` (from `std.map`) extracts every `[key,
-   value]` pair in insertion order, which we walk to print the
-   totals.
+3. `counts.toPairs()` (from `std.map`) extracts every entry in
+   insertion order as a `MapEntry` with `.key` and `.value`, which
+   we walk to print the totals.
