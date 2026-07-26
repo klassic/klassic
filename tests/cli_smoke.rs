@@ -22696,6 +22696,75 @@ fn build_target_aarch64_apple_darwin_binary_runs() {
     );
 }
 
+/// Maps built while the program runs, on Apple Silicon: `Map#empty` and
+/// `Map#put` are the shape every counting program has, and the arm64 backend
+/// stores a map as a chain of `[key][value]` entries it can grow. Asserted
+/// against the evaluator on the arm64 runner, since that is the only place a
+/// Mach-O runs -- and not as a cross-target fixture, because the x86-64
+/// backend's maps are still decided while compiling.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_runtime_maps_run() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_maps_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_maps_{stamp}.bin"));
+    let source = concat!(
+        "import std.map\n",
+        "mutable counts = Map#empty()\n",
+        "foreach (word in [\"the\", \"fox\", \"the\", \"dog\", \"the\"]) {\n",
+        "  counts = Map#put(counts, word, Map#getOrElse(counts, word, 0) + 1)\n",
+        "}\n",
+        "println(counts)\n",
+        "println(Map#keys(counts))\n",
+        "println(Map#values(counts))\n",
+        "println(Map#size(counts))\n",
+        "println(Map#get(counts, \"the\"))\n",
+        "println(Map#containsKey(counts, \"cat\"))\n",
+        "foreach (entry in counts.toPairs()) { println(entry.key + \"=\" + entry.value) }\n",
+    );
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let expected = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("evaluator should run");
+    assert!(
+        expected.status.success(),
+        "the evaluator should run this program\nstderr:\n{}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "darwin native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path).output().expect("Mach-O should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&expected.stdout),
+        "a map built at run time should print what the evaluator prints"
+    );
+}
+
 /// Annotated top-level functions on the direct aarch64 backend:
 /// AAPCS64 calls, deep recursion, mutual recursion with forward
 /// references, multi-argument calls — asserted against the

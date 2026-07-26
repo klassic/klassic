@@ -6512,6 +6512,8 @@ impl NativeCodeGenerator {
             | "abs"
             | "size"
             | "Map#size"
+            | "Map#keys"
+            | "Map#values"
             | "Set#size"
             | "isEmpty"
             | "Map#isEmpty"
@@ -8165,6 +8167,24 @@ impl NativeCodeGenerator {
             "contains" => self.compile_static_contains_direct(arguments, span),
             "double" | "sqrt" | "int" | "floor" | "ceil" | "abs" => {
                 self.compile_numeric_helper(name.as_str(), arguments, span)
+            }
+            // A map's two halves as lists, in insertion order. Both are read
+            // off the compile-time entries, which is what `std.map`'s
+            // `toPairs` and `foldMap` walk.
+            "Map#keys" | "Map#values" => {
+                if arguments.len() != 1 {
+                    return Err(Diagnostic::compile(
+                        span,
+                        format!("{name} expects 1 argument but got {}", arguments.len()),
+                    ));
+                }
+                let entries = self.static_map_entries_from_expr(&arguments[0], span)?;
+                let taken = entries
+                    .into_iter()
+                    .map(|(key, value)| if name == "Map#keys" { key } else { value })
+                    .collect();
+                let label = self.intern_static_list(taken);
+                Ok(NativeValue::StaticList { label })
             }
             "size" | "Map#size" | "Set#size" => {
                 if arguments.len() != 1 {

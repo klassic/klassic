@@ -1470,6 +1470,27 @@ cargo run -- -e "1 + 2"
 - REPL
 - Exit-code policy and error presentation
 
+### Map entries, records in lists, and values that may not be there
+
+A map read as entries is where several representations meet, and closing it
+took one change per representation. On the aarch64 backend a list element can
+now be a record (`ListElem::Record`), which is what `toPairs()` hands back; a
+record field can be a nullable, which is what `Map#get` puts in one; printing a
+record is split into an inline form so a nested one renders without a newline
+(a record that transitively holds itself is rejected rather than printed
+forever); and appending a nullable to a string writes the value or the word
+`null`, matching the evaluator. The compile-time inference that decides a
+function's return type gained three cases it was silently failing on --
+`#Name(...)` construction, `Map#keys`/`Map#values`, and a *lambda* passed to a
+def, which is not a value and so could not be typed as one. Without the last
+of those, any function handing a lambda on to another (`words()` calling
+`stdlibFilter`) could not be typed at all. On the x86-64 backend `Map#keys`
+and `Map#values` read the compile-time entries into a static list, which is
+what lets the same `toPairs()` compile there. Runtime-grown maps
+(`Map#empty`/`Map#put` in a loop) remain aarch64-only: x86-64 holds a map as a
+compile-time `StaticMap` or a fixed-capacity `RuntimeList`, neither of which
+can grow by an amount only known while running.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.

@@ -1247,6 +1247,9 @@ enum ListElem {
     /// An element that is one of this backend's own enums, which is a pointer
     /// like a string is -- `JArr(items: List<Json>)` is a list of them.
     Enum(u32),
+    /// An element that is a record, which is a pointer too. A list of them is
+    /// what `toPairs()` hands back.
+    Record(u32),
     /// An element that is itself a list: `depth` levels of list over `base`.
     /// `List<List<Int>>`'s element is `Nested { depth: 1, base: Int }` and
     /// `List<List<List<Int>>>`'s is `depth: 2`.
@@ -1288,7 +1291,7 @@ impl ListElem {
             ListElem::Int => Some(ScalarElem::Int),
             ListElem::Bool => Some(ScalarElem::Bool),
             ListElem::Str => Some(ScalarElem::Str),
-            ListElem::Enum(_) | ListElem::Nested { .. } => None,
+            ListElem::Enum(_) | ListElem::Record(_) | ListElem::Nested { .. } => None,
         }
     }
 
@@ -1462,6 +1465,7 @@ fn elem_value_type(elem: ListElem) -> ValueType {
         ListElem::Bool => ValueType::Bool,
         ListElem::Str => ValueType::Str,
         ListElem::Enum(shape) => ValueType::Enum(shape),
+        ListElem::Record(index) => ValueType::Record(index),
         ListElem::Nested { .. } => ValueType::List(
             elem.nested_inner()
                 .expect("a nested element is a list of its inner element"),
@@ -1616,6 +1620,7 @@ fn list_elem_of(ty: ValueType) -> Option<ListElem> {
         ValueType::Bool => Some(ListElem::Bool),
         ValueType::Str => Some(ListElem::Str),
         ValueType::Enum(shape) => Some(ListElem::Enum(shape)),
+        ValueType::Record(index) => Some(ListElem::Record(index)),
         // A list of lists: one more level over whatever the inner list holds.
         ValueType::List(inner) => Some(match inner.as_scalar() {
             Some(base) => ListElem::Nested { depth: 1, base },
@@ -1706,6 +1711,9 @@ struct Emitter {
     /// Nominal record declarations plus interned structural shapes;
     /// `ValueType::Record` carries an index into this table.
     records: Vec<RecordInfo>,
+    /// The records whose rendering is currently being emitted, so a record
+    /// that holds itself is rejected instead of printed forever.
+    printing_records: Vec<u32>,
     /// Lazily emitted set helpers (called via `bl`): scalar / string
     /// membership scans and a cons-list reverse.
     member_scalar_label: Option<Label>,
@@ -3802,6 +3810,33 @@ impl Emitter {
                     self.emit_heap_string_copy();
                     rhs_ty = ValueType::Str;
                 }
+                // A value that may not be there appends as the word `null`
+                // when it is not, and as itself when it is -- which is what
+                // reading a map entry's value into a message does.
+                ValueType::Nullable(elem) => {
+                    let null_label = self.asm.new_label();
+                    let end_label = self.asm.new_label();
+                    self.asm
+                        .branch(null_label, BranchKind::CompareZero(Reg::X0));
+                    if is_boxed_scalar(elem_value_type(elem)) {
+                        self.emit_unbox_scalar();
+                    }
+                    match elem {
+                        ListElem::Int => self.emit_int_to_str(),
+                        ListElem::Bool => self.emit_bool_to_str(),
+                        ListElem::Str => self.emit_heap_string_copy(),
+                        _ => {
+                            return Err(unsupported(rhs.span(), "appending a value of this type"));
+                        }
+                    }
+                    self.asm.branch(end_label, BranchKind::Unconditional);
+                    self.asm.bind(null_label);
+                    let offset = self.asm.intern_string_object("null");
+                    self.asm.load_rodata_address(Reg::X0, offset);
+                    self.emit_heap_string_copy();
+                    self.asm.bind(end_label);
+                    rhs_ty = ValueType::Str;
+                }
                 _ => return Err(unsupported(rhs.span(), "appending a value of this type")),
             }
         }
@@ -5601,6 +5636,19 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X2);
     }
 
+    /// Prepend a fresh `[key][value]` entry, taken from those two slots, to
+    /// the chain in `acc`.
+    fn emit_put_entry(&mut self, key_slot: u32, value_slot: u32, acc: u32) {
+        self.asm.load_local(Reg::X0, key_slot);
+        self.push_rooted(Reg::X0);
+        self.asm.load_local(Reg::X0, value_slot);
+        self.emit_cons_cell(); // entry = [key][value]
+        self.push_rooted(Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_cons_cell(); // chain cell = [entry][rest]
+        self.asm.store_local(Reg::X0, acc);
+    }
+
     /// The entry whose key equals the one in x1, or 0 when there is none:
     /// x0 = map chain, x1 = key (a boxed scalar or a string pointer)
     /// -> x0 = entry pointer or 0.
@@ -5853,6 +5901,9 @@ impl Emitter {
             ListElem::Enum(_) => {
                 return Err(unsupported(span, "printing an enum element"));
             }
+            ListElem::Record(index) => {
+                self.emit_print_record_inline(index, span)?;
+            }
             // A nested element is a list: build its text with the same
             // renderer and write that. The recursion is at codegen time and
             // terminates because the depth decreases.
@@ -5903,11 +5954,31 @@ impl Emitter {
     /// `#Name(v1, v2)` for nominal records, `#(v1, v2)` for
     /// structural shapes. Scalar and string fields only for now.
     fn emit_println_record(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
+        self.emit_print_record_inline(index, span)?;
+        self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+        Ok(())
+    }
+
+    /// The same rendering without the newline, which is what a record nested
+    /// inside a list or another record needs. A record that (transitively)
+    /// holds itself would print forever, so the stack of records being
+    /// rendered is checked rather than recursed into.
+    fn emit_print_record_inline(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
+        if self.printing_records.contains(&index) {
+            return Err(unsupported(span, "printing a record that holds itself"));
+        }
+        self.printing_records.push(index);
+        let result = self.emit_print_record_fields(index, span);
+        self.printing_records.pop();
+        result
+    }
+
+    fn emit_print_record_fields(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
         let info = &self.records[index as usize];
         let opener = format!("#{}(", info.name);
         let fields = info.fields.clone();
         for (_, ty) in &fields {
-            if list_elem_of(*ty).is_none() {
+            if list_elem_of(*ty).is_none() && !matches!(ty, ValueType::Nullable(_)) {
                 return Err(unsupported(span, "printing a record with this field type"));
             }
         }
@@ -5920,6 +5991,24 @@ impl Emitter {
             self.asm.pop(Reg::X0);
             self.asm.push(Reg::X0);
             self.emit_gc_load_ptr(Reg::X0, (position * 8) as u32); // barriered
+            // A field that may not be there -- `Map#get`'s answer is the one
+            // every map entry carries -- prints the word `null` when it is
+            // not, which is what the evaluator prints.
+            if let ValueType::Nullable(elem) = *ty {
+                let null_label = self.asm.new_label();
+                let end_label = self.asm.new_label();
+                self.asm
+                    .branch(null_label, BranchKind::CompareZero(Reg::X0));
+                if is_boxed_scalar(elem_value_type(elem)) {
+                    self.emit_unbox_scalar();
+                }
+                self.emit_print_elem(elem, span)?;
+                self.asm.branch(end_label, BranchKind::Unconditional);
+                self.asm.bind(null_label);
+                self.asm.emit_write_rodata(STDOUT_FD, b"null");
+                self.asm.bind(end_label);
+                continue;
+            }
             // Scalar fields are boxed in the POINTER_RECORD; unbox before
             // printing (string fields are already the pointer).
             if is_boxed_scalar(*ty) {
@@ -5928,7 +6017,7 @@ impl Emitter {
             self.emit_print_elem(list_elem_of(*ty).expect("checked above"), span)?;
         }
         self.asm.pop(Reg::X0); // discard the saved object
-        self.asm.emit_write_rodata(STDOUT_FD, b")\n");
+        self.asm.emit_write_rodata(STDOUT_FD, b")");
         Ok(())
     }
 
@@ -6253,6 +6342,167 @@ impl Emitter {
                 self.emit_gc_load_ptr(Reg::X0, 8); // barriered: next is a pointer
                 self.asm.bind(end);
                 Ok(Some(ty))
+            }
+            // `Map#empty()`: the empty chain, which is the null pointer.
+            ("Map#empty", 0) => {
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(Some(ValueType::EmptyMap))
+            }
+            // `Map#put(m, key, value)`: a fresh map with that binding. An
+            // existing key keeps its position and takes the new value; a new
+            // one goes on the end, which is the evaluator's own order.
+            ("Map#put", 3) => {
+                let mark = self.open_temp_roots();
+                let map_ty = self.expression(&arguments[0])?;
+                let existing = match map_ty {
+                    ValueType::Map(key, value) => Some((key, value)),
+                    ValueType::EmptyMap => None,
+                    _ => return Err(unsupported(span, "a map builtin on a non-map")),
+                };
+                let cursor = self.reserve_locals(24);
+                let acc = cursor + 8;
+                let replaced = cursor + 16;
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                self.asm.store_local(Reg::X0, replaced);
+
+                // The key and value are rooted for the whole walk: every entry
+                // copied along the way allocates.
+                let key_ty = self.expression(&arguments[1])?;
+                let Some(key_elem) = list_elem_of(key_ty) else {
+                    return Err(unsupported(arguments[1].span(), "a map key of this type"));
+                };
+                if let Some((existing_key, _)) = existing
+                    && existing_key != key_elem
+                {
+                    return Err(unsupported(arguments[1].span(), "mixed map key types"));
+                }
+                if is_boxed_scalar(key_ty) {
+                    self.emit_box_scalar();
+                }
+                let key_slot = self.reserve_locals(16);
+                let value_slot = key_slot + 8;
+                self.asm.store_local(Reg::X0, key_slot);
+                self.emit_root_frame_slot(key_slot);
+                let value_ty = self.expression(&arguments[2])?;
+                let Some(value_elem) = list_elem_of(value_ty) else {
+                    return Err(unsupported(arguments[2].span(), "a map value of this type"));
+                };
+                if let Some((_, existing_value)) = existing
+                    && existing_value != value_elem
+                {
+                    return Err(unsupported(arguments[2].span(), "mixed map value types"));
+                }
+                if is_boxed_scalar(value_ty) {
+                    self.emit_box_scalar();
+                }
+                self.asm.store_local(Reg::X0, value_slot);
+                self.emit_root_frame_slot(value_slot);
+
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                let keep = self.asm.new_label();
+                let next = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // this entry
+                self.push_rooted(Reg::X0);
+                self.emit_gc_load_ptr(Reg::X0, 0); // its key
+                if is_boxed_scalar(elem_value_type(key_elem)) {
+                    self.emit_unbox_scalar();
+                }
+                self.asm.load_local(Reg::X1, key_slot);
+                match key_elem {
+                    ListElem::Str => self.emit_str_eq(),
+                    _ => {
+                        if is_boxed_scalar(elem_value_type(key_elem)) {
+                            self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
+                        }
+                        self.asm.cmp_reg(Reg::X0, Reg::X1);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                    }
+                }
+                self.asm.branch(keep, BranchKind::CompareZero(Reg::X0));
+                self.pop_rooted(Reg::X1); // the old entry, replaced
+                self.asm.mov_imm64(Reg::X0, 1);
+                self.asm.store_local(Reg::X0, replaced);
+                self.emit_put_entry(key_slot, value_slot, acc);
+                self.asm.branch(next, BranchKind::Unconditional);
+                self.asm.bind(keep);
+                self.pop_rooted(Reg::X0); // the entry, kept as it is
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.bind(next);
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                // A key that was not there goes on the end, which is the front
+                // of the accumulator before it is reversed.
+                let appended = self.asm.new_label();
+                self.asm.load_local(Reg::X0, replaced);
+                self.asm
+                    .branch(appended, BranchKind::CompareNonZero(Reg::X0));
+                self.emit_put_entry(key_slot, value_slot, acc);
+                self.asm.bind(appended);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Map(key_elem, value_elem)))
+            }
+            // `Map#keys(m)` / `Map#values(m)`: one half of every entry, in
+            // insertion order.
+            ("Map#keys", 1) | ("Map#values", 1) => {
+                let mark = self.open_temp_roots();
+                let map_ty = self.expression(&arguments[0])?;
+                let (key_elem, value_elem) = match map_ty {
+                    ValueType::Map(key, value) => (key, value),
+                    ValueType::EmptyMap => {
+                        self.close_temp_roots(mark);
+                        self.asm.mov_imm64(Reg::X0, 0);
+                        return Ok(Some(ValueType::EmptyList));
+                    }
+                    _ => return Err(unsupported(span, "a map builtin on a non-map")),
+                };
+                let wants_keys = name.ends_with("keys");
+                let field = if wants_keys { 0 } else { 8 };
+                let elem = if wants_keys { key_elem } else { value_elem };
+                let cursor = self.reserve_locals(16);
+                let acc = cursor + 8;
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // entry
+                self.emit_gc_load_ptr(Reg::X0, field); // its key or value
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::List(elem)))
             }
             ("isEmpty", 1) | ("Map#isEmpty", 1) => {
                 let ty = self.expression(&arguments[0])?;
@@ -7195,7 +7445,7 @@ impl Emitter {
             ListElem::Int => self.emit_int_to_str(),
             ListElem::Bool => self.emit_bool_to_str(),
             ListElem::Str => {}
-            ListElem::Enum(_) => {
+            ListElem::Enum(_) | ListElem::Record(_) => {
                 return Err(unsupported(span, "rendering an enum element"));
             }
             // Same renderer one level down; the element pointer is already in
@@ -7559,6 +7809,54 @@ impl Emitter {
             // Typed the way the emitter types it, so an `if` with a `null`
             // branch predicts the nullable join rather than the other branch.
             Expr::Null { .. } => Some(ValueType::Null),
+            // `#Name(a, b)`. A generic record's fields take their types from
+            // the arguments, which is the same rule compiling one uses -- so
+            // predicting one interns the shape compilation would intern, and
+            // both agree on the index.
+            Expr::RecordConstructor {
+                name, arguments, ..
+            } => {
+                if let Some(index) = self
+                    .records
+                    .iter()
+                    .position(|record| record.usable && record.name == *name)
+                    .filter(|_| {
+                        !self.generic_records.iter().any(|record| {
+                            record.name == *name && record.fields.len() == arguments.len()
+                        })
+                    })
+                {
+                    return Some(ValueType::Record(index as u32));
+                }
+                let declared = self
+                    .generic_records
+                    .iter()
+                    .find(|record| record.name == *name && record.fields.len() == arguments.len())
+                    .cloned()?;
+                let mut typed = Vec::with_capacity(arguments.len());
+                for (argument, (field, _)) in arguments.iter().zip(declared.fields.iter()) {
+                    let ty = self.static_type_under(argument, locals, depth + 1)?;
+                    if ty == ValueType::Unit || ty == ValueType::Never {
+                        return None;
+                    }
+                    typed.push((field.clone(), ty));
+                }
+                let index = match self.records.iter().position(|record| {
+                    record.usable && record.name == *name && record.fields == typed
+                }) {
+                    Some(index) => index,
+                    None => {
+                        self.records.push(RecordInfo {
+                            name: name.clone(),
+                            fields: typed,
+                            lambda_fields: Vec::new(),
+                            usable: true,
+                        });
+                        self.records.len() - 1
+                    }
+                };
+                Some(ValueType::Record(index as u32))
+            }
             // Collection literals over locals: the whole-program inference
             // cannot see these bindings, so the element type is inferred here.
             // `unit(x) = [x]` in a Monad instance is exactly this shape.
@@ -7921,6 +8219,21 @@ impl Emitter {
                             _ => None,
                         };
                     }
+                    // A map's keys and values are lists of its two halves,
+                    // which is what types every fold that walks a map --
+                    // `std.map`'s `toPairs` among them.
+                    "Map#keys" | "keys" => {
+                        return match first_type {
+                            Some(ValueType::Map(key, _)) => Some(ValueType::List(key)),
+                            _ => None,
+                        };
+                    }
+                    "Map#values" | "values" => {
+                        return match first_type {
+                            Some(ValueType::Map(_, value)) => Some(ValueType::List(value)),
+                            _ => None,
+                        };
+                    }
                     "getOrElse" | "Map#getOrElse" => {
                         return match first_type {
                             Some(ValueType::Map(_, value)) => Some(elem_value_type(value)),
@@ -8004,11 +8317,46 @@ impl Emitter {
                     let params = &generic.params;
                     let body = &generic.body;
                     let mut callee_locals = Vec::with_capacity(params.len());
+                    // A function argument is not a value, so it cannot be
+                    // typed as one: it is bound as a lambda for the callee,
+                    // the way compiling the specialisation binds it. Without
+                    // this a def that hands a lambda on -- `words()` calling
+                    // `stdlibFilter` -- could not be typed at all.
+                    let mut callee_lambdas: Vec<(String, usize)> = Vec::new();
                     for (param, argument) in params.iter().zip(arguments.iter()) {
+                        if let Expr::Lambda {
+                            params: lambda_params,
+                            body: lambda_body,
+                            ..
+                        } = argument
+                        {
+                            let index = self
+                                .intern_lambda(lambda_params.clone(), lambda_body.as_ref().clone());
+                            callee_lambdas.push((param.clone(), index));
+                            continue;
+                        }
+                        if let Expr::Identifier { name, .. } = argument
+                            && let Some(index) = self.lookup_lambda(name)
+                        {
+                            callee_lambdas.push((param.clone(), index));
+                            continue;
+                        }
                         let ty = self.static_type_under(argument, locals, depth + 1)?;
                         callee_locals.push((param.clone(), ty));
                     }
-                    return self.static_type_under(body, &mut callee_locals, depth + 1);
+                    if callee_lambdas.is_empty() {
+                        return self.static_type_under(body, &mut callee_locals, depth + 1);
+                    }
+                    self.push_binding_scopes();
+                    for (param, lambda) in &callee_lambdas {
+                        self.lambda_bindings
+                            .last_mut()
+                            .expect("emitter lambda scope")
+                            .insert(param.clone(), *lambda);
+                    }
+                    let predicted = self.static_type_under(body, &mut callee_locals, depth + 1);
+                    self.pop_binding_scopes();
+                    return predicted;
                 }
                 self.static_type_of(expr)
             }
@@ -8972,7 +9320,10 @@ impl Emitter {
                         self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
                         self.asm.bind(bool_end);
                     }
-                    ListElem::Double | ListElem::Enum(_) | ListElem::Nested { .. } => {
+                    ListElem::Double
+                    | ListElem::Enum(_)
+                    | ListElem::Record(_)
+                    | ListElem::Nested { .. } => {
                         return Err(unsupported(
                             argument.span(),
                             &format!("printing a nullable {elem:?}"),
