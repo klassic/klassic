@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 Klassic is a statically typed object-functional programming language implemented
-as a Rust 2024 Cargo workspace (crate version 0.7.0). The `klassic` executable is
+as a Rust 2024 Cargo workspace (crate version 0.8.0). The `klassic` executable is
 both an evaluator/REPL and a native compiler that writes executables **byte by
 byte** — ELF64 on Linux x86_64, ad-hoc-signed Mach-O on Apple Silicon, PE64 on
 Windows x86_64 — with no `cc`/`as`/`ld`/`codesign`/`link.exe` in the loop. The
