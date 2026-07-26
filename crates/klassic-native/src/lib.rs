@@ -26986,12 +26986,13 @@ impl NativeCodeGenerator {
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity(name, arguments, 2, span)?;
         let input = self.compile_expr(&arguments[0])?;
-        let Some(input) = self.native_string_ref(input) else {
-            return Err(unsupported(span, &format!("native {name} for non-string")));
+        let context = format!("native {name} for non-string");
+        let Some(input) = self.native_string_ref_or_copy(input, span, &context) else {
+            return Err(unsupported(span, &context));
         };
         let needle = self.compile_expr(&arguments[1])?;
-        let Some(needle) = self.native_string_ref(needle) else {
-            return Err(unsupported(span, &format!("native {name} for non-string")));
+        let Some(needle) = self.native_string_ref_or_copy(needle, span, &context) else {
+            return Err(unsupported(span, &context));
         };
         match name {
             "startsWith" => self.emit_native_string_starts_with(input, needle),
@@ -34183,6 +34184,26 @@ impl NativeCodeGenerator {
         } else {
             value
         }
+    }
+
+    /// The same as `native_string_ref`, but a heap string is copied into a
+    /// scratch buffer pair first. An extension method's `this: String`
+    /// parameter arrives as a heap string, so without this every string
+    /// builtin written as `this.startsWith(...)` was refused.
+    fn native_string_ref_or_copy(
+        &mut self,
+        value: NativeValue,
+        span: Span,
+        context: &str,
+    ) -> Option<NativeStringRef> {
+        if let Some(reference) = self.native_string_ref(value) {
+            return Some(reference);
+        }
+        if value != NativeValue::HeapString {
+            return None;
+        }
+        let copied = self.emit_heap_string_to_runtime_string_value(span, context);
+        self.native_string_ref(copied)
     }
 
     fn native_string_ref(&self, value: NativeValue) -> Option<NativeStringRef> {

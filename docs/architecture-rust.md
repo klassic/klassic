@@ -1667,6 +1667,20 @@ the representation that would replace them exists and is proven. Routing the
 builtins through it is a middle-end lowering (map operations to an internal
 enum chain plus the helpers that walk it), not new machine code.
 
+### A string the backend held in the wrong shape
+
+An extension method's `this: String` parameter arrives as a *heap* string,
+while the x86-64 string builtins wanted the other shape of string -- a pair of
+data labels. So `def startsWithText(prefix) = this.startsWith(prefix)`, and
+every `std.string` method written that way, was refused there while compiling
+fine on arm64. The predicate helpers copy a heap string into a scratch pair
+now, which is what the environment-key path already did.
+
+`contains` means two things -- membership in a set, and a substring in a
+string -- and the aarch64 backend only had the first, so `containsText` failed
+there. It dispatches on the receiver now, reusing the byte search `indexOf`
+runs.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.

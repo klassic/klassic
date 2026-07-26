@@ -7394,6 +7394,21 @@ impl Emitter {
             }
             ("contains", 2) | ("Set#contains", 2) => {
                 let set_ty = self.expression(&arguments[0])?;
+                // `contains` reads as membership on a set and as substring
+                // containment on a string -- the evaluator dispatches on the
+                // receiver, and `std.string`'s `containsText` is the second.
+                if set_ty == ValueType::Str {
+                    self.push_rooted(Reg::X0);
+                    if self.expression(&arguments[1])? != ValueType::Str {
+                        return Err(unsupported(span, "contains with a non-string needle"));
+                    }
+                    self.asm.mov_reg(Reg::X1, Reg::X0);
+                    self.pop_rooted(Reg::X0);
+                    self.emit_str_index_of(false);
+                    self.asm.cmp_imm(Reg::X0, 0);
+                    self.asm.cset(Reg::X0, Cond::Ge);
+                    return Ok(Some(ValueType::Bool));
+                }
                 let elem = match set_ty {
                     ValueType::Set(elem) => Some(elem),
                     ValueType::EmptySet => None,
