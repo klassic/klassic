@@ -22741,6 +22741,65 @@ fn native_build_refuses_a_list_built_in_a_recursive_function() {
     );
 }
 
+/// The program the x86-64 backend refuses -- a list built inside a recursive
+/// function out of a list that only exists while the program runs -- run on
+/// Apple Silicon, where every list is a GC-allocated chain and each
+/// activation therefore builds its own. This is the parity story in one
+/// test: the same source, refused there and correct here.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_recursive_list_build_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_reccons_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_reccons_{stamp}.bin"));
+    let source = concat!(
+        "def copyAll(xs: List<String>): List<String> =\n",
+        "  if (isEmpty(xs)) [] else cons(head(xs))(copyAll(tail(xs)))\n",
+        "def dropEmpty(xs: List<String>): List<String> =\n",
+        "  if (isEmpty(xs)) [] else if (isEmptyString(head(xs))) dropEmpty(tail(xs))\n",
+        "  else cons(head(xs))(dropEmpty(tail(xs)))\n",
+        "println(copyAll(split(\"a b c\", \" \")))\n",
+        "println(dropEmpty(split(\"a  b\", \" \")))\n",
+    );
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let expected = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("evaluator should run");
+    assert!(expected.status.success());
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "darwin native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path).output().expect("Mach-O should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&expected.stdout),
+        "a list built inside a recursive function should print what the evaluator prints"
+    );
+}
+
 /// Maps built while the program runs, on Apple Silicon: `Map#empty` and
 /// `Map#put` are the shape every counting program has, and the arm64 backend
 /// stores a map as a chain of `[key][value]` entries it can grow. Asserted
