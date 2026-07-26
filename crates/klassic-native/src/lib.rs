@@ -14744,6 +14744,11 @@ impl NativeCodeGenerator {
         let done = self.asm.create_text_label();
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Greater, nonzero);
+        // The answer is read out of R9 below, so the zero case has to put it
+        // there. Without this the register still holds the previous
+        // `Math#sqrtInt` in the same program, and `Math#sqrtInt(0)` answered
+        // with that instead of 0.
+        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
         self.asm.jmp_label(done);
         self.asm.bind_text_label(nonzero);
         // R8 = n (preserved across the loop).

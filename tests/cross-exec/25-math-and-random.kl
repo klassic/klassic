@@ -1,0 +1,49 @@
+// Cross-target fixture: the integer math helpers and the seeded generator.
+//
+// `Math#sqrtInt(0)` is here for a reason: the x86-64 backend read its answer
+// out of a register the zero case never wrote, so a program that took a square
+// root earlier got that earlier answer back. A single call cannot catch that --
+// it needs a *previous* call to leave something behind, which is why the zero
+// case below follows a non-zero one.
+//
+// The generator is a 64-bit LCG whose high half is the answer, so a seeded
+// program prints a fixed sequence. Every target has to print the same one, or
+// a program that seeds for reproducibility is not reproducible across them.
+
+println(Math#gcd(12, 18))
+println(Math#gcd(18, 12))
+println(Math#gcd(-12, 18))
+println(Math#gcd(7, 13))
+println(Math#gcd(0, 5))
+println(Math#gcd(5, 0))
+assertResult(6)(Math#gcd(12, 18))
+assertResult(1)(Math#gcd(7, 13))
+
+println(Math#powInt(2, 10))
+println(Math#powInt(3, 0))
+println(Math#powInt(1, 63))
+println(Math#powInt(-2, 3))
+println(Math#powInt(10, 1))
+assertResult(1024)(Math#powInt(2, 10))
+assertResult(-8)(Math#powInt(-2, 3))
+
+// The non-zero call comes first on purpose; see the note above.
+println(Math#sqrtInt(17))
+println(Math#sqrtInt(0))
+println(Math#sqrtInt(1))
+println(Math#sqrtInt(16))
+println(Math#sqrtInt(9999))
+assertResult(0)(Math#sqrtInt(0))
+assertResult(99)(Math#sqrtInt(9999))
+
+// Seeded, so the sequence is fixed.
+Random#seed(42)
+println(Random#nextInt(100))
+println(Random#nextInt(100))
+println(Random#nextInt(7))
+Random#seed(42)
+println(Random#nextInt(100))
+Random#seed(1)
+println(Random#nextInt(1000))
+println(Random#nextInt(1))
+println("done")

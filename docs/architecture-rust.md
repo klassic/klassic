@@ -1560,6 +1560,22 @@ for arm64, let CI run it, read what the collector said.
   is about to be compiled, with the loop variable bound, because every turn
   after the first reads what the previous one wrote.
 
+### Integer math, the generator, and a register never written
+
+`Math#gcd` / `Math#powInt` / `Math#sqrtInt` and `Random#seed` /
+`Random#nextInt` are on the aarch64 backend now, by the evaluator's own
+algorithms: Euclid on the absolute values, square-and-multiply, Newton's
+iteration, and the 64-bit LCG whose high half is the answer. The generator's
+state is a `__DATA` cell reserved on first use, so a program that never asks
+for a random number carries no cell for one. A seeded program prints the same
+sequence on every target, which is the whole point of seeding.
+
+Writing the arm64 side turned up a bug in the x86-64 one: `Math#sqrtInt`
+returns its answer out of `r9`, and the `n == 0` fast path jumped to the exit
+without writing it. `Math#sqrtInt(0)` therefore answered with whatever the
+*previous* square root in the same program left in that register. A single
+call could not show it -- the fixture takes a root of 17 first, then of 0.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.

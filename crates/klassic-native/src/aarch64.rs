@@ -1727,6 +1727,10 @@ struct Emitter {
     printing_records: Vec<u32>,
     /// The same, for enums: a cons-style one holds its own shape.
     printing_enums: Vec<u32>,
+    /// The pseudo-random generator's state, reserved the first time a program
+    /// asks for a random number. Zero until seeded, which is where the
+    /// evaluator's own generator starts.
+    random_state_cell: Option<DataLabel>,
     /// Lazily emitted set helpers (called via `bl`): scalar / string
     /// membership scans and a cons-list reverse.
     member_scalar_label: Option<Label>,
@@ -6553,6 +6557,131 @@ impl Emitter {
                 self.close_temp_roots(mark);
                 Ok(Some(ValueType::Str))
             }
+            // `Random#seed(n)` / `Random#nextInt(bound)`: the evaluator's
+            // generator, which is a 64-bit LCG whose high half is the answer.
+            // The same constants and the same shift, so a seeded program
+            // prints the same numbers here as it does there.
+            ("Random#seed", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, "Random#seed of a non-Int"));
+                }
+                let cell = self.random_state_cell();
+                self.asm.load_data_address(Reg::X1, cell);
+                self.asm.str_imm(Reg::X0, Reg::X1, 0);
+                Ok(Some(ValueType::Unit))
+            }
+            ("Random#nextInt", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, "Random#nextInt of a non-Int"));
+                }
+                let cell = self.random_state_cell();
+                self.asm.mov_reg(Reg::X4, Reg::X0); // bound
+                self.asm.load_data_address(Reg::X1, cell);
+                self.asm.ldr_imm(Reg::X0, Reg::X1, 0);
+                self.asm.mov_imm64(Reg::X2, 6_364_136_223_846_793_005);
+                self.asm.mul_reg(Reg::X0, Reg::X0, Reg::X2);
+                self.asm.mov_imm64(Reg::X2, 1_442_695_040_888_963_407);
+                self.asm.add_reg(Reg::X0, Reg::X0, Reg::X2);
+                self.asm.str_imm(Reg::X0, Reg::X1, 0);
+                self.asm.lsr_imm(Reg::X0, Reg::X0, 32);
+                self.asm.sdiv_reg(Reg::X2, Reg::X0, Reg::X4);
+                self.asm.msub_reg(Reg::X0, Reg::X2, Reg::X4, Reg::X0);
+                Ok(Some(ValueType::Int))
+            }
+            // The `Math#*` integer helpers, by the evaluator's own algorithms:
+            // Euclid on the absolute values, square-and-multiply, and Newton's
+            // iteration. A negative exponent or radicand is a runtime error in
+            // the evaluator; here they answer 1 and 0, since this backend has
+            // no way to raise one.
+            ("Math#gcd", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, "Math#gcd of a non-Int"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Int {
+                    return Err(unsupported(span, "Math#gcd of a non-Int"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.asm.pop(Reg::X0);
+                for reg in [Reg::X0, Reg::X1] {
+                    let non_negative = self.asm.new_label();
+                    self.asm.cmp_imm(reg, 0);
+                    self.asm
+                        .branch(non_negative, BranchKind::Conditional(Cond::Ge));
+                    self.asm.mov_imm64(Reg::X2, 0);
+                    self.asm.sub_reg(reg, Reg::X2, reg);
+                    self.asm.bind(non_negative);
+                }
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X1));
+                self.asm.sdiv_reg(Reg::X2, Reg::X0, Reg::X1);
+                self.asm.msub_reg(Reg::X2, Reg::X2, Reg::X1, Reg::X0); // a % b
+                self.asm.mov_reg(Reg::X0, Reg::X1);
+                self.asm.mov_reg(Reg::X1, Reg::X2);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                Ok(Some(ValueType::Int))
+            }
+            ("Math#powInt", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, "Math#powInt of a non-Int"));
+                }
+                self.asm.push(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Int {
+                    return Err(unsupported(span, "Math#powInt of a non-Int"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0); // exponent
+                self.asm.pop(Reg::X2); // base
+                self.asm.mov_imm64(Reg::X0, 1); // result
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                let skip = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.cmp_imm(Reg::X1, 0);
+                self.asm.branch(done, BranchKind::Conditional(Cond::Le));
+                self.asm.mov_imm64(Reg::X3, 1);
+                self.asm.tst_reg(Reg::X1, Reg::X3);
+                self.asm.branch(skip, BranchKind::Conditional(Cond::Eq));
+                self.asm.mul_reg(Reg::X0, Reg::X0, Reg::X2);
+                self.asm.bind(skip);
+                self.asm.lsr_imm(Reg::X1, Reg::X1, 1);
+                self.asm.mul_reg(Reg::X2, Reg::X2, Reg::X2);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                Ok(Some(ValueType::Int))
+            }
+            ("Math#sqrtInt", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(span, "Math#sqrtInt of a non-Int"));
+                }
+                let done = self.asm.new_label();
+                let positive = self.asm.new_label();
+                self.asm.mov_reg(Reg::X1, Reg::X0); // n
+                self.asm.cmp_imm(Reg::X1, 0);
+                self.asm.branch(positive, BranchKind::Conditional(Cond::Gt));
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.branch(done, BranchKind::Unconditional);
+                self.asm.bind(positive);
+                // x = n; y = (x + 1) / 2; while y < x { x = y; y = (x + n/x)/2 }
+                self.asm.mov_reg(Reg::X0, Reg::X1); // x
+                self.asm.add_reg_imm(Reg::X2, Reg::X0, 1);
+                self.asm.mov_imm64(Reg::X3, 2);
+                self.asm.sdiv_reg(Reg::X2, Reg::X2, Reg::X3); // y
+                let loop_start = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.cmp_reg(Reg::X2, Reg::X0);
+                self.asm.branch(done, BranchKind::Conditional(Cond::Ge));
+                self.asm.mov_reg(Reg::X0, Reg::X2); // x = y
+                self.asm.sdiv_reg(Reg::X4, Reg::X1, Reg::X0); // n / x
+                self.asm.add_reg(Reg::X2, Reg::X0, Reg::X4);
+                self.asm.mov_imm64(Reg::X3, 2);
+                self.asm.sdiv_reg(Reg::X2, Reg::X2, Reg::X3);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                Ok(Some(ValueType::Int))
+            }
             ("startsWith", 2) => {
                 if self.expression(&arguments[0])? != ValueType::Str {
                     return Err(unsupported(span, "startsWith of a non-string"));
@@ -8770,7 +8899,8 @@ impl Emitter {
                     // evaluator's -- keeping this in step with the emitter
                     // matters, since a wrong guess is a rejected build.
                     "size" | "length" | "toInt" | "floor" | "int" | "ceil" | "Map#size"
-                    | "Set#size" | "indexOf" | "lastIndexOf" => {
+                    | "Set#size" | "indexOf" | "lastIndexOf" | "Math#gcd" | "Math#powInt"
+                    | "Math#sqrtInt" => {
                         return Some(ValueType::Int);
                     }
                     "isEmpty" | "contains" | "isEmptyString" | "matches" | "containsKey"
@@ -9750,6 +9880,19 @@ impl Emitter {
                     *entry = (slot, widened);
                     break;
                 }
+            }
+        }
+    }
+
+    /// The generator's state cell, reserved on first use so a program that
+    /// never asks for a random number carries no data section for one.
+    fn random_state_cell(&mut self) -> DataLabel {
+        match self.random_state_cell {
+            Some(cell) => cell,
+            None => {
+                let cell = self.asm.reserve_data_cells(1);
+                self.random_state_cell = Some(cell);
+                cell
             }
         }
     }
