@@ -1681,89 +1681,42 @@ string -- and the aarch64 backend only had the first, so `containsText` failed
 there. It dispatches on the receiver now, reusing the byte search `indexOf`
 runs.
 
-### Where the portable collection work resumes
+### Collections whose size is only known while running
 
-The route to `Map` and `List` values whose size is only known while running,
-on every backend, is to build them out of a self-referential enum -- a chain
-of GC cells, which both hand-emitted backends already allocate and walk. A
-*monomorphic* chain works end to end today: fixture 28 grows one in a loop,
-replaces on a repeated key, renders it, and agrees with the evaluator on all
-three targets under `--gc-stress`. A *generic* chain -- which is what a
-lowering would have to emit, since the desugar does not know the key and
-value types -- stops at two places:
+A `Map` or `List` that grows while the program runs is built out of a
+self-referential enum -- a chain of GC cells -- and that works on every
+backend now, generically. Fixture 31 grows one from the *empty case* in a
+loop, at two different key/value type pairs, and agrees with the evaluator on
+all three targets, including under `--gc-stress`; fixture 30 does the same
+with fully applied annotations and a hundred entries.
 
-It is **one** missing inference, and both backends want it. Narrowing the
-repro down to the smallest program that fails shows the same trigger on each:
-a generic helper called with the *empty case of its own enum*.
+Getting there took one inference, which both hand-emitted backends were
+missing in their own way. A call like `put(KMNil, "a", 1)` fixes nothing
+through its first argument -- the empty case of an enum carries no payloads,
+so the other variant's payload reprs stay open -- and both backends then read
+that variant against defaults: x86-64 compared a defaulted scalar to a
+string, aarch64 derived a return shape its own body did not produce. The
+arguments that *do* fix the type variables sit in the same argument list, so
+both now **solve the definition's type variables across every argument**
+(`key: 'k` given a string fixes `'k`) and give an enum-typed parameter whose
+own argument left them open the shape those solutions imply, read off the
+annotation it was declared with.
 
-    def kmPut(m: KM<'k,'v>, key: 'k, value: 'v): KM<'k,'v> = ...
-    kmPut(m, "b", 2)        // fine on both
-    kmPut(KMNil, "a", 1)    // rejected on both
+The two implementations differ where the backends do. aarch64 specialises per
+argument-type tuple, so the solving happens while the specialisation's
+signature is built. x86-64 inlines, so it happens in the binding loop -- and
+the solving has to sit *before* the per-value-kind binding paths, because a
+string argument binds as a constant and never reaches the slot-allocating arm
+that a heap pointer takes, and a string argument is exactly what fixes a
+`'k`. The body reads a parameter's shape out of its slot's entry, so the
+rewritten shape is published there once the whole argument list has been
+seen.
 
-`KMNil` carries no type arguments, so nothing fixes `'k` and `'v` at that
-call. x86-64 then defaults the other variant's payload reprs and rejects
-`k == key` as comparing a `Scalar` to a string; aarch64 derives a return
-shape that its own body does not produce, and rejects the body against its
-annotation. Everything else measured along the way works: shape propagation
-through an inlined generic call, through a `mutable` reassignment and through
-a slot read on x86-64; the same helper on both backends when the chain starts
-from a `KMCons` rather than the empty case.
-
-**The aarch64 half is done.** A specialisation now solves the definition's
-type variables across *all* the arguments -- a parameter annotated `'k` given
-a string fixes `'k` as `String` -- and an enum-typed parameter whose own
-argument left the variables open takes the shape those solutions imply,
-through the annotation it was declared with. `kmPut(KMNil, "a", 1)` and a
-chain grown from the empty case in a loop compile there now, and a
-macOS-gated test runs one.
-
-**The x86-64 half is measured but not landed.** Instrumenting the inline
-binding of `kmPut(KMNil, "a", 1)` shows exactly what a call site has to work
-with:
-
-    param=m     expected=Int  value=HeapPointer  flexible=true
-    param=key   expected=Int  value=StaticString flexible=true
-    param=value expected=Int  value=Int          flexible=true
-
-`KM<'k, 'v>` is not a type this backend models, so the parameter's expected
-value degrades to `Int` and the argument arrives as a bare `HeapPointer` --
-the shape is the only thing that says what its payloads are, and the empty
-case leaves them open. The two arguments that *do* fix the variables are
-right there in the same list, which is what makes the fix the same one
-aarch64 took. An attempt that threaded the annotation text onto
-`NativeFunction`, solved the variables during the binding loop and rewrote
-the slot's shape afterwards compiled but changed nothing observable, so it
-was not kept; the next step is to find where the body reads a parameter's
-shape (the slot's entry in `enum_shapes`, or the `pending_enum_shape` a slot
-read republishes) and make the rewritten shape reach *that*, rather than
-assuming the slot entry is enough.
-
-**What already works on every target, measured:** the same store written with
-*fully applied* annotations -- `kmGet(m: KM<String, Int>, ...)` rather than
-`KM<'k, 'v>` -- compiles and runs on all three, grown from the empty case in
-a loop, a hundred entries deep, agreeing with the evaluator under
-`--gc-stress` (fixture 30). So the representation, the growth, the lookup and
-the rendering are all portable today; the only thing that is not is writing
-the helpers *generically*. That also says what a lowering would have to
-produce to be portable now: monomorphic helpers, one set per key/value type
-pair it sees.
-
-The idea, restated: **recover the type arguments from the other arguments** -- `key: 'k` against a string fixes `'k`, `value: 'v` against an
-Int fixes `'v` -- rather than only from the enum-typed one. aarch64 already
-has the machinery to build a shape from inferred type arguments
-(`canonical_applied_enum_shape`), and x86-64 already has
-`generic_enum_annotation_shape` and `resolve_enum_shape`; what neither does is
-solve for the parameters across *all* of a call's arguments.
-
-Dropping the unresolved arm as dead instead is *not* sound: it was tried, and
-the next call -- whose value really is the other variant -- died with "match:
-no pattern matched" at run time. A compile-time rejection is the safer of the
-two, which is why the rejection stands.
-
-Two language-surface warts turned up alongside them, both worth fixing on
-their own: `x = if (c) a else b` does not parse without parentheses, and a
-`match` arm whose body ends in an assignment takes that assignment's type, so
-two arms ending in assignments to different types disagree.
+What is left is not a representation gap any more but a routing one: the
+*builtin* `Map` and `List` still use compile-time values or fixed-capacity
+buffers on x86-64, so `Map#put` in a loop and `words()` over a runtime list
+stay arm64-only. The chain they would be lowered to is now portable, and a
+lowering can emit its helpers generically rather than one set per type pair.
 
 ## Design Notes
 

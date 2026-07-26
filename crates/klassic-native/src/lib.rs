@@ -5978,6 +5978,14 @@ impl NativeCodeGenerator {
                         unsupported_recursive_inline,
                         inline_reason,
                         captured_top_level_names,
+                        param_annotations
+                            .iter()
+                            .map(|annotation| {
+                                annotation
+                                    .as_ref()
+                                    .map(|annotation| annotation.text.clone())
+                            })
+                            .collect(),
                     );
                 }
                 Expr::VarDecl {
@@ -6036,6 +6044,7 @@ impl NativeCodeGenerator {
                             // reason is never read.
                             String::new(),
                             HashSet::new(),
+                            vec![None; param_count],
                         );
                     }
                 }
@@ -6088,6 +6097,7 @@ impl NativeCodeGenerator {
         unsupported_recursive_inline: bool,
         inline_reason: String,
         captured_top_level_names: HashSet<String>,
+        param_annotation_texts: Vec<Option<String>>,
     ) {
         if self.functions.contains_key(&name) {
             return;
@@ -6103,6 +6113,7 @@ impl NativeCodeGenerator {
                 flexible_params,
                 param_unannotated,
                 param_enum_shapes,
+                param_annotation_texts,
                 return_value,
                 return_enum_shape,
                 body,
@@ -9726,6 +9737,8 @@ impl NativeCodeGenerator {
             ));
         }
         self.push_scope();
+        let mut solutions: Vec<(String, String)> = Vec::new();
+        let mut open_enum_slots: Vec<(VarSlot, String)> = Vec::new();
         for (index, ((param, expected_value), argument)) in function
             .params
             .iter()
@@ -9733,6 +9746,11 @@ impl NativeCodeGenerator {
             .zip(arguments)
             .enumerate()
         {
+            let annotation_text = function
+                .param_annotation_texts
+                .get(index)
+                .cloned()
+                .flatten();
             let flexible = function
                 .flexible_params
                 .get(index)
@@ -9745,6 +9763,19 @@ impl NativeCodeGenerator {
                 .unwrap_or(false);
             let static_argument = self.static_value_from_pure_expr(argument);
             let value = self.compile_expr(argument)?;
+            // Solved here rather than at any one binding path, because the
+            // paths differ by value kind: a string argument binds as a
+            // constant and never reaches the slot-allocating arm below, and
+            // it is exactly the argument that fixes a `'k`.
+            if let Some(text) = annotation_text.as_deref() {
+                let trimmed = text.trim();
+                if trimmed.starts_with('\'')
+                    && let Some(name) = native_value_annotation_name(value)
+                    && !solutions.iter().any(|(known, _)| known == trimmed)
+                {
+                    solutions.push((trimmed.to_string(), name));
+                }
+            }
             if matches!(expected_value, NativeValue::RuntimeString { .. }) {
                 if self.native_string_ref(value).is_none() {
                     self.pop_scope();
@@ -9826,6 +9857,16 @@ impl NativeCodeGenerator {
                 | NativeValue::RuntimeDouble => {
                     let slot = self.allocate_slot(param.clone(), value);
                     self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                    if let Some(text) = annotation_text
+                        && text.trim().contains('\'')
+                        && !text.trim().starts_with('\'')
+                        && self
+                            .enum_shapes
+                            .get(&slot.id)
+                            .is_none_or(shape_leaves_payloads_open)
+                    {
+                        open_enum_slots.push((slot, text.trim().to_string()));
+                    }
                     if let Some(value) = static_argument {
                         self.bind_static_value(param.clone(), value);
                     }
@@ -9848,6 +9889,22 @@ impl NativeCodeGenerator {
                 | NativeValue::BuiltinFunction { .. }
                 | NativeValue::RuntimeMapCallableDispatch(_) => {
                     self.bind_constant(param.clone(), value);
+                }
+            }
+        }
+        // The solutions are complete now, so an enum-typed parameter whose own
+        // argument left the variables open takes the shape they imply, read
+        // off the annotation it was declared with. `put(KMNil, "a", 1)` says
+        // nothing through its first argument -- the empty case carries no
+        // payloads -- while `key: 'k` and `value: 'v` say everything, and the
+        // body reads the parameter's shape out of its slot.
+        if !solutions.is_empty() {
+            let variables: Vec<String> = solutions.iter().map(|(name, _)| name.clone()).collect();
+            let names: Vec<String> = solutions.iter().map(|(_, name)| name.clone()).collect();
+            for (slot, annotation) in open_enum_slots {
+                let applied = substitute_type_variables(&annotation, &variables, &names);
+                if let Some(shape) = self.generic_enum_annotation_shape(&applied) {
+                    self.enum_shapes.insert(slot.id, shape);
                 }
             }
         }
@@ -39683,6 +39740,10 @@ struct NativeFunction {
     /// travels by pointer and the callee prologue binds the shape to
     /// its slot so matches inside the body resolve payload reprs.
     param_enum_shapes: Vec<Option<ConcreteEnumShape>>,
+    /// Each parameter's annotation as written, so a call site can solve the
+    /// definition's type variables from the arguments that fix them and read
+    /// the resulting shape off an annotation like `KM<'k, 'v>`.
+    param_annotation_texts: Vec<Option<String>>,
     return_value: NativeValue,
     /// Shape of the returned value when the return annotation names a
     /// fully-applied generic enum; published at call sites so a later
@@ -41459,6 +41520,54 @@ fn numeric_or_comparison_binary_value(
         )),
         _ => None,
     }
+}
+
+fn shape_leaves_payloads_open(shape: &ConcreteEnumShape) -> bool {
+    shape
+        .variants
+        .values()
+        .any(|variant| variant.fields.iter().any(|field| !field.resolved))
+}
+
+fn native_value_annotation_name(value: NativeValue) -> Option<String> {
+    Some(
+        match value {
+            NativeValue::Int => "Int",
+            NativeValue::Bool => "Boolean",
+            NativeValue::RuntimeDouble => "Double",
+            NativeValue::HeapString
+            | NativeValue::StaticString { .. }
+            | NativeValue::RuntimeString { .. } => "String",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+fn substitute_type_variables(text: &str, variables: &[String], names: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch == '\'' || ch.is_alphanumeric() || ch == '_' {
+            token.push(ch);
+            continue;
+        }
+        if !token.is_empty() {
+            match variables.iter().position(|variable| *variable == token) {
+                Some(at) => out.push_str(&names[at]),
+                None => out.push_str(&token),
+            }
+            token.clear();
+        }
+        out.push(ch);
+    }
+    if !token.is_empty() {
+        match variables.iter().position(|variable| *variable == token) {
+            Some(at) => out.push_str(&names[at]),
+            None => out.push_str(&token),
+        }
+    }
+    out
 }
 
 fn format_static_float(bits: u32) -> String {
