@@ -1,0 +1,65 @@
+// Cross-target fixture: writing and reading files, and rendering collections
+// into strings.
+//
+// Two things every backend has to agree with the evaluator about, both of which
+// are easy to get subtly wrong: `writeLines` joins with newlines and adds *no*
+// trailing one, and `lines` reading back does not report a trailing empty line.
+// So a file written from three lines reads back as three, not four.
+//
+// The interpolation cases matter alongside them because the way a list renders
+// into `#{...}` has to be the way it renders under `println`.
+
+val lines = ["Line 1", "Line 2", "Line 3"]
+FileOutput#writeLines("cross-exec-lines.txt", lines)
+val back = FileInput#lines("cross-exec-lines.txt")
+println(back)
+println(size(back))
+println("read: #{back}")
+assertResult(["Line 1", "Line 2", "Line 3"])(back)
+assertResult(3)(size(back))
+
+// A single line, i.e. nothing to join: still one line back, not two.
+FileOutput#writeLines("cross-exec-one.txt", ["only"])
+println(FileInput#lines("cross-exec-one.txt"))
+assertResult(["only"])(FileInput#lines("cross-exec-one.txt"))
+
+// Plain writing, appending and reading the whole text, so the newline the
+// append introduces is the only one in the file.
+FileOutput#write("cross-exec-all.txt", "first")
+FileOutput#append("cross-exec-all.txt", "\nsecond")
+println(FileInput#all("cross-exec-all.txt"))
+println(FileInput#lines("cross-exec-all.txt"))
+println(FileOutput#exists("cross-exec-all.txt"))
+assertResult(["first", "second"])(FileInput#lines("cross-exec-all.txt"))
+
+// Collections rendered into a string, which has to match `println`'s rendering.
+val ns = [1, 2, 3]
+println("ns=#{ns}")
+println("strs=#{["a", "b"]}")
+println("set=#{%(1, 2, 2)}")
+println("empty=#{[]}")
+println("nested=#{[[1, 2], [3]]}")
+println(ns)
+assertResult("ns=[1, 2, 3]")("ns=#{ns}")
+
+// The block form: `path FileInput#open { stream => ... }` hands the block the
+// path and answers with the block's value, and a braced block is how a trailing
+// function argument is written -- for a fold just as much as for a stream.
+val opened = "cross-exec-all.txt" FileInput#open {(stream) => FileInput#readAll(stream)}
+println(opened)
+println(FileInput#readLines("cross-exec-all.txt"))
+println(foldLeft([1, 2, 3, 4])(0){a, x => a + x})
+assertResult("first\nsecond")(opened)
+assertResult(10)(foldLeft([1, 2, 3, 4])(0){a, x => a + x})
+
+// A path in a binding rather than written at the call site: the same file, read
+// through a name.
+val named = "cross-exec-all.txt"
+println(FileOutput#exists(named))
+println(FileInput#all(named))
+
+FileOutput#delete("cross-exec-lines.txt")
+FileOutput#delete("cross-exec-one.txt")
+FileOutput#delete("cross-exec-all.txt")
+println(FileOutput#exists("cross-exec-all.txt"))
+println("done")

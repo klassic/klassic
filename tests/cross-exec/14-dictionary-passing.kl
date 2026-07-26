@@ -1,0 +1,59 @@
+// Cross-target fixture: typeclass dictionaries, including one that is built
+// from another.
+//
+// `Show_List_dict(Show_Int_dict)` is the shape worth having a fixture for: a
+// function whose *result* is a dictionary, whose lambdas use the dictionary it
+// was handed. Nothing here exists at run time on every backend -- a lambda has
+// no representation on the arm64 one -- so this is really a check that the
+// compile-time resolution agrees with the evaluator's runtime one.
+
+val Show_Int_dict = record {
+  show: (x: Int) => "Int(" + x + ")"
+}
+
+val Show_String_dict = record {
+  show: (x: String) => "Str(" + x + ")"
+}
+
+val Show_List_dict = (Show_a_dict: record { show: ('a) => String }) => record {
+  show: (xs: List<'a>) => {
+    "[" + join(map(xs)((x) => Show_a_dict.show(x)), ", ") + "]"
+  }
+}
+
+def display_impl(dict: record { show: ('a) => String }, x: 'a): String = dict.show(x)
+
+println(display_impl(Show_Int_dict, 42))
+println(display_impl(Show_String_dict, "hello"))
+println(display_impl(Show_List_dict(Show_Int_dict), [1, 2, 3]))
+println(display_impl(Show_List_dict(Show_String_dict), ["a", "b"]))
+assertResult("Int(42)")(display_impl(Show_Int_dict, 42))
+assertResult("[Int(1), Int(2)]")(display_impl(Show_List_dict(Show_Int_dict), [1, 2]))
+
+// The same dictionary used twice, and a list of one element, so the inner
+// dictionary is reached both once and repeatedly.
+val lists = Show_List_dict(Show_Int_dict)
+println(display_impl(lists, [7]))
+println(display_impl(lists, [1, 2, 3, 4]))
+assertResult("[Int(7)]")(display_impl(lists, [7]))
+
+// Typeclass instances declared over a type variable: which `show` a call means
+// is the argument's type, and the list one is not concrete at all.
+typeclass Show<'a> where {
+  show: ('a) => String
+}
+instance Show<Int> where {
+  def show(x: Int): String = "i" + x
+}
+instance Show<String> where {
+  def show(x: String): String = "s" + x
+}
+instance Show<List<'a>> where Show<'a> {
+  def show(xs: List<'a>): String = "<" + join(map(xs)((x) => show(x)), " ") + ">"
+}
+println(show(1))
+println(show("x"))
+println(show([1, 2, 3]))
+println(show(["a", "b"]))
+assertResult("<i1 i2>")(show([1, 2]))
+println("done")

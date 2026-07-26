@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use klassic_span::{Diagnostic, Span};
-use klassic_syntax::{BinaryOp, Expr, StringPart, UnaryOp};
+use klassic_syntax::{BinaryOp, Expr, MatchArm, Pattern, StringPart, UnaryOp};
 
 use crate::macho::{self, DataFixup, FixupSection};
 use crate::portable_asm;
@@ -400,6 +400,24 @@ impl Assembler {
         self.word(0xd100_03ff | (imm << 10));
     }
 
+    /// Reserve the frame now and fill in its size later. How many slots a body
+    /// needs is only known once it has been compiled -- temporaries for a fold,
+    /// a map, a collection literal and an inlined lambda are all taken as the
+    /// emission goes -- and predicting it from the syntax got the answer wrong
+    /// in a way that overwrote the saved frame record. So the instruction is
+    /// emitted with a zero immediate and patched from the high-water mark.
+    fn sub_sp_placeholder(&mut self) -> usize {
+        let at = self.code.len();
+        self.sub_sp_imm(0);
+        at
+    }
+
+    fn patch_sub_sp(&mut self, at: usize, imm: u32) {
+        debug_assert!(imm < 4096);
+        let instruction: u32 = 0xd100_03ff | (imm << 10);
+        self.code[at..at + 4].copy_from_slice(&instruction.to_le_bytes());
+    }
+
     /// `add sp, sp, #imm12`
     fn add_sp_imm(&mut self, imm: u32) {
         debug_assert!(imm < 4096);
@@ -705,7 +723,11 @@ impl Assembler {
         self.word(0x9e78_0000 | (dn << 5) | x as u32);
     }
 
-    /// `frintm dd, dn` — round toward minus infinity (floor).
+    /// `frintm dd, dn` — round toward minus infinity. Unused: this language's
+    /// `floor` truncates toward zero (see the `floor` builtin), so `fcvtzs`
+    /// alone is the whole operation. Kept because it is the natural companion
+    /// to `frintp` and the next rounding builtin will want it.
+    #[allow(dead_code)]
     fn frintm_d(&mut self, dd: u32, dn: u32) {
         self.word(0x1e65_4000 | (dn << 5) | dd);
     }
@@ -1222,6 +1244,9 @@ enum ListElem {
     Int,
     Bool,
     Str,
+    /// An element that is one of this backend's own enums, which is a pointer
+    /// like a string is -- `JArr(items: List<Json>)` is a list of them.
+    Enum(u32),
     /// An element that is itself a list: `depth` levels of list over `base`.
     /// `List<List<Int>>`'s element is `Nested { depth: 1, base: Int }` and
     /// `List<List<List<Int>>>`'s is `depth: 2`.
@@ -1263,7 +1288,7 @@ impl ListElem {
             ListElem::Int => Some(ScalarElem::Int),
             ListElem::Bool => Some(ScalarElem::Bool),
             ListElem::Str => Some(ScalarElem::Str),
-            ListElem::Nested { .. } => None,
+            ListElem::Enum(_) | ListElem::Nested { .. } => None,
         }
     }
 
@@ -1302,6 +1327,13 @@ enum ValueType {
     /// cons-cell list as `List` (membership and dedup are linear
     /// scans).
     Set(ListElem),
+    /// An insertion-ordered map, stored as a cons-cell chain of two-slot
+    /// entries `[key][value]` -- the same shape as a cons cell, so the
+    /// collector traces an entry with no new case. Lookup is a linear scan,
+    /// like `Set`'s membership.
+    Map(ListElem, ListElem),
+    /// The type of `%[]` before any entry pins it down.
+    EmptyMap,
     /// The type of `%()` before any element pins it down.
     EmptySet,
     /// A record value: index into the emitter's record table (nominal
@@ -1311,6 +1343,23 @@ enum ValueType {
     /// the enum desugaring builds around scalars.
     Ptr,
     Unit,
+    /// A generic enum's value: an index into the emitter's shape table, which
+    /// records what each variant carries. The shared lowering only erases
+    /// *monomorphic* enums, so a generic one arrives here as constructor calls
+    /// and `match` expressions, and what a variant's payload is has to be
+    /// tracked per value -- `Some(42)` and `Some("x")` are the same enum and
+    /// not the same shape.
+    Enum(u32),
+    /// `null` itself, before anything pins down what it stands in for. It is
+    /// the null pointer, so it goes into any reference slot; joined with a
+    /// value in an `if` it becomes a `Nullable`.
+    Null,
+    /// `null` *or* a value: the prelude's `stdlibFind` returns the element it
+    /// found or nothing, and one machine word has to carry both. Null is 0 and
+    /// the value is boxed exactly the way a list element is, so a null test
+    /// tells them apart -- which is also why the collector can trace this
+    /// like any other reference.
+    Nullable(ListElem),
     /// The "type" of diverging expressions (`__match_fail()`): merges
     /// with anything in an if join.
     Never,
@@ -1322,10 +1371,22 @@ enum ValueType {
 fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueType> {
     match (then_ty, else_ty) {
         (ValueType::Never, other) | (other, ValueType::Never) => Some(other),
+        // `null` joined with a value. The value's branch boxes it on the way
+        // out (see the `if` codegen), so the join is one word either way.
+        (ValueType::Null, other) | (other, ValueType::Null) if nullable_elem(other).is_some() => {
+            nullable_elem(other).map(ValueType::Nullable)
+        }
+        (ValueType::Nullable(elem), other) | (other, ValueType::Nullable(elem))
+            if nullable_elem(other) == Some(elem) =>
+        {
+            Some(ValueType::Nullable(elem))
+        }
         (ValueType::EmptyList, other @ ValueType::List(_))
         | (other @ ValueType::List(_), ValueType::EmptyList) => Some(other),
         (ValueType::EmptySet, other @ ValueType::Set(_))
         | (other @ ValueType::Set(_), ValueType::EmptySet) => Some(other),
+        (ValueType::EmptyMap, other @ ValueType::Map(..))
+        | (other @ ValueType::Map(..), ValueType::EmptyMap) => Some(other),
         (left, right) if left == right => Some(left),
         _ => None,
     }
@@ -1336,10 +1397,14 @@ fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueTyp
 /// polymorphic empty list into any list slot.
 fn assignable(actual: ValueType, expected: ValueType) -> bool {
     actual == expected
+        // `null` into any reference slot, including one that may hold nothing.
+        || (actual == ValueType::Null && is_heap_pointer(expected))
         || (actual == ValueType::EmptyList
             && matches!(expected, ValueType::List(_) | ValueType::EmptyList))
         || (actual == ValueType::EmptySet
             && matches!(expected, ValueType::Set(_) | ValueType::EmptySet))
+        || (actual == ValueType::EmptyMap
+            && matches!(expected, ValueType::Map(..) | ValueType::EmptyMap))
 }
 
 /// One nominal record declaration or interned structural shape:
@@ -1348,6 +1413,11 @@ fn assignable(actual: ValueType, expected: ValueType) -> bool {
 struct RecordInfo {
     name: String,
     fields: Vec<(String, ValueType)>,
+    /// Fields whose type is a function, as (name, position among *all* the
+    /// declared fields). A function has no runtime representation here, so such
+    /// a field is not part of the object -- it is resolved at compile time from
+    /// the binding that constructed it, exactly like a dictionary's.
+    lambda_fields: Vec<(String, usize)>,
     /// False when the declaration could not be typed (generics,
     /// function-typed fields): the entry stays so `Record` indices
     /// remain stable, but every lookup skips it.
@@ -1375,8 +1445,13 @@ fn is_heap_pointer(ty: ValueType) -> bool {
             | ValueType::EmptyList
             | ValueType::Set(_)
             | ValueType::EmptySet
+            | ValueType::Map(..)
+            | ValueType::EmptyMap
             | ValueType::Record(_)
             | ValueType::Ptr
+            | ValueType::Null
+            | ValueType::Nullable(_)
+            | ValueType::Enum(_)
     )
 }
 
@@ -1386,6 +1461,7 @@ fn elem_value_type(elem: ListElem) -> ValueType {
         ListElem::Double => ValueType::Double,
         ListElem::Bool => ValueType::Bool,
         ListElem::Str => ValueType::Str,
+        ListElem::Enum(shape) => ValueType::Enum(shape),
         ListElem::Nested { .. } => ValueType::List(
             elem.nested_inner()
                 .expect("a nested element is a list of its inner element"),
@@ -1394,12 +1470,68 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 }
 
 /// The element type a value of type `ty` can be a list element of.
+/// A lambda written as the only thing in a block is that lambda.
+fn peel_block(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Block { expressions, .. } if expressions.len() == 1 => peel_block(&expressions[0]),
+        other => other,
+    }
+}
+
+/// `Name<A, B>` split into its head and its arguments, if it is written that
+/// way. Nesting is respected, so `Pair<List<Int>, Int>` gives two arguments.
+fn split_type_arguments(text: &str) -> Option<(&str, Vec<String>)> {
+    let open = text.find('<')?;
+    let inner = text.strip_suffix('>')?.get(open + 1..)?;
+    let mut arguments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (at, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(inner[start..at].trim().to_string());
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    arguments.push(inner[start..].trim().to_string());
+    if arguments.iter().any(|argument| argument.is_empty()) {
+        return None;
+    }
+    Some((&text[..open], arguments))
+}
+
+/// The compile-time identity of a literal map key, if the expression is one.
+/// Only used to resolve duplicate keys in a map literal, so it just has to
+/// tell two different keys apart.
+fn literal_key(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Int { value, .. } => Some(format!("i{value}")),
+        Expr::String { value, .. } => Some(format!("s{value}")),
+        Expr::Bool { value, .. } => Some(format!("b{value}")),
+        _ => None,
+    }
+}
+
+/// The value a nullable join carries, if this type can be one half of one.
+/// A nullable is already that join; anything a list can hold can become one.
+fn nullable_elem(ty: ValueType) -> Option<ListElem> {
+    match ty {
+        ValueType::Nullable(elem) => Some(elem),
+        other => list_elem_of(other),
+    }
+}
+
 fn list_elem_of(ty: ValueType) -> Option<ListElem> {
     match ty {
         ValueType::Int => Some(ListElem::Int),
         ValueType::Double => Some(ListElem::Double),
         ValueType::Bool => Some(ListElem::Bool),
         ValueType::Str => Some(ListElem::Str),
+        ValueType::Enum(shape) => Some(ListElem::Enum(shape)),
         // A list of lists: one more level over whatever the inner list holds.
         ValueType::List(inner) => Some(match inner.as_scalar() {
             Some(base) => ListElem::Nested { depth: 1, base },
@@ -1445,8 +1577,38 @@ struct FunctionInfo {
     /// particular lambda it was handed, and inside the body the parameter
     /// name simply resolves to that lambda.
     lambda_params: Vec<(String, usize)>,
+    /// Parameters bound to a dictionary of lambdas, for the same reason.
+    dict_params: Vec<(String, Vec<(String, usize)>)>,
     ret: ValueType,
     body: Expr,
+}
+
+/// A record declaration with no layout of its own: either generic, or with a
+/// field whose type cannot be written down (`name: *`). Its constructor is what
+/// pins the fields down, so the declaration is kept as text and instantiated
+/// per set of argument types.
+#[derive(Clone)]
+struct GenericRecord {
+    name: String,
+    params: Vec<String>,
+    /// Field names with their annotations, as written.
+    fields: Vec<(String, String)>,
+}
+
+/// The compile-time bindings a lambda was written under.
+///
+/// A lambda has no runtime representation in this backend -- its body is
+/// compiled afresh at each call -- so anything it closes over that exists only
+/// at compile time has to travel with it. Value bindings are frame slots and
+/// stay where they are; another lambda, or a dictionary of them, is a name
+/// resolved at compile time, and without carrying those the body would resolve
+/// them at the *call* site instead. That is what makes a dictionary-returning
+/// function work: the record it answers with holds lambdas that close over the
+/// dictionary it was given.
+#[derive(Clone, Default)]
+struct CapturedEnv {
+    lambdas: Vec<(String, usize)>,
+    dicts: Vec<(String, Vec<(String, usize)>)>,
 }
 
 #[derive(Default)]
@@ -1504,8 +1666,56 @@ struct Emitter {
     generic_functions: Vec<GenericFunction>,
     specializations: HashMap<(usize, Vec<ValueType>), usize>,
     lambdas: Vec<(Vec<String>, Expr)>,
+    /// The environment each lambda was interned under, indexed as `lambdas`.
+    lambda_envs: Vec<CapturedEnv>,
     lambda_bindings: Vec<HashMap<String, usize>>,
+    /// Names bound to another name -- `val sub = substring` binds a builtin
+    /// (or any function) as a value. There is no function value at run time
+    /// here, so the binding is compile-time and `sub(...)` compiles as a call
+    /// to what it names.
+    alias_bindings: Vec<HashMap<String, String>>,
+    /// Names bound to a *record of lambdas* -- the dictionary-passing shape
+    /// `val Show_Int_dict = record { show: (x: Int) => ... }`. Like a lambda,
+    /// such a record has no runtime representation here: `dict.show(x)`
+    /// resolves the field to its lambda and compiles the body at the call.
+    dict_bindings: Vec<HashMap<String, Vec<(String, usize)>>>,
+    /// Generic record declarations, kept as text: `record GPoint<'x, 'y>` has
+    /// no single layout, so an instantiation is interned when one is named --
+    /// `#GPoint<Int, Int>` in a field's type, or a constructor whose arguments
+    /// pin the parameters down.
+    generic_records: Vec<GenericRecord>,
+    /// Generic enum declarations: the enum's name and its variants in
+    /// declaration order, each with how many fields it carries. The order is
+    /// the tag, so it has to be the declaration's.
+    generic_enums: Vec<(String, Vec<(String, usize)>)>,
+    /// Whether each enum has type parameters, i.e. whether its payloads vary
+    /// per value rather than being fixed by the declaration.
+    enum_is_generic: Vec<bool>,
+    /// Each enum's type parameters, for instantiating an applied one.
+    enum_type_params: Vec<Vec<String>>,
+    /// Payload annotations per enum, per variant, as written -- what a
+    /// canonical shape is built from.
+    enum_annotations: Vec<Vec<Vec<String>>>,
+    /// The canonical shape of each enum that has one (no type parameters).
+    canonical_enum_shapes: Vec<Option<u32>>,
+    /// Interned shapes: the enum's index in `generic_enums`, and what each
+    /// variant carries here. `Never` means "not known from this value", which
+    /// is what a nullary constructor says about the other variants' payloads.
+    enum_shapes: Vec<(usize, Vec<Vec<ValueType>>)>,
+    /// Bodies handed to `thread`, run after the program's own statements.
+    /// Not a thread: the hand-emitted x86-64 backend makes the same
+    /// approximation, and matching it keeps the targets' output identical.
+    queued_threads: Vec<(usize, Span)>,
+    /// Names bound to a string literal. Some builtins need the *text* of an
+    /// argument at compile time -- `Dir#mkdirs` creates each parent directory,
+    /// so it splits the path here -- and a literal put in a `val` first is the
+    /// ordinary way to write one.
+    literal_strings: Vec<HashMap<String, String>>,
     next_local_offset: u32,
+    /// The deepest `next_local_offset` reached in the function being emitted.
+    /// Slots are handed back when an inlined lambda's parameters die, so the
+    /// current offset is not the frame's size -- this is.
+    max_local_offset: u32,
 }
 
 impl Emitter {
@@ -1518,7 +1728,7 @@ impl Emitter {
 
     /// Resolve a type annotation against scalars, list types, lowered
     /// enums, and declared records (`#Point` or `Point`).
-    fn annotation_type(&self, text: &str, span: Span) -> Result<ValueType, Diagnostic> {
+    fn annotation_type(&mut self, text: &str, span: Span) -> Result<ValueType, Diagnostic> {
         let trimmed = text.trim();
         let bare = trimmed.trim_start_matches('#');
         // Lowered monomorphic enum values travel as plain heap
@@ -1532,6 +1742,47 @@ impl Emitter {
             .position(|record| record.usable && !record.name.is_empty() && record.name == bare)
         {
             return Ok(ValueType::Record(index as u32));
+        }
+        // An enum this backend compiles itself, named by its declaration.
+        if let Some(enum_index) = self
+            .generic_enums
+            .iter()
+            .position(|(declared, _)| declared == bare)
+            && !self.enum_is_generic[enum_index]
+            && let Some(shape) = self.canonical_enum_shape(enum_index, span)
+        {
+            return Ok(ValueType::Enum(shape));
+        }
+        // `Result<JsonStep, String>`: a generic enum applied to concrete types.
+        if let Some((head, arguments)) = split_type_arguments(bare)
+            && let Some(shape) = self.instantiate_generic_enum(head, &arguments, span)
+        {
+            return Ok(ValueType::Enum(shape));
+        }
+        // `List<X>` / `Set<X>` over anything nameable, not just the three
+        // spellings written out below.
+        if let Some((head, arguments)) = split_type_arguments(trimmed)
+            && arguments.len() == 1
+            && (head == "List" || head == "Set")
+            && let Ok(inner) = self.annotation_type(&arguments[0], span)
+            && let Some(elem) = list_elem_of(inner)
+        {
+            return Ok(if head == "List" {
+                ValueType::List(elem)
+            } else {
+                ValueType::Set(elem)
+            });
+        }
+        if bare == "Point" {
+            let point = self.instantiate_builtin_point();
+            return Ok(ValueType::Record(point));
+        }
+        // `#GPoint<Int, Int>`: a generic record named with its arguments. The
+        // parameters are substituted into the field types and the result is
+        // interned under the same name, so two mentions of the same
+        // instantiation are the same type.
+        if let Some((head, arguments)) = split_type_arguments(bare) {
+            return self.instantiate_generic_record(head, &arguments, span);
         }
         match trimmed {
             "Int" | "Long" | "Short" | "Byte" => Ok(ValueType::Int),
@@ -1551,6 +1802,539 @@ impl Emitter {
 
     /// Intern a structural record shape, reusing an existing entry so
     /// equal shapes share one `ValueType::Record` index.
+    /// Intern the instantiation of a generic record for these type arguments,
+    /// answering with its type. Interned by name *and* field types, so the
+    /// same instantiation named twice is one record.
+    fn instantiate_generic_record(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let Some(GenericRecord { params, fields, .. }) = self
+            .generic_records
+            .iter()
+            .find(|record| record.name == name && record.params.len() == arguments.len())
+            .cloned()
+        else {
+            return Err(unsupported(span, &format!("record `{name}`")));
+        };
+        let mut typed = Vec::with_capacity(fields.len());
+        for (field, annotation) in &fields {
+            // A field named by a parameter takes that argument's type; any
+            // other annotation resolves as it stands (including a nested
+            // instantiation, which recurses through here).
+            let text = match params.iter().position(|param| param == annotation.trim()) {
+                Some(at) => arguments[at].clone(),
+                None => annotation.clone(),
+            };
+            typed.push((field.clone(), self.annotation_type(&text, span)?));
+        }
+        if let Some(index) = self
+            .records
+            .iter()
+            .position(|record| record.usable && record.name == name && record.fields == typed)
+        {
+            return Ok(ValueType::Record(index as u32));
+        }
+        self.records.push(RecordInfo {
+            name: name.to_string(),
+            fields: typed,
+            lambda_fields: Vec::new(),
+            usable: true,
+        });
+        Ok(ValueType::Record((self.records.len() - 1) as u32))
+    }
+
+    /// The canonical shape of an enum with no type parameters, whose payloads
+    /// come from its declaration rather than from each value.
+    ///
+    /// A recursive enum needs this: `JArr(items: List<Json>)` describes itself,
+    /// so shapes taken per value would grow one level deeper on every merge and
+    /// never settle. With no type parameters there is nothing to vary anyway --
+    /// the declaration says everything -- so the shape is allocated first,
+    /// empty, and then filled in, which lets a payload name the enum it is
+    /// part of.
+    fn canonical_enum_shape(&mut self, enum_index: usize, span: Span) -> Option<u32> {
+        if let Some(shape) = self.canonical_enum_shapes[enum_index] {
+            return Some(shape);
+        }
+        let variants = self.generic_enums[enum_index].1.clone();
+        let empty: Vec<Vec<ValueType>> = variants.iter().map(|_| Vec::new()).collect();
+        self.enum_shapes.push((enum_index, empty));
+        let shape = (self.enum_shapes.len() - 1) as u32;
+        self.canonical_enum_shapes[enum_index] = Some(shape);
+        let annotations = self.enum_annotations[enum_index].clone();
+        let mut payloads = Vec::with_capacity(variants.len());
+        for fields in &annotations {
+            let mut typed = Vec::with_capacity(fields.len());
+            for annotation in fields {
+                match self.annotation_type(annotation, span) {
+                    Ok(ty) => typed.push(ty),
+                    Err(_) => {
+                        // A payload this backend cannot name: leave the shape
+                        // unfilled and let the constructor report it.
+                        self.canonical_enum_shapes[enum_index] = None;
+                        return None;
+                    }
+                }
+            }
+            payloads.push(typed);
+        }
+        self.enum_shapes[shape as usize].1 = payloads;
+        Some(shape)
+    }
+
+    /// The shape of a generic enum named with its arguments -- `Result<JsonStep,
+    /// String>`. Applied to concrete types the declaration says everything, so
+    /// the shape is built once from it rather than accumulated per value, which
+    /// is what lets an annotated function's return type be complete instead of
+    /// as much as the first constructor happened to reveal.
+    fn instantiate_generic_enum(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        span: Span,
+    ) -> Option<u32> {
+        let enum_index = self
+            .generic_enums
+            .iter()
+            .position(|(declared, _)| declared == name)?;
+        if !self.enum_is_generic[enum_index] {
+            return None;
+        }
+        let params = self.enum_type_params[enum_index].clone();
+        if params.len() != arguments.len() {
+            return None;
+        }
+        let annotations = self.enum_annotations[enum_index].clone();
+        let mut payloads = Vec::with_capacity(annotations.len());
+        for fields in &annotations {
+            let mut typed = Vec::with_capacity(fields.len());
+            for annotation in fields {
+                let text = match params.iter().position(|param| param == annotation.trim()) {
+                    Some(at) => arguments[at].clone(),
+                    None => annotation.clone(),
+                };
+                typed.push(self.annotation_type(&text, span).ok()?);
+            }
+            payloads.push(typed);
+        }
+        if let Some(index) = self
+            .enum_shapes
+            .iter()
+            .position(|(which, known)| *which == enum_index && *known == payloads)
+        {
+            return Some(index as u32);
+        }
+        self.enum_shapes.push((enum_index, payloads));
+        Some((self.enum_shapes.len() - 1) as u32)
+    }
+
+    /// The enum and variant a constructor name belongs to, with the variant's
+    /// tag and how many fields it carries.
+    fn enum_variant(&self, name: &str) -> Option<(usize, usize, usize)> {
+        self.generic_enums
+            .iter()
+            .enumerate()
+            .find_map(|(enum_index, (_, variants))| {
+                variants
+                    .iter()
+                    .position(|(variant, _)| variant == name)
+                    .map(|tag| (enum_index, tag, variants[tag].1))
+            })
+    }
+
+    /// Intern the shape of an enum whose `tag` variant carries `payload` and
+    /// whose other variants are not described by this value.
+    fn intern_enum_shape(&mut self, enum_index: usize, tag: usize, payload: Vec<ValueType>) -> u32 {
+        let variants = self.generic_enums[enum_index].1.len();
+        let mut shape: Vec<Vec<ValueType>> = (0..variants)
+            .map(|which| {
+                if which == tag {
+                    payload.clone()
+                } else {
+                    vec![ValueType::Never; self.generic_enums[enum_index].1[which].1]
+                }
+            })
+            .collect();
+        shape.shrink_to_fit();
+        if let Some(index) = self
+            .enum_shapes
+            .iter()
+            .position(|(which, known)| *which == enum_index && *known == shape)
+        {
+            return index as u32;
+        }
+        self.enum_shapes.push((enum_index, shape));
+        (self.enum_shapes.len() - 1) as u32
+    }
+
+    /// Build a generic enum's value: `[tag][field...]`, every slot a pointer so
+    /// the collector traces it like any other record.
+    fn emit_enum_value(
+        &mut self,
+        enum_index: usize,
+        tag: usize,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        self.asm.mov_imm64(Reg::X0, tag as u64);
+        self.emit_box_scalar();
+        self.push_rooted(Reg::X0);
+        let mut payload = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            let ty = self.expression(argument)?;
+            if ty == ValueType::Unit || ty == ValueType::Never {
+                return Err(unsupported(argument.span(), "an enum field of this type"));
+            }
+            if is_boxed_scalar(ty) {
+                self.emit_box_scalar();
+            }
+            self.push_rooted(Reg::X0);
+            payload.push(ty);
+        }
+        self.emit_record_object(arguments.len() + 1);
+        // An enum with no type parameters has one shape for every value, taken
+        // from its declaration; only a generic one varies per value.
+        if !self.enum_is_generic[enum_index]
+            && let Some(shape) = self.canonical_enum_shape(enum_index, span)
+        {
+            return Ok(ValueType::Enum(shape));
+        }
+        let shape = self.intern_enum_shape(enum_index, tag, payload);
+        Ok(ValueType::Enum(shape))
+    }
+
+    /// `f(a)(b)(c)` where `f` is a def whose body is `(b) => (c) => ...`.
+    ///
+    /// The curried levels are parameters like any other, so the whole chain is
+    /// compiled as one call taking all of them. That is what lets such a def
+    /// *recurse*: inlining the lambdas one level at a time would have to unroll
+    /// the recursion, and how many times is a run-time answer.
+    ///
+    /// Answers `None` when the shape does not fit, so the ordinary paths run.
+    fn curried_generic_call(
+        &mut self,
+        callee: &Expr,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Option<Result<ValueType, Diagnostic>> {
+        let mut spine: Vec<&[Expr]> = vec![arguments];
+        let mut head = callee;
+        while let Expr::Call {
+            callee, arguments, ..
+        } = head
+        {
+            spine.push(arguments);
+            head = callee;
+        }
+        if spine.len() < 2 {
+            return None;
+        }
+        spine.reverse();
+        let Expr::Identifier { name, .. } = head else {
+            return None;
+        };
+        let generic = self
+            .generic_functions
+            .iter()
+            .rposition(|generic| generic.name == *name && generic.params.len() == spine[0].len())?;
+        // Peel one lambda per applied level, collecting their parameters.
+        let mut params = self.generic_functions[generic].params.clone();
+        let mut body = self.generic_functions[generic].body.clone();
+        for group in &spine[1..] {
+            let Expr::Lambda {
+                params: level,
+                body: inner,
+                ..
+            } = peel_block(&body)
+            else {
+                return None;
+            };
+            if level.len() != group.len() {
+                return None;
+            }
+            params.extend(level.iter().cloned());
+            body = (**inner).clone();
+        }
+        let flattened: Vec<Expr> = spine
+            .iter()
+            .flat_map(|group| group.iter().cloned())
+            .collect();
+        let curried = format!("{name}#curried{}", params.len());
+        let index = match self
+            .generic_functions
+            .iter()
+            .position(|generic| generic.name == curried && generic.params.len() == params.len())
+        {
+            Some(index) => index,
+            None => {
+                let annotations = vec![None; params.len()];
+                self.generic_functions.push(GenericFunction {
+                    name: curried,
+                    params,
+                    body,
+                    declared_return: None,
+                    param_annotations: annotations,
+                    return_annotation: None,
+                });
+                self.generic_functions.len() - 1
+            }
+        };
+        Some(self.emit_generic_function_call(index, &flattened, span))
+    }
+
+    /// Merge two branch types, including two shapes of the same enum -- which
+    /// the free function cannot do, since what a shape knows lives in a table
+    /// here. `Never` in a payload means "not known from that value", so the two
+    /// merge field by field and a nullary constructor learns the other's
+    /// payload.
+    fn merge_types(&mut self, left: ValueType, right: ValueType) -> Option<ValueType> {
+        if let (ValueType::Enum(left), ValueType::Enum(right)) = (left, right)
+            && left != right
+        {
+            let (left_enum, left_shape) = self.enum_shapes[left as usize].clone();
+            let (right_enum, right_shape) = self.enum_shapes[right as usize].clone();
+            if left_enum != right_enum {
+                return None;
+            }
+            let mut merged = Vec::with_capacity(left_shape.len());
+            for (left_payload, right_payload) in left_shape.iter().zip(right_shape.iter()) {
+                let mut fields = Vec::with_capacity(left_payload.len());
+                for (left_field, right_field) in left_payload.iter().zip(right_payload.iter()) {
+                    // Payloads can be enums themselves -- `Ok(Step(...))` --
+                    // so this recurses. It terminates because a payload's
+                    // shape is always interned before the shape holding it.
+                    fields.push(self.merge_types(*left_field, *right_field)?);
+                }
+                merged.push(fields);
+            }
+            if let Some(index) = self
+                .enum_shapes
+                .iter()
+                .position(|(which, known)| *which == left_enum && *known == merged)
+            {
+                return Some(ValueType::Enum(index as u32));
+            }
+            self.enum_shapes.push((left_enum, merged));
+            return Some(ValueType::Enum((self.enum_shapes.len() - 1) as u32));
+        }
+        merge_branch_types(left, right)
+    }
+
+    /// The bindings a pattern makes, as types: the inference's half of
+    /// `emit_pattern`. Answers false when the pattern cannot match this shape,
+    /// which is how an unreachable arm is skipped rather than typed.
+    fn bind_pattern_types(
+        &mut self,
+        ty: ValueType,
+        pattern: &Pattern,
+        locals: &mut Vec<(String, ValueType)>,
+    ) -> bool {
+        match pattern {
+            Pattern::Wildcard { .. } => true,
+            Pattern::Variable { name, .. } => {
+                locals.push((name.clone(), ty));
+                true
+            }
+            Pattern::Constructor { name, args, .. } => {
+                let ValueType::Enum(shape) = ty else {
+                    return false;
+                };
+                let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
+                let Some((which, tag, arity)) = self.enum_variant(name) else {
+                    return false;
+                };
+                if which != enum_index || arity != args.len() {
+                    return false;
+                }
+                if payloads[tag].contains(&ValueType::Never) && !args.is_empty() {
+                    return false;
+                }
+                for (position, argument) in args.iter().enumerate() {
+                    if !self.bind_pattern_types(payloads[tag][position], argument, locals) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Test one pattern against the value in `slot`, jumping to `next` when it
+    /// does not match, and answer with the slots it bound.
+    ///
+    /// Recursive, because patterns are: `case Ok(Step(value, next))` tests two
+    /// tags and binds from the inner value. Nothing is rooted here -- a test
+    /// that fails jumps out, and a root pushed on the way would never be
+    /// dropped -- so the caller roots the slots once the whole pattern held.
+    /// Between the tests only loads happen, so nothing can move in between.
+    fn emit_pattern(
+        &mut self,
+        slot: u32,
+        ty: ValueType,
+        pattern: &Pattern,
+        next: Label,
+        bound: &mut Vec<(String, u32, ValueType)>,
+        span: Span,
+    ) -> Result<bool, Diagnostic> {
+        match pattern {
+            Pattern::Wildcard { .. } => Ok(true),
+            Pattern::Variable { name, .. } => {
+                bound.push((name.clone(), slot, ty));
+                Ok(true)
+            }
+            Pattern::Constructor { name, args, .. } => {
+                let ValueType::Enum(shape) = ty else {
+                    return Err(unsupported(span, "a constructor pattern on this value"));
+                };
+                let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
+                let Some((which, tag, arity)) = self.enum_variant(name) else {
+                    return Err(unsupported(span, "a pattern of this kind"));
+                };
+                if which != enum_index || arity != args.len() {
+                    return Err(unsupported(span, "a pattern from another enum"));
+                }
+                // A payload this shape never carries means the arm is dead.
+                if payloads[tag].contains(&ValueType::Never) && !args.is_empty() {
+                    return Ok(false);
+                }
+                self.asm.load_local(Reg::X0, slot);
+                self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
+                self.emit_unbox_scalar();
+                self.asm.cmp_imm(Reg::X0, tag as u32);
+                self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
+                for (position, argument) in args.iter().enumerate() {
+                    let field_ty = payloads[tag][position];
+                    if matches!(argument, Pattern::Wildcard { .. }) {
+                        continue;
+                    }
+                    self.asm.load_local(Reg::X0, slot);
+                    self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
+                    if is_boxed_scalar(field_ty) {
+                        self.emit_unbox_scalar();
+                    }
+                    let field_slot = self.reserve_locals(8);
+                    self.asm.store_local(Reg::X0, field_slot);
+                    if !self.emit_pattern(field_slot, field_ty, argument, next, bound, span)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Err(unsupported(span, "a pattern of this kind")),
+        }
+    }
+
+    /// `o match { case Some(v) => ...; case None => ... }` on an enum this
+    /// backend compiles itself.
+    ///
+    /// The value carries its tag in its first slot, so an arm is a comparison
+    /// against that and, when it matches, its fields bound to locals. The
+    /// scrutinee lives in a rooted slot because the arms allocate.
+    fn emit_enum_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let mark = self.open_temp_roots();
+        let scrutinee_ty = self.expression(scrutinee)?;
+        if !matches!(scrutinee_ty, ValueType::Enum(_)) {
+            return Err(unsupported(scrutinee.span(), "matching on this value"));
+        }
+        let value = self.reserve_locals(8);
+        self.asm.store_local(Reg::X0, value);
+        self.emit_root_frame_slot(value);
+
+        let end = self.asm.new_label();
+        let mut result: Option<ValueType> = None;
+        let mut exhaustive = false;
+        for arm in arms {
+            if arm.guard.is_some() {
+                return Err(unsupported(arm.span, "a match arm with a guard"));
+            }
+            if matches!(
+                arm.pattern,
+                Pattern::Wildcard { .. } | Pattern::Variable { .. }
+            ) {
+                exhaustive = true;
+            }
+            let next = self.asm.new_label();
+            let mut bound = Vec::new();
+            let reachable = self.emit_pattern(
+                value,
+                scrutinee_ty,
+                &arm.pattern,
+                next,
+                &mut bound,
+                arm.span,
+            )?;
+            if !reachable {
+                // An arm the shape says cannot be taken: its comparison stands
+                // (it always falls through) and its body is left uncompiled.
+                self.asm.bind(next);
+                continue;
+            }
+            self.push_binding_scopes();
+            self.scope_root_counts.push(0);
+            for (name, slot, ty) in &bound {
+                self.scopes
+                    .last_mut()
+                    .expect("emitter scope")
+                    .insert(name.clone(), (*slot, *ty));
+                if is_heap_pointer(*ty) {
+                    self.emit_root_frame_slot(*slot);
+                }
+            }
+            let arm_ty = self.expression(&arm.body)?;
+            self.pop_binding_scopes();
+            let roots = self.scope_root_counts.pop().expect("emitter root scope");
+            self.emit_shadow_pop(roots);
+            result = Some(match result {
+                None => arm_ty,
+                Some(previous) => self
+                    .merge_types(previous, arm_ty)
+                    .ok_or_else(|| unsupported(arm.span, "match arms with different types"))?,
+            });
+            self.asm.branch(end, BranchKind::Unconditional);
+            self.asm.bind(next);
+        }
+        // Falling past every arm is the evaluator's match error.
+        if !exhaustive {
+            self.asm
+                .emit_write_rodata(STDERR_FD, b"klassic: no match\n");
+            self.asm.emit_exit(1);
+        }
+        self.asm.bind(end);
+        self.close_temp_roots(mark);
+        result.ok_or_else(|| unsupported(span, "a match with no arms"))
+    }
+
+    /// The built-in `Point`: two Int fields, known without a declaration.
+    fn instantiate_builtin_point(&mut self) -> u32 {
+        let fields = vec![
+            ("x".to_string(), ValueType::Int),
+            ("y".to_string(), ValueType::Int),
+        ];
+        if let Some(index) = self
+            .records
+            .iter()
+            .position(|record| record.usable && record.name == "Point" && record.fields == fields)
+        {
+            return index as u32;
+        }
+        self.records.push(RecordInfo {
+            name: "Point".to_string(),
+            fields,
+            lambda_fields: Vec::new(),
+            usable: true,
+        });
+        (self.records.len() - 1) as u32
+    }
+
     fn intern_structural_record(&mut self, fields: Vec<(String, ValueType)>) -> u32 {
         if let Some(index) = self
             .records
@@ -1562,14 +2346,28 @@ impl Emitter {
         self.records.push(RecordInfo {
             name: String::new(),
             fields,
+            lambda_fields: Vec::new(),
             usable: true,
         });
         (self.records.len() - 1) as u32
     }
 
-    fn declare_local(&mut self, name: &str, ty: ValueType) -> u32 {
+    /// Hand out `bytes` of frame space, remembering the high-water mark so the
+    /// prologue's reservation can be patched to the real size.
+    fn reserve_locals(&mut self, bytes: u32) -> u32 {
         let offset = self.next_local_offset;
-        self.next_local_offset += 8;
+        self.next_local_offset += bytes;
+        self.max_local_offset = self.max_local_offset.max(self.next_local_offset);
+        offset
+    }
+
+    /// Hand slots back: the offset shrinks, the high-water mark does not.
+    fn release_locals_to(&mut self, offset: u32) {
+        self.next_local_offset = offset;
+    }
+
+    fn declare_local(&mut self, name: &str, ty: ValueType) -> u32 {
+        let offset = self.reserve_locals(8);
         self.scopes
             .last_mut()
             .expect("emitter scope")
@@ -1634,6 +2432,12 @@ impl Emitter {
                 Ok(ValueType::Str)
             }
             Expr::Identifier { name, span } => {
+                // A nullary constructor is a value, not a call: `None`.
+                if self.lookup(name).is_none()
+                    && let Some((enum_index, tag, 0)) = self.enum_variant(name)
+                {
+                    return self.emit_enum_value(enum_index, tag, &[], *span);
+                }
                 let Some((offset, ty)) = self.lookup(name) else {
                     return Err(unsupported(*span, &format!("identifier `{name}`")));
                 };
@@ -1647,7 +2451,7 @@ impl Emitter {
             // costs nothing and needs no special case.
             Expr::Null { .. } => {
                 self.asm.mov_imm64(Reg::X0, 0);
-                Ok(ValueType::Ptr)
+                Ok(ValueType::Null)
             }
             Expr::Unary { op, expr, span } => {
                 let ty = self.expression(expr)?;
@@ -1705,31 +2509,123 @@ impl Emitter {
                 })
             }
             Expr::SetLiteral { elements, span } => self.set_literal(elements, *span),
+            Expr::Match {
+                scrutinee,
+                arms,
+                span,
+            } => self.emit_enum_match(scrutinee, arms, *span),
+            Expr::MapLiteral { entries, span } => self.map_literal(entries, *span),
             // Nominal construction `#Point(3, 4)`.
             Expr::RecordConstructor {
                 name,
                 arguments,
                 span,
             } => {
-                let Some(index) = self
-                    .records
+                // A declaration whose layout depends on its arguments always
+                // goes through the inference below, even after one
+                // instantiation has been interned under the same name --
+                // otherwise `#Pair(true, 1)` would be checked against whatever
+                // `#Pair(1.5, 2.5)` made of it.
+                let inferred = self
+                    .generic_records
                     .iter()
-                    .position(|record| record.usable && record.name == *name)
-                else {
+                    .any(|record| record.name == *name && record.fields.len() == arguments.len());
+                let concrete = if inferred {
+                    None
+                } else {
+                    self.records
+                        .iter()
+                        .position(|record| record.usable && record.name == *name)
+                };
+                let Some(index) = concrete else {
+                    // A generic record's constructor pins its parameters down
+                    // by what it is given: the arguments' own types become the
+                    // instantiation's field types.
+                    if let Some(GenericRecord {
+                        fields: declared, ..
+                    }) = self
+                        .generic_records
+                        .iter()
+                        .find(|record| {
+                            record.name == *name && record.fields.len() == arguments.len()
+                        })
+                        .cloned()
+                    {
+                        let mut typed = Vec::with_capacity(arguments.len());
+                        for (argument, (field, _)) in arguments.iter().zip(declared.iter()) {
+                            let ty = self.expression(argument)?;
+                            if ty == ValueType::Unit || ty == ValueType::Never {
+                                return Err(unsupported(
+                                    argument.span(),
+                                    "a record field of this type",
+                                ));
+                            }
+                            typed.push((field.clone(), ty));
+                            if is_boxed_scalar(ty) {
+                                self.emit_box_scalar();
+                            }
+                            self.push_rooted(Reg::X0);
+                        }
+                        let count = arguments.len();
+                        let index = match self.records.iter().position(|record| {
+                            record.usable && record.name == *name && record.fields == typed
+                        }) {
+                            Some(index) => index,
+                            None => {
+                                self.records.push(RecordInfo {
+                                    name: name.clone(),
+                                    fields: typed,
+                                    lambda_fields: Vec::new(),
+                                    usable: true,
+                                });
+                                self.records.len() - 1
+                            }
+                        };
+                        self.emit_record_object(count);
+                        return Ok(ValueType::Record(index as u32));
+                    }
+                    // `#Point(x, y)` is built in: the evaluator and the type
+                    // checker both know it without a declaration, so this
+                    // backend has to as well.
+                    if name == "Point" && arguments.len() == 2 {
+                        let point = self.instantiate_builtin_point();
+                        for argument in arguments {
+                            if self.expression(argument)? != ValueType::Int {
+                                return Err(unsupported(
+                                    argument.span(),
+                                    "a Point field that is not an Int",
+                                ));
+                            }
+                            self.emit_box_scalar();
+                            self.push_rooted(Reg::X0);
+                        }
+                        self.emit_record_object(2);
+                        return Ok(ValueType::Record(point));
+                    }
                     return Err(unsupported(*span, &format!("record `{name}`")));
                 };
                 let fields = self.records[index].fields.clone();
-                if fields.len() != arguments.len() {
+                let lambda_fields = self.records[index].lambda_fields.clone();
+                let declared = fields.len() + lambda_fields.len();
+                if declared != arguments.len() {
                     return Err(Diagnostic::compile(
                         *span,
                         format!(
-                            "{name} expects {} fields but got {}",
-                            fields.len(),
+                            "{name} expects {declared} fields but got {}",
                             arguments.len()
                         ),
                     ));
                 }
-                for (argument, (_, expected)) in arguments.iter().zip(fields.iter()) {
+                // The function-typed fields are not part of the object; they
+                // are resolved from the binding that constructed it, so only
+                // the stored fields are evaluated here -- in declaration order,
+                // with the compile-time ones skipped.
+                let stored = arguments
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| !lambda_fields.iter().any(|(_, at)| at == position))
+                    .map(|(_, argument)| argument);
+                for (argument, (_, expected)) in stored.zip(fields.iter()) {
                     let ty = self.expression(argument)?;
                     if !assignable(ty, *expected) {
                         return Err(unsupported(argument.span(), "a record field of this type"));
@@ -1739,7 +2635,7 @@ impl Emitter {
                     }
                     self.push_rooted(Reg::X0);
                 }
-                self.emit_record_object(arguments.len());
+                self.emit_record_object(fields.len());
                 Ok(ValueType::Record(index as u32))
             }
             // Structural literal `record { x: 1; y: 2 }`: the shape
@@ -1817,10 +2713,15 @@ impl Emitter {
                 if arguments.len() == 2
                     && let Expr::Identifier { name, .. } = callee.as_ref()
                     && name == "map"
-                    && let Expr::Lambda { params, body, .. } = &arguments[1]
+                    // The builtin's shape is `map(list, f)`. A *function* first
+                    // means this is something else called `map` -- a `Functor`
+                    // instance's own `map(f, xs)`, say -- so leave it to the
+                    // function resolution below.
+                    && self.lambda_argument(&arguments[0]).is_none()
+                    && let Some((params, body)) = self.lambda_argument(&arguments[1])
                     && params.len() == 1
                 {
-                    return self.emit_list_map(&arguments[0], &params[0], body, *span);
+                    return self.emit_list_map(&arguments[0], &params[0], &body, *span);
                 }
                 // Curried `foldLeft(list)(init)(f)` -- which is also what
                 // `xs reduce init => r + e` desugars to -- with a lambda
@@ -1852,10 +2753,11 @@ impl Emitter {
                         *span,
                     );
                 }
-                // Curried `map(list)(f)` where the function is a lambda
-                // literal: the list's element type gives the lambda's
-                // parameter type, so the body can be compiled straight into
-                // the loop.
+                // Curried `map(list)(f)`: the list's element type gives the
+                // lambda's parameter type, so the body can be compiled straight
+                // into the loop. The lambda is either written here or passed in
+                // under a name, which is how a higher-order def hands its own
+                // function parameter on.
                 if arguments.len() == 1
                     && let Expr::Call {
                         callee: inner,
@@ -1865,10 +2767,10 @@ impl Emitter {
                     && list_args.len() == 1
                     && let Expr::Identifier { name, .. } = inner.as_ref()
                     && name == "map"
-                    && let Expr::Lambda { params, body, .. } = &arguments[0]
+                    && let Some((params, body)) = self.lambda_argument(&arguments[0])
                     && params.len() == 1
                 {
-                    return self.emit_list_map(&list_args[0], &params[0], body, *span);
+                    return self.emit_list_map(&list_args[0], &params[0], &body, *span);
                 }
                 // Curried `cons(head)(tail)` — the evaluator's list
                 // prepend builtin.
@@ -1900,9 +2802,50 @@ impl Emitter {
                     self.emit_cons_cell();
                     return Ok(ValueType::List(elem));
                 }
+                // A generic enum's constructor: `Some(v)`.
+                if let Expr::Identifier { name, .. } = callee.as_ref()
+                    && let Some((enum_index, tag, arity)) = self.enum_variant(name)
+                {
+                    if arity != arguments.len() {
+                        return Err(Diagnostic::compile(
+                            *span,
+                            format!(
+                                "{name} carries {arity} field(s) but got {}",
+                                arguments.len()
+                            ),
+                        ));
+                    }
+                    return self.emit_enum_value(enum_index, tag, arguments, *span);
+                }
                 // Method-style builtin call `target.method(args)`:
                 // dispatch as `method(target, args)`, the same way the
                 // evaluator and C backend resolve value methods.
+                // `dict.show(x)` on a dictionary-bound name: the field names a
+                // lambda, so the call is that lambda inlined here.
+                if let Expr::FieldAccess { target, field, .. } = callee.as_ref()
+                    && let Expr::Identifier { name, .. } = target.as_ref()
+                    && let Some(mapping) = self.lookup_dict(name)
+                {
+                    let Some((_, index)) = mapping.iter().find(|(f, _)| f == field) else {
+                        return Err(unsupported(
+                            *span,
+                            &format!("field `{field}` on this dictionary"),
+                        ));
+                    };
+                    let index = *index;
+                    // A function-typed *record* field is called as a method:
+                    // `s.to_string()` passes the record itself as the `this`
+                    // the lambda declares. A dictionary's field takes only
+                    // what the call site writes, so the receiver is prepended
+                    // exactly when the arities say it is expected.
+                    if self.lambdas[index].0.len() == arguments.len() + 1 {
+                        let mut with_receiver = Vec::with_capacity(arguments.len() + 1);
+                        with_receiver.push((**target).clone());
+                        with_receiver.extend(arguments.iter().cloned());
+                        return self.emit_inline_lambda_call(index, &with_receiver, *span);
+                    }
+                    return self.emit_inline_lambda_call(index, arguments, *span);
+                }
                 if let Expr::FieldAccess { target, field, .. } = callee.as_ref() {
                     let mut all = Vec::with_capacity(arguments.len() + 1);
                     all.push((**target).clone());
@@ -1912,10 +2855,14 @@ impl Emitter {
                     }
                     return Err(unsupported(*span, &format!("method `{field}`")));
                 }
+                // `myFoldLeft(list)(z)(f)`: a def whose body is a chain of
+                // lambdas, applied all the way down.
+                if let Some(result) = self.curried_generic_call(callee, arguments, *span) {
+                    return result;
+                }
                 // An immediately applied lambda literal, `((x) => x + 1)(3)`.
                 if let Expr::Lambda { params, body, .. } = callee.as_ref() {
-                    let index = self.lambdas.len();
-                    self.lambdas.push((params.clone(), body.as_ref().clone()));
+                    let index = self.intern_lambda(params.clone(), body.as_ref().clone());
                     return self.emit_inline_lambda_call(index, arguments, *span);
                 }
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
@@ -1925,6 +2872,18 @@ impl Emitter {
                 // same way a local shadows a top-level definition.
                 if let Some(index) = self.lookup_lambda(name) {
                     return self.emit_inline_lambda_call(index, arguments, *span);
+                }
+                // An alias stands for whatever name it was bound to.
+                if let Some(target) = self.lookup_alias(name) {
+                    let callee = Expr::Identifier {
+                        name: target,
+                        span: *span,
+                    };
+                    return self.expression(&Expr::Call {
+                        callee: Box::new(callee),
+                        arguments: arguments.clone(),
+                        span: *span,
+                    });
                 }
                 // `__enum_shape_named(value, "Variant")` and
                 // `__enum_shape_hint(value, id)` are shape aids the shared
@@ -1960,13 +2919,55 @@ impl Emitter {
                 let end_label = self.asm.new_label();
                 self.asm
                     .branch(else_label, BranchKind::CompareZero(Reg::X0));
+                // Whether this join is a nullable has to be decided *before*
+                // either branch is compiled: a branch yielding a bare scalar
+                // boxes on its way out so the join is one word either way, and
+                // once its code is emitted there is no going back. So both
+                // branches are predicted here, and the decision is checked
+                // against what they actually turn out to be below.
+                let predicted = match (
+                    self.static_type_under(then_branch, &mut Vec::new(), 0),
+                    self.static_type_under(else_branch, &mut Vec::new(), 0),
+                ) {
+                    (Some(then_ty), Some(else_ty)) => self.merge_types(then_ty, else_ty),
+                    _ => None,
+                };
+                let nullable_join = matches!(predicted, Some(ValueType::Nullable(_)));
                 let then_ty = self.expression(then_branch)?;
+                let boxed_then = nullable_join && is_boxed_scalar(then_ty);
+                if boxed_then {
+                    self.emit_box_scalar();
+                }
                 self.asm.branch(end_label, BranchKind::Unconditional);
                 self.asm.bind(else_label);
                 let else_ty = self.expression(else_branch)?;
+                let boxed_else = nullable_join && is_boxed_scalar(else_ty);
+                if boxed_else {
+                    self.emit_box_scalar();
+                }
                 self.asm.bind(end_label);
-                merge_branch_types(then_ty, else_ty)
-                    .ok_or_else(|| unsupported(*span, "if branches with different types"))
+                let merged = self
+                    .merge_types(then_ty, else_ty)
+                    .ok_or_else(|| unsupported(*span, "if branches with different types"))?;
+                // The prediction has to have been right about the boxing, or
+                // the value and its type disagree: a nullable holding an
+                // unboxed scalar gets dereferenced as a pointer at the far end,
+                // and an unboxed type holding a box reads the box's address as
+                // the value. Neither is something to compile, so where the
+                // inference could not see the join coming, say so.
+                let boxing_matches = if matches!(merged, ValueType::Nullable(_)) {
+                    (!is_boxed_scalar(then_ty) || boxed_then)
+                        && (!is_boxed_scalar(else_ty) || boxed_else)
+                } else {
+                    !boxed_then && !boxed_else
+                };
+                if !boxing_matches {
+                    return Err(unsupported(
+                        *span,
+                        "an if whose branches join as a nullable the inference could not predict",
+                    ));
+                }
+                Ok(merged)
             }
             // A block in expression position: statements, then the
             // value of the final expression (the enum lowering leans
@@ -1976,15 +2977,13 @@ impl Emitter {
                     self.asm.mov_imm64(Reg::X0, 0);
                     return Ok(ValueType::Unit);
                 };
-                self.scopes.push(HashMap::new());
-                self.lambda_bindings.push(HashMap::new());
+                self.push_binding_scopes();
                 self.scope_root_counts.push(0);
                 for expression in init {
                     self.statement(expression)?;
                 }
                 let ty = self.expression(last)?;
-                self.scopes.pop();
-                self.lambda_bindings.pop();
+                self.pop_binding_scopes();
                 // The block's value is already in x0 and nothing allocates
                 // between here and its use, so dropping the block's roots
                 // now is safe (and the slots themselves are dead).
@@ -2014,6 +3013,29 @@ impl Emitter {
                     ValueType::Str => {}
                     ValueType::Int => self.emit_int_to_str(),
                     ValueType::Bool => self.emit_bool_to_str(),
+                    // A collection renders into the hole the way `println`
+                    // renders it, through the same builder.
+                    ValueType::List(elem) => {
+                        self.emit_list_to_str(elem, "[", "]", hole.span())?;
+                    }
+                    ValueType::Set(elem) => {
+                        self.emit_list_to_str(elem, "%(", ")", hole.span())?;
+                    }
+                    ValueType::EmptyList => {
+                        let offset = self.asm.intern_string_object("[]");
+                        self.asm.load_rodata_address(Reg::X0, offset);
+                        self.emit_heap_string_copy();
+                    }
+                    ValueType::EmptySet => {
+                        let offset = self.asm.intern_string_object("%()");
+                        self.asm.load_rodata_address(Reg::X0, offset);
+                        self.emit_heap_string_copy();
+                    }
+                    ValueType::EmptyMap => {
+                        let offset = self.asm.intern_string_object("%[]");
+                        self.asm.load_rodata_address(Reg::X0, offset);
+                        self.emit_heap_string_copy();
+                    }
                     other => {
                         return Err(unsupported(
                             hole.span(),
@@ -2033,10 +3055,7 @@ impl Emitter {
     /// `O_WRONLY|O_CREAT|` (`O_TRUNC` or `O_APPEND`), writes the
     /// content bytes, then closes -- aborting with a source-located
     /// message on any syscall failure (M14, issue #538).
-    fn emit_file_write(&mut self, path_offset: usize, append: bool) {
-        self.asm.push(Reg::X0); // content object
-
-        self.asm.load_rodata_address(Reg::X0, path_offset);
+    fn emit_file_write(&mut self, append: bool) {
         let flags = if append {
             O_WRONLY | O_CREAT | O_APPEND
         } else {
@@ -2049,7 +3068,7 @@ impl Emitter {
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: FileOutput#write failed to open file\n");
         self.asm.mov_reg(Reg::X3, Reg::X0); // fd
-        self.asm.pop(Reg::X4); // content object
+        self.pop_rooted(Reg::X4); // content object
 
         self.asm.ldr_imm(Reg::X2, Reg::X4, 0); // content len
         self.asm.add_reg_imm(Reg::X1, Reg::X4, 8); // content bytes
@@ -2077,10 +3096,9 @@ impl Emitter {
     /// resident in a register, since `emit_alloc` unconditionally
     /// clobbers x6 and only preserves x0-x5 across its heap-grow
     /// path -- the same lesson #563's bug taught for `trim`.
-    fn emit_file_read_all(&mut self, path_offset: usize) {
+    fn emit_file_read_all(&mut self) {
         const READ_CAP: u64 = 1_048_576;
 
-        self.asm.load_rodata_address(Reg::X0, path_offset);
         self.asm.mov_imm64(Reg::X1, O_RDONLY);
         self.asm.mov_imm64(Reg::X2, 0);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_OPEN));
@@ -2138,9 +3156,8 @@ impl Emitter {
     /// errno 2) as success, matching the evaluator's
     /// `std::io::ErrorKind::NotFound` leniency; any other failure
     /// aborts with a source-located message (M14, issue #538).
-    fn emit_file_delete(&mut self, path_offset: usize) {
+    fn emit_file_delete(&mut self) {
         const ENOENT: u32 = 2;
-        self.asm.load_rodata_address(Reg::X0, path_offset);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_UNLINK));
         self.asm.svc_0x80();
         let ok = self.asm.new_label();
@@ -2159,8 +3176,7 @@ impl Emitter {
     /// source-located message on any failure, matching the
     /// evaluator's `fs::create_dir` (which errors on an
     /// already-existing path) (M15, issue #538).
-    fn emit_dir_mkdir(&mut self, path_offset: usize) {
-        self.asm.load_rodata_address(Reg::X0, path_offset);
+    fn emit_dir_mkdir(&mut self) {
         self.asm.mov_imm64(Reg::X1, DEFAULT_DIR_MODE);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_MKDIR));
         self.asm.svc_0x80();
@@ -2177,9 +3193,8 @@ impl Emitter {
     /// message on any other failure. Does not set a return value;
     /// callers run this once per `/`-separated prefix and set the
     /// `Unit` result after the last one (M15, issue #538).
-    fn emit_dir_mkdir_tolerating_eexist(&mut self, path_offset: usize) {
+    fn emit_dir_mkdir_tolerating_eexist(&mut self) {
         const EEXIST: u32 = 17;
-        self.asm.load_rodata_address(Reg::X0, path_offset);
         self.asm.mov_imm64(Reg::X1, DEFAULT_DIR_MODE);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_MKDIR));
         self.asm.svc_0x80();
@@ -2198,8 +3213,7 @@ impl Emitter {
     /// on any failure, matching the evaluator's `fs::remove_dir`
     /// (errors on a non-empty or missing directory) (M15, issue
     /// #538).
-    fn emit_dir_delete(&mut self, path_offset: usize) {
-        self.asm.load_rodata_address(Reg::X0, path_offset);
+    fn emit_dir_delete(&mut self) {
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_RMDIR));
         self.asm.svc_0x80();
         self.asm
@@ -2222,9 +3236,11 @@ impl Emitter {
     /// its own top bits after this shift). A failed stat (e.g. a
     /// missing path) reports `false` rather than aborting, matching
     /// the evaluator's `Path::is_dir()` (M15, issue #538).
-    fn emit_dir_is_directory(&mut self, path_offset: usize) {
+    fn emit_dir_is_directory(&mut self) {
         const STAT_BUF_SIZE: u64 = 144;
         const S_IFDIR_SHIFTED: u32 = 0o4; // S_IFDIR (0o040000) >> 12
+
+        self.asm.mov_reg(Reg::X7, Reg::X0); // the path, past the buffer setup
 
         // A transient syscall buffer, so it lives on the machine stack, not
         // in the GC heap: the collector's sweep walks a region block by
@@ -2234,7 +3250,7 @@ impl Emitter {
         self.asm.add_reg_sp_imm(Reg::X6, 0);
 
         self.asm.mov_imm64(Reg::X0, AT_FDCWD as u64);
-        self.asm.load_rodata_address(Reg::X1, path_offset);
+        self.asm.mov_reg(Reg::X1, Reg::X7);
         self.asm.mov_reg(Reg::X2, Reg::X6);
         self.asm.mov_imm64(Reg::X3, 0);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_FSTATAT64));
@@ -2258,9 +3274,7 @@ impl Emitter {
     /// NUL-terminated paths (rodata, `source_offset`/`target_offset`).
     /// Aborts with a source-located message on any failure, matching
     /// the evaluator's `fs::rename` (M15, issue #538).
-    fn emit_dir_move(&mut self, source_offset: usize, target_offset: usize) {
-        self.asm.load_rodata_address(Reg::X0, source_offset);
-        self.asm.load_rodata_address(Reg::X1, target_offset);
+    fn emit_dir_move(&mut self) {
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_RENAME));
         self.asm.svc_0x80();
         self.asm
@@ -2736,6 +3750,31 @@ impl Emitter {
     ///
     /// Only x0 and x30 are touched at the call site (x0 is restored), so
     /// this is safe to emit anywhere regardless of what is live.
+    /// Note where the current scope's roots stand, so temporaries rooted from
+    /// here can be dropped again by `close_temp_roots`.
+    ///
+    /// A helper called *inside* an expression has to leave the shadow stack
+    /// exactly as it found it. The stack is strictly last-in-first-out and its
+    /// entries are slot *addresses*, so a frame-slot root left behind is popped
+    /// by whatever `pop_rooted` comes next -- which then leaves that machine
+    /// stack slot rooted after its value is gone, and the next collection reads
+    /// whatever has since been pushed there as a heap reference.
+    fn open_temp_roots(&self) -> usize {
+        *self.scope_root_counts.last().expect("emitter root scope")
+    }
+
+    /// Drop every root taken since `mark`. Preserves x0, so a result being
+    /// returned survives.
+    fn close_temp_roots(&mut self, mark: usize) {
+        let count = self.open_temp_roots();
+        debug_assert!(count >= mark);
+        self.emit_shadow_pop(count - mark);
+        *self
+            .scope_root_counts
+            .last_mut()
+            .expect("emitter root scope") = mark;
+    }
+
     fn emit_root_frame_slot(&mut self, offset: u32) {
         let push = self.shadow_push_routine_label();
         self.asm.push(Reg::X0); // x0 is the argument register below
@@ -2884,6 +3923,45 @@ impl Emitter {
     /// The source is in the immovable image, so it is parked on the machine
     /// stack *without* a root -- rooting a non-heap pointer would send the
     /// collector into `__const` looking for a header.
+    /// A NUL-terminated copy of the string object in x0, left as a byte pointer
+    /// in x0: the syscalls take C strings, and a Klassic string is
+    /// length-prefixed without a terminator. Used for a path that is only known
+    /// at run time -- a literal one interns into rodata already terminated.
+    fn emit_cstring_copy(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+        self.push_rooted(Reg::X0); // the source survives the allocation
+        self.asm.add_reg_imm(Reg::X2, Reg::X2, 1); // room for the terminator
+        self.emit_alloc_raw_string(Reg::X2); // x5 = buffer, x2 preserved
+        self.pop_rooted(Reg::X6); // source
+        self.asm.str_imm(Reg::X2, Reg::X5, 0); // the buffer's own length
+        self.asm.sub_reg_imm(Reg::X2, Reg::X2, 1); // bytes to copy
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8); // dst payload
+        self.asm.add_reg_imm(Reg::X6, Reg::X6, 8); // src payload
+        // The copy advances x7 past the last byte, which is where the
+        // terminator goes.
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X3);
+        self.asm.mov_imm64(Reg::X3, 0);
+        self.asm.strb_post_increment(Reg::X3, Reg::X7);
+        self.asm.add_reg_imm(Reg::X0, Reg::X5, 8);
+    }
+
+    /// Leave a C string for `path` in x0, whether it is a literal or computed.
+    fn emit_path_cstring(&mut self, path: &Expr) -> Result<(), Diagnostic> {
+        if let Expr::String { value, span } = path {
+            if value.contains("#{") {
+                return Err(unsupported(*span, "string interpolation"));
+            }
+            let offset = self.asm.intern_nul_terminated(value);
+            self.asm.load_rodata_address(Reg::X0, offset);
+            return Ok(());
+        }
+        if self.expression(path)? != ValueType::Str {
+            return Err(unsupported(path.span(), "a path that is not a string"));
+        }
+        self.emit_cstring_copy();
+        Ok(())
+    }
+
     fn emit_heap_string_copy(&mut self) {
         self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
         self.asm.push(Reg::X0); // source: rodata never moves
@@ -3983,12 +5061,12 @@ impl Emitter {
     /// accumulator ends up in reverse-insertion order, so a final
     /// reverse restores insertion order for printing.
     fn set_literal(&mut self, elements: &[Expr], span: Span) -> Result<ValueType, Diagnostic> {
+        let mark = self.open_temp_roots();
         // Frame slot for the partial set; survives the bl calls below.
         // It holds a heap reference across the cons allocations, so it is
         // rooted like a named binding (its root is dropped with the
         // enclosing scope; the slot is never reused).
-        let acc = self.next_local_offset;
-        self.next_local_offset += 8;
+        let acc = self.reserve_locals(8);
         self.asm.mov_imm64(Reg::X0, 0); // nil
         self.asm.store_local(Reg::X0, acc);
         self.emit_root_frame_slot(acc);
@@ -4031,10 +5109,211 @@ impl Emitter {
         self.asm.load_local(Reg::X0, acc);
         let reverse = self.reverse_label();
         self.asm.branch(reverse, BranchKind::Link);
+        self.close_temp_roots(mark);
         Ok(match elem_ty {
             Some(elem) => ValueType::Set(elem),
             None => ValueType::EmptySet,
         })
+    }
+
+    /// `%["a": 1 "b": 2]`: an insertion-ordered chain of entries, each entry a
+    /// two-slot cell `[key][value]`.
+    ///
+    /// Keys have to be literals. That is a semantic limit rather than a
+    /// representational one: the evaluator lets a later entry overwrite an
+    /// earlier one's value while keeping the earlier one's *position*, and with
+    /// literal keys that resolution happens here at compile time instead of
+    /// needing to mutate an entry. A computed key is reported as unsupported
+    /// rather than quietly dropping the overwrite.
+    fn map_literal(
+        &mut self,
+        entries: &[(Expr, Expr)],
+        span: Span,
+    ) -> Result<ValueType, Diagnostic> {
+        let mark = self.open_temp_roots();
+        let mut ordered: Vec<(&Expr, &Expr)> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        for (key, value) in entries {
+            let Some(literal) = literal_key(key) else {
+                return Err(unsupported(key.span(), "a map key that is not a literal"));
+            };
+            match seen.iter().position(|previous| *previous == literal) {
+                Some(at) => ordered[at].1 = value,
+                None => {
+                    seen.push(literal);
+                    ordered.push((key, value));
+                }
+            }
+        }
+
+        // Frame slot for the partial map, rooted like the set literal's: it
+        // holds a heap reference across every allocation below.
+        let acc = self.reserve_locals(8);
+        self.asm.mov_imm64(Reg::X0, 0); // nil
+        self.asm.store_local(Reg::X0, acc);
+        self.emit_root_frame_slot(acc);
+
+        let mut key_elem = None;
+        let mut value_elem = None;
+        for (key, value) in ordered {
+            let key_ty = self.expression(key)?;
+            let Some(this_key) = list_elem_of(key_ty) else {
+                return Err(unsupported(key.span(), "a map key of this type"));
+            };
+            if *key_elem.get_or_insert(this_key) != this_key {
+                return Err(unsupported(span, "mixed map key types"));
+            }
+            if is_boxed_scalar(key_ty) {
+                self.emit_box_scalar();
+            }
+            // The key waits on the machine stack as a root while the value is
+            // evaluated, then becomes the entry's head.
+            self.push_rooted(Reg::X0);
+            let value_ty = self.expression(value)?;
+            let Some(this_value) = list_elem_of(value_ty) else {
+                return Err(unsupported(value.span(), "a map value of this type"));
+            };
+            if *value_elem.get_or_insert(this_value) != this_value {
+                return Err(unsupported(span, "mixed map value types"));
+            }
+            if is_boxed_scalar(value_ty) {
+                self.emit_box_scalar();
+            }
+            self.emit_cons_cell(); // entry = [key][value]
+            self.push_rooted(Reg::X0);
+            self.asm.load_local(Reg::X0, acc);
+            self.emit_cons_cell(); // chain cell = [entry][rest]
+            self.asm.store_local(Reg::X0, acc);
+        }
+
+        self.asm.load_local(Reg::X0, acc);
+        let reverse = self.reverse_label();
+        self.asm.branch(reverse, BranchKind::Link);
+        self.close_temp_roots(mark);
+        Ok(match (key_elem, value_elem) {
+            (Some(key), Some(value)) => ValueType::Map(key, value),
+            _ => ValueType::EmptyMap,
+        })
+    }
+
+    /// The length of the cons-cell chain in x0 -> x0. Lists, sets and maps are
+    /// all the same chain, so they all count the same way.
+    fn emit_chain_length(&mut self) {
+        let count_loop = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        // The barriered next-reads clobber x0, so the running count lives in
+        // x2 (which the barrier preserves) until the end.
+        self.asm.mov_imm64(Reg::X2, 0);
+        self.asm.bind(count_loop);
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X1));
+        self.emit_gc_load_ptr(Reg::X1, 8); // x0 = next (barriered)
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        self.asm.add_reg_imm(Reg::X2, Reg::X2, 1);
+        self.asm.branch(count_loop, BranchKind::Unconditional);
+        self.asm.bind(done);
+        self.asm.mov_reg(Reg::X0, Reg::X2);
+    }
+
+    /// The entry whose key equals the one in x1, or 0 when there is none:
+    /// x0 = map chain, x1 = key (a boxed scalar or a string pointer)
+    /// -> x0 = entry pointer or 0.
+    ///
+    /// The wanted key, the cursor and the candidate entry all live in a
+    /// machine-stack scratch frame because the string comparison clobbers the
+    /// low registers; they are rooted, since a comparison of string keys can
+    /// be reached across a load barrier that relocates.
+    fn emit_map_lookup(&mut self, key: ListElem) {
+        let loop_start = self.asm.new_label();
+        let found = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.push_rooted(Reg::X1); // wanted key
+        self.push_rooted(Reg::X0); // cursor
+        self.asm.bind(loop_start);
+        self.pop_rooted(Reg::X2);
+        self.push_rooted(Reg::X2); // peek the cursor
+        self.asm.branch(done, BranchKind::CompareZero(Reg::X2));
+        self.emit_gc_load_ptr(Reg::X2, 0); // x0 = entry (barriered)
+        self.push_rooted(Reg::X0); // the entry is the answer if the key matches
+        self.emit_gc_load_ptr(Reg::X0, 0); // x0 = this entry's key
+        if is_boxed_scalar(elem_value_type(key)) {
+            self.emit_unbox_scalar();
+        }
+        // The wanted key sits two rooted slots below the entry, and each
+        // pushed slot is 16 bytes wide here.
+        self.asm.add_reg_sp_imm(Reg::X1, 32);
+        self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
+        match key {
+            ListElem::Str => self.emit_str_eq(),
+            _ => {
+                if is_boxed_scalar(elem_value_type(key)) {
+                    self.asm.ldr_imm(Reg::X1, Reg::X1, 0); // unbox the wanted key
+                }
+                self.asm.cmp_reg(Reg::X0, Reg::X1);
+                self.asm.cset(Reg::X0, Cond::Eq);
+            }
+        }
+        self.asm.branch(found, BranchKind::CompareNonZero(Reg::X0));
+        self.pop_rooted(Reg::X2); // discard this entry
+        self.pop_rooted(Reg::X2); // the cursor
+        self.emit_gc_load_ptr(Reg::X2, 8); // x0 = next (barriered)
+        self.push_rooted(Reg::X0);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(found);
+        self.pop_rooted(Reg::X0); // the matching entry
+        self.pop_rooted(Reg::X2); // the cursor
+        self.pop_rooted(Reg::X2); // the wanted key
+        let end = self.asm.new_label();
+        self.asm.branch(end, BranchKind::Unconditional);
+        self.asm.bind(done);
+        self.pop_rooted(Reg::X2); // the cursor
+        self.pop_rooted(Reg::X2); // the wanted key
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(end);
+    }
+
+    /// println of the map in x0 in the evaluator's format: `%[k: v, k2: v2]`.
+    fn emit_println_map(
+        &mut self,
+        key: ListElem,
+        value: ListElem,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let loop_start = self.asm.new_label();
+        let close = self.asm.new_label();
+        self.push_rooted(Reg::X0); // cursor
+        self.asm.emit_write_rodata(STDOUT_FD, b"%[");
+        self.pop_rooted(Reg::X3);
+        self.push_rooted(Reg::X3);
+        self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
+        self.asm.bind(loop_start);
+        self.pop_rooted(Reg::X3);
+        self.push_rooted(Reg::X3);
+        self.emit_gc_load_ptr(Reg::X3, 0); // x0 = entry (barriered)
+        self.push_rooted(Reg::X0); // the entry survives printing the key
+        self.emit_gc_load_ptr(Reg::X0, 0); // x0 = key
+        if is_boxed_scalar(elem_value_type(key)) {
+            self.emit_unbox_scalar();
+        }
+        self.emit_print_elem(key, span)?;
+        self.asm.emit_write_rodata(STDOUT_FD, b": ");
+        self.pop_rooted(Reg::X3); // the entry
+        self.emit_gc_load_ptr(Reg::X3, 8); // x0 = value
+        if is_boxed_scalar(elem_value_type(value)) {
+            self.emit_unbox_scalar();
+        }
+        self.emit_print_elem(value, span)?;
+        self.pop_rooted(Reg::X3); // the cursor
+        self.emit_gc_load_ptr(Reg::X3, 8); // x0 = next (barriered)
+        self.asm.mov_reg(Reg::X3, Reg::X0);
+        self.push_rooted(Reg::X3);
+        self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
+        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(close);
+        self.pop_rooted(Reg::X3); // discard the cursor
+        self.asm.emit_write_rodata(STDOUT_FD, b"]\n");
+        Ok(())
     }
 
     /// println of the set in x0 in the evaluator's format: `%(e1, e2)`.
@@ -4182,6 +5461,11 @@ impl Emitter {
             // (including inside a list) work regardless.
             ListElem::Double => {
                 return Err(unsupported(span, "printing a Double element"));
+            }
+            // An enum element would need this backend to know how the
+            // evaluator renders that enum, which it does not.
+            ListElem::Enum(_) => {
+                return Err(unsupported(span, "printing an enum element"));
             }
             // A nested element is a list: build its text with the same
             // renderer and write that. The recursion is at codegen time and
@@ -4420,6 +5704,61 @@ impl Emitter {
                 self.emit_substring();
                 Ok(Some(ValueType::Str))
             }
+            // `println` in expression position, which is where it lands when it
+            // is the last thing in a block -- the body of a timed or mapped
+            // block, say. It answers with unit, like every other statement.
+            ("println", 1) => {
+                self.println_call(arguments, span)?;
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(Some(ValueType::Unit))
+            }
+            // The same line on standard error.
+            ("printlnError", 1) => {
+                if let Some(line) = Self::literal_line(&arguments[0])? {
+                    self.asm.emit_write_rodata(STDERR_FD, line.as_bytes());
+                    self.asm.mov_imm64(Reg::X0, 0);
+                    return Ok(Some(ValueType::Unit));
+                }
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(
+                        arguments[0].span(),
+                        "printing this to standard error",
+                    ));
+                }
+                self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+                self.asm.add_reg_imm(Reg::X1, Reg::X0, 8); // bytes
+                self.asm.mov_imm64(Reg::X0, STDERR_FD);
+                self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+                self.asm.svc_0x80();
+                self.asm.emit_write_rodata(STDERR_FD, b"\n");
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(Some(ValueType::Unit))
+            }
+            ("assert", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Bool {
+                    return Err(unsupported(span, "assert of a non-Bool"));
+                }
+                let ok = self.asm.new_label();
+                self.asm.branch(ok, BranchKind::CompareNonZero(Reg::X0));
+                self.asm
+                    .emit_write_rodata(STDERR_FD, b"klassic: assertion failed\n");
+                self.asm.emit_exit(1);
+                self.asm.bind(ok);
+                Ok(Some(ValueType::Unit))
+            }
+            ("matches", 2) => {
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "matches on a non-string"));
+                }
+                self.push_rooted(Reg::X0);
+                if self.expression(&arguments[1])? != ValueType::Str {
+                    return Err(unsupported(span, "matches with a non-string pattern"));
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.pop_rooted(Reg::X0);
+                self.emit_str_matches();
+                Ok(Some(ValueType::Bool))
+            }
             ("startsWith", 2) => {
                 if self.expression(&arguments[0])? != ValueType::Str {
                     return Err(unsupported(span, "startsWith of a non-string"));
@@ -4529,16 +5868,46 @@ impl Emitter {
                 self.asm.bind(end);
                 Ok(Some(ty))
             }
-            ("isEmpty", 1) => {
+            ("isEmpty", 1) | ("Map#isEmpty", 1) => {
                 let ty = self.expression(&arguments[0])?;
-                if !matches!(ty, ValueType::List(_) | ValueType::EmptyList) {
-                    return Err(unsupported(span, "isEmpty of a non-list"));
+                if !matches!(
+                    ty,
+                    ValueType::List(_)
+                        | ValueType::EmptyList
+                        | ValueType::Map(..)
+                        | ValueType::EmptyMap
+                ) {
+                    return Err(unsupported(span, "isEmpty of a non-collection"));
                 }
                 self.asm.cmp_imm(Reg::X0, 0);
                 self.asm.cset(Reg::X0, Cond::Eq);
                 Ok(Some(ValueType::Bool))
             }
-            ("size", 1) => {
+            // `xs.map(f)`: the method spelling is dispatched as a builtin
+            // call, so it lands here rather than in the two-argument and
+            // curried forms the function spelling matches.
+            ("map", 2) => {
+                // Declining rather than failing here matters: a `Functor`
+                // instance declares its own `map(f, xs)`, and that call has to
+                // reach the function resolution instead of stopping at the
+                // builtin table.
+                if self.lambda_argument(&arguments[0]).is_some() {
+                    return Ok(None);
+                }
+                let Some((params, body)) = self.lambda_argument(&arguments[1]) else {
+                    return Ok(None);
+                };
+                if params.len() != 1 {
+                    return Err(unsupported(span, "mapping with a function of this arity"));
+                }
+                Ok(Some(self.emit_list_map(
+                    &arguments[0],
+                    &params[0],
+                    &body,
+                    span,
+                )?))
+            }
+            ("size", 1) | ("Map#size", 1) => {
                 let ty = self.expression(&arguments[0])?;
                 if !matches!(
                     ty,
@@ -4546,26 +5915,196 @@ impl Emitter {
                         | ValueType::EmptyList
                         | ValueType::Set(_)
                         | ValueType::EmptySet
+                        | ValueType::Map(..)
+                        | ValueType::EmptyMap
                 ) {
                     return Err(unsupported(span, "size of a non-collection"));
                 }
-                // Both lists and sets are cons-cell chains, so the
-                // length walk is identical.
-                let count_loop = self.asm.new_label();
-                let done = self.asm.new_label();
-                self.asm.mov_reg(Reg::X1, Reg::X0);
-                // The barriered next-reads clobber x0, so the running count
-                // lives in x2 (which the barrier preserves) until the end.
-                self.asm.mov_imm64(Reg::X2, 0);
-                self.asm.bind(count_loop);
-                self.asm.branch(done, BranchKind::CompareZero(Reg::X1));
-                self.emit_gc_load_ptr(Reg::X1, 8); // x0 = next (barriered)
-                self.asm.mov_reg(Reg::X1, Reg::X0);
-                self.asm.add_reg_imm(Reg::X2, Reg::X2, 1);
-                self.asm.branch(count_loop, BranchKind::Unconditional);
-                self.asm.bind(done);
-                self.asm.mov_reg(Reg::X0, Reg::X2);
+                // Lists, sets and maps are all cons-cell chains, so the
+                // length walk is the same one.
+                self.emit_chain_length();
                 Ok(Some(ValueType::Int))
+            }
+            // The `Map#*` builtins the stdlib's `std.map` extension methods
+            // delegate to. A map is a chain of `[key][value]` entries, so
+            // looking one up is a linear scan and its size is the same walk a
+            // list's is.
+            // `m.getOrElse(key, fallback)`: the value if the key is there, the
+            // fallback otherwise -- so unlike `get` this answers with the
+            // value's own type. The fallback is only evaluated when it is
+            // needed, which is what the stdlib's own definition does.
+            ("getOrElse", 3) | ("Map#getOrElse", 3) => {
+                let map_ty = self.expression(&arguments[0])?;
+                let (key_elem, value_elem) = match map_ty {
+                    ValueType::Map(key, value) => (key, value),
+                    ValueType::EmptyMap => {
+                        self.expression(&arguments[1])?;
+                        return Ok(Some(self.expression(&arguments[2])?));
+                    }
+                    _ => return Err(unsupported(span, "a map builtin on a non-map")),
+                };
+                self.push_rooted(Reg::X0);
+                let key_ty = self.expression(&arguments[1])?;
+                if list_elem_of(key_ty) != Some(key_elem) {
+                    return Err(unsupported(
+                        arguments[1].span(),
+                        "a key of a different type than the map's keys",
+                    ));
+                }
+                if is_boxed_scalar(key_ty) {
+                    self.emit_box_scalar();
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.pop_rooted(Reg::X0);
+                self.emit_map_lookup(key_elem);
+                let absent = self.asm.new_label();
+                let end = self.asm.new_label();
+                let value_ty = elem_value_type(value_elem);
+                self.asm.branch(absent, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                if is_boxed_scalar(value_ty) {
+                    self.emit_unbox_scalar();
+                }
+                self.asm.branch(end, BranchKind::Unconditional);
+                self.asm.bind(absent);
+                let fallback_ty = self.expression(&arguments[2])?;
+                if !assignable(fallback_ty, value_ty) {
+                    return Err(unsupported(
+                        arguments[2].span(),
+                        "a fallback of a different type than the map's values",
+                    ));
+                }
+                self.asm.bind(end);
+                Ok(Some(value_ty))
+            }
+            // `sleep(millis)` without a sleep syscall: this backend only issues
+            // syscalls whose numbers it can verify, and Darwin does not publish
+            // them in headers, so the wait is spun on the clock that is already
+            // verified here. That costs the CPU it holds for the duration --
+            // worth being explicit about -- but it is exact and it is honest,
+            // where a guessed syscall number would break only on the machine
+            // that runs the program.
+            ("sleep", 1) => {
+                if self.expression(&arguments[0])? != ValueType::Int {
+                    return Err(unsupported(arguments[0].span(), "sleeping for a non-Int"));
+                }
+                self.asm.push(Reg::X0); // millis
+                self.emit_time_now_millis(); // x0 = now
+                self.asm.pop(Reg::X1); // millis
+                // The evaluator rejects a negative duration at run time.
+                let non_negative = self.asm.new_label();
+                self.asm.cmp_imm(Reg::X1, 0);
+                self.asm
+                    .branch(non_negative, BranchKind::Conditional(Cond::Ge));
+                self.asm
+                    .emit_write_rodata(STDERR_FD, b"klassic: sleep expects a non-negative Int\n");
+                self.asm.emit_exit(1);
+                self.asm.bind(non_negative);
+                self.asm.add_reg(Reg::X1, Reg::X0, Reg::X1); // deadline
+                self.asm.push(Reg::X1);
+                let wait = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(wait);
+                self.emit_time_now_millis(); // x0 = now
+                self.asm.add_reg_sp_imm(Reg::X1, 0);
+                self.asm.ldr_imm(Reg::X1, Reg::X1, 0); // deadline
+                self.asm.cmp_reg(Reg::X0, Reg::X1);
+                self.asm.branch(done, BranchKind::Conditional(Cond::Ge));
+                self.asm.branch(wait, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.pop(Reg::X1); // deadline, discarded
+                self.asm.mov_imm64(Reg::X0, 0); // Unit
+                Ok(Some(ValueType::Unit))
+            }
+            // `thread(block)` runs the block after the program's own statements
+            // rather than beside them. Creating a thread on Darwin needs a
+            // syscall whose number this host cannot verify, and the x86-64
+            // backend queues them the same way, so the targets agree on what a
+            // program prints -- which is what a program can observe here.
+            ("thread", 1) => {
+                let Some((params, body)) = self.lambda_argument(&arguments[0]) else {
+                    return Err(unsupported(arguments[0].span(), "threading this argument"));
+                };
+                if !params.is_empty() {
+                    return Err(unsupported(
+                        arguments[0].span(),
+                        "a thread body that takes arguments",
+                    ));
+                }
+                let index = self.intern_lambda(params, body);
+                self.queued_threads.push((index, span));
+                self.asm.mov_imm64(Reg::X0, 0); // Unit
+                Ok(Some(ValueType::Unit))
+            }
+            // `stopwatch(block)`: how many milliseconds the block took. Its
+            // value is discarded, like the evaluator's.
+            ("stopwatch", 1) => {
+                let Some((params, body)) = self.lambda_argument(&arguments[0]) else {
+                    return Err(unsupported(arguments[0].span(), "timing this argument"));
+                };
+                if !params.is_empty() {
+                    return Err(unsupported(
+                        arguments[0].span(),
+                        "timing a block that takes arguments",
+                    ));
+                }
+                self.emit_time_now_millis(); // x0 = start
+                self.asm.push(Reg::X0);
+                let index = self.intern_lambda(params, body);
+                self.emit_inline_lambda_call(index, &[], span)?;
+                self.emit_time_now_millis(); // x0 = end
+                self.asm.pop(Reg::X1); // start
+                self.asm.sub_reg(Reg::X0, Reg::X0, Reg::X1);
+                Ok(Some(ValueType::Int))
+            }
+            ("Map#containsKey", 2) | ("containsKey", 2) | ("Map#get", 2) | ("get", 2) => {
+                let map_ty = self.expression(&arguments[0])?;
+                let (key_elem, value_elem) = match map_ty {
+                    ValueType::Map(key, value) => (key, value),
+                    // Nothing is in an empty map, whatever is asked of it --
+                    // but the key still has to be evaluated for its effects.
+                    ValueType::EmptyMap => {
+                        self.expression(&arguments[1])?;
+                        self.asm.mov_imm64(Reg::X0, 0);
+                        return Ok(Some(if name.ends_with("containsKey") {
+                            ValueType::Bool
+                        } else {
+                            ValueType::Null
+                        }));
+                    }
+                    _ => return Err(unsupported(span, "a map builtin on a non-map")),
+                };
+                self.push_rooted(Reg::X0); // the map survives the key
+                let key_ty = self.expression(&arguments[1])?;
+                if list_elem_of(key_ty) != Some(key_elem) {
+                    return Err(unsupported(
+                        arguments[1].span(),
+                        "a key of a different type than the map's keys",
+                    ));
+                }
+                if is_boxed_scalar(key_ty) {
+                    self.emit_box_scalar();
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.pop_rooted(Reg::X0);
+                self.emit_map_lookup(key_elem);
+                if name.ends_with("containsKey") {
+                    self.asm.cmp_imm(Reg::X0, 0);
+                    self.asm.cset(Reg::X0, Cond::Ne);
+                    return Ok(Some(ValueType::Bool));
+                }
+                // `get` answers with the value or nothing, which is exactly a
+                // nullable: the entry's value slot already holds it the way a
+                // nullable wants it (boxed scalar or pointer).
+                let absent = self.asm.new_label();
+                let end = self.asm.new_label();
+                self.asm.branch(absent, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.branch(end, BranchKind::Unconditional);
+                self.asm.bind(absent);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.bind(end);
+                Ok(Some(ValueType::Nullable(value_elem)))
             }
             ("contains", 2) => {
                 let set_ty = self.expression(&arguments[0])?;
@@ -4712,18 +6251,22 @@ impl Emitter {
                     _ => Err(unsupported(span, "sqrt of this type")),
                 }
             }
-            ("floor", 1) | ("ceil", 1) => {
+            // `int` and `floor` are the same builtin in this language and
+            // both *truncate toward zero* -- `floor(-4.7)` is -4, not -5 --
+            // which is exactly what `fcvtzs` does on its own. `ceil` is a true
+            // ceiling, so it rounds up first. Both are Int-valued.
+            ("floor", 1) | ("int", 1) | ("ceil", 1) => {
                 let ty = self.expression(&arguments[0])?;
-                if ty != ValueType::Double {
-                    return Err(unsupported(span, &format!("{name} of a non-Double")));
+                match ty {
+                    ValueType::Double => {}
+                    // An integer is already the answer.
+                    ValueType::Int => return Ok(Some(ValueType::Int)),
+                    _ => return Err(unsupported(span, &format!("{name} of this type"))),
                 }
                 self.asm.fmov_d_from_x(0, Reg::X0);
-                if name == "floor" {
-                    self.asm.frintm_d(0, 0);
-                } else {
+                if name == "ceil" {
                     self.asm.frintp_d(0, 0);
                 }
-                // The evaluator's floor/ceil are Int-valued.
                 self.asm.fcvtzs_x_from_d(Reg::X0, 0);
                 Ok(Some(ValueType::Int))
             }
@@ -4761,18 +6304,7 @@ impl Emitter {
             // becomes the Bool result directly — the first user of the
             // M11 syscall-failure convention (issue #538).
             ("Dir#exists", 1) | ("FileOutput#exists", 1) => {
-                let Expr::String {
-                    value,
-                    span: str_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if value.contains("#{") {
-                    return Err(unsupported(*str_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(value);
-                self.asm.load_rodata_address(Reg::X0, path_offset);
+                self.emit_path_cstring(&arguments[0])?;
                 self.asm.mov_imm64(Reg::X1, 0); // F_OK
                 self.asm.mov_imm64(Reg::X16, u64::from(SYS_ACCESS));
                 self.asm.svc_0x80();
@@ -4780,97 +6312,160 @@ impl Emitter {
                 Ok(Some(ValueType::Bool))
             }
             ("FileOutput#write", 2) | ("FileOutput#append", 2) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
                 if self.expression(&arguments[1])? != ValueType::Str {
                     return Err(unsupported(
                         span,
                         &format!("{name} with non-string content"),
                     ));
                 }
-                self.emit_file_write(path_offset, name == "FileOutput#append");
+                // The content waits as a root while the path is built, since
+                // building one from a run-time string allocates.
+                self.push_rooted(Reg::X0);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_file_write(name == "FileOutput#append");
                 Ok(Some(ValueType::Unit))
             }
-            ("FileInput#all", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+            // `writeLines(path, lines)` is the lines joined with newlines and
+            // written -- no trailing one, which is what the evaluator's own
+            // `join` does. Building that call rather than a second string
+            // walker keeps the two spellings the same code.
+            ("FileOutput#writeLines", 2) => {
+                let joined = Expr::Call {
+                    callee: Box::new(Expr::Identifier {
+                        name: "join".to_string(),
+                        span,
+                    }),
+                    arguments: vec![
+                        arguments[1].clone(),
+                        Expr::String {
+                            value: "\n".to_string(),
+                            span,
+                        },
+                    ],
+                    span,
                 };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
+                if self.expression(&joined)? != ValueType::Str {
+                    return Err(unsupported(span, "writeLines of a non-string list"));
                 }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_file_read_all(path_offset);
+                self.push_rooted(Reg::X0);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_file_write(false);
+                Ok(Some(ValueType::Unit))
+            }
+            // `lines(path)` splits the file on newlines *without* a trailing
+            // empty line, which is what the evaluator gets from Rust's
+            // `str::lines`. Built here as the same expression `std.string`'s
+            // own `lines` is written as, over two hidden locals so the text and
+            // the split are each computed once.
+            ("FileInput#lines", 1) | ("FileInput#readLines", 1) => {
+                let mark = self.open_temp_roots();
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_file_read_all();
+                let text = self.declare_local("__file_lines_text", ValueType::Str);
+                self.asm.store_local(Reg::X0, text);
+                self.emit_root_frame_slot(text);
+                let name_expr = |name: &str| Expr::Identifier {
+                    name: name.to_string(),
+                    span,
+                };
+                let call = |name: &str, args: Vec<Expr>| Expr::Call {
+                    callee: Box::new(Expr::Identifier {
+                        name: name.to_string(),
+                        span,
+                    }),
+                    arguments: args,
+                    span,
+                };
+                let split = call(
+                    "split",
+                    vec![
+                        name_expr("__file_lines_text"),
+                        Expr::String {
+                            value: "\n".to_string(),
+                            span,
+                        },
+                    ],
+                );
+                let parts_ty = self.expression(&split)?;
+                let parts = self.declare_local("__file_lines_parts", parts_ty);
+                self.asm.store_local(Reg::X0, parts);
+                self.emit_root_frame_slot(parts);
+                let trimmed = Expr::If {
+                    condition: Box::new(call(
+                        "isEmptyString",
+                        vec![call("stdlibLast", vec![name_expr("__file_lines_parts")])],
+                    )),
+                    then_branch: Box::new(call(
+                        "stdlibTake",
+                        vec![
+                            name_expr("__file_lines_parts"),
+                            Expr::Binary {
+                                op: BinaryOp::Subtract,
+                                lhs: Box::new(call("size", vec![name_expr("__file_lines_parts")])),
+                                rhs: Box::new(Expr::Int {
+                                    value: 1,
+                                    kind: klassic_syntax::IntLiteralKind::Int,
+                                    span,
+                                }),
+                                span,
+                            },
+                        ],
+                    )),
+                    else_branch: Some(Box::new(name_expr("__file_lines_parts"))),
+                    span,
+                };
+                let lines = self.expression(&trimmed)?;
+                self.close_temp_roots(mark);
+                Ok(Some(lines))
+            }
+            // `path FileInput#open { stream => ... }`: the evaluator hands the
+            // block the path itself and answers with the block's value, so this
+            // is the block inlined with its parameter bound to the path. There
+            // is no descriptor to keep or close -- reading happens inside.
+            ("FileInput#open", 2) => {
+                let Some((params, body)) = self.lambda_argument(&arguments[1]) else {
+                    return Err(unsupported(arguments[1].span(), "opening with this block"));
+                };
+                if params.len() != 1 {
+                    return Err(unsupported(
+                        arguments[1].span(),
+                        "an open block taking other than one stream",
+                    ));
+                }
+                let index = self.intern_lambda(params, body);
+                let opened = self.emit_inline_lambda_call(index, &arguments[0..1], span)?;
+                Ok(Some(opened))
+            }
+            ("FileInput#all", 1) | ("FileInput#readAll", 1) => {
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_file_read_all();
                 Ok(Some(ValueType::Str))
             }
             ("FileOutput#delete", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_file_delete(path_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_file_delete();
                 Ok(Some(ValueType::Unit))
             }
             ("Dir#mkdir", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_dir_mkdir(path_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_dir_mkdir();
                 Ok(Some(ValueType::Unit))
             }
             ("Dir#delete", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_dir_delete(path_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_dir_delete();
                 Ok(Some(ValueType::Unit))
             }
             ("Dir#mkdirs", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
+                // Each parent directory is created in turn, so this one needs
+                // the path's text here rather than at run time -- a `val`
+                // holding a literal counts.
+                let Some(path) = self.literal_string(&arguments[0]) else {
+                    return Err(unsupported(
+                        arguments[0].span(),
+                        "mkdirs of a path that is not a literal",
+                    ));
                 };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
                 // An empty path is a no-op, matching the evaluator's
                 // `fs::create_dir_all("")` (which succeeds); `mkdir("")`
                 // itself would fail with ENOENT, not EEXIST, and abort.
@@ -4885,50 +6480,26 @@ impl Emitter {
                 }
                 for prefix in prefixes {
                     let prefix_offset = self.asm.intern_nul_terminated(&prefix);
-                    self.emit_dir_mkdir_tolerating_eexist(prefix_offset);
+                    self.asm.load_rodata_address(Reg::X0, prefix_offset);
+                    self.emit_dir_mkdir_tolerating_eexist();
                 }
                 self.asm.mov_imm64(Reg::X0, 0); // Unit
                 Ok(Some(ValueType::Unit))
             }
             ("Dir#isDirectory", 1) => {
-                let Expr::String {
-                    value: path,
-                    span: path_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if path.contains("#{") {
-                    return Err(unsupported(*path_span, "string interpolation"));
-                }
-                let path_offset = self.asm.intern_nul_terminated(path);
-                self.emit_dir_is_directory(path_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_dir_is_directory();
                 Ok(Some(ValueType::Bool))
             }
             ("Dir#move", 2) => {
-                let Expr::String {
-                    value: source,
-                    span: source_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(arguments[0].span(), "a non-literal path"));
-                };
-                if source.contains("#{") {
-                    return Err(unsupported(*source_span, "string interpolation"));
-                }
-                let Expr::String {
-                    value: target,
-                    span: target_span,
-                } = &arguments[1]
-                else {
-                    return Err(unsupported(arguments[1].span(), "a non-literal path"));
-                };
-                if target.contains("#{") {
-                    return Err(unsupported(*target_span, "string interpolation"));
-                }
-                let source_offset = self.asm.intern_nul_terminated(source);
-                let target_offset = self.asm.intern_nul_terminated(target);
-                self.emit_dir_move(source_offset, target_offset);
+                self.emit_path_cstring(&arguments[0])?;
+                // The source waits as a root: a run-time target path allocates,
+                // and a collection would move the buffer it is parked in.
+                self.push_rooted(Reg::X0);
+                self.emit_path_cstring(&arguments[1])?;
+                self.asm.mov_reg(Reg::X1, Reg::X0);
+                self.pop_rooted(Reg::X0);
+                self.emit_dir_move();
                 Ok(Some(ValueType::Unit))
             }
             ("Environment#exists", 1) => {
@@ -5010,10 +6581,10 @@ impl Emitter {
         close: &str,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        let cursor = self.next_local_offset;
+        let mark = self.open_temp_roots();
+        let cursor = self.reserve_locals(24);
         let acc = cursor + 8;
         let sep = acc + 8;
-        self.next_local_offset += 24;
         self.asm.store_local(Reg::X0, cursor);
         self.emit_root_frame_slot(cursor);
         let open_offset = self.asm.intern_string_object(open);
@@ -5054,6 +6625,9 @@ impl Emitter {
             ListElem::Int => self.emit_int_to_str(),
             ListElem::Bool => self.emit_bool_to_str(),
             ListElem::Str => {}
+            ListElem::Enum(_) => {
+                return Err(unsupported(span, "rendering an enum element"));
+            }
             // Same renderer one level down; the element pointer is already in
             // x0, and the result replaces it.
             ListElem::Nested { .. } => {
@@ -5083,7 +6657,118 @@ impl Emitter {
         self.asm.mov_reg(Reg::X1, Reg::X0);
         self.asm.load_local(Reg::X0, acc);
         self.emit_str_concat();
+        self.close_temp_roots(mark);
         Ok(())
+    }
+
+    /// Is every byte of the string in x0 an ASCII digit? x0 becomes the Bool.
+    /// An empty string answers false, which is what both digit patterns want.
+    fn emit_str_all_digits(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+        self.asm.add_reg_imm(Reg::X3, Reg::X0, 8); // bytes
+        let loop_start = self.asm.new_label();
+        let no = self.asm.new_label();
+        let yes = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.branch(no, BranchKind::CompareZero(Reg::X2));
+        self.asm.bind(loop_start);
+        self.asm.branch(yes, BranchKind::CompareZero(Reg::X2));
+        self.asm.ldrb_post_increment(Reg::X4, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm.branch(no, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'9'));
+        self.asm.branch(no, BranchKind::Conditional(Cond::Gt));
+        self.asm.sub_reg_imm(Reg::X2, Reg::X2, 1);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(yes);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(no);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
+    }
+
+    /// `matches(input, pattern)`: the language's deliberately tiny regex --
+    /// `.*` matches anything, `[0-9]+` a non-empty run of digits, `[0-9]` a
+    /// single digit, and any other pattern is a literal to compare against.
+    ///
+    /// Decided at run time by comparing the pattern string, where the x86-64
+    /// backend folds it at compile time from a static string; doing it this way
+    /// costs three string comparisons and works for a pattern that is not a
+    /// literal.
+    fn emit_str_matches(&mut self) {
+        // x0 = input, x1 = pattern. Both are parked as roots: building each
+        // literal below allocates.
+        self.push_rooted(Reg::X0); // input, at [sp + 16] after the next push
+        self.push_rooted(Reg::X1); // pattern, at [sp]
+        let matched = self.asm.new_label();
+        let unmatched = self.asm.new_label();
+        let done = self.asm.new_label();
+        let literal = self.asm.new_label();
+        let digits_plus = self.asm.new_label();
+        let single_digit = self.asm.new_label();
+
+        // Each test compares the pattern against one of the three forms.
+        for (text, target) in [
+            (".*", matched),
+            ("[0-9]+", digits_plus),
+            ("[0-9]", single_digit),
+        ] {
+            self.asm.add_reg_sp_imm(Reg::X3, 0);
+            self.asm.ldr_imm(Reg::X0, Reg::X3, 0); // the pattern
+            let offset = self.asm.intern_string_object(text);
+            self.asm.load_rodata_address(Reg::X1, offset);
+            self.asm.push(Reg::X0);
+            self.asm.mov_reg(Reg::X0, Reg::X1);
+            self.emit_heap_string_copy(); // the literal, as a heap string
+            self.asm.mov_reg(Reg::X1, Reg::X0);
+            self.asm.pop(Reg::X0);
+            self.emit_str_eq();
+            self.asm.branch(target, BranchKind::CompareNonZero(Reg::X0));
+        }
+        self.asm.branch(literal, BranchKind::Unconditional);
+
+        // `[0-9]+`: a non-empty run of digits.
+        self.asm.bind(digits_plus);
+        self.asm.add_reg_sp_imm(Reg::X3, 16);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0); // the input
+        self.emit_str_all_digits();
+        self.asm
+            .branch(matched, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.branch(unmatched, BranchKind::Unconditional);
+
+        // `[0-9]`: exactly one digit.
+        self.asm.bind(single_digit);
+        self.asm.add_reg_sp_imm(Reg::X3, 16);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0);
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+        self.asm.cmp_imm(Reg::X2, 1);
+        self.asm
+            .branch(unmatched, BranchKind::Conditional(Cond::Ne));
+        self.emit_str_all_digits();
+        self.asm
+            .branch(matched, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.branch(unmatched, BranchKind::Unconditional);
+
+        // Anything else is a literal to equal.
+        self.asm.bind(literal);
+        self.asm.add_reg_sp_imm(Reg::X3, 16);
+        self.asm.ldr_imm(Reg::X0, Reg::X3, 0); // the input
+        self.asm.add_reg_sp_imm(Reg::X3, 0);
+        self.asm.ldr_imm(Reg::X1, Reg::X3, 0); // the pattern
+        self.emit_str_eq();
+        self.asm
+            .branch(matched, BranchKind::CompareNonZero(Reg::X0));
+
+        self.asm.bind(unmatched);
+        self.asm.mov_imm64(Reg::X2, 0);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(matched);
+        self.asm.mov_imm64(Reg::X2, 1);
+        self.asm.bind(done);
+        self.pop_rooted(Reg::X1);
+        self.pop_rooted(Reg::X0);
+        self.asm.mov_reg(Reg::X0, Reg::X2);
     }
 
     /// Content equality for two cons chains: x0 and x1 are the heads, x0
@@ -5136,6 +6821,13 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X2);
         if elem_ty == ValueType::Str {
             self.emit_str_eq(); // x0 = Bool
+        } else if let Some(inner) = elem.nested_inner() {
+            // The elements are themselves lists, so they compare by content
+            // too -- a pointer comparison here would call two separately built
+            // inner lists different, which is what it did before the nested
+            // element type existed. The recursion is at codegen time and
+            // terminates because the depth decreases.
+            self.emit_list_eq(inner, span)?;
         } else {
             self.asm.cmp_reg(Reg::X0, Reg::X1);
             self.asm.cset(Reg::X0, Cond::Eq);
@@ -5186,6 +6878,7 @@ impl Emitter {
         body: &Expr,
         span: Span,
     ) -> Result<ValueType, Diagnostic> {
+        let mark = self.open_temp_roots();
         let list_ty = self.expression(list)?;
         let elem = match list_ty {
             ValueType::List(elem) => elem,
@@ -5198,10 +6891,9 @@ impl Emitter {
         // references across the allocations the body and the cons perform, so
         // both are rooted; the parameter slot is rooted only when its type is
         // a reference.
-        let cursor = self.next_local_offset;
+        let cursor = self.reserve_locals(24);
         let acc = cursor + 8;
         let param_slot = acc + 8;
-        self.next_local_offset += 24;
         self.asm.store_local(Reg::X0, cursor);
         self.emit_root_frame_slot(cursor);
         self.asm.mov_imm64(Reg::X0, 0); // acc = nil
@@ -5220,8 +6912,7 @@ impl Emitter {
             self.emit_unbox_scalar();
         }
         self.asm.store_local(Reg::X0, param_slot);
-        self.scopes.push(HashMap::new());
-        self.lambda_bindings.push(HashMap::new());
+        self.push_binding_scopes();
         self.scope_root_counts.push(0);
         self.scopes
             .last_mut()
@@ -5242,8 +6933,7 @@ impl Emitter {
         self.asm.load_local(Reg::X0, acc);
         self.emit_cons_cell();
         self.asm.store_local(Reg::X0, acc);
-        self.scopes.pop();
-        self.lambda_bindings.pop();
+        self.pop_binding_scopes();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         // cursor = [cursor + 8]
@@ -5259,6 +6949,7 @@ impl Emitter {
         self.asm.push_frame_record(); // the bl clobbers x30
         self.asm.branch(reverse, BranchKind::Link);
         self.asm.pop_frame_record();
+        self.close_temp_roots(mark);
         let _ = span;
         Ok(ValueType::List(mapped_elem))
     }
@@ -5275,7 +6966,7 @@ impl Emitter {
     /// branch is concrete; that is exactly what makes `def fact(n) = if (n <
     /// 2) 1 else n * fact(n - 1)` work.
     fn static_type_under(
-        &self,
+        &mut self,
         expr: &Expr,
         locals: &mut Vec<(String, ValueType)>,
         depth: u32,
@@ -5285,7 +6976,7 @@ impl Emitter {
         // `if` merge below is what still gets a useful answer out of a
         // recursive function: the branch that bottoms out types, and the one
         // that recurses contributes nothing.
-        if depth > 6 {
+        if depth > 40 {
             return None;
         }
         match expr {
@@ -5295,6 +6986,30 @@ impl Emitter {
                 .find(|(n, _)| n == name)
                 .map(|(_, ty)| *ty)
                 .or_else(|| self.lookup(name).map(|(_, ty)| ty)),
+            // Typed the way the emitter types it, so an `if` with a `null`
+            // branch predicts the nullable join rather than the other branch.
+            Expr::Null { .. } => Some(ValueType::Null),
+            // Collection literals over locals: the whole-program inference
+            // cannot see these bindings, so the element type is inferred here.
+            // `unit(x) = [x]` in a Monad instance is exactly this shape.
+            Expr::ListLiteral { elements, .. } => match elements.first() {
+                None => Some(ValueType::EmptyList),
+                Some(first) => list_elem_of(self.static_type_under(first, locals, depth + 1)?)
+                    .map(ValueType::List),
+            },
+            Expr::SetLiteral { elements, .. } => match elements.first() {
+                None => Some(ValueType::EmptySet),
+                Some(first) => list_elem_of(self.static_type_under(first, locals, depth + 1)?)
+                    .map(ValueType::Set),
+            },
+            Expr::MapLiteral { entries, .. } => match entries.first() {
+                None => Some(ValueType::EmptyMap),
+                Some((key, value)) => {
+                    let key = list_elem_of(self.static_type_under(key, locals, depth + 1)?)?;
+                    let value = list_elem_of(self.static_type_under(value, locals, depth + 1)?)?;
+                    Some(ValueType::Map(key, value))
+                }
+            },
             Expr::Block { expressions, .. } => {
                 let mark = locals.len();
                 let (last, init) = expressions.split_last()?;
@@ -5309,6 +7024,40 @@ impl Emitter {
                 locals.truncate(mark);
                 ty
             }
+            // A match answers with its arms merged, with each arm's bindings
+            // taken from the scrutinee's shape. This is what types the option
+            // helpers, whose bodies are nothing but a match.
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                let ValueType::Enum(shape) =
+                    self.static_type_under(scrutinee, locals, depth + 1)?
+                else {
+                    return None;
+                };
+                let mut result: Option<ValueType> = None;
+                for arm in arms {
+                    if arm.guard.is_some() {
+                        return None;
+                    }
+                    let mark = locals.len();
+                    // Patterns nest, so the bindings are collected the way the
+                    // emitter collects them; an arm the shape says cannot be
+                    // taken contributes nothing, exactly as there.
+                    if !self.bind_pattern_types(ValueType::Enum(shape), &arm.pattern, locals) {
+                        locals.truncate(mark);
+                        continue;
+                    }
+                    let arm_ty = self.static_type_under(&arm.body, locals, depth + 1);
+                    locals.truncate(mark);
+                    let arm_ty = arm_ty?;
+                    result = Some(match result {
+                        None => arm_ty,
+                        Some(previous) => self.merge_types(previous, arm_ty)?,
+                    });
+                }
+                result
+            }
             Expr::If {
                 then_branch,
                 else_branch,
@@ -5321,7 +7070,7 @@ impl Emitter {
                 match (then_ty, else_ty) {
                     // Merged, so `if (done) [] else cons(x)(rest)` is a list
                     // of x rather than the empty list the first branch shows.
-                    (Some(then_ty), Some(else_ty)) => merge_branch_types(then_ty, else_ty),
+                    (Some(then_ty), Some(else_ty)) => self.merge_types(then_ty, else_ty),
                     // A branch whose type is unknown -- the recursive one --
                     // does not veto the branch that is known.
                     (known, None) | (None, known) => known,
@@ -5375,10 +7124,44 @@ impl Emitter {
                         ..
                     } = callee.as_ref()
                     && initial_args.len() == 1
-                    && let Expr::Call { callee: inner, .. } = with_initial.as_ref()
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: list_args,
+                        ..
+                    } = with_initial.as_ref()
                     && matches!(inner.as_ref(), Expr::Identifier { name, .. } if name == "foldLeft")
                 {
-                    return self.static_type_under(&initial_args[0], locals, depth + 1);
+                    let initial_ty = self.static_type_under(&initial_args[0], locals, depth + 1)?;
+                    // ...but the body can widen it, exactly as the emitter's
+                    // own fold does: starting from `[]` and appending lists
+                    // ends up a list. Take the same fixpoint here so a
+                    // fold-based function's return type is the settled one.
+                    if let Expr::Lambda { params, body, .. } = &arguments[0]
+                        && params.len() == 2
+                        && list_args.len() == 1
+                        && let Some(ValueType::List(elem)) =
+                            self.static_type_under(&list_args[0], locals, depth + 1)
+                    {
+                        let elem_ty = elem_value_type(elem);
+                        let mut acc_ty = initial_ty;
+                        for _ in 0..3 {
+                            locals.push((params[0].clone(), acc_ty));
+                            locals.push((params[1].clone(), elem_ty));
+                            let folded = self.static_type_under(body, locals, depth + 1);
+                            locals.pop();
+                            locals.pop();
+                            let Some(merged) = folded.and_then(|f| self.merge_types(acc_ty, f))
+                            else {
+                                break;
+                            };
+                            if merged == acc_ty {
+                                break;
+                            }
+                            acc_ty = merged;
+                        }
+                        return Some(acc_ty);
+                    }
+                    return Some(initial_ty);
                 }
                 // Curried `cons(head)(tail)` builds a list of the head's type.
                 if arguments.len() == 1
@@ -5393,6 +7176,97 @@ impl Emitter {
                     let head_ty = self.static_type_under(&head_args[0], locals, depth + 1)?;
                     return list_elem_of(head_ty).map(ValueType::List);
                 }
+                // Curried `map(list)(f)`, the spelling `xs.map(f)` also
+                // becomes: a list of whatever the lambda produces.
+                if arguments.len() == 1
+                    && let Expr::Call {
+                        callee: inner,
+                        arguments: list_args,
+                        ..
+                    } = callee.as_ref()
+                    && list_args.len() == 1
+                    && matches!(inner.as_ref(), Expr::Identifier { name, .. } if name == "map")
+                {
+                    return self.mapped_list_type(&list_args[0], &arguments[0], locals, depth);
+                }
+                // A curried call `f(a)(b)(c)`: the emitter compiles it as one
+                // call to a flattened function, so predict that -- which is
+                // what types such a function's *recursion*, and so what its
+                // result widens to.
+                if let Expr::Call { .. } = callee.as_ref() {
+                    let mut spine: Vec<&[Expr]> = vec![arguments];
+                    let mut head = callee.as_ref();
+                    while let Expr::Call {
+                        callee, arguments, ..
+                    } = head
+                    {
+                        spine.push(arguments);
+                        head = callee;
+                    }
+                    spine.reverse();
+                    if let Expr::Identifier { name, .. } = head {
+                        let flattened: Vec<Expr> = spine
+                            .iter()
+                            .flat_map(|group| group.iter().cloned())
+                            .collect();
+                        let curried = format!("{name}#curried{}", flattened.len());
+                        if let Some(generic) = self.generic_functions.iter().rposition(|generic| {
+                            generic.name == curried && generic.params.len() == flattened.len()
+                        }) {
+                            let (params, body) = {
+                                let generic = &self.generic_functions[generic];
+                                (generic.params.clone(), generic.body.clone())
+                            };
+                            let mark = locals.len();
+                            self.lambda_bindings.push(HashMap::new());
+                            for (param, argument) in params.iter().zip(flattened.iter()) {
+                                // A function argument is bound as one; anything
+                                // else contributes its type.
+                                if let Some((lambda_params, lambda_body)) =
+                                    self.lambda_argument(argument)
+                                {
+                                    let lambda = self.intern_lambda(lambda_params, lambda_body);
+                                    self.lambda_bindings
+                                        .last_mut()
+                                        .expect("emitter lambda scope")
+                                        .insert(param.clone(), lambda);
+                                    continue;
+                                }
+                                if let Some(ty) =
+                                    self.static_type_under(argument, locals, depth + 1)
+                                {
+                                    locals.push((param.clone(), ty));
+                                }
+                            }
+                            let predicted = self.static_type_under(&body, locals, depth + 1);
+                            self.lambda_bindings.pop();
+                            locals.truncate(mark);
+                            return predicted;
+                        }
+                    }
+                }
+                // Method-style `target.m(args)`: the emitter dispatches it as
+                // `m(target, args)`, so predict that call instead. This is what
+                // types an instance method whose body is `xs.map(f)`.
+                if let Expr::FieldAccess {
+                    target,
+                    field,
+                    span: access,
+                } = callee.as_ref()
+                {
+                    let mut all = Vec::with_capacity(arguments.len() + 1);
+                    all.push((**target).clone());
+                    all.extend(arguments.iter().cloned());
+                    let dispatched = Expr::Call {
+                        callee: Box::new(Expr::Identifier {
+                            name: field.clone(),
+                            span: *access,
+                        }),
+                        arguments: all,
+                        span: *access,
+                    };
+                    return self.static_type_under(&dispatched, locals, depth + 1);
+                }
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return None;
                 };
@@ -5401,7 +7275,7 @@ impl Emitter {
                 // is what types a higher-order def like
                 // `def applyTwice(f, x) = f(f(x))`.
                 if let Some(lambda) = self.lookup_lambda(name) {
-                    let (lambda_params, lambda_body) = &self.lambdas[lambda];
+                    let (lambda_params, lambda_body) = self.lambdas[lambda].clone();
                     if lambda_params.len() != arguments.len() {
                         return None;
                     }
@@ -5410,7 +7284,7 @@ impl Emitter {
                         let ty = self.static_type_under(argument, locals, depth + 1)?;
                         lambda_locals.push((param.clone(), ty));
                     }
-                    return self.static_type_under(lambda_body, &mut lambda_locals, depth + 1);
+                    return self.static_type_under(&lambda_body, &mut lambda_locals, depth + 1);
                 }
                 // A builtin's result, for the handful whose type the inference
                 // path actually meets. Anything else falls through to the
@@ -5445,14 +7319,71 @@ impl Emitter {
                             })
                             .filter(|ty| matches!(ty, ValueType::List(_) | ValueType::EmptyList));
                     }
-                    "println" | "print" => return Some(ValueType::Unit),
-                    "double" | "sqrt" | "floor" | "ceil" => return Some(ValueType::Double),
+                    "println" | "print" | "assert" => return Some(ValueType::Unit),
+                    "double" | "sqrt" => return Some(ValueType::Double),
                     "abs" => return first_type,
-                    "size" | "length" | "toInt" => return Some(ValueType::Int),
-                    "isEmpty" | "contains" => return Some(ValueType::Bool),
+                    // `floor`/`int`/`ceil` are Int-valued here, like the
+                    // evaluator's -- keeping this in step with the emitter
+                    // matters, since a wrong guess is a rejected build.
+                    "size" | "length" | "toInt" | "floor" | "int" | "ceil" | "Map#size" => {
+                        return Some(ValueType::Int);
+                    }
+                    "isEmpty" | "contains" | "isEmptyString" | "matches" | "containsKey"
+                    | "Map#containsKey" | "Map#isEmpty" | "Map#containsValue" => {
+                        return Some(ValueType::Bool);
+                    }
+                    // Splitting a string is how `std.string`'s `lines` and
+                    // `words` start, so the inference has to get through it to
+                    // type them at all.
+                    "split" => return Some(ValueType::List(ListElem::Str)),
+                    // `map(list, f)`, the spelling the evaluator's own builtin
+                    // takes.
+                    "map" if arguments.len() == 2 => {
+                        return self.mapped_list_type(&arguments[0], &arguments[1], locals, depth);
+                    }
+                    // Looking a key up answers with the value or nothing, so
+                    // the inference needs the map's own value type -- which is
+                    // what types `std.map`'s `getOrElse`, whose body merges a
+                    // lookup with its fallback.
+                    "get" | "Map#get" => {
+                        return match first_type {
+                            Some(ValueType::Map(_, value)) => Some(ValueType::Nullable(value)),
+                            _ => None,
+                        };
+                    }
+                    "getOrElse" | "Map#getOrElse" => {
+                        return match first_type {
+                            Some(ValueType::Map(_, value)) => Some(elem_value_type(value)),
+                            _ => None,
+                        };
+                    }
+                    // The enum lowering's allocators. A constructor call like
+                    // `Some(x)` becomes one of these, so without them a
+                    // function that just wraps a constructor cannot be typed.
+                    "__gc_record" | "__gc_alloc" | "__gc_string" => {
+                        return Some(ValueType::Ptr);
+                    }
+                    "__match_fail" => return Some(ValueType::Never),
                     "toString" | "substring" | "trim" | "toUpperCase" | "toLowerCase"
                     | "reverse" | "join" | "replaceAll" | "at" => return Some(ValueType::Str),
                     _ => {}
+                }
+                // A generic enum's constructor: the payload types the call
+                // site gives are the shape the value carries.
+                if let Some((enum_index, tag, arity)) = self.enum_variant(name)
+                    && arity == arguments.len()
+                {
+                    let mut payload = Vec::with_capacity(arity);
+                    for argument in arguments {
+                        payload.push(self.static_type_under(argument, locals, depth + 1)?);
+                    }
+                    if !self.enum_is_generic[enum_index]
+                        && let Some(shape) = self.canonical_enum_shape(enum_index, expr.span())
+                    {
+                        return Some(ValueType::Enum(shape));
+                    }
+                    let shape = self.intern_enum_shape(enum_index, tag, payload);
+                    return Some(ValueType::Enum(shape));
                 }
                 // A generic def's result is its body's, inferred with the
                 // parameters bound to these argument types -- the same thing
@@ -5460,10 +7391,41 @@ impl Emitter {
                 if let Some(generic) = self.generic_functions.iter().rposition(|generic| {
                     generic.name == *name && generic.params.len() == arguments.len()
                 }) {
-                    let generic = self.generic_functions[generic].clone();
-                    if let Some(declared) = generic.declared_return {
+                    let specialised = self.generic_functions[generic].clone();
+                    if let Some(declared) = specialised.declared_return {
                         return Some(declared);
                     }
+                    // A specialisation already registered for these arguments
+                    // answers with its own return type. This is what types a
+                    // *recursive* call: the specialisation goes into the table
+                    // before its body is compiled, so a call inside that body
+                    // gets the real answer here instead of descending into the
+                    // body again and running into the depth limit -- and the
+                    // depth limit would answer with the base case alone, which
+                    // for a function returning `null` or a value is exactly the
+                    // half that leaves the other half unboxed.
+                    let values: Vec<ValueType> = arguments
+                        .iter()
+                        .filter_map(|argument| self.static_type_under(argument, locals, depth + 1))
+                        .collect();
+                    let mut registered = self
+                        .specializations
+                        .iter()
+                        .filter(|((which, _), _)| *which == generic)
+                        .map(|(_, index)| &self.functions[*index].1)
+                        .filter(|info| {
+                            info.params
+                                .iter()
+                                .map(|(_, ty)| *ty)
+                                .eq(values.iter().copied())
+                        })
+                        .map(|info| info.ret);
+                    if let Some(first) = registered.next()
+                        && registered.all(|ret| ret == first)
+                    {
+                        return Some(first);
+                    }
+                    let generic = specialised;
                     let params = &generic.params;
                     let body = &generic.body;
                     let mut callee_locals = Vec::with_capacity(params.len());
@@ -5514,6 +7476,7 @@ impl Emitter {
         let mut rooted = Vec::with_capacity(arguments.len());
         let mut value_params: Vec<(String, ValueType)> = Vec::new();
         let mut lambda_params: Vec<(String, usize)> = Vec::new();
+        let mut dict_params: Vec<(String, Vec<(String, usize)>)> = Vec::new();
         for (param, argument) in params.iter().zip(arguments.iter()) {
             // A lambda argument is not a value: it is interned and the
             // parameter name is bound to it inside the specialisation, so a
@@ -5524,9 +7487,7 @@ impl Emitter {
                 ..
             } = argument
             {
-                let index = self.lambdas.len();
-                self.lambdas
-                    .push((lambda_args.clone(), lambda_body.as_ref().clone()));
+                let index = self.intern_lambda(lambda_args.clone(), lambda_body.as_ref().clone());
                 lambda_params.push((param.clone(), index));
                 continue;
             }
@@ -5538,6 +7499,12 @@ impl Emitter {
                 && let Some(index) = self.lookup_lambda(name)
             {
                 lambda_params.push((param.clone(), index));
+                continue;
+            }
+            // Likewise a dictionary of lambdas: `showValue(Show_Int_dict, 42)`
+            // hands over the record's field-to-lambda mapping, not a value.
+            if let Some(dict) = self.dict_value_of(argument) {
+                dict_params.push((param.clone(), dict));
                 continue;
             }
             let ty = self.expression(argument)?;
@@ -5560,7 +7527,17 @@ impl Emitter {
         for (_, index) in &lambda_params {
             key_types.push(ValueType::Record(*index as u32));
         }
+        for (_, fields) in &dict_params {
+            for (_, index) in fields {
+                key_types.push(ValueType::Set(ListElem::Nested {
+                    depth: 1,
+                    base: ScalarElem::Int,
+                }));
+                key_types.push(ValueType::Record(*index as u32));
+            }
+        }
         let key = (generic, key_types);
+        let fresh = !self.specializations.contains_key(&key);
         let index = match self.specializations.get(&key) {
             Some(&index) => index,
             None => {
@@ -5585,18 +7562,31 @@ impl Emitter {
                 // The lambda parameters must be visible while the body's type
                 // is worked out, or a higher-order def's result could not be
                 // typed at all.
+                // Both kinds of compile-time parameter have to be visible
+                // while the body's type is worked out, and both scopes are
+                // pushed so the pops below stay symmetric -- an unmatched pop
+                // here silently discarded the *enclosing* scope, which is how
+                // a second dictionary at top level stopped being found.
                 self.lambda_bindings
                     .push(lambda_params.iter().cloned().collect());
+                self.dict_bindings
+                    .push(dict_params.iter().cloned().collect());
+                self.alias_bindings.push(HashMap::new());
                 let inferred = declared_return
                     .or(matched_return)
                     .or_else(|| self.static_type_under(&body, &mut locals, 0));
                 self.lambda_bindings.pop();
-                let Some(ret) = inferred else {
-                    return Err(unsupported(
-                        span,
-                        &format!("a call to `{name}`, whose result type cannot be determined"),
-                    ));
-                };
+                self.dict_bindings.pop();
+                self.alias_bindings.pop();
+                // No answer yet is not the same as no answer: a body that calls
+                // *another* function which calls back into this one cannot be
+                // typed until this specialisation exists to be found. So it is
+                // registered with a provisional `Never` -- which merges with
+                // anything, so a recursive call contributes nothing rather than
+                // poisoning the merge -- and the fixpoint below settles it. If
+                // it is still `Never` afterwards, the call really cannot be
+                // typed and that is reported there.
+                let ret = inferred.unwrap_or(ValueType::Never);
                 let label = self.asm.new_label();
                 // Registered *before* its body is emitted, so a recursive
                 // call inside the body finds this specialisation instead of
@@ -5607,6 +7597,7 @@ impl Emitter {
                         label,
                         params: signature,
                         lambda_params: lambda_params.clone(),
+                        dict_params: dict_params.clone(),
                         ret,
                         body,
                     },
@@ -5616,10 +7607,60 @@ impl Emitter {
                 index
             }
         };
+        if fresh {
+            // The first guess at the return type came from a body in which the
+            // recursive call had nothing to resolve to yet, so it is the base
+            // case's answer alone: `myFoldLeft` starting from `[]` looked like
+            // it returned the empty list. Now that the specialisation is
+            // registered the recursion resolves, so take the fixpoint and
+            // correct the registration -- before the body is compiled, since
+            // the body is checked against it.
+            for _ in 0..8 {
+                let (params, body, current) = {
+                    let info = &self.functions[index].1;
+                    (info.params.clone(), info.body.clone(), info.ret)
+                };
+                let mut locals: Vec<(String, ValueType)> = params
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), *ty))
+                    .collect();
+                self.push_binding_scopes();
+                for (param, lambda) in &lambda_params {
+                    self.lambda_bindings
+                        .last_mut()
+                        .expect("emitter lambda scope")
+                        .insert(param.clone(), *lambda);
+                }
+                for (param, fields) in &dict_params {
+                    self.dict_bindings
+                        .last_mut()
+                        .expect("emitter dict scope")
+                        .insert(param.clone(), fields.clone());
+                }
+                let predicted = self.static_type_under(&body, &mut locals, 0);
+                self.pop_binding_scopes();
+                let Some(predicted) = predicted else {
+                    break;
+                };
+                let Some(merged) = self.merge_types(current, predicted) else {
+                    break;
+                };
+                if merged == current {
+                    break;
+                }
+                self.functions[index].1.ret = merged;
+            }
+        }
         let (label, ret) = {
             let info = &self.functions[index].1;
             (info.label, info.ret)
         };
+        if ret == ValueType::Never {
+            return Err(unsupported(
+                span,
+                &format!("a call to `{name}`, whose result type cannot be determined"),
+            ));
+        }
         for (position, register) in ARG_REGS.iter().take(argument_types.len()).enumerate().rev() {
             if rooted[position] {
                 self.pop_rooted(*register);
@@ -5650,15 +7691,15 @@ impl Emitter {
         body: &Expr,
         span: Span,
     ) -> Result<ValueType, Diagnostic> {
+        let mark = self.open_temp_roots();
         let initial_ty = self.expression(initial)?;
         if initial_ty == ValueType::Unit {
             return Err(unsupported(initial.span(), "a unit-typed accumulator"));
         }
-        let acc = self.next_local_offset;
+        let acc = self.reserve_locals(32);
         let cursor = acc + 8;
         let acc_slot = cursor + 8;
         let elem_slot = acc_slot + 8;
-        self.next_local_offset += 32;
         self.asm.store_local(Reg::X0, acc);
         if is_heap_pointer(initial_ty) {
             self.emit_root_frame_slot(acc);
@@ -5674,6 +7715,31 @@ impl Emitter {
         self.emit_root_frame_slot(cursor);
 
         let elem_ty = elem_value_type(elem);
+        // The accumulator's type can be *widened* by the body:
+        // `foldLeft(xss)([])((acc, xs) => concat(acc, xs))` starts from the
+        // polymorphic empty list and ends up holding a real list, so typing the
+        // body against the initial value alone would reject the fold. Settle
+        // the type first by inference -- this emits nothing -- and compile the
+        // body once against the settled type. Widening only ever turns the
+        // empty list/set into a list/set, both of which are heap pointers
+        // already, so the accumulator's rooting above is unaffected.
+        let mut acc_ty = initial_ty;
+        for _ in 0..3 {
+            let mut locals = vec![
+                (acc_param.to_string(), acc_ty),
+                (elem_param.to_string(), elem_ty),
+            ];
+            let Some(folded) = self.static_type_under(body, &mut locals, 0) else {
+                break;
+            };
+            let Some(merged) = self.merge_types(acc_ty, folded) else {
+                break;
+            };
+            if merged == acc_ty {
+                break;
+            }
+            acc_ty = merged;
+        }
         let loop_start = self.asm.new_label();
         let done = self.asm.new_label();
         self.asm.bind(loop_start);
@@ -5686,30 +7752,28 @@ impl Emitter {
         self.asm.store_local(Reg::X0, elem_slot);
         self.asm.load_local(Reg::X0, acc);
         self.asm.store_local(Reg::X0, acc_slot);
-        self.scopes.push(HashMap::new());
-        self.lambda_bindings.push(HashMap::new());
+        self.push_binding_scopes();
         self.scope_root_counts.push(0);
         {
             let scope = self.scopes.last_mut().expect("emitter scope");
-            scope.insert(acc_param.to_string(), (acc_slot, initial_ty));
+            scope.insert(acc_param.to_string(), (acc_slot, acc_ty));
             scope.insert(elem_param.to_string(), (elem_slot, elem_ty));
         }
-        if is_heap_pointer(initial_ty) {
+        if is_heap_pointer(acc_ty) {
             self.emit_root_frame_slot(acc_slot);
         }
         if is_heap_pointer(elem_ty) {
             self.emit_root_frame_slot(elem_slot);
         }
         let folded = self.expression(body)?;
-        if folded != initial_ty {
+        if !assignable(folded, acc_ty) {
             return Err(unsupported(
                 body.span(),
                 "a fold whose accumulator changes type",
             ));
         }
         self.asm.store_local(Reg::X0, acc);
-        self.scopes.pop();
-        self.lambda_bindings.pop();
+        self.pop_binding_scopes();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         self.asm.load_local(Reg::X0, cursor);
@@ -5718,16 +7782,244 @@ impl Emitter {
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(done);
         self.asm.load_local(Reg::X0, acc);
+        self.close_temp_roots(mark);
         let _ = span;
-        Ok(initial_ty)
+        Ok(acc_ty)
+    }
+
+    /// Open a scope for all four kinds of compile-time binding at once.
+    ///
+    /// These stacks have to move in lockstep: an unmatched pop discards the
+    /// *enclosing* scope, and the symptom is a binding that silently stops
+    /// existing (or a panic on an empty stack). Two bugs of exactly that shape
+    /// happened while these were pushed one by one, so opening and closing
+    /// them is a single operation now.
+    fn push_binding_scopes(&mut self) {
+        self.scopes.push(HashMap::new());
+        self.lambda_bindings.push(HashMap::new());
+        self.dict_bindings.push(HashMap::new());
+        self.alias_bindings.push(HashMap::new());
+        self.literal_strings.push(HashMap::new());
+    }
+
+    /// Close the scopes `push_binding_scopes` opened.
+    fn pop_binding_scopes(&mut self) {
+        self.scopes.pop();
+        self.lambda_bindings.pop();
+        self.dict_bindings.pop();
+        self.alias_bindings.pop();
+        self.literal_strings.pop();
+    }
+
+    /// A name aliasing another name, innermost scope first.
+    fn lookup_alias(&self, name: &str) -> Option<String> {
+        self.alias_bindings
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
+    }
+
+    /// A name bound to a dictionary of lambdas, innermost scope first.
+    /// Intern a lambda together with the compile-time environment it was
+    /// written under, and answer with its index.
+    fn intern_lambda(&mut self, params: Vec<String>, body: Expr) -> usize {
+        // Outer scopes first, so an inner binding of the same name wins when
+        // the environment is installed in order.
+        let env = CapturedEnv {
+            lambdas: self
+                .lambda_bindings
+                .iter()
+                .flatten()
+                .map(|(name, index)| (name.clone(), *index))
+                .collect(),
+            dicts: self
+                .dict_bindings
+                .iter()
+                .flatten()
+                .map(|(name, fields)| (name.clone(), fields.clone()))
+                .collect(),
+        };
+        self.lambdas.push((params, body));
+        self.lambda_envs.push(env);
+        self.lambdas.len() - 1
+    }
+
+    /// The field-to-lambda mapping of an expression that denotes a dictionary
+    /// at compile time.
+    ///
+    /// Three shapes, and the third is the point: a name bound to one, a record
+    /// literal whose fields are all lambdas, and a *call* whose result is one
+    /// -- `Show_List_dict(Show_Int_dict)`, a dictionary parameterised by
+    /// another. That call is evaluated here rather than at run time, with the
+    /// argument bound as a dictionary inside, so the lambdas in the record it
+    /// answers with capture it.
+    ///
+    /// Interning lambdas is all this does; it emits no code, so asking whether
+    /// an arbitrary argument happens to be a dictionary costs nothing but a few
+    /// unused table entries.
+    fn dict_value_of(&mut self, expr: &Expr) -> Option<Vec<(String, usize)>> {
+        match expr {
+            Expr::Identifier { name, .. } => self.lookup_dict(name),
+            Expr::RecordLiteral { fields, .. }
+                if !fields.is_empty()
+                    && fields
+                        .iter()
+                        .all(|(_, value)| matches!(value, Expr::Lambda { .. })) =>
+            {
+                let mut mapping = Vec::with_capacity(fields.len());
+                for (field, value) in fields {
+                    let Expr::Lambda { params, body, .. } = value else {
+                        unreachable!("checked in the guard");
+                    };
+                    let index = self.intern_lambda(params.clone(), body.as_ref().clone());
+                    mapping.push((field.clone(), index));
+                }
+                Some(mapping)
+            }
+            Expr::Block { expressions, .. } if expressions.len() == 1 => {
+                self.dict_value_of(&expressions[0])
+            }
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                let Expr::Identifier { name, .. } = callee.as_ref() else {
+                    return None;
+                };
+                let index = self.lookup_lambda(name)?;
+                let (params, body) = self.lambdas[index].clone();
+                if params.len() != arguments.len() {
+                    return None;
+                }
+                self.push_binding_scopes();
+                self.install_captured_env(index);
+                let mut bound = true;
+                for (param, argument) in params.iter().zip(arguments.iter()) {
+                    if let Some(dict) = self.dict_value_of(argument) {
+                        self.dict_bindings
+                            .last_mut()
+                            .expect("emitter dict scope")
+                            .insert(param.clone(), dict);
+                        continue;
+                    }
+                    if let Expr::Identifier { name, .. } = argument
+                        && let Some(lambda) = self.lookup_lambda(name)
+                    {
+                        self.lambda_bindings
+                            .last_mut()
+                            .expect("emitter lambda scope")
+                            .insert(param.clone(), lambda);
+                        continue;
+                    }
+                    // A value argument cannot be bound without emitting code,
+                    // so this is not a compile-time dictionary after all.
+                    bound = false;
+                    break;
+                }
+                let mapping = if bound {
+                    self.dict_value_of(&body)
+                } else {
+                    None
+                };
+                self.pop_binding_scopes();
+                mapping
+            }
+            _ => None,
+        }
+    }
+
+    /// Install a lambda's captured environment in the innermost scope. Adds to
+    /// what is already visible rather than replacing it: the names a lambda
+    /// closed over resolve to what they meant then, and nothing else moves.
+    fn install_captured_env(&mut self, index: usize) {
+        let env = self.lambda_envs[index].clone();
+        for (name, lambda) in env.lambdas {
+            self.lambda_bindings
+                .last_mut()
+                .expect("emitter lambda scope")
+                .insert(name, lambda);
+        }
+        for (name, fields) in env.dicts {
+            self.dict_bindings
+                .last_mut()
+                .expect("emitter dict scope")
+                .insert(name, fields);
+        }
+    }
+
+    fn lookup_dict(&self, name: &str) -> Option<Vec<(String, usize)>> {
+        self.dict_bindings
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
     }
 
     /// A name bound to a lambda, innermost scope first.
+    /// The text of an argument that is a string literal, directly or through a
+    /// `val` bound to one. Interpolation is deliberately excluded: its value is
+    /// not known until it runs.
+    fn literal_string(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::String { value, .. } if !value.contains("#{") => Some(value.clone()),
+            Expr::Identifier { name, .. } => self
+                .literal_strings
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(name))
+                .cloned(),
+            _ => None,
+        }
+    }
+
     fn lookup_lambda(&self, name: &str) -> Option<usize> {
         self.lambda_bindings
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).copied())
+    }
+
+    /// The parameters and body of a lambda argument, whether it was written
+    /// out at the call site or passed in under a name -- a higher-order def
+    /// hands its own lambda parameter on, so both spellings turn up.
+    fn lambda_argument(&self, expr: &Expr) -> Option<(Vec<String>, Expr)> {
+        match expr {
+            Expr::Lambda { params, body, .. } => Some((params.clone(), (**body).clone())),
+            Expr::Identifier { name, .. } => {
+                let index = self.lookup_lambda(name)?;
+                let (params, body) = &self.lambdas[index];
+                Some((params.clone(), body.clone()))
+            }
+            // `{ (x) => ... }` and `{x, y => ...}`: a braced block whose only
+            // expression is the lambda, which is how a trailing block argument
+            // is written.
+            Expr::Block { expressions, .. } if expressions.len() == 1 => {
+                self.lambda_argument(&expressions[0])
+            }
+            _ => None,
+        }
+    }
+
+    /// The type of mapping `list` through `f`: a list of whatever the lambda's
+    /// body produces with its parameter bound to the element type. Inference
+    /// only -- nothing is emitted.
+    fn mapped_list_type(
+        &mut self,
+        list: &Expr,
+        f: &Expr,
+        locals: &mut Vec<(String, ValueType)>,
+        depth: u32,
+    ) -> Option<ValueType> {
+        let elem = match self.static_type_under(list, locals, depth + 1)? {
+            ValueType::List(elem) => elem,
+            _ => return None,
+        };
+        let (params, body) = self.lambda_argument(f)?;
+        if params.len() != 1 {
+            return None;
+        }
+        locals.push((params[0].clone(), elem_value_type(elem)));
+        let result = self.static_type_under(&body, locals, depth + 1);
+        locals.pop();
+        list_elem_of(result?).map(ValueType::List)
     }
 
     /// Compile a call to a lambda-bound name by compiling the lambda's body
@@ -5763,13 +8055,13 @@ impl Emitter {
             if ty == ValueType::Unit {
                 return Err(unsupported(argument.span(), "a unit-typed argument"));
             }
-            let offset = self.next_local_offset;
-            self.next_local_offset += 8;
+            let offset = self.reserve_locals(8);
             self.asm.store_local(Reg::X0, offset);
             bound.push((offset, ty));
         }
-        self.scopes.push(HashMap::new());
-        self.lambda_bindings.push(HashMap::new());
+        self.push_binding_scopes();
+        // What the lambda closed over, before its parameters shadow anything.
+        self.install_captured_env(index);
         self.scope_root_counts.push(0);
         for (param, (offset, ty)) in params.iter().zip(bound.iter()) {
             self.scopes
@@ -5783,12 +8075,11 @@ impl Emitter {
             }
         }
         let result = self.expression(&body)?;
-        self.scopes.pop();
-        self.lambda_bindings.pop();
+        self.pop_binding_scopes();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
         // The parameter slots are dead now; let the next call reuse them.
-        self.next_local_offset = saved_offset;
+        self.release_locals_to(saved_offset);
         Ok(result)
     }
 
@@ -5832,20 +8123,32 @@ impl Emitter {
         } else {
             let argument_types: Vec<Option<ValueType>> =
                 arguments.iter().map(|a| self.static_type_of(a)).collect();
-            candidates
-                .iter()
-                .rev()
-                .copied()
-                .find(|&candidate| {
-                    let params = &self.functions[candidate].1.params;
-                    params.len() == arguments.len()
-                        && params.iter().zip(argument_types.iter()).all(
-                            |((_, expected), actual)| {
-                                actual.is_some_and(|actual| assignable(actual, *expected))
-                            },
-                        )
-                })
-                .unwrap_or(fallback)
+            let accepted = candidates.iter().rev().copied().find(|&candidate| {
+                let params = &self.functions[candidate].1.params;
+                params.len() == arguments.len()
+                    && params
+                        .iter()
+                        .zip(argument_types.iter())
+                        .all(|((_, expected), actual)| {
+                            actual.is_some_and(|actual| assignable(actual, *expected))
+                        })
+            });
+            match accepted {
+                Some(index) => index,
+                // No concrete overload accepts these arguments. One of the
+                // instances may still be the answer without being concrete:
+                // `instance Show<List<'a>>` declares its `show` over a type
+                // variable, so it is compiled per call site like any other
+                // signature that is not fully annotated.
+                None => {
+                    if let Some(generic) = self.generic_functions.iter().rposition(|generic| {
+                        generic.name == name && generic.params.len() == arguments.len()
+                    }) {
+                        return self.emit_generic_function_call(generic, arguments, span);
+                    }
+                    fallback
+                }
+            }
         };
         let (label, params, ret) = {
             let info = &self.functions[index].1;
@@ -5903,29 +8206,23 @@ impl Emitter {
     /// and binds parameters to frame-pointer slots, the body is a
     /// single expression whose value stays in x0.
     fn emit_function(&mut self, index: usize) -> Result<(), Diagnostic> {
-        let (label, params, lambda_params, ret, body) = {
+        let (label, params, lambda_params, dict_params, ret, body) = {
             let info = &self.functions[index].1;
             (
                 info.label,
                 info.params.clone(),
                 info.lambda_params.clone(),
+                info.dict_params.clone(),
                 info.ret,
                 info.body.clone(),
             )
         };
         self.asm.bind(label);
         self.asm.push_frame_record();
-        let frame_size = ((params.len() as u32 + count_var_decls(&body)) * 8).div_ceil(16) * 16;
-        if frame_size >= 4096 {
-            return Err(unsupported(body.span(), "this many local variables"));
-        }
-        if frame_size > 0 {
-            self.asm.sub_sp_imm(frame_size);
-        }
+        let frame_patch = self.asm.sub_sp_placeholder();
         self.asm.mov_fp_sp();
 
-        self.scopes.push(HashMap::new());
-        self.lambda_bindings.push(HashMap::new());
+        self.push_binding_scopes();
         self.scope_root_counts.push(0);
         for (param, lambda) in &lambda_params {
             self.lambda_bindings
@@ -5933,8 +8230,16 @@ impl Emitter {
                 .expect("emitter lambda scope")
                 .insert(param.clone(), *lambda);
         }
+        for (param, fields) in &dict_params {
+            self.dict_bindings
+                .last_mut()
+                .expect("emitter dict scope")
+                .insert(param.clone(), fields.clone());
+        }
         let saved_offset = self.next_local_offset;
+        let saved_max = self.max_local_offset;
         self.next_local_offset = 0;
+        self.max_local_offset = 0;
         let mut param_slots = Vec::new();
         for (position, (param, ty)) in params.iter().enumerate() {
             let offset = self.declare_local(param, *ty);
@@ -5949,14 +8254,26 @@ impl Emitter {
             self.emit_root_frame_slot(offset);
         }
         let body_ty = self.expression(&body)?;
-        self.scopes.pop();
-        self.lambda_bindings.pop();
+        self.pop_binding_scopes();
         // Drop this activation's roots before returning; the result is in
         // x0, which the pop helper preserves.
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
         self.emit_shadow_pop(roots);
+        // The body is compiled, so the frame's real size is known: fill in the
+        // reservation and take it back down the same amount.
+        let frame_size = self.max_local_offset.div_ceil(16) * 16;
+        if frame_size >= 4096 {
+            return Err(unsupported(body.span(), "this many local variables"));
+        }
+        self.asm.patch_sub_sp(frame_patch, frame_size);
         self.next_local_offset = saved_offset;
-        if !assignable(body_ty, ret) {
+        self.max_local_offset = saved_max;
+        // A body narrower than the registered return type is fine: two shapes
+        // of one enum have the same representation, and the wider one is what
+        // callers were told. Merging is how "narrower" is decided, since what a
+        // shape knows lives in a table here.
+        let fits = assignable(body_ty, ret) || self.merge_types(body_ty, ret) == Some(ret);
+        if !fits {
             return Err(unsupported(
                 body.span(),
                 "a function body of a different type than its return annotation",
@@ -6024,6 +8341,14 @@ impl Emitter {
                 self.asm.emit_write_rodata(STDOUT_FD, b"%()\n");
                 Ok(())
             }
+            ValueType::Map(key, value) => {
+                self.emit_println_map(key, value, span)?;
+                Ok(())
+            }
+            ValueType::EmptyMap => {
+                self.asm.emit_write_rodata(STDOUT_FD, b"%[]\n");
+                Ok(())
+            }
             ValueType::Record(index) => {
                 self.emit_println_record(index, argument.span())?;
                 Ok(())
@@ -6040,6 +8365,48 @@ impl Emitter {
                 self.asm.bind(end_label);
                 Ok(())
             }
+            ValueType::Null => {
+                self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
+                Ok(())
+            }
+            // `null` or a value: the evaluator prints the word `null` for the
+            // empty case, and the value itself otherwise.
+            ValueType::Nullable(elem) => {
+                let null_label = self.asm.new_label();
+                let end_label = self.asm.new_label();
+                self.asm
+                    .branch(null_label, BranchKind::CompareZero(Reg::X0));
+                let inner = elem_value_type(elem);
+                if is_boxed_scalar(inner) {
+                    self.emit_unbox_scalar();
+                }
+                match elem {
+                    ListElem::Int => self.asm.emit_print_int_line(),
+                    ListElem::Str => self.emit_println_str(),
+                    ListElem::Bool => {
+                        let false_label = self.asm.new_label();
+                        let bool_end = self.asm.new_label();
+                        self.asm
+                            .branch(false_label, BranchKind::CompareZero(Reg::X0));
+                        self.asm.emit_write_rodata(STDOUT_FD, b"true\n");
+                        self.asm.branch(bool_end, BranchKind::Unconditional);
+                        self.asm.bind(false_label);
+                        self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
+                        self.asm.bind(bool_end);
+                    }
+                    ListElem::Double | ListElem::Enum(_) | ListElem::Nested { .. } => {
+                        return Err(unsupported(
+                            argument.span(),
+                            &format!("printing a nullable {elem:?}"),
+                        ));
+                    }
+                }
+                self.asm.branch(end_label, BranchKind::Unconditional);
+                self.asm.bind(null_label);
+                self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
+                self.asm.bind(end_label);
+                Ok(())
+            }
             other => Err(unsupported(
                 argument.span(),
                 &format!("printing a {other:?} value"),
@@ -6050,14 +8417,12 @@ impl Emitter {
     fn statement(&mut self, expr: &Expr) -> Result<(), Diagnostic> {
         match expr {
             Expr::Block { expressions, .. } => {
-                self.scopes.push(HashMap::new());
-                self.lambda_bindings.push(HashMap::new());
+                self.push_binding_scopes();
                 self.scope_root_counts.push(0);
                 for expression in expressions {
                     self.statement(expression)?;
                 }
-                self.scopes.pop();
-                self.lambda_bindings.pop();
+                self.pop_binding_scopes();
                 let roots = self.scope_root_counts.pop().expect("emitter root scope");
                 self.emit_shadow_pop(roots);
                 Ok(())
@@ -6068,24 +8433,126 @@ impl Emitter {
             // A typeclass declaration is type-level only, and an instance's
             // methods were already collected as functions, so neither emits
             // code here.
+            // An enum declaration is likewise type-level by the time it gets
+            // here: the lowering has already turned its constructors and
+            // matches into records and calls.
             Expr::ModuleHeader { .. }
             | Expr::Import { .. }
             | Expr::DefDecl { .. }
             | Expr::RecordDeclaration { .. }
+            | Expr::EnumDeclaration { .. }
             | Expr::TypeClassDeclaration { .. }
             | Expr::InstanceDeclaration { .. } => Ok(()),
             Expr::VarDecl { name, value, .. } => {
+                // Remember a string literal's text for the builtins that need
+                // it at compile time, and forget any older binding of this name
+                // so a shadowing one does not inherit the wrong text.
+                {
+                    let literal = match value.as_ref() {
+                        Expr::String { value, .. } if !value.contains("#{") => Some(value.clone()),
+                        _ => None,
+                    };
+                    let scope = self
+                        .literal_strings
+                        .last_mut()
+                        .expect("emitter literal scope");
+                    match literal {
+                        Some(text) => scope.insert(name.clone(), text),
+                        None => scope.remove(name),
+                    };
+                }
                 // `val f = (x) => ...`: bind the name to the lambda body
                 // instead of to a slot. There is nothing to store -- the body
                 // is compiled at each call site, where the parameter types
                 // are known from the arguments.
                 if let Expr::Lambda { params, body, .. } = value.as_ref() {
-                    let index = self.lambdas.len();
-                    self.lambdas.push((params.clone(), body.as_ref().clone()));
+                    let index = self.intern_lambda(params.clone(), body.as_ref().clone());
                     self.lambda_bindings
                         .last_mut()
                         .expect("emitter lambda scope")
                         .insert(name.clone(), index);
+                    return Ok(());
+                }
+                // `val Show_Int_dict = record { show: (x: Int) => ... }`: a
+                // record whose fields are all lambdas is the dictionary-passing
+                // shape, and like a lambda it lives only at compile time --
+                // the name is bound to its field-to-lambda mapping and
+                // `dict.show(x)` compiles the body at the call.
+                // `val sub = substring`: a bare name on the right that is not
+                // a value in this backend -- a builtin or a function -- becomes
+                // an alias resolved at each call.
+                if let Expr::Identifier { name: target, .. } = value.as_ref()
+                    && self.lookup(target).is_none()
+                    && self.lookup_lambda(target).is_none()
+                    && self.lookup_dict(target).is_none()
+                    // A nullary constructor is a value, not another name.
+                    && self.enum_variant(target).is_none()
+                {
+                    let target = self.lookup_alias(target).unwrap_or_else(|| target.clone());
+                    self.alias_bindings
+                        .last_mut()
+                        .expect("emitter alias scope")
+                        .insert(name.clone(), target);
+                    return Ok(());
+                }
+                if let Expr::RecordLiteral { fields, .. } = value.as_ref()
+                    && !fields.is_empty()
+                    && fields
+                        .iter()
+                        .all(|(_, value)| matches!(value, Expr::Lambda { .. }))
+                {
+                    let mapping = self
+                        .dict_value_of(value)
+                        .expect("a record of lambdas is a dictionary");
+                    self.dict_bindings
+                        .last_mut()
+                        .expect("emitter dict scope")
+                        .insert(name.clone(), mapping);
+                    return Ok(());
+                }
+                // A nominal record with function-typed fields: the stored
+                // fields become the object, and the functions are remembered
+                // against this name so `s.to_string()` can find one.
+                if let Expr::RecordConstructor {
+                    name: record,
+                    arguments,
+                    ..
+                } = value.as_ref()
+                    && let Some(index) = self
+                        .records
+                        .iter()
+                        .position(|info| info.usable && info.name == *record)
+                    && !self.records[index].lambda_fields.is_empty()
+                {
+                    let lambda_fields = self.records[index].lambda_fields.clone();
+                    let mut mapping = Vec::with_capacity(lambda_fields.len());
+                    for (field, position) in lambda_fields {
+                        let Some((params, body)) = arguments
+                            .get(position)
+                            .and_then(|argument| self.lambda_argument(argument))
+                        else {
+                            return Err(unsupported(
+                                value.span(),
+                                "a function-typed field that is not a function",
+                            ));
+                        };
+                        mapping.push((field, self.intern_lambda(params, body)));
+                    }
+                    self.dict_bindings
+                        .last_mut()
+                        .expect("emitter dict scope")
+                        .insert(name.clone(), mapping);
+                    // The object itself is still a value binding.
+                }
+                // ...and so is a call that answers with one, which is how a
+                // dictionary parameterised by another is bound to a name.
+                if matches!(value.as_ref(), Expr::Call { .. })
+                    && let Some(mapping) = self.dict_value_of(value)
+                {
+                    self.dict_bindings
+                        .last_mut()
+                        .expect("emitter dict scope")
+                        .insert(name.clone(), mapping);
                     return Ok(());
                 }
                 let ty = self.expression(value)?;
@@ -6170,55 +8637,6 @@ impl Emitter {
     }
 }
 
-/// Count every local the program can declare so the frame can be
-/// reserved once up front (slots are never reused; fine at this
-/// scale). The recursion mirrors exactly the expression shapes the
-/// code generator walks — the enum lowering plants `val`s inside
-/// expression-position blocks — so it never undercounts a compilable
-/// program; anything it cannot see fails compilation before a slot
-/// is touched.
-fn count_var_decls(expr: &Expr) -> u32 {
-    match expr {
-        // A lambda's parameters and locals become frame slots of whichever
-        // function inlines it; the slots are released again after the call
-        // (see emit_inline_lambda_call), so counting each lambda once is
-        // enough for the frame to hold the deepest single call.
-        Expr::Lambda { params, body, .. } => params.len() as u32 + count_var_decls(body),
-        Expr::VarDecl { value, .. } => 1 + count_var_decls(value),
-        Expr::Assign { value, .. } => count_var_decls(value),
-        Expr::Block { expressions, .. } => expressions.iter().map(count_var_decls).sum(),
-        Expr::While {
-            condition, body, ..
-        } => count_var_decls(condition) + count_var_decls(body),
-        Expr::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            count_var_decls(condition)
-                + count_var_decls(then_branch)
-                + else_branch
-                    .as_ref()
-                    .map_or(0, |branch| count_var_decls(branch))
-        }
-        Expr::Binary { lhs, rhs, .. } => count_var_decls(lhs) + count_var_decls(rhs),
-        Expr::Call {
-            callee, arguments, ..
-        } => count_var_decls(callee) + arguments.iter().map(count_var_decls).sum::<u32>(),
-        Expr::ListLiteral { elements, .. } => elements.iter().map(count_var_decls).sum(),
-        // A set literal reserves one frame slot for its accumulator,
-        // plus whatever its elements declare.
-        Expr::SetLiteral { elements, .. } => 1 + elements.iter().map(count_var_decls).sum::<u32>(),
-        Expr::RecordConstructor { arguments, .. } => arguments.iter().map(count_var_decls).sum(),
-        Expr::RecordLiteral { fields, .. } => {
-            fields.iter().map(|(_, value)| count_var_decls(value)).sum()
-        }
-        Expr::FieldAccess { target, .. } => count_var_decls(target),
-        _ => 0,
-    }
-}
-
 /// Register every monomorphic, fully annotated top-level record
 /// declaration. Two passes so records can reference each other in any
 /// order; declarations the subset cannot type (generics, function
@@ -6230,6 +8648,34 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
     // Pass 1: names, so field annotations can reference any record.
     for expression in expressions {
         if let Expr::RecordDeclaration {
+            name,
+            type_params,
+            fields,
+            ..
+        } = expression
+            && !type_params.is_empty()
+        {
+            // No single layout, so nothing is registered yet: an instantiation
+            // is interned when one is named.
+            emitter.generic_records.push(GenericRecord {
+                name: name.clone(),
+                params: type_params.clone(),
+                fields: fields
+                    .iter()
+                    .map(|field| {
+                        (
+                            field.name.clone(),
+                            field
+                                .annotation
+                                .as_ref()
+                                .map(|annotation| annotation.text.clone())
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        if let Expr::RecordDeclaration {
             name, type_params, ..
         } = expression
             && type_params.is_empty()
@@ -6239,8 +8685,48 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
             emitter.records.push(RecordInfo {
                 name: name.clone(),
                 fields: Vec::new(),
+                lambda_fields: Vec::new(),
                 usable: true,
             });
+        }
+    }
+    // Generic enums are not lowered by the shared pass, so their declarations
+    // are still here: remember the variants in order, since that order is the
+    // tag every value carries.
+    for expression in expressions {
+        // Every declaration that is still here is one the shared pass did not
+        // lower -- a generic enum, or one whose payload names an applied type
+        // like `List<Json>`. Either way this backend compiles it itself.
+        if let Expr::EnumDeclaration {
+            name,
+            type_params,
+            variants,
+            ..
+        } = expression
+        {
+            emitter.generic_enums.push((
+                name.clone(),
+                variants
+                    .iter()
+                    .map(|variant| (variant.name.clone(), variant.params.len()))
+                    .collect(),
+            ));
+            emitter.enum_annotations.push(
+                variants
+                    .iter()
+                    .map(|variant| {
+                        variant
+                            .params
+                            .iter()
+                            .map(|(_, annotation)| annotation.text.clone())
+                            .collect()
+                    })
+                    .collect(),
+            );
+            // Only an enum with no parameters has one shape for every value.
+            emitter.canonical_enum_shapes.push(None);
+            emitter.enum_is_generic.push(!type_params.is_empty());
+            emitter.enum_type_params.push(type_params.clone());
         }
     }
     // Pass 2: field types; undecodable declarations are marked
@@ -6259,12 +8745,19 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
             continue;
         }
         let mut typed = Vec::with_capacity(fields.len());
+        let mut lambda_fields = Vec::new();
         let mut usable = true;
-        for field in fields {
+        for (position, field) in fields.iter().enumerate() {
             let Some(annotation) = &field.annotation else {
                 usable = false;
                 break;
             };
+            // A function-typed field is compile-time only, so the record is
+            // still perfectly usable -- that field simply is not stored.
+            if annotation.text.contains("=>") {
+                lambda_fields.push((field.name.clone(), position));
+                continue;
+            }
             let Ok(ty) = emitter.annotation_type(&annotation.text, *span) else {
                 usable = false;
                 break;
@@ -6277,7 +8770,31 @@ fn collect_records(expr: &Expr, emitter: &mut Emitter) {
             .position(|record| record.name == *name)
             .expect("registered in pass 1");
         emitter.records[index].fields = typed;
+        emitter.records[index].lambda_fields = lambda_fields;
         emitter.records[index].usable = usable;
+        // A declaration whose field types cannot be written down -- `name: *`,
+        // say -- has no layout of its own, but its *constructor* pins every
+        // field down. So it is remembered the way a generic declaration is, and
+        // instantiated from the arguments when one is built.
+        if !usable {
+            emitter.generic_records.push(GenericRecord {
+                name: name.clone(),
+                params: Vec::new(),
+                fields: fields
+                    .iter()
+                    .map(|field| {
+                        (
+                            field.name.clone(),
+                            field
+                                .annotation
+                                .as_ref()
+                                .map(|annotation| annotation.text.clone())
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+            });
+        }
     }
 }
 
@@ -6365,6 +8882,7 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) {
                 label,
                 params: signature,
                 lambda_params: Vec::new(),
+                dict_params: Vec::new(),
                 ret,
                 body: body.as_ref().clone(),
             },
@@ -7029,6 +9547,8 @@ pub(crate) fn emit_macho_program(
     };
     emitter.scopes.push(HashMap::new());
     emitter.lambda_bindings.push(HashMap::new());
+    emitter.dict_bindings.push(HashMap::new());
+    emitter.alias_bindings.push(HashMap::new());
     emitter.scope_root_counts.push(0);
     collect_records(expr, &mut emitter);
     collect_functions(expr, &mut emitter);
@@ -7052,16 +9572,23 @@ pub(crate) fn emit_macho_program(
     emitter.emit_gc_init_heap(&gc);
     emitter.emit_gc_init_colors(&gc, GC_EVAC_OFF);
 
-    let frame_size = (count_var_decls(expr) * 8).div_ceil(16) * 16;
-    if frame_size >= 4096 {
-        return Err(unsupported(expr.span(), "this many local variables"));
-    }
-    if frame_size > 0 {
-        emitter.asm.sub_sp_imm(frame_size);
-    }
+    // Reserved now, sized once the program has been compiled -- see
+    // `sub_sp_placeholder`.
+    let frame_patch = emitter.asm.sub_sp_placeholder();
     emitter.asm.mov_fp_sp();
 
     emitter.statement(expr)?;
+    // The queued `thread` bodies, in the order they were handed over. They run
+    // inside the program's own frame, so anything they closed over is still
+    // where they left it.
+    for (index, span) in std::mem::take(&mut emitter.queued_threads) {
+        emitter.emit_inline_lambda_call(index, &[], span)?;
+    }
+    let frame_size = emitter.max_local_offset.div_ceil(16) * 16;
+    if frame_size >= 4096 {
+        return Err(unsupported(expr.span(), "this many local variables"));
+    }
+    emitter.asm.patch_sub_sp(frame_patch, frame_size);
     if gc_log {
         emitter.emit_gc_log_report(&gc);
     }
@@ -7070,6 +9597,13 @@ pub(crate) fn emit_macho_program(
     // Emit reached functions; their bodies may reach more.
     let mut emitted = vec![false; emitter.functions.len()];
     while let Some(index) = emitter.pending.pop() {
+        // Emitting a body can *add* functions: a generic def reached from
+        // here gets a fresh specialisation per argument-type tuple, appended
+        // to `functions` and queued. So the seen-set has to grow with the
+        // list rather than being sized once up front.
+        if emitted.len() < emitter.functions.len() {
+            emitted.resize(emitter.functions.len(), false);
+        }
         if !emitted[index] {
             emitted[index] = true;
             emitter.emit_function(index)?;

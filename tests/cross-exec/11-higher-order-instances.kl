@@ -1,0 +1,67 @@
+// Cross-target fixture: functions passed as arguments, including through
+// typeclass instances.
+//
+// The interesting case is a function that arrives under a *name* rather than
+// written at the call site: `def apply(f, xs) = xs.map(f)` has to reach the
+// same mapping loop as `map(xs, (x) => ...)` does, and a `Functor` instance
+// declares its own two-argument `map(f, xs)` whose argument order is the other
+// way round -- so a backend that decided "two arguments named map" meant the
+// builtin would compile the instance's own method into itself.
+//
+// All three spellings of mapping appear below, each with a named function, and
+// the last section runs one through a higher-kinded instance.
+
+typeclass Functor<'f: * => *> where {
+  map: (('a) => 'b, 'f<'a>) => 'f<'b>
+}
+
+instance Functor<List> where {
+  def map(f: ('a) => 'b, xs: List<'a>): List<'b> = {
+    xs.map(f)
+  }
+}
+
+typeclass Monad<'m: * => *> where {
+  bind: ('m<'a>, ('a) => 'm<'b>) => 'm<'b>;
+  unit: ('a) => 'm<'a>
+}
+
+instance Monad<List> where {
+  def bind(xs: List<'a>, f: ('a) => List<'b>): List<'b> = f(head(xs))
+  def unit(x: 'a): List<'a> = [x]
+}
+
+// The instance's `map`, whose first argument is the function.
+def doubleAll(xs: List<Int>): List<Int> = {
+  map((x) => x * 2, xs)
+}
+println(doubleAll([1, 2, 3, 4, 5]))
+println(doubleAll([10]))
+assertResult([2, 4, 6])(doubleAll([1, 2, 3]))
+
+// The builtin's `map`, whose first argument is the list, in all three
+// spellings and with the function passed in under a name each time.
+def viaMethod(g, xs) = xs.map(g)
+def viaCall(g, xs) = map(xs, g)
+def viaCurried(g, xs) = map(xs)(g)
+println(viaMethod((x) => x + 1, [1, 2, 3]))
+println(viaCall((x) => x + 1, [1, 2, 3]))
+println(viaCurried((x) => x + 1, [1, 2, 3]))
+println(viaMethod((s) => s + "!", ["a", "b"]))
+assertResult([2, 3, 4])(viaMethod((x) => x + 1, [1, 2, 3]))
+assertResult([2, 3, 4])(viaCall((x) => x + 1, [1, 2, 3]))
+assertResult([2, 3, 4])(viaCurried((x) => x + 1, [1, 2, 3]))
+
+// A function that maps twice, so the named function is handed on again.
+def twice(g, xs) = map(map(xs, g), g)
+println(twice((x) => x * 3, [1, 2]))
+assertResult([9, 18])(twice((x) => x * 3, [1, 2]))
+
+// The Monad instance: `bind`'s result type comes from the lambda's, which
+// comes from `unit`'s body being a list literal over its own parameter.
+def pairWithNext<'m>(xs: 'm<Int>): 'm<Int> where Monad<'m> = {
+  bind(xs, (x) => unit(x + 1))
+}
+println(pairWithNext([1, 2, 3]))
+assertResult([2])(pairWithNext([1, 2, 3]))
+println("done")

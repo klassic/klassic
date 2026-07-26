@@ -13,12 +13,28 @@ enum Json {
   case JBool(b: Bool)
   case JNum(n: Int)
   case JStr(s: String)
-  case JArr(items: List<Json>)
-  case JObj(entries: List<JsonMember>)
+  case JArr(items: JsonValues)
+  case JObj(entries: JsonMembers)
 }
 
 enum JsonMember {
   case Member(key: String, value: Json)
+}
+
+// An array's elements and an object's members are cons-style enums rather than
+// `List<Json>`. A list whose elements are heap values, built as it is walked,
+// is not something every native target can represent -- so saying it this way
+// is what makes the module compile everywhere rather than only under the
+// evaluator. `jsonValues` / `jsonMembers` convert to ordinary lists for callers
+// that would rather have one.
+enum JsonValues {
+  case ValuesNil
+  case ValuesCons(head: Json, tail: JsonValues)
+}
+
+enum JsonMembers {
+  case MembersNil
+  case MembersCons(head: JsonMember, tail: JsonMembers)
 }
 
 // Internal: a successful step carries the parsed value and the next
@@ -27,19 +43,34 @@ enum JsonStep {
   case Step(value: Json, next: Int)
 }
 
-def jsonCharAt(text, i) = substring(text, i, i + 1)
+def jsonCharAt(text: String, i: Int): String = substring(text, i, i + 1)
 
-def jsonIsDigit(c) = c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+def jsonIsDigit(c: String): Boolean = c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
 
-def jsonIsWs(c) = c == " " || c == "\n" || c == "\t" || c == "\r"
+def jsonIsWs(c: String): Boolean = c == " " || c == "\n" || c == "\t" || c == "\r"
 
-def jsonSkipWs(text, i) = if (i < length(text) && jsonIsWs(jsonCharAt(text, i))) jsonSkipWs(text, i + 1) else i
+def jsonSkipWs(text: String, i: Int): Int = if (i < length(text) && jsonIsWs(jsonCharAt(text, i))) jsonSkipWs(text, i + 1) else i
 
-def jsonReverse(xs, acc) = if (isEmpty(xs)) acc else jsonReverse(tail(xs), cons(head(xs))(acc))
+// One reverse per element type rather than one polymorphic one: a native build
+// compiles a recursive function once, for the types it is declared with, and a
+// type parameter would make it a per-call-site expansion instead -- which a
+// self-recursive function cannot be.
+def jsonReverseValues(xs: JsonValues, acc: JsonValues): JsonValues = xs match {
+  case ValuesNil => acc
+  case ValuesCons(h, t) => jsonReverseValues(t, ValuesCons(h, acc))
+}
 
+def jsonReverseMembers(xs: JsonMembers, acc: JsonMembers): JsonMembers = xs match {
+  case MembersNil => acc
+  case MembersCons(h, t) => jsonReverseMembers(t, MembersCons(h, acc))
+}
+
+// Left unannotated on purpose: the failure it builds is used where both
+// `Result<JsonStep, String>` and `Result<Json, String>` are expected, and it
+// does not recurse -- so a native build can compile it at each call site.
 def jsonFail(message, i) = err("#{message} at position #{i}")
 
-def jsonExpectLiteral(text, i, literal, value) = {
+def jsonExpectLiteral(text: String, i: Int, literal: String, value: Json): Result<JsonStep, String> = {
   if (i + length(literal) <= length(text) && substring(text, i, i + length(literal)) == literal) {
     ok(Step(value, i + length(literal)))
   } else {
@@ -47,11 +78,11 @@ def jsonExpectLiteral(text, i, literal, value) = {
   }
 }
 
-def jsonDigitValue(c) = {
+def jsonDigitValue(c: String): Int = {
   if (c == "0") 0 else if (c == "1") 1 else if (c == "2") 2 else if (c == "3") 3 else if (c == "4") 4 else if (c == "5") 5 else if (c == "6") 6 else if (c == "7") 7 else if (c == "8") 8 else 9
 }
 
-def jsonParseDigits(text, i, acc) = {
+def jsonParseDigits(text: String, i: Int, acc: Int): JsonStep = {
   if (i < length(text) && jsonIsDigit(jsonCharAt(text, i))) {
     jsonParseDigits(text, i + 1, acc * 10 + jsonDigitValue(jsonCharAt(text, i)))
   } else {
@@ -59,24 +90,26 @@ def jsonParseDigits(text, i, acc) = {
   }
 }
 
-def jsonParseNumber(text, i) = {
+def jsonParseNumber(text: String, i: Int): Result<JsonStep, String> = {
   val negative = i < length(text) && jsonCharAt(text, i) == "-"
   val start = if (negative) i + 1 else i
   if (start < length(text) && jsonIsDigit(jsonCharAt(text, start))) {
     jsonParseDigits(text, start, 0) match {
-      case Step(JNum(magnitude), next) => ok(Step(JNum(if (negative) 0 - magnitude else magnitude), next))
-      case Step(other, next) => jsonFail("internal number state", i)
+      case Step(parsed, next) => parsed match {
+        case JNum(magnitude) => ok(Step(JNum(if (negative) 0 - magnitude else magnitude), next))
+        case other => jsonFail("internal number state", i)
+      }
     }
   } else {
     jsonFail("expected digits", start)
   }
 }
 
-def jsonEscapeChar(e) = {
+def jsonEscapeChar(e: String): String = {
   if (e == "\"") "\"" else if (e == "\\") "\\" else if (e == "/") "/" else if (e == "n") "\n" else if (e == "t") "\t" else if (e == "r") "\r" else ""
 }
 
-def jsonParseStringBody(text, i, acc) = {
+def jsonParseStringBody(text: String, i: Int, acc: String): Result<JsonStep, String> = {
   if (i >= length(text)) {
     jsonFail("unterminated string", i)
   } else {
@@ -100,57 +133,69 @@ def jsonParseStringBody(text, i, acc) = {
   }
 }
 
-def jsonParseArrayItems(text, i, acc) = {
+def jsonParseArrayItems(text: String, i: Int, acc: JsonValues): Result<JsonStep, String> = {
   jsonParseValue(text, jsonSkipWs(text, i)) match {
-    case Ok(Step(item, next)) => {
-      val rest = jsonSkipWs(text, next)
-      val grown = cons(item)(acc)
-      if (rest < length(text) && jsonCharAt(text, rest) == ",") {
-        jsonParseArrayItems(text, rest + 1, grown)
-      } else if (rest < length(text) && jsonCharAt(text, rest) == "]") {
-        ok(Step(JArr(jsonReverse(grown, [])), rest + 1))
-      } else {
-        jsonFail("expected `,` or `]`", rest)
+    case Ok(step) => step match {
+      case Step(item, next) => {
+        val rest = jsonSkipWs(text, next)
+        val grown = ValuesCons(item, acc)
+        if (rest < length(text) && jsonCharAt(text, rest) == ",") {
+          jsonParseArrayItems(text, rest + 1, grown)
+        } else if (rest < length(text) && jsonCharAt(text, rest) == "]") {
+          ok(Step(JArr(jsonReverseValues(grown, ValuesNil)), rest + 1))
+        } else {
+          jsonFail("expected `,` or `]`", rest)
+        }
       }
     }
     case Err(message) => err(message)
   }
 }
 
-def jsonParseMembers(text, i, acc) = {
+def jsonParseMembers(text: String, i: Int, acc: JsonMembers): Result<JsonStep, String> = {
   val keyAt = jsonSkipWs(text, i)
   if (keyAt >= length(text) || jsonCharAt(text, keyAt) != "\"") {
     jsonFail("expected object key", keyAt)
   } else {
     jsonParseStringBody(text, keyAt + 1, "") match {
-      case Ok(Step(JStr(key), afterKey)) => {
-        val colonAt = jsonSkipWs(text, afterKey)
-        if (colonAt >= length(text) || jsonCharAt(text, colonAt) != ":") {
-          jsonFail("expected `:`", colonAt)
-        } else {
-          jsonParseValue(text, jsonSkipWs(text, colonAt + 1)) match {
-            case Ok(Step(value, next)) => {
-              val rest = jsonSkipWs(text, next)
-              val grown = cons(Member(key, value))(acc)
-              if (rest < length(text) && jsonCharAt(text, rest) == ",") {
-                jsonParseMembers(text, rest + 1, grown)
-              } else if (rest < length(text) && jsonCharAt(text, rest) == "}") {
-                ok(Step(JObj(jsonReverse(grown, [])), rest + 1))
-              } else {
-                jsonFail("expected `,` or `}`", rest)
-              }
-            }
-            case Err(message) => err(message)
-          }
+      case Ok(step) => step match {
+        case Step(parsedKey, afterKey) => parsedKey match {
+          case JStr(key) => jsonParseMemberValue(text, afterKey, key, keyAt, acc)
+          case other => jsonFail("internal key state", keyAt)
         }
       }
-      case Ok(Step(other, afterKey)) => jsonFail("internal key state", keyAt)
       case Err(message) => err(message)
     }
   }
 }
 
-def jsonParseValue(text, i) = {
+// The value half of a member, split out so each match nests one level: a
+// native build resolves a pattern's payload shape one step at a time.
+def jsonParseMemberValue(text: String, afterKey: Int, key: String, keyAt: Int, acc: JsonMembers): Result<JsonStep, String> = {
+  val colonAt = jsonSkipWs(text, afterKey)
+  if (colonAt >= length(text) || jsonCharAt(text, colonAt) != ":") {
+    jsonFail("expected `:`", colonAt)
+  } else {
+    jsonParseValue(text, jsonSkipWs(text, colonAt + 1)) match {
+      case Ok(step) => step match {
+        case Step(value, next) => {
+          val rest = jsonSkipWs(text, next)
+          val grown = MembersCons(Member(key, value), acc)
+          if (rest < length(text) && jsonCharAt(text, rest) == ",") {
+            jsonParseMembers(text, rest + 1, grown)
+          } else if (rest < length(text) && jsonCharAt(text, rest) == "}") {
+            ok(Step(JObj(jsonReverseMembers(grown, MembersNil)), rest + 1))
+          } else {
+            jsonFail("expected `,` or `}`", rest)
+          }
+        }
+      }
+      case Err(message) => err(message)
+    }
+  }
+}
+
+def jsonParseValue(text: String, i: Int): Result<JsonStep, String> = {
   if (i >= length(text)) {
     jsonFail("unexpected end of input", i)
   } else {
@@ -165,10 +210,10 @@ def jsonParseValue(text, i) = {
       jsonParseStringBody(text, i + 1, "")
     } else if (c == "[") {
       val at = jsonSkipWs(text, i + 1)
-      if (at < length(text) && jsonCharAt(text, at) == "]") ok(Step(JArr([]), at + 1)) else jsonParseArrayItems(text, i + 1, [])
+      if (at < length(text) && jsonCharAt(text, at) == "]") ok(Step(JArr(ValuesNil), at + 1)) else jsonParseArrayItems(text, i + 1, ValuesNil)
     } else if (c == "{") {
       val at = jsonSkipWs(text, i + 1)
-      if (at < length(text) && jsonCharAt(text, at) == "}") ok(Step(JObj([]), at + 1)) else jsonParseMembers(text, i + 1, [])
+      if (at < length(text) && jsonCharAt(text, at) == "}") ok(Step(JObj(MembersNil), at + 1)) else jsonParseMembers(text, i + 1, MembersNil)
     } else if (c == "-" || jsonIsDigit(c)) {
       jsonParseNumber(text, i)
     } else {
@@ -177,33 +222,77 @@ def jsonParseValue(text, i) = {
   }
 }
 
-def parse(text) = {
+def parse(text: String): Result<Json, String> = {
   jsonParseValue(text, jsonSkipWs(text, 0)) match {
-    case Ok(Step(value, next)) => {
-      val rest = jsonSkipWs(text, next)
-      if (rest >= length(text)) ok(value) else jsonFail("trailing input", rest)
+    case Ok(step) => step match {
+      case Step(value, next) => {
+        val rest = jsonSkipWs(text, next)
+        if (rest >= length(text)) ok(value) else jsonFail("trailing input", rest)
+      }
     }
     case Err(message) => err(message)
   }
 }
 
-def jsonEncodeChar(c) = {
+def jsonEncodeChar(c: String): String = {
   if (c == "\"") "\\\"" else if (c == "\\") "\\\\" else if (c == "\n") "\\n" else if (c == "\t") "\\t" else if (c == "\r") "\\r" else c
 }
 
-def jsonEscape(s, i, acc) = if (i >= length(s)) acc else jsonEscape(s, i + 1, acc + jsonEncodeChar(jsonCharAt(s, i)))
+def jsonEscape(s: String, i: Int, acc: String): String = if (i >= length(s)) acc else jsonEscape(s, i + 1, acc + jsonEncodeChar(jsonCharAt(s, i)))
 
-def jsonJoin(parts, sep) = {
-  if (isEmpty(parts)) "" else if (isEmpty(tail(parts))) "#{head(parts)}" else "#{head(parts)}#{sep}#{jsonJoin(tail(parts), sep)}"
+// Rendering walks the cons enums directly rather than mapping over a list and
+// joining it: same output, and it needs nothing a native target may not have.
+def jsonValuesText(xs: JsonValues, acc: String): String = xs match {
+  case ValuesNil => acc
+  case ValuesCons(h, t) => {
+    val rendered = stringify(h)
+    val next = if (acc == "") rendered else acc + "," + rendered
+    jsonValuesText(t, next)
+  }
 }
 
-def stringify(json) = json match {
+def jsonMemberText(m: JsonMember): String = m match {
+  case Member(key, value) => "\"" + jsonEscape(key, 0, "") + "\":" + stringify(value)
+}
+
+def jsonMembersText(xs: JsonMembers, acc: String): String = xs match {
+  case MembersNil => acc
+  case MembersCons(h, t) => {
+    val rendered = jsonMemberText(h)
+    val next = if (acc == "") rendered else acc + "," + rendered
+    jsonMembersText(t, next)
+  }
+}
+
+def stringify(json: Json): String = json match {
   case JNull => "null"
   case JBool(b) => if (b) "true" else "false"
   case JNum(n) => "#{n}"
   case JStr(s) => "\"" + jsonEscape(s, 0, "") + "\""
-  case JArr(items) => "[" + jsonJoin(stdlibMap(items, (item) => stringify(item)), ",") + "]"
-  case JObj(entries) => "{" + jsonJoin(stdlibMap(entries, (entry) => entry match {
-    case Member(key, value) => "\"" + jsonEscape(key, 0, "") + "\":" + stringify(value)
-  }), ",") + "}"
+  case JArr(items) => "[" + jsonValuesText(items, "") + "]"
+  case JObj(entries) => "{" + jsonMembersText(entries, "") + "}"
+}
+
+// How many values a document holds, counting the document itself: the shape of
+// walk a caller most often wants, provided here so it does not have to be
+// written against the cons enums at every call site.
+def jsonCountValues(json: Json): Int = json match {
+  case JNull => 1
+  case JBool(b) => 1
+  case JNum(n) => 1
+  case JStr(s) => 1
+  case JArr(items) => jsonCountValuesIn(items, 0)
+  case JObj(entries) => jsonCountMembersIn(entries, 0)
+}
+
+def jsonCountValuesIn(xs: JsonValues, acc: Int): Int = xs match {
+  case ValuesNil => acc
+  case ValuesCons(h, t) => jsonCountValuesIn(t, acc + jsonCountValues(h))
+}
+
+def jsonCountMembersIn(xs: JsonMembers, acc: Int): Int = xs match {
+  case MembersNil => acc
+  case MembersCons(h, t) => h match {
+    case Member(key, value) => jsonCountMembersIn(t, acc + jsonCountValues(value))
+  }
 }

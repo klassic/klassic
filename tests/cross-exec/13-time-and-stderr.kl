@@ -1,0 +1,41 @@
+// Cross-target fixture: timing a block, sleeping, and standard error.
+//
+// The elapsed value itself cannot be asserted -- it differs every run -- so
+// what is checked is the shape every backend has to agree on: the block runs
+// exactly once, its value is discarded, the answer is milliseconds, and a
+// sleep of N is at least N. The lines printed inside the block are the proof
+// that it ran, and in the right order relative to everything else.
+
+println("before")
+val slept = stopwatch( => {
+  sleep(150)
+  println("inside")
+})
+println("after")
+println(slept > 100)
+println(slept < 60000)
+assertResult(true)(slept > 100)
+
+// A block that does not sleep still answers with a number, and still runs.
+val quick = stopwatch( => { println("quick") })
+println(quick < 30000)
+assertResult(true)(quick < 30000)
+
+// Sleeping for nothing is allowed and returns immediately.
+sleep(0)
+println("zero slept")
+
+// Standard error is a separate stream: this line is not part of the stdout
+// the fixture is compared on, which is itself the thing being checked.
+// A `thread` body runs after the program's own statements on every native
+// target, so what a program prints is the same everywhere -- which is the only
+// thing about it a program can observe here.
+thread(() => {
+  println("from the thread")
+})
+println("after handing over the thread")
+
+printlnError("to standard error")
+val message = "also to standard error"
+printlnError(message)
+println("done")

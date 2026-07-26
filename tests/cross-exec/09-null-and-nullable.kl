@@ -1,0 +1,40 @@
+// Cross-target fixture: `null`, and the values that may or may not be there.
+//
+// A function like the prelude's `stdlibFind` returns the element it found *or*
+// nothing, so one machine word has to carry both -- and every backend has to
+// agree with the evaluator on which one it is printing. That is what this
+// fixture pins down: the word `null` for the empty case, the value itself
+// otherwise, for each type a value can be.
+//
+// The found case allocates (the element is boxed to share the empty case's
+// representation) while the list being searched is still live, so this also
+// exercises the collector with a half-formed answer in a rooted slot.
+
+println(null)
+val nothing = null
+println(nothing)
+
+// Found and not found, over the same list.
+println(stdlibFind([1, 2, 3, 4], (x) => x > 2))
+println(stdlibFind([1, 2], (x) => x > 5))
+println(stdlibFind([10, 20, 30], (x) => x > 15))
+
+// Bound rather than printed straight away: the answer sits in a slot across
+// the next call, which is where a missing root would show up.
+val found = stdlibFind([10, 20], (x) => x > 15)
+val missing = stdlibFind([10, 20], (x) => x > 99)
+println(stdlibRange(0, 3))
+println(found)
+println(missing)
+
+// The join itself, both ways round, for each type of value.
+println(if (true) null else 7)
+println(if (false) null else 7)
+println(if (true) 7 else null)
+println(if (false) 7 else null)
+println(if (false) null else "s")
+println(if (true) null else "s")
+println(if (false) null else true)
+println(if (false) null else false)
+println(if (true) null else false)
+println("done")

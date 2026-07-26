@@ -1,9 +1,11 @@
 // JSON round-trip demo: parse, inspect, and re-render JSON with the
-// pure-Klassic std.json module. Run with the evaluator:
+// pure-Klassic std.json module, under the evaluator or any native target:
 //
 //   klassic examples/json-inspect.kl
+//   klassic build examples/json-inspect.kl -o json-inspect
 //
-// (std.json is evaluator-only in native builds for now — see issue #432.)
+// An array's elements are a cons-style enum rather than a list, which is what
+// lets the module compile on every target; walking one is a `match` per cell.
 
 import std.json.{parse, stringify}
 
@@ -12,19 +14,21 @@ def countValues(j: Json): Int = j match {
   case JBool(b) => 1
   case JNum(n) => 1
   case JStr(s) => 1
-  case JArr(items) => countAll(items)
-  case JObj(entries) => countMembers(entries)
+  case JArr(items) => countAll(items, 0)
+  case JObj(entries) => countMembers(entries, 0)
 }
 
-def countAll(items: List<Json>): Int =
-  if (isEmpty(items)) 0
-  else countValues(head(items)) + countAll(tail(items))
+def countAll(items: JsonValues, acc: Int): Int = items match {
+  case ValuesNil => acc
+  case ValuesCons(h, t) => countAll(t, acc + countValues(h))
+}
 
-def countMembers(entries: List<JsonMember>): Int =
-  if (isEmpty(entries)) 0
-  else head(entries) match {
-    case Member(key, value) => countValues(value) + countMembers(tail(entries))
+def countMembers(entries: JsonMembers, acc: Int): Int = entries match {
+  case MembersNil => acc
+  case MembersCons(h, t) => h match {
+    case Member(key, value) => countMembers(t, acc + countValues(value))
   }
+}
 
 val text = "{\"name\": \"klassic\", \"tags\": [\"compiler\", \"adt\"], \"stars\": 230, \"native\": true}"
 
