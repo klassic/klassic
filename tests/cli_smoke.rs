@@ -22800,6 +22800,75 @@ fn build_target_aarch64_apple_darwin_recursive_list_build_runs() {
     );
 }
 
+/// A generic chain helper called with the *empty case of its own enum*, on
+/// Apple Silicon. `KMNil` carries no type arguments, so nothing fixes `'k`
+/// and `'v` through that argument -- but `key: 'k` given a string and
+/// `value: 'v` given an Int fix both, and the parameter's shape follows from
+/// them. Before that, the specialisation derived a return shape its own body
+/// did not produce and the build was refused.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_generic_chain_from_empty_runs() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_macho_chain_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_macho_chain_{stamp}.bin"));
+    let source = concat!(
+        "enum KM<'k, 'v> { case KMNil; case KMCons(key: 'k, value: 'v, rest: KM<'k, 'v>) }\n",
+        "def kmPut(m: KM<'k, 'v>, key: 'k, value: 'v): KM<'k, 'v> =\n",
+        "  KMCons(key, value, m)\n",
+        "def kmGetOrElse(m: KM<'k, 'v>, key: 'k, fallback: 'v): 'v = m match {\n",
+        "  case KMNil => fallback\n",
+        "  case KMCons(k, v, rest) => if (k == key) v else kmGetOrElse(rest, key, fallback)\n",
+        "}\n",
+        "mutable counts = KMNil\n",
+        "foreach (w in [\"a\", \"b\", \"a\"]) { counts = kmPut(counts, w, 1) }\n",
+        "println(kmGetOrElse(counts, \"a\", 0))\n",
+        "println(kmGetOrElse(counts, \"b\", 0))\n",
+        "println(kmGetOrElse(counts, \"z\", -1))\n",
+    );
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let expected = Command::new(klassic_bin())
+        .arg(source_path.to_str().expect("path should be utf-8"))
+        .output()
+        .expect("evaluator should run");
+    assert!(
+        expected.status.success(),
+        "the evaluator should run this program\nstderr:\n{}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "darwin native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path).output().expect("Mach-O should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&expected.stdout),
+        "a chain grown from the empty case should print what the evaluator prints"
+    );
+}
+
 /// Maps built while the program runs, on Apple Silicon: `Map#empty` and
 /// `Map#put` are the shape every counting program has, and the arm64 backend
 /// stores a map as a chain of `[key][value]` entries it can grow. Asserted

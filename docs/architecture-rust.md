@@ -1709,8 +1709,16 @@ through an inlined generic call, through a `mutable` reassignment and through
 a slot read on x86-64; the same helper on both backends when the chain starts
 from a `KMCons` rather than the empty case.
 
-The fix is the same on both: **recover the type arguments from the other
-arguments** -- `key: 'k` against a string fixes `'k`, `value: 'v` against an
+**The aarch64 half is done.** A specialisation now solves the definition's
+type variables across *all* the arguments -- a parameter annotated `'k` given
+a string fixes `'k` as `String` -- and an enum-typed parameter whose own
+argument left the variables open takes the shape those solutions imply,
+through the annotation it was declared with. `kmPut(KMNil, "a", 1)` and a
+chain grown from the empty case in a loop compile there now, and a
+macOS-gated test runs one.
+
+The x86-64 half is the same idea in its own machinery: **recover the type
+arguments from the other arguments** -- `key: 'k` against a string fixes `'k`, `value: 'v` against an
 Int fixes `'v` -- rather than only from the enum-typed one. aarch64 already
 has the machinery to build a shape from inferred type arguments
 (`canonical_applied_enum_shape`), and x86-64 already has

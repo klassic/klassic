@@ -1477,6 +1477,22 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 /// Replace whole-identifier occurrences of each type parameter in an
 /// annotation with its argument: `Chain<a>` with `a = Int` becomes
 /// `Chain<Int>`, while `Char` is left alone.
+/// The annotation a type would be written as, for the types a type variable
+/// can be solved to from an argument. Anything else answers `None`, which
+/// leaves the variable unsolved rather than guessing.
+fn type_annotation_name(ty: ValueType) -> Option<String> {
+    Some(
+        match ty {
+            ValueType::Int => "Int",
+            ValueType::Str => "String",
+            ValueType::Bool => "Boolean",
+            ValueType::Double => "Double",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
 fn substitute_type_params(text: &str, params: &[String], arguments: &[String]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut token = String::new();
@@ -9492,7 +9508,8 @@ impl Emitter {
         let mut value_params: Vec<(String, ValueType)> = Vec::new();
         let mut lambda_params: Vec<(String, usize)> = Vec::new();
         let mut dict_params: Vec<(String, Vec<(String, usize)>)> = Vec::new();
-        for (param, argument) in params.iter().zip(arguments.iter()) {
+        let mut value_annotations: Vec<Option<String>> = Vec::new();
+        for (position, (param, argument)) in params.iter().zip(arguments.iter()).enumerate() {
             // A lambda argument is not a value: it is interned and the
             // parameter name is bound to it inside the specialisation, so a
             // higher-order def is specialised per lambda as well as per type.
@@ -9535,6 +9552,57 @@ impl Emitter {
             }
             argument_types.push(ty);
             value_params.push((param.clone(), ty));
+            value_annotations.push(param_annotations.get(position).cloned().flatten());
+        }
+        // Solve the definition's type variables from *all* the arguments, and
+        // give an enum-typed parameter whose own argument left them open the
+        // shape those solutions imply. `put(KMNil, "a", 1)` says nothing
+        // through its first argument -- the empty case carries no payloads --
+        // while `key: 'k` and `value: 'v` say everything, and without this the
+        // body destructures the other variant against payloads it does not
+        // know.
+        let mut bindings: Vec<(String, String)> = Vec::new();
+        for ((_, ty), annotation) in value_params.iter().zip(value_annotations.iter()) {
+            let Some(annotation) = annotation else {
+                continue;
+            };
+            let text = annotation.trim();
+            if !text.starts_with('\'') {
+                continue;
+            }
+            let Some(name) = type_annotation_name(*ty) else {
+                continue;
+            };
+            if !bindings.iter().any(|(known, _)| known == text) {
+                bindings.push((text.to_string(), name));
+            }
+        }
+        if !bindings.is_empty() {
+            let variables: Vec<String> = bindings.iter().map(|(name, _)| name.clone()).collect();
+            let solutions: Vec<String> = bindings.iter().map(|(_, name)| name.clone()).collect();
+            for position in 0..value_params.len() {
+                let ValueType::Enum(shape) = value_params[position].1 else {
+                    continue;
+                };
+                let open = self.enum_shapes[shape as usize]
+                    .1
+                    .iter()
+                    .any(|payload| payload.contains(&ValueType::Never));
+                if !open {
+                    continue;
+                }
+                let Some(annotation) = value_annotations[position].clone() else {
+                    continue;
+                };
+                let applied = substitute_type_params(&annotation, &variables, &solutions);
+                if applied == annotation {
+                    continue;
+                }
+                if let Ok(resolved @ ValueType::Enum(_)) = self.annotation_type(&applied, span) {
+                    value_params[position].1 = resolved;
+                    argument_types[position] = resolved;
+                }
+            }
         }
         // The lambda identities are part of what makes a specialisation
         // distinct, so they join the argument types in the key.
