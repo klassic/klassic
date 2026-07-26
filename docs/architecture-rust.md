@@ -1717,8 +1717,28 @@ through the annotation it was declared with. `kmPut(KMNil, "a", 1)` and a
 chain grown from the empty case in a loop compile there now, and a
 macOS-gated test runs one.
 
-The x86-64 half is the same idea in its own machinery: **recover the type
-arguments from the other arguments** -- `key: 'k` against a string fixes `'k`, `value: 'v` against an
+**The x86-64 half is measured but not landed.** Instrumenting the inline
+binding of `kmPut(KMNil, "a", 1)` shows exactly what a call site has to work
+with:
+
+    param=m     expected=Int  value=HeapPointer  flexible=true
+    param=key   expected=Int  value=StaticString flexible=true
+    param=value expected=Int  value=Int          flexible=true
+
+`KM<'k, 'v>` is not a type this backend models, so the parameter's expected
+value degrades to `Int` and the argument arrives as a bare `HeapPointer` --
+the shape is the only thing that says what its payloads are, and the empty
+case leaves them open. The two arguments that *do* fix the variables are
+right there in the same list, which is what makes the fix the same one
+aarch64 took. An attempt that threaded the annotation text onto
+`NativeFunction`, solved the variables during the binding loop and rewrote
+the slot's shape afterwards compiled but changed nothing observable, so it
+was not kept; the next step is to find where the body reads a parameter's
+shape (the slot's entry in `enum_shapes`, or the `pending_enum_shape` a slot
+read republishes) and make the rewritten shape reach *that*, rather than
+assuming the slot entry is enough.
+
+The idea, restated: **recover the type arguments from the other arguments** -- `key: 'k` against a string fixes `'k`, `value: 'v` against an
 Int fixes `'v` -- rather than only from the enum-typed one. aarch64 already
 has the machinery to build a shape from inferred type arguments
 (`canonical_applied_enum_shape`), and x86-64 already has
