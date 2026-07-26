@@ -7047,7 +7047,16 @@ impl NativeCodeGenerator {
                 match slot.value {
                     NativeValue::RuntimeString { data, len } => {
                         let compiled = self.compile_expr(value)?;
-                        let Some(input) = self.native_string_ref(compiled) else {
+                        // A heap string is copied into the binding's buffer,
+                        // like every other shape of string: building one by
+                        // appending in a loop -- `out = out + k + ": " + v` --
+                        // produces a heap string, and refusing it here refused
+                        // the loop.
+                        let Some(input) = self.native_string_ref_or_copy(
+                            compiled,
+                            *span,
+                            "native string assignment for this value type",
+                        ) else {
                             return Err(unsupported(
                                 *span,
                                 "native string assignment for this value type",
@@ -7113,6 +7122,18 @@ impl NativeCodeGenerator {
                     ));
                 }
                 self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                // Assigning a generic enum value merges its shape into the
+                // slot's, resolved reprs winning over defaulted ones. A
+                // binding seeded with a nullary constructor -- `mutable m =
+                // KMNil` -- knows nothing about the payloads until something
+                // is put in it, and that something is what says.
+                if let Some(shape) = self.pending_enum_shape.take() {
+                    let merged =
+                        merge_enum_shapes(self.enum_shapes.get(&slot.id).cloned(), Some(shape));
+                    if let Some(merged) = merged {
+                        self.enum_shapes.insert(slot.id, merged);
+                    }
+                }
                 if self.dynamic_control_depth > 0 {
                     self.remove_static_value(name);
                 } else if static_expr_is_pure(value)

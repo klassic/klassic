@@ -1,0 +1,129 @@
+// Cross-target fixture: a key/value store written the way a portable lowering
+// of the builtin `Map` would write it -- a generic self-referential enum plus
+// while-loop helpers, so nothing recurses and every backend can compile them.
+//
+// Three things had to be true at once for this to work on all three targets,
+// and each was a hole: a binding seeded with a nullary constructor has to take
+// its payload types from what is later assigned to it; a string built by
+// appending in a loop has to be assignable back to the binding it came from;
+// and the record of which slots have been matched on has to belong to one
+// function, since frame offsets repeat in the next one.
+//
+// The counting runs both paths through `put` -- a key already there, replaced
+// in place, and a new one appended -- and the rendering appends numbers to a
+// string, which is what every rendering of such a chain does.
+
+enum KlassicMapChain<'k, 'v> {
+  case KlassicMapNil
+  case KlassicMapCons(key: 'k, value: 'v, rest: KlassicMapChain<'k, 'v>)
+}
+
+def klassicMapReverse(m: KlassicMapChain<'k, 'v>): KlassicMapChain<'k, 'v> = {
+  mutable cur = m
+  mutable acc = KlassicMapNil
+  mutable go = true
+  while (go) {
+    cur match {
+      case KlassicMapNil => { go = false; 0 }
+      case KlassicMapCons(k, v, rest) => { acc = KlassicMapCons(k, v, acc); cur = rest; 0 }
+    }
+  }
+  acc
+}
+
+def klassicMapPut(m: KlassicMapChain<'k, 'v>, key: 'k, value: 'v): KlassicMapChain<'k, 'v> = {
+  mutable cur = m
+  mutable acc = KlassicMapNil
+  mutable replaced = false
+  mutable go = true
+  while (go) {
+    cur match {
+      case KlassicMapNil => { go = false; 0 }
+      case KlassicMapCons(k, v, rest) => {
+        acc = (if (k == key) KlassicMapCons(k, value, acc) else KlassicMapCons(k, v, acc))
+        replaced = (if (k == key) true else replaced)
+        cur = rest
+        0
+      }
+    }
+  }
+  klassicMapReverse((if (replaced) acc else KlassicMapCons(key, value, acc)))
+}
+
+def klassicMapGetOrElse(m: KlassicMapChain<'k, 'v>, key: 'k, fallback: 'v): 'v = {
+  mutable cur = m
+  mutable found = fallback
+  mutable go = true
+  while (go) {
+    cur match {
+      case KlassicMapNil => { go = false; 0 }
+      case KlassicMapCons(k, v, rest) => {
+        found = (if (k == key) v else found)
+        go = (if (k == key) false else true)
+        cur = rest
+        0
+      }
+    }
+  }
+  found
+}
+
+def klassicMapContainsKey(m: KlassicMapChain<'k, 'v>, key: 'k): Boolean = {
+  mutable cur = m
+  mutable yes = false
+  mutable go = true
+  while (go) {
+    cur match {
+      case KlassicMapNil => { go = false; 0 }
+      case KlassicMapCons(k, v, rest) => {
+        yes = (if (k == key) true else yes)
+        go = (if (k == key) false else true)
+        cur = rest
+        0
+      }
+    }
+  }
+  yes
+}
+
+def klassicMapSize(m: KlassicMapChain<'k, 'v>): Int = {
+  mutable cur = m
+  mutable n = 0
+  mutable go = true
+  while (go) {
+    cur match {
+      case KlassicMapNil => { go = false; 0 }
+      case KlassicMapCons(k, v, rest) => { n = n + 1; cur = rest; 0 }
+    }
+  }
+  n
+}
+
+def klassicMapRender(m: KlassicMapChain<'k, 'v>): String = {
+  mutable cur = m
+  mutable out = ""
+  mutable first = true
+  mutable go = true
+  while (go) {
+    cur match {
+      case KlassicMapNil => { go = false; 0 }
+      case KlassicMapCons(k, v, rest) => {
+        out = (if (first) (out + k + ": " + v) else (out + ", " + k + ": " + v))
+        first = false
+        cur = rest
+        0
+      }
+    }
+  }
+  "%[" + out + "]"
+}
+
+mutable counts = KlassicMapNil
+foreach (w in ["the", "fox", "the", "dog", "the"]) {
+  counts = klassicMapPut(counts, w, klassicMapGetOrElse(counts, w, 0) + 1)
+}
+println(klassicMapRender(counts))
+println(klassicMapSize(counts))
+println(klassicMapGetOrElse(counts, "the", 0))
+println(klassicMapContainsKey(counts, "cat"))
+println(klassicMapRender(KlassicMapNil))

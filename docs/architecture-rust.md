@@ -1712,7 +1712,29 @@ that a heap pointer takes, and a string argument is exactly what fixes a
 rewritten shape is published there once the whole argument list has been
 seen.
 
-#### What a portable `Map` lowering runs into, measured
+#### The helpers a portable `Map` lowering needs now compile
+
+Written the way a lowering would write them -- a generic self-referential enum
+plus while-loop helpers, so nothing recurses -- put, lookup, membership, size
+and rendering compile and run on all three targets, and the word counter built
+from them agrees with the evaluator including under `--gc-stress`
+(fixture 32). Three holes had to be closed, one per backend concern:
+
+- **A binding seeded with a nullary constructor takes its payload types from
+  what is assigned to it.** `mutable acc = KMNil` knows nothing; the first
+  `acc = KMCons(k, v, acc)` says everything. x86-64 merges the assigned
+  value's shape into the slot's, resolved reprs winning over defaulted ones.
+- **A string built by appending in a loop is assignable back.** `out = out + k
+  + ": " + v` produces a heap string, and a `mutable` string binding is a
+  fixed buffer; the heap string is copied into it now, as every other shape of
+  string already was.
+- **The record of which slots have been matched on belongs to one function.**
+  It is keyed by frame offset, and every function's frame starts at the same
+  place -- so a slot matched in one function blocked widening for an unrelated
+  slot at the same offset in the next. On aarch64 that is what refused
+  `acc = KMCons(...)` with "assignment changing a type".
+
+#### What a portable `Map` lowering ran into before, measured
 
 Lowering the builtin map to the chain means emitting helpers -- put, lookup,
 size, rendering -- that the program's own map operations are rewritten to
