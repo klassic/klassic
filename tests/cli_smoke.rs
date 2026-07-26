@@ -2070,6 +2070,65 @@ fn evaluates_process_exit_via_cli() {
     assert!(output.stderr.is_empty());
 }
 
+/// `StandardInput#lines()` compiled to a native binary reads the same lines
+/// the evaluator does. Tested here rather than in a cross-exec fixture because
+/// what a program finds on standard input is the harness's business: the
+/// fixture runner does not redirect it, so only a test that pipes the input
+/// can say what the answer should be.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_standard_input_lines_matches_the_evaluator() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_stdin_lines_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_stdin_lines_{stamp}.bin"));
+    fs::write(
+        &source_path,
+        "val lines = StandardInput#lines()\n\
+         println(size(lines))\n\
+         foreach (line in lines) { println(\"[\" + line + \"]\") }\n",
+    )
+    .expect("temp source file should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "native build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let mut child = Command::new(&bin_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("generated binary should run");
+    {
+        let mut stdin = child.stdin.take().expect("stdin should be piped");
+        stdin
+            .write_all(b"alpha\nbeta\ngamma\n")
+            .expect("stdin should accept input");
+    }
+    let run = child.wait_with_output().expect("binary should finish");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "3\n[alpha]\n[beta]\n[gamma]\n"
+    );
+}
+
 #[test]
 fn evaluates_standard_input_via_cli() {
     let mut child = Command::new(klassic_bin())
