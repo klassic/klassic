@@ -1538,6 +1538,28 @@ building the same probes for all three targets:
   extension by what the receiver's type turns out to be -- inferred without
   emitting anything, so asking is free.
 
+### Two bugs the arm64 runner found, and what they have in common
+
+Both were invisible on a Linux host, and both were found the same way: build
+for arm64, let CI run it, read what the collector said.
+
+- **A root pushed on one path only.** `Set#add(s, x)` rooted the two slots its
+  copy needs *after* the branch that skips the copy when `x` is already in the
+  set. The shadow stack is popped by a count worked out while compiling, so
+  the skip path popped two roots it never pushed: "klassic gc: shadow stack
+  underflow". Every root a function pushes has to be pushed before any
+  runtime branch, or popped again on each path -- checking that is now part of
+  writing one.
+- **A loop body compiled against a stale type.** A `mutable` takes its type
+  from what is assigned to it, and the declaration site settles that by
+  prediction. A loop cannot be settled there: `m = Map#put(m, k, ...)`
+  mentions the loop's own variable, which does not exist yet at the
+  declaration -- so the prediction failed, `m` stayed the empty map it started
+  as, and `Map#getOrElse(m, k, 0)` inside the loop compiled to its fallback.
+  It counted every word as 1. The fixpoint is taken again when the loop body
+  is about to be compiled, with the loop variable bound, because every turn
+  after the first reads what the previous one wrote.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.

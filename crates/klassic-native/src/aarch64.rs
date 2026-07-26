@@ -2557,6 +2557,10 @@ impl Emitter {
         if is_heap_pointer(elem_ty) {
             self.emit_root_frame_slot(element);
         }
+        // The body's reads have to see what the body's writes will make of a
+        // binding, because every turn after the first reads what the previous
+        // one wrote.
+        self.widen_loop_mutables(body);
         self.statement(body)?;
         self.pop_binding_scopes();
         let roots = self.scope_root_counts.pop().expect("emitter root scope");
@@ -7318,12 +7322,11 @@ impl Emitter {
                 // Already a member? Then the set is its own answer.
                 let present = self.asm.new_label();
                 let end = self.asm.new_label();
-                self.asm.load_local(Reg::X1, raw);
-                self.asm.load_local(Reg::X0, source);
-                let member = self.member_label(elem);
-                self.asm.branch(member, BranchKind::Link);
-                self.asm
-                    .branch(present, BranchKind::CompareNonZero(Reg::X0));
+                // The copy's two slots are rooted before the branch below, not
+                // inside it. The shadow stack is popped by a count worked out
+                // while compiling, so a root pushed on one path only leaves the
+                // other path popping one that was never pushed -- which is what
+                // `Set#add(s, x)` did when `x` was already there.
                 let acc = self.reserve_locals(8);
                 self.asm.mov_imm64(Reg::X0, 0);
                 self.asm.store_local(Reg::X0, acc);
@@ -7332,6 +7335,12 @@ impl Emitter {
                 self.asm.load_local(Reg::X0, source);
                 self.asm.store_local(Reg::X0, cursor);
                 self.emit_root_frame_slot(cursor);
+                self.asm.load_local(Reg::X1, raw);
+                self.asm.load_local(Reg::X0, source);
+                let member = self.member_label(elem);
+                self.asm.branch(member, BranchKind::Link);
+                self.asm
+                    .branch(present, BranchKind::CompareNonZero(Reg::X0));
                 let loop_start = self.asm.new_label();
                 let copied = self.asm.new_label();
                 self.asm.bind(loop_start);
@@ -8833,9 +8842,34 @@ impl Emitter {
                     "getOrElse" | "Map#getOrElse" => {
                         return match first_type {
                             Some(ValueType::Map(_, value)) => Some(elem_value_type(value)),
+                            // On a map with nothing in it the answer is the
+                            // fallback, which is what the emitter does -- and
+                            // typing it is what lets a `mutable` map that is
+                            // grown in a loop settle on a type at all.
+                            Some(ValueType::EmptyMap) if arguments.len() == 3 => {
+                                self.static_type_under(&arguments[2], locals, depth + 1)
+                            }
                             _ => None,
                         };
                     }
+                    // `Map#put(m, k, v)`: a map of what the key and value are.
+                    // Without this a map grown in a loop stays typed as the
+                    // empty map it started as, and every lookup inside the loop
+                    // compiles to its fallback.
+                    "Map#put" if arguments.len() == 3 => {
+                        let key = list_elem_of(self.static_type_under(
+                            &arguments[1],
+                            locals,
+                            depth + 1,
+                        )?)?;
+                        let value = list_elem_of(self.static_type_under(
+                            &arguments[2],
+                            locals,
+                            depth + 1,
+                        )?)?;
+                        return Some(ValueType::Map(key, value));
+                    }
+                    "Map#empty" => return Some(ValueType::EmptyMap),
                     // The enum lowering's allocators. A constructor call like
                     // `Some(x)` becomes one of these, so without them a
                     // function that just wraps a constructor cannot be typed.
@@ -9659,6 +9693,67 @@ impl Emitter {
         Ok(result)
     }
 
+    /// Widen the slots of any bindings a loop body assigns to, before that
+    /// body is compiled.
+    ///
+    /// A `mutable` takes its type from what is assigned to it, and the
+    /// declaration site can settle that for straight-line code. A loop cannot
+    /// be settled there: `m = Map#put(m, k, ...)` mentions the loop's own
+    /// variable, which does not exist yet at the declaration. So the same
+    /// fixpoint is taken again here, with the loop variable bound -- otherwise
+    /// the body's *reads* compile against the type the binding started with
+    /// (`Map#empty()` is the empty map, and a lookup on one is its fallback),
+    /// which is correct on the first turn and wrong on every turn after it.
+    fn widen_loop_mutables(&mut self, body: &Expr) {
+        let names: Vec<String> = self
+            .scopes
+            .iter()
+            .flatten()
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            let mut assigned = Vec::new();
+            collect_assignments(body, &name, &mut assigned);
+            if assigned.is_empty() {
+                continue;
+            }
+            let Some((slot, current)) = self.lookup(&name) else {
+                continue;
+            };
+            let mut widened = current;
+            for _ in 0..4 {
+                let mut grew = false;
+                for value in &assigned {
+                    let mut locals = Vec::new();
+                    let Some(ty) = self.static_type_under(value, &mut locals, 0) else {
+                        continue;
+                    };
+                    let Some(merged) = self.merge_types(widened, ty) else {
+                        continue;
+                    };
+                    if merged != widened {
+                        widened = merged;
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            if widened == current {
+                continue;
+            }
+            // Both the old type and the new one are heap references, so the
+            // root the slot already has still covers it.
+            for scope in self.scopes.iter_mut().rev() {
+                if let Some(entry) = scope.get_mut(&name) {
+                    *entry = (slot, widened);
+                    break;
+                }
+            }
+        }
+    }
+
     /// The name an `extension (this: T) { ... }` block is keyed by, worked out
     /// from what the receiver's type turns out to be. Typing it emits nothing,
     /// so asking costs only the inference.
@@ -10272,6 +10367,7 @@ impl Emitter {
                     return Err(unsupported(condition.span(), "a non-Bool condition"));
                 }
                 self.asm.branch(end_label, BranchKind::CompareZero(Reg::X0));
+                self.widen_loop_mutables(body);
                 self.statement(body)?;
                 self.asm.branch(loop_label, BranchKind::Unconditional);
                 self.asm.bind(end_label);
