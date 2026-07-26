@@ -1712,71 +1712,50 @@ that a heap pointer takes, and a string argument is exactly what fixes a
 rewritten shape is published there once the whole argument list has been
 seen.
 
-#### The helpers a portable `Map` lowering needs now compile
+#### A map grown while the program runs, on every target
 
-Written the way a lowering would write them -- a generic self-referential enum
-plus while-loop helpers, so nothing recurses -- put, lookup, membership, size
-and rendering compile and run on all three targets, and the word counter built
-from them agrees with the evaluator including under `--gc-stress`
-(fixture 32). Three holes had to be closed, one per backend concern:
+`Map#empty()` followed by `Map#put` in a loop -- the word counter as anyone
+would write it -- builds on all three targets now. A map created that way is
+lowered onto a chain of GC cells and the helpers in
+`crates/klassic-native/src/map_chain.rs`, which are Klassic source prepended
+to the prelude and compiled like any other definition: a generic
+self-referential enum and `while`-loop helpers, so nothing recurses and every
+backend can compile them (`tests/cross-exec/32-map-chain-helpers.kl` runs
+them on their own, `33-builtin-map-grown-in-a-loop.kl` runs the counter).
+
+The pass is all-or-nothing per program. A map is lowered only when it is
+created by `Map#empty()` and *every* use of it is one of put, `getOrElse`,
+`containsKey`, size, emptiness or printing -- in either the function or the
+method spelling. A map that is handed to a function, asked for its keys or
+walked as entries leaves the whole program alone, so what compiled before
+still compiles the way it did. The walk that decides this enumerates every
+kind of expression rather than falling back to a wildcard: an unlisted one
+would report "no children" and let a use slip past, which is exactly how the
+first version of it half-lowered a program that used `toPairs`.
+
+Three backend holes had to be closed to make the helpers compilable at all,
+one per concern:
 
 - **A binding seeded with a nullary constructor takes its payload types from
   what is assigned to it.** `mutable acc = KMNil` knows nothing; the first
   `acc = KMCons(k, v, acc)` says everything. x86-64 merges the assigned
   value's shape into the slot's, resolved reprs winning over defaulted ones.
 - **A string built by appending in a loop is assignable back.** `out = out + k
-  + ": " + v` produces a heap string, and a `mutable` string binding is a
-  fixed buffer; the heap string is copied into it now, as every other shape of
-  string already was.
+  + ": " + v` produces a heap string while a `mutable` string binding is a
+  fixed buffer; the heap string is copied into it now.
 - **The record of which slots have been matched on belongs to one function.**
-  It is keyed by frame offset, and every function's frame starts at the same
-  place -- so a slot matched in one function blocked widening for an unrelated
-  slot at the same offset in the next. On aarch64 that is what refused
-  `acc = KMCons(...)` with "assignment changing a type".
+  It is keyed by frame offset and every frame starts at the same place, so a
+  slot matched in one function was blocking widening for an unrelated slot at
+  the same offset in the next -- which is what refused `acc = KMCons(...)` on
+  aarch64.
 
-#### What a portable `Map` lowering ran into before, measured
-
-Lowering the builtin map to the chain means emitting helpers -- put, lookup,
-size, rendering -- that the program's own map operations are rewritten to
-call. Written generically, so the lowering needs no type inference of its
-own, they are rejected, and three ways of getting past that were tried and
-refused:
-
-- **Partial shapes are unsound as they stand.** `containsKey(m, key)` fixes
-  the key's type and says nothing about the value's, so the annotation solves
-  to `KlassicMapChain<String, 'v>`. Letting `generic_enum_annotation_shape`
-  resolve what it can and leave the rest defaulted compiles -- and prints
-  `%[3: 3, 3: 1, 3: 1]` for a store whose keys are words. A defaulted repr is
-  read as the wrong kind.
-- **Refusing to read an unresolved field**, which would make partial shapes
-  safe, breaks ten existing tests. The model defaults those fields on purpose:
-  they are read only in arms that are dead at run time, and rejecting the read
-  rejects working programs.
-- **Dropping such an arm as dead** was refuted earlier: the next call, whose
-  value really is that variant, dies with "match: no pattern matched".
-
-So the lowering needs *fully* resolved shapes at every helper call, which
-means either the helpers are monomorphic -- and the desugar does not know the
-key and value types -- or x86-64's shape model gains a precise notion of a
-dead arm rather than a defaulted one. That is a design decision about the
-model, not a missing case, and it is where the next attempt should start.
-
-(A smaller thing found on the way: a constructor whose name begins with `__`
-does not parse in a *pattern* -- `case __Nil =>` is a syntax error while
-`case KNil =>` is fine -- so an injected enum cannot use the usual
-double-underscore convention for synthesized names.)
-
-What is left is not a representation gap any more but a routing one, and it
-splits in two. `Map#put` in a loop needs the *builtin* map lowered to the
-chain above -- a middle-end pass that injects the enum and its helpers and
-rewrites the `Map#*` calls, the map literals and the rendering; the helpers
-can be generic now, so the pass needs no type inference of its own.
-`words()` needs something else: `stdlibFilter` is a *recursive* generic
-function taking `List<'a>`, and a recursive function has to be compiled once,
-so its parameter kinds must be fixed -- measured again after the type-variable
-solving landed, and the reason is still "this backend cannot pass `xs`
-(`List<'a>`) by itself". That one wants monomorphisation of recursive generic
-definitions, which is a separate piece from the map lowering.
+What is still not lowered: a map that is *only* created and never put into
+keeps every payload type unknown, so asking it about a key is refused --
+there is nothing in it to say what its keys are. And `words()` over a runtime
+list is a different piece: `stdlibFilter` is a *recursive* generic function
+taking `List<'a>`, and a recursive function is compiled once, so its
+parameter kinds have to be fixed. That one wants monomorphisation of
+recursive generic definitions.
 
 ## Design Notes
 

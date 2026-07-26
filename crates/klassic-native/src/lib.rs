@@ -487,10 +487,11 @@ pub fn compile_source_to_elf(
     compile_source_for_target(name, text, config)
 }
 
-#[allow(clippy::result_large_err)]
 mod cbackend;
 mod gc_layout;
 mod llvm;
+#[allow(clippy::result_large_err)]
+mod map_chain;
 
 #[allow(clippy::result_large_err)]
 mod aarch64;
@@ -587,6 +588,13 @@ pub fn compile_source_with_prelude_and_modules_for_target(
 ) -> Result<Vec<u8>, NativeCompileError> {
     let mut bundled = String::with_capacity(prelude_text.len() + user_text.len() + 1);
     bundled.push_str(prelude_text);
+    // A map that grows while the program runs is lowered onto a chain, and
+    // the chain's helpers are Klassic source: prepended here so they are
+    // parsed and checked with everything else, and only when a program has a
+    // map to grow.
+    if map_chain::program_creates_runtime_map(user_text) {
+        bundled.push_str(map_chain::HELPERS);
+    }
     if !prelude_text.ends_with('\n') {
         bundled.push('\n');
     }
@@ -634,6 +642,10 @@ fn compile_internal(
             }
         }
     }
+    // Maps that grow while the program runs become chains before the enums
+    // are lowered, so the chain lowers with everything else. Only the user's
+    // own code is rewritten; the stdlib's map functions keep the builtin map.
+    let expr = map_chain::lower_runtime_maps(expr, prelude_offset);
     let (expr, lowered_enum_names, mono_enum_shapes, mono_enum_variants) = desugar_enums(expr);
     // Capture the extension-method registry before the desugar erases the
     // `ExtensionDeclaration`s, so codegen can resolve method names that the
