@@ -1491,6 +1491,27 @@ what lets the same `toPairs()` compile there. Runtime-grown maps
 compile-time `StaticMap` or a fixed-capacity `RuntimeList`, neither of which
 can grow by an amount only known while running.
 
+### Sets, and enum values as values
+
+The `Set#*` family the stdlib's extension methods call was uneven across the
+backends: aarch64 had none of it (a set literal worked, but `Set#size` did
+not), and x86-64 had the method spellings (`s.add(x)`, `s.toList()`) without
+the function ones. Both are complete now. On aarch64 a set is the same
+insertion-ordered chain a list is, so `Set#toList` is a type change, `Set#size`
+is the length walk, and `Set#add`/`Set#fromList` are the set literal's own
+dedupe loop over a chain only known while running -- `add` copies the chain
+backwards, prepends, and reverses, so the new element comes out last the way
+the evaluator prints it. On x86-64 the same four are compile-time
+transformations of a `StaticSet`, alongside the function spellings of
+`Map#put`, `Map#empty` and `Map#getOrElse`.
+
+The aarch64 backend can also print an enum value as a value now -- `Some(3)`,
+`None`, `Ok(1)` -- both to stdout and into a string, so `println(result)` and
+`"#{result}"` agree with the evaluator, and a list of enums renders like any
+other list. It is a comparison per variant against the tag the constructor
+stored; a variant whose payload the shape records as `Never` is skipped, which
+is the same reading `match` takes of it.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.

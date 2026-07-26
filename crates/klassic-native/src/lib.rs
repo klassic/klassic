@@ -6488,7 +6488,9 @@ impl NativeCodeGenerator {
             | "Dir#current"
             | "Dir#home"
             | "Dir#temp"
-            | "Time#nowMillis" => Some(0),
+            | "Time#nowMillis"
+            | "Map#empty"
+            | "Set#empty" => Some(0),
             "println"
             | "printlnError"
             | "sleep"
@@ -6514,6 +6516,8 @@ impl NativeCodeGenerator {
             | "Map#size"
             | "Map#keys"
             | "Map#values"
+            | "Set#toList"
+            | "Set#fromList"
             | "Set#size"
             | "isEmpty"
             | "Map#isEmpty"
@@ -6552,6 +6556,7 @@ impl NativeCodeGenerator {
             | "join"
             | "contains"
             | "Set#contains"
+            | "Set#add"
             | "Map#containsKey"
             | "containsKey"
             | "Map#containsValue"
@@ -6566,7 +6571,7 @@ impl NativeCodeGenerator {
             | "Dir#move"
             | "Math#powInt"
             | "Math#gcd" => Some(2),
-            "substring" | "replace" | "replaceAll" => Some(3),
+            "substring" | "replace" | "replaceAll" | "Map#put" | "Map#getOrElse" => Some(3),
             _ => None,
         }
     }
@@ -8382,6 +8387,30 @@ impl NativeCodeGenerator {
             }
             "Map#get" | "get" => self.compile_static_map_get_direct(arguments, span),
             "Set#contains" => self.compile_static_set_contains_direct(arguments, span),
+            // The function spellings of the set builders. The method forms
+            // (`s.add(x)`, `s.toList()`) were already here; `std.set`'s own
+            // extension methods call these.
+            "Set#toList" if arguments.len() == 1 => self.compile_set_to_list(&arguments[0], span),
+            "Set#add" if arguments.len() == 2 => {
+                self.compile_set_add(&arguments[0], &arguments[1], span)
+            }
+            "Map#getOrElse" if arguments.len() == 3 => {
+                self.compile_map_get_or_else(&arguments[0], &arguments[1], &arguments[2], span)
+            }
+            "Map#put" if arguments.len() == 3 => {
+                self.compile_map_put(&arguments[0], &arguments[1], &arguments[2], span)
+            }
+            "Map#empty" if arguments.is_empty() => {
+                let label = self.intern_static_map(Vec::new());
+                Ok(self.emit_static_value(&StaticValue::StaticMap { label }))
+            }
+            "Set#empty" if arguments.is_empty() => {
+                let label = self.intern_static_set(Vec::new());
+                Ok(self.emit_static_value(&StaticValue::StaticSet { label }))
+            }
+            "Set#fromList" if arguments.len() == 1 => {
+                self.compile_set_from_list(&arguments[0], span)
+            }
             "FileOutput#write" => self.compile_file_output_write(arguments, false, span),
             "FileOutput#append" => self.compile_file_output_write(arguments, true, span),
             "FileOutput#writeLines" => self.compile_file_output_write_lines(arguments, span),
@@ -15392,6 +15421,32 @@ impl NativeCodeGenerator {
         let elements = self.static_sets[label.0].elements.clone();
         let list_label = self.intern_static_list(elements);
         Ok(self.emit_static_value(&StaticValue::StaticList { label: list_label }))
+    }
+
+    /// `Set#fromList(xs)` — the list's elements as a set, keeping the first
+    /// occurrence of each in the order they arrive, which is what the
+    /// evaluator does and what a set literal already does here.
+    fn compile_set_from_list(
+        &mut self,
+        target: &Expr,
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        let elements = self.static_list_values_from_argument_preserving_effects(
+            target,
+            span,
+            "native Set#fromList for non-static list",
+        )?;
+        let mut deduped: Vec<StaticValue> = Vec::with_capacity(elements.len());
+        for element in elements {
+            if !deduped
+                .iter()
+                .any(|seen| self.static_value_equal_user(seen, &element))
+            {
+                deduped.push(element);
+            }
+        }
+        let label = self.intern_static_set(deduped);
+        Ok(self.emit_static_value(&StaticValue::StaticSet { label }))
     }
 
     /// `m.put(k, v)` — a fresh static map with `k -> v` set. An existing key

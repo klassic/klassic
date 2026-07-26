@@ -1714,6 +1714,8 @@ struct Emitter {
     /// The records whose rendering is currently being emitted, so a record
     /// that holds itself is rejected instead of printed forever.
     printing_records: Vec<u32>,
+    /// The same, for enums: a cons-style one holds its own shape.
+    printing_enums: Vec<u32>,
     /// Lazily emitted set helpers (called via `bl`): scalar / string
     /// membership scans and a cons-list reverse.
     member_scalar_label: Option<Label>,
@@ -3365,6 +3367,9 @@ impl Emitter {
                         let offset = self.asm.intern_string_object("%[]");
                         self.asm.load_rodata_address(Reg::X0, offset);
                         self.emit_heap_string_copy();
+                    }
+                    ValueType::Enum(shape) => {
+                        self.emit_enum_to_str(shape, hole.span())?;
                     }
                     other => {
                         return Err(unsupported(
@@ -5896,10 +5901,8 @@ impl Emitter {
             ListElem::Double => {
                 return Err(unsupported(span, "printing a Double element"));
             }
-            // An enum element would need this backend to know how the
-            // evaluator renders that enum, which it does not.
-            ListElem::Enum(_) => {
-                return Err(unsupported(span, "printing an enum element"));
+            ListElem::Enum(shape) => {
+                self.emit_print_enum_inline(shape, span)?;
             }
             ListElem::Record(index) => {
                 self.emit_print_record_inline(index, span)?;
@@ -6018,6 +6021,76 @@ impl Emitter {
         }
         self.asm.pop(Reg::X0); // discard the saved object
         self.asm.emit_write_rodata(STDOUT_FD, b")");
+        Ok(())
+    }
+
+    /// The evaluator's rendering of an enum value in x0 -- `Some(3)`, `None`,
+    /// `Ok(1)` -- without a newline, so it reads the same alone, inside a list,
+    /// or inside a record. The value is `[boxed tag][payload...]`, so this is a
+    /// comparison per variant against the tag the constructor stored.
+    fn emit_print_enum_inline(&mut self, shape: u32, span: Span) -> Result<(), Diagnostic> {
+        if self.printing_enums.contains(&shape) {
+            return Err(unsupported(span, "printing an enum that holds itself"));
+        }
+        self.printing_enums.push(shape);
+        let result = self.emit_print_enum_variants(shape, span);
+        self.printing_enums.pop();
+        result
+    }
+
+    fn emit_print_enum_variants(&mut self, shape: u32, span: Span) -> Result<(), Diagnostic> {
+        let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
+        let variants = self.generic_enums[enum_index].1.clone();
+        let end = self.asm.new_label();
+        self.asm.push(Reg::X0); // the value survives the writes below
+        for (tag, (variant, arity)) in variants.iter().enumerate() {
+            // A payload this shape never carries means no value of it is this
+            // variant, which is the same reading `match` takes of `Never`.
+            if payloads[tag].contains(&ValueType::Never) {
+                continue;
+            }
+            let next = self.asm.new_label();
+            self.asm.pop(Reg::X0);
+            self.asm.push(Reg::X0);
+            self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
+            self.emit_unbox_scalar();
+            self.asm.cmp_imm(Reg::X0, tag as u32);
+            self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
+            self.asm.emit_write_rodata(STDOUT_FD, variant.as_bytes());
+            if *arity > 0 {
+                self.asm.emit_write_rodata(STDOUT_FD, b"(");
+                let fields = payloads[tag].clone();
+                for (position, field_ty) in fields.iter().copied().take(*arity).enumerate() {
+                    if position > 0 {
+                        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+                    }
+                    self.asm.pop(Reg::X0);
+                    self.asm.push(Reg::X0);
+                    self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
+                    if is_boxed_scalar(field_ty) {
+                        self.emit_unbox_scalar();
+                    }
+                    match field_ty {
+                        ValueType::Enum(inner) => self.emit_print_enum_inline(inner, span)?,
+                        ValueType::Record(inner) => self.emit_print_record_inline(inner, span)?,
+                        other => {
+                            let Some(elem) = list_elem_of(other) else {
+                                return Err(unsupported(
+                                    span,
+                                    "printing an enum payload of this type",
+                                ));
+                            };
+                            self.emit_print_elem(elem, span)?;
+                        }
+                    }
+                }
+                self.asm.emit_write_rodata(STDOUT_FD, b")");
+            }
+            self.asm.branch(end, BranchKind::Unconditional);
+            self.asm.bind(next);
+        }
+        self.asm.bind(end);
+        self.asm.pop(Reg::X0); // discard the saved value
         Ok(())
     }
 
@@ -6504,12 +6577,14 @@ impl Emitter {
                 self.close_temp_roots(mark);
                 Ok(Some(ValueType::List(elem)))
             }
-            ("isEmpty", 1) | ("Map#isEmpty", 1) => {
+            ("isEmpty", 1) | ("Map#isEmpty", 1) | ("Set#isEmpty", 1) => {
                 let ty = self.expression(&arguments[0])?;
                 if !matches!(
                     ty,
                     ValueType::List(_)
                         | ValueType::EmptyList
+                        | ValueType::Set(_)
+                        | ValueType::EmptySet
                         | ValueType::Map(..)
                         | ValueType::EmptyMap
                 ) {
@@ -6543,7 +6618,7 @@ impl Emitter {
                     span,
                 )?))
             }
-            ("size", 1) | ("Map#size", 1) => {
+            ("size", 1) | ("Map#size", 1) | ("Set#size", 1) => {
                 let ty = self.expression(&arguments[0])?;
                 if !matches!(
                     ty,
@@ -6919,7 +6994,7 @@ impl Emitter {
                 self.asm.bind(end);
                 Ok(Some(ValueType::Nullable(value_elem)))
             }
-            ("contains", 2) => {
+            ("contains", 2) | ("Set#contains", 2) => {
                 let set_ty = self.expression(&arguments[0])?;
                 let elem = match set_ty {
                     ValueType::Set(elem) => Some(elem),
@@ -6942,6 +7017,162 @@ impl Emitter {
                     None => self.asm.mov_imm64(Reg::X0, 0),
                 }
                 Ok(Some(ValueType::Bool))
+            }
+            // The rest of the `Set#*` family `std.set`'s extension methods
+            // delegate to. A set is an insertion-ordered chain with no
+            // duplicates, which is the same chain a list is -- so reading one
+            // as a list is a type change, and the two builders below are the
+            // set literal's own loop over a chain that is only known while
+            // running.
+            ("Set#empty", 0) => {
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(Some(ValueType::EmptySet))
+            }
+            ("Set#toList", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                match ty {
+                    ValueType::Set(elem) => Ok(Some(ValueType::List(elem))),
+                    ValueType::EmptySet => Ok(Some(ValueType::EmptyList)),
+                    ValueType::List(_) | ValueType::EmptyList => Ok(Some(ty)),
+                    _ => Err(unsupported(span, "a set builtin on a non-set")),
+                }
+            }
+            // `Set#add(s, x)`: the same set when `x` is already in it, and
+            // otherwise a fresh chain holding `x` last -- built by copying the
+            // old one backwards, prepending `x`, and reversing, so insertion
+            // order comes out the way the evaluator prints it.
+            ("Set#add", 2) => {
+                let mark = self.open_temp_roots();
+                let set_ty = self.expression(&arguments[0])?;
+                let declared = match set_ty {
+                    ValueType::Set(elem) => Some(elem),
+                    ValueType::EmptySet => None,
+                    _ => return Err(unsupported(span, "a set builtin on a non-set")),
+                };
+                let source = self.reserve_locals(8);
+                self.asm.store_local(Reg::X0, source);
+                self.emit_root_frame_slot(source);
+                let value_ty = self.expression(&arguments[1])?;
+                let Some(elem) = list_elem_of(value_ty) else {
+                    return Err(unsupported(
+                        arguments[1].span(),
+                        "a set element of this type",
+                    ));
+                };
+                if declared.is_some_and(|declared| declared != elem) {
+                    return Err(unsupported(span, "adding an element of another type"));
+                }
+                let raw = self.reserve_locals(8);
+                self.asm.store_local(Reg::X0, raw);
+                if is_heap_pointer(value_ty) {
+                    self.emit_root_frame_slot(raw);
+                }
+                let boxed = self.reserve_locals(8);
+                if is_boxed_scalar(value_ty) {
+                    self.emit_box_scalar();
+                }
+                self.asm.store_local(Reg::X0, boxed);
+                self.emit_root_frame_slot(boxed);
+                // Already a member? Then the set is its own answer.
+                let present = self.asm.new_label();
+                let end = self.asm.new_label();
+                self.asm.load_local(Reg::X1, raw);
+                self.asm.load_local(Reg::X0, source);
+                let member = self.member_label(elem);
+                self.asm.branch(member, BranchKind::Link);
+                self.asm
+                    .branch(present, BranchKind::CompareNonZero(Reg::X0));
+                let acc = self.reserve_locals(8);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                let cursor = self.reserve_locals(8);
+                self.asm.load_local(Reg::X0, source);
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                let loop_start = self.asm.new_label();
+                let copied = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(copied, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // the element, already boxed
+                self.push_rooted(Reg::X0); // head for the cons below
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(copied);
+                self.asm.load_local(Reg::X0, boxed);
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.asm.branch(end, BranchKind::Unconditional);
+                self.asm.bind(present);
+                self.asm.load_local(Reg::X0, source);
+                self.asm.bind(end);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Set(elem)))
+            }
+            // `Set#fromList(xs)`: the set literal's loop, over a chain that is
+            // only known while running -- keep the first occurrence of each
+            // element, in the order they arrive.
+            ("Set#fromList", 1) => {
+                let mark = self.open_temp_roots();
+                let ty = self.expression(&arguments[0])?;
+                let elem = match ty {
+                    ValueType::List(elem) | ValueType::Set(elem) => elem,
+                    ValueType::EmptyList | ValueType::EmptySet => {
+                        self.close_temp_roots(mark);
+                        return Ok(Some(ValueType::EmptySet));
+                    }
+                    _ => return Err(unsupported(span, "a set builtin on a non-collection")),
+                };
+                let cursor = self.reserve_locals(8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                let acc = self.reserve_locals(8);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // the element, already boxed
+                self.push_rooted(Reg::X0); // survives the scan, and is the head
+                if is_boxed_scalar(elem_value_type(elem)) {
+                    self.emit_unbox_scalar();
+                }
+                self.asm.mov_reg(Reg::X1, Reg::X0); // candidate
+                self.asm.load_local(Reg::X0, acc);
+                let member = self.member_label(elem);
+                self.asm.branch(member, BranchKind::Link);
+                let skip = self.asm.new_label();
+                let after = self.asm.new_label();
+                self.asm.branch(skip, BranchKind::CompareNonZero(Reg::X0));
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell(); // takes the parked head
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.branch(after, BranchKind::Unconditional);
+                self.asm.bind(skip);
+                self.pop_rooted(Reg::X0); // a duplicate: drop the parked head
+                self.asm.bind(after);
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Set(elem)))
             }
             // ---- enum-lowering primitives (`desugar_enums`) ----
             // `__gc_record(n)` / `__gc_alloc(bytes)`: zeroed heap
@@ -7445,8 +7676,9 @@ impl Emitter {
             ListElem::Int => self.emit_int_to_str(),
             ListElem::Bool => self.emit_bool_to_str(),
             ListElem::Str => {}
-            ListElem::Enum(_) | ListElem::Record(_) => {
-                return Err(unsupported(span, "rendering an enum element"));
+            ListElem::Enum(shape) => self.emit_enum_to_str(shape, span)?,
+            ListElem::Record(_) => {
+                return Err(unsupported(span, "rendering a record element"));
             }
             // Same renderer one level down; the element pointer is already in
             // x0, and the result replaces it.
@@ -7477,6 +7709,99 @@ impl Emitter {
         self.asm.mov_reg(Reg::X1, Reg::X0);
         self.asm.load_local(Reg::X0, acc);
         self.emit_str_concat();
+        self.close_temp_roots(mark);
+        Ok(())
+    }
+
+    /// Append the text of a literal to the string builder in `acc`.
+    fn emit_append_literal(&mut self, acc: u32, text: &str) {
+        let offset = self.asm.intern_string_object(text);
+        self.asm.load_rodata_address(Reg::X0, offset);
+        self.emit_heap_string_copy();
+        self.asm.mov_reg(Reg::X1, Reg::X0);
+        self.asm.load_local(Reg::X0, acc);
+        self.emit_str_concat();
+        self.asm.store_local(Reg::X0, acc);
+    }
+
+    /// The rendering `emit_print_enum_inline` writes to stdout, built as a heap
+    /// string instead -- which is what `"#{result}"` and a list of enums need.
+    /// The value is in x0 and the string replaces it.
+    fn emit_enum_to_str(&mut self, shape: u32, span: Span) -> Result<(), Diagnostic> {
+        if self.printing_enums.contains(&shape) {
+            return Err(unsupported(span, "rendering an enum that holds itself"));
+        }
+        self.printing_enums.push(shape);
+        let result = self.emit_enum_to_str_variants(shape, span);
+        self.printing_enums.pop();
+        result
+    }
+
+    fn emit_enum_to_str_variants(&mut self, shape: u32, span: Span) -> Result<(), Diagnostic> {
+        let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
+        let variants = self.generic_enums[enum_index].1.clone();
+        let mark = self.open_temp_roots();
+        let value = self.reserve_locals(16);
+        let acc = value + 8;
+        self.asm.store_local(Reg::X0, value);
+        self.emit_root_frame_slot(value);
+        // The builder starts empty, and is rooted before any branch so every
+        // path through the switch below has pushed the same roots.
+        let empty = self.asm.intern_string_object("");
+        self.asm.load_rodata_address(Reg::X0, empty);
+        self.emit_heap_string_copy();
+        self.asm.store_local(Reg::X0, acc);
+        self.emit_root_frame_slot(acc);
+        let end = self.asm.new_label();
+        for (tag, (variant, arity)) in variants.iter().enumerate() {
+            if payloads[tag].contains(&ValueType::Never) {
+                continue;
+            }
+            let next = self.asm.new_label();
+            self.asm.load_local(Reg::X0, value);
+            self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
+            self.emit_unbox_scalar();
+            self.asm.cmp_imm(Reg::X0, tag as u32);
+            self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
+            self.emit_append_literal(acc, variant);
+            if *arity > 0 {
+                self.emit_append_literal(acc, "(");
+                let fields = payloads[tag].clone();
+                for (position, field_ty) in fields.iter().copied().take(*arity).enumerate() {
+                    if position > 0 {
+                        self.emit_append_literal(acc, ", ");
+                    }
+                    self.asm.load_local(Reg::X0, value);
+                    self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
+                    if is_boxed_scalar(field_ty) {
+                        self.emit_unbox_scalar();
+                    }
+                    match field_ty {
+                        ValueType::Int => self.emit_int_to_str(),
+                        ValueType::Bool => self.emit_bool_to_str(),
+                        ValueType::Str => {}
+                        ValueType::Enum(inner) => self.emit_enum_to_str(inner, span)?,
+                        ValueType::List(elem) => self.emit_list_to_str(elem, "[", "]", span)?,
+                        ValueType::Set(elem) => self.emit_list_to_str(elem, "%(", ")", span)?,
+                        other => {
+                            return Err(unsupported(
+                                span,
+                                &format!("rendering an enum payload of type {other:?}"),
+                            ));
+                        }
+                    }
+                    self.asm.mov_reg(Reg::X1, Reg::X0);
+                    self.asm.load_local(Reg::X0, acc);
+                    self.emit_str_concat();
+                    self.asm.store_local(Reg::X0, acc);
+                }
+                self.emit_append_literal(acc, ")");
+            }
+            self.asm.branch(end, BranchKind::Unconditional);
+            self.asm.bind(next);
+        }
+        self.asm.bind(end);
+        self.asm.load_local(Reg::X0, acc);
         self.close_temp_roots(mark);
         Ok(())
     }
@@ -8193,12 +8518,41 @@ impl Emitter {
                     // `floor`/`int`/`ceil` are Int-valued here, like the
                     // evaluator's -- keeping this in step with the emitter
                     // matters, since a wrong guess is a rejected build.
-                    "size" | "length" | "toInt" | "floor" | "int" | "ceil" | "Map#size" => {
+                    "size" | "length" | "toInt" | "floor" | "int" | "ceil" | "Map#size"
+                    | "Set#size" => {
                         return Some(ValueType::Int);
                     }
                     "isEmpty" | "contains" | "isEmptyString" | "matches" | "containsKey"
-                    | "Map#containsKey" | "Map#isEmpty" | "Map#containsValue" => {
+                    | "Map#containsKey" | "Map#isEmpty" | "Map#containsValue" | "Set#isEmpty"
+                    | "Set#contains" => {
                         return Some(ValueType::Bool);
+                    }
+                    // The set builders, so `std.set`'s extension methods can
+                    // be typed: two of them answer with a set, and reading one
+                    // as a list keeps the element type.
+                    "Set#empty" => return Some(ValueType::EmptySet),
+                    "Set#toList" => {
+                        return match first_type {
+                            Some(ValueType::Set(elem)) => Some(ValueType::List(elem)),
+                            Some(ValueType::EmptySet) => Some(ValueType::EmptyList),
+                            other @ (Some(ValueType::List(_)) | Some(ValueType::EmptyList)) => {
+                                other
+                            }
+                            _ => None,
+                        };
+                    }
+                    "Set#add" | "Set#fromList" => {
+                        return match first_type {
+                            Some(ValueType::Set(elem)) | Some(ValueType::List(elem)) => {
+                                Some(ValueType::Set(elem))
+                            }
+                            Some(ValueType::EmptySet) | Some(ValueType::EmptyList)
+                                if name == "Set#fromList" =>
+                            {
+                                Some(ValueType::EmptySet)
+                            }
+                            _ => None,
+                        };
                     }
                     // Splitting a string is how `std.string`'s `lines` and
                     // `words` start, so the inference has to get through it to
@@ -9334,6 +9688,11 @@ impl Emitter {
                 self.asm.bind(null_label);
                 self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
                 self.asm.bind(end_label);
+                Ok(())
+            }
+            ValueType::Enum(shape) => {
+                self.emit_print_enum_inline(shape, argument.span())?;
+                self.asm.emit_write_rodata(STDOUT_FD, b"\n");
                 Ok(())
             }
             other => Err(unsupported(
