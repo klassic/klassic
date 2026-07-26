@@ -145,6 +145,12 @@ pub fn program_creates_runtime_map(user_text: &str) -> bool {
 pub fn lower_runtime_maps(expr: Expr, prelude_len: usize) -> Expr {
     let mut tracked = HashSet::new();
     collect_created_maps(&expr, prelude_len, &mut tracked);
+    // A map that is never put into has nothing to grow, and nothing in it to
+    // say what its keys and values are -- so it stays the builtin empty map,
+    // which every backend already handles.
+    let mut grown = HashSet::new();
+    collect_grown_maps(&expr, prelude_len, &tracked, &mut grown);
+    let tracked = grown;
     if tracked.is_empty() {
         return expr;
     }
@@ -170,6 +176,27 @@ fn collect_created_maps(expr: &Expr, prelude_len: usize, out: &mut HashSet<Strin
     }
     for child in children(expr) {
         collect_created_maps(child, prelude_len, out);
+    }
+}
+
+/// Of the maps created by `Map#empty()`, the ones something is put into.
+fn collect_grown_maps(
+    expr: &Expr,
+    prelude_len: usize,
+    created: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    if let Expr::Assign { name, value, span } = expr
+        && is_user(*span, prelude_len)
+        && created.contains(name)
+        && matches!(value.as_ref(), Expr::Call { callee, arguments, .. }
+            if arguments.len() == 3
+                && matches!(callee.as_ref(), Expr::Identifier { name, .. } if name == "Map#put"))
+    {
+        out.insert(name.clone());
+    }
+    for child in children(expr) {
+        collect_grown_maps(child, prelude_len, created, out);
     }
 }
 
