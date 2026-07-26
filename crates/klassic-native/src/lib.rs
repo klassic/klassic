@@ -5346,13 +5346,6 @@ impl NativeCodeGenerator {
                 .iter()
                 .all(|arm| en_pattern_supported_shaped(shape, &arm.pattern))
         {
-            eprintln!(
-                "DBG shape variants={:?} arms={:?}",
-                shape.variants.keys().collect::<Vec<_>>(),
-                arms.iter()
-                    .map(|a| format!("{:?}", a.pattern))
-                    .collect::<Vec<_>>()
-            );
             return Err(unsupported(
                 span,
                 "native generic enum match: a pattern variant is not in the scrutinee shape",
