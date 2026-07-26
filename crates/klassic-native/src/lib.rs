@@ -20693,8 +20693,26 @@ impl NativeCodeGenerator {
         name: &str,
     ) -> Result<NativeStringRef, Diagnostic> {
         let value = self.compile_expr(argument)?;
-        self.native_string_ref(value)
-            .ok_or_else(|| unsupported(span, &format!("native {name} for non-string key")))
+        if let Some(reference) = self.native_string_ref(value) {
+            return Ok(reference);
+        }
+        // A name computed at run time -- `env_or(name)` reading its own
+        // parameter -- is a heap string, which the entry search cannot read
+        // directly. Copying it into the runtime string buffer makes it the
+        // same kind of reference a literal is.
+        if value == NativeValue::HeapString {
+            let copied = self.emit_heap_string_to_runtime_string_value(
+                span,
+                "environment variable name is too long",
+            );
+            if let Some(reference) = self.native_string_ref(copied) {
+                return Ok(reference);
+            }
+        }
+        Err(unsupported(
+            span,
+            &format!("native {name} for non-string key"),
+        ))
     }
 
     fn emit_environment_get_static_key(

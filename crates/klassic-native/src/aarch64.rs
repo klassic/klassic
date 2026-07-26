@@ -1470,6 +1470,90 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 }
 
 /// The element type a value of type `ty` can be a list element of.
+/// Replace whole-identifier occurrences of each type parameter in an
+/// annotation with its argument: `Chain<a>` with `a = Int` becomes
+/// `Chain<Int>`, while `Char` is left alone.
+fn substitute_type_params(text: &str, params: &[String], arguments: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if token.is_empty() {
+            return;
+        }
+        match params.iter().position(|param| param == token) {
+            Some(at) => out.push_str(&arguments[at]),
+            None => out.push_str(token),
+        }
+        token.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '\'' {
+            token.push(ch);
+        } else {
+            flush(&mut token, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+/// Every value assigned to `name` inside this expression. A partial walk of
+/// the shapes assignments actually appear in; anything it does not look inside
+/// simply leaves the binding typed by its initial value, which is the old
+/// behaviour.
+fn collect_assignments(expr: &Expr, name: &str, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::Assign {
+            name: target,
+            value,
+            ..
+        } => {
+            if target == name {
+                out.push((**value).clone());
+            }
+            collect_assignments(value, name, out);
+        }
+        Expr::Block { expressions, .. } => {
+            for expression in expressions {
+                collect_assignments(expression, name, out);
+            }
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_assignments(condition, name, out);
+            collect_assignments(then_branch, name, out);
+            if let Some(branch) = else_branch {
+                collect_assignments(branch, name, out);
+            }
+        }
+        Expr::While {
+            condition, body, ..
+        } => {
+            collect_assignments(condition, name, out);
+            collect_assignments(body, name, out);
+        }
+        Expr::Foreach { iterable, body, .. } => {
+            collect_assignments(iterable, name, out);
+            collect_assignments(body, name, out);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_assignments(scrutinee, name, out);
+            for arm in arms {
+                collect_assignments(&arm.body, name, out);
+            }
+        }
+        Expr::VarDecl { value, .. } => collect_assignments(value, name, out),
+        _ => {}
+    }
+}
+
 /// A lambda written as the only thing in a block is that lambda.
 fn peel_block(expr: &Expr) -> &Expr {
     match expr {
@@ -1693,6 +1777,14 @@ struct Emitter {
     enum_is_generic: Vec<bool>,
     /// Each enum's type parameters, for instantiating an applied one.
     enum_type_params: Vec<Vec<String>>,
+    /// Interned shapes for applied generic enums, keyed by the enum and its
+    /// type arguments, so `Chain<Int>` is one shape however often it is named.
+    applied_enum_shapes: HashMap<(usize, Vec<String>), u32>,
+    /// Frame slots that a `match` has already been compiled against. Widening
+    /// one of those in place would be wrong -- the match decided which arms
+    /// were reachable from the shape it saw -- so those assignments are still
+    /// reported instead.
+    matched_enum_slots: std::collections::HashSet<u32>,
     /// Payload annotations per enum, per variant, as written -- what a
     /// canonical shape is built from.
     enum_annotations: Vec<Vec<Vec<String>>>,
@@ -1706,6 +1798,10 @@ struct Emitter {
     /// Not a thread: the hand-emitted x86-64 backend makes the same
     /// approximation, and matching it keeps the targets' output identical.
     queued_threads: Vec<(usize, Span)>,
+    /// Values assigned to a `mutable` binding later in the block it is
+    /// declared in, collected before the block is compiled so the binding's
+    /// slot can be typed for all of them.
+    pending_widenings: HashMap<String, Vec<Expr>>,
     /// Names bound to a string literal. Some builtins need the *text* of an
     /// argument at compile time -- `Dir#mkdirs` creates each parent directory,
     /// so it splits the path here -- and a literal put in a `val` first is the
@@ -1907,28 +2003,40 @@ impl Emitter {
         if params.len() != arguments.len() {
             return None;
         }
+        let key = (enum_index, arguments.to_vec());
+        if let Some(shape) = self.applied_enum_shapes.get(&key) {
+            return Some(*shape);
+        }
+        // Allocated empty and recorded first, so a payload that names this
+        // very instantiation -- `Cons(head: 'a, tail: Chain<'a>)` -- finds it
+        // instead of recursing forever.
+        let variants = self.generic_enums[enum_index].1.len();
+        self.enum_shapes
+            .push((enum_index, vec![Vec::new(); variants]));
+        let shape = (self.enum_shapes.len() - 1) as u32;
+        self.applied_enum_shapes.insert(key, shape);
         let annotations = self.enum_annotations[enum_index].clone();
         let mut payloads = Vec::with_capacity(annotations.len());
         for fields in &annotations {
             let mut typed = Vec::with_capacity(fields.len());
             for annotation in fields {
-                let text = match params.iter().position(|param| param == annotation.trim()) {
-                    Some(at) => arguments[at].clone(),
-                    None => annotation.clone(),
-                };
-                typed.push(self.annotation_type(&text, span).ok()?);
+                // Substitute the arguments into the annotation, so both `a`
+                // and `Chain<a>` resolve. Whole identifiers only: a plain
+                // `replace` would rewrite the `a` inside `Char`.
+                let text = substitute_type_params(annotation.trim(), &params, arguments);
+                match self.annotation_type(&text, span) {
+                    Ok(ty) => typed.push(ty),
+                    Err(_) => {
+                        self.applied_enum_shapes
+                            .remove(&(enum_index, arguments.to_vec()));
+                        return None;
+                    }
+                }
             }
             payloads.push(typed);
         }
-        if let Some(index) = self
-            .enum_shapes
-            .iter()
-            .position(|(which, known)| *which == enum_index && *known == payloads)
-        {
-            return Some(index as u32);
-        }
-        self.enum_shapes.push((enum_index, payloads));
-        Some((self.enum_shapes.len() - 1) as u32)
+        self.enum_shapes[shape as usize].1 = payloads;
+        Some(shape)
     }
 
     /// The enum and variant a constructor name belongs to, with the variant's
@@ -1943,6 +2051,72 @@ impl Emitter {
                     .position(|(variant, _)| variant == name)
                     .map(|tag| (enum_index, tag, variants[tag].1))
             })
+    }
+
+    /// The annotation text for a type, for the cases that have a name. Used to
+    /// turn a constructor's argument types back into the enum's type arguments.
+    fn annotation_of(&self, ty: ValueType) -> Option<String> {
+        Some(match ty {
+            ValueType::Int => "Int".to_string(),
+            ValueType::Double => "Double".to_string(),
+            ValueType::Bool => "Boolean".to_string(),
+            ValueType::Str => "String".to_string(),
+            ValueType::List(elem) => {
+                format!("List<{}>", self.annotation_of(elem_value_type(elem))?)
+            }
+            ValueType::Set(elem) => {
+                format!("Set<{}>", self.annotation_of(elem_value_type(elem))?)
+            }
+            ValueType::Record(index) => {
+                let record = self.records.get(index as usize)?;
+                if record.name.is_empty() {
+                    return None;
+                }
+                record.name.clone()
+            }
+            ValueType::Enum(shape) => {
+                let (enum_index, _) = self.enum_shapes.get(shape as usize)?;
+                self.generic_enums.get(*enum_index)?.0.clone()
+            }
+            _ => return None,
+        })
+    }
+
+    /// The canonical shape for a *generic* enum whose type arguments this
+    /// constructor pins down: `Cons(1, rest)` on `Chain<'a>` says `'a` is Int,
+    /// so the value has the shape of `Chain<Int>`.
+    ///
+    /// Without this, a self-referential constructor's shape describes one more
+    /// level on every use -- `Cons(Int, <shape of the tail>)` -- and a loop
+    /// that rebuilds the value never settles on a type.
+    fn canonical_applied_enum_shape(
+        &mut self,
+        enum_index: usize,
+        tag: usize,
+        payload: &[ValueType],
+        span: Span,
+    ) -> Option<u32> {
+        let params = self.enum_type_params.get(enum_index)?.clone();
+        if params.is_empty() {
+            return None;
+        }
+        let annotations = self.enum_annotations.get(enum_index)?.get(tag)?.clone();
+        if annotations.len() != payload.len() {
+            return None;
+        }
+        let mut arguments: Vec<Option<String>> = vec![None; params.len()];
+        for (annotation, ty) in annotations.iter().zip(payload.iter()) {
+            // Only a payload that *is* a parameter says what that parameter is.
+            if let Some(at) = params.iter().position(|param| param == annotation.trim()) {
+                let named = self.annotation_of(*ty)?;
+                match &arguments[at] {
+                    Some(existing) if *existing != named => return None,
+                    _ => arguments[at] = Some(named),
+                }
+            }
+        }
+        let arguments: Vec<String> = arguments.into_iter().collect::<Option<Vec<_>>>()?;
+        self.instantiate_generic_enum(&self.generic_enums[enum_index].0.clone(), &arguments, span)
     }
 
     /// Intern the shape of an enum whose `tag` variant carries `payload` and
@@ -2000,6 +2174,12 @@ impl Emitter {
         if !self.enum_is_generic[enum_index]
             && let Some(shape) = self.canonical_enum_shape(enum_index, span)
         {
+            return Ok(ValueType::Enum(shape));
+        }
+        // A generic enum whose arguments this constructor pins down has a
+        // canonical shape too, which is what keeps a self-referential one from
+        // describing one more level on every use.
+        if let Some(shape) = self.canonical_applied_enum_shape(enum_index, tag, &payload, span) {
             return Ok(ValueType::Enum(shape));
         }
         let shape = self.intern_enum_shape(enum_index, tag, payload);
@@ -2083,6 +2263,82 @@ impl Emitter {
             }
         };
         Some(self.emit_generic_function_call(index, &flattened, span))
+    }
+
+    /// Note, for every `mutable` declared in this block, what is assigned to
+    /// it later on, so its slot can be typed for all of them.
+    fn collect_block_widenings(&mut self, expressions: &[Expr]) {
+        for (position, expression) in expressions.iter().enumerate() {
+            let Expr::VarDecl {
+                name,
+                mutable: true,
+                ..
+            } = expression
+            else {
+                continue;
+            };
+            let mut assigned = Vec::new();
+            for later in &expressions[position + 1..] {
+                collect_assignments(later, name, &mut assigned);
+            }
+            self.pending_widenings.insert(name.clone(), assigned);
+        }
+    }
+
+    /// The type a `mutable` binding's slot needs: its initial type merged with
+    /// every type assigned to it later in the statement being compiled.
+    ///
+    /// Only widening merges apply -- two shapes of one enum, an empty list and
+    /// a list -- so a genuine type change is still reported at the assignment.
+    fn widened_mutable_type(&mut self, name: &str, initial: ValueType) -> ValueType {
+        let assigned = self
+            .pending_widenings
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        if assigned.is_empty() {
+            return initial;
+        }
+        // The binding is not in scope yet, and what is assigned to it usually
+        // mentions it -- `c = Cons(v, c)` -- so the name is bound to what the
+        // slot holds so far and the whole thing settles by repetition.
+        let mut widened = initial;
+        for _ in 0..4 {
+            let mut grew = false;
+            for value in &assigned {
+                let mut locals = vec![(name.to_string(), widened)];
+                let Some(ty) = self.static_type_under(value, &mut locals, 0) else {
+                    continue;
+                };
+                let Some(merged) = self.merge_types(widened, ty) else {
+                    return initial;
+                };
+                if merged != widened {
+                    widened = merged;
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        widened
+    }
+
+    /// Whether two types are the same, comparing enum shapes by what they say
+    /// rather than by which entry they are.
+    ///
+    /// One shape can be interned more than once -- an annotation names an
+    /// instantiation, a constructor builds one, a merge produces one -- and
+    /// two entries with identical contents describe the same values, so an
+    /// index comparison would reject a value that fits perfectly.
+    fn same_shape(&self, left: ValueType, right: ValueType) -> bool {
+        match (left, right) {
+            (ValueType::Enum(left), ValueType::Enum(right)) => {
+                left == right || self.enum_shapes[left as usize] == self.enum_shapes[right as usize]
+            }
+            (left, right) => left == right,
+        }
     }
 
     /// Merge two branch types, including two shapes of the same enum -- which
@@ -2302,6 +2558,11 @@ impl Emitter {
         span: Span,
     ) -> Result<ValueType, Diagnostic> {
         let mark = self.open_temp_roots();
+        if let Expr::Identifier { name, .. } = scrutinee
+            && let Some((offset, _)) = self.lookup(name)
+        {
+            self.matched_enum_slots.insert(offset);
+        }
         let scrutinee_ty = self.expression(scrutinee)?;
         if !matches!(scrutinee_ty, ValueType::Enum(_)) {
             return Err(unsupported(scrutinee.span(), "matching on this value"));
@@ -3358,11 +3619,17 @@ impl Emitter {
     /// next byte is `'='` (so `"FOO"` doesn't spuriously match an
     /// entry for `"FOOBAR"`), matching the evaluator's
     /// `env::var_os(key).is_some()` (M16, issue #538).
-    fn emit_environment_exists(&mut self, key: &str) {
-        let key_len = key.len() as u64;
-        let key_offset = self.asm.intern_rodata(key.as_bytes());
-
+    /// Find the environment entry whose name is the `x10` bytes at `x9`,
+    /// leaving a pointer to the byte after its `=` in x0, or 0 when there is
+    /// no such variable.
+    ///
+    /// The key comes in as a pointer and a length rather than as text, so a
+    /// name computed at run time -- `env_or(name)` reading its own parameter --
+    /// searches the same way a literal one does.
+    fn emit_environment_lookup(&mut self) {
         self.asm.mov_reg(Reg::X6, Reg::X23); // envp cursor
+        self.asm.mov_reg(Reg::X4, Reg::X9); // key bytes, kept for each entry
+        self.asm.mov_reg(Reg::X5, Reg::X10); // key length
         let loop_start = self.asm.new_label();
         let try_match = self.asm.new_label();
         let check_equals = self.asm.new_label();
@@ -3375,8 +3642,8 @@ impl Emitter {
         self.asm.ldr_imm(Reg::X7, Reg::X6, 0); // entry ptr
         self.asm.branch(not_found, BranchKind::CompareZero(Reg::X7));
         self.asm.mov_reg(Reg::X8, Reg::X7); // entry byte cursor
-        self.asm.load_rodata_address(Reg::X9, key_offset); // key byte cursor
-        self.asm.mov_imm64(Reg::X10, key_len); // remaining length
+        self.asm.mov_reg(Reg::X9, Reg::X4); // key byte cursor
+        self.asm.mov_reg(Reg::X10, Reg::X5); // remaining length
 
         self.asm.bind(try_match);
         self.asm
@@ -3399,11 +3666,35 @@ impl Emitter {
         self.asm.branch(loop_start, BranchKind::Unconditional);
 
         self.asm.bind(found);
-        self.asm.mov_imm64(Reg::X0, 1);
+        // x8 points at the `=`; the value starts after it.
+        self.asm.add_reg_imm(Reg::X0, Reg::X8, 1);
         self.asm.branch(done, BranchKind::Unconditional);
         self.asm.bind(not_found);
         self.asm.mov_imm64(Reg::X0, 0);
         self.asm.bind(done);
+    }
+
+    /// Leave the key of an `Environment#*` call in x9 (bytes) and x10 (length),
+    /// whether it is written at the call site or computed.
+    fn emit_environment_key(&mut self, key: &Expr) -> Result<(), Diagnostic> {
+        if let Expr::String { value, span } = key {
+            if value.contains("#{") {
+                return Err(unsupported(*span, "string interpolation"));
+            }
+            let offset = self.asm.intern_rodata(value.as_bytes());
+            self.asm.load_rodata_address(Reg::X9, offset);
+            self.asm.mov_imm64(Reg::X10, value.len() as u64);
+            return Ok(());
+        }
+        if self.expression(key)? != ValueType::Str {
+            return Err(unsupported(
+                key.span(),
+                "an environment variable name that is not a string",
+            ));
+        }
+        self.asm.ldr_imm(Reg::X10, Reg::X0, 0); // length
+        self.asm.add_reg_imm(Reg::X9, Reg::X0, 8); // bytes
+        Ok(())
     }
 
     /// `Time#nowMillis`(): `gettimeofday(&buf, NULL, NULL)` (all
@@ -6775,21 +7066,28 @@ impl Emitter {
                 Ok(Some(ValueType::Unit))
             }
             ("Environment#exists", 1) => {
-                let Expr::String {
-                    value: key,
-                    span: key_span,
-                } = &arguments[0]
-                else {
-                    return Err(unsupported(
-                        arguments[0].span(),
-                        "a non-literal environment variable name",
-                    ));
-                };
-                if key.contains("#{") {
-                    return Err(unsupported(*key_span, "string interpolation"));
-                }
-                self.emit_environment_exists(key);
+                self.emit_environment_key(&arguments[0])?;
+                self.emit_environment_lookup();
+                self.asm.cmp_imm(Reg::X0, 0);
+                self.asm.cset(Reg::X0, Cond::Ne);
                 Ok(Some(ValueType::Bool))
+            }
+            // `Environment#get(name)`: the variable's value, or the
+            // evaluator's error when there is no such variable.
+            ("Environment#get", 1) => {
+                self.emit_environment_key(&arguments[0])?;
+                self.emit_environment_lookup();
+                let present = self.asm.new_label();
+                self.asm
+                    .branch(present, BranchKind::CompareNonZero(Reg::X0));
+                self.asm.emit_write_rodata(
+                    STDERR_FD,
+                    b"klassic: failed to read environment variable\n",
+                );
+                self.asm.emit_exit(1);
+                self.asm.bind(present);
+                self.emit_heap_string_from_cstring();
+                Ok(Some(ValueType::Str))
             }
             ("Time#nowMillis", 0) => {
                 self.emit_time_now_millis();
@@ -7651,6 +7949,11 @@ impl Emitter {
                     }
                     if !self.enum_is_generic[enum_index]
                         && let Some(shape) = self.canonical_enum_shape(enum_index, expr.span())
+                    {
+                        return Some(ValueType::Enum(shape));
+                    }
+                    if let Some(shape) =
+                        self.canonical_applied_enum_shape(enum_index, tag, &payload, expr.span())
                     {
                         return Some(ValueType::Enum(shape));
                     }
@@ -8544,7 +8847,10 @@ impl Emitter {
         // of one enum have the same representation, and the wider one is what
         // callers were told. Merging is how "narrower" is decided, since what a
         // shape knows lives in a table here.
-        let fits = assignable(body_ty, ret) || self.merge_types(body_ty, ret) == Some(ret);
+        let fits = assignable(body_ty, ret)
+            || self
+                .merge_types(body_ty, ret)
+                .is_some_and(|merged| self.same_shape(merged, ret));
         if !fits {
             return Err(unsupported(
                 body.span(),
@@ -8691,6 +8997,7 @@ impl Emitter {
             Expr::Block { expressions, .. } => {
                 self.push_binding_scopes();
                 self.scope_root_counts.push(0);
+                self.collect_block_widenings(expressions);
                 for expression in expressions {
                     self.statement(expression)?;
                 }
@@ -8831,6 +9138,13 @@ impl Emitter {
                 if ty == ValueType::Unit {
                     return Err(unsupported(value.span(), "a unit-typed binding"));
                 }
+                // A `mutable` slot has to hold everything that will be
+                // assigned to it, not just what it starts as: `mutable c =
+                // Nil` followed by `c = Cons(v, c)` starts as an enum shape
+                // that carries nothing and ends as one that does. The
+                // assignments are already in the tree, so the slot's type is
+                // the merge of them all.
+                let ty = self.widened_mutable_type(name, ty);
                 let offset = self.declare_local(name, ty);
                 self.asm.store_local(Reg::X0, offset);
                 // M7: a binding that holds a heap reference becomes a
@@ -8847,7 +9161,32 @@ impl Emitter {
                     return Err(unsupported(*span, &format!("assignment to `{name}`")));
                 };
                 let ty = self.expression(value)?;
-                if !assignable(ty, expected) {
+                // A slot typed for everything assigned to it accepts a value
+                // that is narrower than it: two shapes of one enum have the
+                // same representation, and the slot was widened to hold both.
+                let mut fits = assignable(ty, expected)
+                    || self
+                        .merge_types(ty, expected)
+                        .is_some_and(|merged| self.same_shape(merged, expected));
+                // A slot the declaration could not type for everything -- the
+                // value assigned to it mentions a name that was not in scope
+                // yet, a `foreach` binding say -- can still widen here, as long
+                // as nothing has matched on it. A match settles which arms are
+                // reachable from the shape it saw, so widening after one would
+                // leave that decision behind.
+                if !fits
+                    && !self.matched_enum_slots.contains(&offset)
+                    && let Some(merged) = self.merge_types(ty, expected)
+                {
+                    for scope in self.scopes.iter_mut().rev() {
+                        if let Some(entry) = scope.get_mut(name) {
+                            entry.1 = merged;
+                            break;
+                        }
+                    }
+                    fits = true;
+                }
+                if !fits {
                     return Err(unsupported(*span, "assignment changing a type"));
                 }
                 self.asm.store_local(Reg::X0, offset);

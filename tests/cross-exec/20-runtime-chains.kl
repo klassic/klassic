@@ -1,0 +1,55 @@
+// Cross-target fixture: data structures built while the program runs.
+//
+// A self-referential generic enum is how you build one without a library:
+// `Cons(head, tail)` grows a chain, and a `mutable` holding it starts as the
+// empty case and ends as the full one. Both halves of that had a target where
+// they did not work -- the type of a value that describes itself grew one
+// level deeper on every use, and a mutable slot was typed by whatever it was
+// initialised to.
+//
+// The environment lookups are here for the same reason: a name computed at run
+// time (a function's own parameter) used to be rejected on every target.
+
+enum Chain<a> {
+  case Nil
+  case Cons(head: a, tail: Chain<a>)
+}
+
+def total(c: Chain<Int>, acc: Int): Int = c match {
+  case Nil => acc
+  case Cons(h, t) => total(t, acc + h)
+}
+
+def lengthOfChain(c: Chain<Int>, acc: Int): Int = c match {
+  case Nil => acc
+  case Cons(h, t) => lengthOfChain(t, acc + 1)
+}
+
+mutable numbers = Nil
+foreach (n in [1, 2, 3, 4, 5]) {
+  numbers = Cons(n * 2, numbers)
+}
+println(total(numbers, 0))
+println(lengthOfChain(numbers, 0))
+assertResult(30)(total(numbers, 0))
+assertResult(5)(lengthOfChain(numbers, 0))
+
+// A chain of strings: the same enum at another argument.
+def joinChain(c: Chain<String>, acc: String): String = c match {
+  case Nil => acc
+  case Cons(h, t) => joinChain(t, if (acc == "") h else acc + "," + h)
+}
+mutable words = Nil
+foreach (w in ["a", "b", "c"]) {
+  words = Cons(w, words)
+}
+println(joinChain(words, ""))
+assertResult("c,b,a")(joinChain(words, ""))
+
+// An environment variable whose name is a parameter rather than a literal.
+def envOr(name: String, fallback: String): String =
+  if (Environment#exists(name)) Environment#get(name) else fallback
+println(envOr("KLASSIC_FIXTURE_UNSET_VARIABLE", "fallback"))
+assertResult("fallback")(envOr("KLASSIC_FIXTURE_UNSET_VARIABLE", "fallback"))
+println(Environment#exists("KLASSIC_FIXTURE_UNSET_VARIABLE"))
+println("done")
