@@ -6432,6 +6432,29 @@ impl Emitter {
                 self.emit_str_matches();
                 Ok(Some(ValueType::Bool))
             }
+            // `String#isInt` / `String#isDouble`: folded when the text is known
+            // while compiling (Rust's own parse decides, so the answer is the
+            // evaluator's by construction), scanned when it is not.
+            ("String#isInt", 1) | ("String#isDouble", 1) => {
+                if let Some(text) = self.literal_string(&arguments[0]) {
+                    let answer = if name == "String#isInt" {
+                        text.trim().parse::<i64>().is_ok()
+                    } else {
+                        text.trim().parse::<f64>().is_ok()
+                    };
+                    self.asm.mov_imm64(Reg::X0, u64::from(answer));
+                    return Ok(Some(ValueType::Bool));
+                }
+                if self.expression(&arguments[0])? != ValueType::Str {
+                    return Err(unsupported(span, "a string test of a non-string"));
+                }
+                if name == "String#isInt" {
+                    self.emit_str_is_int();
+                } else {
+                    self.emit_str_is_double();
+                }
+                Ok(Some(ValueType::Bool))
+            }
             ("indexOf", 2) | ("lastIndexOf", 2) => {
                 if self.expression(&arguments[0])? != ValueType::Str {
                     return Err(unsupported(span, "indexOf of a non-string"));
@@ -8184,6 +8207,295 @@ impl Emitter {
         self.asm.load_local(Reg::X0, acc);
         self.close_temp_roots(mark);
         Ok(())
+    }
+
+    /// Leave the trimmed window of the string in x0 as `[x3, x2)` over the
+    /// bytes at x1: the evaluator's `is_int`/`is_double` both start with
+    /// `trim()`, and everything after reads that window.
+    fn emit_trim_window(&mut self) {
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
+        self.asm.add_reg_imm(Reg::X1, Reg::X0, 8); // bytes
+        self.asm.mov_imm64(Reg::X3, 0);
+        let left_loop = self.asm.new_label();
+        let left_done = self.asm.new_label();
+        self.asm.bind(left_loop);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm
+            .branch(left_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.emit_branch_unless_ascii_space(Reg::X4, left_done);
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.branch(left_loop, BranchKind::Unconditional);
+        self.asm.bind(left_done);
+        let right_loop = self.asm.new_label();
+        let right_done = self.asm.new_label();
+        self.asm.bind(right_loop);
+        self.asm.cmp_reg(Reg::X2, Reg::X3);
+        self.asm
+            .branch(right_done, BranchKind::Conditional(Cond::Le));
+        self.asm.sub_reg_imm(Reg::X5, Reg::X2, 1);
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X5);
+        self.emit_branch_unless_ascii_space(Reg::X4, right_done);
+        self.asm.mov_reg(Reg::X2, Reg::X5);
+        self.asm.branch(right_loop, BranchKind::Unconditional);
+        self.asm.bind(right_done);
+    }
+
+    /// Branch to `label` unless the byte in `reg` is ASCII whitespace.
+    fn emit_branch_unless_ascii_space(&mut self, reg: Reg, label: Label) {
+        let is_space = self.asm.new_label();
+        for byte in [b' ', b'\t', b'\n', b'\r', 0x0b, 0x0c] {
+            self.asm.cmp_imm(reg, u32::from(byte));
+            self.asm.branch(is_space, BranchKind::Conditional(Cond::Eq));
+        }
+        self.asm.branch(label, BranchKind::Unconditional);
+        self.asm.bind(is_space);
+    }
+
+    /// `String#isInt(s)` for a string only known at run time: what
+    /// `s.trim().parse::<i64>()` accepts, range included. Nineteen digits is
+    /// the only length that needs comparing, and it compares digits, so no
+    /// 128-bit arithmetic is involved.
+    fn emit_str_is_int(&mut self) {
+        let positive = self.asm.intern_rodata(b"9223372036854775807");
+        let negative = self.asm.intern_rodata(b"9223372036854775808");
+        let no = self.asm.new_label();
+        let yes = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.emit_trim_window();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ge));
+        // An optional sign, remembered in x7.
+        let signed = self.asm.new_label();
+        let after_sign = self.asm.new_label();
+        self.asm.mov_imm64(Reg::X7, 0);
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'+'));
+        self.asm.branch(signed, BranchKind::Conditional(Cond::Eq));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'-'));
+        self.asm
+            .branch(after_sign, BranchKind::Conditional(Cond::Ne));
+        self.asm.mov_imm64(Reg::X7, 1);
+        self.asm.bind(signed);
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.bind(after_sign);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ge));
+        // Leading zeros do not count towards the range; keep the last digit.
+        let zero_loop = self.asm.new_label();
+        let zeros_done = self.asm.new_label();
+        self.asm.bind(zero_loop);
+        self.asm.sub_reg(Reg::X5, Reg::X2, Reg::X3);
+        self.asm.cmp_imm(Reg::X5, 1);
+        self.asm
+            .branch(zeros_done, BranchKind::Conditional(Cond::Le));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm
+            .branch(zeros_done, BranchKind::Conditional(Cond::Ne));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.branch(zero_loop, BranchKind::Unconditional);
+        self.asm.bind(zeros_done);
+        // Every remaining byte has to be a digit.
+        let digit_loop = self.asm.new_label();
+        let digits_done = self.asm.new_label();
+        self.asm.mov_reg(Reg::X5, Reg::X3);
+        self.asm.bind(digit_loop);
+        self.asm.cmp_reg(Reg::X5, Reg::X2);
+        self.asm
+            .branch(digits_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X5);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm.branch(no, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'9'));
+        self.asm.branch(no, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X5, Reg::X5, 1);
+        self.asm.branch(digit_loop, BranchKind::Unconditional);
+        self.asm.bind(digits_done);
+        self.asm.sub_reg(Reg::X5, Reg::X2, Reg::X3);
+        self.asm.cmp_imm(Reg::X5, 19);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Gt));
+        self.asm.branch(yes, BranchKind::Conditional(Cond::Lt));
+        let use_negative = self.asm.new_label();
+        let limit_ready = self.asm.new_label();
+        self.asm.cmp_imm(Reg::X7, 0);
+        self.asm
+            .branch(use_negative, BranchKind::Conditional(Cond::Ne));
+        self.asm.load_rodata_address(Reg::X6, positive);
+        self.asm.branch(limit_ready, BranchKind::Unconditional);
+        self.asm.bind(use_negative);
+        self.asm.load_rodata_address(Reg::X6, negative);
+        self.asm.bind(limit_ready);
+        let compare_loop = self.asm.new_label();
+        self.asm.mov_imm64(Reg::X5, 0);
+        self.asm.bind(compare_loop);
+        self.asm.cmp_imm(Reg::X5, 19);
+        self.asm.branch(yes, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.ldrb_reg_offset(Reg::X8, Reg::X6, Reg::X5);
+        self.asm.cmp_reg(Reg::X4, Reg::X8);
+        self.asm.branch(yes, BranchKind::Conditional(Cond::Lt));
+        self.asm.branch(no, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.add_reg_imm(Reg::X5, Reg::X5, 1);
+        self.asm.branch(compare_loop, BranchKind::Unconditional);
+        self.asm.bind(yes);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(no);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
+    }
+
+    /// `String#isDouble(s)` for a string only known at run time: what
+    /// `s.trim().parse::<f64>()` accepts -- an optional sign, then `inf`,
+    /// `infinity` or `nan` in either case, or digits with an optional point
+    /// and an optional exponent. Too large to represent parses as infinity
+    /// rather than failing, so there is no range check.
+    fn emit_str_is_double(&mut self) {
+        let no = self.asm.new_label();
+        let yes = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.emit_trim_window();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ge));
+        let signed = self.asm.new_label();
+        let after_sign = self.asm.new_label();
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'+'));
+        self.asm.branch(signed, BranchKind::Conditional(Cond::Eq));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'-'));
+        self.asm
+            .branch(after_sign, BranchKind::Conditional(Cond::Ne));
+        self.asm.bind(signed);
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.bind(after_sign);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ge));
+        // `inf`, `infinity` and `nan`, in any case.
+        for word in [b"infinity".as_slice(), b"inf".as_slice(), b"nan".as_slice()] {
+            let offset = self.asm.intern_rodata(word);
+            let mismatch = self.asm.new_label();
+            let compare = self.asm.new_label();
+            self.asm.sub_reg(Reg::X5, Reg::X2, Reg::X3);
+            self.asm.cmp_imm(Reg::X5, word.len() as u32);
+            self.asm.branch(mismatch, BranchKind::Conditional(Cond::Ne));
+            self.asm.load_rodata_address(Reg::X6, offset);
+            self.asm.mov_imm64(Reg::X5, 0);
+            self.asm.bind(compare);
+            self.asm.cmp_imm(Reg::X5, word.len() as u32);
+            self.asm.branch(yes, BranchKind::Conditional(Cond::Ge));
+            self.asm.add_reg(Reg::X9, Reg::X3, Reg::X5);
+            self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X9);
+            // Lower-case the input byte; the words above are lower-case.
+            self.asm.mov_imm64(Reg::X10, 0x20);
+            self.asm.orr_reg(Reg::X4, Reg::X4, Reg::X10);
+            self.asm.ldrb_reg_offset(Reg::X8, Reg::X6, Reg::X5);
+            self.asm.cmp_reg(Reg::X4, Reg::X8);
+            self.asm.branch(mismatch, BranchKind::Conditional(Cond::Ne));
+            self.asm.add_reg_imm(Reg::X5, Reg::X5, 1);
+            self.asm.branch(compare, BranchKind::Unconditional);
+            self.asm.bind(mismatch);
+        }
+        // Digits, an optional point with more digits, at least one of the two.
+        self.asm.mov_imm64(Reg::X7, 0);
+        let int_digits = self.asm.new_label();
+        let int_done = self.asm.new_label();
+        self.asm.bind(int_digits);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(int_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm.branch(int_done, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'9'));
+        self.asm.branch(int_done, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.add_reg_imm(Reg::X7, Reg::X7, 1);
+        self.asm.branch(int_digits, BranchKind::Unconditional);
+        self.asm.bind(int_done);
+        let after_point = self.asm.new_label();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm
+            .branch(after_point, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'.'));
+        self.asm
+            .branch(after_point, BranchKind::Conditional(Cond::Ne));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        let frac_digits = self.asm.new_label();
+        self.asm.bind(frac_digits);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm
+            .branch(after_point, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm
+            .branch(after_point, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'9'));
+        self.asm
+            .branch(after_point, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.add_reg_imm(Reg::X7, Reg::X7, 1);
+        self.asm.branch(frac_digits, BranchKind::Unconditional);
+        self.asm.bind(after_point);
+        self.asm.cmp_imm(Reg::X7, 0);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Eq));
+        // An optional exponent, which needs at least one digit of its own.
+        let after_exponent = self.asm.new_label();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm
+            .branch(after_exponent, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.mov_imm64(Reg::X10, 0x20);
+        self.asm.orr_reg(Reg::X4, Reg::X4, Reg::X10);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'e'));
+        self.asm
+            .branch(after_exponent, BranchKind::Conditional(Cond::Ne));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        let exponent_signed = self.asm.new_label();
+        let exponent_digits = self.asm.new_label();
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'+'));
+        self.asm
+            .branch(exponent_signed, BranchKind::Conditional(Cond::Eq));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'-'));
+        self.asm
+            .branch(exponent_digits, BranchKind::Conditional(Cond::Ne));
+        self.asm.bind(exponent_signed);
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.bind(exponent_digits);
+        self.asm.mov_imm64(Reg::X7, 0);
+        let exponent_loop = self.asm.new_label();
+        let exponent_done = self.asm.new_label();
+        self.asm.bind(exponent_loop);
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm
+            .branch(exponent_done, BranchKind::Conditional(Cond::Ge));
+        self.asm.ldrb_reg_offset(Reg::X4, Reg::X1, Reg::X3);
+        self.asm.cmp_imm(Reg::X4, u32::from(b'0'));
+        self.asm
+            .branch(exponent_done, BranchKind::Conditional(Cond::Lt));
+        self.asm.cmp_imm(Reg::X4, u32::from(b'9'));
+        self.asm
+            .branch(exponent_done, BranchKind::Conditional(Cond::Gt));
+        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
+        self.asm.add_reg_imm(Reg::X7, Reg::X7, 1);
+        self.asm.branch(exponent_loop, BranchKind::Unconditional);
+        self.asm.bind(exponent_done);
+        self.asm.cmp_imm(Reg::X7, 0);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Eq));
+        self.asm.bind(after_exponent);
+        // Anything left over means it was not a number.
+        self.asm.cmp_reg(Reg::X3, Reg::X2);
+        self.asm.branch(no, BranchKind::Conditional(Cond::Ne));
+        self.asm.bind(yes);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(no);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
     }
 
     /// Is every byte of the string in x0 an ASCII digit? x0 becomes the Bool.

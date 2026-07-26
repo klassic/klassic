@@ -6544,6 +6544,8 @@ impl NativeCodeGenerator {
             | "Math#sqrtInt"
             | "String#parseInt"
             | "Random#seed"
+            | "String#isInt"
+            | "String#isDouble"
             | "Random#nextInt" => Some(1),
             "at"
             | "matches"
@@ -8387,6 +8389,34 @@ impl NativeCodeGenerator {
             }
             "Map#get" | "get" => self.compile_static_map_get_direct(arguments, span),
             "Set#contains" => self.compile_static_set_contains_direct(arguments, span),
+            // `String#isInt` / `String#isDouble`: folded when the text is
+            // known while compiling (Rust's own parse decides, so the answer
+            // is the evaluator's by construction), scanned when it is not.
+            "String#isInt" | "String#isDouble" if arguments.len() == 1 => {
+                if self.expr_may_yield_runtime_string(&arguments[0]) {
+                    let input = self.compile_expr(&arguments[0])?;
+                    let Some(input) = self.native_string_ref(input) else {
+                        return Err(unsupported(span, &format!("native {name} for non-string")));
+                    };
+                    return Ok(if name == "String#isInt" {
+                        self.emit_runtime_string_is_int(input)
+                    } else {
+                        self.emit_runtime_string_is_double(input)
+                    });
+                }
+                let text = self.static_string_from_argument_preserving_effects(
+                    &arguments[0],
+                    span,
+                    name.as_str(),
+                )?;
+                let answer = if name == "String#isInt" {
+                    text.trim().parse::<i64>().is_ok()
+                } else {
+                    text.trim().parse::<f64>().is_ok()
+                };
+                self.asm.mov_imm64(Reg::Rax, u64::from(answer));
+                Ok(NativeValue::Bool)
+            }
             // The function spellings of the set builders. The method forms
             // (`s.add(x)`, `s.toList()`) were already here; `std.set`'s own
             // extension methods call these.
@@ -36296,6 +36326,286 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(done);
         self.asm.mov_data_addr(Reg::R10, offset);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R9);
+    }
+
+    /// Leave `[r9, r8)` holding the input with ASCII whitespace trimmed off
+    /// both ends, with `rsi` = bytes and `rdx` = length. The evaluator's
+    /// `is_int`/`is_double` both start with `trim()`, and everything after
+    /// them reads the window this leaves behind.
+    fn emit_trim_window_r9_r8(&mut self, input: NativeStringRef) {
+        self.asm.mov_data_addr(Reg::Rsi, input.data);
+        self.emit_load_native_string_len(Reg::Rdx, input.len);
+        let left_loop = self.asm.create_text_label();
+        let consume_left = self.asm.create_text_label();
+        let left_done = self.asm.create_text_label();
+        self.asm.mov_imm64(Reg::R9, 0);
+        self.asm.bind_text_label(left_loop);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::Rdx);
+        self.asm.jcc_label(Condition::GreaterEqual, left_done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.emit_jump_if_ascii_whitespace(Reg::Rax, consume_left);
+        self.asm.jmp_label(left_done);
+        self.asm.bind_text_label(consume_left);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.jmp_label(left_loop);
+        self.asm.bind_text_label(left_done);
+
+        let right_loop = self.asm.create_text_label();
+        let consume_right = self.asm.create_text_label();
+        let right_done = self.asm.create_text_label();
+        self.asm.mov_reg_reg(Reg::R8, Reg::Rdx);
+        self.asm.bind_text_label(right_loop);
+        self.asm.cmp_reg_reg(Reg::R8, Reg::R9);
+        self.asm.jcc_label(Condition::LessEqual, right_done);
+        self.asm.mov_reg_reg(Reg::R10, Reg::R8);
+        self.asm.dec_reg(Reg::R10);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R10);
+        self.emit_jump_if_ascii_whitespace(Reg::Rax, consume_right);
+        self.asm.jmp_label(right_done);
+        self.asm.bind_text_label(consume_right);
+        self.asm.dec_reg(Reg::R8);
+        self.asm.jmp_label(right_loop);
+        self.asm.bind_text_label(right_done);
+    }
+
+    /// `String#isInt(s)` for a string only known at run time: what
+    /// `s.trim().parse::<i64>()` accepts, range included. The range check is a
+    /// digit count and, at exactly nineteen digits, a comparison against the
+    /// limit's own digits -- no 128-bit arithmetic, and exact.
+    fn emit_runtime_string_is_int(&mut self, input: NativeStringRef) -> NativeValue {
+        let positive_limit = self.asm.data_label_with_bytes(b"9223372036854775807");
+        let negative_limit = self.asm.data_label_with_bytes(b"9223372036854775808");
+        let no = self.asm.create_text_label();
+        let yes = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.emit_trim_window_r9_r8(input);
+        // Empty after trimming is not a number.
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, no);
+        // An optional sign, remembered in r11 (1 when negative).
+        let signed = self.asm.create_text_label();
+        let after_sign = self.asm.create_text_label();
+        self.asm.mov_imm64(Reg::R11, 0);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'+' as i8);
+        self.asm.jcc_label(Condition::Equal, signed);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'-' as i8);
+        self.asm.jcc_label(Condition::NotEqual, after_sign);
+        self.asm.mov_imm64(Reg::R11, 1);
+        self.asm.bind_text_label(signed);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.bind_text_label(after_sign);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, no);
+        // Leading zeros do not count towards the range, so drop them -- but
+        // keep the last digit, so "0" stays a number.
+        let zero_loop = self.asm.create_text_label();
+        let zeros_done = self.asm.create_text_label();
+        self.asm.bind_text_label(zero_loop);
+        self.asm.mov_reg_reg(Reg::R10, Reg::R8);
+        self.asm.sub_reg_reg(Reg::R10, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::R10, 1);
+        self.asm.jcc_label(Condition::LessEqual, zeros_done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'0' as i8);
+        self.asm.jcc_label(Condition::NotEqual, zeros_done);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.jmp_label(zero_loop);
+        self.asm.bind_text_label(zeros_done);
+        // Every remaining byte has to be a digit.
+        let digit_loop = self.asm.create_text_label();
+        let digits_done = self.asm.create_text_label();
+        self.asm.mov_reg_reg(Reg::R10, Reg::R9);
+        self.asm.bind_text_label(digit_loop);
+        self.asm.cmp_reg_reg(Reg::R10, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, digits_done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R10);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'0' as i8);
+        self.asm.jcc_label(Condition::Less, no);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'9' as i8);
+        self.asm.jcc_label(Condition::Greater, no);
+        self.asm.inc_reg(Reg::R10);
+        self.asm.jmp_label(digit_loop);
+        self.asm.bind_text_label(digits_done);
+        // Nineteen digits is the only length that needs comparing.
+        self.asm.mov_reg_reg(Reg::R10, Reg::R8);
+        self.asm.sub_reg_reg(Reg::R10, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::R10, 19);
+        self.asm.jcc_label(Condition::Greater, no);
+        self.asm.jcc_label(Condition::Less, yes);
+        let use_negative = self.asm.create_text_label();
+        let limit_ready = self.asm.create_text_label();
+        self.asm.cmp_reg_imm8(Reg::R11, 0);
+        self.asm.jcc_label(Condition::NotEqual, use_negative);
+        self.asm.mov_data_addr(Reg::R11, positive_limit);
+        self.asm.jmp_label(limit_ready);
+        self.asm.bind_text_label(use_negative);
+        self.asm.mov_data_addr(Reg::R11, negative_limit);
+        self.asm.bind_text_label(limit_ready);
+        let compare_loop = self.asm.create_text_label();
+        self.asm.mov_imm64(Reg::R10, 0);
+        self.asm.bind_text_label(compare_loop);
+        self.asm.cmp_reg_imm8(Reg::R10, 19);
+        self.asm.jcc_label(Condition::GreaterEqual, yes);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.movzx_byte_indexed(Reg::Rcx, Reg::R11, Reg::R10);
+        self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.jcc_label(Condition::Less, yes);
+        self.asm.jcc_label(Condition::Greater, no);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.inc_reg(Reg::R10);
+        self.asm.jmp_label(compare_loop);
+        self.asm.bind_text_label(yes);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(no);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.bind_text_label(done);
+        NativeValue::Bool
+    }
+
+    /// `String#isDouble(s)` for a string only known at run time: what
+    /// `s.trim().parse::<f64>()` accepts -- an optional sign, then `inf`,
+    /// `infinity` or `nan` (either case), or digits with an optional point
+    /// and an optional exponent. A value too large to represent parses as
+    /// infinity rather than failing, so there is no range check here.
+    fn emit_runtime_string_is_double(&mut self, input: NativeStringRef) -> NativeValue {
+        let no = self.asm.create_text_label();
+        let yes = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.emit_trim_window_r9_r8(input);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, no);
+        // An optional sign.
+        let signed = self.asm.create_text_label();
+        let after_sign = self.asm.create_text_label();
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'+' as i8);
+        self.asm.jcc_label(Condition::Equal, signed);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'-' as i8);
+        self.asm.jcc_label(Condition::NotEqual, after_sign);
+        self.asm.bind_text_label(signed);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.bind_text_label(after_sign);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, no);
+        // `inf`, `infinity` and `nan`, in any case.
+        for word in [b"infinity".as_slice(), b"inf".as_slice(), b"nan".as_slice()] {
+            let label = self.asm.data_label_with_bytes(word);
+            let mismatch = self.asm.create_text_label();
+            let compare = self.asm.create_text_label();
+            // Only when what is left is exactly this long.
+            self.asm.mov_reg_reg(Reg::R10, Reg::R8);
+            self.asm.sub_reg_reg(Reg::R10, Reg::R9);
+            self.asm.cmp_reg_imm8(Reg::R10, word.len() as i8);
+            self.asm.jcc_label(Condition::NotEqual, mismatch);
+            self.asm.mov_data_addr(Reg::R11, label);
+            self.asm.mov_imm64(Reg::R10, 0);
+            self.asm.bind_text_label(compare);
+            self.asm.cmp_reg_imm8(Reg::R10, word.len() as i8);
+            self.asm.jcc_label(Condition::GreaterEqual, yes);
+            self.asm.mov_reg_reg(Reg::Rcx, Reg::R9);
+            self.asm.add_reg_reg(Reg::Rcx, Reg::R10);
+            self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::Rcx);
+            // Lower-case the input byte; the words above are lower-case.
+            self.asm.mov_imm64(Reg::Rcx, 0x20);
+            self.asm.or_reg_reg(Reg::Rax, Reg::Rcx);
+            self.asm.movzx_byte_indexed(Reg::Rcx, Reg::R11, Reg::R10);
+            self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
+            self.asm.jcc_label(Condition::NotEqual, mismatch);
+            self.asm.inc_reg(Reg::R10);
+            self.asm.jmp_label(compare);
+            self.asm.bind_text_label(mismatch);
+        }
+        // Digits, an optional point with more digits, and at least one of
+        // the two. r11 counts them.
+        self.asm.mov_imm64(Reg::R11, 0);
+        let int_digits = self.asm.create_text_label();
+        let int_done = self.asm.create_text_label();
+        self.asm.bind_text_label(int_digits);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, int_done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'0' as i8);
+        self.asm.jcc_label(Condition::Less, int_done);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'9' as i8);
+        self.asm.jcc_label(Condition::Greater, int_done);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.inc_reg(Reg::R11);
+        self.asm.jmp_label(int_digits);
+        self.asm.bind_text_label(int_done);
+        let after_point = self.asm.create_text_label();
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, after_point);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'.' as i8);
+        self.asm.jcc_label(Condition::NotEqual, after_point);
+        self.asm.inc_reg(Reg::R9);
+        let frac_digits = self.asm.create_text_label();
+        self.asm.bind_text_label(frac_digits);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, after_point);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'0' as i8);
+        self.asm.jcc_label(Condition::Less, after_point);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'9' as i8);
+        self.asm.jcc_label(Condition::Greater, after_point);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.inc_reg(Reg::R11);
+        self.asm.jmp_label(frac_digits);
+        self.asm.bind_text_label(after_point);
+        self.asm.cmp_reg_imm8(Reg::R11, 0);
+        self.asm.jcc_label(Condition::Equal, no);
+        // An optional exponent, which needs at least one digit of its own.
+        let after_exponent = self.asm.create_text_label();
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, after_exponent);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.mov_imm64(Reg::Rcx, 0x20);
+        self.asm.or_reg_reg(Reg::Rax, Reg::Rcx);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'e' as i8);
+        self.asm.jcc_label(Condition::NotEqual, after_exponent);
+        self.asm.inc_reg(Reg::R9);
+        let exponent_signed = self.asm.create_text_label();
+        let exponent_digits = self.asm.create_text_label();
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, no);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'+' as i8);
+        self.asm.jcc_label(Condition::Equal, exponent_signed);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'-' as i8);
+        self.asm.jcc_label(Condition::NotEqual, exponent_digits);
+        self.asm.bind_text_label(exponent_signed);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.bind_text_label(exponent_digits);
+        self.asm.mov_imm64(Reg::R11, 0);
+        let exponent_loop = self.asm.create_text_label();
+        let exponent_done = self.asm.create_text_label();
+        self.asm.bind_text_label(exponent_loop);
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::GreaterEqual, exponent_done);
+        self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rsi, Reg::R9);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'0' as i8);
+        self.asm.jcc_label(Condition::Less, exponent_done);
+        self.asm.cmp_reg_imm8(Reg::Rax, b'9' as i8);
+        self.asm.jcc_label(Condition::Greater, exponent_done);
+        self.asm.inc_reg(Reg::R9);
+        self.asm.inc_reg(Reg::R11);
+        self.asm.jmp_label(exponent_loop);
+        self.asm.bind_text_label(exponent_done);
+        self.asm.cmp_reg_imm8(Reg::R11, 0);
+        self.asm.jcc_label(Condition::Equal, no);
+        self.asm.bind_text_label(after_exponent);
+        // Anything left over means it was not a number.
+        self.asm.cmp_reg_reg(Reg::R9, Reg::R8);
+        self.asm.jcc_label(Condition::NotEqual, no);
+        self.asm.bind_text_label(yes);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(no);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.bind_text_label(done);
+        NativeValue::Bool
     }
 
     fn emit_jump_if_ascii_whitespace(&mut self, byte_reg: Reg, label: TextLabel) {

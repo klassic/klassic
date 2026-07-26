@@ -1599,6 +1599,25 @@ collection ABI, not adding a builtin. `String#isInt` / `String#isDouble` are
 missing on every native backend equally -- matching the evaluator means
 matching `parse::<i64>()`, overflow included.
 
+### Asking whether a string is a number
+
+`String#isInt` and `String#isDouble` were missing from every native backend,
+because matching the evaluator means matching `parse::<i64>()` and
+`parse::<f64>()` on the trimmed text -- range included. Both hand-emitted
+backends have them now, twice over: the text known while compiling is decided
+by Rust's own parse, and the text only known while running is decided by a
+byte scanner.
+
+The range needs no wide arithmetic. Leading zeros are dropped, then the digit
+count decides: more than nineteen is out of range, fewer is in, and exactly
+nineteen compares against the limit's own digits -- `9223372036854775807`
+positive, `9223372036854775808` negative, which is why the sign is remembered
+before the digits are read. The double side is the grammar rather than the
+range, since a value too large parses as infinity: an optional sign, then
+`inf`/`infinity`/`nan` in either case, or digits with an optional point and an
+optional exponent that needs a digit of its own. `.5` and `5.` are numbers;
+`1e` is not.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.

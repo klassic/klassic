@@ -1,0 +1,65 @@
+// Cross-target fixture: asking whether a string is a number.
+//
+// The answer has to be the evaluator's, which is Rust's `parse::<i64>()` and
+// `parse::<f64>()` on the trimmed text -- so the range matters: nineteen
+// digits can be either side of the limit, and the limit itself differs by one
+// between positive and negative. `9223372036854775807` is a number and
+// `9223372036854775808` is not, while `-9223372036854775808` is and
+// `-9223372036854775809` is not. Leading zeros do not count towards it.
+//
+// For doubles the corners are the grammar's: `.5` and `5.` are numbers, `1e`
+// is not, `inf` and `NaN` are, and a value too large to represent parses as
+// infinity rather than failing.
+//
+// Each case is asked twice -- once of a literal, which is decided while
+// compiling, and once of a line read back from a file, which is decided while
+// running. The two paths are different code and have to agree.
+
+import std.string
+
+// Literals.
+println(String#isInt("42"))
+println(String#isInt("  42  "))
+println(String#isInt("-42"))
+println(String#isInt("+42"))
+println(String#isInt(""))
+println(String#isInt("4a"))
+println(String#isInt("9223372036854775807"))
+println(String#isInt("9223372036854775808"))
+println(String#isInt("-9223372036854775808"))
+println(String#isInt("-9223372036854775809"))
+println(String#isInt("0000000000000000000005"))
+println(String#isInt("-0"))
+assertResult(true)(String#isInt("9223372036854775807"))
+assertResult(false)(String#isInt("9223372036854775808"))
+
+println(String#isDouble("1.5"))
+println(String#isDouble("1e5"))
+println(String#isDouble("1E+5"))
+println(String#isDouble(".5"))
+println(String#isDouble("5."))
+println(String#isDouble("inf"))
+println(String#isDouble("INFINITY"))
+println(String#isDouble("NaN"))
+println(String#isDouble("1e"))
+println(String#isDouble("abc"))
+println(String#isDouble("1e999"))
+assertResult(true)(String#isDouble(".5"))
+assertResult(false)(String#isDouble("1e"))
+
+// The same questions, of text only known while running.
+val candidates = ["42", "  7  ", "-42", "+42", "4a", "", "9223372036854775807",
+  "9223372036854775808", "-9223372036854775808", "-9223372036854775809",
+  "0000000000000000000005", "-0", "1.5", "1e5", "1E+5", ".5", "5.", "inf",
+  "INFINITY", "NaN", "1e", "abc", "1e999"]
+FileOutput#writeLines("cross-exec-numbers.txt", candidates)
+foreach (line in FileInput#lines("cross-exec-numbers.txt")) {
+  println(line + "|" + String#isInt(line) + "|" + String#isDouble(line))
+}
+FileOutput#delete("cross-exec-numbers.txt")
+
+// The stdlib's own spellings.
+println("42".isInteger())
+println("4a".isInteger())
+println("1.5".isFloat())
+println("done")
