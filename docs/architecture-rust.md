@@ -1712,6 +1712,38 @@ that a heap pointer takes, and a string argument is exactly what fixes a
 rewritten shape is published there once the whole argument list has been
 seen.
 
+#### What a portable `Map` lowering runs into, measured
+
+Lowering the builtin map to the chain means emitting helpers -- put, lookup,
+size, rendering -- that the program's own map operations are rewritten to
+call. Written generically, so the lowering needs no type inference of its
+own, they are rejected, and three ways of getting past that were tried and
+refused:
+
+- **Partial shapes are unsound as they stand.** `containsKey(m, key)` fixes
+  the key's type and says nothing about the value's, so the annotation solves
+  to `KlassicMapChain<String, 'v>`. Letting `generic_enum_annotation_shape`
+  resolve what it can and leave the rest defaulted compiles -- and prints
+  `%[3: 3, 3: 1, 3: 1]` for a store whose keys are words. A defaulted repr is
+  read as the wrong kind.
+- **Refusing to read an unresolved field**, which would make partial shapes
+  safe, breaks ten existing tests. The model defaults those fields on purpose:
+  they are read only in arms that are dead at run time, and rejecting the read
+  rejects working programs.
+- **Dropping such an arm as dead** was refuted earlier: the next call, whose
+  value really is that variant, dies with "match: no pattern matched".
+
+So the lowering needs *fully* resolved shapes at every helper call, which
+means either the helpers are monomorphic -- and the desugar does not know the
+key and value types -- or x86-64's shape model gains a precise notion of a
+dead arm rather than a defaulted one. That is a design decision about the
+model, not a missing case, and it is where the next attempt should start.
+
+(A smaller thing found on the way: a constructor whose name begins with `__`
+does not parse in a *pattern* -- `case __Nil =>` is a syntax error while
+`case KNil =>` is fine -- so an injected enum cannot use the usual
+double-underscore convention for synthesized names.)
+
 What is left is not a representation gap any more but a routing one, and it
 splits in two. `Map#put` in a loop needs the *builtin* map lowered to the
 chain above -- a middle-end pass that injects the enum and its helpers and
