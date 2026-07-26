@@ -1618,6 +1618,32 @@ range, since a value too large parses as infinity: an optional sign, then
 optional exponent that needs a digit of its own. `.5` and `5.` are numbers;
 `1e` is not.
 
+### One buffer per call site is one buffer per recursion
+
+A list built by `cons` out of a list that only exists while the program runs
+has, on the x86-64 backend, a result buffer chosen while compiling -- one per
+call site. A recursive function has one call site and many activations, so
+they all shared it, and
+
+    def copyAll(xs: List<String>): List<String> =
+      if (isEmpty(xs)) [] else cons(head(xs))(copyAll(tail(xs)))
+    println(copyAll(split("a b c", " ")))
+
+printed `[c, c, c]` where the evaluator prints `[a, b, c]`. No warning, no
+crash: a wrong answer. The build is refused now, with a diagnostic that says
+which construct it is, and a cli_smoke test pins that.
+
+Refusing is the fix available today; the fix that would make it *work* is the
+same one the other two open gaps need. Runtime-grown maps, generic recursive
+definitions over collections, and this are one missing piece seen from three
+sides: the x86-64 backend has no heap representation for a collection whose
+size is only known while running. Its collections are compile-time values or
+fixed-capacity buffers addressed by compile-time index, which is why
+`FileInput#lines` can be *passed* to a recursive function (it is a buffer pair
+and reading it is fine) but a list *built* inside one cannot be returned.
+Closing all three means giving the backend a GC-allocated list -- cells,
+rooting, and the load barrier -- not another builtin.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.

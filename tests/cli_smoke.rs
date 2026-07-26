@@ -22696,6 +22696,51 @@ fn build_target_aarch64_apple_darwin_binary_runs() {
     );
 }
 
+/// A list built inside a recursive function, out of a list that only exists
+/// while the program runs: this used to compile and print the innermost
+/// element in every position -- `[c, c, c]` for `[a, b, c]` -- because the
+/// result buffer is chosen while compiling, so every activation shared one.
+/// A wrong answer with no warning is the worst thing a compiler can do, so
+/// the build is refused until the backend can put such a list on the heap.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_build_refuses_a_list_built_in_a_recursive_function() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_rec_cons_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_rec_cons_{stamp}.bin"));
+    let source = concat!(
+        "def copyAll(xs: List<String>): List<String> =\n",
+        "  if (isEmpty(xs)) [] else cons(head(xs))(copyAll(tail(xs)))\n",
+        "println(copyAll(split(\"a b c\", \" \")))\n",
+    );
+    fs::write(&source_path, source).expect("temp source file should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        !build.status.success(),
+        "a list built inside a recursive function should be refused, not miscompiled"
+    );
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("inside a recursive function"),
+        "the diagnostic should say what cannot be built\nstderr:\n{stderr}"
+    );
+}
+
 /// Maps built while the program runs, on Apple Silicon: `Map#empty` and
 /// `Map#put` are the shape every counting program has, and the arm64 backend
 /// stores a map as a chain of `[key][value]` entries it can grow. Asserted

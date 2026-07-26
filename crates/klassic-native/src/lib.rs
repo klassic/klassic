@@ -4495,6 +4495,11 @@ struct NativeCodeGenerator {
     functions: HashMap<String, NativeFunction>,
     function_order: Vec<String>,
     referenced_functions: HashSet<String>,
+    /// Definitions that reach themselves. A value backed by a buffer chosen
+    /// while compiling has one buffer per *call site*, which is one buffer for
+    /// every activation of a recursive function -- so building one inside a
+    /// recursive definition has to be refused rather than emitted.
+    recursive_function_names: HashSet<String>,
     active_function_name: Option<String>,
     instance_methods: Vec<NativeInstanceMethod>,
     record_schemas: HashMap<String, Vec<NativeRecordFieldSchema>>,
@@ -4870,6 +4875,7 @@ impl NativeCodeGenerator {
             functions: HashMap::new(),
             function_order: Vec::new(),
             referenced_functions: HashSet::new(),
+            recursive_function_names: HashSet::new(),
             active_function_name: None,
             instance_methods: Vec::new(),
             record_schemas,
@@ -5844,6 +5850,8 @@ impl NativeCodeGenerator {
         };
         let thread_aliases = top_level_thread_aliases(expressions);
         let recursive_names = recursive_def_names(expressions);
+        self.recursive_function_names
+            .extend(recursive_names.iter().cloned());
         let top_level_value_names = top_level_value_names(expressions);
         self.top_level_mutable_names = top_level_mutable_names(expressions);
         for expression in expressions {
@@ -9989,6 +9997,13 @@ impl NativeCodeGenerator {
         }
     }
 
+    /// Is the body being compiled part of a definition that reaches itself?
+    fn inside_recursive_function(&self) -> bool {
+        self.active_function_name
+            .as_ref()
+            .is_some_and(|name| self.recursive_function_names.contains(name))
+    }
+
     fn compile_cons(
         &mut self,
         head_arguments: &[Expr],
@@ -10002,6 +10017,16 @@ impl NativeCodeGenerator {
             ));
         }
         if self.expr_may_yield_runtime_lines_list(&tail_arguments[0]) {
+            // The result is a buffer chosen while compiling, so there is one
+            // per call site -- shared by every activation of a recursive
+            // function, which would print the innermost element in every
+            // position. Refuse rather than answer wrongly.
+            if self.inside_recursive_function() {
+                return Err(unsupported(
+                    span,
+                    "building a list inside a recursive function, whose result buffer is chosen while compiling",
+                ));
+            }
             let head = self.compile_expr(&head_arguments[0])?;
             let Some(head) = self.native_string_ref(head) else {
                 return Err(unsupported(
