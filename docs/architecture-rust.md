@@ -1644,6 +1644,29 @@ and reading it is fine) but a list *built* inside one cannot be returned.
 Closing all three means giving the backend a GC-allocated list -- cells,
 rooting, and the load barrier -- not another builtin.
 
+### The heap representation the x86-64 backend already had
+
+Reading the three open gaps as "x86-64 has no heap collection" was one level
+too pessimistic. It has one: a self-referential enum is a chain of
+`__gc_record` cells, built by the shared lowering, and it works under
+recursion -- `CountsCons(k, v, countsPut(rest, ...))` allocates a cell per
+activation, which is exactly what a compile-time buffer cannot do.
+
+What stopped it being *usable* as a key/value store was one missing
+conversion: appending a number to a heap string. `acc + key + ": " + value`
+is the shape every rendering of such a chain takes, and the heap-string
+concatenation refused an `Int` or a `Boolean` operand. It renders them the
+way `toString` does and copies the text onto the heap now, and with that the
+word counter -- grow a chain in a loop, replace on a repeated key, render it
+afterwards -- compiles and runs on all three targets, and agrees with the
+evaluator under `--gc-stress`.
+
+So the remaining gap is narrower than it looked: the builtin `Map` and `List`
+types still use compile-time values or fixed-capacity buffers on x86-64, but
+the representation that would replace them exists and is proven. Routing the
+builtins through it is a middle-end lowering (map operations to an internal
+enum chain plus the helpers that walk it), not new machine code.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.

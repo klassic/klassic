@@ -13812,6 +13812,23 @@ impl NativeCodeGenerator {
                 Ok(())
             }
             NativeValue::HeapPointer if allow_erased_pointer => Ok(()),
+            // A number or a flag appended to a heap string: render it the way
+            // `toString` does, then copy the text onto the heap so the result
+            // is a heap string like the other operand. Without this,
+            // `acc + key + ": " + value` -- the shape every rendering of a
+            // key/value chain takes -- could not be compiled.
+            NativeValue::Int | NativeValue::Bool => {
+                let text = if value == NativeValue::Int {
+                    self.emit_i64_rax_to_runtime_string_ref(span, context)
+                } else {
+                    self.emit_bool_rax_to_runtime_string_ref(span, context)
+                };
+                let NativeStringLen::Runtime(len) = text.len else {
+                    return Err(unsupported(span, context));
+                };
+                self.emit_runtime_string_to_heap_string(text.data, len);
+                Ok(())
+            }
             _ => Err(unsupported(span, context)),
         }
     }

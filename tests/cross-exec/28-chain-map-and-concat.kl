@@ -1,0 +1,68 @@
+// Cross-target fixture: a key/value store built while the program runs, out
+// of a self-referential enum, and rendered by appending to a string.
+//
+// This is the word counter written in the language itself, and it exercises
+// the one thing every backend needs for a collection whose size is only known
+// while running: a chain on the heap, grown a cell at a time, walked and
+// rendered afterwards. Counting a word twice means the *replace* path runs;
+// counting three different words means the *append* path runs; and rendering
+// appends a number to a string, which is the shape `key + ": " + value` takes.
+//
+// The insertion order is the observable part: a repeated key keeps its first
+// position while taking its last value, which is what a map does.
+
+enum Counts {
+  case CountsNil
+  case CountsCons(key: String, value: Int, rest: Counts)
+}
+
+def countsPut(m: Counts, key: String, value: Int): Counts = m match {
+  case CountsNil => CountsCons(key, value, CountsNil)
+  case CountsCons(k, v, rest) =>
+    if (k == key) CountsCons(k, value, rest) else CountsCons(k, v, countsPut(rest, key, value))
+}
+
+def countsGet(m: Counts, key: String, fallback: Int): Int = m match {
+  case CountsNil => fallback
+  case CountsCons(k, v, rest) => if (k == key) v else countsGet(rest, key, fallback)
+}
+
+def countsSize(m: Counts, acc: Int): Int = m match {
+  case CountsNil => acc
+  case CountsCons(k, v, rest) => countsSize(rest, acc + 1)
+}
+
+def countsRender(m: Counts, acc: String): String = m match {
+  case CountsNil => acc
+  case CountsCons(k, v, rest) => countsRender(rest, acc + k + ": " + v + " ")
+}
+
+mutable counts = CountsNil
+foreach (word in ["the", "fox", "the", "dog", "the", "fox"]) {
+  counts = countsPut(counts, word, countsGet(counts, word, 0) + 1)
+}
+println(countsRender(counts, ""))
+println(countsSize(counts, 0))
+println(countsGet(counts, "the", 0))
+println(countsGet(counts, "fox", 0))
+println(countsGet(counts, "cat", -1))
+assertResult(3)(countsSize(counts, 0))
+assertResult(3)(countsGet(counts, "the", 0))
+assertResult(2)(countsGet(counts, "fox", 0))
+assertResult(-1)(countsGet(counts, "cat", -1))
+
+// A chain of a hundred entries, so the allocation runs past anything a
+// compile-time buffer would have reserved.
+def fill(m: Counts, n: Int): Counts =
+  if (n == 0) m else fill(countsPut(m, "k" + n, n), n - 1)
+val big = fill(CountsNil, 100)
+println(countsSize(big, 0))
+println(countsGet(big, "k1", 0))
+println(countsGet(big, "k100", 0))
+assertResult(100)(countsSize(big, 0))
+assertResult(50)(countsGet(big, "k50", 0))
+
+// Appending numbers and flags to a string, which the rendering above needs.
+val n = countsSize(counts, 0)
+println("size=" + n + " empty=" + (n == 0))
+println("done")
