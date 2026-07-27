@@ -151,6 +151,11 @@ pub trait PortableAsm {
     fn save_barrier_registers(&mut self) {}
     fn restore_barrier_registers(&mut self) {}
 
+    /// The same, around an allocation. A different list from the barrier's:
+    /// the allocation's own arguments are live where the barrier's are not.
+    fn save_alloc_registers(&mut self) {}
+    fn restore_alloc_registers(&mut self) {}
+
     fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize);
     /// Terminate the process with status `code` (does not return).
     fn plat_exit(&mut self, code: u64);
@@ -446,6 +451,26 @@ pub fn emit_gc_grow_budget<E: PortableAsm>(
 /// (`plat_write_data` / `plat_exit`): the routine's control flow is
 /// architecture-independent, while each backend's impl chooses the actual
 /// OS interface (Linux/macOS `syscall` vs Windows shim `call`).
+/// Ask the collector for an object: a 16-byte header `[size|mark][type_tag]`
+/// followed by `payload_bytes` of payload, answered as the *user* pointer in
+/// `V0` (the block plus the header), so every payload access is unchanged.
+///
+/// The argument registers are the shared `gc_alloc`'s own -- `V7` the size
+/// and `V6` the tag -- which is why this can be written once. What a backend
+/// needs kept across the call is asked of it, as with the barrier.
+pub fn emit_gc_alloc_object<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    payload_bytes: u64,
+    tag: u64,
+) {
+    out.mov_imm64(Reg::V7, payload_bytes);
+    out.mov_imm64(Reg::V6, tag);
+    out.save_alloc_registers();
+    out.call_label(entry);
+    out.restore_alloc_registers();
+}
+
 /// The load barrier's fast path, around the shared slow routine.
 ///
 /// Three stages, and all three are policy rather than machinery: a value

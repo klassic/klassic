@@ -13708,7 +13708,9 @@ impl NativeCodeGenerator {
         self.emit_non_negative_builtin_int_check(span, "__gc_alloc");
         self.emit_builtin_allocation_size_check(span, "__gc_alloc", Self::GC_MAX_PAYLOAD_SIZE);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        // Type tag 1 = "raw bytes" (no pointer fields).
+        // Type tag 1 = "raw bytes" (no pointer fields). The size is already
+        // in the argument register, so only the tag and the call come from
+        // the shared sequence here.
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
         Ok(NativeValue::HeapPointer)

@@ -246,6 +246,21 @@ struct Assembler {
 /// The registers a barrier's slow path has to leave as it found them here.
 /// x10-x12 have no name in the portable register set, which is why this list
 /// lives on this side of the trait rather than in the shared routine.
+/// The same, around an allocation: x4/x5 carry the arguments, so they are not
+/// in this list, and x8 is (the barrier's field address is not live here).
+const ALLOC_SAVED: [Reg; 10] = [
+    Reg::X1,
+    Reg::X2,
+    Reg::X3,
+    Reg::X6,
+    Reg::X7,
+    Reg::X8,
+    Reg::X9,
+    Reg::X10,
+    Reg::X11,
+    Reg::X12,
+];
+
 const BARRIER_SAVED: [Reg; 11] = [
     Reg::X1,
     Reg::X2,
@@ -1230,6 +1245,16 @@ impl portable_asm::PortableAsm for Assembler {
     }
     fn restore_barrier_registers(&mut self) {
         for reg in BARRIER_SAVED.into_iter().rev() {
+            self.pop(reg);
+        }
+    }
+    fn save_alloc_registers(&mut self) {
+        for reg in ALLOC_SAVED {
+            self.push(reg);
+        }
+    }
+    fn restore_alloc_registers(&mut self) {
+        for reg in ALLOC_SAVED.into_iter().rev() {
             self.pop(reg);
         }
     }
@@ -4201,9 +4226,8 @@ impl Emitter {
     /// POINTER_RECORD (every payload slot a heap pointer), so the collector
     /// traces only the latter.
     fn emit_gc_alloc_object(&mut self, words: usize, tag: u64) {
-        self.asm.mov_imm64(Reg::X5, (words * 8) as u64); // payload bytes
-        self.asm.mov_imm64(Reg::X4, tag);
-        self.emit_gc_alloc_call(); // x0 = user pointer
+        let entry = self.gc_alloc_entry_label();
+        crate::portable_asm::emit_gc_alloc_object(&mut self.asm, entry, (words * 8) as u64, tag);
     }
 
     /// Box a scalar (in x0) into its own single-slot `RAW_BYTES` object,

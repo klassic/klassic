@@ -1832,6 +1832,20 @@ shared. That division -- policy in the shared routine, register allocation in
 the backend -- is the one to reach for whenever the next piece looks
 unportable.
 
+Asking the collector for an object folded next, on the same pattern. The
+argument registers were already agreed -- the shared `gc_alloc` reads the size
+from `V7` and the tag from `V6` -- so `emit_gc_alloc_object` is the sequence
+around them: put the two arguments in place, keep what this backend needs,
+call. The aarch64 list differs from the barrier's, which is the point of
+asking the backend rather than hard-coding one: x4/x5 carry the arguments
+here and x8 is live where it was not.
+
+So the mutator's side of the collector now reads the same on both: root push
+and pop, colour on store, the load barrier's three stages, and the allocation
+call. What is left is boxing a scalar into its own one-slot object and
+unboxing it -- a `RAW_BYTES` allocation plus a store, and a load -- which is
+the same shape again.
+
 Colour-on-store also folded: a heap slot holds a coloured pointer on both
 backends and null stays raw on both, so `emit_gc_colour_pointer` is that rule
 written once. It is emitted inline rather than called -- three instructions,
