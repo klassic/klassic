@@ -4468,6 +4468,12 @@ struct NativeCodeGenerator {
     gc_oom_text: DataLabel,
     gc_worklist_overflow_text: DataLabel,
     gc_shadow_overflow_text: DataLabel,
+    gc_shadow_underflow_text: DataLabel,
+    /// The shared shadow-stack push and pop, called rather than inlined: the
+    /// protocol lives in `portable_asm` so both hand-emitted backends run the
+    /// same one.
+    gc_shadow_push: TextLabel,
+    gc_shadow_pop: TextLabel,
     gc_bounds_error_text: DataLabel,
     /// Lowest rsp the program may reach before the prologue probe
     /// aborts: initial rsp minus RLIMIT_STACK plus a safety margin,
@@ -4708,6 +4714,10 @@ impl NativeCodeGenerator {
             asm.data_label_with_bytes(b"klassic gc: mark worklist overflow\n");
         let gc_shadow_overflow_text =
             asm.data_label_with_bytes(b"klassic gc: shadow stack overflow\n");
+        let gc_shadow_underflow_text =
+            asm.data_label_with_bytes(b"klassic gc: shadow stack underflow\n");
+        let gc_shadow_push = asm.create_text_label();
+        let gc_shadow_pop = asm.create_text_label();
         let gc_bounds_error_text = asm.data_label_with_bytes(b"klassic gc: index out of bounds\n");
         let stack_floor = asm.data_label_with_i64s(&[0]);
         let stack_overflow_abort = asm.create_text_label();
@@ -4872,6 +4882,9 @@ impl NativeCodeGenerator {
             gc_oom_text,
             gc_worklist_overflow_text,
             gc_shadow_overflow_text,
+            gc_shadow_underflow_text,
+            gc_shadow_push,
+            gc_shadow_pop,
             gc_bounds_error_text,
             stack_floor,
             stack_overflow_abort,
@@ -5522,6 +5535,7 @@ impl NativeCodeGenerator {
         self.emit_gc_alloc_large_runtime();
         self.emit_gc_grow_budget_runtime();
         self.emit_gc_bounds_error_runtime();
+        self.emit_gc_shadow_runtime();
         if self.is_windows {
             self.emit_win_init_runtime();
             self.emit_win_write_runtime();
@@ -39484,6 +39498,33 @@ impl NativeCodeGenerator {
     /// fixed diagnostic and exits with status 1. The list / string
     /// builtins jump here directly when they detect an index outside
     /// the stored length range.
+    /// The shadow stack's push and pop, from the shared source both
+    /// hand-emitted backends use. Called rather than inlined: the sequence is
+    /// about twenty instructions and every rooted temporary needs one.
+    fn emit_gc_shadow_runtime(&mut self) {
+        let push = self.gc_shadow_push;
+        let pop = self.gc_shadow_pop;
+        let stack = self.gc_shadow_stack;
+        let top = self.gc_shadow_stack_top;
+        let overflow = self.gc_shadow_overflow_text;
+        let underflow = self.gc_shadow_underflow_text;
+        portable_asm::emit_gc_shadow_push_runtime(
+            self,
+            push,
+            stack,
+            top,
+            overflow,
+            b"klassic gc: shadow stack overflow\n".len(),
+        );
+        portable_asm::emit_gc_shadow_pop_runtime(
+            self,
+            pop,
+            top,
+            underflow,
+            b"klassic gc: shadow stack underflow\n".len(),
+        );
+    }
+
     fn emit_gc_bounds_error_runtime(&mut self) {
         // Migrated onto the portable `PortableAsm` emitter trait -- the
         // first GC routine to use its platform primitives. The control
@@ -39547,51 +39588,21 @@ impl NativeCodeGenerator {
     /// callers can use this immediately after computing a heap pointer
     /// without an extra spill.
     fn emit_gc_shadow_push(&mut self, rbp_offset: i32) {
-        let overflow = self.asm.create_text_label();
-        let success = self.asm.create_text_label();
-        // Save rax — most callers have the just-computed heap pointer in
-        // it and need to store it into the new slot after this returns.
+        // The routine takes the slot's address in rax and preserves every
+        // register it can see, so the caller only has to park its own rax --
+        // most callers have the just-computed heap pointer there.
         self.asm.push_reg(Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm
-            .cmp_reg_imm32(Reg::Rax, Self::GC_SHADOW_STACK_LEN as i32);
-        self.asm.jcc_label(Condition::AboveOrEqual, overflow);
-        self.asm.mov_data_addr(Reg::R8, self.gc_shadow_stack);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
-        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
-        self.asm.shl_reg_imm8(Reg::R9, 3);
-        self.asm.add_reg_reg(Reg::R8, Reg::R9);
-        // rbp moved by 8 due to push rax above; reflect that when forming
-        // the slot address.
-        self.asm.lea_reg_rbp_neg_disp32(Reg::Rcx, rbp_offset);
-        self.asm.store_ptr_disp32(Reg::R8, 0, Reg::Rcx);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.jmp_label(success);
-        self.asm.bind_text_label(overflow);
-        self.emit_write_data(
-            2,
-            self.gc_shadow_overflow_text,
-            b"klassic gc: shadow stack overflow\n".len(),
-        );
-        self.emit_exit_code(1);
-        self.asm.bind_text_label(success);
+        self.asm.lea_reg_rbp_neg_disp32(Reg::Rax, rbp_offset);
+        self.asm.call_label(self.gc_shadow_push);
         self.asm.pop_reg(Reg::Rax);
     }
 
     /// Emit `gc_shadow_top -= count` so a closing scope drops its
     /// tracked heap-pointer slots from the shadow stack in one shot.
     fn emit_gc_shadow_pop_n(&mut self, count: usize) {
-        if count == 0 {
-            return;
+        for _ in 0..count {
+            self.asm.call_label(self.gc_shadow_pop);
         }
-        self.asm.push_reg(Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.sub_reg_imm32(Reg::Rax, count as i32);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.pop_reg(Reg::Rax);
     }
 
     fn push_temp_reg(&mut self, reg: Reg) {

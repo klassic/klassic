@@ -1811,8 +1811,10 @@ first of those to move: `emit_gc_shadow_push_runtime` and
 of the protocol -- a root is the *address* of a slot so the collector can
 rewrite it when it moves an object, the table has a fixed length, and
 overflowing or underflowing it is fatal rather than silent. The aarch64
-backend calls them; the x86-64 backend still inlines its own copies, which is
-the next thing to fold in.
+backend calls them, and so does the x86-64 one -- which used to inline the
+whole sequence, about twenty instructions, at every rooted temporary. A call
+site is four instructions now (park rax, form the slot address, call, restore),
+and the overflow check exists once in the image instead of once per push.
 
 The underflow check is worth keeping in the shared version: pushes and pops
 have to balance on every path through every function, an imbalance is
