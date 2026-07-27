@@ -1749,10 +1749,36 @@ one per concern:
   the same offset in the next -- which is what refused `acc = KMCons(...)` on
   aarch64.
 
+#### `words()`, and walking a map's entries
+
+`words()` used to filter the pieces a split leaves behind, which means
+building a list while the program runs -- the one thing the x86-64 backend
+cannot do. It collapses runs of whitespace in the *text* instead, so the
+split leaves no empty pieces and no list is built, and the answer is the same
+list for every input (checked against the old implementation case by case).
+Text with nothing in it has no words, which is why `splitWords` splits on the
+empty delimiter there: both branches of the `if` then produce lines, which is
+what a backend needs to join them.
+
+Four string builtins had to stop insisting on a text known while compiling:
+`split`, `replace`/`replaceAll`, `trim` and its neighbours all take a heap
+string now, copying it into a scratch buffer the way the environment-key path
+already did. A binding that holds a heap string also takes any other shape of
+string, by lifting it onto the heap first -- which is what
+`t = replaceAll(t, ...)` in a loop produces.
+
+`foreach (e in m.toPairs())` over a lowered map becomes a walk over the
+chain, with the entry's halves bound directly and `e.key` / `e.value`
+rewritten to those bindings. A body that does anything else with the entry
+leaves the program alone, like every other case the pass does not cover.
+
+With those, every recipe in the cookbook builds on all three targets.
+
 What is still not lowered: a map that is *only* created and never put into
 keeps every payload type unknown, so asking it about a key is refused --
-there is nothing in it to say what its keys are. And `words()` over a runtime
-list is a different piece: `stdlibFilter` is a *recursive* generic function
+there is nothing in it to say what its keys are. A general runtime list is
+still not built on x86-64, which is why the lowering above rewrites
+`words()` rather than the filter it used to call: `stdlibFilter` is a *recursive* generic function
 taking `List<'a>`, and a recursive function is compiled once, so its
 parameter kinds have to be fixed. That one wants monomorphisation of
 recursive generic definitions.

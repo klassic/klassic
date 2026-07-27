@@ -7127,6 +7127,25 @@ impl NativeCodeGenerator {
                     return Err(unsupported(*span, "native assignment to this value type"));
                 }
                 let compiled = self.compile_expr(value)?;
+                // A binding that holds a heap string takes any other shape of
+                // string by lifting it onto the heap first -- which is what
+                // `t = replaceAll(t, ...)` in a loop produces, and refusing it
+                // refused the loop.
+                let compiled = if slot.value == NativeValue::HeapString
+                    && compiled != NativeValue::HeapString
+                    && self
+                        .emit_heap_string_concat_fragment(
+                            compiled,
+                            *span,
+                            "native assignment with changed value type",
+                            false,
+                        )
+                        .is_ok()
+                {
+                    NativeValue::HeapString
+                } else {
+                    compiled
+                };
                 if compiled != slot.value {
                     return Err(unsupported(
                         *span,
@@ -12222,7 +12241,9 @@ impl NativeCodeGenerator {
                 }
                 if self.expr_may_yield_runtime_string(&arguments[0]) {
                     let input = self.compile_expr(&arguments[0])?;
-                    if self.native_string_ref(input).is_some() {
+                    // A string is its own text, whichever shape of string it
+                    // is -- a heap one included.
+                    if self.native_string_ref(input).is_some() || input == NativeValue::HeapString {
                         return Ok(input);
                     }
                     return Err(unsupported(
@@ -12517,9 +12538,23 @@ impl NativeCodeGenerator {
             }
             "split" => {
                 self.expect_static_arity(name, arguments, 2, span)?;
-                if self.expr_may_yield_runtime_string(&arguments[0]) {
+                // A string this backend cannot work out while compiling is
+                // split at run time. `expr_may_yield_runtime_string` only sees
+                // the shapes it knows, so a text built by a *function* -- a
+                // heap string -- used to fall through to the static path and
+                // be refused; asking whether it previews to a static value
+                // covers both.
+                let input_is_static = {
+                    let before = self.static_scopes.clone();
+                    let preview = self.preview_static_value_after_effectful_eval(&arguments[0]);
+                    self.static_scopes = before;
+                    preview.is_some()
+                };
+                if self.expr_may_yield_runtime_string(&arguments[0]) || !input_is_static {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) =
+                        self.native_string_ref_or_copy(input, span, "native split for non-string")
+                    else {
                         return Err(unsupported(span, "native split for non-string"));
                     };
                     if self.expr_may_yield_runtime_string(&arguments[1]) {
@@ -12570,11 +12605,24 @@ impl NativeCodeGenerator {
             }
             "trim" | "trimLeft" | "trimRight" | "toLowerCase" | "toUpperCase" | "reverse" => {
                 self.expect_static_arity(name, arguments, 1, span)?;
-                if matches!(name, "trim" | "trimLeft" | "trimRight")
-                    && self.expr_may_yield_runtime_string(&arguments[0])
-                {
+                // As in `split` and `replaceAll`: a text this backend cannot
+                // work out while compiling is handled at run time, whatever
+                // shape of string it turned out to be.
+                let input_is_static = {
+                    let before = self.static_scopes.clone();
+                    let preview = self.preview_static_value_after_effectful_eval(&arguments[0]);
+                    self.static_scopes = before;
+                    preview.is_some()
+                };
+                let runtime_input =
+                    self.expr_may_yield_runtime_string(&arguments[0]) || !input_is_static;
+                if matches!(name, "trim" | "trimLeft" | "trimRight") && runtime_input {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) = self.native_string_ref_or_copy(
+                        input,
+                        span,
+                        &format!("native {name} for non-string"),
+                    ) else {
                         return Err(unsupported(span, &format!("native {name} for non-string")));
                     };
                     return Ok(self.emit_runtime_string_trim(
@@ -12584,18 +12632,24 @@ impl NativeCodeGenerator {
                         span,
                     ));
                 }
-                if matches!(name, "toLowerCase" | "toUpperCase")
-                    && self.expr_may_yield_runtime_string(&arguments[0])
-                {
+                if matches!(name, "toLowerCase" | "toUpperCase") && runtime_input {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) = self.native_string_ref_or_copy(
+                        input,
+                        span,
+                        &format!("native {name} for non-string"),
+                    ) else {
                         return Err(unsupported(span, &format!("native {name} for non-string")));
                     };
                     return Ok(self.emit_runtime_string_ascii_case(input, name == "toUpperCase"));
                 }
-                if name == "reverse" && self.expr_may_yield_runtime_string(&arguments[0]) {
+                if name == "reverse" && runtime_input {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) = self.native_string_ref_or_copy(
+                        input,
+                        span,
+                        "native reverse for non-string",
+                    ) else {
                         return Err(unsupported(span, "native reverse for non-string"));
                     };
                     return Ok(self.emit_runtime_string_reverse(input));
@@ -12615,9 +12669,22 @@ impl NativeCodeGenerator {
             }
             "replace" | "replaceAll" => {
                 self.expect_static_arity(name, arguments, 3, span)?;
-                if self.expr_may_yield_runtime_string(&arguments[0]) {
+                // As in `split`: a text this backend cannot work out while
+                // compiling is replaced at run time, whether or not it is one
+                // of the shapes `expr_may_yield_runtime_string` recognises.
+                let input_is_static = {
+                    let before = self.static_scopes.clone();
+                    let preview = self.preview_static_value_after_effectful_eval(&arguments[0]);
+                    self.static_scopes = before;
+                    preview.is_some()
+                };
+                if self.expr_may_yield_runtime_string(&arguments[0]) || !input_is_static {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) = self.native_string_ref_or_copy(
+                        input,
+                        span,
+                        "native replace for non-string",
+                    ) else {
                         return Err(unsupported(span, "native replace for non-string"));
                     };
                     if name == "replace" {
@@ -30630,6 +30697,24 @@ impl NativeCodeGenerator {
                     && field == "split"
                 {
                     return self.expr_may_yield_runtime_string(target);
+                }
+                // The function spelling of the same thing. Only the method
+                // form was recognised, so `split(s, d)` -- which is how the
+                // stdlib writes it -- was not seen as producing lines, and an
+                // `if` with one in each branch had nothing to join them by.
+                if let Expr::Identifier { name, .. } = callee.as_ref()
+                    && self.builtin_name_for_identifier(name) == "split"
+                    && let Some(input) = arguments.first()
+                {
+                    // A heap string counts here even though it does not count
+                    // as a runtime string generally: what this answers is
+                    // "does splitting this produce lines", and it does. Saying
+                    // so generally would change what every other builtin makes
+                    // of a heap string.
+                    let heap_input = matches!(input, Expr::Identifier { name, .. }
+                        if self.lookup_var(name).map(|slot| slot.value)
+                            == Some(NativeValue::HeapString));
+                    return heap_input || self.expr_may_yield_runtime_string(input);
                 }
                 if let Some(name) = self.file_input_lines_print_call_name(expr) {
                     return matches!(name.as_str(), "FileInput#lines" | "FileInput#readLines")

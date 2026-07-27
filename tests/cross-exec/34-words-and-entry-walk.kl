@@ -1,0 +1,48 @@
+// Cross-target fixture: splitting text into words, and walking a map's
+// entries -- the two halves of the word counter.
+//
+// `words()` used to need a filter over the pieces a split leaves behind,
+// which means building a list while the program runs; it collapses runs of
+// whitespace in the *text* instead, so the split leaves no empty pieces and
+// no list has to be built. The cases below are the ones that distinguish the
+// two: repeated separators, tabs and newlines, and text that is only
+// whitespace.
+//
+// The entry walk is `foreach (e in m.toPairs())` over a map grown at run
+// time. It becomes a walk over the chain the map was lowered to, with the
+// entry's halves bound directly, so the order it visits is the map's
+// insertion order.
+
+import std.map
+import std.string
+
+println("a b  c".words())
+println("x\ty\nz".words())
+println("".words())
+println("  ".words())
+println("  a  b  ".words())
+println("one".words())
+println("a\n\nb".words())
+assertResult(3)(size("a b  c".words()))
+assertResult(0)(size("  ".words()))
+
+mutable counts = Map#empty()
+foreach (word in "the fox the dog the fox".words()) {
+  counts = Map#put(counts, word, counts.getOrElse(word, 0) + 1)
+}
+println(counts)
+println(Map#size(counts))
+foreach (entry in counts.toPairs()) {
+  println(entry.key + ": " + entry.value)
+}
+assertResult(3)(Map#size(counts))
+assertResult(3)(counts.getOrElse("the", 0))
+
+// A second walk over the same map, to show the first did not consume it.
+mutable total = 0
+foreach (entry in counts.toPairs()) {
+  total = total + entry.value
+}
+println(total)
+assertResult(6)(total)
+println("done")

@@ -3,10 +3,9 @@
 Read a file, count how many times each word appears, print the
 result. Demonstrates file I/O, string splitting, and `Map<String,
 Int>` from `std.map` — Klassic's automatic GC means none of this
-touches a heap pointer directly. Run it with the evaluator
-(`klassic wc.kl -- <path>`); building `Map#put`/`Map#empty` to a
-native executable is on the native compiler's coverage roadmap, not
-supported yet.
+touches a heap pointer directly. Runs under the evaluator
+(`klassic wc.kl -- <path>`) and builds to a native executable on every
+target.
 
 ```kl
 val args = CommandLine#args()
