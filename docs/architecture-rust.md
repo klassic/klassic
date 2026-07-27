@@ -1925,6 +1925,39 @@ side of a branch.
   ```klassic,norun documents a program that needs arguments or stdin and is
   extracted but not run. Four blocks were missing the `import` line they
   needed when the harness first ran (issue #629).
+- The seven system stdlib modules (`std.env`, `std.cli`, `std.dir`,
+  `std.process`, `std.file`, `std.path`, `std.time`) carry type annotations
+  now. They had none, which each backend then failed on for its own reason:
+  aarch64 could not give a binding a type it never learned ("a call to
+  `__mod_std_env_exists`, whose result type cannot be determined") and x86-64
+  could not tell the string `lastIndexOf` from the list one. Annotating also
+  uncovers what the missing annotations were hiding, which is the rest of this
+  entry (issue #622).
+- An annotated `String` parameter arrives as a heap string, so annotating a
+  definition used to be what stopped a program compiling. Three places on the
+  x86-64 side now take a heap string where they took only a static or runtime
+  one: the file and directory builtins' path and content arguments (through
+  `expr_yields_runtime_or_heap_string` plus `native_string_ref_or_copy`),
+  `indexOf`/`lastIndexOf`, and the `if` merge, which recognises a string
+  helper applied to a heap string as string-yielding and so joins
+  `if (c) heapString else substring(...)`. The general
+  `expr_may_yield_runtime_string` predicate is deliberately *not* widened --
+  that was measured to break programs whose other string paths cannot copy.
+- aarch64 canonicalises the v0.1 prelude spellings (`getEnv` ->
+  `Environment#get`, `args` -> `CommandLine#args`, and five more) in both
+  `builtin_call` and `static_type_under`, so the stdlib modules written
+  against the short names compile there (issue #623). It also gained
+  `Dir#current` (Darwin `__getcwd`, which fills a buffer and answers 0, so the
+  length comes from scanning to the terminator), `Dir#home`, `Dir#temp` and
+  `Dir#isFile`.
+- aarch64's `annotation_type` resolves a structural record written as its
+  fields, `{ year: Int; month: Int }`, interning it the way a record literal
+  interns; `std.time` returns one. `assignable` also accepts a `Nullable(T)`
+  body under a `T` return annotation, which is what `std.cli`'s `option`
+  is -- a String or nothing.
+- `tests/cross-exec/36-stdlib-system-modules.kl` covers all seven modules on
+  all three targets, imported under aliases (three of them declare `exists`,
+  two declare `join`).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

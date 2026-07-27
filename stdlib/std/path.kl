@@ -5,25 +5,25 @@ module std.path
 // paths land later when the runtime crate gains target-aware path
 // semantics.
 
-def separator() = "/"
+def separator(): String = "/"
 
-def basename(path) = {
+def basename(path: String): String = {
   val slash = lastIndexOf(path, "/")
   if((slash < 0)) path else substring(path, slash + 1, length(path))
 }
 
-def dirname(path) = {
+def dirname(path: String): String = {
   val slash = lastIndexOf(path, "/")
   if((slash < 0)) "" else if((slash == 0)) "/" else substring(path, 0, slash)
 }
 
-def fileExtension(path) = {
+def fileExtension(path: String): String = {
   val name = basename(path)
   val dot = lastIndexOf(name, ".")
   if((dot <= 0)) "" else substring(name, dot, length(name))
 }
 
-def withoutExtension(path) = {
+def withoutExtension(path: String): String = {
   val name = basename(path)
   val dot = lastIndexOf(name, ".")
   if((dot <= 0)) path else {
@@ -32,7 +32,7 @@ def withoutExtension(path) = {
   }
 }
 
-def join(a, b) = {
+def join(a: String, b: String): String = {
   if(isEmptyString(a)) b else if(isEmptyString(b)) a else {
     val tail = at(a, length(a) - 1)
     if((tail == "/")) a + b else a + "/" + b

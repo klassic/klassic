@@ -1,0 +1,89 @@
+// Cross-target fixture: the stdlib modules that wrap the system builtins.
+//
+// `std.env`, `std.dir`, `std.file`, `std.path`, `std.process`, `std.time` and
+// `std.cli` were written without type annotations. The evaluator infers
+// through them and both native backends then failed for their own reason --
+// aarch64 could not give a binding a type it never learned, and x86-64 could
+// not tell the string `lastIndexOf` from the list one. Neither reason was
+// visible in the diagnostic, which named a synthesized `__mod_std_*` function.
+//
+// The modules carry annotations now, which is what makes the calls below
+// compile; the annotations in turn make each parameter arrive as a *heap*
+// string, so this fixture is also the coverage for reading a path, a file's
+// contents and a substring out of one.
+//
+// Every module is imported under an alias. Three of them declare `exists` and
+// two declare `join`, so the alias is what says which one a call means -- and
+// it exercises the aliased-import path on every target at the same time.
+//
+// Every value printed here has to be the same on all three targets, so the
+// program asks about shapes rather than about this machine: whether a path
+// helper split a string where expected, not what the current directory is.
+
+import std.env as E
+import std.dir as D
+import std.file as F
+import std.path as P
+import std.process as R
+import std.time as T
+import std.cli as C
+
+// Paths, entirely in terms of annotated String parameters.
+println(P.basename("/a/b/c.txt"))
+println(P.basename("plain"))
+println(P.dirname("/a/b/c.txt"))
+println(P.dirname("plain"))
+println(P.fileExtension("/a/b/c.txt"))
+println(P.fileExtension("noext"))
+println(P.withoutExtension("/a/b/c.txt"))
+println(P.join("/a", "b"))
+println(P.join("", "b"))
+println(P.separator())
+assertResult("c.txt")(P.basename("/a/b/c.txt"))
+assertResult("/a/b")(P.dirname("/a/b/c.txt"))
+
+// A file written and read back through the module, i.e. through a heap-string
+// path and a heap-string content.
+F.write("cross-exec-system.txt", "one")
+F.append("cross-exec-system.txt", "-two")
+println(F.readAll("cross-exec-system.txt"))
+println(F.exists("cross-exec-system.txt"))
+F.writeLines("cross-exec-system-lines.txt", ["a", "b"])
+println(F.readLines("cross-exec-system-lines.txt"))
+assertResult("one-two")(F.readAll("cross-exec-system.txt"))
+F.delete("cross-exec-system.txt")
+F.delete("cross-exec-system-lines.txt")
+println(F.exists("cross-exec-system.txt"))
+
+// A directory this program makes itself, so the answers do not depend on the
+// machine it runs on.
+D.mkdir("cross-exec-system-dir")
+println(D.isDirectory("cross-exec-system-dir"))
+println(D.isFile("cross-exec-system-dir"))
+D.delete("cross-exec-system-dir")
+
+// The environment, asked about a variable this program knows is absent.
+println(E.exists("KLASSIC_DEFINITELY_NOT_SET"))
+println(E.getOrElse("KLASSIC_DEFINITELY_NOT_SET", "fallback"))
+assertResult("fallback")(E.getOrElse("KLASSIC_DEFINITELY_NOT_SET", "fallback"))
+
+// The system directories: their contents differ per machine, so only their
+// shape is asserted.
+println(isEmptyString(D.current()))
+println(isEmptyString(D.home()))
+println(isEmptyString(D.temp()))
+
+// Arguments, with none passed.
+println(size(R.args()))
+println(C.flag(["-v", "x"], "-v"))
+println(C.flag(["x"], "-v"))
+println(C.option(["--out", "f.txt"], "--out"))
+
+// Time arithmetic on a fixed instant, so the output is the same everywhere.
+println(T.formatIso(0))
+println(T.formatHuman(951868800000))
+println(T.parseIso("2000-03-01T00:00:00.000Z"))
+println(T.durationMillis(1000, 4000))
+println(T.nowMillis() > 0)
+assertResult(951868800000)(T.parseIso("2000-03-01T00:00:00.000Z"))
+println("done")

@@ -12861,12 +12861,15 @@ impl NativeCodeGenerator {
             }
             "indexOf" | "lastIndexOf" => {
                 self.expect_static_arity(name, arguments, 2, span)?;
+                // A heap string is copied into a runtime pair rather than
+                // refused: it is what an annotated `String` parameter holds,
+                // and `std.path` is written entirely in terms of these two.
                 let input = self.compile_expr(&arguments[0])?;
-                let Some(input) = self.native_string_ref(input) else {
+                let Some(input) = self.native_string_ref_or_copy(input, span, name) else {
                     return Err(unsupported(span, &format!("native {name} for non-string")));
                 };
                 let needle = self.compile_expr(&arguments[1])?;
-                let Some(needle) = self.native_string_ref(needle) else {
+                let Some(needle) = self.native_string_ref_or_copy(needle, span, name) else {
                     return Err(unsupported(span, &format!("native {name} for non-string")));
                 };
                 self.emit_native_string_index_of(input, needle, name == "lastIndexOf");
@@ -20660,11 +20663,11 @@ impl NativeCodeGenerator {
             "FileOutput#write"
         };
         self.expect_static_arity(name, arguments, 2, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label = self.compile_runtime_path_argument(&arguments[0], span, name)?;
-            if self.expr_may_yield_runtime_string(&arguments[1]) {
+            if self.expr_yields_runtime_or_heap_string(&arguments[1]) {
                 let content = self.compile_expr(&arguments[1])?;
-                let Some(content) = self.native_string_ref(content) else {
+                let Some(content) = self.native_string_ref_or_copy(content, span, name) else {
                     return Err(unsupported(
                         span,
                         &format!("native {name} for non-string content"),
@@ -20688,9 +20691,9 @@ impl NativeCodeGenerator {
         }
         let path =
             self.static_string_from_argument_preserving_effects(&arguments[0], span, name)?;
-        if self.expr_may_yield_runtime_string(&arguments[1]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[1]) {
             let content = self.compile_expr(&arguments[1])?;
-            let Some(content) = self.native_string_ref(content) else {
+            let Some(content) = self.native_string_ref_or_copy(content, span, name) else {
                 return Err(unsupported(
                     span,
                     &format!("native {name} for non-string content"),
@@ -20726,7 +20729,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("FileOutput#writeLines", arguments, 2, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "FileOutput#writeLines")?;
             let content = self.compile_expr(&arguments[1])?;
@@ -20795,7 +20798,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("FileOutput#exists", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "FileOutput#exists")?;
             self.emit_runtime_path_exists_label(path_label);
@@ -20830,7 +20833,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("FileOutput#delete", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "FileOutput#delete")?;
             self.emit_file_delete_label(path_label, span, "FileOutput#delete");
@@ -21669,7 +21672,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("FileInput#all", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "FileInput#all")?;
             return Ok(self.emit_file_read_to_runtime_string_from_path_label(
@@ -21710,7 +21713,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("FileInput#lines", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "FileInput#lines")?;
             let content = self.emit_file_read_to_runtime_string_from_path_label(
@@ -22360,7 +22363,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("Dir#exists", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "Dir#exists")?;
             self.emit_runtime_path_exists_label(path_label);
@@ -22390,7 +22393,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("Dir#isDirectory", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "Dir#isDirectory")?;
             self.emit_runtime_path_type_check_label(path_label, true, span, "Dir#isDirectory");
@@ -22418,7 +22421,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("Dir#isFile", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "Dir#isFile")?;
             self.emit_runtime_path_type_check_label(path_label, false, span, "Dir#isFile");
@@ -22445,7 +22448,7 @@ impl NativeCodeGenerator {
     ) -> Result<NativeValue, Diagnostic> {
         let name = if recursive { "Dir#mkdirs" } else { "Dir#mkdir" };
         self.expect_static_arity(name, arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label = self.compile_runtime_path_argument(&arguments[0], span, name)?;
             if recursive {
                 self.emit_dir_mkdirs_label(path_label, span, name);
@@ -22477,7 +22480,7 @@ impl NativeCodeGenerator {
     ) -> Result<NativeValue, Diagnostic> {
         let name = if full { "Dir#listFull" } else { "Dir#list" };
         self.expect_static_arity(name, arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let (path_label, path) =
                 self.compile_runtime_path_argument_ref(&arguments[0], span, name)?;
             return Ok(self.emit_dir_list_path_label(path_label, path, full, span, name));
@@ -22545,7 +22548,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("Dir#delete", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "Dir#delete")?;
             self.emit_dir_delete_label(path_label, span, "Dir#delete");
@@ -27053,7 +27056,10 @@ impl NativeCodeGenerator {
         name: &str,
     ) -> Result<(DataLabel, NativeStringRef), Diagnostic> {
         let value = self.compile_expr(expr)?;
-        let Some(path) = self.native_string_ref(value) else {
+        // A heap string is copied into a runtime pair rather than refused:
+        // that is what an annotated `String` parameter arrives as, and a
+        // path is exactly the place a caller passes one.
+        let Some(path) = self.native_string_ref_or_copy(value, span, name) else {
             return Err(unsupported(
                 span,
                 &format!("native {name} for non-string path"),
@@ -30514,9 +30520,32 @@ impl NativeCodeGenerator {
                 rhs,
                 ..
             } => self.heap_string_yield(lhs, locals) || self.heap_string_yield(rhs, locals),
-            Expr::Call { callee, .. } => match callee.as_ref() {
-                Expr::Identifier { name, .. } => {
-                    heap_string_returning_helper(&self.builtin_name_for_identifier(name))
+            Expr::Call {
+                callee, arguments, ..
+            } => match callee.as_ref() {
+                Expr::Identifier { name, .. }
+                    if heap_string_returning_helper(&self.builtin_name_for_identifier(name)) =>
+                {
+                    true
+                }
+                // A string helper applied to a heap string yields a string
+                // whose contents are only known at run time. Saying "heap"
+                // here is a merge *strategy*, not a claim about the exact
+                // representation: the coercion accepts a static, runtime or
+                // heap string, so predicting heap for either shape is sound
+                // and is what lets `if (c) heapString else substring(...)`
+                // join at all.
+                Expr::Identifier { name, .. }
+                    if runtime_string_returning_helper(&self.builtin_name_for_identifier(name)) =>
+                {
+                    arguments
+                        .first()
+                        .is_some_and(|argument| self.heap_string_yield(argument, locals))
+                }
+                Expr::FieldAccess { target, field, .. }
+                    if runtime_string_returning_helper(field) =>
+                {
+                    self.heap_string_yield(target, locals)
                 }
                 callee => self
                     .callee_return_value_hint(callee)
@@ -30555,6 +30584,32 @@ impl NativeCodeGenerator {
                 (then_value == else_value).then_some(then_value)
             }
             _ => None,
+        }
+    }
+
+    /// Whether a file or directory argument is a string this backend has to
+    /// read at run time. Wider than `expr_may_yield_runtime_string` by one
+    /// case: a heap string, which is what an annotated `String` parameter
+    /// holds. The wider answer is confined to the file and directory
+    /// builtins because their helpers copy a heap string into a runtime pair
+    /// (`native_string_ref_or_copy`), while widening the general predicate
+    /// has been measured to break programs whose other string paths cannot.
+    fn expr_yields_runtime_or_heap_string(&self, expr: &Expr) -> bool {
+        if self.expr_may_yield_runtime_string(expr) {
+            return true;
+        }
+        if matches!(
+            self.native_value_hint_for_expr(expr),
+            Some(NativeValue::HeapString)
+        ) {
+            return true;
+        }
+        match expr {
+            Expr::Identifier { name, .. } => matches!(
+                self.lookup_var(name).map(|slot| slot.value),
+                Some(NativeValue::HeapString)
+            ),
+            _ => false,
         }
     }
 

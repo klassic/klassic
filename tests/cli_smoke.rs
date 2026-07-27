@@ -108,6 +108,77 @@ fn declared_variants_are_constructor_patterns() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "5\n99\n()\n");
 }
 
+/// The system stdlib modules carry type annotations, which is what both
+/// native backends needed: aarch64 could not give a binding a type it never
+/// learned, and x86-64 could not tell the string `lastIndexOf` from the list
+/// one. The evaluator inferred through them either way, so this pins the
+/// answers the annotations have to keep producing.
+#[test]
+fn system_stdlib_modules_are_annotated() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.path as P\nimport std.env as E\nimport std.time as T\nimport std.cli as C\nprintln(P.basename(\"/a/b/c.txt\"))\nprintln(P.dirname(\"/a/b/c.txt\"))\nprintln(P.fileExtension(\"x.tar\"))\nprintln(E.getOrElse(\"KLASSIC_DEFINITELY_NOT_SET\", \"fallback\"))\nprintln(T.formatIso(0))\nprintln(C.option([\"--out\", \"f.txt\"], \"--out\"))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "the annotated modules should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "c.txt\n/a/b\n.tar\nfallback\n1970-01-01T00:00:00.000Z\nf.txt\n()\n"
+    );
+}
+
+/// A path or a file's contents that arrives as a *heap* string -- which is
+/// what an annotated `String` parameter holds -- is copied into a runtime
+/// pair rather than refused. Annotating a definition must never be what stops
+/// a program compiling.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_reads_a_file_through_an_annotated_path() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after the epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("klassic-annotated-path-{stamp}"));
+    fs::create_dir_all(&dir).expect("temp dir should be creatable");
+    let source_path = dir.join("program.kl");
+    let bin_path = dir.join("program");
+    fs::write(
+        &source_path,
+        "def store(path: String, text: String): Unit = FileOutput#write(path, text)\n         def load(path: String): String = FileInput#readAll(path)\n         def stem(path: String): String = {\n           val slash = lastIndexOf(path, \"/\")\n           if((slash < 0)) path else substring(path, slash + 1, length(path))\n         }\n         store(\"annotated.txt\", \"contents\")\n         println(load(\"annotated.txt\"))\n         println(stem(\"/a/b/annotated.txt\"))\n         println(stem(\"bare\"))\n         FileOutput#delete(\"annotated.txt\")\n",
+    )
+    .expect("source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "an annotated String parameter should still compile\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .current_dir(&dir)
+        .output()
+        .expect("generated program should run");
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "contents\nannotated.txt\nbare\n"
+    );
+}
+
 /// std.option / std.result richer API via method-style dispatch. The
 /// clean names are restored now that native module namespacing (#449)
 /// makes the free names safe and receiver-type dispatch picks the right

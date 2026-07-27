@@ -2,28 +2,28 @@ module std.dir
 
 // Directory helpers wrapping the existing `Dir#*` builtins.
 
-def current() = Dir#current()
+def current(): String = Dir#current()
 
-def home() = Dir#home()
+def home(): String = Dir#home()
 
-def temp() = Dir#temp()
+def temp(): String = Dir#temp()
 
-def exists(path) = Dir#exists(path)
+def exists(path: String): Boolean = Dir#exists(path)
 
-def mkdir(path) = Dir#mkdir(path)
+def mkdir(path: String): Unit = Dir#mkdir(path)
 
-def mkdirs(path) = Dir#mkdirs(path)
+def mkdirs(path: String): Unit = Dir#mkdirs(path)
 
-def isDirectory(path) = Dir#isDirectory(path)
+def isDirectory(path: String): Boolean = Dir#isDirectory(path)
 
-def isFile(path) = Dir#isFile(path)
+def isFile(path: String): Boolean = Dir#isFile(path)
 
-def list(path) = Dir#list(path)
+def list(path: String): List<String> = Dir#list(path)
 
-def listFull(path) = Dir#listFull(path)
+def listFull(path: String): List<String> = Dir#listFull(path)
 
-def delete(path) = Dir#delete(path)
+def delete(path: String): Unit = Dir#delete(path)
 
-def copy(src, dst) = Dir#copy(src, dst)
+def copy(src: String, dst: String): Unit = Dir#copy(src, dst)
 
-def move(src, dst) = Dir#move(src, dst)
+def move(src: String, dst: String): Unit = Dir#move(src, dst)

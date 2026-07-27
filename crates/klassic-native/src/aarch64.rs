@@ -82,6 +82,14 @@ const DEFAULT_DIR_MODE: u64 = 0o755;
 const GC_EVAC_OFF: bool = false;
 
 const SYS_MMAP: u16 = 197;
+
+/// Darwin `__getcwd(buf, size)`: fills `buf`, answers 0 on success.
+const SYS_GETCWD: u16 = 326;
+
+/// `S_IFDIR` (0o040000) >> 12, the value `st_mode`'s type field takes for a
+/// directory; `S_IFREG` (0o100000) >> 12 for a regular file.
+const S_IFDIR_SHIFTED: u32 = 0o4;
+const S_IFREG_SHIFTED: u32 = 0o10;
 const STDOUT_FD: u64 = 1;
 const STDERR_FD: u64 = 2;
 /// One bump-allocator segment. Exhaustion mmaps a fresh segment (the
@@ -1458,6 +1466,10 @@ fn assignable(actual: ValueType, expected: ValueType) -> bool {
     actual == expected
         // `null` into any reference slot, including one that may hold nothing.
         || (actual == ValueType::Null && is_heap_pointer(expected))
+        // A value that is *sometimes* null fits a slot of what it otherwise
+        // is, for the same reason `null` itself does: `std.cli`'s `option`
+        // answers a String or nothing, and its annotation says String.
+        || matches!(actual, ValueType::Nullable(elem) if elem_value_type(elem) == expected)
         || (actual == ValueType::EmptyList
             && matches!(expected, ValueType::List(_) | ValueType::EmptyList))
         || (actual == ValueType::EmptySet
@@ -1536,6 +1548,49 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 /// The annotation a type would be written as, for the types a type variable
 /// can be solved to from an argument. Anything else answers `None`, which
 /// leaves the variable unsolved rather than guessing.
+/// The fields of a structural record annotation, `{ a: Int; b: String }`, in
+/// the order written. `None` when the text is not one. Splitting is done at
+/// the top nesting level so a field whose own type is a record or a generic
+/// application survives.
+fn split_structural_record_fields(text: &str) -> Option<Vec<(String, String)>> {
+    let trimmed = text.trim();
+    let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?;
+    let mut fields = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for ch in inner.chars() {
+        match ch {
+            '{' | '<' | '(' | '[' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' | '>' | ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ';' | ',' if depth == 0 => {
+                fields.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    fields.push(current);
+    let mut typed = Vec::new();
+    for field in fields {
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        let (name, annotation) = field.split_once(':')?;
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        typed.push((name.to_string(), annotation.trim().to_string()));
+    }
+    if typed.is_empty() { None } else { Some(typed) }
+}
+
 fn type_annotation_name(ty: ValueType) -> Option<String> {
     Some(
         match ty {
@@ -1974,6 +2029,29 @@ impl Emitter {
         if bare == "Point" {
             let point = self.instantiate_builtin_point();
             return Ok(ValueType::Record(point));
+        }
+        // A structural record written as its fields: `{ year: Int; month: Int }`.
+        // `std.time` returns one of these, and without this the whole module
+        // is refused for a reason that reads as if the backend could not model
+        // an `Int`.
+        if let Some(fields) = split_structural_record_fields(trimmed) {
+            let mut typed = Vec::with_capacity(fields.len());
+            for (field, annotation) in fields {
+                let resolved = self.annotation_type(&annotation, span)?;
+                typed.push((field, resolved));
+            }
+            if let Some(index) = self.records.iter().position(|record| {
+                record.usable && record.name.is_empty() && record.fields == typed
+            }) {
+                return Ok(ValueType::Record(index as u32));
+            }
+            self.records.push(RecordInfo {
+                name: String::new(),
+                fields: typed,
+                lambda_fields: Vec::new(),
+                usable: true,
+            });
+            return Ok(ValueType::Record((self.records.len() - 1) as u32));
         }
         // `#GPoint<Int, Int>`: a generic record named with its arguments. The
         // parameters are substituted into the field types and the result is
@@ -3728,9 +3806,12 @@ impl Emitter {
     /// its own top bits after this shift). A failed stat (e.g. a
     /// missing path) reports `false` rather than aborting, matching
     /// the evaluator's `Path::is_dir()` (M15, issue #538).
-    fn emit_dir_is_directory(&mut self) {
+    /// Whether the path in x0 stats to a file of the given type, where the
+    /// type is `st_mode >> 12` -- `S_IFDIR_SHIFTED` for a directory,
+    /// `S_IFREG_SHIFTED` for a regular file. A path that does not stat at all
+    /// answers false, which is what the evaluator's `is_dir`/`is_file` do.
+    fn emit_dir_stat_mode_is(&mut self, kind: u32) {
         const STAT_BUF_SIZE: u64 = 144;
-        const S_IFDIR_SHIFTED: u32 = 0o4; // S_IFDIR (0o040000) >> 12
 
         self.asm.mov_reg(Reg::X7, Reg::X0); // the path, past the buffer setup
 
@@ -3756,7 +3837,7 @@ impl Emitter {
         self.asm.bind(success);
         self.asm.ldrh_imm(Reg::X0, Reg::X6, 4);
         self.asm.lsr_imm(Reg::X0, Reg::X0, 12);
-        self.asm.cmp_imm(Reg::X0, S_IFDIR_SHIFTED);
+        self.asm.cmp_imm(Reg::X0, kind);
         self.asm.cset(Reg::X0, Cond::Eq);
         self.asm.bind(done);
         self.asm.add_sp_imm(STAT_BUF_SIZE as u32);
@@ -4471,6 +4552,48 @@ impl Emitter {
     /// collector into `__const` looking for a header.
     /// A heap string holding the NUL-terminated bytes at the pointer in x0.
     /// The length is measured first, since a C string does not carry one.
+    /// A heap string from the `x2` bytes at `x9`, which must lie outside the
+    /// heap (rodata or the machine stack) so the allocation cannot move them.
+    fn emit_heap_string_from_bytes(&mut self) {
+        self.asm.push(Reg::X9);
+        self.asm.push(Reg::X2);
+        self.emit_alloc_raw_string(Reg::X2); // x5 = object, x2 preserved
+        self.asm.pop(Reg::X2);
+        self.asm.pop(Reg::X6);
+        self.asm.str_imm(Reg::X2, Reg::X5, 0); // length
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8); // destination bytes
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X3);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
+    /// An environment-variable name known while compiling, left in the
+    /// (x9 bytes, x10 length) pair `emit_environment_lookup` reads.
+    fn emit_environment_static_key(&mut self, key: &[u8]) {
+        let offset = self.asm.intern_rodata(key);
+        self.asm.load_rodata_address(Reg::X9, offset);
+        self.asm.mov_imm64(Reg::X10, key.len() as u64);
+    }
+
+    /// `Dir#current()`: Darwin's `__getcwd` fills a buffer and answers 0, so
+    /// the length comes from scanning to the terminator rather than from the
+    /// return value. The buffer is transient and lives on the machine stack,
+    /// not in the GC heap, for the same reason the `stat` buffer does: a raw
+    /// header-less block would desynchronise the sweep's block walk.
+    fn emit_dir_current(&mut self) {
+        const PATH_BUF_SIZE: u32 = 4096;
+        self.asm.sub_sp_imm(PATH_BUF_SIZE);
+        self.asm.add_reg_sp_imm(Reg::X0, 0);
+        self.asm.mov_reg(Reg::X6, Reg::X0);
+        self.asm.mov_imm64(Reg::X1, u64::from(PATH_BUF_SIZE));
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_GETCWD));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: Dir#current failed\n");
+        self.asm.mov_reg(Reg::X0, Reg::X6);
+        self.emit_heap_string_from_cstring();
+        self.asm.add_sp_imm(PATH_BUF_SIZE);
+    }
+
     fn emit_heap_string_from_cstring(&mut self) {
         // x9 = the bytes; x2 = length, counted to the terminator.
         self.asm.mov_reg(Reg::X9, Reg::X0);
@@ -6319,12 +6442,32 @@ impl Emitter {
     /// x19/x20. Preserves x0-x5 because allocation sites have live
     /// String / display builtins, mirroring the C backend's surface.
     /// Returns Ok(None) when `name` is not a builtin.
+    /// The v0.1 prelude spells several builtins without their namespace:
+    /// `getEnv` is `Environment#get`, `args` is `CommandLine#args`, and so
+    /// on. The stdlib modules are written against those short names, so a
+    /// backend that only knows the namespaced spelling refuses `std.env`
+    /// and `std.process` for a reason that has nothing to do with what it
+    /// can emit.
+    fn canonical_builtin_name(name: &str) -> &str {
+        match name {
+            "args" => "CommandLine#args",
+            "exit" => "Process#exit",
+            "stdin" => "StandardInput#all",
+            "stdinLines" => "StandardInput#lines",
+            "env" => "Environment#vars",
+            "getEnv" => "Environment#get",
+            "hasEnv" => "Environment#exists",
+            other => other,
+        }
+    }
+
     fn builtin_call(
         &mut self,
         name: &str,
         arguments: &[Expr],
         span: Span,
     ) -> Result<Option<ValueType>, Diagnostic> {
+        let name = Self::canonical_builtin_name(name);
         match (name, arguments.len()) {
             ("length", 1) => {
                 if self.expression(&arguments[0])? != ValueType::Str {
@@ -8002,7 +8145,12 @@ impl Emitter {
             }
             ("Dir#isDirectory", 1) => {
                 self.emit_path_cstring(&arguments[0])?;
-                self.emit_dir_is_directory();
+                self.emit_dir_stat_mode_is(S_IFDIR_SHIFTED);
+                Ok(Some(ValueType::Bool))
+            }
+            ("Dir#isFile", 1) => {
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_dir_stat_mode_is(S_IFREG_SHIFTED);
                 Ok(Some(ValueType::Bool))
             }
             ("Dir#move", 2) => {
@@ -8015,6 +8163,44 @@ impl Emitter {
                 self.pop_rooted(Reg::X0);
                 self.emit_dir_move();
                 Ok(Some(ValueType::Unit))
+            }
+            ("Dir#current", 0) => {
+                self.emit_dir_current();
+                Ok(Some(ValueType::Str))
+            }
+            // `HOME` and `TMPDIR` are where the evaluator reads these from,
+            // and `Dir#temp` falls back to `/tmp` the way it does there.
+            ("Dir#home", 0) => {
+                self.emit_environment_static_key(b"HOME");
+                self.emit_environment_lookup();
+                let present = self.asm.new_label();
+                self.asm
+                    .branch(present, BranchKind::CompareNonZero(Reg::X0));
+                self.asm.emit_write_rodata(
+                    STDERR_FD,
+                    b"klassic: failed to get home dir: environment variable HOME is not set\n",
+                );
+                self.asm.emit_exit(1);
+                self.asm.bind(present);
+                self.emit_heap_string_from_cstring();
+                Ok(Some(ValueType::Str))
+            }
+            ("Dir#temp", 0) => {
+                self.emit_environment_static_key(b"TMPDIR");
+                self.emit_environment_lookup();
+                let present = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm
+                    .branch(present, BranchKind::CompareNonZero(Reg::X0));
+                let fallback = self.asm.intern_rodata(b"/tmp");
+                self.asm.load_rodata_address(Reg::X9, fallback);
+                self.asm.mov_imm64(Reg::X2, 4);
+                self.emit_heap_string_from_bytes();
+                self.asm.branch(done, BranchKind::Unconditional);
+                self.asm.bind(present);
+                self.emit_heap_string_from_cstring();
+                self.asm.bind(done);
+                Ok(Some(ValueType::Str))
             }
             ("Environment#exists", 1) => {
                 self.emit_environment_key(&arguments[0])?;
@@ -9244,7 +9430,12 @@ impl Emitter {
                 let first_type = arguments
                     .first()
                     .and_then(|argument| self.static_type_under(argument, locals, depth + 1));
-                match name.as_str() {
+                // The prelude's short spellings resolve the same way here as
+                // they do when the call is emitted; predicting a type for
+                // `Environment#get` and not for `getEnv` would refuse a body
+                // the emitter can compile.
+                let name = Self::canonical_builtin_name(name);
+                match name {
                     // head/tail matter more than they look: they are how the
                     // prelude's recursive list functions are written, so
                     // without them a body like `cons(head(xs))(rest)` cannot
