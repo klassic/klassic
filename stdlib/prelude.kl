@@ -20,7 +20,7 @@ def stdlibTake(xs, n) = if((n <= 0)) [] else if(isEmpty(xs)) [] else cons(head(x
 
 def stdlibDrop(xs, n) = if((n <= 0)) xs else if(isEmpty(xs)) xs else stdlibDrop(tail(xs), n - 1)
 
-def stdlibFilter(xs, p) = if(isEmpty(xs)) [] else if(p(head(xs))) cons(head(xs))(stdlibFilter(tail(xs), p)) else stdlibFilter(tail(xs), p)
+def stdlibFilter(xs: List<'a>, p: ('a) => Boolean): List<'a> = if(isEmpty(xs)) xs else if(p(head(xs))) cons(head(xs))(stdlibFilter(tail(xs), p)) else stdlibFilter(tail(xs), p)
 
 def stdlibFind(xs, p) = if(isEmpty(xs)) null else if(p(head(xs))) head(xs) else stdlibFind(tail(xs), p)
 

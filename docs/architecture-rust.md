@@ -2053,6 +2053,13 @@ side of a branch.
   Calling the result on the spot always worked; the binding is what ruled out
   currying and partial application (issue #621). A list *of* such lambdas is
   still refused -- a lambda has no value to put in a list.
+- A recursive generic definition compiles on aarch64 (it specialises per
+  argument-type tuple) and, on x86-64, wherever the call can be inlined with a
+  concrete list. `stdlibFilter` in the prelude carries an annotation now,
+  which moves its x86-64 diagnostic from "its result type is neither
+  annotated nor inferable" -- a fixable-sounding complaint that was not the
+  real one -- to "this backend cannot pass `xs` (`List<'a>`) by itself", which
+  is the actual blocker and the one issue #433 tracks (issue #613, half).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
