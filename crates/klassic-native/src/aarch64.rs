@@ -2831,6 +2831,14 @@ impl Emitter {
                     return self.emit_enum_value(enum_index, tag, &[], *span);
                 }
                 let Some((offset, ty)) = self.lookup(name) else {
+                    // A builtin mentioned as a value rather than called:
+                    // `Process#exit != null` asks whether it is there, and it
+                    // is. Calling one through a name is a different path (an
+                    // alias), so the only thing this has to be is not null.
+                    if name.contains('#') {
+                        self.asm.mov_imm64(Reg::X0, 1);
+                        return Ok(ValueType::Ptr);
+                    }
                     return Err(unsupported(*span, &format!("identifier `{name}`")));
                 };
                 self.asm.load_local(Reg::X0, offset);
@@ -3937,8 +3945,25 @@ impl Emitter {
         } else {
             self.asm.pop(Reg::X0);
         }
-        if lhs_ty != rhs_ty {
+        // Asking whether a heap reference is `null` compares a pointer with
+        // nothing, so the two sides are different types by construction.
+        let comparing_with_null = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+            && ((lhs_ty == ValueType::Null && is_heap_pointer(rhs_ty))
+                || (rhs_ty == ValueType::Null && is_heap_pointer(lhs_ty)));
+        if lhs_ty != rhs_ty && !comparing_with_null {
             return Err(unsupported(span, "mixed operand types"));
+        }
+        if comparing_with_null {
+            self.asm.cmp_reg(Reg::X0, Reg::X1);
+            self.asm.cset(
+                Reg::X0,
+                if op == BinaryOp::Equal {
+                    Cond::Eq
+                } else {
+                    Cond::Ne
+                },
+            );
+            return Ok(ValueType::Bool);
         }
         if lhs_ty == ValueType::Str {
             return match op {

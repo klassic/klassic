@@ -1774,6 +1774,23 @@ leaves the program alone, like every other case the pass does not cover.
 
 With those, every recipe in the cookbook builds on all three targets.
 
+#### `distinct`, and a builtin as a value
+
+`distinct` was a recursive filter, which no backend that compiles a function
+once can take -- a `List<'a>` parameter has no single shape to compile it
+for. A set keeps the first occurrence of each element in order, which is
+exactly what `distinct` answers, so it is `Set#toList(Set#fromList(xs))` now:
+two builtins every backend already has, and no list is built while the
+program runs.
+
+A builtin mentioned rather than called -- `Process#exit != null` -- is a
+value on aarch64 now, and comparing a heap reference with `null` is allowed
+there: the two sides are different types by construction, which is why the
+comparison was refused.
+
+With those, no probe in the corpora and no recipe in the cookbook builds on
+one target and not another.
+
 What is still not lowered: a map that is *only* created and never put into
 keeps every payload type unknown, so asking it about a key is refused --
 there is nothing in it to say what its keys are. A general runtime list is
