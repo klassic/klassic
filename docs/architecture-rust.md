@@ -1992,6 +1992,11 @@ side of a branch.
   loop-shaped helper in `map_chain.rs` ended its arms with a throwaway `0`.
   Those eight are gone. aarch64 also gained an expression-position assignment
   and printing of unit as `()` (issue #610).
+- Floating-point division by zero follows IEEE 754 -- `1.0 / 0.0` is infinity
+  and `0.0 / 0.0` is NaN -- in the evaluator and in the static fold both
+  native backends share. It was an error, so a program could reach infinity by
+  multiplying (`1e300 * 1e300` folded to `inf`) and not by dividing. Integer
+  division by zero stays an error: there is no integer infinity (issue #627).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

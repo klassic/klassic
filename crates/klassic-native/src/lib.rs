@@ -41702,9 +41702,7 @@ fn static_numeric_binary_value(
         1 => {
             let lhs = static_value_as_f32(lhs)?;
             let rhs = static_value_as_f32(rhs)?;
-            if matches!(op, BinaryOp::Divide) && rhs == 0.0 {
-                return None;
-            }
+
             let value = match op {
                 BinaryOp::Add => lhs + rhs,
                 BinaryOp::Subtract => lhs - rhs,
@@ -41717,9 +41715,7 @@ fn static_numeric_binary_value(
         2 => {
             let lhs = static_value_as_f64(lhs)?;
             let rhs = static_value_as_f64(rhs)?;
-            if matches!(op, BinaryOp::Divide) && rhs == 0.0 {
-                return None;
-            }
+
             let value = match op {
                 BinaryOp::Add => lhs + rhs,
                 BinaryOp::Subtract => lhs - rhs,

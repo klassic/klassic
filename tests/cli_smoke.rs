@@ -200,6 +200,41 @@ fn an_assignment_yields_unit() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n()\n5\n()\n");
 }
 
+/// Floating-point division by zero has an answer under IEEE 754, which is
+/// what the underlying f64 implements, so it is no longer an error: a program
+/// could reach infinity by multiplying and not by dividing. Integer division
+/// by zero stays an error -- there is no integer infinity to produce.
+#[test]
+fn float_division_by_zero_follows_ieee() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println(1.0 / 0.0)\nprintln(-1.0 / 0.0)\nprintln(0.0 / 0.0)\nprintln(1.0e300 * 1.0e300)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "float division by zero should have an answer\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "inf\n-inf\nNaN\ninf\n()\n"
+    );
+
+    let integer = Command::new(klassic_bin())
+        .args(["-e", "1 / 0"])
+        .output()
+        .expect("binary should run");
+    assert!(!integer.status.success(), "1 / 0 should stay an error");
+    assert!(
+        String::from_utf8_lossy(&integer.stderr).contains("division by zero"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&integer.stderr)
+    );
+}
+
 /// std.option / std.result richer API via method-style dispatch. The
 /// clean names are restored now that native module namespacing (#449)
 /// makes the free names safe and receiver-type dispatch picks the right
