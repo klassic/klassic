@@ -1,0 +1,54 @@
+// Cross-target fixture: a function that returns a function.
+//
+// A lambda has no runtime representation in the aarch64 backend -- its body
+// is compiled where it is called -- so binding one that a *call* produced
+// meant binding the lambda together with the arguments it closed over. Those
+// go into slots of the caller's frame, which outlive the binding, and the
+// lambda reads them when it is finally called.
+//
+// Calling the result on the spot always worked; it is the binding that did
+// not, which rules out currying and partial application -- ordinary things to
+// write in this language.
+
+def adder(n: Int): (Int) => Int = (x) => x + n
+def prefixer(p: String): (String) => String = (s) => p + s
+def scaler(a: Int, b: Int): (Int) => Int = (x) => x * a + b
+
+// On the spot.
+println(adder(3)(4))
+println(prefixer("<")("x"))
+println(scaler(2, 1)(5))
+
+// Bound first, then called -- the case that did not compile.
+val add3 = adder(3)
+println(add3(4))
+println(add3(0))
+println(add3(-3))
+assertResult(7)(add3(4))
+
+val angle = prefixer("<<")
+println(angle("a"))
+println(angle(""))
+assertResult("<<a")(angle("a"))
+
+val twicePlusOne = scaler(2, 1)
+println(twicePlusOne(5))
+println(twicePlusOne(0))
+assertResult(11)(twicePlusOne(5))
+
+// Captured from a value that is only known while running, so the capture is a
+// slot rather than a constant folded in.
+mutable k = 0
+k = k + 4
+val addK = adder(k)
+println(addK(1))
+assertResult(5)(addK(1))
+
+// Two bindings of the same function keep their own captures.
+val addOne = adder(1)
+val addTen = adder(10)
+println(addOne(100))
+println(addTen(100))
+assertResult(101)(addOne(100))
+assertResult(110)(addTen(100))
+println("done")

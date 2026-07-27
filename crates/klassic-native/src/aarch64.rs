@@ -1986,6 +1986,7 @@ struct GenericFunction {
     return_annotation: Option<String>,
 }
 
+#[derive(Clone)]
 struct FunctionInfo {
     label: Label,
     params: Vec<(String, ValueType)>,
@@ -2027,6 +2028,12 @@ struct GenericRecord {
 struct CapturedEnv {
     lambdas: Vec<(String, usize)>,
     dicts: Vec<(String, Vec<(String, usize)>)>,
+    /// Frame slots the lambda closed over, as (name, slot, type). A lambda
+    /// has no runtime representation here -- its body is compiled where it is
+    /// called -- so a value it captured has to be reachable from there. It is,
+    /// because the slot outlives the binding: `val add3 = adder(3)` puts the
+    /// 3 in a slot of the *caller's* frame and the lambda reads it.
+    values: Vec<(String, u32, ValueType)>,
 }
 
 #[derive(Default)]
@@ -10916,10 +10923,88 @@ impl Emitter {
                 .flatten()
                 .map(|(name, fields)| (name.clone(), fields.clone()))
                 .collect(),
+            values: Vec::new(),
         };
         self.lambdas.push((params, body));
         self.lambda_envs.push(env);
         self.lambdas.len() - 1
+    }
+
+    /// A call whose callee's body *is* a lambda: compile each argument into a
+    /// slot of this frame and intern the lambda with those slots as its
+    /// captured environment, so calling it later reads them. Answers `None`
+    /// when the call is not that shape, which is every other call.
+    fn returned_lambda_binding(&mut self, value: &Expr) -> Result<Option<usize>, Diagnostic> {
+        let Expr::Call {
+            callee, arguments, ..
+        } = value
+        else {
+            return Ok(None);
+        };
+        let Expr::Identifier { name, .. } = callee.as_ref() else {
+            return Ok(None);
+        };
+        // A def whose return type this backend cannot model -- `(Int) => Int`
+        // is one -- is kept whole as a generic function and specialised per
+        // call, so that is where a lambda-returning def lives.
+        let Some(generic) = self
+            .generic_functions
+            .iter()
+            .position(|function| function.name == *name)
+        else {
+            return Ok(None);
+        };
+        let function = self.generic_functions[generic].clone();
+        if function.params.len() != arguments.len() {
+            return Ok(None);
+        }
+        // The body, past any wrapping block that only produces it.
+        let mut body = &function.body;
+        while let Expr::Block { expressions, .. } = body {
+            if expressions.len() != 1 {
+                break;
+            }
+            body = &expressions[0];
+        }
+        let Expr::Lambda {
+            params: lambda_params,
+            body: lambda_body,
+            ..
+        } = body
+        else {
+            return Ok(None);
+        };
+        let lambda_params = lambda_params.clone();
+        let lambda_body = lambda_body.as_ref().clone();
+        let mut captured = Vec::with_capacity(arguments.len());
+        for (param, argument) in function.params.iter().zip(arguments) {
+            let ty = self.expression(argument)?;
+            let slot = self.reserve_locals(8);
+            self.asm.store_local(Reg::X0, slot);
+            if is_heap_pointer(ty) {
+                self.emit_root_frame_slot(slot);
+            }
+            captured.push((param.clone(), slot, ty));
+        }
+        Ok(Some(self.intern_lambda_capturing(
+            lambda_params,
+            lambda_body,
+            captured,
+        )))
+    }
+
+    /// Intern a lambda that also closed over frame slots -- what a function
+    /// returning a lambda leaves behind once its arguments are materialised
+    /// into the caller's frame.
+    fn intern_lambda_capturing(
+        &mut self,
+        params: Vec<String>,
+        body: Expr,
+        values: Vec<(String, u32, ValueType)>,
+    ) -> usize {
+        let index = self.intern_lambda(params, body);
+        self.lambda_envs[index].values = values;
+        index
     }
 
     /// The field-to-lambda mapping of an expression that denotes a dictionary
@@ -11021,6 +11106,12 @@ impl Emitter {
                 .last_mut()
                 .expect("emitter dict scope")
                 .insert(name, fields);
+        }
+        for (name, slot, ty) in env.values {
+            self.scopes
+                .last_mut()
+                .expect("emitter scope")
+                .insert(name, (slot, ty));
         }
     }
 
@@ -11752,6 +11843,20 @@ impl Emitter {
                 // are known from the arguments.
                 if let Expr::Lambda { params, body, .. } = value.as_ref() {
                     let index = self.intern_lambda(params.clone(), body.as_ref().clone());
+                    self.lambda_bindings
+                        .last_mut()
+                        .expect("emitter lambda scope")
+                        .insert(name.clone(), index);
+                    return Ok(());
+                }
+                // `val add3 = adder(3)` where `adder` returns a lambda. The
+                // lambda has no runtime representation, so what is bound here
+                // is the lambda *plus* the arguments it closed over, each
+                // materialised into a slot of this frame. Currying and
+                // partial application are ordinary in this language, and
+                // without this a returned lambda could only be called on the
+                // spot.
+                if let Some(index) = self.returned_lambda_binding(value)? {
                     self.lambda_bindings
                         .last_mut()
                         .expect("emitter lambda scope")

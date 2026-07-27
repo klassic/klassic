@@ -2044,6 +2044,15 @@ side of a branch.
   `tests/cross-exec/39-empty-map-questions.kl`, kept separate from the
   grown-map fixtures because the lowering is all-or-nothing per program
   (issue #614).
+- aarch64 binds a lambda that a *call* produced: `val add3 = adder(3)`. A
+  lambda has no runtime representation there -- its body is compiled where it
+  is called -- so what is bound is the lambda plus the arguments it closed
+  over, each materialised into a slot of the caller's frame and carried in
+  `CapturedEnv::values`. The slots outlive the binding, so the body reads them
+  when the lambda is finally called, and a heap-reference capture is rooted.
+  Calling the result on the spot always worked; the binding is what ruled out
+  currying and partial application (issue #621). A list *of* such lambdas is
+  still refused -- a lambda has no value to put in a list.
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
