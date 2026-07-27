@@ -1816,6 +1816,11 @@ whole sequence, about twenty instructions, at every rooted temporary. A call
 site is four instructions now (park rax, form the slot address, call, restore),
 and the overflow check exists once in the image instead of once per push.
 
+Colour-on-store followed: a heap slot holds a coloured pointer on both
+backends and null stays raw on both, so `emit_gc_colour_pointer` is that rule
+written once. It is emitted inline rather than called -- three instructions,
+and every store of a reference needs it.
+
 The underflow check is worth keeping in the shared version: pushes and pops
 have to balance on every path through every function, an imbalance is
 otherwise invisible, and it is what caught `Set#add` rooting its slots on one

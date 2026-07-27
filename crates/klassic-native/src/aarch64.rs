@@ -4207,13 +4207,26 @@ impl Emitter {
     /// Null stays raw zero: `0 | colour` would be a bogus pointer, and the
     /// root scan and barriers all treat 0 as "nothing here".
     fn emit_color_ptr(&mut self, dst: Reg, src: Reg) {
-        let raw = self.asm.new_label();
         if dst != src {
             self.asm.mov_reg(dst, src);
         }
-        self.asm.branch(raw, BranchKind::CompareZero(dst));
-        self.asm.orr_reg(dst, dst, Reg::X25); // | good colour
-        self.asm.bind(raw);
+        // The colouring itself is the shared one: a heap slot holds a
+        // coloured pointer on every backend, and null stays raw on every
+        // backend, so the rule lives in one place.
+        let portable = match dst {
+            Reg::X0 => crate::portable_asm::Reg::V0,
+            Reg::X1 => crate::portable_asm::Reg::V1,
+            Reg::X2 => crate::portable_asm::Reg::V2,
+            Reg::X3 => crate::portable_asm::Reg::V3,
+            other => {
+                let raw = self.asm.new_label();
+                self.asm.branch(raw, BranchKind::CompareZero(other));
+                self.asm.orr_reg(other, other, Reg::X25);
+                self.asm.bind(raw);
+                return;
+            }
+        };
+        crate::portable_asm::emit_gc_colour_pointer(&mut self.asm, portable);
     }
 
     /// The two shadow-stack cells, reserved on first use.

@@ -14672,11 +14672,7 @@ impl NativeCodeGenerator {
             // bogus non-null pointer; a genuine null stays a raw 0 (which
             // the load barrier passes through untouched). An Int/Double
             // value stored through this same funnel is left uncolored.
-            let store_raw = self.asm.create_text_label();
-            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-            self.asm.jcc_label(Condition::Equal, store_raw);
-            self.asm.or_reg_reg(Reg::Rax, Reg::R14); // raw | good_color
-            self.asm.bind_text_label(store_raw);
+            portable_asm::emit_gc_colour_pointer(self, portable_asm::Reg::V0);
         }
         self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
         self.pop_scope();

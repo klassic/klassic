@@ -436,6 +436,23 @@ pub fn emit_gc_grow_budget<E: PortableAsm>(
 /// (`plat_write_data` / `plat_exit`): the routine's control flow is
 /// architecture-independent, while each backend's impl chooses the actual
 /// OS interface (Linux/macOS `syscall` vs Windows shim `call`).
+/// Colour a pointer on its way into a heap slot.
+///
+/// A heap slot holds a *coloured* pointer, which is what makes the load
+/// barrier able to tell a stale reference from a current one. Null is left
+/// alone: `0 | good_colour` would be a bogus non-null pointer, and a genuine
+/// null has to stay a raw zero for the barrier to pass it through.
+///
+/// Emitted inline rather than called -- it is three instructions, and every
+/// store of a reference needs it.
+pub fn emit_gc_colour_pointer<E: PortableAsm>(out: &mut E, reg: Reg) {
+    let raw = out.create_text_label();
+    out.test_reg_reg(reg, reg);
+    out.jcc_label(Condition::Equal, raw);
+    out.or_reg_reg(reg, Reg::GoodColor);
+    out.bind_text_label(raw);
+}
+
 /// The shadow stack's push, as one routine both backends call.
 ///
 /// The protocol is the whole point of sharing it: a root is the *address* of
