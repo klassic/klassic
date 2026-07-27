@@ -436,6 +436,85 @@ pub fn emit_gc_grow_budget<E: PortableAsm>(
 /// (`plat_write_data` / `plat_exit`): the routine's control flow is
 /// architecture-independent, while each backend's impl chooses the actual
 /// OS interface (Linux/macOS `syscall` vs Windows shim `call`).
+/// The shadow stack's push, as one routine both backends call.
+///
+/// The protocol is the whole point of sharing it: a root is the *address* of
+/// a slot, so the collector can rewrite what the slot holds when it moves an
+/// object; the table has a fixed length and overflowing it is fatal rather
+/// than silent. Written once here, the two backends cannot drift on either.
+///
+/// Called with the slot's address in the first argument register. Preserves
+/// every register the caller can see.
+pub fn emit_gc_shadow_push_runtime<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    shadow_stack: E::DataLabel,
+    shadow_stack_top: E::DataLabel,
+    overflow_text: E::DataLabel,
+    overflow_text_len: usize,
+) {
+    use crate::gc_layout::GC_SHADOW_STACK_LEN;
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V1);
+    out.push_reg(Reg::V2);
+    out.push_reg(Reg::V3);
+    out.mov_data_addr(Reg::V2, shadow_stack_top);
+    out.load_ptr_disp32(Reg::V3, Reg::V2, 0);
+    let ok = out.create_text_label();
+    out.mov_imm64(Reg::V1, GC_SHADOW_STACK_LEN as u64);
+    out.cmp_reg_reg(Reg::V3, Reg::V1);
+    out.jcc_label(Condition::Below, ok);
+    out.plat_write_data(2, overflow_text, overflow_text_len);
+    out.plat_exit(1);
+    out.bind_text_label(ok);
+    out.mov_data_addr(Reg::V1, shadow_stack);
+    out.load_ptr_disp32(Reg::V1, Reg::V1, 0);
+    out.shl_reg_imm8(Reg::V3, 3);
+    out.add_reg_reg(Reg::V1, Reg::V3);
+    out.store_ptr_disp32(Reg::V1, 0, Reg::V0);
+    out.load_ptr_disp32(Reg::V3, Reg::V2, 0);
+    out.add_reg_imm32(Reg::V3, 1);
+    out.store_ptr_disp32(Reg::V2, 0, Reg::V3);
+    out.pop_reg(Reg::V3);
+    out.pop_reg(Reg::V2);
+    out.pop_reg(Reg::V1);
+    out.ret();
+}
+
+/// The shadow stack's pop, as one routine both backends call.
+///
+/// The underflow check is a self-test of the root bookkeeping: pushes and
+/// pops have to balance on every path through every function, and an
+/// imbalance is otherwise silent -- a leaked root, or a negative top that
+/// makes the next push write outside the table. Aborting turns any mismatch
+/// into an immediate failure instead of a rare corruption once the collector
+/// is live.
+pub fn emit_gc_shadow_pop_runtime<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    shadow_stack_top: E::DataLabel,
+    underflow_text: E::DataLabel,
+    underflow_text_len: usize,
+) {
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V0);
+    out.push_reg(Reg::V1);
+    out.mov_data_addr(Reg::V0, shadow_stack_top);
+    out.load_ptr_disp32(Reg::V1, Reg::V0, 0);
+    let ok = out.create_text_label();
+    out.mov_imm64(Reg::V2, 0);
+    out.cmp_reg_reg(Reg::V1, Reg::V2);
+    out.jcc_label(Condition::NotEqual, ok);
+    out.plat_write_data(2, underflow_text, underflow_text_len);
+    out.plat_exit(1);
+    out.bind_text_label(ok);
+    out.sub_reg_imm32(Reg::V1, 1);
+    out.store_ptr_disp32(Reg::V0, 0, Reg::V1);
+    out.pop_reg(Reg::V1);
+    out.pop_reg(Reg::V0);
+    out.ret();
+}
+
 pub fn emit_gc_bounds_error<E: PortableAsm>(
     out: &mut E,
     entry: E::TextLabel,

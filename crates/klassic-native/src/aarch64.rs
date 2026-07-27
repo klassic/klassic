@@ -4360,62 +4360,32 @@ impl Emitter {
     /// the same diagnostic the portable routines use for their tables.
     fn emit_shadow_push_routine(&mut self, label: Label) {
         let (base, top) = self.shadow_cells();
-        self.asm.bind(label);
-        self.asm.push(Reg::X1);
-        self.asm.push(Reg::X2);
-        self.asm.push(Reg::X3);
-        self.asm.load_data_address(Reg::X2, top);
-        self.asm.ldr_imm(Reg::X3, Reg::X2, 0); // top
-        let ok = self.asm.new_label();
-        self.asm
-            .mov_imm64(Reg::X1, crate::gc_layout::GC_SHADOW_STACK_LEN as u64);
-        self.asm.cmp_reg(Reg::X3, Reg::X1);
-        self.asm.branch(ok, BranchKind::Conditional(Cond::Lt));
-        self.asm
-            .emit_write_rodata(STDERR_FD, b"klassic gc: shadow stack overflow\n");
-        self.asm.emit_exit(1);
-        self.asm.bind(ok);
-        self.asm.load_data_address(Reg::X1, base);
-        self.asm.ldr_imm(Reg::X1, Reg::X1, 0); // shadow stack base
-        self.asm.lsl_imm(Reg::X3, Reg::X3, 3); // top * 8
-        self.asm.add_reg(Reg::X1, Reg::X1, Reg::X3);
-        self.asm.str_imm(Reg::X0, Reg::X1, 0); // base[top] = slot address
-        self.asm.ldr_imm(Reg::X3, Reg::X2, 0);
-        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
-        self.asm.str_imm(Reg::X3, Reg::X2, 0); // top += 1
-        self.asm.pop(Reg::X3);
-        self.asm.pop(Reg::X2);
-        self.asm.pop(Reg::X1);
-        self.asm.ret();
+        let text = self
+            .asm
+            .intern_rodata(b"klassic gc: shadow stack overflow\n");
+        crate::portable_asm::emit_gc_shadow_push_runtime(
+            &mut self.asm,
+            label,
+            PortDataAddr::Bss(base),
+            PortDataAddr::Bss(top),
+            PortDataAddr::Rodata(text),
+            b"klassic gc: shadow stack overflow\n".len(),
+        );
     }
 
     /// `bl`-called: drop one shadow-stack root. Preserves every register.
-    ///
-    /// The underflow check is a deliberate self-test of the root
-    /// bookkeeping: pushes and pops must balance on every path, and an
-    /// imbalance is otherwise silent (a leaked root, or -- worse -- a
-    /// negative top that makes the next push write outside the table).
-    /// Aborting here turns any mismatch into an immediate, obvious CI
-    /// failure on arm64 instead of a rare corruption once the collector is
-    /// live.
     fn emit_shadow_pop_routine(&mut self, label: Label) {
         let (_, top) = self.shadow_cells();
-        self.asm.bind(label);
-        self.asm.push(Reg::X0);
-        self.asm.push(Reg::X1);
-        self.asm.load_data_address(Reg::X0, top);
-        self.asm.ldr_imm(Reg::X1, Reg::X0, 0);
-        let ok = self.asm.new_label();
-        self.asm.branch(ok, BranchKind::CompareNonZero(Reg::X1));
-        self.asm
-            .emit_write_rodata(STDERR_FD, b"klassic gc: shadow stack underflow\n");
-        self.asm.emit_exit(1);
-        self.asm.bind(ok);
-        self.asm.sub_reg_imm(Reg::X1, Reg::X1, 1);
-        self.asm.str_imm(Reg::X1, Reg::X0, 0);
-        self.asm.pop(Reg::X1);
-        self.asm.pop(Reg::X0);
-        self.asm.ret();
+        let text = self
+            .asm
+            .intern_rodata(b"klassic gc: shadow stack underflow\n");
+        crate::portable_asm::emit_gc_shadow_pop_runtime(
+            &mut self.asm,
+            label,
+            PortDataAddr::Bss(top),
+            PortDataAddr::Rodata(text),
+            b"klassic gc: shadow stack underflow\n".len(),
+        );
     }
 
     /// M7: copy the string object in x0 onto the GC heap, leaving the copy

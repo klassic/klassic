@@ -1800,6 +1800,25 @@ taking `List<'a>`, and a recursive function is compiled once, so its
 parameter kinds have to be fixed. That one wants monomorphisation of
 recursive generic definitions.
 
+### The shadow stack, written once
+
+The 24 GC runtime routines have been emitted through `PortableAsm` since
+#600, but the *mutator* side -- the sequences a compiled program runs to push
+a root, drop one, load through the barrier, colour a store -- was written
+twice, once per hand-emitted backend. The shadow stack's push and pop are the
+first of those to move: `emit_gc_shadow_push_runtime` and
+`emit_gc_shadow_pop_runtime` in `portable_asm.rs` are now the single source
+of the protocol -- a root is the *address* of a slot so the collector can
+rewrite it when it moves an object, the table has a fixed length, and
+overflowing or underflowing it is fatal rather than silent. The aarch64
+backend calls them; the x86-64 backend still inlines its own copies, which is
+the next thing to fold in.
+
+The underflow check is worth keeping in the shared version: pushes and pops
+have to balance on every path through every function, an imbalance is
+otherwise invisible, and it is what caught `Set#add` rooting its slots on one
+side of a branch.
+
 ## Design Notes
 
 - The direct evaluator is the current execution engine.
