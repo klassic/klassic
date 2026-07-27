@@ -1979,6 +1979,12 @@ side of a branch.
 - The enum lowering now descends into string interpolation. It did not, so
   `"#{Some(1)}"` kept a constructor call no backend had declared -- a shared
   middle-end gap that showed up as an unknown function on aarch64.
+- aarch64 steps over an `axiom` / `theorem` declaration instead of refusing
+  it. Proofs are checked before any backend runs, so a declaration produces no
+  code -- exactly like the other declaration forms already listed beside it.
+  `test-programs/proof-surface.kl` is the first `.kl` file in the repo using
+  either keyword, which is why a whole target refusing them went unnoticed for
+  a release (issue #625).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

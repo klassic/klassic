@@ -11389,6 +11389,12 @@ impl Emitter {
             | Expr::RecordDeclaration { .. }
             | Expr::EnumDeclaration { .. }
             | Expr::TypeClassDeclaration { .. }
+            // A proof is checked before any backend runs (`analyze_proofs`,
+            // and the --warn-trust / --deny-trust flags act there), so by the
+            // time it reaches codegen it produces no code -- exactly like the
+            // declarations above it.
+            | Expr::AxiomDeclaration { .. }
+            | Expr::TheoremDeclaration { .. }
             | Expr::InstanceDeclaration { .. } => Ok(()),
             Expr::VarDecl {
                 name,

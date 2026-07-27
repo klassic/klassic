@@ -1,0 +1,26 @@
+// The proof surface, in a program that also runs.
+//
+// `axiom` and `theorem` are checked before any backend sees them and produce
+// no code, so a build's only job is to step over them. Nothing exercised that
+// -- there was no `.kl` file in the repo using either keyword -- and one
+// target refused every program containing an `axiom` for a whole release
+// without anyone noticing.
+//
+// The flags that act on this surface are `--warn-trust` (report a trusted
+// proof) and `--deny-trust` (refuse one); both are covered by their own tests
+// in tests/cli_smoke.rs. This file is the half that has to keep building and
+// running everywhere.
+
+axiom reflexive(x: Int): { x == x }
+
+axiom addCommutes(x: Int, y: Int): { x + y == y + x }
+
+// Ordinary code beside them, so a build that mishandled a declaration would
+// take the rest of the program down with it.
+def add(x: Int, y: Int): Int = x + y
+
+println(add(2, 3))
+println(add(3, 2))
+println(add(2, 3) == add(3, 2))
+assertResult(5)(add(2, 3))
+println("done")

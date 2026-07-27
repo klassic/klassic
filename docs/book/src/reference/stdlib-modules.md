@@ -403,7 +403,8 @@ import std.dir.{current, home, temp, isDirectory, list}
 
 println(current())            // current working directory
 println(home())               // user's home directory
-println(list("/tmp"))         // directory entries
+println(isDirectory(temp()))  // true
+println(list(temp()))         // directory entries
 ```
 
 ## std.process
