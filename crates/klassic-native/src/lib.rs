@@ -6926,6 +6926,7 @@ impl NativeCodeGenerator {
                 value,
                 mutable,
                 span,
+                annotation,
                 ..
             } => {
                 if !mutable && let Some(alias) = self.builtin_alias_from_expr(value) {
@@ -6934,6 +6935,15 @@ impl NativeCodeGenerator {
                     return Ok(NativeValue::Unit);
                 }
                 let compiled = self.compile_expr(value)?;
+                // A binding annotated with a generic enum applied to concrete
+                // types says what its payloads are, even when the value does
+                // not: `val e: Chain<String, Int> = Nil` builds the empty
+                // case, which fixes nothing on its own. Reading the shape off
+                // the annotation is exact -- every type argument is named --
+                // so it is not the partial resolution that is unsound.
+                let annotated_shape = annotation
+                    .as_ref()
+                    .and_then(|annotation| self.generic_enum_annotation_shape(&annotation.text));
                 match compiled {
                     NativeValue::Int
                     | NativeValue::Bool
@@ -6941,6 +6951,9 @@ impl NativeCodeGenerator {
                     | NativeValue::HeapString
                     | NativeValue::RuntimeDouble => {
                         let slot = self.allocate_slot(name.clone(), compiled);
+                        if let Some(shape) = annotated_shape {
+                            self.enum_shapes.insert(slot.id, shape);
+                        }
                         self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                         if static_expr_is_pure(value)
                             && let Some(value) = self.static_value_from_expr(value)

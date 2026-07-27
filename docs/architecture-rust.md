@@ -2060,6 +2060,13 @@ side of a branch.
   annotated nor inferable" -- a fixable-sounding complaint that was not the
   real one -- to "this backend cannot pass `xs` (`List<'a>`) by itself", which
   is the actual blocker and the one issue #433 tracks (issue #613, half).
+- A `val` annotated with a generic enum applied to concrete types gives its
+  binding that shape. `val e: Chain<String, Int> = Nil` builds the empty case,
+  which fixes nothing on its own, so a helper walking it had no idea what its
+  fields hold. Reading the shape off the annotation is exact -- every type
+  argument is named -- so it is not the partial resolution issue #612 is
+  about, which stays refused. Covered by
+  `tests/cross-exec/41-annotated-generic-enum.kl` (issue #612, the safe part).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

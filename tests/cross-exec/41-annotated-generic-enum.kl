@@ -1,0 +1,62 @@
+// Cross-target fixture: a generic enum whose payloads only the annotation
+// names.
+//
+// A value built from the *empty* case fixes nothing -- `Nil` carries no
+// payloads -- so a helper walking it had no idea what its fields hold, and
+// reading a key out of one was refused for want of a type. The binding's own
+// annotation names every type argument, which is exact rather than a partial
+// guess, so it is what the value's shape is read from.
+
+enum Chain<'k, 'v> {
+  case Nil
+  case Cons(key: 'k, value: 'v, rest: Chain<'k, 'v>)
+}
+
+def hasKey(c: Chain<'k, 'v>, key: 'k): Boolean = {
+  mutable cur = c
+  mutable yes = false
+  mutable go = true
+  while (go) {
+    cur match {
+      case Nil => go = false
+      case Cons(k, v, rest) => { yes = (if (k == key) true else yes); cur = rest }
+    }
+  }
+  yes
+}
+
+def sizeOfChain(c: Chain<'k, 'v>): Int = {
+  mutable cur = c
+  mutable n = 0
+  mutable go = true
+  while (go) {
+    cur match {
+      case Nil => go = false
+      case Cons(k, v, rest) => { n = n + 1; cur = rest }
+    }
+  }
+  n
+}
+
+// A chain that says what it holds only through the annotation.
+val empty: Chain<String, Int> = Nil
+println(hasKey(empty, "a"))
+println(sizeOfChain(empty))
+assertResult(false)(hasKey(empty, "a"))
+
+// One built up from it, where the constructions fix the payloads themselves.
+val one: Chain<String, Int> = Cons("a", 1, Nil)
+val two: Chain<String, Int> = Cons("b", 2, one)
+println(hasKey(two, "a"))
+println(hasKey(two, "b"))
+println(hasKey(two, "zz"))
+println(sizeOfChain(two))
+assertResult(2)(sizeOfChain(two))
+
+// The other way round: Int keys and String values, so a shape read from the
+// annotation cannot be right by accident.
+val flipped: Chain<Int, String> = Cons(1, "one", Nil)
+println(hasKey(flipped, 1))
+println(hasKey(flipped, 9))
+println(sizeOfChain(flipped))
+println("done")
