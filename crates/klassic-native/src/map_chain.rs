@@ -55,7 +55,6 @@ def klassicMapPut(m: KlassicMapChain<'k, 'v>, key: 'k, value: 'v): KlassicMapCha
         acc = (if (k == key) KlassicMapCons(k, value, acc) else KlassicMapCons(k, v, acc))
         replaced = (if (k == key) true else replaced)
         cur = rest
-        0
       }
     }
   }
@@ -73,7 +72,6 @@ def klassicMapGetOrElse(m: KlassicMapChain<'k, 'v>, key: 'k, fallback: 'v): 'v =
         found = (if (k == key) v else found)
         go = (if (k == key) false else true)
         cur = rest
-        0
       }
     }
   }
@@ -91,7 +89,6 @@ def klassicMapContainsKey(m: KlassicMapChain<'k, 'v>, key: 'k): Boolean = {
         yes = (if (k == key) true else yes)
         go = (if (k == key) false else true)
         cur = rest
-        0
       }
     }
   }
@@ -123,7 +120,6 @@ def klassicMapRender(m: KlassicMapChain<'k, 'v>): String = {
         out = (if (first) (out + k + ": " + v) else (out + ", " + k + ": " + v))
         first = false
         cur = rest
-        0
       }
     }
   }

@@ -2035,6 +2035,15 @@ side of a branch.
   was first tried). x86-64 saved nothing at these sites and is unchanged; the
   fast path -- the colour test and the strip, which is what almost every load
   executes -- does not change on either (issue #618).
+- A map created by `Map#empty()` and never put into can be asked about a key,
+  its size and its emptiness. Creating one is what triggers the chain
+  lowering, so the chain's helpers have to typecheck for a chain that stays
+  empty -- they did not once an assignment started yielding unit, because the
+  arms of a `match` written for effect no longer agreed with a sibling arm
+  ending in a bare `0`. Covered by
+  `tests/cross-exec/39-empty-map-questions.kl`, kept separate from the
+  grown-map fixtures because the lowering is all-or-nothing per program
+  (issue #614).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
