@@ -24,6 +24,9 @@ function.
 ## Constructing values
 
 ```klassic
+import std.result
+import std.option
+
 val good = Ok(42)             // Result<Int, _>
 val bad  = Err("nope")        // Result<_, String>
 val maybe = Some("hi")        // Option<String>
@@ -36,6 +39,8 @@ Postfix `match` dispatches on the variant tag and binds the
 positional fields inside each arm body:
 
 ```klassic
+import std.option
+
 def describe(o) = o match {
   case Some(value) => "got " + toString(value)
   case None        => "nothing"

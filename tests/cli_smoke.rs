@@ -30,6 +30,84 @@ fn stdlib_completeness_round_two() {
     );
 }
 
+/// The most negative `Int` is writable as a literal. Its digits alone are one
+/// past `i64::MAX`, so the sign has to reach the range check -- and a larger
+/// magnitude has to stay rejected under either sign.
+#[test]
+fn most_negative_int_literal_round_trips() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "val low = -9223372036854775808\nprintln(low)\nprintln(low + 1)\nprintln(low match { case -9223372036854775808 => \"min\"; case _ => \"other\" })",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "the minimum Int should be a literal\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "-9223372036854775808\n-9223372036854775807\nmin\n()\n"
+    );
+
+    for source in ["9223372036854775808", "-9223372036854775809"] {
+        let rejected = Command::new(klassic_bin())
+            .args(["-e", source])
+            .output()
+            .expect("binary should run");
+        assert!(
+            !rejected.status.success(),
+            "{source} should stay out of range"
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("integer literal is out of range"),
+            "{source} should report the range, got:\n{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+}
+
+/// An `if` is an expression on the right of an assignment, as it is
+/// everywhere else -- no parentheses needed.
+#[test]
+fn assignment_takes_a_branch_on_its_right() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "mutable x = 1\nx = if (true) 2 else 3\nprintln(x)\nmutable y = 0\ny += if (false) 1 else 10\nprintln(y)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "an if should parse as an assignment's value\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "2\n10\n()\n");
+}
+
+/// A declared enum variant is a constructor in a pattern whatever it is
+/// spelled like, so generated code can use the `__` convention. A name that
+/// was never declared stays a binding.
+#[test]
+fn declared_variants_are_constructor_patterns() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum __A { case __N; case __C(x: Int) }\nprintln(__C(5) match { case __N => 0; case __C(x) => x })\nprintln(1 match { case _Rest => 99 })",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "an underscore-prefixed variant should match\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "5\n99\n()\n");
+}
+
 /// std.option / std.result richer API via method-style dispatch. The
 /// clean names are restored now that native module namespacing (#449)
 /// makes the free names safe and receiver-type dispatch picks the right

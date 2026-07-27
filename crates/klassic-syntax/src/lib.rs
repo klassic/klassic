@@ -410,6 +410,11 @@ struct Token {
 #[derive(Clone, Debug, PartialEq)]
 enum TokenKind {
     Int(i64, IntLiteralKind),
+    /// A decimal integer literal whose digits do not fit an `i64`. The lexer
+    /// keeps the magnitude instead of failing so the parser can fold a
+    /// preceding unary minus into it: `-9223372036854775808` is the one value
+    /// that is only reachable that way. Anywhere else this token is an error.
+    IntOutOfRange(u128, IntLiteralKind),
     Double(f64, FloatLiteralKind),
     String(String),
     // Interpolated string template pieces. A string with `#{...}` holes
@@ -482,6 +487,19 @@ enum TokenKind {
     LBrace,
     RBrace,
     Eof,
+}
+
+/// The magnitude of `i64::MIN`. It is the only out-of-range magnitude a unary
+/// minus can turn into a value, which is why the range check waits for the
+/// sign rather than happening in the lexer.
+const I64_MIN_MAGNITUDE: u128 = 1u128 << 63;
+
+fn negate_out_of_range_literal(magnitude: u128, span: Span) -> Result<i64, Diagnostic> {
+    if magnitude == I64_MIN_MAGNITUDE {
+        Ok(i64::MIN)
+    } else {
+        Err(Diagnostic::parse(span, "integer literal is out of range"))
+    }
 }
 
 pub fn parse_source(source: &SourceFile) -> Result<Expr, Diagnostic> {
@@ -835,15 +853,18 @@ impl<'a> Lexer<'a> {
         };
 
         let text = self.input[start..text_end].replace('_', "");
-        let value = text.parse::<i64>().map_err(|_| {
-            Diagnostic::parse(
-                Span::new(start, text_end),
-                "integer literal is out of range",
-            )
-        })?;
+        // Out of range is not decided here: `-9223372036854775808` reaches the
+        // lexer as digits whose magnitude is one past `i64::MAX`, and only the
+        // parser knows whether a unary minus is about to absorb it. Digits too
+        // large even for the magnitude saturate, which keeps them out of range
+        // under every sign.
+        let kind_token = match text.parse::<i64>() {
+            Ok(value) => TokenKind::Int(value, kind),
+            Err(_) => TokenKind::IntOutOfRange(text.parse::<u128>().unwrap_or(u128::MAX), kind),
+        };
 
         Ok(Token {
-            kind: TokenKind::Int(value, kind),
+            kind: kind_token,
             span: Span::new(start, self.position),
         })
     }
@@ -1090,6 +1111,7 @@ struct Parser {
     /// must be declared before use (forward references already fail), so
     /// the set is complete by the time a `#Name` is reached.
     record_names: std::collections::HashSet<String>,
+    enum_variant_names: std::collections::HashSet<String>,
 }
 
 impl Parser {
@@ -1098,6 +1120,7 @@ impl Parser {
             tokens,
             index: 0,
             record_names: std::collections::HashSet::new(),
+            enum_variant_names: std::collections::HashSet::new(),
         }
     }
 
@@ -1616,6 +1639,10 @@ impl Parser {
                 }
             }
             let (variant_name, variant_span) = self.expect_identifier()?;
+            // Remembered so a pattern can name this constructor even when the
+            // name does not start with an uppercase letter, which is how the
+            // pattern parser otherwise tells a constructor from a binding.
+            self.enum_variant_names.insert(variant_name.clone());
             let params = if matches!(self.peek().kind, TokenKind::LParen) {
                 self.bump();
                 let mut entries = Vec::new();
@@ -1818,6 +1845,13 @@ impl Parser {
                             span: start.merge(int_span),
                         })
                     }
+                    TokenKind::IntOutOfRange(magnitude, _) => {
+                        let int_span = self.bump().span;
+                        Ok(Pattern::LiteralInt {
+                            value: negate_out_of_range_literal(magnitude, int_span)?,
+                            span: start.merge(int_span),
+                        })
+                    }
                     _ => Err(Diagnostic::parse(
                         self.peek().span,
                         "expected integer literal after `-` in pattern",
@@ -1837,12 +1871,16 @@ impl Parser {
                 if name == "_" {
                     return Ok(Pattern::Wildcard { span: head_span });
                 }
+                // A constructor pattern is spelled with a leading capital.
+                // A name that was declared as an enum variant is one whatever
+                // it is spelled like, which is what lets generated code use
+                // the `__`-prefixed convention used for synthesized names.
                 let starts_upper = name
                     .chars()
                     .next()
                     .map(|c| c.is_ascii_uppercase())
                     .unwrap_or(false);
-                if starts_upper {
+                if starts_upper || self.enum_variant_names.contains(&name) {
                     let (args, end_span) = if matches!(self.peek().kind, TokenKind::LParen) {
                         self.bump();
                         let mut args = Vec::new();
@@ -2308,7 +2346,7 @@ impl Parser {
             ));
         };
         self.consume_separators();
-        let rhs = self.parse_assignment()?;
+        let rhs = self.parse_assignment_rhs()?;
         let value = match compound {
             None => rhs,
             Some(op) => Expr::Binary {
@@ -2327,6 +2365,19 @@ impl Parser {
             name,
             value: Box::new(value),
         })
+    }
+
+    /// The right-hand side of an assignment. `if`, `while` and `foreach` are
+    /// expressions everywhere else in the language, so they are expressions
+    /// here too; `parse_assignment` alone descends past the keyword handlers
+    /// and reports "expected an expression" at the `if`.
+    fn parse_assignment_rhs(&mut self) -> Result<Expr, Diagnostic> {
+        match self.peek().kind {
+            TokenKind::If => self.parse_if_expression(),
+            TokenKind::While => self.parse_while_expression(),
+            TokenKind::Foreach => self.parse_foreach_expression(),
+            _ => self.parse_assignment(),
+        }
     }
 
     fn parse_ternary(&mut self) -> Result<Expr, Diagnostic> {
@@ -2456,6 +2507,18 @@ impl Parser {
             }
             TokenKind::Minus => {
                 let token = self.bump().span;
+                // `-9223372036854775808` is one literal, not a negation of a
+                // literal that does not exist.
+                if let TokenKind::IntOutOfRange(magnitude, literal_kind) = self.peek().kind.clone()
+                {
+                    let int_span = self.bump().span;
+                    let value = negate_out_of_range_literal(magnitude, int_span)?;
+                    return Ok(Expr::Int {
+                        value,
+                        kind: literal_kind,
+                        span: token.merge(int_span),
+                    });
+                }
                 let expr = self.parse_unary()?;
                 Ok(Expr::Unary {
                     op: UnaryOp::Minus,
@@ -2796,6 +2859,10 @@ impl Parser {
                     span: token,
                 })
             }
+            TokenKind::IntOutOfRange(..) => Err(Diagnostic::parse(
+                self.peek().span,
+                "integer literal is out of range",
+            )),
             TokenKind::Double(value, kind) => {
                 let token = self.bump().span;
                 Ok(Expr::Double {
@@ -4077,6 +4144,12 @@ fn token_text(kind: &TokenKind) -> String {
             IntLiteralKind::Int => value.to_string(),
             IntLiteralKind::Long => format!("{value}L"),
         },
+        TokenKind::IntOutOfRange(magnitude, kind) => match kind {
+            IntLiteralKind::Byte => format!("{magnitude}BY"),
+            IntLiteralKind::Short => format!("{magnitude}S"),
+            IntLiteralKind::Int => magnitude.to_string(),
+            IntLiteralKind::Long => format!("{magnitude}L"),
+        },
         TokenKind::Double(value, kind) => match kind {
             FloatLiteralKind::Float => format!("{value}F"),
             FloatLiteralKind::Double => value.to_string(),
@@ -4158,6 +4231,7 @@ fn needs_spacing_between(previous: Option<&TokenKind>, next: Option<&TokenKind>)
             kind,
             TokenKind::Identifier(_)
                 | TokenKind::Int(..)
+                | TokenKind::IntOutOfRange(..)
                 | TokenKind::Double(..)
                 | TokenKind::True
                 | TokenKind::False
@@ -4984,5 +5058,58 @@ mod tests {
             }
             other => panic!("unexpected program: {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_most_negative_int_is_a_literal() {
+        // The digits alone are one past `i64::MAX`; the minus is what makes
+        // them a value, so the range check has to wait for it.
+        let file = SourceFile::new("test.kl", "-9223372036854775808");
+        let program = parse_source(&file).expect("program should parse");
+        match program {
+            Expr::Int { value, .. } => assert_eq!(value, i64::MIN),
+            other => panic!("unexpected program: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_larger_magnitude_is_still_out_of_range() {
+        for source in ["9223372036854775808", "-9223372036854775809", "-1e0000000"] {
+            let file = SourceFile::new("test.kl", source);
+            if let Ok(program) = parse_source(&file) {
+                // `-1e0000000` is a float and may parse; the integer cases
+                // must not.
+                assert!(
+                    !matches!(program, Expr::Int { .. }),
+                    "{source} should not be an int literal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_assignment_takes_an_if_on_its_right() {
+        let file = SourceFile::new("test.kl", "mutable x = 1\nx = if (true) 2 else 3");
+        let program = parse_source(&file).expect("program should parse");
+        match program {
+            Expr::Block { expressions, .. } => {
+                assert!(matches!(expressions[1], Expr::Assign { .. }));
+            }
+            other => panic!("unexpected program: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_declared_variant_is_a_constructor_pattern_whatever_its_spelling() {
+        let source = "enum __A { case __N; case __C(x: Int) }\n\
+                      __C(5) match { case __N => 0; case __C(x) => x }";
+        let file = SourceFile::new("test.kl", source);
+        parse_source(&file).expect("program should parse");
+    }
+
+    #[test]
+    fn an_undeclared_underscore_name_is_still_a_binding() {
+        let file = SourceFile::new("test.kl", "1 match { case _Rest => 99 }");
+        parse_source(&file).expect("program should parse");
     }
 }

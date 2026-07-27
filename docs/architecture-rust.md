@@ -1903,6 +1903,28 @@ side of a branch.
   inherits the enclosing builtin's own name (e.g. `map: ...`) rather than
   naming the callback itself — an improvement over no name at all, but not
   fully precise; left as a documented limitation rather than chased further.
+- The lexer no longer decides whether a decimal integer literal is in range:
+  `-9223372036854775808` reaches it as digits one past `i64::MAX`, and only
+  the parser knows whether a unary minus is about to absorb them. Digits that
+  do not fit become `TokenKind::IntOutOfRange(magnitude, kind)`, which the
+  unary-minus arms in both the expression and the pattern parser turn into
+  `i64::MIN` when the magnitude is exactly `1 << 63` and reject otherwise;
+  anywhere else the token is the same "integer literal is out of range" it
+  always was (issue #628).
+- An assignment's right-hand side goes through `parse_assignment_rhs`, which
+  admits the expression keywords `if` / `while` / `foreach` before falling
+  back to `parse_assignment`. `x = if (c) a else b` used to need parentheses
+  because those keywords are handled above `parse_assignment`, so the
+  descent reported "expected an expression" at the `if` (issue #609).
+- The pattern parser now treats a name as a constructor when it was declared
+  as an enum variant, in addition to the existing leading-capital rule, so a
+  variant named with the `__` convention used for synthesized names matches.
+  An undeclared `_`-prefixed name stays a binding (issue #611).
+- `tests/book_examples.rs` extracts every ```klassic block under
+  `docs/book/src` and runs it through the evaluator; an info string of
+  ```klassic,norun documents a program that needs arguments or stdin and is
+  extracted but not run. Four blocks were missing the `import` line they
+  needed when the harness first ran (issue #629).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
