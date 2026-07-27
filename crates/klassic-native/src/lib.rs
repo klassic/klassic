@@ -7418,6 +7418,16 @@ impl NativeCodeGenerator {
             self.asm.movzx_rax_al();
             return Ok(NativeValue::Bool);
         }
+        // A string compared with `null`. A static or runtime string is a
+        // (data, length) pair in fixed storage, so it is never null and the
+        // answer is settled here; a heap string is a pointer, so the answer is
+        // whether that pointer is zero. Asking is what a caller writes first
+        // after a lookup that may not have found anything.
+        if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+            && let Some(answer) = self.compile_string_null_comparison(lhs_value, op, rhs, span)?
+        {
+            return Ok(answer);
+        }
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && let Some(lhs_string) = self.native_string_ref(lhs_value)
         {
@@ -34479,6 +34489,53 @@ impl NativeCodeGenerator {
     /// scratch buffer pair first. An extension method's `this: String`
     /// parameter arrives as a heap string, so without this every string
     /// builtin written as `this.startsWith(...)` was refused.
+    /// `s == null` / `s != null` where one side is a string. Answers `None`
+    /// when this is not that comparison, so the caller falls through to the
+    /// ordinary string equality.
+    ///
+    /// A static or runtime string is a (data, length) pair in fixed storage,
+    /// so it is never null and the answer is settled while compiling. A heap
+    /// string is a pointer, so the answer is whether that pointer is zero.
+    fn compile_string_null_comparison(
+        &mut self,
+        lhs_value: NativeValue,
+        op: BinaryOp,
+        rhs: &Expr,
+        _span: Span,
+    ) -> Result<Option<NativeValue>, Diagnostic> {
+        if lhs_value == NativeValue::Null {
+            let rhs_value = self.compile_expr(rhs)?;
+            return Ok(self.emit_string_null_answer(rhs_value, op));
+        }
+        if !matches!(rhs, Expr::Null { .. }) {
+            return Ok(None);
+        }
+        Ok(self.emit_string_null_answer(lhs_value, op))
+    }
+
+    /// The answer for a string `value` compared with `null`, with the string
+    /// already in Rax. `None` when `value` is not a string.
+    fn emit_string_null_answer(&mut self, value: NativeValue, op: BinaryOp) -> Option<NativeValue> {
+        match value {
+            NativeValue::StaticString { .. } | NativeValue::RuntimeString { .. } => {
+                self.asm
+                    .mov_imm64(Reg::Rax, u64::from(op == BinaryOp::NotEqual));
+                Some(NativeValue::Bool)
+            }
+            NativeValue::HeapString => {
+                self.asm.cmp_reg_imm8(Reg::Rax, 0);
+                self.asm.setcc_al(if op == BinaryOp::Equal {
+                    Condition::Equal
+                } else {
+                    Condition::NotEqual
+                });
+                self.asm.movzx_rax_al();
+                Some(NativeValue::Bool)
+            }
+            _ => None,
+        }
+    }
+
     fn native_string_ref_or_copy(
         &mut self,
         value: NativeValue,

@@ -1314,6 +1314,10 @@ enum ListElem {
     /// An element that is a record, which is a pointer too. A list of them is
     /// what `toPairs()` hands back.
     Record(u32),
+    /// An element that is a *lowered* enum -- one the shared pass erased into
+    /// `__gc_record` calls -- carrying its entry in the lowered-enum table so
+    /// a list of them can be printed. A pointer, like the two above.
+    LoweredEnum(u32),
     /// An element that is itself a list: `depth` levels of list over `base`.
     /// `List<List<Int>>`'s element is `Nested { depth: 1, base: Int }` and
     /// `List<List<List<Int>>>`'s is `depth: 2`.
@@ -1355,7 +1359,10 @@ impl ListElem {
             ListElem::Int => Some(ScalarElem::Int),
             ListElem::Bool => Some(ScalarElem::Bool),
             ListElem::Str => Some(ScalarElem::Str),
-            ListElem::Enum(_) | ListElem::Record(_) | ListElem::Nested { .. } => None,
+            ListElem::Enum(_)
+            | ListElem::Record(_)
+            | ListElem::LoweredEnum(_)
+            | ListElem::Nested { .. } => None,
         }
     }
 
@@ -1733,6 +1740,7 @@ fn elem_value_type(elem: ListElem) -> ValueType {
         ListElem::Str => ValueType::Str,
         ListElem::Enum(shape) => ValueType::Enum(shape),
         ListElem::Record(index) => ValueType::Record(index),
+        ListElem::LoweredEnum(index) => ValueType::LoweredEnum(index),
         ListElem::Nested { .. } => ValueType::List(
             elem.nested_inner()
                 .expect("a nested element is a list of its inner element"),
@@ -1958,6 +1966,7 @@ fn list_elem_of(ty: ValueType) -> Option<ListElem> {
         ValueType::Str => Some(ListElem::Str),
         ValueType::Enum(shape) => Some(ListElem::Enum(shape)),
         ValueType::Record(index) => Some(ListElem::Record(index)),
+        ValueType::LoweredEnum(index) => Some(ListElem::LoweredEnum(index)),
         // A list of lists: one more level over whatever the inner list holds.
         ValueType::List(inner) => Some(match inner.as_scalar() {
             Some(base) => ListElem::Nested { depth: 1, base },
@@ -6464,6 +6473,9 @@ impl Emitter {
             ListElem::Enum(shape) => {
                 self.emit_print_enum_inline(shape, span)?;
             }
+            ListElem::LoweredEnum(index) => {
+                self.emit_print_lowered_enum(index, span)?;
+            }
             ListElem::Record(index) => {
                 self.emit_print_record_inline(index, span)?;
             }
@@ -8840,6 +8852,7 @@ impl Emitter {
             ListElem::Bool => self.emit_bool_to_str(),
             ListElem::Str => {}
             ListElem::Enum(shape) => self.emit_enum_to_str(shape, span)?,
+            ListElem::LoweredEnum(index) => self.emit_lowered_enum_to_str(index, span)?,
             ListElem::Record(_) => {
                 return Err(unsupported(span, "rendering a record element"));
             }
@@ -11557,6 +11570,7 @@ impl Emitter {
                     ListElem::Double
                     | ListElem::Enum(_)
                     | ListElem::Record(_)
+                    | ListElem::LoweredEnum(_)
                     | ListElem::Nested { .. } => {
                         return Err(unsupported(
                             argument.span(),

@@ -2008,6 +2008,17 @@ side of a branch.
   which is what `mapValues`, `filterValues` and `foldMap` do (issue #615).
   Still unsupported everywhere: `mapKeys`, which goes through
   `Map#fromPairs`.
+- x86-64 compares a string with `null`. A static or runtime string is a
+  (data, length) pair in fixed storage, so it is never null and the answer is
+  settled while compiling; a heap string is a pointer, so the answer is
+  whether that pointer is zero. It reported "equality for values with
+  different types", which is the first thing a caller writes after a lookup
+  that may not have found anything (issue #624).
+- aarch64 holds a lowered enum in a list (`ListElem::LoweredEnum`), so
+  `[Sm(1), Nn]` builds and prints there. x86-64 still refuses it: its list
+  literals are static storage and a list of heap values needs the runtime
+  representation issue #433 tracks, which is a separate piece of work
+  (issue #620, half).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

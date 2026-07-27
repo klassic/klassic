@@ -235,6 +235,52 @@ fn float_division_by_zero_follows_ieee() {
     );
 }
 
+/// A string compared with `null`. A static or runtime string is a
+/// (data, length) pair in fixed storage and so is never null; a heap string
+/// is a pointer and the answer is whether it is zero. Asking is the first
+/// thing written after a lookup that may not have found anything, and it did
+/// not compile.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_compares_a_string_with_null() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after the epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("klassic-string-null-{stamp}"));
+    fs::create_dir_all(&dir).expect("temp dir should be creatable");
+    let source_path = dir.join("program.kl");
+    let bin_path = dir.join("program");
+    fs::write(
+        &source_path,
+        "import std.string\n         val s: String = getEnv(\"PATH\")\n         println(s == null)\n         println(s != null)\n         val t = \"abc\"\n         println(t == null)\n         println(null == t)\n         println(t.toUpperCase() == null)\n",
+    )
+    .expect("source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "comparing a string with null should compile\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("generated program should run");
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "false\ntrue\nfalse\nfalse\nfalse\n"
+    );
+}
+
 /// std.option / std.result richer API via method-style dispatch. The
 /// clean names are restored now that native module namespacing (#449)
 /// makes the free names safe and receiver-type dispatch picks the right
