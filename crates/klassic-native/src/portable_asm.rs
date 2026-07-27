@@ -501,9 +501,11 @@ pub fn emit_gc_shadow_pop_runtime<E: PortableAsm>(
     out.push_reg(Reg::V1);
     out.mov_data_addr(Reg::V0, shadow_stack_top);
     out.load_ptr_disp32(Reg::V1, Reg::V0, 0);
+    // Compared against an immediate rather than through a scratch register:
+    // this routine promises to preserve every register the caller can see,
+    // and it has only saved the two it uses.
     let ok = out.create_text_label();
-    out.mov_imm64(Reg::V2, 0);
-    out.cmp_reg_reg(Reg::V1, Reg::V2);
+    out.cmp_reg_imm8(Reg::V1, 0);
     out.jcc_label(Condition::NotEqual, ok);
     out.plat_write_data(2, underflow_text, underflow_text_len);
     out.plat_exit(1);
