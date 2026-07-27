@@ -58,7 +58,14 @@ def indexOfFrom(xs, x, i) = if(isEmpty(xs)) (0 - 1) else if(head(xs) == x) i els
 def indexOf(xs, x) = indexOfFrom(xs, x, 0)
 
 // Drop later duplicates, keeping each element's first occurrence.
-def distinct(xs) = if(isEmpty(xs)) [] else cons(head(xs))(distinct(filter(tail(xs), (y) => y != head(xs))))
+// Keep the first occurrence of each element, in order -- which is what a set
+// keeps, so this is a set round trip rather than a recursive filter.
+//
+// The recursion it replaces could not be compiled by every native backend: a
+// recursive function has to be compiled once, and a `List<'a>` parameter has
+// no single shape to compile it for. `Set#fromList` and `Set#toList` are
+// builtins on every backend.
+def distinct(xs: List<'a>): List<'a> = Set#toList(Set#fromList(xs))
 
 // ---------- flatten ---------------------------------------------------------
 

@@ -4468,6 +4468,12 @@ struct NativeCodeGenerator {
     gc_oom_text: DataLabel,
     gc_worklist_overflow_text: DataLabel,
     gc_shadow_overflow_text: DataLabel,
+    gc_shadow_underflow_text: DataLabel,
+    /// The shared shadow-stack push and pop, called rather than inlined: the
+    /// protocol lives in `portable_asm` so both hand-emitted backends run the
+    /// same one.
+    gc_shadow_push: TextLabel,
+    gc_shadow_pop: TextLabel,
     gc_bounds_error_text: DataLabel,
     /// Lowest rsp the program may reach before the prologue probe
     /// aborts: initial rsp minus RLIMIT_STACK plus a safety margin,
@@ -4708,6 +4714,10 @@ impl NativeCodeGenerator {
             asm.data_label_with_bytes(b"klassic gc: mark worklist overflow\n");
         let gc_shadow_overflow_text =
             asm.data_label_with_bytes(b"klassic gc: shadow stack overflow\n");
+        let gc_shadow_underflow_text =
+            asm.data_label_with_bytes(b"klassic gc: shadow stack underflow\n");
+        let gc_shadow_push = asm.create_text_label();
+        let gc_shadow_pop = asm.create_text_label();
         let gc_bounds_error_text = asm.data_label_with_bytes(b"klassic gc: index out of bounds\n");
         let stack_floor = asm.data_label_with_i64s(&[0]);
         let stack_overflow_abort = asm.create_text_label();
@@ -4872,6 +4882,9 @@ impl NativeCodeGenerator {
             gc_oom_text,
             gc_worklist_overflow_text,
             gc_shadow_overflow_text,
+            gc_shadow_underflow_text,
+            gc_shadow_push,
+            gc_shadow_pop,
             gc_bounds_error_text,
             stack_floor,
             stack_overflow_abort,
@@ -5522,6 +5535,7 @@ impl NativeCodeGenerator {
         self.emit_gc_alloc_large_runtime();
         self.emit_gc_grow_budget_runtime();
         self.emit_gc_bounds_error_runtime();
+        self.emit_gc_shadow_runtime();
         if self.is_windows {
             self.emit_win_init_runtime();
             self.emit_win_write_runtime();
@@ -7127,6 +7141,25 @@ impl NativeCodeGenerator {
                     return Err(unsupported(*span, "native assignment to this value type"));
                 }
                 let compiled = self.compile_expr(value)?;
+                // A binding that holds a heap string takes any other shape of
+                // string by lifting it onto the heap first -- which is what
+                // `t = replaceAll(t, ...)` in a loop produces, and refusing it
+                // refused the loop.
+                let compiled = if slot.value == NativeValue::HeapString
+                    && compiled != NativeValue::HeapString
+                    && self
+                        .emit_heap_string_concat_fragment(
+                            compiled,
+                            *span,
+                            "native assignment with changed value type",
+                            false,
+                        )
+                        .is_ok()
+                {
+                    NativeValue::HeapString
+                } else {
+                    compiled
+                };
                 if compiled != slot.value {
                     return Err(unsupported(
                         *span,
@@ -12222,7 +12255,9 @@ impl NativeCodeGenerator {
                 }
                 if self.expr_may_yield_runtime_string(&arguments[0]) {
                     let input = self.compile_expr(&arguments[0])?;
-                    if self.native_string_ref(input).is_some() {
+                    // A string is its own text, whichever shape of string it
+                    // is -- a heap one included.
+                    if self.native_string_ref(input).is_some() || input == NativeValue::HeapString {
                         return Ok(input);
                     }
                     return Err(unsupported(
@@ -12517,9 +12552,23 @@ impl NativeCodeGenerator {
             }
             "split" => {
                 self.expect_static_arity(name, arguments, 2, span)?;
-                if self.expr_may_yield_runtime_string(&arguments[0]) {
+                // A string this backend cannot work out while compiling is
+                // split at run time. `expr_may_yield_runtime_string` only sees
+                // the shapes it knows, so a text built by a *function* -- a
+                // heap string -- used to fall through to the static path and
+                // be refused; asking whether it previews to a static value
+                // covers both.
+                let input_is_static = {
+                    let before = self.static_scopes.clone();
+                    let preview = self.preview_static_value_after_effectful_eval(&arguments[0]);
+                    self.static_scopes = before;
+                    preview.is_some()
+                };
+                if self.expr_may_yield_runtime_string(&arguments[0]) || !input_is_static {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) =
+                        self.native_string_ref_or_copy(input, span, "native split for non-string")
+                    else {
                         return Err(unsupported(span, "native split for non-string"));
                     };
                     if self.expr_may_yield_runtime_string(&arguments[1]) {
@@ -12570,11 +12619,24 @@ impl NativeCodeGenerator {
             }
             "trim" | "trimLeft" | "trimRight" | "toLowerCase" | "toUpperCase" | "reverse" => {
                 self.expect_static_arity(name, arguments, 1, span)?;
-                if matches!(name, "trim" | "trimLeft" | "trimRight")
-                    && self.expr_may_yield_runtime_string(&arguments[0])
-                {
+                // As in `split` and `replaceAll`: a text this backend cannot
+                // work out while compiling is handled at run time, whatever
+                // shape of string it turned out to be.
+                let input_is_static = {
+                    let before = self.static_scopes.clone();
+                    let preview = self.preview_static_value_after_effectful_eval(&arguments[0]);
+                    self.static_scopes = before;
+                    preview.is_some()
+                };
+                let runtime_input =
+                    self.expr_may_yield_runtime_string(&arguments[0]) || !input_is_static;
+                if matches!(name, "trim" | "trimLeft" | "trimRight") && runtime_input {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) = self.native_string_ref_or_copy(
+                        input,
+                        span,
+                        &format!("native {name} for non-string"),
+                    ) else {
                         return Err(unsupported(span, &format!("native {name} for non-string")));
                     };
                     return Ok(self.emit_runtime_string_trim(
@@ -12584,18 +12646,24 @@ impl NativeCodeGenerator {
                         span,
                     ));
                 }
-                if matches!(name, "toLowerCase" | "toUpperCase")
-                    && self.expr_may_yield_runtime_string(&arguments[0])
-                {
+                if matches!(name, "toLowerCase" | "toUpperCase") && runtime_input {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) = self.native_string_ref_or_copy(
+                        input,
+                        span,
+                        &format!("native {name} for non-string"),
+                    ) else {
                         return Err(unsupported(span, &format!("native {name} for non-string")));
                     };
                     return Ok(self.emit_runtime_string_ascii_case(input, name == "toUpperCase"));
                 }
-                if name == "reverse" && self.expr_may_yield_runtime_string(&arguments[0]) {
+                if name == "reverse" && runtime_input {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) = self.native_string_ref_or_copy(
+                        input,
+                        span,
+                        "native reverse for non-string",
+                    ) else {
                         return Err(unsupported(span, "native reverse for non-string"));
                     };
                     return Ok(self.emit_runtime_string_reverse(input));
@@ -12615,9 +12683,22 @@ impl NativeCodeGenerator {
             }
             "replace" | "replaceAll" => {
                 self.expect_static_arity(name, arguments, 3, span)?;
-                if self.expr_may_yield_runtime_string(&arguments[0]) {
+                // As in `split`: a text this backend cannot work out while
+                // compiling is replaced at run time, whether or not it is one
+                // of the shapes `expr_may_yield_runtime_string` recognises.
+                let input_is_static = {
+                    let before = self.static_scopes.clone();
+                    let preview = self.preview_static_value_after_effectful_eval(&arguments[0]);
+                    self.static_scopes = before;
+                    preview.is_some()
+                };
+                if self.expr_may_yield_runtime_string(&arguments[0]) || !input_is_static {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) = self.native_string_ref_or_copy(
+                        input,
+                        span,
+                        "native replace for non-string",
+                    ) else {
                         return Err(unsupported(span, "native replace for non-string"));
                     };
                     if name == "replace" {
@@ -13627,7 +13708,9 @@ impl NativeCodeGenerator {
         self.emit_non_negative_builtin_int_check(span, "__gc_alloc");
         self.emit_builtin_allocation_size_check(span, "__gc_alloc", Self::GC_MAX_PAYLOAD_SIZE);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        // Type tag 1 = "raw bytes" (no pointer fields).
+        // Type tag 1 = "raw bytes" (no pointer fields). The size is already
+        // in the argument register, so only the tag and the call come from
+        // the shared sequence here.
         self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
         self.asm.call_label(self.gc_alloc);
         Ok(NativeValue::HeapPointer)
@@ -14357,14 +14440,12 @@ impl NativeCodeGenerator {
             // so the register holds a raw (canonical) pointer. Only the
             // pointer-typed reads barrier -- an Int/Double read through
             // this same funnel must NOT strip (its high bits are data).
-            let ok = self.asm.create_text_label();
-            self.asm.mov_reg_reg(Reg::R10, Reg::Rax); // field addr
+            self.asm.mov_reg_reg(Reg::R10, Reg::Rax); // field addr, for self-heal
             self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0); // colored value
-            self.asm.test_reg_reg(Reg::Rax, Reg::R15); // bad color?
-            self.asm.jcc_label(Condition::Equal, ok);
-            self.asm.call_label(self.gc_load_barrier_slow);
-            self.asm.bind_text_label(ok);
-            self.asm.and_reg_reg(Reg::Rax, Reg::R13); // strip -> raw
+            let slow = self.gc_load_barrier_slow;
+            // Nothing to save: the slow routine keeps what this backend's
+            // callers hold.
+            portable_asm::emit_gc_load_barrier(self, slow);
         } else {
             self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
         }
@@ -14591,11 +14672,7 @@ impl NativeCodeGenerator {
             // bogus non-null pointer; a genuine null stays a raw 0 (which
             // the load barrier passes through untouched). An Int/Double
             // value stored through this same funnel is left uncolored.
-            let store_raw = self.asm.create_text_label();
-            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-            self.asm.jcc_label(Condition::Equal, store_raw);
-            self.asm.or_reg_reg(Reg::Rax, Reg::R14); // raw | good_color
-            self.asm.bind_text_label(store_raw);
+            portable_asm::emit_gc_colour_pointer(self, portable_asm::Reg::V0);
         }
         self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
         self.pop_scope();
@@ -30631,6 +30708,24 @@ impl NativeCodeGenerator {
                 {
                     return self.expr_may_yield_runtime_string(target);
                 }
+                // The function spelling of the same thing. Only the method
+                // form was recognised, so `split(s, d)` -- which is how the
+                // stdlib writes it -- was not seen as producing lines, and an
+                // `if` with one in each branch had nothing to join them by.
+                if let Expr::Identifier { name, .. } = callee.as_ref()
+                    && self.builtin_name_for_identifier(name) == "split"
+                    && let Some(input) = arguments.first()
+                {
+                    // A heap string counts here even though it does not count
+                    // as a runtime string generally: what this answers is
+                    // "does splitting this produce lines", and it does. Saying
+                    // so generally would change what every other builtin makes
+                    // of a heap string.
+                    let heap_input = matches!(input, Expr::Identifier { name, .. }
+                        if self.lookup_var(name).map(|slot| slot.value)
+                            == Some(NativeValue::HeapString));
+                    return heap_input || self.expr_may_yield_runtime_string(input);
+                }
                 if let Some(name) = self.file_input_lines_print_call_name(expr) {
                     return matches!(name.as_str(), "FileInput#lines" | "FileInput#readLines")
                         && arguments
@@ -39399,6 +39494,33 @@ impl NativeCodeGenerator {
     /// fixed diagnostic and exits with status 1. The list / string
     /// builtins jump here directly when they detect an index outside
     /// the stored length range.
+    /// The shadow stack's push and pop, from the shared source both
+    /// hand-emitted backends use. Called rather than inlined: the sequence is
+    /// about twenty instructions and every rooted temporary needs one.
+    fn emit_gc_shadow_runtime(&mut self) {
+        let push = self.gc_shadow_push;
+        let pop = self.gc_shadow_pop;
+        let stack = self.gc_shadow_stack;
+        let top = self.gc_shadow_stack_top;
+        let overflow = self.gc_shadow_overflow_text;
+        let underflow = self.gc_shadow_underflow_text;
+        portable_asm::emit_gc_shadow_push_runtime(
+            self,
+            push,
+            stack,
+            top,
+            overflow,
+            b"klassic gc: shadow stack overflow\n".len(),
+        );
+        portable_asm::emit_gc_shadow_pop_runtime(
+            self,
+            pop,
+            top,
+            underflow,
+            b"klassic gc: shadow stack underflow\n".len(),
+        );
+    }
+
     fn emit_gc_bounds_error_runtime(&mut self) {
         // Migrated onto the portable `PortableAsm` emitter trait -- the
         // first GC routine to use its platform primitives. The control
@@ -39462,51 +39584,21 @@ impl NativeCodeGenerator {
     /// callers can use this immediately after computing a heap pointer
     /// without an extra spill.
     fn emit_gc_shadow_push(&mut self, rbp_offset: i32) {
-        let overflow = self.asm.create_text_label();
-        let success = self.asm.create_text_label();
-        // Save rax — most callers have the just-computed heap pointer in
-        // it and need to store it into the new slot after this returns.
+        // The routine takes the slot's address in rax and preserves every
+        // register it can see, so the caller only has to park its own rax --
+        // most callers have the just-computed heap pointer there.
         self.asm.push_reg(Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm
-            .cmp_reg_imm32(Reg::Rax, Self::GC_SHADOW_STACK_LEN as i32);
-        self.asm.jcc_label(Condition::AboveOrEqual, overflow);
-        self.asm.mov_data_addr(Reg::R8, self.gc_shadow_stack);
-        self.asm.load_ptr_disp32(Reg::R8, Reg::R8, 0);
-        self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
-        self.asm.shl_reg_imm8(Reg::R9, 3);
-        self.asm.add_reg_reg(Reg::R8, Reg::R9);
-        // rbp moved by 8 due to push rax above; reflect that when forming
-        // the slot address.
-        self.asm.lea_reg_rbp_neg_disp32(Reg::Rcx, rbp_offset);
-        self.asm.store_ptr_disp32(Reg::R8, 0, Reg::Rcx);
-        self.asm.add_reg_imm32(Reg::Rax, 1);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.jmp_label(success);
-        self.asm.bind_text_label(overflow);
-        self.emit_write_data(
-            2,
-            self.gc_shadow_overflow_text,
-            b"klassic gc: shadow stack overflow\n".len(),
-        );
-        self.emit_exit_code(1);
-        self.asm.bind_text_label(success);
+        self.asm.lea_reg_rbp_neg_disp32(Reg::Rax, rbp_offset);
+        self.asm.call_label(self.gc_shadow_push);
         self.asm.pop_reg(Reg::Rax);
     }
 
     /// Emit `gc_shadow_top -= count` so a closing scope drops its
     /// tracked heap-pointer slots from the shadow stack in one shot.
     fn emit_gc_shadow_pop_n(&mut self, count: usize) {
-        if count == 0 {
-            return;
+        for _ in 0..count {
+            self.asm.call_label(self.gc_shadow_pop);
         }
-        self.asm.push_reg(Reg::Rax);
-        self.asm.mov_data_addr(Reg::R10, self.gc_shadow_stack_top);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
-        self.asm.sub_reg_imm32(Reg::Rax, count as i32);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
-        self.asm.pop_reg(Reg::Rax);
     }
 
     fn push_temp_reg(&mut self, reg: Reg) {

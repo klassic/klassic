@@ -141,6 +141,21 @@ pub trait PortableAsm {
     // future ARM-Linux `svc`), so that per-OS emission stays inside the
     // impl and never leaks into the portable GC code that calls them.
     /// Write `len` bytes at data label `data` to file descriptor `fd`.
+    /// Save whatever this backend needs kept across the load barrier's slow
+    /// path, and restore it. The policy around the call is shared; *which
+    /// registers a backend has live there* is the one genuinely
+    /// platform-specific part of it, and three of the aarch64 ones have no
+    /// name in the portable register set. The default is to save nothing,
+    /// which is what a backend whose slow routine already keeps what its
+    /// callers hold wants.
+    fn save_barrier_registers(&mut self) {}
+    fn restore_barrier_registers(&mut self) {}
+
+    /// The same, around an allocation. A different list from the barrier's:
+    /// the allocation's own arguments are live where the barrier's are not.
+    fn save_alloc_registers(&mut self) {}
+    fn restore_alloc_registers(&mut self) {}
+
     fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize);
     /// Terminate the process with status `code` (does not return).
     fn plat_exit(&mut self, code: u64);
@@ -436,6 +451,169 @@ pub fn emit_gc_grow_budget<E: PortableAsm>(
 /// (`plat_write_data` / `plat_exit`): the routine's control flow is
 /// architecture-independent, while each backend's impl chooses the actual
 /// OS interface (Linux/macOS `syscall` vs Windows shim `call`).
+/// Ask the collector for an object: a 16-byte header `[size|mark][type_tag]`
+/// followed by `payload_bytes` of payload, answered as the *user* pointer in
+/// `V0` (the block plus the header), so every payload access is unchanged.
+///
+/// The argument registers are the shared `gc_alloc`'s own -- `V7` the size
+/// and `V6` the tag -- which is why this can be written once. What a backend
+/// needs kept across the call is asked of it, as with the barrier.
+pub fn emit_gc_alloc_object<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    payload_bytes: u64,
+    tag: u64,
+) {
+    out.mov_imm64(Reg::V7, payload_bytes);
+    out.mov_imm64(Reg::V6, tag);
+    out.save_alloc_registers();
+    out.call_label(entry);
+    out.restore_alloc_registers();
+}
+
+/// Box a scalar into its own single-slot `RAW_BYTES` object, scalar in `V0`
+/// and the box's user pointer out in `V0`.
+///
+/// Every slot of a `POINTER_RECORD` has to hold a pointer, so a scalar record
+/// field or list element is boxed on the way in and unboxed on the way out.
+/// That uniform representation is the collector's, not one backend's: it is
+/// what lets the mark phase walk a record without knowing what its fields
+/// mean.
+pub fn emit_gc_box_scalar<E: PortableAsm>(out: &mut E, entry: E::TextLabel) {
+    out.push_reg(Reg::V0); // the scalar, across the allocation
+    emit_gc_alloc_object(out, entry, 8, crate::gc_layout::GC_TYPE_RAW_BYTES);
+    out.pop_reg(Reg::V1);
+    out.store_ptr_disp32(Reg::V0, 0, Reg::V1);
+}
+
+/// Read a scalar back out of its box: the box's user pointer in `V0`, the
+/// scalar out in `V0`. The counterpart of `emit_gc_box_scalar`, and the
+/// reason it is here is the same -- the layout is the collector's.
+pub fn emit_gc_unbox_scalar<E: PortableAsm>(out: &mut E) {
+    out.load_ptr_disp32(Reg::V0, Reg::V0, 0);
+}
+
+/// The load barrier's fast path, around the shared slow routine.
+///
+/// Three stages, and all three are policy rather than machinery: a value
+/// whose colour is *bad* has to go through the slow path, everything else is
+/// current, and either way the colour is stripped so the register holds a
+/// canonical pointer. Written once, the two backends cannot disagree about
+/// which mask means bad or which one strips.
+///
+/// The value is in `V0` and the field's address is wherever the slow routine
+/// expects it -- the caller puts it there, since that is the one part of this
+/// that differs. What has to be kept across the call is asked of the backend
+/// (`save_barrier_registers`), because that is the other part.
+pub fn emit_gc_load_barrier<E: PortableAsm>(out: &mut E, slow: E::TextLabel) {
+    let ok = out.create_text_label();
+    out.test_reg_reg(Reg::V0, Reg::BadMask);
+    out.jcc_label(Condition::Equal, ok);
+    out.save_barrier_registers();
+    out.call_label(slow);
+    out.restore_barrier_registers();
+    out.bind_text_label(ok);
+    out.and_reg_reg(Reg::V0, Reg::ColorStrip);
+}
+
+/// Colour a pointer on its way into a heap slot.
+///
+/// A heap slot holds a *coloured* pointer, which is what makes the load
+/// barrier able to tell a stale reference from a current one. Null is left
+/// alone: `0 | good_colour` would be a bogus non-null pointer, and a genuine
+/// null has to stay a raw zero for the barrier to pass it through.
+///
+/// Emitted inline rather than called -- it is three instructions, and every
+/// store of a reference needs it.
+pub fn emit_gc_colour_pointer<E: PortableAsm>(out: &mut E, reg: Reg) {
+    let raw = out.create_text_label();
+    out.test_reg_reg(reg, reg);
+    out.jcc_label(Condition::Equal, raw);
+    out.or_reg_reg(reg, Reg::GoodColor);
+    out.bind_text_label(raw);
+}
+
+/// The shadow stack's push, as one routine both backends call.
+///
+/// The protocol is the whole point of sharing it: a root is the *address* of
+/// a slot, so the collector can rewrite what the slot holds when it moves an
+/// object; the table has a fixed length and overflowing it is fatal rather
+/// than silent. Written once here, the two backends cannot drift on either.
+///
+/// Called with the slot's address in the first argument register. Preserves
+/// every register the caller can see.
+pub fn emit_gc_shadow_push_runtime<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    shadow_stack: E::DataLabel,
+    shadow_stack_top: E::DataLabel,
+    overflow_text: E::DataLabel,
+    overflow_text_len: usize,
+) {
+    use crate::gc_layout::GC_SHADOW_STACK_LEN;
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V1);
+    out.push_reg(Reg::V2);
+    out.push_reg(Reg::V3);
+    out.mov_data_addr(Reg::V2, shadow_stack_top);
+    out.load_ptr_disp32(Reg::V3, Reg::V2, 0);
+    let ok = out.create_text_label();
+    out.mov_imm64(Reg::V1, GC_SHADOW_STACK_LEN as u64);
+    out.cmp_reg_reg(Reg::V3, Reg::V1);
+    out.jcc_label(Condition::Below, ok);
+    out.plat_write_data(2, overflow_text, overflow_text_len);
+    out.plat_exit(1);
+    out.bind_text_label(ok);
+    out.mov_data_addr(Reg::V1, shadow_stack);
+    out.load_ptr_disp32(Reg::V1, Reg::V1, 0);
+    out.shl_reg_imm8(Reg::V3, 3);
+    out.add_reg_reg(Reg::V1, Reg::V3);
+    out.store_ptr_disp32(Reg::V1, 0, Reg::V0);
+    out.load_ptr_disp32(Reg::V3, Reg::V2, 0);
+    out.add_reg_imm32(Reg::V3, 1);
+    out.store_ptr_disp32(Reg::V2, 0, Reg::V3);
+    out.pop_reg(Reg::V3);
+    out.pop_reg(Reg::V2);
+    out.pop_reg(Reg::V1);
+    out.ret();
+}
+
+/// The shadow stack's pop, as one routine both backends call.
+///
+/// The underflow check is a self-test of the root bookkeeping: pushes and
+/// pops have to balance on every path through every function, and an
+/// imbalance is otherwise silent -- a leaked root, or a negative top that
+/// makes the next push write outside the table. Aborting turns any mismatch
+/// into an immediate failure instead of a rare corruption once the collector
+/// is live.
+pub fn emit_gc_shadow_pop_runtime<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    shadow_stack_top: E::DataLabel,
+    underflow_text: E::DataLabel,
+    underflow_text_len: usize,
+) {
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V0);
+    out.push_reg(Reg::V1);
+    out.mov_data_addr(Reg::V0, shadow_stack_top);
+    out.load_ptr_disp32(Reg::V1, Reg::V0, 0);
+    // Compared against an immediate rather than through a scratch register:
+    // this routine promises to preserve every register the caller can see,
+    // and it has only saved the two it uses.
+    let ok = out.create_text_label();
+    out.cmp_reg_imm8(Reg::V1, 0);
+    out.jcc_label(Condition::NotEqual, ok);
+    out.plat_write_data(2, underflow_text, underflow_text_len);
+    out.plat_exit(1);
+    out.bind_text_label(ok);
+    out.sub_reg_imm32(Reg::V1, 1);
+    out.store_ptr_disp32(Reg::V0, 0, Reg::V1);
+    out.pop_reg(Reg::V1);
+    out.pop_reg(Reg::V0);
+    out.ret();
+}
+
 pub fn emit_gc_bounds_error<E: PortableAsm>(
     out: &mut E,
     entry: E::TextLabel,

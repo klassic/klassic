@@ -243,6 +243,38 @@ struct Assembler {
     bt_pending: bool,
 }
 
+/// The registers a barrier's slow path has to leave as it found them here.
+/// x10-x12 have no name in the portable register set, which is why this list
+/// lives on this side of the trait rather than in the shared routine.
+/// The same, around an allocation: x4/x5 carry the arguments, so they are not
+/// in this list, and x8 is (the barrier's field address is not live here).
+const ALLOC_SAVED: [Reg; 10] = [
+    Reg::X1,
+    Reg::X2,
+    Reg::X3,
+    Reg::X6,
+    Reg::X7,
+    Reg::X8,
+    Reg::X9,
+    Reg::X10,
+    Reg::X11,
+    Reg::X12,
+];
+
+const BARRIER_SAVED: [Reg; 11] = [
+    Reg::X1,
+    Reg::X2,
+    Reg::X3,
+    Reg::X4,
+    Reg::X5,
+    Reg::X6,
+    Reg::X7,
+    Reg::X9,
+    Reg::X10,
+    Reg::X11,
+    Reg::X12,
+];
+
 impl Assembler {
     fn word(&mut self, instruction: u32) {
         self.code.extend_from_slice(&instruction.to_le_bytes());
@@ -1201,6 +1233,30 @@ impl portable_asm::PortableAsm for Assembler {
         self.sub_reg_imm(count, count, 1);
         self.branch(copy_loop, BranchKind::Unconditional);
         self.bind(done);
+    }
+
+    /// The registers this backend has live across a barrier's slow path.
+    /// x10-x12 have no name in the portable set, which is why the list is
+    /// here rather than in the shared routine.
+    fn save_barrier_registers(&mut self) {
+        for reg in BARRIER_SAVED {
+            self.push(reg);
+        }
+    }
+    fn restore_barrier_registers(&mut self) {
+        for reg in BARRIER_SAVED.into_iter().rev() {
+            self.pop(reg);
+        }
+    }
+    fn save_alloc_registers(&mut self) {
+        for reg in ALLOC_SAVED {
+            self.push(reg);
+        }
+    }
+    fn restore_alloc_registers(&mut self) {
+        for reg in ALLOC_SAVED.into_iter().rev() {
+            self.pop(reg);
+        }
     }
 
     fn plat_write_data(&mut self, fd: u64, data: PortDataAddr, len: usize) {
@@ -2831,6 +2887,14 @@ impl Emitter {
                     return self.emit_enum_value(enum_index, tag, &[], *span);
                 }
                 let Some((offset, ty)) = self.lookup(name) else {
+                    // A builtin mentioned as a value rather than called:
+                    // `Process#exit != null` asks whether it is there, and it
+                    // is. Calling one through a name is a different path (an
+                    // alias), so the only thing this has to be is not null.
+                    if name.contains('#') {
+                        self.asm.mov_imm64(Reg::X0, 1);
+                        return Ok(ValueType::Ptr);
+                    }
                     return Err(unsupported(*span, &format!("identifier `{name}`")));
                 };
                 self.asm.load_local(Reg::X0, offset);
@@ -3937,8 +4001,25 @@ impl Emitter {
         } else {
             self.asm.pop(Reg::X0);
         }
-        if lhs_ty != rhs_ty {
+        // Asking whether a heap reference is `null` compares a pointer with
+        // nothing, so the two sides are different types by construction.
+        let comparing_with_null = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+            && ((lhs_ty == ValueType::Null && is_heap_pointer(rhs_ty))
+                || (rhs_ty == ValueType::Null && is_heap_pointer(lhs_ty)));
+        if lhs_ty != rhs_ty && !comparing_with_null {
             return Err(unsupported(span, "mixed operand types"));
+        }
+        if comparing_with_null {
+            self.asm.cmp_reg(Reg::X0, Reg::X1);
+            self.asm.cset(
+                Reg::X0,
+                if op == BinaryOp::Equal {
+                    Cond::Eq
+                } else {
+                    Cond::Ne
+                },
+            );
+            return Ok(ValueType::Bool);
         }
         if lhs_ty == ValueType::Str {
             return match op {
@@ -4145,9 +4226,8 @@ impl Emitter {
     /// POINTER_RECORD (every payload slot a heap pointer), so the collector
     /// traces only the latter.
     fn emit_gc_alloc_object(&mut self, words: usize, tag: u64) {
-        self.asm.mov_imm64(Reg::X5, (words * 8) as u64); // payload bytes
-        self.asm.mov_imm64(Reg::X4, tag);
-        self.emit_gc_alloc_call(); // x0 = user pointer
+        let entry = self.gc_alloc_entry_label();
+        crate::portable_asm::emit_gc_alloc_object(&mut self.asm, entry, (words * 8) as u64, tag);
     }
 
     /// Box a scalar (in x0) into its own single-slot `RAW_BYTES` object,
@@ -4156,16 +4236,14 @@ impl Emitter {
     /// list elements are boxed on write and unboxed on read (the uniform
     /// representation the shared enum lowering already uses).
     fn emit_box_scalar(&mut self) {
-        self.asm.push(Reg::X0); // preserve the scalar across the alloc
-        self.emit_gc_alloc_object(1, crate::gc_layout::GC_TYPE_RAW_BYTES);
-        self.asm.pop(Reg::X1);
-        self.asm.str_imm(Reg::X1, Reg::X0, 0); // [box] = scalar
+        let entry = self.gc_alloc_entry_label();
+        crate::portable_asm::emit_gc_box_scalar(&mut self.asm, entry);
     }
 
     /// Unbox a scalar: load it from the single-slot box whose user
     /// pointer is in x0.
     fn emit_unbox_scalar(&mut self) {
-        self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+        crate::portable_asm::emit_gc_unbox_scalar(&mut self.asm);
     }
 
     /// M7: colour a heap reference on its way into a heap slot --
@@ -4182,13 +4260,26 @@ impl Emitter {
     /// Null stays raw zero: `0 | colour` would be a bogus pointer, and the
     /// root scan and barriers all treat 0 as "nothing here".
     fn emit_color_ptr(&mut self, dst: Reg, src: Reg) {
-        let raw = self.asm.new_label();
         if dst != src {
             self.asm.mov_reg(dst, src);
         }
-        self.asm.branch(raw, BranchKind::CompareZero(dst));
-        self.asm.orr_reg(dst, dst, Reg::X25); // | good colour
-        self.asm.bind(raw);
+        // The colouring itself is the shared one: a heap slot holds a
+        // coloured pointer on every backend, and null stays raw on every
+        // backend, so the rule lives in one place.
+        let portable = match dst {
+            Reg::X0 => crate::portable_asm::Reg::V0,
+            Reg::X1 => crate::portable_asm::Reg::V1,
+            Reg::X2 => crate::portable_asm::Reg::V2,
+            Reg::X3 => crate::portable_asm::Reg::V3,
+            other => {
+                let raw = self.asm.new_label();
+                self.asm.branch(raw, BranchKind::CompareZero(other));
+                self.asm.orr_reg(other, other, Reg::X25);
+                self.asm.bind(raw);
+                return;
+            }
+        };
+        crate::portable_asm::emit_gc_colour_pointer(&mut self.asm, portable);
     }
 
     /// The two shadow-stack cells, reserved on first use.
@@ -4335,62 +4426,32 @@ impl Emitter {
     /// the same diagnostic the portable routines use for their tables.
     fn emit_shadow_push_routine(&mut self, label: Label) {
         let (base, top) = self.shadow_cells();
-        self.asm.bind(label);
-        self.asm.push(Reg::X1);
-        self.asm.push(Reg::X2);
-        self.asm.push(Reg::X3);
-        self.asm.load_data_address(Reg::X2, top);
-        self.asm.ldr_imm(Reg::X3, Reg::X2, 0); // top
-        let ok = self.asm.new_label();
-        self.asm
-            .mov_imm64(Reg::X1, crate::gc_layout::GC_SHADOW_STACK_LEN as u64);
-        self.asm.cmp_reg(Reg::X3, Reg::X1);
-        self.asm.branch(ok, BranchKind::Conditional(Cond::Lt));
-        self.asm
-            .emit_write_rodata(STDERR_FD, b"klassic gc: shadow stack overflow\n");
-        self.asm.emit_exit(1);
-        self.asm.bind(ok);
-        self.asm.load_data_address(Reg::X1, base);
-        self.asm.ldr_imm(Reg::X1, Reg::X1, 0); // shadow stack base
-        self.asm.lsl_imm(Reg::X3, Reg::X3, 3); // top * 8
-        self.asm.add_reg(Reg::X1, Reg::X1, Reg::X3);
-        self.asm.str_imm(Reg::X0, Reg::X1, 0); // base[top] = slot address
-        self.asm.ldr_imm(Reg::X3, Reg::X2, 0);
-        self.asm.add_reg_imm(Reg::X3, Reg::X3, 1);
-        self.asm.str_imm(Reg::X3, Reg::X2, 0); // top += 1
-        self.asm.pop(Reg::X3);
-        self.asm.pop(Reg::X2);
-        self.asm.pop(Reg::X1);
-        self.asm.ret();
+        let text = self
+            .asm
+            .intern_rodata(b"klassic gc: shadow stack overflow\n");
+        crate::portable_asm::emit_gc_shadow_push_runtime(
+            &mut self.asm,
+            label,
+            PortDataAddr::Bss(base),
+            PortDataAddr::Bss(top),
+            PortDataAddr::Rodata(text),
+            b"klassic gc: shadow stack overflow\n".len(),
+        );
     }
 
     /// `bl`-called: drop one shadow-stack root. Preserves every register.
-    ///
-    /// The underflow check is a deliberate self-test of the root
-    /// bookkeeping: pushes and pops must balance on every path, and an
-    /// imbalance is otherwise silent (a leaked root, or -- worse -- a
-    /// negative top that makes the next push write outside the table).
-    /// Aborting here turns any mismatch into an immediate, obvious CI
-    /// failure on arm64 instead of a rare corruption once the collector is
-    /// live.
     fn emit_shadow_pop_routine(&mut self, label: Label) {
         let (_, top) = self.shadow_cells();
-        self.asm.bind(label);
-        self.asm.push(Reg::X0);
-        self.asm.push(Reg::X1);
-        self.asm.load_data_address(Reg::X0, top);
-        self.asm.ldr_imm(Reg::X1, Reg::X0, 0);
-        let ok = self.asm.new_label();
-        self.asm.branch(ok, BranchKind::CompareNonZero(Reg::X1));
-        self.asm
-            .emit_write_rodata(STDERR_FD, b"klassic gc: shadow stack underflow\n");
-        self.asm.emit_exit(1);
-        self.asm.bind(ok);
-        self.asm.sub_reg_imm(Reg::X1, Reg::X1, 1);
-        self.asm.str_imm(Reg::X1, Reg::X0, 0);
-        self.asm.pop(Reg::X1);
-        self.asm.pop(Reg::X0);
-        self.asm.ret();
+        let text = self
+            .asm
+            .intern_rodata(b"klassic gc: shadow stack underflow\n");
+        crate::portable_asm::emit_gc_shadow_pop_runtime(
+            &mut self.asm,
+            label,
+            PortDataAddr::Bss(top),
+            PortDataAddr::Rodata(text),
+            b"klassic gc: shadow stack underflow\n".len(),
+        );
     }
 
     /// M7: copy the string object in x0 onto the GC heap, leaving the copy
@@ -4539,37 +4600,12 @@ impl Emitter {
     }
 
     /// The barrier proper: x8 = field address on entry, x0 = the raw
-    /// pointer on exit.
+    /// pointer on exit. The test, the call and the strip are the shared
+    /// ones; what this backend adds is the register list above.
     fn emit_gc_load_barriered(&mut self) {
-        const SAVED: [Reg; 11] = [
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X4,
-            Reg::X5,
-            Reg::X6,
-            Reg::X7,
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-        ];
         self.asm.ldr_imm(Reg::X0, Reg::X8, 0);
-        let fast = self.asm.new_label();
-        self.asm.tst_reg(Reg::X0, Reg::X26);
-        self.asm.branch(fast, BranchKind::Conditional(Cond::Eq));
         let slow = self.load_barrier_label();
-        self.asm.push_frame_record(); // the bl below clobbers x30
-        for reg in SAVED {
-            self.asm.push(reg);
-        }
-        self.asm.branch(slow, BranchKind::Link); // x0 = value, x8 = field
-        for reg in SAVED.into_iter().rev() {
-            self.asm.pop(reg);
-        }
-        self.asm.pop_frame_record();
-        self.asm.bind(fast);
-        self.asm.and_reg(Reg::X0, Reg::X0, Reg::X24);
+        crate::portable_asm::emit_gc_load_barrier(&mut self.asm, slow);
     }
 
     /// Allocate a GC heap string whose payload is `[len][bytes...]`, with

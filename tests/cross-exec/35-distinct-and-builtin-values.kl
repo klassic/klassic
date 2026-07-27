@@ -1,0 +1,31 @@
+// Cross-target fixture: `distinct` and a builtin mentioned as a value.
+//
+// `distinct` used to be written as a recursive filter, which no backend that
+// compiles a function once could take: a `List<'a>` parameter has no single
+// shape to compile it for. It is a set round trip now -- a set keeps the
+// first occurrence of each element in order, which is exactly what `distinct`
+// answers -- so it is two builtins every backend already has. The repeated,
+// all-repeated and empty cases are here because those are where a dedupe that
+// kept the *last* occurrence, or sorted, would disagree.
+//
+// The second half asks whether a builtin is there. It is a value, not a call,
+// and comparing a heap reference with `null` compares a pointer with nothing
+// -- two different types by construction, which one backend refused.
+
+import std.list
+
+println([3, 1, 3, 2, 1].distinctItems())
+println(distinct(["a", "b", "a"]))
+println(distinct([]))
+println(distinct([5]))
+println(distinct([1, 1, 1]))
+println(distinct([2, 1]))
+assertResult([3, 1, 2])([3, 1, 3, 2, 1].distinctItems())
+assertResult([2, 1])(distinct([2, 1]))
+assertResult(1)(size(distinct([1, 1, 1])))
+assertResult(0)(size(distinct([])))
+
+println(Process#exit != null)
+println(Time#nowMillis != null)
+assertResult(true)(Process#exit != null)
+println("done")

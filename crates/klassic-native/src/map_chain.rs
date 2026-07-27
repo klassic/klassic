@@ -230,6 +230,19 @@ fn every_use_is_lowerable(expr: &Expr, prelude_len: usize, tracked: &HashSet<Str
             }
             every_use_is_lowerable(value, prelude_len, tracked)
         }
+        Expr::Foreach {
+            binding,
+            iterable,
+            body,
+            span,
+        } if is_user(*span, prelude_len)
+            && entries_call_map(iterable, tracked, prelude_len).is_some() =>
+        {
+            // The body may only read the entry's two halves; anything else
+            // done with it has no chain equivalent here.
+            body_uses_entry_only_as_halves(body, binding)
+                && every_use_is_lowerable(body, prelude_len, tracked)
+        }
         Expr::Call {
             callee, arguments, ..
         } => {
@@ -321,6 +334,90 @@ fn supported_call<'a>(
     }
 }
 
+/// `m.toPairs()` / `m.entries()` on a tracked map, answering with the map.
+fn entries_call_map<'a>(
+    expr: &'a Expr,
+    tracked: &HashSet<String>,
+    prelude_len: usize,
+) -> Option<&'a Expr> {
+    let Expr::Call {
+        callee, arguments, ..
+    } = expr
+    else {
+        return None;
+    };
+    if !arguments.is_empty() {
+        return None;
+    }
+    let Expr::FieldAccess { target, field, .. } = callee.as_ref() else {
+        return None;
+    };
+    if !matches!(field.as_str(), "toPairs" | "entries") {
+        return None;
+    }
+    match target.as_ref() {
+        Expr::Identifier { name, span }
+            if tracked.contains(name) && is_user(*span, prelude_len) =>
+        {
+            Some(target.as_ref())
+        }
+        _ => None,
+    }
+}
+
+/// Is the loop's entry binding only ever read as `.key` and `.value`?
+fn body_uses_entry_only_as_halves(body: &Expr, binding: &str) -> bool {
+    match body {
+        Expr::Identifier { name, .. } => name != binding,
+        Expr::FieldAccess { target, field, .. } => {
+            if matches!(target.as_ref(), Expr::Identifier { name, .. } if name == binding) {
+                return matches!(field.as_str(), "key" | "value");
+            }
+            body_uses_entry_only_as_halves(target, binding)
+        }
+        other => children(other)
+            .into_iter()
+            .all(|child| body_uses_entry_only_as_halves(child, binding)),
+    }
+}
+
+/// Replace `entry.key` / `entry.value` with the names the loop below binds.
+fn substitute_entry_halves(expr: Expr, binding: &str, key: &str, value: &str) -> Expr {
+    if let Expr::FieldAccess {
+        target,
+        field,
+        span,
+    } = &expr
+        && matches!(target.as_ref(), Expr::Identifier { name, .. } if name == binding)
+    {
+        let name = match field.as_str() {
+            "key" => Some(key),
+            "value" => Some(value),
+            _ => None,
+        };
+        if let Some(name) = name {
+            return Expr::Identifier {
+                name: name.to_string(),
+                span: *span,
+            };
+        }
+    }
+    match expr {
+        Expr::FieldAccess {
+            target,
+            field,
+            span,
+        } => Expr::FieldAccess {
+            target: Box::new(substitute_entry_halves(*target, binding, key, value)),
+            field,
+            span,
+        },
+        other => map_children(other, &mut |child| {
+            substitute_entry_halves(child, binding, key, value)
+        }),
+    }
+}
+
 fn call(name: &str, arguments: Vec<Expr>, span: Span) -> Expr {
     Expr::Call {
         callee: Box::new(Expr::Identifier {
@@ -332,12 +429,141 @@ fn call(name: &str, arguments: Vec<Expr>, span: Span) -> Expr {
     }
 }
 
+/// A block, for the loop the entry walk becomes.
+fn block(expressions: Vec<Expr>, span: Span) -> Expr {
+    Expr::Block { expressions, span }
+}
+
+fn ident(name: &str, span: Span) -> Expr {
+    Expr::Identifier {
+        name: name.to_string(),
+        span,
+    }
+}
+
+fn int(value: i64, span: Span) -> Expr {
+    Expr::Int {
+        value,
+        kind: klassic_syntax::IntLiteralKind::Int,
+        span,
+    }
+}
+
+/// `foreach (e in m.toPairs()) { body }` over a chain: walk the cells,
+/// binding each entry's halves to the names the body was rewritten to use.
+fn entry_walk(map: Expr, binding: &str, body: Expr, span: Span, index: usize) -> Expr {
+    let cur = format!("klassicMapCur{index}");
+    let go = format!("klassicMapGo{index}");
+    let key = format!("klassicMapKey{index}");
+    let value = format!("klassicMapValue{index}");
+    let rest = format!("klassicMapRest{index}");
+    let body = substitute_entry_halves(body, binding, &key, &value);
+    let cons_arm = MatchArm {
+        pattern: klassic_syntax::Pattern::Constructor {
+            name: "KlassicMapCons".to_string(),
+            args: vec![
+                klassic_syntax::Pattern::Variable {
+                    name: key.clone(),
+                    span,
+                },
+                klassic_syntax::Pattern::Variable {
+                    name: value.clone(),
+                    span,
+                },
+                klassic_syntax::Pattern::Variable {
+                    name: rest.clone(),
+                    span,
+                },
+            ],
+            span,
+        },
+        guard: None,
+        body: block(
+            vec![
+                body,
+                Expr::Assign {
+                    name: cur.clone(),
+                    value: Box::new(ident(&rest, span)),
+                    span,
+                },
+                int(0, span),
+            ],
+            span,
+        ),
+        span,
+    };
+    let nil_arm = MatchArm {
+        pattern: klassic_syntax::Pattern::Constructor {
+            name: "KlassicMapNil".to_string(),
+            args: Vec::new(),
+            span,
+        },
+        guard: None,
+        body: block(
+            vec![
+                Expr::Assign {
+                    name: go.clone(),
+                    value: Box::new(Expr::Bool { value: false, span }),
+                    span,
+                },
+                int(0, span),
+            ],
+            span,
+        ),
+        span,
+    };
+    block(
+        vec![
+            Expr::VarDecl {
+                mutable: true,
+                name: cur.clone(),
+                annotation: None,
+                value: Box::new(map),
+                span,
+            },
+            Expr::VarDecl {
+                mutable: true,
+                name: go.clone(),
+                annotation: None,
+                value: Box::new(Expr::Bool { value: true, span }),
+                span,
+            },
+            Expr::While {
+                condition: Box::new(ident(&go, span)),
+                body: Box::new(Expr::Match {
+                    scrutinee: Box::new(ident(&cur, span)),
+                    arms: vec![nil_arm, cons_arm],
+                    span,
+                }),
+                span,
+            },
+        ],
+        span,
+    )
+}
+
 fn rewrite(expr: Expr, prelude_len: usize, tracked: &HashSet<String>) -> Expr {
     let names_tracked_map = |expr: &Expr| {
         matches!(expr, Expr::Identifier { name, span }
             if tracked.contains(name) && is_user(*span, prelude_len))
     };
     match expr {
+        Expr::Foreach {
+            binding,
+            iterable,
+            body,
+            span,
+        } if is_user(span, prelude_len)
+            && entries_call_map(&iterable, tracked, prelude_len).is_some() =>
+        {
+            let map = entries_call_map(&iterable, tracked, prelude_len)
+                .expect("checked just above")
+                .clone();
+            let body = rewrite(*body, prelude_len, tracked);
+            // The names are keyed by where the loop is, so nested walks in one
+            // program do not shadow each other.
+            entry_walk(map, &binding, body, span, span.start)
+        }
         Expr::Call {
             callee,
             arguments,
@@ -596,6 +822,58 @@ fn map_children(expr: Expr, f: &mut impl FnMut(Expr) -> Expr) -> Expr {
                     span: arm.span,
                 })
                 .collect(),
+            span,
+        },
+        Expr::Call {
+            callee,
+            arguments,
+            span,
+        } => Expr::Call {
+            callee: Box::new(f(*callee)),
+            arguments: arguments.into_iter().map(&mut *f).collect(),
+            span,
+        },
+        Expr::FieldAccess {
+            target,
+            field,
+            span,
+        } => Expr::FieldAccess {
+            target: Box::new(f(*target)),
+            field,
+            span,
+        },
+        Expr::RecordConstructor {
+            name,
+            arguments,
+            span,
+        } => Expr::RecordConstructor {
+            name,
+            arguments: arguments.into_iter().map(&mut *f).collect(),
+            span,
+        },
+        Expr::RecordLiteral { fields, span } => Expr::RecordLiteral {
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| (name, f(value)))
+                .collect(),
+            span,
+        },
+        Expr::MapLiteral { entries, span } => Expr::MapLiteral {
+            entries: entries
+                .into_iter()
+                .map(|(key, value)| (f(key), f(value)))
+                .collect(),
+            span,
+        },
+        Expr::Lambda {
+            params,
+            param_annotations,
+            body,
+            span,
+        } => Expr::Lambda {
+            params,
+            param_annotations,
+            body: Box::new(f(*body)),
             span,
         },
         Expr::ListLiteral { elements, span } => Expr::ListLiteral {

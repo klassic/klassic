@@ -1749,13 +1749,123 @@ one per concern:
   the same offset in the next -- which is what refused `acc = KMCons(...)` on
   aarch64.
 
+#### `words()`, and walking a map's entries
+
+`words()` used to filter the pieces a split leaves behind, which means
+building a list while the program runs -- the one thing the x86-64 backend
+cannot do. It collapses runs of whitespace in the *text* instead, so the
+split leaves no empty pieces and no list is built, and the answer is the same
+list for every input (checked against the old implementation case by case).
+Text with nothing in it has no words, which is why `splitWords` splits on the
+empty delimiter there: both branches of the `if` then produce lines, which is
+what a backend needs to join them.
+
+Four string builtins had to stop insisting on a text known while compiling:
+`split`, `replace`/`replaceAll`, `trim` and its neighbours all take a heap
+string now, copying it into a scratch buffer the way the environment-key path
+already did. A binding that holds a heap string also takes any other shape of
+string, by lifting it onto the heap first -- which is what
+`t = replaceAll(t, ...)` in a loop produces.
+
+`foreach (e in m.toPairs())` over a lowered map becomes a walk over the
+chain, with the entry's halves bound directly and `e.key` / `e.value`
+rewritten to those bindings. A body that does anything else with the entry
+leaves the program alone, like every other case the pass does not cover.
+
+With those, every recipe in the cookbook builds on all three targets.
+
+#### `distinct`, and a builtin as a value
+
+`distinct` was a recursive filter, which no backend that compiles a function
+once can take -- a `List<'a>` parameter has no single shape to compile it
+for. A set keeps the first occurrence of each element in order, which is
+exactly what `distinct` answers, so it is `Set#toList(Set#fromList(xs))` now:
+two builtins every backend already has, and no list is built while the
+program runs.
+
+A builtin mentioned rather than called -- `Process#exit != null` -- is a
+value on aarch64 now, and comparing a heap reference with `null` is allowed
+there: the two sides are different types by construction, which is why the
+comparison was refused.
+
+With those, no probe in the corpora and no recipe in the cookbook builds on
+one target and not another.
+
 What is still not lowered: a map that is *only* created and never put into
 keeps every payload type unknown, so asking it about a key is refused --
-there is nothing in it to say what its keys are. And `words()` over a runtime
-list is a different piece: `stdlibFilter` is a *recursive* generic function
+there is nothing in it to say what its keys are. A general runtime list is
+still not built on x86-64, which is why the lowering above rewrites
+`words()` rather than the filter it used to call: `stdlibFilter` is a *recursive* generic function
 taking `List<'a>`, and a recursive function is compiled once, so its
 parameter kinds have to be fixed. That one wants monomorphisation of
 recursive generic definitions.
+
+### The shadow stack, written once
+
+The 24 GC runtime routines have been emitted through `PortableAsm` since
+#600, but the *mutator* side -- the sequences a compiled program runs to push
+a root, drop one, load through the barrier, colour a store -- was written
+twice, once per hand-emitted backend. The shadow stack's push and pop are the
+first of those to move: `emit_gc_shadow_push_runtime` and
+`emit_gc_shadow_pop_runtime` in `portable_asm.rs` are now the single source
+of the protocol -- a root is the *address* of a slot so the collector can
+rewrite it when it moves an object, the table has a fixed length, and
+overflowing or underflowing it is fatal rather than silent. The aarch64
+backend calls them, and so does the x86-64 one -- which used to inline the
+whole sequence, about twenty instructions, at every rooted temporary. A call
+site is four instructions now (park rax, form the slot address, call, restore),
+and the overflow check exists once in the image instead of once per push.
+
+The load barrier's fast path followed, on both: test the colour, take the
+slow path when it is bad, strip either way. All three are policy rather than
+machinery, and `emit_gc_load_barrier` is where they live now.
+
+What kept aarch64 out at first is worth recording, because it is the shape of
+the remaining work. Its call site saves eleven registers around the slow
+path, and three of them (x10-x12) have no name in the portable register set --
+which cannot simply grow, since the portable names *are* the x86-64 register
+file and it is full. Expressing the list in portable names silently saved the
+wrong physical registers. So the list stays on the backend's side of the
+trait, behind `save_barrier_registers` / `restore_barrier_registers`: what to
+keep live is genuinely platform-specific, while everything around it is
+shared. That division -- policy in the shared routine, register allocation in
+the backend -- is the one to reach for whenever the next piece looks
+unportable.
+
+Asking the collector for an object folded next, on the same pattern. The
+argument registers were already agreed -- the shared `gc_alloc` reads the size
+from `V7` and the tag from `V6` -- so `emit_gc_alloc_object` is the sequence
+around them: put the two arguments in place, keep what this backend needs,
+call. The aarch64 list differs from the barrier's, which is the point of
+asking the backend rather than hard-coding one: x4/x5 carry the arguments
+here and x8 is live where it was not.
+
+Boxing finished the inventory. A scalar in a `POINTER_RECORD` slot is a
+one-slot `RAW_BYTES` object, because the mark phase has to be able to walk a
+record without knowing what its fields mean -- that layout is the
+collector's, not one backend's, so `emit_gc_box_scalar` and
+`emit_gc_unbox_scalar` are where it is written. (The x86-64 backend boxes
+through the shared enum lowering's AST rather than a machine-level helper, so
+it does not emit these today; they are here because the *representation* is
+shared, and a backend that needs the sequence should not invent its own.)
+
+So the mutator's side of the collector reads the same on both backends now:
+root push and pop, colour on store, the load barrier's three stages, the
+allocation call, and boxing. What stays per backend is the register
+allocation around them -- which registers are live across a call -- asked for
+through two pairs of trait methods, and the instruction encodings themselves.
+That is the line the goal was after: the collector's rules in one place, the
+machine's conventions in the backend.
+
+Colour-on-store also folded: a heap slot holds a coloured pointer on both
+backends and null stays raw on both, so `emit_gc_colour_pointer` is that rule
+written once. It is emitted inline rather than called -- three instructions,
+and every store of a reference needs it.
+
+The underflow check is worth keeping in the shared version: pushes and pops
+have to balance on every path through every function, an imbalance is
+otherwise invisible, and it is what caught `Set#add` rooting its slots on one
+side of a branch.
 
 ## Design Notes
 

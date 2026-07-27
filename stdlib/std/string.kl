@@ -5,6 +5,29 @@ module std.string
 // in dot-notation — no naming conflict with the existing top-level
 // `length` / `trim` / ... builtins.
 
+// Collapse runs of spaces to one, so a split on " " leaves no empty pieces.
+//
+// Written as a loop over the text rather than as a filter over the split
+// pieces: filtering means building a list while the program runs, which not
+// every native backend can do, while replacing inside a string is something
+// they all can. The result is the same list `stdlibFilter` produced.
+// Split text that has already had its whitespace runs collapsed. Text with
+// nothing in it has no words -- `split` would answer with one empty piece,
+// and the filter this replaced dropped it.
+// Both branches split, so the two answers have the same shape wherever a
+// backend cares: splitting nothing on nothing is the empty list.
+def splitWords(s: String): List<String> = if(isEmptyString(s)) split(s, "") else split(s, " ")
+
+def collapseSpaceRuns(s: String): String = {
+  mutable t = s
+  mutable prev = ""
+  mutable go = true
+  while (go) {
+    if (t == prev) { go = false; 0 } else { prev = t; t = replaceAll(t, "  ", " "); 0 }
+  }
+  t
+}
+
 extension (this: String) {
   def isEmpty() = isEmptyString(this)
   def nonEmpty() = if(isEmptyString(this)) false else true
@@ -16,7 +39,7 @@ extension (this: String) {
   // more than one line, and a `words` that only knew about `" "` returned
   // "fox\nthe" as a single word. Written as one expression rather than with an
   // intermediate binding, which is what keeps it foldable in a native build.
-  def words() = stdlibFilter(split(replaceAll(replaceAll(replaceAll(this, "\n", " "), "\t", " "), "\r", " "), " "), (w) => if(isEmptyString(w)) false else true)
+  def words() = splitWords(collapseSpaceRuns(trim(replaceAll(replaceAll(replaceAll(this, "\n", " "), "\t", " "), "\r", " "))))
   def lengthChars() = length(this)
   def reverseChars() = reverse(this)
   def upper() = toUpperCase(this)
