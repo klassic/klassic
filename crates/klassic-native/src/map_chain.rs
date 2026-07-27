@@ -36,8 +36,8 @@ def klassicMapReverse(m: KlassicMapChain<'k, 'v>): KlassicMapChain<'k, 'v> = {
   mutable go = true
   while (go) {
     cur match {
-      case KlassicMapNil => { go = false; 0 }
-      case KlassicMapCons(k, v, rest) => { acc = KlassicMapCons(k, v, acc); cur = rest; 0 }
+      case KlassicMapNil => { go = false }
+      case KlassicMapCons(k, v, rest) => { acc = KlassicMapCons(k, v, acc); cur = rest }
     }
   }
   acc
@@ -50,7 +50,7 @@ def klassicMapPut(m: KlassicMapChain<'k, 'v>, key: 'k, value: 'v): KlassicMapCha
   mutable go = true
   while (go) {
     cur match {
-      case KlassicMapNil => { go = false; 0 }
+      case KlassicMapNil => { go = false }
       case KlassicMapCons(k, v, rest) => {
         acc = (if (k == key) KlassicMapCons(k, value, acc) else KlassicMapCons(k, v, acc))
         replaced = (if (k == key) true else replaced)
@@ -68,7 +68,7 @@ def klassicMapGetOrElse(m: KlassicMapChain<'k, 'v>, key: 'k, fallback: 'v): 'v =
   mutable go = true
   while (go) {
     cur match {
-      case KlassicMapNil => { go = false; 0 }
+      case KlassicMapNil => { go = false }
       case KlassicMapCons(k, v, rest) => {
         found = (if (k == key) v else found)
         go = (if (k == key) false else true)
@@ -86,7 +86,7 @@ def klassicMapContainsKey(m: KlassicMapChain<'k, 'v>, key: 'k): Boolean = {
   mutable go = true
   while (go) {
     cur match {
-      case KlassicMapNil => { go = false; 0 }
+      case KlassicMapNil => { go = false }
       case KlassicMapCons(k, v, rest) => {
         yes = (if (k == key) true else yes)
         go = (if (k == key) false else true)
@@ -104,8 +104,8 @@ def klassicMapSize(m: KlassicMapChain<'k, 'v>): Int = {
   mutable go = true
   while (go) {
     cur match {
-      case KlassicMapNil => { go = false; 0 }
-      case KlassicMapCons(k, v, rest) => { n = n + 1; cur = rest; 0 }
+      case KlassicMapNil => { go = false }
+      case KlassicMapCons(k, v, rest) => { n = n + 1; cur = rest }
     }
   }
   n
@@ -118,7 +118,7 @@ def klassicMapRender(m: KlassicMapChain<'k, 'v>): String = {
   mutable go = true
   while (go) {
     cur match {
-      case KlassicMapNil => { go = false; 0 }
+      case KlassicMapNil => { go = false }
       case KlassicMapCons(k, v, rest) => {
         out = (if (first) (out + k + ": " + v) else (out + ", " + k + ": " + v))
         first = false

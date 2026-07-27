@@ -7075,6 +7075,10 @@ impl NativeCodeGenerator {
                     )),
                 }
             }
+            // An assignment is done for its effect and yields unit, matching
+            // the type it is given. Two `match` arms that both end in one
+            // therefore agree, which is what let the arms be written for
+            // effect at all.
             Expr::Assign { name, value, span } => {
                 let slot = self.lookup_var(name).ok_or_else(|| {
                     Diagnostic::compile(*span, format!("undefined native variable `{name}`"))
@@ -7097,7 +7101,7 @@ impl NativeCodeGenerator {
                         "runtime-list assignment exceeds 65536 bytes",
                     )?;
                     self.remove_static_value(name);
-                    return Ok(slot.value);
+                    return Ok(NativeValue::Unit);
                 }
                 if native_value_can_be_static_mutable(slot.value) {
                     if self.dynamic_control_depth > 0 && self.mergeable_dynamic_branch_depth == 0 {
@@ -7120,7 +7124,7 @@ impl NativeCodeGenerator {
                     } else {
                         self.remove_static_value(name);
                     }
-                    return Ok(compiled);
+                    return Ok(NativeValue::Unit);
                 }
                 match slot.value {
                     NativeValue::RuntimeString { data, len } => {
@@ -7148,7 +7152,7 @@ impl NativeCodeGenerator {
                             "string assignment exceeds 65536 bytes",
                         );
                         self.remove_static_value(name);
-                        return Ok(slot.value);
+                        return Ok(NativeValue::Unit);
                     }
                     NativeValue::RuntimeLinesList { data, len } => {
                         let compiled = self.compile_expr(value)?;
@@ -7165,7 +7169,7 @@ impl NativeCodeGenerator {
                             "line-list assignment exceeds 65536 bytes",
                         );
                         self.remove_static_value(name);
-                        return Ok(slot.value);
+                        return Ok(NativeValue::Unit);
                     }
                     NativeValue::RuntimeRecord { label } => {
                         let compiled = self.compile_expr(value)?;
@@ -7178,7 +7182,7 @@ impl NativeCodeGenerator {
                             "record assignment exceeds 65536 bytes",
                         )?;
                         self.remove_static_value(name);
-                        return Ok(slot.value);
+                        return Ok(NativeValue::Unit);
                     }
                     _ => {}
                 }
@@ -7240,7 +7244,7 @@ impl NativeCodeGenerator {
                 } else {
                     self.remove_static_value(name);
                 }
-                Ok(compiled)
+                Ok(NativeValue::Unit)
             }
             Expr::Match {
                 scrutinee,

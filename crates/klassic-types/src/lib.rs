@@ -2019,7 +2019,13 @@ impl TypeChecker {
                     ));
                 }
                 let value_type = self.infer_expr(value)?;
-                self.enforce_assignable(binding.ty, value_type, *span)
+                self.enforce_assignable(binding.ty, value_type, *span)?;
+                // An assignment is done for its effect. Giving it the assigned
+                // value's type meant two `match` arms that both end in one
+                // disagreed unless the values happened to share a type, which
+                // forced a throwaway value at the end of every arm written for
+                // effect.
+                Ok(Type::Unit)
             }
             Expr::Unary { op, expr, span } => {
                 let inner = self.infer_expr(expr)?;

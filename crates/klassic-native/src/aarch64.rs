@@ -3092,6 +3092,14 @@ impl Emitter {
                 self.asm.mov_imm64(Reg::X0, *value as u64);
                 Ok(ValueType::Int)
             }
+            // An assignment in expression position: done for its effect, so
+            // it yields unit. Two `match` arms that both end in one therefore
+            // agree, which is what lets a `match` be written for effect.
+            Expr::Assign { .. } => {
+                self.statement(expr)?;
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(ValueType::Unit)
+            }
             // `expr cleanup { ... }`: the clause runs after the expression it
             // is attached to, and the expression's value is still the value.
             // A heap result is parked as a root, because the clause can
@@ -11300,6 +11308,12 @@ impl Emitter {
             }
             ValueType::Null => {
                 self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
+                Ok(())
+            }
+            // The evaluator prints unit as `()`, and an assignment is a unit
+            // now, so a program can reach here by printing one.
+            ValueType::Unit => {
+                self.asm.emit_write_rodata(STDOUT_FD, b"()\n");
                 Ok(())
             }
             // `null` or a value: the evaluator prints the word `null` for the

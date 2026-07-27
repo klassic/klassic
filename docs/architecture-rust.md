@@ -1985,6 +1985,13 @@ side of a branch.
   `test-programs/proof-surface.kl` is the first `.kl` file in the repo using
   either keyword, which is why a whole target refusing them went unnoticed for
   a release (issue #625).
+- An assignment is typed `Unit` and evaluates to unit, on every path: the
+  checker, the evaluator, and both native backends. It used to take the
+  assigned value's type, so two `match` arms that both ended in an assignment
+  disagreed unless the values happened to share a type -- which is why every
+  loop-shaped helper in `map_chain.rs` ended its arms with a throwaway `0`.
+  Those eight are gone. aarch64 also gained an expression-position assignment
+  and printing of unit as `()` (issue #610).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

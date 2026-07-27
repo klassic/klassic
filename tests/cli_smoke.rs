@@ -179,6 +179,27 @@ fn native_reads_a_file_through_an_annotated_path() {
     );
 }
 
+/// An assignment is done for its effect and yields unit. It used to take the
+/// assigned value's type, so two `match` arms that both ended in one
+/// disagreed unless the values happened to share a type -- which forced a
+/// throwaway value at the end of every arm written for effect.
+#[test]
+fn an_assignment_yields_unit() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum KM { case KMNil; case KMCons(k: Int, rest: KM) }\nmutable cur: KM = KMCons(1, KMNil)\nmutable go = true\nmutable seen = 0\nwhile (go) {\n  cur match {\n    case KMNil => go = false\n    case KMCons(k, rest) => { seen = seen + k; cur = rest }\n  }\n}\nprintln(seen)\nmutable x = 1\nprintln(x = 5)\nprintln(x)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "arms ending in assignments should agree\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n()\n5\n()\n");
+}
+
 /// std.option / std.result richer API via method-style dispatch. The
 /// clean names are restored now that native module namespacing (#449)
 /// makes the free names safe and receiver-type dispatch picks the right
