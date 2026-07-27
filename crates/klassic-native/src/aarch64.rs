@@ -2192,6 +2192,35 @@ impl Emitter {
             .find_map(|scope| scope.get(name).copied())
     }
 
+    /// Whether this condition is decided while compiling, and how. Narrow on
+    /// purpose: it answers only for the emptiness of a collection whose type
+    /// says it has no elements, which is the shape a generic helper's base
+    /// case is written in.
+    fn static_condition(&mut self, condition: &Expr) -> Option<bool> {
+        let Expr::Call {
+            callee, arguments, ..
+        } = condition
+        else {
+            return None;
+        };
+        let name = match callee.as_ref() {
+            Expr::Identifier { name, .. } => name.as_str(),
+            _ => return None,
+        };
+        let name = Self::canonical_builtin_name(name);
+        if !matches!(
+            name,
+            "isEmpty" | "Set#isEmpty" | "Map#isEmpty" | "isEmptyString"
+        ) {
+            return None;
+        }
+        let argument = arguments.first()?;
+        match self.static_type_under(argument, &mut Vec::new(), 0)? {
+            ValueType::EmptyList | ValueType::EmptySet | ValueType::EmptyMap => Some(true),
+            _ => None,
+        }
+    }
+
     /// Resolve a type annotation against scalars, list types, lowered
     /// enums, and declared records (`#Point` or `Point`).
     fn annotation_type(&mut self, text: &str, span: Span) -> Result<ValueType, Diagnostic> {
@@ -3709,6 +3738,14 @@ impl Emitter {
                 let Some(else_branch) = else_branch else {
                     return Err(unsupported(*span, "if without else as an expression"));
                 };
+                // A condition settled while compiling takes only its own
+                // branch. The other one is unreachable for *this*
+                // specialisation, and compiling it anyway is what refuses a
+                // generic helper written as `if (isEmpty(xs)) xs else
+                // <something about head(xs)>` when it is called with `[]`.
+                if let Some(taken) = self.static_condition(condition) {
+                    return self.expression(if taken { then_branch } else { else_branch });
+                }
                 let condition_ty = self.expression(condition)?;
                 if condition_ty != ValueType::Bool {
                     return Err(unsupported(condition.span(), "a non-Bool condition"));

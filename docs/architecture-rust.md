@@ -2019,6 +2019,12 @@ side of a branch.
   literals are static storage and a list of heap values needs the runtime
   representation issue #433 tracks, which is a separate piece of work
   (issue #620, half).
+- aarch64 folds an `if` whose condition is settled while compiling, taking
+  only that branch. `static_condition` answers narrowly -- the emptiness of a
+  collection whose type says it has no elements -- which is the shape a
+  generic helper's base case is written in, and compiling the other branch
+  anyway is what refused `if (isEmpty(xs)) xs else <something about head(xs)>`
+  when it was called with `[]`. x86-64 already did this (issue #616).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
