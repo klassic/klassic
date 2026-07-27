@@ -14443,7 +14443,7 @@ impl NativeCodeGenerator {
             let slow = self.gc_load_barrier_slow;
             // Nothing to save: the slow routine keeps what this backend's
             // callers hold.
-            portable_asm::emit_gc_load_barrier(self, slow, &[]);
+            portable_asm::emit_gc_load_barrier(self, slow);
         } else {
             self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
         }

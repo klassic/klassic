@@ -141,6 +141,16 @@ pub trait PortableAsm {
     // future ARM-Linux `svc`), so that per-OS emission stays inside the
     // impl and never leaks into the portable GC code that calls them.
     /// Write `len` bytes at data label `data` to file descriptor `fd`.
+    /// Save whatever this backend needs kept across the load barrier's slow
+    /// path, and restore it. The policy around the call is shared; *which
+    /// registers a backend has live there* is the one genuinely
+    /// platform-specific part of it, and three of the aarch64 ones have no
+    /// name in the portable register set. The default is to save nothing,
+    /// which is what a backend whose slow routine already keeps what its
+    /// callers hold wants.
+    fn save_barrier_registers(&mut self) {}
+    fn restore_barrier_registers(&mut self) {}
+
     fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize);
     /// Terminate the process with status `code` (does not return).
     fn plat_exit(&mut self, code: u64);
@@ -446,20 +456,15 @@ pub fn emit_gc_grow_budget<E: PortableAsm>(
 ///
 /// The value is in `V0` and the field's address is wherever the slow routine
 /// expects it -- the caller puts it there, since that is the one part of this
-/// that differs. `saved` is what the caller needs kept across the call: the
-/// slow routine preserves what the x86-64 backend cares about, and the
-/// aarch64 backend names the rest.
-pub fn emit_gc_load_barrier<E: PortableAsm>(out: &mut E, slow: E::TextLabel, saved: &[Reg]) {
+/// that differs. What has to be kept across the call is asked of the backend
+/// (`save_barrier_registers`), because that is the other part.
+pub fn emit_gc_load_barrier<E: PortableAsm>(out: &mut E, slow: E::TextLabel) {
     let ok = out.create_text_label();
     out.test_reg_reg(Reg::V0, Reg::BadMask);
     out.jcc_label(Condition::Equal, ok);
-    for reg in saved {
-        out.push_reg(*reg);
-    }
+    out.save_barrier_registers();
     out.call_label(slow);
-    for reg in saved.iter().rev() {
-        out.pop_reg(*reg);
-    }
+    out.restore_barrier_registers();
     out.bind_text_label(ok);
     out.and_reg_reg(Reg::V0, Reg::ColorStrip);
 }

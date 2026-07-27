@@ -243,6 +243,23 @@ struct Assembler {
     bt_pending: bool,
 }
 
+/// The registers a barrier's slow path has to leave as it found them here.
+/// x10-x12 have no name in the portable register set, which is why this list
+/// lives on this side of the trait rather than in the shared routine.
+const BARRIER_SAVED: [Reg; 11] = [
+    Reg::X1,
+    Reg::X2,
+    Reg::X3,
+    Reg::X4,
+    Reg::X5,
+    Reg::X6,
+    Reg::X7,
+    Reg::X9,
+    Reg::X10,
+    Reg::X11,
+    Reg::X12,
+];
+
 impl Assembler {
     fn word(&mut self, instruction: u32) {
         self.code.extend_from_slice(&instruction.to_le_bytes());
@@ -1201,6 +1218,20 @@ impl portable_asm::PortableAsm for Assembler {
         self.sub_reg_imm(count, count, 1);
         self.branch(copy_loop, BranchKind::Unconditional);
         self.bind(done);
+    }
+
+    /// The registers this backend has live across a barrier's slow path.
+    /// x10-x12 have no name in the portable set, which is why the list is
+    /// here rather than in the shared routine.
+    fn save_barrier_registers(&mut self) {
+        for reg in BARRIER_SAVED {
+            self.push(reg);
+        }
+    }
+    fn restore_barrier_registers(&mut self) {
+        for reg in BARRIER_SAVED.into_iter().rev() {
+            self.pop(reg);
+        }
     }
 
     fn plat_write_data(&mut self, fd: u64, data: PortDataAddr, len: usize) {
@@ -4547,37 +4578,12 @@ impl Emitter {
     }
 
     /// The barrier proper: x8 = field address on entry, x0 = the raw
-    /// pointer on exit.
+    /// pointer on exit. The test, the call and the strip are the shared
+    /// ones; what this backend adds is the register list above.
     fn emit_gc_load_barriered(&mut self) {
-        const SAVED: [Reg; 11] = [
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X4,
-            Reg::X5,
-            Reg::X6,
-            Reg::X7,
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-        ];
         self.asm.ldr_imm(Reg::X0, Reg::X8, 0);
-        let fast = self.asm.new_label();
-        self.asm.tst_reg(Reg::X0, Reg::X26);
-        self.asm.branch(fast, BranchKind::Conditional(Cond::Eq));
         let slow = self.load_barrier_label();
-        self.asm.push_frame_record(); // the bl below clobbers x30
-        for reg in SAVED {
-            self.asm.push(reg);
-        }
-        self.asm.branch(slow, BranchKind::Link); // x0 = value, x8 = field
-        for reg in SAVED.into_iter().rev() {
-            self.asm.pop(reg);
-        }
-        self.asm.pop_frame_record();
-        self.asm.bind(fast);
-        self.asm.and_reg(Reg::X0, Reg::X0, Reg::X24);
+        crate::portable_asm::emit_gc_load_barrier(&mut self.asm, slow);
     }
 
     /// Allocate a GC heap string whose payload is `[len][bytes...]`, with

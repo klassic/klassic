@@ -1816,14 +1816,21 @@ whole sequence, about twenty instructions, at every rooted temporary. A call
 site is four instructions now (park rax, form the slot address, call, restore),
 and the overflow check exists once in the image instead of once per push.
 
-The load barrier's fast path followed for x86-64: test the colour, take the
+The load barrier's fast path followed, on both: test the colour, take the
 slow path when it is bad, strip either way. All three are policy rather than
-machinery, and `emit_gc_load_barrier` is where they live now. The aarch64
-backend still emits its own -- not because the policy differs, but because it
-saves ten registers around the call and three of them (x10-x12) have no name
-in the portable register set. Naming them, or giving the shared routine the
-job of preserving them, is what would let that call site fold in too; the
-save list is the platform-specific part, and it is the only part left there.
+machinery, and `emit_gc_load_barrier` is where they live now.
+
+What kept aarch64 out at first is worth recording, because it is the shape of
+the remaining work. Its call site saves eleven registers around the slow
+path, and three of them (x10-x12) have no name in the portable register set --
+which cannot simply grow, since the portable names *are* the x86-64 register
+file and it is full. Expressing the list in portable names silently saved the
+wrong physical registers. So the list stays on the backend's side of the
+trait, behind `save_barrier_registers` / `restore_barrier_registers`: what to
+keep live is genuinely platform-specific, while everything around it is
+shared. That division -- policy in the shared routine, register allocation in
+the backend -- is the one to reach for whenever the next piece looks
+unportable.
 
 Colour-on-store also folded: a heap slot holds a coloured pointer on both
 backends and null stays raw on both, so `emit_gc_colour_pointer` is that rule
