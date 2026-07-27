@@ -1840,11 +1840,22 @@ call. The aarch64 list differs from the barrier's, which is the point of
 asking the backend rather than hard-coding one: x4/x5 carry the arguments
 here and x8 is live where it was not.
 
-So the mutator's side of the collector now reads the same on both: root push
-and pop, colour on store, the load barrier's three stages, and the allocation
-call. What is left is boxing a scalar into its own one-slot object and
-unboxing it -- a `RAW_BYTES` allocation plus a store, and a load -- which is
-the same shape again.
+Boxing finished the inventory. A scalar in a `POINTER_RECORD` slot is a
+one-slot `RAW_BYTES` object, because the mark phase has to be able to walk a
+record without knowing what its fields mean -- that layout is the
+collector's, not one backend's, so `emit_gc_box_scalar` and
+`emit_gc_unbox_scalar` are where it is written. (The x86-64 backend boxes
+through the shared enum lowering's AST rather than a machine-level helper, so
+it does not emit these today; they are here because the *representation* is
+shared, and a backend that needs the sequence should not invent its own.)
+
+So the mutator's side of the collector reads the same on both backends now:
+root push and pop, colour on store, the load barrier's three stages, the
+allocation call, and boxing. What stays per backend is the register
+allocation around them -- which registers are live across a call -- asked for
+through two pairs of trait methods, and the instruction encodings themselves.
+That is the line the goal was after: the collector's rules in one place, the
+machine's conventions in the backend.
 
 Colour-on-store also folded: a heap slot holds a coloured pointer on both
 backends and null stays raw on both, so `emit_gc_colour_pointer` is that rule

@@ -471,6 +471,28 @@ pub fn emit_gc_alloc_object<E: PortableAsm>(
     out.restore_alloc_registers();
 }
 
+/// Box a scalar into its own single-slot `RAW_BYTES` object, scalar in `V0`
+/// and the box's user pointer out in `V0`.
+///
+/// Every slot of a `POINTER_RECORD` has to hold a pointer, so a scalar record
+/// field or list element is boxed on the way in and unboxed on the way out.
+/// That uniform representation is the collector's, not one backend's: it is
+/// what lets the mark phase walk a record without knowing what its fields
+/// mean.
+pub fn emit_gc_box_scalar<E: PortableAsm>(out: &mut E, entry: E::TextLabel) {
+    out.push_reg(Reg::V0); // the scalar, across the allocation
+    emit_gc_alloc_object(out, entry, 8, crate::gc_layout::GC_TYPE_RAW_BYTES);
+    out.pop_reg(Reg::V1);
+    out.store_ptr_disp32(Reg::V0, 0, Reg::V1);
+}
+
+/// Read a scalar back out of its box: the box's user pointer in `V0`, the
+/// scalar out in `V0`. The counterpart of `emit_gc_box_scalar`, and the
+/// reason it is here is the same -- the layout is the collector's.
+pub fn emit_gc_unbox_scalar<E: PortableAsm>(out: &mut E) {
+    out.load_ptr_disp32(Reg::V0, Reg::V0, 0);
+}
+
 /// The load barrier's fast path, around the shared slow routine.
 ///
 /// Three stages, and all three are policy rather than machinery: a value

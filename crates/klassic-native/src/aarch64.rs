@@ -4236,16 +4236,14 @@ impl Emitter {
     /// list elements are boxed on write and unboxed on read (the uniform
     /// representation the shared enum lowering already uses).
     fn emit_box_scalar(&mut self) {
-        self.asm.push(Reg::X0); // preserve the scalar across the alloc
-        self.emit_gc_alloc_object(1, crate::gc_layout::GC_TYPE_RAW_BYTES);
-        self.asm.pop(Reg::X1);
-        self.asm.str_imm(Reg::X1, Reg::X0, 0); // [box] = scalar
+        let entry = self.gc_alloc_entry_label();
+        crate::portable_asm::emit_gc_box_scalar(&mut self.asm, entry);
     }
 
     /// Unbox a scalar: load it from the single-slot box whose user
     /// pointer is in x0.
     fn emit_unbox_scalar(&mut self) {
-        self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+        crate::portable_asm::emit_gc_unbox_scalar(&mut self.asm);
     }
 
     /// M7: colour a heap reference on its way into a heap slot --
