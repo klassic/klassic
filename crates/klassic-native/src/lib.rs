@@ -14438,14 +14438,12 @@ impl NativeCodeGenerator {
             // so the register holds a raw (canonical) pointer. Only the
             // pointer-typed reads barrier -- an Int/Double read through
             // this same funnel must NOT strip (its high bits are data).
-            let ok = self.asm.create_text_label();
-            self.asm.mov_reg_reg(Reg::R10, Reg::Rax); // field addr
+            self.asm.mov_reg_reg(Reg::R10, Reg::Rax); // field addr, for self-heal
             self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0); // colored value
-            self.asm.test_reg_reg(Reg::Rax, Reg::R15); // bad color?
-            self.asm.jcc_label(Condition::Equal, ok);
-            self.asm.call_label(self.gc_load_barrier_slow);
-            self.asm.bind_text_label(ok);
-            self.asm.and_reg_reg(Reg::Rax, Reg::R13); // strip -> raw
+            let slow = self.gc_load_barrier_slow;
+            // Nothing to save: the slow routine keeps what this backend's
+            // callers hold.
+            portable_asm::emit_gc_load_barrier(self, slow, &[]);
         } else {
             self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
         }

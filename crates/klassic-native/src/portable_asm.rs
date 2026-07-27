@@ -436,6 +436,34 @@ pub fn emit_gc_grow_budget<E: PortableAsm>(
 /// (`plat_write_data` / `plat_exit`): the routine's control flow is
 /// architecture-independent, while each backend's impl chooses the actual
 /// OS interface (Linux/macOS `syscall` vs Windows shim `call`).
+/// The load barrier's fast path, around the shared slow routine.
+///
+/// Three stages, and all three are policy rather than machinery: a value
+/// whose colour is *bad* has to go through the slow path, everything else is
+/// current, and either way the colour is stripped so the register holds a
+/// canonical pointer. Written once, the two backends cannot disagree about
+/// which mask means bad or which one strips.
+///
+/// The value is in `V0` and the field's address is wherever the slow routine
+/// expects it -- the caller puts it there, since that is the one part of this
+/// that differs. `saved` is what the caller needs kept across the call: the
+/// slow routine preserves what the x86-64 backend cares about, and the
+/// aarch64 backend names the rest.
+pub fn emit_gc_load_barrier<E: PortableAsm>(out: &mut E, slow: E::TextLabel, saved: &[Reg]) {
+    let ok = out.create_text_label();
+    out.test_reg_reg(Reg::V0, Reg::BadMask);
+    out.jcc_label(Condition::Equal, ok);
+    for reg in saved {
+        out.push_reg(*reg);
+    }
+    out.call_label(slow);
+    for reg in saved.iter().rev() {
+        out.pop_reg(*reg);
+    }
+    out.bind_text_label(ok);
+    out.and_reg_reg(Reg::V0, Reg::ColorStrip);
+}
+
 /// Colour a pointer on its way into a heap slot.
 ///
 /// A heap slot holds a *coloured* pointer, which is what makes the load

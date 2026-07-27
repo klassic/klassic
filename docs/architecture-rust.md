@@ -1816,7 +1816,16 @@ whole sequence, about twenty instructions, at every rooted temporary. A call
 site is four instructions now (park rax, form the slot address, call, restore),
 and the overflow check exists once in the image instead of once per push.
 
-Colour-on-store followed: a heap slot holds a coloured pointer on both
+The load barrier's fast path followed for x86-64: test the colour, take the
+slow path when it is bad, strip either way. All three are policy rather than
+machinery, and `emit_gc_load_barrier` is where they live now. The aarch64
+backend still emits its own -- not because the policy differs, but because it
+saves ten registers around the call and three of them (x10-x12) have no name
+in the portable register set. Naming them, or giving the shared routine the
+job of preserving them, is what would let that call site fold in too; the
+save list is the platform-specific part, and it is the only part left there.
+
+Colour-on-store also folded: a heap slot holds a coloured pointer on both
 backends and null stays raw on both, so `emit_gc_colour_pointer` is that rule
 written once. It is emitted inline rather than called -- three instructions,
 and every store of a reference needs it.
