@@ -1406,9 +1406,15 @@ enum ValueType {
     /// A record value: index into the emitter's record table (nominal
     /// declarations and interned structural shapes).
     Record(u32),
-    /// An untyped heap pointer: lowered enum values and the box cells
-    /// the enum desugaring builds around scalars.
+    /// An untyped heap pointer: the box cells the enum desugaring builds
+    /// around scalars, and any lowered enum value whose enum could not be
+    /// named at the point it was built.
     Ptr,
+    /// A *lowered* monomorphic enum value: an index into
+    /// `lowered_enum_table`. The shared lowering erased the declaration and
+    /// left `__gc_record` calls, so the value is a pointer -- this says which
+    /// enum's pointer it is, which is what printing one needs.
+    LoweredEnum(u32),
     Unit,
     /// A generic enum's value: an index into the emitter's shape table, which
     /// records what each variant carries. The shared lowering only erases
@@ -1454,6 +1460,15 @@ fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueTyp
         | (other @ ValueType::Set(_), ValueType::EmptySet) => Some(other),
         (ValueType::EmptyMap, other @ ValueType::Map(..))
         | (other @ ValueType::Map(..), ValueType::EmptyMap) => Some(other),
+        // Two lowered enums of different enums, or one against a bare
+        // pointer, join as the pointer they both are: the join carries no
+        // single variant table, so it can no longer be printed, which is
+        // exactly what was true before any of them carried one.
+        (ValueType::LoweredEnum(left), ValueType::LoweredEnum(right)) if left != right => {
+            Some(ValueType::Ptr)
+        }
+        (ValueType::LoweredEnum(_), ValueType::Ptr)
+        | (ValueType::Ptr, ValueType::LoweredEnum(_)) => Some(ValueType::Ptr),
         (left, right) if left == right => Some(left),
         _ => None,
     }
@@ -1464,6 +1479,14 @@ fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueTyp
 /// polymorphic empty list into any list slot.
 fn assignable(actual: ValueType, expected: ValueType) -> bool {
     actual == expected
+        // A lowered enum *is* a heap pointer -- naming which enum it is only
+        // adds what printing needs, and must not narrow where the value can
+        // go. Both directions, because the lowering's own helpers are typed
+        // in terms of the bare pointer.
+        || matches!(
+            (actual, expected),
+            (ValueType::LoweredEnum(_), ValueType::Ptr) | (ValueType::Ptr, ValueType::LoweredEnum(_))
+        )
         // `null` into any reference slot, including one that may hold nothing.
         || (actual == ValueType::Null && is_heap_pointer(expected))
         // A value that is *sometimes* null fits a slot of what it otherwise
@@ -1476,6 +1499,153 @@ fn assignable(actual: ValueType, expected: ValueType) -> bool {
             && matches!(expected, ValueType::Set(_) | ValueType::EmptySet))
         || (actual == ValueType::EmptyMap
             && matches!(expected, ValueType::Map(..) | ValueType::EmptyMap))
+}
+
+/// What a lowered monomorphic enum looks like, carried over from the shared
+/// `desugar_enums` pass so this backend can render one.
+///
+/// The lowering erases the declaration and leaves `__gc_record` calls behind,
+/// which is why a value of such an enum arrives here as a bare pointer. The
+/// pass does wrap every construction in `__enum_shape_named(value, "Variant")`
+/// for the x86-64 display path; this backend reads the same marker, which is
+/// what lets it name the enum a pointer belongs to and print it.
+#[derive(Default)]
+pub(crate) struct LoweredEnumTable {
+    /// One entry per lowered enum: its name and its variants in tag order.
+    enums: Vec<LoweredEnumInfo>,
+    /// Variant name -> the enum it belongs to.
+    owner: HashMap<String, usize>,
+}
+
+pub(crate) struct LoweredEnumInfo {
+    /// The enum's own name, so an annotation naming it resolves here.
+    name: String,
+    variants: Vec<LoweredVariant>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LoweredVariant {
+    name: String,
+    /// One entry per payload, in declaration order: how to render it.
+    fields: Vec<LoweredFieldRepr>,
+}
+
+/// How to render one payload of a lowered enum. Deliberately narrower than
+/// the shared `EnumFieldRepr`: everything this backend needs to know is which
+/// of the four printable shapes the eight bytes are.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum LoweredFieldRepr {
+    Int,
+    Bool,
+    Str,
+    /// Another lowered enum, named by the annotation it was declared with so
+    /// the renderer can descend into it. The name is resolved to a table
+    /// index lazily, because a payload can name an enum whose own entry is
+    /// still being built.
+    Enum(String),
+    /// A payload this backend has no rendering for -- a Double, whose
+    /// shortest-round-trip formatter does not exist here.
+    Unrenderable,
+}
+
+impl LoweredFieldRepr {
+    fn from_repr(repr: crate::EnumFieldRepr, annotation: String) -> Self {
+        match repr {
+            crate::EnumFieldRepr::Scalar => Self::Int,
+            crate::EnumFieldRepr::BoolField => Self::Bool,
+            crate::EnumFieldRepr::StringField => Self::Str,
+            crate::EnumFieldRepr::EnumField => Self::Enum(annotation),
+            crate::EnumFieldRepr::DoubleField => Self::Unrenderable,
+        }
+    }
+}
+
+impl LoweredEnumTable {
+    /// Build from the shared lowering's own tables: `variants` gives every
+    /// variant its tag index and its payload reprs, and `variant_owner` says
+    /// which enum each belongs to. Those two are complete and authoritative,
+    /// so the table is exactly what the lowering erased.
+    pub(crate) fn from_shapes(
+        variants: &HashMap<String, crate::EnumVariantInfo>,
+        field_annotations: &HashMap<String, Vec<String>>,
+        variant_owner: &HashMap<String, String>,
+    ) -> Self {
+        let mut table = Self::default();
+        let mut by_name: HashMap<String, usize> = HashMap::new();
+        // Sorted so the table is built the same way on every run; the tag
+        // index below is what actually orders the variants.
+        let mut names: Vec<&String> = variants.keys().collect();
+        names.sort();
+        for variant in names {
+            let Some(owner) = variant_owner.get(variant) else {
+                continue;
+            };
+            let info = &variants[variant];
+            let index = *by_name.entry(owner.clone()).or_insert_with(|| {
+                table.enums.push(LoweredEnumInfo {
+                    name: owner.clone(),
+                    variants: Vec::new(),
+                });
+                table.enums.len() - 1
+            });
+            let entry = &mut table.enums[index];
+            let tag = info.index as usize;
+            if entry.variants.len() <= tag {
+                entry.variants.resize(
+                    tag + 1,
+                    LoweredVariant {
+                        name: String::new(),
+                        fields: Vec::new(),
+                    },
+                );
+            }
+            let annotations = field_annotations.get(variant);
+            entry.variants[tag] = LoweredVariant {
+                name: variant.clone(),
+                fields: info
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(position, repr)| {
+                        let annotation = annotations
+                            .and_then(|texts| texts.get(position))
+                            .cloned()
+                            .unwrap_or_default();
+                        LoweredFieldRepr::from_repr(*repr, annotation)
+                    })
+                    .collect(),
+            };
+            table.owner.insert(variant.clone(), index);
+        }
+        // An enum with a gap in its tags never existed -- the lowering numbers
+        // variants consecutively -- but a defensive drop keeps a nameless
+        // entry from being printed as one.
+        table
+            .enums
+            .retain(|info| info.variants.iter().all(|variant| !variant.name.is_empty()));
+        table.owner.clear();
+        for (index, info) in table.enums.iter().enumerate() {
+            for variant in &info.variants {
+                table.owner.insert(variant.name.clone(), index);
+            }
+        }
+        table
+    }
+
+    fn info(&self, index: u32) -> &LoweredEnumInfo {
+        &self.enums[index as usize]
+    }
+
+    fn owner_of(&self, variant: &str) -> Option<u32> {
+        self.owner.get(variant).map(|index| *index as u32)
+    }
+
+    fn index_by_name(&self, name: &str) -> Option<u32> {
+        self.enums
+            .iter()
+            .position(|info| info.name == name)
+            .map(|index| index as u32)
+    }
 }
 
 /// One nominal record declaration or interned structural shape:
@@ -1508,6 +1678,23 @@ fn is_boxed_scalar(ty: ValueType) -> bool {
 /// collector must trace? `EmptyList`/`EmptySet` are the nil pointer (0),
 /// which the root scan and the barriers both pass through untouched, so
 /// rooting them is harmless and keeps the classification purely by type.
+/// Whether the enum lowering's `__gc_read`/`__gc_write` primitives accept a
+/// value of this type: a bare heap pointer, or one that also remembers which
+/// lowered enum it is.
+/// A lowered enum seen as the pointer it is. Used where a type is *stored*
+/// (an enum shape's payload, a record's field) rather than used, so that the
+/// added precision never splits one type into two.
+fn as_pointer_repr(ty: ValueType) -> ValueType {
+    match ty {
+        ValueType::LoweredEnum(_) => ValueType::Ptr,
+        other => other,
+    }
+}
+
+fn is_lowering_pointer(ty: ValueType) -> bool {
+    matches!(ty, ValueType::Ptr | ValueType::LoweredEnum(_))
+}
+
 fn is_heap_pointer(ty: ValueType) -> bool {
     matches!(
         ty,
@@ -1523,6 +1710,7 @@ fn is_heap_pointer(ty: ValueType) -> bool {
             | ValueType::Null
             | ValueType::Nullable(_)
             | ValueType::Enum(_)
+            | ValueType::LoweredEnum(_)
     )
 }
 
@@ -1884,9 +2072,14 @@ struct Emitter {
     /// Number of shadow-stack roots pushed in each open scope, so leaving
     /// a scope pops exactly its own.
     scope_root_counts: Vec<usize>,
-    /// Names of enums `desugar_enums` lowered to `__gc_record` shape;
-    /// annotations naming them type as plain heap pointers.
+    /// Names of enums `desugar_enums` lowered to `__gc_record` shape.
     lowered_enums: std::collections::HashSet<String>,
+    /// What each of those enums looks like, so a value of one can be printed
+    /// rather than refused as an untyped pointer.
+    lowered_enum_table: LoweredEnumTable,
+    /// Lowered enums currently being rendered, so one that holds itself is
+    /// refused rather than expanded forever.
+    printing_lowered_enums: Vec<u32>,
     scopes: Vec<HashMap<String, (u32, ValueType)>>,
     /// Lambda bodies interned by `val f = (x) => ...`, and the names bound to
     /// them, scoped like ordinary locals. A lambda has no runtime
@@ -1984,9 +2177,13 @@ impl Emitter {
     fn annotation_type(&mut self, text: &str, span: Span) -> Result<ValueType, Diagnostic> {
         let trimmed = text.trim();
         let bare = trimmed.trim_start_matches('#');
-        // Lowered monomorphic enum values travel as plain heap
-        // pointers.
+        // A lowered monomorphic enum: a heap pointer that remembers which
+        // enum it is, so a parameter or return annotated with one can be
+        // printed rather than refused.
         if self.lowered_enums.contains(bare) {
+            if let Some(index) = self.lowered_enum_table.index_by_name(bare) {
+                return Ok(ValueType::LoweredEnum(index));
+            }
             return Ok(ValueType::Ptr);
         }
         if let Some(index) = self
@@ -2205,7 +2402,13 @@ impl Emitter {
                 // `replace` would rewrite the `a` inside `Char`.
                 let text = substitute_type_params(annotation.trim(), &params, arguments);
                 match self.annotation_type(&text, span) {
-                    Ok(ty) => typed.push(ty),
+                    // A payload that is a lowered enum is stored as the bare
+                    // pointer it is. Which enum it is only matters where the
+                    // value is printed, and letting the distinction into a
+                    // shape would make `Ok(step)` built from an argument and
+                    // `Ok(step)` built from an annotation two different
+                    // shapes of the same instantiation.
+                    Ok(ty) => typed.push(as_pointer_repr(ty)),
                     Err(_) => {
                         self.applied_enum_shapes
                             .remove(&(enum_index, arguments.to_vec()));
@@ -3441,10 +3644,23 @@ impl Emitter {
                 }
                 // `__enum_shape_named(value, "Variant")` and
                 // `__enum_shape_hint(value, id)` are shape aids the shared
-                // enum-lowering pass wraps around values for the x86_64
-                // display/dispatch paths. The aarch64 backend has no use
-                // for the shape, so it compiles the wrapped value
-                // transparently and drops the marker.
+                // enum-lowering pass wraps around every construction of a
+                // lowered enum. The value itself is a bare `__gc_record`
+                // pointer; the marker is the only place its enum is named, so
+                // this is where the pointer picks up a type that can be
+                // printed. `__enum_shape_hint` carries an id rather than a
+                // name and stays transparent.
+                if name == "__enum_shape_named"
+                    && let [value, Expr::String { value: variant, .. }] = arguments.as_slice()
+                {
+                    let compiled = self.expression(value)?;
+                    if compiled == ValueType::Ptr
+                        && let Some(index) = self.lowered_enum_table.owner_of(variant)
+                    {
+                        return Ok(ValueType::LoweredEnum(index));
+                    }
+                    return Ok(compiled);
+                }
                 if (name == "__enum_shape_named" || name == "__enum_shape_hint")
                     && let Some(value) = arguments.first()
                 {
@@ -3598,6 +3814,9 @@ impl Emitter {
                     }
                     ValueType::Enum(shape) => {
                         self.emit_enum_to_str(shape, hole.span())?;
+                    }
+                    ValueType::LoweredEnum(index) => {
+                        self.emit_lowered_enum_to_str(index, hole.span())?;
                     }
                     other => {
                         return Err(unsupported(
@@ -6394,6 +6613,94 @@ impl Emitter {
         Ok(())
     }
 
+    /// Write the *lowered* enum value in x0 as `Variant(field, ...)`, no
+    /// trailing newline. The shared lowering laid it out as a `__gc_record`
+    /// whose slot 0 boxes the variant tag and whose remaining slots box the
+    /// payloads in declaration order, so this is a switch on that tag.
+    ///
+    /// A payload that is itself a pointer -- another enum, a Double -- prints
+    /// as `<value>`: this backend has no shortest-round-trip Double
+    /// formatter, and rendering a nested enum would need the nested enum's
+    /// identity, which the tag alone does not carry.
+    fn emit_print_lowered_enum(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
+        if self.printing_lowered_enums.contains(&index) {
+            return Err(unsupported(span, "printing an enum that holds itself"));
+        }
+        self.printing_lowered_enums.push(index);
+        let result = self.emit_print_lowered_enum_variants(index, span);
+        self.printing_lowered_enums.pop();
+        result
+    }
+
+    fn emit_print_lowered_enum_variants(
+        &mut self,
+        index: u32,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let variants: Vec<(String, Vec<LoweredFieldRepr>)> = self
+            .lowered_enum_table
+            .info(index)
+            .variants
+            .iter()
+            .map(|variant| (variant.name.clone(), variant.fields.clone()))
+            .collect();
+        if variants.is_empty() {
+            return Err(unsupported(span, "printing an enum with no variants"));
+        }
+        let end = self.asm.new_label();
+        self.asm.push(Reg::X0); // the value survives the writes below
+        for (tag, (name, fields)) in variants.iter().enumerate() {
+            let next = self.asm.new_label();
+            self.asm.pop(Reg::X0);
+            self.asm.push(Reg::X0);
+            self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
+            self.emit_unbox_scalar();
+            self.asm.cmp_imm(Reg::X0, tag as u32);
+            self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
+            self.asm.emit_write_rodata(STDOUT_FD, name.as_bytes());
+            if !fields.is_empty() {
+                self.asm.emit_write_rodata(STDOUT_FD, b"(");
+                for (position, repr) in fields.iter().enumerate() {
+                    if position > 0 {
+                        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+                    }
+                    self.asm.pop(Reg::X0);
+                    self.asm.push(Reg::X0);
+                    self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
+                    match repr {
+                        LoweredFieldRepr::Int => {
+                            self.emit_unbox_scalar();
+                            self.emit_print_elem(ListElem::Int, span)?;
+                        }
+                        LoweredFieldRepr::Bool => {
+                            self.emit_unbox_scalar();
+                            self.emit_print_elem(ListElem::Bool, span)?;
+                        }
+                        LoweredFieldRepr::Str => self.emit_print_elem(ListElem::Str, span)?,
+                        LoweredFieldRepr::Enum(name) => {
+                            let Some(inner) = self.lowered_enum_table.index_by_name(name) else {
+                                return Err(unsupported(
+                                    span,
+                                    "printing an enum payload of this type",
+                                ));
+                            };
+                            self.emit_print_lowered_enum(inner, span)?;
+                        }
+                        LoweredFieldRepr::Unrenderable => {
+                            return Err(unsupported(span, "printing an enum payload of this type"));
+                        }
+                    }
+                }
+                self.asm.emit_write_rodata(STDOUT_FD, b")");
+            }
+            self.asm.branch(end, BranchKind::Unconditional);
+            self.asm.bind(next);
+        }
+        self.asm.bind(end);
+        self.asm.pop(Reg::X0); // discard the saved value
+        Ok(())
+    }
+
     /// println of the list in x0 in the evaluator's format:
     /// `[e1, e2, ...]` (strings unquoted).
     fn emit_println_list(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
@@ -7817,7 +8124,10 @@ impl Emitter {
                 Ok(Some(ValueType::Ptr))
             }
             ("__gc_write", 3) => {
-                if self.expression(&arguments[0])? != ValueType::Ptr {
+                // A lowered enum value is one of these pointers wearing the
+                // name of its enum, so the lowering's own reads and writes
+                // take it exactly as they take a bare pointer.
+                if !is_lowering_pointer(self.expression(&arguments[0])?) {
                     return Err(unsupported(span, "__gc_write to a non-pointer"));
                 }
                 self.push_rooted(Reg::X0);
@@ -7842,7 +8152,7 @@ impl Emitter {
                 Ok(Some(ValueType::Unit))
             }
             ("__gc_read", 2) | ("__gc_read_ptr", 2) | ("__gc_read_string", 2) => {
-                if self.expression(&arguments[0])? != ValueType::Ptr {
+                if !is_lowering_pointer(self.expression(&arguments[0])?) {
                     return Err(unsupported(span, &format!("{name} of a non-pointer")));
                 }
                 self.push_rooted(Reg::X0);
@@ -8443,6 +8753,104 @@ impl Emitter {
                             return Err(unsupported(
                                 span,
                                 &format!("rendering an enum payload of type {other:?}"),
+                            ));
+                        }
+                    }
+                    self.asm.mov_reg(Reg::X1, Reg::X0);
+                    self.asm.load_local(Reg::X0, acc);
+                    self.emit_str_concat();
+                    self.asm.store_local(Reg::X0, acc);
+                }
+                self.emit_append_literal(acc, ")");
+            }
+            self.asm.branch(end, BranchKind::Unconditional);
+            self.asm.bind(next);
+        }
+        self.asm.bind(end);
+        self.asm.load_local(Reg::X0, acc);
+        self.close_temp_roots(mark);
+        Ok(())
+    }
+
+    /// The lowered enum value in x0 as a heap string, `Variant(field, ...)`.
+    /// The same switch `emit_print_lowered_enum` writes, building into a
+    /// rooted accumulator instead of writing to stdout, so it can go in a
+    /// string interpolation hole.
+    fn emit_lowered_enum_to_str(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
+        if self.printing_lowered_enums.contains(&index) {
+            return Err(unsupported(span, "rendering an enum that holds itself"));
+        }
+        self.printing_lowered_enums.push(index);
+        let result = self.emit_lowered_enum_to_str_variants(index, span);
+        self.printing_lowered_enums.pop();
+        result
+    }
+
+    fn emit_lowered_enum_to_str_variants(
+        &mut self,
+        index: u32,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let variants: Vec<(String, Vec<LoweredFieldRepr>)> = self
+            .lowered_enum_table
+            .info(index)
+            .variants
+            .iter()
+            .map(|variant| (variant.name.clone(), variant.fields.clone()))
+            .collect();
+        if variants.is_empty() {
+            return Err(unsupported(span, "rendering an enum with no variants"));
+        }
+        let mark = self.open_temp_roots();
+        let value = self.reserve_locals(16);
+        let acc = value + 8;
+        self.asm.store_local(Reg::X0, value);
+        self.emit_root_frame_slot(value);
+        let empty = self.asm.intern_string_object("");
+        self.asm.load_rodata_address(Reg::X0, empty);
+        self.emit_heap_string_copy();
+        self.asm.store_local(Reg::X0, acc);
+        self.emit_root_frame_slot(acc);
+        let end = self.asm.new_label();
+        for (tag, (name, fields)) in variants.iter().enumerate() {
+            let next = self.asm.new_label();
+            self.asm.load_local(Reg::X0, value);
+            self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
+            self.emit_unbox_scalar();
+            self.asm.cmp_imm(Reg::X0, tag as u32);
+            self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
+            self.emit_append_literal(acc, name);
+            if !fields.is_empty() {
+                self.emit_append_literal(acc, "(");
+                for (position, repr) in fields.iter().enumerate() {
+                    if position > 0 {
+                        self.emit_append_literal(acc, ", ");
+                    }
+                    self.asm.load_local(Reg::X0, value);
+                    self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
+                    match repr {
+                        LoweredFieldRepr::Int => {
+                            self.emit_unbox_scalar();
+                            self.emit_int_to_str();
+                        }
+                        LoweredFieldRepr::Bool => {
+                            self.emit_unbox_scalar();
+                            self.emit_bool_to_str();
+                        }
+                        LoweredFieldRepr::Str => {}
+                        LoweredFieldRepr::Enum(name) => {
+                            let Some(inner) = self.lowered_enum_table.index_by_name(name) else {
+                                return Err(unsupported(
+                                    span,
+                                    "rendering an enum payload of this type",
+                                ));
+                            };
+                            self.emit_lowered_enum_to_str(inner, span)?;
+                        }
+                        LoweredFieldRepr::Unrenderable => {
+                            return Err(unsupported(
+                                span,
+                                "rendering an enum payload of this type",
                             ));
                         }
                     }
@@ -10935,6 +11343,11 @@ impl Emitter {
                 self.asm.bind(end_label);
                 Ok(())
             }
+            ValueType::LoweredEnum(index) => {
+                self.emit_print_lowered_enum(index, argument.span())?;
+                self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+                Ok(())
+            }
             ValueType::Enum(shape) => {
                 self.emit_print_enum_inline(shape, argument.span())?;
                 self.asm.emit_write_rodata(STDOUT_FD, b"\n");
@@ -12127,12 +12540,14 @@ impl Emitter {
 pub(crate) fn emit_macho_program(
     expr: &Expr,
     lowered_enums: std::collections::HashSet<String>,
+    lowered_enum_table: LoweredEnumTable,
     gc_log: bool,
     gc_stress: bool,
     gc_poison: bool,
 ) -> Result<Vec<u8>, Diagnostic> {
     let mut emitter = Emitter {
         lowered_enums,
+        lowered_enum_table,
         gc_log,
         gc_stress,
         gc_poison,

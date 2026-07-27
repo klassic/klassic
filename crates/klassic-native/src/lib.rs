@@ -646,7 +646,13 @@ fn compile_internal(
     // are lowered, so the chain lowers with everything else. Only the user's
     // own code is rewritten; the stdlib's map functions keep the builtin map.
     let expr = map_chain::lower_runtime_maps(expr, prelude_offset);
-    let (expr, lowered_enum_names, mono_enum_shapes, mono_enum_variants) = desugar_enums(expr);
+    let (
+        expr,
+        lowered_enum_names,
+        mono_enum_shapes,
+        mono_enum_variants,
+        mono_enum_field_annotations,
+    ) = desugar_enums(expr);
     // Capture the extension-method registry before the desugar erases the
     // `ExtensionDeclaration`s, so codegen can resolve method names that the
     // desugar left ambiguous (declared on more than one type) by the
@@ -686,6 +692,11 @@ fn compile_internal(
         NativeBackend::DirectAarch64 => aarch64::emit_macho_program(
             &expr,
             lowered_enum_names,
+            aarch64::LoweredEnumTable::from_shapes(
+                &mono_enum_variants,
+                &mono_enum_field_annotations,
+                &variant_owner_enum,
+            ),
             config.gc_log,
             config.gc_stress,
             config.gc_poison,
@@ -1923,14 +1934,19 @@ fn collect_enum_decls(expr: &Expr, out: &mut Vec<(String, Vec<String>, Vec<EnumV
     }
 }
 
-fn desugar_enums(
-    expr: Expr,
-) -> (
+/// What `desugar_enums` hands back: the rewritten program, the names of the
+/// enums it lowered, a shape per variant name, a variant table, and each
+/// variant's field annotations as written (which is the only place a payload
+/// that is itself an enum still says *which* enum).
+type DesugaredEnums = (
     Expr,
     HashSet<String>,
     HashMap<String, ConcreteEnumShape>,
     HashMap<String, EnumVariantInfo>,
-) {
+    HashMap<String, Vec<String>>,
+);
+
+fn desugar_enums(expr: Expr) -> DesugaredEnums {
     let mut decls = Vec::new();
     collect_enum_decls(&expr, &mut decls);
 
@@ -1988,6 +2004,7 @@ fn desugar_enums(
     // / wildcard `match` expressions carry no enum dependency and are
     // lowered the same way, which is a net new native capability.
     let mut variants = HashMap::new();
+    let mut variant_field_annotations: HashMap<String, Vec<String>> = HashMap::new();
     for name in &supported {
         for (index, variant) in mono[name].iter().enumerate() {
             let fields = variant
@@ -1998,6 +2015,17 @@ fn desugar_enums(
                         .expect("supported enum field classified")
                 })
                 .collect();
+            // The annotation text alongside the repr: a payload that is
+            // another enum is `EnumField` either way, and rendering one needs
+            // to know *which* enum, which only the text still says.
+            variant_field_annotations.insert(
+                variant.name.clone(),
+                variant
+                    .params
+                    .iter()
+                    .map(|(_, annotation)| annotation.text.trim().to_string())
+                    .collect(),
+            );
             variants.insert(
                 variant.name.clone(),
                 EnumVariantInfo {
@@ -2076,7 +2104,13 @@ fn desugar_enums(
         counter: 0,
     };
     let lowered = lowering.lower(expr);
-    (lowered, lowering.lowered_enums, mono_enum_shapes, variants)
+    (
+        lowered,
+        lowering.lowered_enums,
+        mono_enum_shapes,
+        variants,
+        variant_field_annotations,
+    )
 }
 
 /// Fresh synthetic-name generator shared by the enum lowering and the
@@ -2607,6 +2641,24 @@ impl EnumLowering {
             },
             Expr::SetLiteral { elements, span } => Expr::SetLiteral {
                 elements: elements.into_iter().map(|e| self.lower(e)).collect(),
+                span,
+            },
+            // A hole is an expression like any other: `"#{Some(1)}"` holds a
+            // constructor that has to be lowered, and a `match` written in a
+            // hole has to become the same tag switch it becomes anywhere else.
+            // Without this arm the hole keeps a constructor call no backend
+            // declared, which is what a backend then reports as an unknown
+            // function.
+            Expr::StringInterpolation { parts, span } => Expr::StringInterpolation {
+                parts: parts
+                    .into_iter()
+                    .map(|part| match part {
+                        StringPart::Literal(text) => StringPart::Literal(text),
+                        StringPart::Interpolation(inner) => {
+                            StringPart::Interpolation(Box::new(self.lower(*inner)))
+                        }
+                    })
+                    .collect(),
                 span,
             },
             other => other,

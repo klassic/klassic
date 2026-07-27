@@ -1,0 +1,99 @@
+// Cross-target fixture: printing an enum the program declares itself.
+//
+// The shared lowering erases a monomorphic enum into `__gc_record` calls, so
+// a value of one arrives at a backend as a bare pointer with nothing saying
+// which enum it is. x86-64 recovered that from the `__enum_shape_named`
+// marker the lowering leaves behind; aarch64 dropped the marker and refused
+// to print the pointer. Both read it now.
+//
+// `Option` and `Result` are here beside the user enums on purpose: they are
+// generic, so they are *not* lowered and travel a different path. A change
+// that fixed one and broke the other would show up as a difference between
+// the two halves of this file.
+//
+// A hole in a string is its own path: the enum lowering did not descend into
+// interpolation, so `"#{Some(1)}"` kept a constructor call no backend had
+// declared.
+//
+// An enum that holds *itself* is matched here but not printed: rendering one
+// would have to expand without bound at compile time, so both backends refuse
+// it, and a fixture has to stay within what they accept on every target.
+
+import std.option
+import std.result
+
+enum Colour { case Red; case Green; case Blue }
+enum Shape { case Circle(radius: Int); case Rect(w: Int, h: Int) }
+enum Tagged { case Named(name: String); case Flagged(on: Boolean); case Blank }
+enum Chain { case Nil; case Cons(head: Int, tail: Chain) }
+// A payload that is another enum, and not this one, so rendering it descends
+// exactly once.
+enum Wrapper { case Wrapping(inner: Colour); case Empty }
+
+// A nullary variant, a one-field variant, and a many-field one.
+println(Red)
+println(Green)
+println(Blue)
+println(Circle(3))
+println(Rect(2, 5))
+println(Named("klassic"))
+println(Flagged(true))
+println(Flagged(false))
+println(Blank)
+assertResult("Rect(2, 5)")("#{Rect(2, 5)}")
+assertResult("Blank")("#{Blank}")
+
+// Through a binding, and through an annotated one.
+val c = Circle(7)
+val tagged: Tagged = Named("bound")
+println(c)
+println(tagged)
+println("shape=#{c} tag=#{tagged}")
+
+// A payload that is a different enum renders by descending into it.
+println(Wrapping(Red))
+println(Wrapping(Blue))
+println(Empty)
+assertResult("Wrapping(Green)")("#{Wrapping(Green)}")
+
+// Matching still works on every one of them, which is what the lowering was
+// there to make possible in the first place.
+def area(s: Shape): Int = s match {
+  case Circle(r) => r * r * 3
+  case Rect(w, h) => w * h
+}
+println(area(Circle(3)))
+println(area(Rect(2, 5)))
+assertResult(27)(area(Circle(3)))
+
+def describe(t: Tagged): String = t match {
+  case Named(n) => "named " + n
+  case Flagged(f) => "flagged " + f
+  case Blank => "blank"
+}
+println(describe(Named("x")))
+println(describe(Flagged(true)))
+println(describe(Blank))
+
+// A recursive enum, matched rather than printed. The value is built inside
+// the call so the recursion does not read a top-level binding, which one
+// backend refuses.
+def depth(c: Chain, acc: Int): Int = c match {
+  case Nil => acc
+  case Cons(h, t) => depth(t, acc + 1)
+}
+println(depth(Cons(1, Cons(2, Nil)), 0))
+assertResult(2)(depth(Cons(1, Cons(2, Nil)), 0))
+
+// The generic half: not lowered, and printed by the other path.
+val some: Option<Int> = Some(4)
+val none: Option<Int> = None
+val ok: Result<Int, String> = Ok(9)
+val bad: Result<Int, String> = Err("nope")
+println(some)
+println(none)
+println(ok)
+println(bad)
+println("opt=#{some} res=#{bad}")
+assertResult("Some(4)")("#{some}")
+println("done")

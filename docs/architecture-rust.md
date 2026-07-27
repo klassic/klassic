@@ -1958,6 +1958,27 @@ side of a branch.
 - `tests/cross-exec/36-stdlib-system-modules.kl` covers all seven modules on
   all three targets, imported under aliases (three of them declare `exists`,
   two declare `join`).
+- aarch64 can print a value of an enum the program declared itself. The
+  shared lowering erases a monomorphic enum into `__gc_record` calls, so such
+  a value arrives as a bare pointer; x86-64 recovered its identity from the
+  `__enum_shape_named(value, "Variant")` marker the lowering leaves behind,
+  and aarch64 dropped the marker. It reads it now, giving the value
+  `ValueType::LoweredEnum(index)` into `LoweredEnumTable` -- built from the
+  lowering's own variant table plus each field's annotation text, which is
+  the only place a payload that is itself an enum still says *which* enum.
+  `emit_print_lowered_enum` / `emit_lowered_enum_to_str` switch on the boxed
+  tag in slot 0 and render the payloads from slots 1.. , descending into a
+  nested enum and refusing (like the generic path) an enum that holds itself
+  (issue #619).
+- `LoweredEnum` and `Ptr` are assignable to each other in both directions and
+  join as `Ptr`, because naming which enum a pointer is must only add what
+  printing needs and never narrow where the value can go. It is also
+  normalised to `Ptr` wherever a type is *stored* -- an enum shape's payload
+  -- so `Ok(step)` built from an argument and `Ok(step)` built from an
+  annotation stay one shape.
+- The enum lowering now descends into string interpolation. It did not, so
+  `"#{Some(1)}"` kept a constructor call no backend had declared -- a shared
+  middle-end gap that showed up as an unknown function on aarch64.
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
