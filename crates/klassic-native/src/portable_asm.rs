@@ -141,21 +141,6 @@ pub trait PortableAsm {
     // future ARM-Linux `svc`), so that per-OS emission stays inside the
     // impl and never leaks into the portable GC code that calls them.
     /// Write `len` bytes at data label `data` to file descriptor `fd`.
-    /// Save whatever this backend needs kept across the load barrier's slow
-    /// path, and restore it. The policy around the call is shared; *which
-    /// registers a backend has live there* is the one genuinely
-    /// platform-specific part of it, and three of the aarch64 ones have no
-    /// name in the portable register set. The default is to save nothing,
-    /// which is what a backend whose slow routine already keeps what its
-    /// callers hold wants.
-    fn save_barrier_registers(&mut self) {}
-    fn restore_barrier_registers(&mut self) {}
-
-    /// The same, around an allocation. A different list from the barrier's:
-    /// the allocation's own arguments are live where the barrier's are not.
-    fn save_alloc_registers(&mut self) {}
-    fn restore_alloc_registers(&mut self) {}
-
     fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize);
     /// Terminate the process with status `code` (does not return).
     fn plat_exit(&mut self, code: u64);
@@ -457,7 +442,7 @@ pub fn emit_gc_grow_budget<E: PortableAsm>(
 ///
 /// The argument registers are the shared `gc_alloc`'s own -- `V7` the size
 /// and `V6` the tag -- which is why this can be written once. What a backend
-/// needs kept across the call is asked of it, as with the barrier.
+/// needs kept across the call is the routine's own job, as with the barrier.
 pub fn emit_gc_alloc_object<E: PortableAsm>(
     out: &mut E,
     entry: E::TextLabel,
@@ -466,9 +451,7 @@ pub fn emit_gc_alloc_object<E: PortableAsm>(
 ) {
     out.mov_imm64(Reg::V7, payload_bytes);
     out.mov_imm64(Reg::V6, tag);
-    out.save_alloc_registers();
     out.call_label(entry);
-    out.restore_alloc_registers();
 }
 
 /// Box a scalar into its own single-slot `RAW_BYTES` object, scalar in `V0`
@@ -503,15 +486,15 @@ pub fn emit_gc_unbox_scalar<E: PortableAsm>(out: &mut E) {
 ///
 /// The value is in `V0` and the field's address is wherever the slow routine
 /// expects it -- the caller puts it there, since that is the one part of this
-/// that differs. What has to be kept across the call is asked of the backend
-/// (`save_barrier_registers`), because that is the other part.
+/// that differs. Keeping registers across the call is the routine's own job:
+/// a backend that needs any kept passes a label that saves them, calls the
+/// routine and restores, so no call site carries a list that could drift from
+/// what the routine clobbers.
 pub fn emit_gc_load_barrier<E: PortableAsm>(out: &mut E, slow: E::TextLabel) {
     let ok = out.create_text_label();
     out.test_reg_reg(Reg::V0, Reg::BadMask);
     out.jcc_label(Condition::Equal, ok);
-    out.save_barrier_registers();
     out.call_label(slow);
-    out.restore_barrier_registers();
     out.bind_text_label(ok);
     out.and_reg_reg(Reg::V0, Reg::ColorStrip);
 }

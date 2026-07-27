@@ -2025,6 +2025,16 @@ side of a branch.
   generic helper's base case is written in, and compiling the other branch
   anyway is what refused `if (isEmpty(xs)) xs else <something about head(xs)>`
   when it was called with `[]`. x86-64 already did this (issue #616).
+- The GC's two call sites no longer carry register-save lists. aarch64 emits
+  one wrapper per routine -- save `BARRIER_SAVED` / `ALLOC_SAVED`, call the
+  routine, restore, return -- and every barriered read and every allocation
+  `bl`s the wrapper. The four `save_*_registers` / `restore_*_registers` trait
+  hooks are gone from `PortableAsm`, and with them the class of bug where one
+  site's list and the routine's actual clobbers drift apart (which is how the
+  V-register-named list mapped X10-X12 to the wrong physical registers when it
+  was first tried). x86-64 saved nothing at these sites and is unchanged; the
+  fast path -- the colour test and the strip, which is what almost every load
+  executes -- does not change on either (issue #618).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

@@ -256,6 +256,10 @@ struct Assembler {
 /// lives on this side of the trait rather than in the shared routine.
 /// The same, around an allocation: x4/x5 carry the arguments, so they are not
 /// in this list, and x8 is (the barrier's field address is not live here).
+/// What the allocation wrapper saves around the routine: the registers this
+/// backend has live across an allocation. Read in one place -- the wrapper --
+/// so no call site can hold a list that drifts from what the routine
+/// actually clobbers.
 const ALLOC_SAVED: [Reg; 10] = [
     Reg::X1,
     Reg::X2,
@@ -269,6 +273,9 @@ const ALLOC_SAVED: [Reg; 10] = [
     Reg::X12,
 ];
 
+/// The same for the load barrier's slow path. Its list differs from the
+/// allocation's: the allocation's own arguments are live where the barrier's
+/// are not.
 const BARRIER_SAVED: [Reg; 11] = [
     Reg::X1,
     Reg::X2,
@@ -1243,30 +1250,6 @@ impl portable_asm::PortableAsm for Assembler {
         self.bind(done);
     }
 
-    /// The registers this backend has live across a barrier's slow path.
-    /// x10-x12 have no name in the portable set, which is why the list is
-    /// here rather than in the shared routine.
-    fn save_barrier_registers(&mut self) {
-        for reg in BARRIER_SAVED {
-            self.push(reg);
-        }
-    }
-    fn restore_barrier_registers(&mut self) {
-        for reg in BARRIER_SAVED.into_iter().rev() {
-            self.pop(reg);
-        }
-    }
-    fn save_alloc_registers(&mut self) {
-        for reg in ALLOC_SAVED {
-            self.push(reg);
-        }
-    }
-    fn restore_alloc_registers(&mut self) {
-        for reg in ALLOC_SAVED.into_iter().rev() {
-            self.pop(reg);
-        }
-    }
-
     fn plat_write_data(&mut self, fd: u64, data: PortDataAddr, len: usize) {
         Assembler::mov_imm64(self, Reg::X0, fd);
         match data {
@@ -2076,6 +2059,12 @@ struct Emitter {
     /// `reserve_gc_state`, whichever comes first -- owns it; the routine
     /// body itself is always emitted with the rest of the GC runtime.
     gc_load_barrier_label: Option<Label>,
+    /// Wrappers around the two GC routines that save what this backend has
+    /// live across them. Emitted once each; the call sites just `bl` here, so
+    /// no site carries a register list of its own and none can drift from
+    /// what the routine actually clobbers.
+    gc_barrier_trampoline_label: Option<Label>,
+    gc_alloc_trampoline_label: Option<Label>,
     /// `__bss` cells for the GC shadow stack (base pointer, top index),
     /// shared by `reserve_gc_state` and the mutator's root pushes.
     shadow_stack_cells: Option<(DataLabel, DataLabel)>,
@@ -4581,27 +4570,9 @@ impl Emitter {
     /// callers park those with `push_rooted` and take them back afterwards,
     /// which also picks up the new address once the collector moves objects.
     fn emit_gc_alloc_call(&mut self) {
-        const SAVED: [Reg; 10] = [
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X6,
-            Reg::X7,
-            Reg::X8,
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-        ];
-        let entry = self.gc_alloc_entry_label();
+        let entry = self.alloc_trampoline_label();
         self.asm.push_frame_record(); // the bl clobbers x30
-        for reg in SAVED {
-            self.asm.push(reg);
-        }
         self.asm.branch(entry, BranchKind::Link);
-        for reg in SAVED.into_iter().rev() {
-            self.asm.pop(reg);
-        }
         self.asm.pop_frame_record();
     }
 
@@ -4976,6 +4947,7 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X5);
     }
 
+    /// The routine itself, which the GC emission binds.
     fn load_barrier_label(&mut self) -> Label {
         match self.gc_load_barrier_label {
             Some(label) => label,
@@ -4985,6 +4957,66 @@ impl Emitter {
                 label
             }
         }
+    }
+
+    /// What a barriered read calls: the wrapper that saves this backend's
+    /// live registers around the routine.
+    fn barrier_trampoline_label(&mut self) -> Label {
+        match self.gc_barrier_trampoline_label {
+            Some(label) => label,
+            None => {
+                let label = self.asm.new_label();
+                self.gc_barrier_trampoline_label = Some(label);
+                label
+            }
+        }
+    }
+
+    /// The same for an allocation.
+    fn alloc_trampoline_label(&mut self) -> Label {
+        match self.gc_alloc_trampoline_label {
+            Some(label) => label,
+            None => {
+                let label = self.asm.new_label();
+                self.gc_alloc_trampoline_label = Some(label);
+                label
+            }
+        }
+    }
+
+    /// Emit both wrappers. Each saves the registers this backend has live
+    /// across its routine, calls it, restores, and returns -- so the policy
+    /// lives in one place instead of at every call site, and a register the
+    /// routine clobbers cannot be forgotten at one site and remembered at
+    /// another.
+    fn emit_gc_call_trampolines(&mut self) {
+        let barrier = self.barrier_trampoline_label();
+        let slow = self.load_barrier_label();
+        self.asm.bind(barrier);
+        self.asm.push_frame_record(); // the bl clobbers x30
+        for reg in BARRIER_SAVED {
+            self.asm.push(reg);
+        }
+        self.asm.branch(slow, BranchKind::Link);
+        for reg in BARRIER_SAVED.into_iter().rev() {
+            self.asm.pop(reg);
+        }
+        self.asm.pop_frame_record();
+        self.asm.ret();
+
+        let alloc_wrapper = self.alloc_trampoline_label();
+        let alloc = self.gc_alloc_entry_label();
+        self.asm.bind(alloc_wrapper);
+        self.asm.push_frame_record();
+        for reg in ALLOC_SAVED {
+            self.asm.push(reg);
+        }
+        self.asm.branch(alloc, BranchKind::Link);
+        for reg in ALLOC_SAVED.into_iter().rev() {
+            self.asm.pop(reg);
+        }
+        self.asm.pop_frame_record();
+        self.asm.ret();
     }
 
     /// M7: load a heap *pointer* out of `[base + offset]` through the GC
@@ -5030,10 +5062,12 @@ impl Emitter {
 
     /// The barrier proper: x8 = field address on entry, x0 = the raw
     /// pointer on exit. The test, the call and the strip are the shared
-    /// ones; what this backend adds is the register list above.
+    /// ones; what this backend adds is a wrapper around the slow routine
+    /// that saves the registers it has live there -- once, rather than at
+    /// each of these sites.
     fn emit_gc_load_barriered(&mut self) {
         self.asm.ldr_imm(Reg::X0, Reg::X8, 0);
-        let slow = self.load_barrier_label();
+        let slow = self.barrier_trampoline_label();
         crate::portable_asm::emit_gc_load_barrier(&mut self.asm, slow);
     }
 
@@ -12928,6 +12962,9 @@ pub(crate) fn emit_macho_program(
     // PortableAsm lowering end-to-end, and must encode validly. The go-live
     // (M7) routes the mutator through gc_alloc and adds roots/barriers.
     emitter.emit_gc_runtime(&gc);
+    // The two wrappers that save this backend's live registers around the
+    // routines above, so no call site carries a list of its own.
+    emitter.emit_gc_call_trampolines();
 
     emitter.asm.finish();
     // `bss_len` is 0 for every program today (no codegen reserves GC
