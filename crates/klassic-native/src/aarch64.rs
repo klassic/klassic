@@ -1691,6 +1691,17 @@ fn as_pointer_repr(ty: ValueType) -> ValueType {
     }
 }
 
+/// The element type a value can be stored in a map as. Wider than
+/// `list_elem_of` by the nullable case: `Map#get` answers a value or nothing,
+/// and every fold that rebuilds a map feeds that straight back into
+/// `Map#put`. Both are one boxed word.
+fn map_value_elem(ty: ValueType) -> Option<ListElem> {
+    match ty {
+        ValueType::Nullable(elem) => Some(elem),
+        other => list_elem_of(other),
+    }
+}
+
 fn is_lowering_pointer(ty: ValueType) -> bool {
     matches!(ty, ValueType::Ptr | ValueType::LoweredEnum(_))
 }
@@ -4228,7 +4239,7 @@ impl Emitter {
             return Ok(ValueType::Bool);
         }
 
-        let lhs_ty = self.expression(lhs)?;
+        let mut lhs_ty = self.expression(lhs)?;
         // A heap-reference left operand (a string being concatenated, a
         // collection being compared) waits while the right operand is
         // evaluated, which can allocate -- root its slot for that window.
@@ -4308,6 +4319,28 @@ impl Emitter {
             self.pop_rooted(Reg::X0);
         } else {
             self.asm.pop(Reg::X0);
+        }
+        // A value that may be null, used as the value it is: `Map#get` answers
+        // one, and `std.map`'s `mapValues` and `filterValues` do arithmetic on
+        // the result. It arrives boxed, so unboxing it is what makes the two
+        // sides the same type. A genuinely null operand would fault here
+        // rather than being read as zero, which is the same bargain the other
+        // backend already makes.
+        if !matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
+            if let ValueType::Nullable(elem) = lhs_ty
+                && is_boxed_scalar(elem_value_type(elem))
+                && rhs_ty == elem_value_type(elem)
+            {
+                self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+                lhs_ty = elem_value_type(elem);
+            }
+            if let ValueType::Nullable(elem) = rhs_ty
+                && is_boxed_scalar(elem_value_type(elem))
+                && lhs_ty == elem_value_type(elem)
+            {
+                self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
+                rhs_ty = elem_value_type(elem);
+            }
         }
         // Asking whether a heap reference is `null` compares a pointer with
         // nothing, so the two sides are different types by construction.
@@ -7369,7 +7402,11 @@ impl Emitter {
                 self.asm.store_local(Reg::X0, key_slot);
                 self.emit_root_frame_slot(key_slot);
                 let value_ty = self.expression(&arguments[2])?;
-                let Some(value_elem) = list_elem_of(value_ty) else {
+                // `Map#get` answers the value *or nothing*, and rebuilding a
+                // map is written as `Map#put(acc, k, Map#get(m, k))` -- so a
+                // value that may be null is a value of its own element type.
+                // It is already one boxed word either way.
+                let Some(value_elem) = map_value_elem(value_ty) else {
                     return Err(unsupported(arguments[2].span(), "a map value of this type"));
                 };
                 if let Some((_, existing_value)) = existing
@@ -7438,6 +7475,158 @@ impl Emitter {
                 self.asm.branch(reverse, BranchKind::Link);
                 self.close_temp_roots(mark);
                 Ok(Some(ValueType::Map(key_elem, value_elem)))
+            }
+            // `Map#containsValue(m, value)`: a scan of the second half of every
+            // entry, the mirror of `Map#containsKey`'s scan of the first.
+            ("Map#containsValue", 2) | ("containsValue", 2) => {
+                let mark = self.open_temp_roots();
+                let map_ty = self.expression(&arguments[0])?;
+                let value_elem = match map_ty {
+                    ValueType::Map(_, value) => Some(value),
+                    // An empty map holds nothing, so it contains no value.
+                    ValueType::EmptyMap => None,
+                    _ => return Err(unsupported(span, "a map builtin on a non-map")),
+                };
+                let cursor = self.reserve_locals(16);
+                let wanted = cursor + 8;
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                let candidate_ty = self.expression(&arguments[1])?;
+                let Some(candidate) = list_elem_of(candidate_ty) else {
+                    return Err(unsupported(arguments[1].span(), "a map value of this type"));
+                };
+                if is_boxed_scalar(candidate_ty) {
+                    self.emit_box_scalar();
+                }
+                self.asm.store_local(Reg::X0, wanted);
+                self.emit_root_frame_slot(wanted);
+                let Some(value_elem) = value_elem else {
+                    self.asm.mov_imm64(Reg::X0, 0);
+                    self.close_temp_roots(mark);
+                    return Ok(Some(ValueType::Bool));
+                };
+                if value_elem != candidate {
+                    return Err(unsupported(arguments[1].span(), "mixed map value types"));
+                }
+                let loop_start = self.asm.new_label();
+                let found = self.asm.new_label();
+                let missing = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(missing, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // this entry
+                self.emit_gc_load_ptr(Reg::X0, 8); // its value
+                if is_boxed_scalar(elem_value_type(value_elem)) {
+                    self.emit_unbox_scalar();
+                }
+                self.asm.load_local(Reg::X1, wanted);
+                match value_elem {
+                    ListElem::Str => self.emit_str_eq(),
+                    _ => {
+                        if is_boxed_scalar(elem_value_type(value_elem)) {
+                            self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
+                        }
+                        self.asm.cmp_reg(Reg::X0, Reg::X1);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                    }
+                }
+                self.asm.branch(found, BranchKind::CompareNonZero(Reg::X0));
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(found);
+                self.asm.mov_imm64(Reg::X0, 1);
+                self.asm.branch(done, BranchKind::Unconditional);
+                self.asm.bind(missing);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.bind(done);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Bool))
+            }
+            // `Map#remove(m, key)`: the same walk `Map#put` does, keeping every
+            // entry whose key differs and dropping the one that matches. The
+            // accumulator is built front-to-back and reversed, so insertion
+            // order survives.
+            ("Map#remove", 2) | ("remove", 2) => {
+                let mark = self.open_temp_roots();
+                let map_ty = self.expression(&arguments[0])?;
+                let existing = match map_ty {
+                    ValueType::Map(key, value) => Some((key, value)),
+                    ValueType::EmptyMap => None,
+                    _ => return Err(unsupported(span, "a map builtin on a non-map")),
+                };
+                let cursor = self.reserve_locals(16);
+                let acc = cursor + 8;
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                let key_ty = self.expression(&arguments[1])?;
+                let Some(key_elem) = list_elem_of(key_ty) else {
+                    return Err(unsupported(arguments[1].span(), "a map key of this type"));
+                };
+                if is_boxed_scalar(key_ty) {
+                    self.emit_box_scalar();
+                }
+                let key_slot = self.reserve_locals(8);
+                self.asm.store_local(Reg::X0, key_slot);
+                self.emit_root_frame_slot(key_slot);
+                let Some((existing_key, existing_value)) = existing else {
+                    // Removing from the empty map is the empty map.
+                    self.asm.mov_imm64(Reg::X0, 0);
+                    self.close_temp_roots(mark);
+                    return Ok(Some(ValueType::EmptyMap));
+                };
+                if existing_key != key_elem {
+                    return Err(unsupported(arguments[1].span(), "mixed map key types"));
+                }
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                let keep = self.asm.new_label();
+                let next = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // this entry
+                self.push_rooted(Reg::X0);
+                self.emit_gc_load_ptr(Reg::X0, 0); // its key
+                if is_boxed_scalar(elem_value_type(key_elem)) {
+                    self.emit_unbox_scalar();
+                }
+                self.asm.load_local(Reg::X1, key_slot);
+                match key_elem {
+                    ListElem::Str => self.emit_str_eq(),
+                    _ => {
+                        if is_boxed_scalar(elem_value_type(key_elem)) {
+                            self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
+                        }
+                        self.asm.cmp_reg(Reg::X0, Reg::X1);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                    }
+                }
+                self.asm.branch(keep, BranchKind::CompareZero(Reg::X0));
+                self.pop_rooted(Reg::X1); // the matching entry, dropped
+                self.asm.branch(next, BranchKind::Unconditional);
+                self.asm.bind(keep);
+                self.pop_rooted(Reg::X0);
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.bind(next);
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Map(existing_key, existing_value)))
             }
             // `Map#keys(m)` / `Map#values(m)`: one half of every entry, in
             // insertion order.
@@ -9890,9 +10079,9 @@ impl Emitter {
                         return Some(ValueType::Int);
                     }
                     "isEmpty" | "contains" | "isEmptyString" | "matches" | "containsKey"
-                    | "Map#containsKey" | "Map#isEmpty" | "Map#containsValue" | "Set#isEmpty"
-                    | "Set#contains" | "startsWith" | "endsWith" | "String#isInt"
-                    | "String#isDouble" => {
+                    | "containsValue" | "Map#containsKey" | "Map#isEmpty" | "Map#containsValue"
+                    | "Set#isEmpty" | "Set#contains" | "startsWith" | "endsWith"
+                    | "String#isInt" | "String#isDouble" => {
                         return Some(ValueType::Bool);
                     }
                     "String#parseInt" => return Some(ValueType::Int),
@@ -9915,6 +10104,19 @@ impl Emitter {
                             Some(ValueType::Set(elem)) | Some(ValueType::List(elem)) => {
                                 Some(ValueType::Set(elem))
                             }
+                            // Adding to the empty set is what fixes its
+                            // element type, and it is how every fold that
+                            // builds a set starts -- `std.set`'s `setFilter`
+                            // folds from `Set#empty()`. The element being
+                            // added is the only thing that says what the set
+                            // holds, so read it from there.
+                            Some(ValueType::EmptySet) if name == "Set#add" => arguments
+                                .get(1)
+                                .and_then(|argument| {
+                                    self.static_type_under(argument, locals, depth + 1)
+                                })
+                                .and_then(list_elem_of)
+                                .map(ValueType::Set),
                             Some(ValueType::EmptySet) | Some(ValueType::EmptyList)
                                 if name == "Set#fromList" =>
                             {
@@ -9980,12 +10182,23 @@ impl Emitter {
                             locals,
                             depth + 1,
                         )?)?;
-                        let value = list_elem_of(self.static_type_under(
+                        // The value may be a lookup, which answers a value or
+                        // nothing: `Map#put(acc, k, Map#get(m, k))` is how
+                        // `filterKeys` and `merge` rebuild a map.
+                        let value = map_value_elem(self.static_type_under(
                             &arguments[2],
                             locals,
                             depth + 1,
                         )?)?;
                         return Some(ValueType::Map(key, value));
+                    }
+                    // Dropping an entry keeps the map's type; an empty map
+                    // stays empty.
+                    "Map#remove" if arguments.len() == 2 => {
+                        return match first_type {
+                            Some(ty @ (ValueType::Map(..) | ValueType::EmptyMap)) => Some(ty),
+                            _ => None,
+                        };
                     }
                     "Map#empty" => return Some(ValueType::EmptyMap),
                     // The enum lowering's allocators. A constructor call like

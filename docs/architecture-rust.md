@@ -1997,6 +1997,17 @@ side of a branch.
   native backends share. It was an error, so a program could reach infinity by
   multiplying (`1e300 * 1e300` folded to `inf`) and not by dividing. Integer
   division by zero stays an error: there is no integer infinity (issue #627).
+- aarch64 gained `Map#remove` and `Map#containsValue` (the same chain walk
+  `Map#put` does, and the mirror of `Map#containsKey`'s scan), and the rest of
+  `std.map` / `std.set` came with them by fixing what they had in common: a
+  collection rebuilt by folding from an empty one. `Set#add` on the empty set
+  now takes its element type from the element being added, and a map value is
+  allowed to be `Nullable` -- `Map#put(acc, k, Map#get(m, k))` is how
+  `filterKeys` and `merge` are written, and `Map#get` answers a value *or
+  nothing*. A nullable operand in arithmetic is unboxed to the value it holds,
+  which is what `mapValues`, `filterValues` and `foldMap` do (issue #615).
+  Still unsupported everywhere: `mapKeys`, which goes through
+  `Map#fromPairs`.
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
