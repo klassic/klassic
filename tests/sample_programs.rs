@@ -43,6 +43,7 @@ fn sample_programs() -> Vec<&'static str> {
         "monad-with-newlines.kl",
         "mutable.kl",
         "numeric-literals.kl",
+        "proof-surface.kl",
         "record.kl",
         "reduce_syntax.kl",
         "set-literal.kl",

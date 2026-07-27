@@ -1263,7 +1263,9 @@ fn eval_expr_inner(
         Expr::Assign { name, value, span } => {
             let evaluated = eval_expr(value, environment, state)?;
             match environment.assign(name, evaluated) {
-                Ok(value) => Ok(value),
+                // Unit, matching the type an assignment is given: it is done
+                // for its effect, not for a value.
+                Ok(_) => Ok(Value::Unit),
                 Err(AssignmentFailure::Undefined) => Err(Diagnostic::runtime(
                     *span,
                     format!("undefined variable `{name}`"),

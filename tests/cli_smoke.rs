@@ -30,6 +30,257 @@ fn stdlib_completeness_round_two() {
     );
 }
 
+/// The most negative `Int` is writable as a literal. Its digits alone are one
+/// past `i64::MAX`, so the sign has to reach the range check -- and a larger
+/// magnitude has to stay rejected under either sign.
+#[test]
+fn most_negative_int_literal_round_trips() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "val low = -9223372036854775808\nprintln(low)\nprintln(low + 1)\nprintln(low match { case -9223372036854775808 => \"min\"; case _ => \"other\" })",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "the minimum Int should be a literal\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "-9223372036854775808\n-9223372036854775807\nmin\n()\n"
+    );
+
+    for source in ["9223372036854775808", "-9223372036854775809"] {
+        let rejected = Command::new(klassic_bin())
+            .args(["-e", source])
+            .output()
+            .expect("binary should run");
+        assert!(
+            !rejected.status.success(),
+            "{source} should stay out of range"
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("integer literal is out of range"),
+            "{source} should report the range, got:\n{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+}
+
+/// An `if` is an expression on the right of an assignment, as it is
+/// everywhere else -- no parentheses needed.
+#[test]
+fn assignment_takes_a_branch_on_its_right() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "mutable x = 1\nx = if (true) 2 else 3\nprintln(x)\nmutable y = 0\ny += if (false) 1 else 10\nprintln(y)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "an if should parse as an assignment's value\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "2\n10\n()\n");
+}
+
+/// A declared enum variant is a constructor in a pattern whatever it is
+/// spelled like, so generated code can use the `__` convention. A name that
+/// was never declared stays a binding.
+#[test]
+fn declared_variants_are_constructor_patterns() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum __A { case __N; case __C(x: Int) }\nprintln(__C(5) match { case __N => 0; case __C(x) => x })\nprintln(1 match { case _Rest => 99 })",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "an underscore-prefixed variant should match\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "5\n99\n()\n");
+}
+
+/// The system stdlib modules carry type annotations, which is what both
+/// native backends needed: aarch64 could not give a binding a type it never
+/// learned, and x86-64 could not tell the string `lastIndexOf` from the list
+/// one. The evaluator inferred through them either way, so this pins the
+/// answers the annotations have to keep producing.
+#[test]
+fn system_stdlib_modules_are_annotated() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "import std.path as P\nimport std.env as E\nimport std.time as T\nimport std.cli as C\nprintln(P.basename(\"/a/b/c.txt\"))\nprintln(P.dirname(\"/a/b/c.txt\"))\nprintln(P.fileExtension(\"x.tar\"))\nprintln(E.getOrElse(\"KLASSIC_DEFINITELY_NOT_SET\", \"fallback\"))\nprintln(T.formatIso(0))\nprintln(C.option([\"--out\", \"f.txt\"], \"--out\"))",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "the annotated modules should evaluate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "c.txt\n/a/b\n.tar\nfallback\n1970-01-01T00:00:00.000Z\nf.txt\n()\n"
+    );
+}
+
+/// A path or a file's contents that arrives as a *heap* string -- which is
+/// what an annotated `String` parameter holds -- is copied into a runtime
+/// pair rather than refused. Annotating a definition must never be what stops
+/// a program compiling.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_reads_a_file_through_an_annotated_path() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after the epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("klassic-annotated-path-{stamp}"));
+    fs::create_dir_all(&dir).expect("temp dir should be creatable");
+    let source_path = dir.join("program.kl");
+    let bin_path = dir.join("program");
+    fs::write(
+        &source_path,
+        "def store(path: String, text: String): Unit = FileOutput#write(path, text)\n         def load(path: String): String = FileInput#readAll(path)\n         def stem(path: String): String = {\n           val slash = lastIndexOf(path, \"/\")\n           if((slash < 0)) path else substring(path, slash + 1, length(path))\n         }\n         store(\"annotated.txt\", \"contents\")\n         println(load(\"annotated.txt\"))\n         println(stem(\"/a/b/annotated.txt\"))\n         println(stem(\"bare\"))\n         FileOutput#delete(\"annotated.txt\")\n",
+    )
+    .expect("source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "an annotated String parameter should still compile\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .current_dir(&dir)
+        .output()
+        .expect("generated program should run");
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "contents\nannotated.txt\nbare\n"
+    );
+}
+
+/// An assignment is done for its effect and yields unit. It used to take the
+/// assigned value's type, so two `match` arms that both ended in one
+/// disagreed unless the values happened to share a type -- which forced a
+/// throwaway value at the end of every arm written for effect.
+#[test]
+fn an_assignment_yields_unit() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "enum KM { case KMNil; case KMCons(k: Int, rest: KM) }\nmutable cur: KM = KMCons(1, KMNil)\nmutable go = true\nmutable seen = 0\nwhile (go) {\n  cur match {\n    case KMNil => go = false\n    case KMCons(k, rest) => { seen = seen + k; cur = rest }\n  }\n}\nprintln(seen)\nmutable x = 1\nprintln(x = 5)\nprintln(x)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "arms ending in assignments should agree\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n()\n5\n()\n");
+}
+
+/// Floating-point division by zero has an answer under IEEE 754, which is
+/// what the underlying f64 implements, so it is no longer an error: a program
+/// could reach infinity by multiplying and not by dividing. Integer division
+/// by zero stays an error -- there is no integer infinity to produce.
+#[test]
+fn float_division_by_zero_follows_ieee() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "println(1.0 / 0.0)\nprintln(-1.0 / 0.0)\nprintln(0.0 / 0.0)\nprintln(1.0e300 * 1.0e300)",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        output.status.success(),
+        "float division by zero should have an answer\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "inf\n-inf\nNaN\ninf\n()\n"
+    );
+
+    let integer = Command::new(klassic_bin())
+        .args(["-e", "1 / 0"])
+        .output()
+        .expect("binary should run");
+    assert!(!integer.status.success(), "1 / 0 should stay an error");
+    assert!(
+        String::from_utf8_lossy(&integer.stderr).contains("division by zero"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&integer.stderr)
+    );
+}
+
+/// A string compared with `null`. A static or runtime string is a
+/// (data, length) pair in fixed storage and so is never null; a heap string
+/// is a pointer and the answer is whether it is zero. Asking is the first
+/// thing written after a lookup that may not have found anything, and it did
+/// not compile.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_compares_a_string_with_null() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after the epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("klassic-string-null-{stamp}"));
+    fs::create_dir_all(&dir).expect("temp dir should be creatable");
+    let source_path = dir.join("program.kl");
+    let bin_path = dir.join("program");
+    fs::write(
+        &source_path,
+        "import std.string\n         val s: String = getEnv(\"PATH\")\n         println(s == null)\n         println(s != null)\n         val t = \"abc\"\n         println(t == null)\n         println(null == t)\n         println(t.toUpperCase() == null)\n",
+    )
+    .expect("source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "comparing a string with null should compile\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("generated program should run");
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "false\ntrue\nfalse\nfalse\nfalse\n"
+    );
+}
+
 /// std.option / std.result richer API via method-style dispatch. The
 /// clean names are restored now that native module namespacing (#449)
 /// makes the free names safe and receiver-type dispatch picks the right

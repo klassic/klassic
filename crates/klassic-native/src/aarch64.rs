@@ -82,6 +82,14 @@ const DEFAULT_DIR_MODE: u64 = 0o755;
 const GC_EVAC_OFF: bool = false;
 
 const SYS_MMAP: u16 = 197;
+
+/// Darwin `__getcwd(buf, size)`: fills `buf`, answers 0 on success.
+const SYS_GETCWD: u16 = 326;
+
+/// `S_IFDIR` (0o040000) >> 12, the value `st_mode`'s type field takes for a
+/// directory; `S_IFREG` (0o100000) >> 12 for a regular file.
+const S_IFDIR_SHIFTED: u32 = 0o4;
+const S_IFREG_SHIFTED: u32 = 0o10;
 const STDOUT_FD: u64 = 1;
 const STDERR_FD: u64 = 2;
 /// One bump-allocator segment. Exhaustion mmaps a fresh segment (the
@@ -248,6 +256,10 @@ struct Assembler {
 /// lives on this side of the trait rather than in the shared routine.
 /// The same, around an allocation: x4/x5 carry the arguments, so they are not
 /// in this list, and x8 is (the barrier's field address is not live here).
+/// What the allocation wrapper saves around the routine: the registers this
+/// backend has live across an allocation. Read in one place -- the wrapper --
+/// so no call site can hold a list that drifts from what the routine
+/// actually clobbers.
 const ALLOC_SAVED: [Reg; 10] = [
     Reg::X1,
     Reg::X2,
@@ -261,6 +273,9 @@ const ALLOC_SAVED: [Reg; 10] = [
     Reg::X12,
 ];
 
+/// The same for the load barrier's slow path. Its list differs from the
+/// allocation's: the allocation's own arguments are live where the barrier's
+/// are not.
 const BARRIER_SAVED: [Reg; 11] = [
     Reg::X1,
     Reg::X2,
@@ -1235,30 +1250,6 @@ impl portable_asm::PortableAsm for Assembler {
         self.bind(done);
     }
 
-    /// The registers this backend has live across a barrier's slow path.
-    /// x10-x12 have no name in the portable set, which is why the list is
-    /// here rather than in the shared routine.
-    fn save_barrier_registers(&mut self) {
-        for reg in BARRIER_SAVED {
-            self.push(reg);
-        }
-    }
-    fn restore_barrier_registers(&mut self) {
-        for reg in BARRIER_SAVED.into_iter().rev() {
-            self.pop(reg);
-        }
-    }
-    fn save_alloc_registers(&mut self) {
-        for reg in ALLOC_SAVED {
-            self.push(reg);
-        }
-    }
-    fn restore_alloc_registers(&mut self) {
-        for reg in ALLOC_SAVED.into_iter().rev() {
-            self.pop(reg);
-        }
-    }
-
     fn plat_write_data(&mut self, fd: u64, data: PortDataAddr, len: usize) {
         Assembler::mov_imm64(self, Reg::X0, fd);
         match data {
@@ -1306,6 +1297,10 @@ enum ListElem {
     /// An element that is a record, which is a pointer too. A list of them is
     /// what `toPairs()` hands back.
     Record(u32),
+    /// An element that is a *lowered* enum -- one the shared pass erased into
+    /// `__gc_record` calls -- carrying its entry in the lowered-enum table so
+    /// a list of them can be printed. A pointer, like the two above.
+    LoweredEnum(u32),
     /// An element that is itself a list: `depth` levels of list over `base`.
     /// `List<List<Int>>`'s element is `Nested { depth: 1, base: Int }` and
     /// `List<List<List<Int>>>`'s is `depth: 2`.
@@ -1347,7 +1342,10 @@ impl ListElem {
             ListElem::Int => Some(ScalarElem::Int),
             ListElem::Bool => Some(ScalarElem::Bool),
             ListElem::Str => Some(ScalarElem::Str),
-            ListElem::Enum(_) | ListElem::Record(_) | ListElem::Nested { .. } => None,
+            ListElem::Enum(_)
+            | ListElem::Record(_)
+            | ListElem::LoweredEnum(_)
+            | ListElem::Nested { .. } => None,
         }
     }
 
@@ -1398,9 +1396,15 @@ enum ValueType {
     /// A record value: index into the emitter's record table (nominal
     /// declarations and interned structural shapes).
     Record(u32),
-    /// An untyped heap pointer: lowered enum values and the box cells
-    /// the enum desugaring builds around scalars.
+    /// An untyped heap pointer: the box cells the enum desugaring builds
+    /// around scalars, and any lowered enum value whose enum could not be
+    /// named at the point it was built.
     Ptr,
+    /// A *lowered* monomorphic enum value: an index into
+    /// `lowered_enum_table`. The shared lowering erased the declaration and
+    /// left `__gc_record` calls, so the value is a pointer -- this says which
+    /// enum's pointer it is, which is what printing one needs.
+    LoweredEnum(u32),
     Unit,
     /// A generic enum's value: an index into the emitter's shape table, which
     /// records what each variant carries. The shared lowering only erases
@@ -1446,6 +1450,15 @@ fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueTyp
         | (other @ ValueType::Set(_), ValueType::EmptySet) => Some(other),
         (ValueType::EmptyMap, other @ ValueType::Map(..))
         | (other @ ValueType::Map(..), ValueType::EmptyMap) => Some(other),
+        // Two lowered enums of different enums, or one against a bare
+        // pointer, join as the pointer they both are: the join carries no
+        // single variant table, so it can no longer be printed, which is
+        // exactly what was true before any of them carried one.
+        (ValueType::LoweredEnum(left), ValueType::LoweredEnum(right)) if left != right => {
+            Some(ValueType::Ptr)
+        }
+        (ValueType::LoweredEnum(_), ValueType::Ptr)
+        | (ValueType::Ptr, ValueType::LoweredEnum(_)) => Some(ValueType::Ptr),
         (left, right) if left == right => Some(left),
         _ => None,
     }
@@ -1456,14 +1469,173 @@ fn merge_branch_types(then_ty: ValueType, else_ty: ValueType) -> Option<ValueTyp
 /// polymorphic empty list into any list slot.
 fn assignable(actual: ValueType, expected: ValueType) -> bool {
     actual == expected
+        // A lowered enum *is* a heap pointer -- naming which enum it is only
+        // adds what printing needs, and must not narrow where the value can
+        // go. Both directions, because the lowering's own helpers are typed
+        // in terms of the bare pointer.
+        || matches!(
+            (actual, expected),
+            (ValueType::LoweredEnum(_), ValueType::Ptr) | (ValueType::Ptr, ValueType::LoweredEnum(_))
+        )
         // `null` into any reference slot, including one that may hold nothing.
         || (actual == ValueType::Null && is_heap_pointer(expected))
+        // A value that is *sometimes* null fits a slot of what it otherwise
+        // is, for the same reason `null` itself does: `std.cli`'s `option`
+        // answers a String or nothing, and its annotation says String.
+        || matches!(actual, ValueType::Nullable(elem) if elem_value_type(elem) == expected)
         || (actual == ValueType::EmptyList
             && matches!(expected, ValueType::List(_) | ValueType::EmptyList))
         || (actual == ValueType::EmptySet
             && matches!(expected, ValueType::Set(_) | ValueType::EmptySet))
         || (actual == ValueType::EmptyMap
             && matches!(expected, ValueType::Map(..) | ValueType::EmptyMap))
+}
+
+/// What a lowered monomorphic enum looks like, carried over from the shared
+/// `desugar_enums` pass so this backend can render one.
+///
+/// The lowering erases the declaration and leaves `__gc_record` calls behind,
+/// which is why a value of such an enum arrives here as a bare pointer. The
+/// pass does wrap every construction in `__enum_shape_named(value, "Variant")`
+/// for the x86-64 display path; this backend reads the same marker, which is
+/// what lets it name the enum a pointer belongs to and print it.
+#[derive(Default)]
+pub(crate) struct LoweredEnumTable {
+    /// One entry per lowered enum: its name and its variants in tag order.
+    enums: Vec<LoweredEnumInfo>,
+    /// Variant name -> the enum it belongs to.
+    owner: HashMap<String, usize>,
+}
+
+pub(crate) struct LoweredEnumInfo {
+    /// The enum's own name, so an annotation naming it resolves here.
+    name: String,
+    variants: Vec<LoweredVariant>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LoweredVariant {
+    name: String,
+    /// One entry per payload, in declaration order: how to render it.
+    fields: Vec<LoweredFieldRepr>,
+}
+
+/// How to render one payload of a lowered enum. Deliberately narrower than
+/// the shared `EnumFieldRepr`: everything this backend needs to know is which
+/// of the four printable shapes the eight bytes are.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum LoweredFieldRepr {
+    Int,
+    Bool,
+    Str,
+    /// Another lowered enum, named by the annotation it was declared with so
+    /// the renderer can descend into it. The name is resolved to a table
+    /// index lazily, because a payload can name an enum whose own entry is
+    /// still being built.
+    Enum(String),
+    /// A payload this backend has no rendering for -- a Double, whose
+    /// shortest-round-trip formatter does not exist here.
+    Unrenderable,
+}
+
+impl LoweredFieldRepr {
+    fn from_repr(repr: crate::EnumFieldRepr, annotation: String) -> Self {
+        match repr {
+            crate::EnumFieldRepr::Scalar => Self::Int,
+            crate::EnumFieldRepr::BoolField => Self::Bool,
+            crate::EnumFieldRepr::StringField => Self::Str,
+            crate::EnumFieldRepr::EnumField => Self::Enum(annotation),
+            crate::EnumFieldRepr::DoubleField => Self::Unrenderable,
+        }
+    }
+}
+
+impl LoweredEnumTable {
+    /// Build from the shared lowering's own tables: `variants` gives every
+    /// variant its tag index and its payload reprs, and `variant_owner` says
+    /// which enum each belongs to. Those two are complete and authoritative,
+    /// so the table is exactly what the lowering erased.
+    pub(crate) fn from_shapes(
+        variants: &HashMap<String, crate::EnumVariantInfo>,
+        field_annotations: &HashMap<String, Vec<String>>,
+        variant_owner: &HashMap<String, String>,
+    ) -> Self {
+        let mut table = Self::default();
+        let mut by_name: HashMap<String, usize> = HashMap::new();
+        // Sorted so the table is built the same way on every run; the tag
+        // index below is what actually orders the variants.
+        let mut names: Vec<&String> = variants.keys().collect();
+        names.sort();
+        for variant in names {
+            let Some(owner) = variant_owner.get(variant) else {
+                continue;
+            };
+            let info = &variants[variant];
+            let index = *by_name.entry(owner.clone()).or_insert_with(|| {
+                table.enums.push(LoweredEnumInfo {
+                    name: owner.clone(),
+                    variants: Vec::new(),
+                });
+                table.enums.len() - 1
+            });
+            let entry = &mut table.enums[index];
+            let tag = info.index as usize;
+            if entry.variants.len() <= tag {
+                entry.variants.resize(
+                    tag + 1,
+                    LoweredVariant {
+                        name: String::new(),
+                        fields: Vec::new(),
+                    },
+                );
+            }
+            let annotations = field_annotations.get(variant);
+            entry.variants[tag] = LoweredVariant {
+                name: variant.clone(),
+                fields: info
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(position, repr)| {
+                        let annotation = annotations
+                            .and_then(|texts| texts.get(position))
+                            .cloned()
+                            .unwrap_or_default();
+                        LoweredFieldRepr::from_repr(*repr, annotation)
+                    })
+                    .collect(),
+            };
+            table.owner.insert(variant.clone(), index);
+        }
+        // An enum with a gap in its tags never existed -- the lowering numbers
+        // variants consecutively -- but a defensive drop keeps a nameless
+        // entry from being printed as one.
+        table
+            .enums
+            .retain(|info| info.variants.iter().all(|variant| !variant.name.is_empty()));
+        table.owner.clear();
+        for (index, info) in table.enums.iter().enumerate() {
+            for variant in &info.variants {
+                table.owner.insert(variant.name.clone(), index);
+            }
+        }
+        table
+    }
+
+    fn info(&self, index: u32) -> &LoweredEnumInfo {
+        &self.enums[index as usize]
+    }
+
+    fn owner_of(&self, variant: &str) -> Option<u32> {
+        self.owner.get(variant).map(|index| *index as u32)
+    }
+
+    fn index_by_name(&self, name: &str) -> Option<u32> {
+        self.enums
+            .iter()
+            .position(|info| info.name == name)
+            .map(|index| index as u32)
+    }
 }
 
 /// One nominal record declaration or interned structural shape:
@@ -1496,6 +1668,34 @@ fn is_boxed_scalar(ty: ValueType) -> bool {
 /// collector must trace? `EmptyList`/`EmptySet` are the nil pointer (0),
 /// which the root scan and the barriers both pass through untouched, so
 /// rooting them is harmless and keeps the classification purely by type.
+/// Whether the enum lowering's `__gc_read`/`__gc_write` primitives accept a
+/// value of this type: a bare heap pointer, or one that also remembers which
+/// lowered enum it is.
+/// A lowered enum seen as the pointer it is. Used where a type is *stored*
+/// (an enum shape's payload, a record's field) rather than used, so that the
+/// added precision never splits one type into two.
+fn as_pointer_repr(ty: ValueType) -> ValueType {
+    match ty {
+        ValueType::LoweredEnum(_) => ValueType::Ptr,
+        other => other,
+    }
+}
+
+/// The element type a value can be stored in a map as. Wider than
+/// `list_elem_of` by the nullable case: `Map#get` answers a value or nothing,
+/// and every fold that rebuilds a map feeds that straight back into
+/// `Map#put`. Both are one boxed word.
+fn map_value_elem(ty: ValueType) -> Option<ListElem> {
+    match ty {
+        ValueType::Nullable(elem) => Some(elem),
+        other => list_elem_of(other),
+    }
+}
+
+fn is_lowering_pointer(ty: ValueType) -> bool {
+    matches!(ty, ValueType::Ptr | ValueType::LoweredEnum(_))
+}
+
 fn is_heap_pointer(ty: ValueType) -> bool {
     matches!(
         ty,
@@ -1511,6 +1711,7 @@ fn is_heap_pointer(ty: ValueType) -> bool {
             | ValueType::Null
             | ValueType::Nullable(_)
             | ValueType::Enum(_)
+            | ValueType::LoweredEnum(_)
     )
 }
 
@@ -1522,6 +1723,7 @@ fn elem_value_type(elem: ListElem) -> ValueType {
         ListElem::Str => ValueType::Str,
         ListElem::Enum(shape) => ValueType::Enum(shape),
         ListElem::Record(index) => ValueType::Record(index),
+        ListElem::LoweredEnum(index) => ValueType::LoweredEnum(index),
         ListElem::Nested { .. } => ValueType::List(
             elem.nested_inner()
                 .expect("a nested element is a list of its inner element"),
@@ -1536,6 +1738,49 @@ fn elem_value_type(elem: ListElem) -> ValueType {
 /// The annotation a type would be written as, for the types a type variable
 /// can be solved to from an argument. Anything else answers `None`, which
 /// leaves the variable unsolved rather than guessing.
+/// The fields of a structural record annotation, `{ a: Int; b: String }`, in
+/// the order written. `None` when the text is not one. Splitting is done at
+/// the top nesting level so a field whose own type is a record or a generic
+/// application survives.
+fn split_structural_record_fields(text: &str) -> Option<Vec<(String, String)>> {
+    let trimmed = text.trim();
+    let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?;
+    let mut fields = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for ch in inner.chars() {
+        match ch {
+            '{' | '<' | '(' | '[' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' | '>' | ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ';' | ',' if depth == 0 => {
+                fields.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    fields.push(current);
+    let mut typed = Vec::new();
+    for field in fields {
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        let (name, annotation) = field.split_once(':')?;
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        typed.push((name.to_string(), annotation.trim().to_string()));
+    }
+    if typed.is_empty() { None } else { Some(typed) }
+}
+
 fn type_annotation_name(ty: ValueType) -> Option<String> {
     Some(
         match ty {
@@ -1704,6 +1949,7 @@ fn list_elem_of(ty: ValueType) -> Option<ListElem> {
         ValueType::Str => Some(ListElem::Str),
         ValueType::Enum(shape) => Some(ListElem::Enum(shape)),
         ValueType::Record(index) => Some(ListElem::Record(index)),
+        ValueType::LoweredEnum(index) => Some(ListElem::LoweredEnum(index)),
         // A list of lists: one more level over whatever the inner list holds.
         ValueType::List(inner) => Some(match inner.as_scalar() {
             Some(base) => ListElem::Nested { depth: 1, base },
@@ -1740,6 +1986,7 @@ struct GenericFunction {
     return_annotation: Option<String>,
 }
 
+#[derive(Clone)]
 struct FunctionInfo {
     label: Label,
     params: Vec<(String, ValueType)>,
@@ -1781,6 +2028,12 @@ struct GenericRecord {
 struct CapturedEnv {
     lambdas: Vec<(String, usize)>,
     dicts: Vec<(String, Vec<(String, usize)>)>,
+    /// Frame slots the lambda closed over, as (name, slot, type). A lambda
+    /// has no runtime representation here -- its body is compiled where it is
+    /// called -- so a value it captured has to be reachable from there. It is,
+    /// because the slot outlives the binding: `val add3 = adder(3)` puts the
+    /// 3 in a slot of the *caller's* frame and the lambda reads it.
+    values: Vec<(String, u32, ValueType)>,
 }
 
 #[derive(Default)]
@@ -1813,6 +2066,12 @@ struct Emitter {
     /// `reserve_gc_state`, whichever comes first -- owns it; the routine
     /// body itself is always emitted with the rest of the GC runtime.
     gc_load_barrier_label: Option<Label>,
+    /// Wrappers around the two GC routines that save what this backend has
+    /// live across them. Emitted once each; the call sites just `bl` here, so
+    /// no site carries a register list of its own and none can drift from
+    /// what the routine actually clobbers.
+    gc_barrier_trampoline_label: Option<Label>,
+    gc_alloc_trampoline_label: Option<Label>,
     /// `__bss` cells for the GC shadow stack (base pointer, top index),
     /// shared by `reserve_gc_state` and the mutator's root pushes.
     shadow_stack_cells: Option<(DataLabel, DataLabel)>,
@@ -1829,9 +2088,14 @@ struct Emitter {
     /// Number of shadow-stack roots pushed in each open scope, so leaving
     /// a scope pops exactly its own.
     scope_root_counts: Vec<usize>,
-    /// Names of enums `desugar_enums` lowered to `__gc_record` shape;
-    /// annotations naming them type as plain heap pointers.
+    /// Names of enums `desugar_enums` lowered to `__gc_record` shape.
     lowered_enums: std::collections::HashSet<String>,
+    /// What each of those enums looks like, so a value of one can be printed
+    /// rather than refused as an untyped pointer.
+    lowered_enum_table: LoweredEnumTable,
+    /// Lowered enums currently being rendered, so one that holds itself is
+    /// refused rather than expanded forever.
+    printing_lowered_enums: Vec<u32>,
     scopes: Vec<HashMap<String, (u32, ValueType)>>,
     /// Lambda bodies interned by `val f = (x) => ...`, and the names bound to
     /// them, scoped like ordinary locals. A lambda has no runtime
@@ -1924,14 +2188,47 @@ impl Emitter {
             .find_map(|scope| scope.get(name).copied())
     }
 
+    /// Whether this condition is decided while compiling, and how. Narrow on
+    /// purpose: it answers only for the emptiness of a collection whose type
+    /// says it has no elements, which is the shape a generic helper's base
+    /// case is written in.
+    fn static_condition(&mut self, condition: &Expr) -> Option<bool> {
+        let Expr::Call {
+            callee, arguments, ..
+        } = condition
+        else {
+            return None;
+        };
+        let name = match callee.as_ref() {
+            Expr::Identifier { name, .. } => name.as_str(),
+            _ => return None,
+        };
+        let name = Self::canonical_builtin_name(name);
+        if !matches!(
+            name,
+            "isEmpty" | "Set#isEmpty" | "Map#isEmpty" | "isEmptyString"
+        ) {
+            return None;
+        }
+        let argument = arguments.first()?;
+        match self.static_type_under(argument, &mut Vec::new(), 0)? {
+            ValueType::EmptyList | ValueType::EmptySet | ValueType::EmptyMap => Some(true),
+            _ => None,
+        }
+    }
+
     /// Resolve a type annotation against scalars, list types, lowered
     /// enums, and declared records (`#Point` or `Point`).
     fn annotation_type(&mut self, text: &str, span: Span) -> Result<ValueType, Diagnostic> {
         let trimmed = text.trim();
         let bare = trimmed.trim_start_matches('#');
-        // Lowered monomorphic enum values travel as plain heap
-        // pointers.
+        // A lowered monomorphic enum: a heap pointer that remembers which
+        // enum it is, so a parameter or return annotated with one can be
+        // printed rather than refused.
         if self.lowered_enums.contains(bare) {
+            if let Some(index) = self.lowered_enum_table.index_by_name(bare) {
+                return Ok(ValueType::LoweredEnum(index));
+            }
             return Ok(ValueType::Ptr);
         }
         if let Some(index) = self
@@ -1974,6 +2271,29 @@ impl Emitter {
         if bare == "Point" {
             let point = self.instantiate_builtin_point();
             return Ok(ValueType::Record(point));
+        }
+        // A structural record written as its fields: `{ year: Int; month: Int }`.
+        // `std.time` returns one of these, and without this the whole module
+        // is refused for a reason that reads as if the backend could not model
+        // an `Int`.
+        if let Some(fields) = split_structural_record_fields(trimmed) {
+            let mut typed = Vec::with_capacity(fields.len());
+            for (field, annotation) in fields {
+                let resolved = self.annotation_type(&annotation, span)?;
+                typed.push((field, resolved));
+            }
+            if let Some(index) = self.records.iter().position(|record| {
+                record.usable && record.name.is_empty() && record.fields == typed
+            }) {
+                return Ok(ValueType::Record(index as u32));
+            }
+            self.records.push(RecordInfo {
+                name: String::new(),
+                fields: typed,
+                lambda_fields: Vec::new(),
+                usable: true,
+            });
+            return Ok(ValueType::Record((self.records.len() - 1) as u32));
         }
         // `#GPoint<Int, Int>`: a generic record named with its arguments. The
         // parameters are substituted into the field types and the result is
@@ -2127,7 +2447,13 @@ impl Emitter {
                 // `replace` would rewrite the `a` inside `Char`.
                 let text = substitute_type_params(annotation.trim(), &params, arguments);
                 match self.annotation_type(&text, span) {
-                    Ok(ty) => typed.push(ty),
+                    // A payload that is a lowered enum is stored as the bare
+                    // pointer it is. Which enum it is only matters where the
+                    // value is printed, and letting the distinction into a
+                    // shape would make `Ok(step)` built from an argument and
+                    // `Ok(step)` built from an annotation two different
+                    // shapes of the same instantiation.
+                    Ok(ty) => typed.push(as_pointer_repr(ty)),
                     Err(_) => {
                         self.applied_enum_shapes
                             .remove(&(enum_index, arguments.to_vec()));
@@ -2811,6 +3137,14 @@ impl Emitter {
                 self.asm.mov_imm64(Reg::X0, *value as u64);
                 Ok(ValueType::Int)
             }
+            // An assignment in expression position: done for its effect, so
+            // it yields unit. Two `match` arms that both end in one therefore
+            // agree, which is what lets a `match` be written for effect.
+            Expr::Assign { .. } => {
+                self.statement(expr)?;
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(ValueType::Unit)
+            }
             // `expr cleanup { ... }`: the clause runs after the expression it
             // is attached to, and the expression's value is still the value.
             // A heap result is parked as a root, because the clause can
@@ -3363,10 +3697,23 @@ impl Emitter {
                 }
                 // `__enum_shape_named(value, "Variant")` and
                 // `__enum_shape_hint(value, id)` are shape aids the shared
-                // enum-lowering pass wraps around values for the x86_64
-                // display/dispatch paths. The aarch64 backend has no use
-                // for the shape, so it compiles the wrapped value
-                // transparently and drops the marker.
+                // enum-lowering pass wraps around every construction of a
+                // lowered enum. The value itself is a bare `__gc_record`
+                // pointer; the marker is the only place its enum is named, so
+                // this is where the pointer picks up a type that can be
+                // printed. `__enum_shape_hint` carries an id rather than a
+                // name and stays transparent.
+                if name == "__enum_shape_named"
+                    && let [value, Expr::String { value: variant, .. }] = arguments.as_slice()
+                {
+                    let compiled = self.expression(value)?;
+                    if compiled == ValueType::Ptr
+                        && let Some(index) = self.lowered_enum_table.owner_of(variant)
+                    {
+                        return Ok(ValueType::LoweredEnum(index));
+                    }
+                    return Ok(compiled);
+                }
                 if (name == "__enum_shape_named" || name == "__enum_shape_hint")
                     && let Some(value) = arguments.first()
                 {
@@ -3387,6 +3734,14 @@ impl Emitter {
                 let Some(else_branch) = else_branch else {
                     return Err(unsupported(*span, "if without else as an expression"));
                 };
+                // A condition settled while compiling takes only its own
+                // branch. The other one is unreachable for *this*
+                // specialisation, and compiling it anyway is what refuses a
+                // generic helper written as `if (isEmpty(xs)) xs else
+                // <something about head(xs)>` when it is called with `[]`.
+                if let Some(taken) = self.static_condition(condition) {
+                    return self.expression(if taken { then_branch } else { else_branch });
+                }
                 let condition_ty = self.expression(condition)?;
                 if condition_ty != ValueType::Bool {
                     return Err(unsupported(condition.span(), "a non-Bool condition"));
@@ -3520,6 +3875,9 @@ impl Emitter {
                     }
                     ValueType::Enum(shape) => {
                         self.emit_enum_to_str(shape, hole.span())?;
+                    }
+                    ValueType::LoweredEnum(index) => {
+                        self.emit_lowered_enum_to_str(index, hole.span())?;
                     }
                     other => {
                         return Err(unsupported(
@@ -3728,9 +4086,12 @@ impl Emitter {
     /// its own top bits after this shift). A failed stat (e.g. a
     /// missing path) reports `false` rather than aborting, matching
     /// the evaluator's `Path::is_dir()` (M15, issue #538).
-    fn emit_dir_is_directory(&mut self) {
+    /// Whether the path in x0 stats to a file of the given type, where the
+    /// type is `st_mode >> 12` -- `S_IFDIR_SHIFTED` for a directory,
+    /// `S_IFREG_SHIFTED` for a regular file. A path that does not stat at all
+    /// answers false, which is what the evaluator's `is_dir`/`is_file` do.
+    fn emit_dir_stat_mode_is(&mut self, kind: u32) {
         const STAT_BUF_SIZE: u64 = 144;
-        const S_IFDIR_SHIFTED: u32 = 0o4; // S_IFDIR (0o040000) >> 12
 
         self.asm.mov_reg(Reg::X7, Reg::X0); // the path, past the buffer setup
 
@@ -3756,7 +4117,7 @@ impl Emitter {
         self.asm.bind(success);
         self.asm.ldrh_imm(Reg::X0, Reg::X6, 4);
         self.asm.lsr_imm(Reg::X0, Reg::X0, 12);
-        self.asm.cmp_imm(Reg::X0, S_IFDIR_SHIFTED);
+        self.asm.cmp_imm(Reg::X0, kind);
         self.asm.cset(Reg::X0, Cond::Eq);
         self.asm.bind(done);
         self.asm.add_sp_imm(STAT_BUF_SIZE as u32);
@@ -3920,7 +4281,7 @@ impl Emitter {
             return Ok(ValueType::Bool);
         }
 
-        let lhs_ty = self.expression(lhs)?;
+        let mut lhs_ty = self.expression(lhs)?;
         // A heap-reference left operand (a string being concatenated, a
         // collection being compared) waits while the right operand is
         // evaluated, which can allocate -- root its slot for that window.
@@ -4000,6 +4361,28 @@ impl Emitter {
             self.pop_rooted(Reg::X0);
         } else {
             self.asm.pop(Reg::X0);
+        }
+        // A value that may be null, used as the value it is: `Map#get` answers
+        // one, and `std.map`'s `mapValues` and `filterValues` do arithmetic on
+        // the result. It arrives boxed, so unboxing it is what makes the two
+        // sides the same type. A genuinely null operand would fault here
+        // rather than being read as zero, which is the same bargain the other
+        // backend already makes.
+        if !matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
+            if let ValueType::Nullable(elem) = lhs_ty
+                && is_boxed_scalar(elem_value_type(elem))
+                && rhs_ty == elem_value_type(elem)
+            {
+                self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
+                lhs_ty = elem_value_type(elem);
+            }
+            if let ValueType::Nullable(elem) = rhs_ty
+                && is_boxed_scalar(elem_value_type(elem))
+                && lhs_ty == elem_value_type(elem)
+            {
+                self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
+                rhs_ty = elem_value_type(elem);
+            }
         }
         // Asking whether a heap reference is `null` compares a pointer with
         // nothing, so the two sides are different types by construction.
@@ -4194,27 +4577,9 @@ impl Emitter {
     /// callers park those with `push_rooted` and take them back afterwards,
     /// which also picks up the new address once the collector moves objects.
     fn emit_gc_alloc_call(&mut self) {
-        const SAVED: [Reg; 10] = [
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X6,
-            Reg::X7,
-            Reg::X8,
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-        ];
-        let entry = self.gc_alloc_entry_label();
+        let entry = self.alloc_trampoline_label();
         self.asm.push_frame_record(); // the bl clobbers x30
-        for reg in SAVED {
-            self.asm.push(reg);
-        }
         self.asm.branch(entry, BranchKind::Link);
-        for reg in SAVED.into_iter().rev() {
-            self.asm.pop(reg);
-        }
         self.asm.pop_frame_record();
     }
 
@@ -4471,6 +4836,48 @@ impl Emitter {
     /// collector into `__const` looking for a header.
     /// A heap string holding the NUL-terminated bytes at the pointer in x0.
     /// The length is measured first, since a C string does not carry one.
+    /// A heap string from the `x2` bytes at `x9`, which must lie outside the
+    /// heap (rodata or the machine stack) so the allocation cannot move them.
+    fn emit_heap_string_from_bytes(&mut self) {
+        self.asm.push(Reg::X9);
+        self.asm.push(Reg::X2);
+        self.emit_alloc_raw_string(Reg::X2); // x5 = object, x2 preserved
+        self.asm.pop(Reg::X2);
+        self.asm.pop(Reg::X6);
+        self.asm.str_imm(Reg::X2, Reg::X5, 0); // length
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8); // destination bytes
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X3);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+    }
+
+    /// An environment-variable name known while compiling, left in the
+    /// (x9 bytes, x10 length) pair `emit_environment_lookup` reads.
+    fn emit_environment_static_key(&mut self, key: &[u8]) {
+        let offset = self.asm.intern_rodata(key);
+        self.asm.load_rodata_address(Reg::X9, offset);
+        self.asm.mov_imm64(Reg::X10, key.len() as u64);
+    }
+
+    /// `Dir#current()`: Darwin's `__getcwd` fills a buffer and answers 0, so
+    /// the length comes from scanning to the terminator rather than from the
+    /// return value. The buffer is transient and lives on the machine stack,
+    /// not in the GC heap, for the same reason the `stat` buffer does: a raw
+    /// header-less block would desynchronise the sweep's block walk.
+    fn emit_dir_current(&mut self) {
+        const PATH_BUF_SIZE: u32 = 4096;
+        self.asm.sub_sp_imm(PATH_BUF_SIZE);
+        self.asm.add_reg_sp_imm(Reg::X0, 0);
+        self.asm.mov_reg(Reg::X6, Reg::X0);
+        self.asm.mov_imm64(Reg::X1, u64::from(PATH_BUF_SIZE));
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_GETCWD));
+        self.asm.svc_0x80();
+        self.asm
+            .emit_abort_if_syscall_failed(b"klassic: Dir#current failed\n");
+        self.asm.mov_reg(Reg::X0, Reg::X6);
+        self.emit_heap_string_from_cstring();
+        self.asm.add_sp_imm(PATH_BUF_SIZE);
+    }
+
     fn emit_heap_string_from_cstring(&mut self) {
         // x9 = the bytes; x2 = length, counted to the terminator.
         self.asm.mov_reg(Reg::X9, Reg::X0);
@@ -4547,6 +4954,7 @@ impl Emitter {
         self.asm.mov_reg(Reg::X0, Reg::X5);
     }
 
+    /// The routine itself, which the GC emission binds.
     fn load_barrier_label(&mut self) -> Label {
         match self.gc_load_barrier_label {
             Some(label) => label,
@@ -4556,6 +4964,66 @@ impl Emitter {
                 label
             }
         }
+    }
+
+    /// What a barriered read calls: the wrapper that saves this backend's
+    /// live registers around the routine.
+    fn barrier_trampoline_label(&mut self) -> Label {
+        match self.gc_barrier_trampoline_label {
+            Some(label) => label,
+            None => {
+                let label = self.asm.new_label();
+                self.gc_barrier_trampoline_label = Some(label);
+                label
+            }
+        }
+    }
+
+    /// The same for an allocation.
+    fn alloc_trampoline_label(&mut self) -> Label {
+        match self.gc_alloc_trampoline_label {
+            Some(label) => label,
+            None => {
+                let label = self.asm.new_label();
+                self.gc_alloc_trampoline_label = Some(label);
+                label
+            }
+        }
+    }
+
+    /// Emit both wrappers. Each saves the registers this backend has live
+    /// across its routine, calls it, restores, and returns -- so the policy
+    /// lives in one place instead of at every call site, and a register the
+    /// routine clobbers cannot be forgotten at one site and remembered at
+    /// another.
+    fn emit_gc_call_trampolines(&mut self) {
+        let barrier = self.barrier_trampoline_label();
+        let slow = self.load_barrier_label();
+        self.asm.bind(barrier);
+        self.asm.push_frame_record(); // the bl clobbers x30
+        for reg in BARRIER_SAVED {
+            self.asm.push(reg);
+        }
+        self.asm.branch(slow, BranchKind::Link);
+        for reg in BARRIER_SAVED.into_iter().rev() {
+            self.asm.pop(reg);
+        }
+        self.asm.pop_frame_record();
+        self.asm.ret();
+
+        let alloc_wrapper = self.alloc_trampoline_label();
+        let alloc = self.gc_alloc_entry_label();
+        self.asm.bind(alloc_wrapper);
+        self.asm.push_frame_record();
+        for reg in ALLOC_SAVED {
+            self.asm.push(reg);
+        }
+        self.asm.branch(alloc, BranchKind::Link);
+        for reg in ALLOC_SAVED.into_iter().rev() {
+            self.asm.pop(reg);
+        }
+        self.asm.pop_frame_record();
+        self.asm.ret();
     }
 
     /// M7: load a heap *pointer* out of `[base + offset]` through the GC
@@ -4601,10 +5069,12 @@ impl Emitter {
 
     /// The barrier proper: x8 = field address on entry, x0 = the raw
     /// pointer on exit. The test, the call and the strip are the shared
-    /// ones; what this backend adds is the register list above.
+    /// ones; what this backend adds is a wrapper around the slow routine
+    /// that saves the registers it has live there -- once, rather than at
+    /// each of these sites.
     fn emit_gc_load_barriered(&mut self) {
         self.asm.ldr_imm(Reg::X0, Reg::X8, 0);
-        let slow = self.load_barrier_label();
+        let slow = self.barrier_trampoline_label();
         crate::portable_asm::emit_gc_load_barrier(&mut self.asm, slow);
     }
 
@@ -6081,6 +6551,9 @@ impl Emitter {
             ListElem::Enum(shape) => {
                 self.emit_print_enum_inline(shape, span)?;
             }
+            ListElem::LoweredEnum(index) => {
+                self.emit_print_lowered_enum(index, span)?;
+            }
             ListElem::Record(index) => {
                 self.emit_print_record_inline(index, span)?;
             }
@@ -6271,6 +6744,94 @@ impl Emitter {
         Ok(())
     }
 
+    /// Write the *lowered* enum value in x0 as `Variant(field, ...)`, no
+    /// trailing newline. The shared lowering laid it out as a `__gc_record`
+    /// whose slot 0 boxes the variant tag and whose remaining slots box the
+    /// payloads in declaration order, so this is a switch on that tag.
+    ///
+    /// A payload that is itself a pointer -- another enum, a Double -- prints
+    /// as `<value>`: this backend has no shortest-round-trip Double
+    /// formatter, and rendering a nested enum would need the nested enum's
+    /// identity, which the tag alone does not carry.
+    fn emit_print_lowered_enum(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
+        if self.printing_lowered_enums.contains(&index) {
+            return Err(unsupported(span, "printing an enum that holds itself"));
+        }
+        self.printing_lowered_enums.push(index);
+        let result = self.emit_print_lowered_enum_variants(index, span);
+        self.printing_lowered_enums.pop();
+        result
+    }
+
+    fn emit_print_lowered_enum_variants(
+        &mut self,
+        index: u32,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let variants: Vec<(String, Vec<LoweredFieldRepr>)> = self
+            .lowered_enum_table
+            .info(index)
+            .variants
+            .iter()
+            .map(|variant| (variant.name.clone(), variant.fields.clone()))
+            .collect();
+        if variants.is_empty() {
+            return Err(unsupported(span, "printing an enum with no variants"));
+        }
+        let end = self.asm.new_label();
+        self.asm.push(Reg::X0); // the value survives the writes below
+        for (tag, (name, fields)) in variants.iter().enumerate() {
+            let next = self.asm.new_label();
+            self.asm.pop(Reg::X0);
+            self.asm.push(Reg::X0);
+            self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
+            self.emit_unbox_scalar();
+            self.asm.cmp_imm(Reg::X0, tag as u32);
+            self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
+            self.asm.emit_write_rodata(STDOUT_FD, name.as_bytes());
+            if !fields.is_empty() {
+                self.asm.emit_write_rodata(STDOUT_FD, b"(");
+                for (position, repr) in fields.iter().enumerate() {
+                    if position > 0 {
+                        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+                    }
+                    self.asm.pop(Reg::X0);
+                    self.asm.push(Reg::X0);
+                    self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
+                    match repr {
+                        LoweredFieldRepr::Int => {
+                            self.emit_unbox_scalar();
+                            self.emit_print_elem(ListElem::Int, span)?;
+                        }
+                        LoweredFieldRepr::Bool => {
+                            self.emit_unbox_scalar();
+                            self.emit_print_elem(ListElem::Bool, span)?;
+                        }
+                        LoweredFieldRepr::Str => self.emit_print_elem(ListElem::Str, span)?,
+                        LoweredFieldRepr::Enum(name) => {
+                            let Some(inner) = self.lowered_enum_table.index_by_name(name) else {
+                                return Err(unsupported(
+                                    span,
+                                    "printing an enum payload of this type",
+                                ));
+                            };
+                            self.emit_print_lowered_enum(inner, span)?;
+                        }
+                        LoweredFieldRepr::Unrenderable => {
+                            return Err(unsupported(span, "printing an enum payload of this type"));
+                        }
+                    }
+                }
+                self.asm.emit_write_rodata(STDOUT_FD, b")");
+            }
+            self.asm.branch(end, BranchKind::Unconditional);
+            self.asm.bind(next);
+        }
+        self.asm.bind(end);
+        self.asm.pop(Reg::X0); // discard the saved value
+        Ok(())
+    }
+
     /// println of the list in x0 in the evaluator's format:
     /// `[e1, e2, ...]` (strings unquoted).
     fn emit_println_list(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
@@ -6319,12 +6880,32 @@ impl Emitter {
     /// x19/x20. Preserves x0-x5 because allocation sites have live
     /// String / display builtins, mirroring the C backend's surface.
     /// Returns Ok(None) when `name` is not a builtin.
+    /// The v0.1 prelude spells several builtins without their namespace:
+    /// `getEnv` is `Environment#get`, `args` is `CommandLine#args`, and so
+    /// on. The stdlib modules are written against those short names, so a
+    /// backend that only knows the namespaced spelling refuses `std.env`
+    /// and `std.process` for a reason that has nothing to do with what it
+    /// can emit.
+    fn canonical_builtin_name(name: &str) -> &str {
+        match name {
+            "args" => "CommandLine#args",
+            "exit" => "Process#exit",
+            "stdin" => "StandardInput#all",
+            "stdinLines" => "StandardInput#lines",
+            "env" => "Environment#vars",
+            "getEnv" => "Environment#get",
+            "hasEnv" => "Environment#exists",
+            other => other,
+        }
+    }
+
     fn builtin_call(
         &mut self,
         name: &str,
         arguments: &[Expr],
         span: Span,
     ) -> Result<Option<ValueType>, Diagnostic> {
+        let name = Self::canonical_builtin_name(name);
         match (name, arguments.len()) {
             ("length", 1) => {
                 if self.expression(&arguments[0])? != ValueType::Str {
@@ -6911,7 +7492,11 @@ impl Emitter {
                 self.asm.store_local(Reg::X0, key_slot);
                 self.emit_root_frame_slot(key_slot);
                 let value_ty = self.expression(&arguments[2])?;
-                let Some(value_elem) = list_elem_of(value_ty) else {
+                // `Map#get` answers the value *or nothing*, and rebuilding a
+                // map is written as `Map#put(acc, k, Map#get(m, k))` -- so a
+                // value that may be null is a value of its own element type.
+                // It is already one boxed word either way.
+                let Some(value_elem) = map_value_elem(value_ty) else {
                     return Err(unsupported(arguments[2].span(), "a map value of this type"));
                 };
                 if let Some((_, existing_value)) = existing
@@ -6980,6 +7565,158 @@ impl Emitter {
                 self.asm.branch(reverse, BranchKind::Link);
                 self.close_temp_roots(mark);
                 Ok(Some(ValueType::Map(key_elem, value_elem)))
+            }
+            // `Map#containsValue(m, value)`: a scan of the second half of every
+            // entry, the mirror of `Map#containsKey`'s scan of the first.
+            ("Map#containsValue", 2) | ("containsValue", 2) => {
+                let mark = self.open_temp_roots();
+                let map_ty = self.expression(&arguments[0])?;
+                let value_elem = match map_ty {
+                    ValueType::Map(_, value) => Some(value),
+                    // An empty map holds nothing, so it contains no value.
+                    ValueType::EmptyMap => None,
+                    _ => return Err(unsupported(span, "a map builtin on a non-map")),
+                };
+                let cursor = self.reserve_locals(16);
+                let wanted = cursor + 8;
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                let candidate_ty = self.expression(&arguments[1])?;
+                let Some(candidate) = list_elem_of(candidate_ty) else {
+                    return Err(unsupported(arguments[1].span(), "a map value of this type"));
+                };
+                if is_boxed_scalar(candidate_ty) {
+                    self.emit_box_scalar();
+                }
+                self.asm.store_local(Reg::X0, wanted);
+                self.emit_root_frame_slot(wanted);
+                let Some(value_elem) = value_elem else {
+                    self.asm.mov_imm64(Reg::X0, 0);
+                    self.close_temp_roots(mark);
+                    return Ok(Some(ValueType::Bool));
+                };
+                if value_elem != candidate {
+                    return Err(unsupported(arguments[1].span(), "mixed map value types"));
+                }
+                let loop_start = self.asm.new_label();
+                let found = self.asm.new_label();
+                let missing = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(missing, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // this entry
+                self.emit_gc_load_ptr(Reg::X0, 8); // its value
+                if is_boxed_scalar(elem_value_type(value_elem)) {
+                    self.emit_unbox_scalar();
+                }
+                self.asm.load_local(Reg::X1, wanted);
+                match value_elem {
+                    ListElem::Str => self.emit_str_eq(),
+                    _ => {
+                        if is_boxed_scalar(elem_value_type(value_elem)) {
+                            self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
+                        }
+                        self.asm.cmp_reg(Reg::X0, Reg::X1);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                    }
+                }
+                self.asm.branch(found, BranchKind::CompareNonZero(Reg::X0));
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(found);
+                self.asm.mov_imm64(Reg::X0, 1);
+                self.asm.branch(done, BranchKind::Unconditional);
+                self.asm.bind(missing);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.bind(done);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Bool))
+            }
+            // `Map#remove(m, key)`: the same walk `Map#put` does, keeping every
+            // entry whose key differs and dropping the one that matches. The
+            // accumulator is built front-to-back and reversed, so insertion
+            // order survives.
+            ("Map#remove", 2) | ("remove", 2) => {
+                let mark = self.open_temp_roots();
+                let map_ty = self.expression(&arguments[0])?;
+                let existing = match map_ty {
+                    ValueType::Map(key, value) => Some((key, value)),
+                    ValueType::EmptyMap => None,
+                    _ => return Err(unsupported(span, "a map builtin on a non-map")),
+                };
+                let cursor = self.reserve_locals(16);
+                let acc = cursor + 8;
+                self.asm.store_local(Reg::X0, cursor);
+                self.emit_root_frame_slot(cursor);
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                let key_ty = self.expression(&arguments[1])?;
+                let Some(key_elem) = list_elem_of(key_ty) else {
+                    return Err(unsupported(arguments[1].span(), "a map key of this type"));
+                };
+                if is_boxed_scalar(key_ty) {
+                    self.emit_box_scalar();
+                }
+                let key_slot = self.reserve_locals(8);
+                self.asm.store_local(Reg::X0, key_slot);
+                self.emit_root_frame_slot(key_slot);
+                let Some((existing_key, existing_value)) = existing else {
+                    // Removing from the empty map is the empty map.
+                    self.asm.mov_imm64(Reg::X0, 0);
+                    self.close_temp_roots(mark);
+                    return Ok(Some(ValueType::EmptyMap));
+                };
+                if existing_key != key_elem {
+                    return Err(unsupported(arguments[1].span(), "mixed map key types"));
+                }
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                let keep = self.asm.new_label();
+                let next = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+                self.emit_gc_load_ptr(Reg::X0, 0); // this entry
+                self.push_rooted(Reg::X0);
+                self.emit_gc_load_ptr(Reg::X0, 0); // its key
+                if is_boxed_scalar(elem_value_type(key_elem)) {
+                    self.emit_unbox_scalar();
+                }
+                self.asm.load_local(Reg::X1, key_slot);
+                match key_elem {
+                    ListElem::Str => self.emit_str_eq(),
+                    _ => {
+                        if is_boxed_scalar(elem_value_type(key_elem)) {
+                            self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
+                        }
+                        self.asm.cmp_reg(Reg::X0, Reg::X1);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                    }
+                }
+                self.asm.branch(keep, BranchKind::CompareZero(Reg::X0));
+                self.pop_rooted(Reg::X1); // the matching entry, dropped
+                self.asm.branch(next, BranchKind::Unconditional);
+                self.asm.bind(keep);
+                self.pop_rooted(Reg::X0);
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.bind(next);
+                self.asm.load_local(Reg::X0, cursor);
+                self.emit_gc_load_ptr(Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::Map(existing_key, existing_value)))
             }
             // `Map#keys(m)` / `Map#values(m)`: one half of every entry, in
             // insertion order.
@@ -7674,7 +8411,10 @@ impl Emitter {
                 Ok(Some(ValueType::Ptr))
             }
             ("__gc_write", 3) => {
-                if self.expression(&arguments[0])? != ValueType::Ptr {
+                // A lowered enum value is one of these pointers wearing the
+                // name of its enum, so the lowering's own reads and writes
+                // take it exactly as they take a bare pointer.
+                if !is_lowering_pointer(self.expression(&arguments[0])?) {
                     return Err(unsupported(span, "__gc_write to a non-pointer"));
                 }
                 self.push_rooted(Reg::X0);
@@ -7699,7 +8439,7 @@ impl Emitter {
                 Ok(Some(ValueType::Unit))
             }
             ("__gc_read", 2) | ("__gc_read_ptr", 2) | ("__gc_read_string", 2) => {
-                if self.expression(&arguments[0])? != ValueType::Ptr {
+                if !is_lowering_pointer(self.expression(&arguments[0])?) {
                     return Err(unsupported(span, &format!("{name} of a non-pointer")));
                 }
                 self.push_rooted(Reg::X0);
@@ -8002,7 +8742,12 @@ impl Emitter {
             }
             ("Dir#isDirectory", 1) => {
                 self.emit_path_cstring(&arguments[0])?;
-                self.emit_dir_is_directory();
+                self.emit_dir_stat_mode_is(S_IFDIR_SHIFTED);
+                Ok(Some(ValueType::Bool))
+            }
+            ("Dir#isFile", 1) => {
+                self.emit_path_cstring(&arguments[0])?;
+                self.emit_dir_stat_mode_is(S_IFREG_SHIFTED);
                 Ok(Some(ValueType::Bool))
             }
             ("Dir#move", 2) => {
@@ -8015,6 +8760,44 @@ impl Emitter {
                 self.pop_rooted(Reg::X0);
                 self.emit_dir_move();
                 Ok(Some(ValueType::Unit))
+            }
+            ("Dir#current", 0) => {
+                self.emit_dir_current();
+                Ok(Some(ValueType::Str))
+            }
+            // `HOME` and `TMPDIR` are where the evaluator reads these from,
+            // and `Dir#temp` falls back to `/tmp` the way it does there.
+            ("Dir#home", 0) => {
+                self.emit_environment_static_key(b"HOME");
+                self.emit_environment_lookup();
+                let present = self.asm.new_label();
+                self.asm
+                    .branch(present, BranchKind::CompareNonZero(Reg::X0));
+                self.asm.emit_write_rodata(
+                    STDERR_FD,
+                    b"klassic: failed to get home dir: environment variable HOME is not set\n",
+                );
+                self.asm.emit_exit(1);
+                self.asm.bind(present);
+                self.emit_heap_string_from_cstring();
+                Ok(Some(ValueType::Str))
+            }
+            ("Dir#temp", 0) => {
+                self.emit_environment_static_key(b"TMPDIR");
+                self.emit_environment_lookup();
+                let present = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm
+                    .branch(present, BranchKind::CompareNonZero(Reg::X0));
+                let fallback = self.asm.intern_rodata(b"/tmp");
+                self.asm.load_rodata_address(Reg::X9, fallback);
+                self.asm.mov_imm64(Reg::X2, 4);
+                self.emit_heap_string_from_bytes();
+                self.asm.branch(done, BranchKind::Unconditional);
+                self.asm.bind(present);
+                self.emit_heap_string_from_cstring();
+                self.asm.bind(done);
+                Ok(Some(ValueType::Str))
             }
             ("Environment#exists", 1) => {
                 self.emit_environment_key(&arguments[0])?;
@@ -8147,6 +8930,7 @@ impl Emitter {
             ListElem::Bool => self.emit_bool_to_str(),
             ListElem::Str => {}
             ListElem::Enum(shape) => self.emit_enum_to_str(shape, span)?,
+            ListElem::LoweredEnum(index) => self.emit_lowered_enum_to_str(index, span)?,
             ListElem::Record(_) => {
                 return Err(unsupported(span, "rendering a record element"));
             }
@@ -8257,6 +9041,104 @@ impl Emitter {
                             return Err(unsupported(
                                 span,
                                 &format!("rendering an enum payload of type {other:?}"),
+                            ));
+                        }
+                    }
+                    self.asm.mov_reg(Reg::X1, Reg::X0);
+                    self.asm.load_local(Reg::X0, acc);
+                    self.emit_str_concat();
+                    self.asm.store_local(Reg::X0, acc);
+                }
+                self.emit_append_literal(acc, ")");
+            }
+            self.asm.branch(end, BranchKind::Unconditional);
+            self.asm.bind(next);
+        }
+        self.asm.bind(end);
+        self.asm.load_local(Reg::X0, acc);
+        self.close_temp_roots(mark);
+        Ok(())
+    }
+
+    /// The lowered enum value in x0 as a heap string, `Variant(field, ...)`.
+    /// The same switch `emit_print_lowered_enum` writes, building into a
+    /// rooted accumulator instead of writing to stdout, so it can go in a
+    /// string interpolation hole.
+    fn emit_lowered_enum_to_str(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
+        if self.printing_lowered_enums.contains(&index) {
+            return Err(unsupported(span, "rendering an enum that holds itself"));
+        }
+        self.printing_lowered_enums.push(index);
+        let result = self.emit_lowered_enum_to_str_variants(index, span);
+        self.printing_lowered_enums.pop();
+        result
+    }
+
+    fn emit_lowered_enum_to_str_variants(
+        &mut self,
+        index: u32,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let variants: Vec<(String, Vec<LoweredFieldRepr>)> = self
+            .lowered_enum_table
+            .info(index)
+            .variants
+            .iter()
+            .map(|variant| (variant.name.clone(), variant.fields.clone()))
+            .collect();
+        if variants.is_empty() {
+            return Err(unsupported(span, "rendering an enum with no variants"));
+        }
+        let mark = self.open_temp_roots();
+        let value = self.reserve_locals(16);
+        let acc = value + 8;
+        self.asm.store_local(Reg::X0, value);
+        self.emit_root_frame_slot(value);
+        let empty = self.asm.intern_string_object("");
+        self.asm.load_rodata_address(Reg::X0, empty);
+        self.emit_heap_string_copy();
+        self.asm.store_local(Reg::X0, acc);
+        self.emit_root_frame_slot(acc);
+        let end = self.asm.new_label();
+        for (tag, (name, fields)) in variants.iter().enumerate() {
+            let next = self.asm.new_label();
+            self.asm.load_local(Reg::X0, value);
+            self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
+            self.emit_unbox_scalar();
+            self.asm.cmp_imm(Reg::X0, tag as u32);
+            self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
+            self.emit_append_literal(acc, name);
+            if !fields.is_empty() {
+                self.emit_append_literal(acc, "(");
+                for (position, repr) in fields.iter().enumerate() {
+                    if position > 0 {
+                        self.emit_append_literal(acc, ", ");
+                    }
+                    self.asm.load_local(Reg::X0, value);
+                    self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
+                    match repr {
+                        LoweredFieldRepr::Int => {
+                            self.emit_unbox_scalar();
+                            self.emit_int_to_str();
+                        }
+                        LoweredFieldRepr::Bool => {
+                            self.emit_unbox_scalar();
+                            self.emit_bool_to_str();
+                        }
+                        LoweredFieldRepr::Str => {}
+                        LoweredFieldRepr::Enum(name) => {
+                            let Some(inner) = self.lowered_enum_table.index_by_name(name) else {
+                                return Err(unsupported(
+                                    span,
+                                    "rendering an enum payload of this type",
+                                ));
+                            };
+                            self.emit_lowered_enum_to_str(inner, span)?;
+                        }
+                        LoweredFieldRepr::Unrenderable => {
+                            return Err(unsupported(
+                                span,
+                                "rendering an enum payload of this type",
                             ));
                         }
                     }
@@ -9244,7 +10126,12 @@ impl Emitter {
                 let first_type = arguments
                     .first()
                     .and_then(|argument| self.static_type_under(argument, locals, depth + 1));
-                match name.as_str() {
+                // The prelude's short spellings resolve the same way here as
+                // they do when the call is emitted; predicting a type for
+                // `Environment#get` and not for `getEnv` would refuse a body
+                // the emitter can compile.
+                let name = Self::canonical_builtin_name(name);
+                match name {
                     // head/tail matter more than they look: they are how the
                     // prelude's recursive list functions are written, so
                     // without them a body like `cons(head(xs))(rest)` cannot
@@ -9283,9 +10170,9 @@ impl Emitter {
                         return Some(ValueType::Int);
                     }
                     "isEmpty" | "contains" | "isEmptyString" | "matches" | "containsKey"
-                    | "Map#containsKey" | "Map#isEmpty" | "Map#containsValue" | "Set#isEmpty"
-                    | "Set#contains" | "startsWith" | "endsWith" | "String#isInt"
-                    | "String#isDouble" => {
+                    | "containsValue" | "Map#containsKey" | "Map#isEmpty" | "Map#containsValue"
+                    | "Set#isEmpty" | "Set#contains" | "startsWith" | "endsWith"
+                    | "String#isInt" | "String#isDouble" => {
                         return Some(ValueType::Bool);
                     }
                     "String#parseInt" => return Some(ValueType::Int),
@@ -9308,6 +10195,19 @@ impl Emitter {
                             Some(ValueType::Set(elem)) | Some(ValueType::List(elem)) => {
                                 Some(ValueType::Set(elem))
                             }
+                            // Adding to the empty set is what fixes its
+                            // element type, and it is how every fold that
+                            // builds a set starts -- `std.set`'s `setFilter`
+                            // folds from `Set#empty()`. The element being
+                            // added is the only thing that says what the set
+                            // holds, so read it from there.
+                            Some(ValueType::EmptySet) if name == "Set#add" => arguments
+                                .get(1)
+                                .and_then(|argument| {
+                                    self.static_type_under(argument, locals, depth + 1)
+                                })
+                                .and_then(list_elem_of)
+                                .map(ValueType::Set),
                             Some(ValueType::EmptySet) | Some(ValueType::EmptyList)
                                 if name == "Set#fromList" =>
                             {
@@ -9373,12 +10273,23 @@ impl Emitter {
                             locals,
                             depth + 1,
                         )?)?;
-                        let value = list_elem_of(self.static_type_under(
+                        // The value may be a lookup, which answers a value or
+                        // nothing: `Map#put(acc, k, Map#get(m, k))` is how
+                        // `filterKeys` and `merge` rebuild a map.
+                        let value = map_value_elem(self.static_type_under(
                             &arguments[2],
                             locals,
                             depth + 1,
                         )?)?;
                         return Some(ValueType::Map(key, value));
+                    }
+                    // Dropping an entry keeps the map's type; an empty map
+                    // stays empty.
+                    "Map#remove" if arguments.len() == 2 => {
+                        return match first_type {
+                            Some(ty @ (ValueType::Map(..) | ValueType::EmptyMap)) => Some(ty),
+                            _ => None,
+                        };
                     }
                     "Map#empty" => return Some(ValueType::EmptyMap),
                     // The enum lowering's allocators. A constructor call like
@@ -10012,10 +10923,88 @@ impl Emitter {
                 .flatten()
                 .map(|(name, fields)| (name.clone(), fields.clone()))
                 .collect(),
+            values: Vec::new(),
         };
         self.lambdas.push((params, body));
         self.lambda_envs.push(env);
         self.lambdas.len() - 1
+    }
+
+    /// A call whose callee's body *is* a lambda: compile each argument into a
+    /// slot of this frame and intern the lambda with those slots as its
+    /// captured environment, so calling it later reads them. Answers `None`
+    /// when the call is not that shape, which is every other call.
+    fn returned_lambda_binding(&mut self, value: &Expr) -> Result<Option<usize>, Diagnostic> {
+        let Expr::Call {
+            callee, arguments, ..
+        } = value
+        else {
+            return Ok(None);
+        };
+        let Expr::Identifier { name, .. } = callee.as_ref() else {
+            return Ok(None);
+        };
+        // A def whose return type this backend cannot model -- `(Int) => Int`
+        // is one -- is kept whole as a generic function and specialised per
+        // call, so that is where a lambda-returning def lives.
+        let Some(generic) = self
+            .generic_functions
+            .iter()
+            .position(|function| function.name == *name)
+        else {
+            return Ok(None);
+        };
+        let function = self.generic_functions[generic].clone();
+        if function.params.len() != arguments.len() {
+            return Ok(None);
+        }
+        // The body, past any wrapping block that only produces it.
+        let mut body = &function.body;
+        while let Expr::Block { expressions, .. } = body {
+            if expressions.len() != 1 {
+                break;
+            }
+            body = &expressions[0];
+        }
+        let Expr::Lambda {
+            params: lambda_params,
+            body: lambda_body,
+            ..
+        } = body
+        else {
+            return Ok(None);
+        };
+        let lambda_params = lambda_params.clone();
+        let lambda_body = lambda_body.as_ref().clone();
+        let mut captured = Vec::with_capacity(arguments.len());
+        for (param, argument) in function.params.iter().zip(arguments) {
+            let ty = self.expression(argument)?;
+            let slot = self.reserve_locals(8);
+            self.asm.store_local(Reg::X0, slot);
+            if is_heap_pointer(ty) {
+                self.emit_root_frame_slot(slot);
+            }
+            captured.push((param.clone(), slot, ty));
+        }
+        Ok(Some(self.intern_lambda_capturing(
+            lambda_params,
+            lambda_body,
+            captured,
+        )))
+    }
+
+    /// Intern a lambda that also closed over frame slots -- what a function
+    /// returning a lambda leaves behind once its arguments are materialised
+    /// into the caller's frame.
+    fn intern_lambda_capturing(
+        &mut self,
+        params: Vec<String>,
+        body: Expr,
+        values: Vec<(String, u32, ValueType)>,
+    ) -> usize {
+        let index = self.intern_lambda(params, body);
+        self.lambda_envs[index].values = values;
+        index
     }
 
     /// The field-to-lambda mapping of an expression that denotes a dictionary
@@ -10117,6 +11106,12 @@ impl Emitter {
                 .last_mut()
                 .expect("emitter dict scope")
                 .insert(name, fields);
+        }
+        for (name, slot, ty) in env.values {
+            self.scopes
+                .last_mut()
+                .expect("emitter scope")
+                .insert(name, (slot, ty));
         }
     }
 
@@ -10703,6 +11698,12 @@ impl Emitter {
                 self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
                 Ok(())
             }
+            // The evaluator prints unit as `()`, and an assignment is a unit
+            // now, so a program can reach here by printing one.
+            ValueType::Unit => {
+                self.asm.emit_write_rodata(STDOUT_FD, b"()\n");
+                Ok(())
+            }
             // `null` or a value: the evaluator prints the word `null` for the
             // empty case, and the value itself otherwise.
             ValueType::Nullable(elem) => {
@@ -10731,6 +11732,7 @@ impl Emitter {
                     ListElem::Double
                     | ListElem::Enum(_)
                     | ListElem::Record(_)
+                    | ListElem::LoweredEnum(_)
                     | ListElem::Nested { .. } => {
                         return Err(unsupported(
                             argument.span(),
@@ -10742,6 +11744,11 @@ impl Emitter {
                 self.asm.bind(null_label);
                 self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
                 self.asm.bind(end_label);
+                Ok(())
+            }
+            ValueType::LoweredEnum(index) => {
+                self.emit_print_lowered_enum(index, argument.span())?;
+                self.asm.emit_write_rodata(STDOUT_FD, b"\n");
                 Ok(())
             }
             ValueType::Enum(shape) => {
@@ -10785,6 +11792,12 @@ impl Emitter {
             | Expr::RecordDeclaration { .. }
             | Expr::EnumDeclaration { .. }
             | Expr::TypeClassDeclaration { .. }
+            // A proof is checked before any backend runs (`analyze_proofs`,
+            // and the --warn-trust / --deny-trust flags act there), so by the
+            // time it reaches codegen it produces no code -- exactly like the
+            // declarations above it.
+            | Expr::AxiomDeclaration { .. }
+            | Expr::TheoremDeclaration { .. }
             | Expr::InstanceDeclaration { .. } => Ok(()),
             Expr::VarDecl {
                 name,
@@ -10830,6 +11843,20 @@ impl Emitter {
                 // are known from the arguments.
                 if let Expr::Lambda { params, body, .. } = value.as_ref() {
                     let index = self.intern_lambda(params.clone(), body.as_ref().clone());
+                    self.lambda_bindings
+                        .last_mut()
+                        .expect("emitter lambda scope")
+                        .insert(name.clone(), index);
+                    return Ok(());
+                }
+                // `val add3 = adder(3)` where `adder` returns a lambda. The
+                // lambda has no runtime representation, so what is bound here
+                // is the lambda *plus* the arguments it closed over, each
+                // materialised into a slot of this frame. Currying and
+                // partial application are ordinary in this language, and
+                // without this a returned lambda could only be called on the
+                // spot.
+                if let Some(index) = self.returned_lambda_binding(value)? {
                     self.lambda_bindings
                         .last_mut()
                         .expect("emitter lambda scope")
@@ -11936,12 +12963,14 @@ impl Emitter {
 pub(crate) fn emit_macho_program(
     expr: &Expr,
     lowered_enums: std::collections::HashSet<String>,
+    lowered_enum_table: LoweredEnumTable,
     gc_log: bool,
     gc_stress: bool,
     gc_poison: bool,
 ) -> Result<Vec<u8>, Diagnostic> {
     let mut emitter = Emitter {
         lowered_enums,
+        lowered_enum_table,
         gc_log,
         gc_stress,
         gc_poison,
@@ -12038,6 +13067,9 @@ pub(crate) fn emit_macho_program(
     // PortableAsm lowering end-to-end, and must encode validly. The go-live
     // (M7) routes the mutator through gc_alloc and adds roots/barriers.
     emitter.emit_gc_runtime(&gc);
+    // The two wrappers that save this backend's live registers around the
+    // routines above, so no call site carries a list of its own.
+    emitter.emit_gc_call_trampolines();
 
     emitter.asm.finish();
     // `bss_len` is 0 for every program today (no codegen reserves GC

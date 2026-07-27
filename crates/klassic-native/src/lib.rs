@@ -646,7 +646,13 @@ fn compile_internal(
     // are lowered, so the chain lowers with everything else. Only the user's
     // own code is rewritten; the stdlib's map functions keep the builtin map.
     let expr = map_chain::lower_runtime_maps(expr, prelude_offset);
-    let (expr, lowered_enum_names, mono_enum_shapes, mono_enum_variants) = desugar_enums(expr);
+    let (
+        expr,
+        lowered_enum_names,
+        mono_enum_shapes,
+        mono_enum_variants,
+        mono_enum_field_annotations,
+    ) = desugar_enums(expr);
     // Capture the extension-method registry before the desugar erases the
     // `ExtensionDeclaration`s, so codegen can resolve method names that the
     // desugar left ambiguous (declared on more than one type) by the
@@ -686,6 +692,11 @@ fn compile_internal(
         NativeBackend::DirectAarch64 => aarch64::emit_macho_program(
             &expr,
             lowered_enum_names,
+            aarch64::LoweredEnumTable::from_shapes(
+                &mono_enum_variants,
+                &mono_enum_field_annotations,
+                &variant_owner_enum,
+            ),
             config.gc_log,
             config.gc_stress,
             config.gc_poison,
@@ -1923,14 +1934,19 @@ fn collect_enum_decls(expr: &Expr, out: &mut Vec<(String, Vec<String>, Vec<EnumV
     }
 }
 
-fn desugar_enums(
-    expr: Expr,
-) -> (
+/// What `desugar_enums` hands back: the rewritten program, the names of the
+/// enums it lowered, a shape per variant name, a variant table, and each
+/// variant's field annotations as written (which is the only place a payload
+/// that is itself an enum still says *which* enum).
+type DesugaredEnums = (
     Expr,
     HashSet<String>,
     HashMap<String, ConcreteEnumShape>,
     HashMap<String, EnumVariantInfo>,
-) {
+    HashMap<String, Vec<String>>,
+);
+
+fn desugar_enums(expr: Expr) -> DesugaredEnums {
     let mut decls = Vec::new();
     collect_enum_decls(&expr, &mut decls);
 
@@ -1988,6 +2004,7 @@ fn desugar_enums(
     // / wildcard `match` expressions carry no enum dependency and are
     // lowered the same way, which is a net new native capability.
     let mut variants = HashMap::new();
+    let mut variant_field_annotations: HashMap<String, Vec<String>> = HashMap::new();
     for name in &supported {
         for (index, variant) in mono[name].iter().enumerate() {
             let fields = variant
@@ -1998,6 +2015,17 @@ fn desugar_enums(
                         .expect("supported enum field classified")
                 })
                 .collect();
+            // The annotation text alongside the repr: a payload that is
+            // another enum is `EnumField` either way, and rendering one needs
+            // to know *which* enum, which only the text still says.
+            variant_field_annotations.insert(
+                variant.name.clone(),
+                variant
+                    .params
+                    .iter()
+                    .map(|(_, annotation)| annotation.text.trim().to_string())
+                    .collect(),
+            );
             variants.insert(
                 variant.name.clone(),
                 EnumVariantInfo {
@@ -2076,7 +2104,13 @@ fn desugar_enums(
         counter: 0,
     };
     let lowered = lowering.lower(expr);
-    (lowered, lowering.lowered_enums, mono_enum_shapes, variants)
+    (
+        lowered,
+        lowering.lowered_enums,
+        mono_enum_shapes,
+        variants,
+        variant_field_annotations,
+    )
 }
 
 /// Fresh synthetic-name generator shared by the enum lowering and the
@@ -2607,6 +2641,24 @@ impl EnumLowering {
             },
             Expr::SetLiteral { elements, span } => Expr::SetLiteral {
                 elements: elements.into_iter().map(|e| self.lower(e)).collect(),
+                span,
+            },
+            // A hole is an expression like any other: `"#{Some(1)}"` holds a
+            // constructor that has to be lowered, and a `match` written in a
+            // hole has to become the same tag switch it becomes anywhere else.
+            // Without this arm the hole keeps a constructor call no backend
+            // declared, which is what a backend then reports as an unknown
+            // function.
+            Expr::StringInterpolation { parts, span } => Expr::StringInterpolation {
+                parts: parts
+                    .into_iter()
+                    .map(|part| match part {
+                        StringPart::Literal(text) => StringPart::Literal(text),
+                        StringPart::Interpolation(inner) => {
+                            StringPart::Interpolation(Box::new(self.lower(*inner)))
+                        }
+                    })
+                    .collect(),
                 span,
             },
             other => other,
@@ -6874,6 +6926,7 @@ impl NativeCodeGenerator {
                 value,
                 mutable,
                 span,
+                annotation,
                 ..
             } => {
                 if !mutable && let Some(alias) = self.builtin_alias_from_expr(value) {
@@ -6882,6 +6935,15 @@ impl NativeCodeGenerator {
                     return Ok(NativeValue::Unit);
                 }
                 let compiled = self.compile_expr(value)?;
+                // A binding annotated with a generic enum applied to concrete
+                // types says what its payloads are, even when the value does
+                // not: `val e: Chain<String, Int> = Nil` builds the empty
+                // case, which fixes nothing on its own. Reading the shape off
+                // the annotation is exact -- every type argument is named --
+                // so it is not the partial resolution that is unsound.
+                let annotated_shape = annotation
+                    .as_ref()
+                    .and_then(|annotation| self.generic_enum_annotation_shape(&annotation.text));
                 match compiled {
                     NativeValue::Int
                     | NativeValue::Bool
@@ -6889,6 +6951,9 @@ impl NativeCodeGenerator {
                     | NativeValue::HeapString
                     | NativeValue::RuntimeDouble => {
                         let slot = self.allocate_slot(name.clone(), compiled);
+                        if let Some(shape) = annotated_shape {
+                            self.enum_shapes.insert(slot.id, shape);
+                        }
                         self.asm.store_rbp_slot(slot.offset, Reg::Rax);
                         if static_expr_is_pure(value)
                             && let Some(value) = self.static_value_from_expr(value)
@@ -7023,6 +7088,10 @@ impl NativeCodeGenerator {
                     )),
                 }
             }
+            // An assignment is done for its effect and yields unit, matching
+            // the type it is given. Two `match` arms that both end in one
+            // therefore agree, which is what let the arms be written for
+            // effect at all.
             Expr::Assign { name, value, span } => {
                 let slot = self.lookup_var(name).ok_or_else(|| {
                     Diagnostic::compile(*span, format!("undefined native variable `{name}`"))
@@ -7045,7 +7114,7 @@ impl NativeCodeGenerator {
                         "runtime-list assignment exceeds 65536 bytes",
                     )?;
                     self.remove_static_value(name);
-                    return Ok(slot.value);
+                    return Ok(NativeValue::Unit);
                 }
                 if native_value_can_be_static_mutable(slot.value) {
                     if self.dynamic_control_depth > 0 && self.mergeable_dynamic_branch_depth == 0 {
@@ -7068,7 +7137,7 @@ impl NativeCodeGenerator {
                     } else {
                         self.remove_static_value(name);
                     }
-                    return Ok(compiled);
+                    return Ok(NativeValue::Unit);
                 }
                 match slot.value {
                     NativeValue::RuntimeString { data, len } => {
@@ -7096,7 +7165,7 @@ impl NativeCodeGenerator {
                             "string assignment exceeds 65536 bytes",
                         );
                         self.remove_static_value(name);
-                        return Ok(slot.value);
+                        return Ok(NativeValue::Unit);
                     }
                     NativeValue::RuntimeLinesList { data, len } => {
                         let compiled = self.compile_expr(value)?;
@@ -7113,7 +7182,7 @@ impl NativeCodeGenerator {
                             "line-list assignment exceeds 65536 bytes",
                         );
                         self.remove_static_value(name);
-                        return Ok(slot.value);
+                        return Ok(NativeValue::Unit);
                     }
                     NativeValue::RuntimeRecord { label } => {
                         let compiled = self.compile_expr(value)?;
@@ -7126,7 +7195,7 @@ impl NativeCodeGenerator {
                             "record assignment exceeds 65536 bytes",
                         )?;
                         self.remove_static_value(name);
-                        return Ok(slot.value);
+                        return Ok(NativeValue::Unit);
                     }
                     _ => {}
                 }
@@ -7188,7 +7257,7 @@ impl NativeCodeGenerator {
                 } else {
                     self.remove_static_value(name);
                 }
-                Ok(compiled)
+                Ok(NativeValue::Unit)
             }
             Expr::Match {
                 scrutinee,
@@ -7361,6 +7430,16 @@ impl NativeCodeGenerator {
             });
             self.asm.movzx_rax_al();
             return Ok(NativeValue::Bool);
+        }
+        // A string compared with `null`. A static or runtime string is a
+        // (data, length) pair in fixed storage, so it is never null and the
+        // answer is settled here; a heap string is a pointer, so the answer is
+        // whether that pointer is zero. Asking is what a caller writes first
+        // after a lookup that may not have found anything.
+        if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+            && let Some(answer) = self.compile_string_null_comparison(lhs_value, op, rhs, span)?
+        {
+            return Ok(answer);
         }
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && let Some(lhs_string) = self.native_string_ref(lhs_value)
@@ -12861,12 +12940,15 @@ impl NativeCodeGenerator {
             }
             "indexOf" | "lastIndexOf" => {
                 self.expect_static_arity(name, arguments, 2, span)?;
+                // A heap string is copied into a runtime pair rather than
+                // refused: it is what an annotated `String` parameter holds,
+                // and `std.path` is written entirely in terms of these two.
                 let input = self.compile_expr(&arguments[0])?;
-                let Some(input) = self.native_string_ref(input) else {
+                let Some(input) = self.native_string_ref_or_copy(input, span, name) else {
                     return Err(unsupported(span, &format!("native {name} for non-string")));
                 };
                 let needle = self.compile_expr(&arguments[1])?;
-                let Some(needle) = self.native_string_ref(needle) else {
+                let Some(needle) = self.native_string_ref_or_copy(needle, span, name) else {
                     return Err(unsupported(span, &format!("native {name} for non-string")));
                 };
                 self.emit_native_string_index_of(input, needle, name == "lastIndexOf");
@@ -20660,11 +20742,11 @@ impl NativeCodeGenerator {
             "FileOutput#write"
         };
         self.expect_static_arity(name, arguments, 2, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label = self.compile_runtime_path_argument(&arguments[0], span, name)?;
-            if self.expr_may_yield_runtime_string(&arguments[1]) {
+            if self.expr_yields_runtime_or_heap_string(&arguments[1]) {
                 let content = self.compile_expr(&arguments[1])?;
-                let Some(content) = self.native_string_ref(content) else {
+                let Some(content) = self.native_string_ref_or_copy(content, span, name) else {
                     return Err(unsupported(
                         span,
                         &format!("native {name} for non-string content"),
@@ -20688,9 +20770,9 @@ impl NativeCodeGenerator {
         }
         let path =
             self.static_string_from_argument_preserving_effects(&arguments[0], span, name)?;
-        if self.expr_may_yield_runtime_string(&arguments[1]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[1]) {
             let content = self.compile_expr(&arguments[1])?;
-            let Some(content) = self.native_string_ref(content) else {
+            let Some(content) = self.native_string_ref_or_copy(content, span, name) else {
                 return Err(unsupported(
                     span,
                     &format!("native {name} for non-string content"),
@@ -20726,7 +20808,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("FileOutput#writeLines", arguments, 2, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "FileOutput#writeLines")?;
             let content = self.compile_expr(&arguments[1])?;
@@ -20795,7 +20877,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("FileOutput#exists", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "FileOutput#exists")?;
             self.emit_runtime_path_exists_label(path_label);
@@ -20830,7 +20912,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("FileOutput#delete", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "FileOutput#delete")?;
             self.emit_file_delete_label(path_label, span, "FileOutput#delete");
@@ -21669,7 +21751,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("FileInput#all", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "FileInput#all")?;
             return Ok(self.emit_file_read_to_runtime_string_from_path_label(
@@ -21710,7 +21792,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("FileInput#lines", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "FileInput#lines")?;
             let content = self.emit_file_read_to_runtime_string_from_path_label(
@@ -22360,7 +22442,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("Dir#exists", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "Dir#exists")?;
             self.emit_runtime_path_exists_label(path_label);
@@ -22390,7 +22472,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("Dir#isDirectory", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "Dir#isDirectory")?;
             self.emit_runtime_path_type_check_label(path_label, true, span, "Dir#isDirectory");
@@ -22418,7 +22500,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("Dir#isFile", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "Dir#isFile")?;
             self.emit_runtime_path_type_check_label(path_label, false, span, "Dir#isFile");
@@ -22445,7 +22527,7 @@ impl NativeCodeGenerator {
     ) -> Result<NativeValue, Diagnostic> {
         let name = if recursive { "Dir#mkdirs" } else { "Dir#mkdir" };
         self.expect_static_arity(name, arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label = self.compile_runtime_path_argument(&arguments[0], span, name)?;
             if recursive {
                 self.emit_dir_mkdirs_label(path_label, span, name);
@@ -22477,7 +22559,7 @@ impl NativeCodeGenerator {
     ) -> Result<NativeValue, Diagnostic> {
         let name = if full { "Dir#listFull" } else { "Dir#list" };
         self.expect_static_arity(name, arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let (path_label, path) =
                 self.compile_runtime_path_argument_ref(&arguments[0], span, name)?;
             return Ok(self.emit_dir_list_path_label(path_label, path, full, span, name));
@@ -22545,7 +22627,7 @@ impl NativeCodeGenerator {
         span: Span,
     ) -> Result<NativeValue, Diagnostic> {
         self.expect_static_arity("Dir#delete", arguments, 1, span)?;
-        if self.expr_may_yield_runtime_string(&arguments[0]) {
+        if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
             let path_label =
                 self.compile_runtime_path_argument(&arguments[0], span, "Dir#delete")?;
             self.emit_dir_delete_label(path_label, span, "Dir#delete");
@@ -27053,7 +27135,10 @@ impl NativeCodeGenerator {
         name: &str,
     ) -> Result<(DataLabel, NativeStringRef), Diagnostic> {
         let value = self.compile_expr(expr)?;
-        let Some(path) = self.native_string_ref(value) else {
+        // A heap string is copied into a runtime pair rather than refused:
+        // that is what an annotated `String` parameter arrives as, and a
+        // path is exactly the place a caller passes one.
+        let Some(path) = self.native_string_ref_or_copy(value, span, name) else {
             return Err(unsupported(
                 span,
                 &format!("native {name} for non-string path"),
@@ -30514,9 +30599,32 @@ impl NativeCodeGenerator {
                 rhs,
                 ..
             } => self.heap_string_yield(lhs, locals) || self.heap_string_yield(rhs, locals),
-            Expr::Call { callee, .. } => match callee.as_ref() {
-                Expr::Identifier { name, .. } => {
-                    heap_string_returning_helper(&self.builtin_name_for_identifier(name))
+            Expr::Call {
+                callee, arguments, ..
+            } => match callee.as_ref() {
+                Expr::Identifier { name, .. }
+                    if heap_string_returning_helper(&self.builtin_name_for_identifier(name)) =>
+                {
+                    true
+                }
+                // A string helper applied to a heap string yields a string
+                // whose contents are only known at run time. Saying "heap"
+                // here is a merge *strategy*, not a claim about the exact
+                // representation: the coercion accepts a static, runtime or
+                // heap string, so predicting heap for either shape is sound
+                // and is what lets `if (c) heapString else substring(...)`
+                // join at all.
+                Expr::Identifier { name, .. }
+                    if runtime_string_returning_helper(&self.builtin_name_for_identifier(name)) =>
+                {
+                    arguments
+                        .first()
+                        .is_some_and(|argument| self.heap_string_yield(argument, locals))
+                }
+                Expr::FieldAccess { target, field, .. }
+                    if runtime_string_returning_helper(field) =>
+                {
+                    self.heap_string_yield(target, locals)
                 }
                 callee => self
                     .callee_return_value_hint(callee)
@@ -30555,6 +30663,32 @@ impl NativeCodeGenerator {
                 (then_value == else_value).then_some(then_value)
             }
             _ => None,
+        }
+    }
+
+    /// Whether a file or directory argument is a string this backend has to
+    /// read at run time. Wider than `expr_may_yield_runtime_string` by one
+    /// case: a heap string, which is what an annotated `String` parameter
+    /// holds. The wider answer is confined to the file and directory
+    /// builtins because their helpers copy a heap string into a runtime pair
+    /// (`native_string_ref_or_copy`), while widening the general predicate
+    /// has been measured to break programs whose other string paths cannot.
+    fn expr_yields_runtime_or_heap_string(&self, expr: &Expr) -> bool {
+        if self.expr_may_yield_runtime_string(expr) {
+            return true;
+        }
+        if matches!(
+            self.native_value_hint_for_expr(expr),
+            Some(NativeValue::HeapString)
+        ) {
+            return true;
+        }
+        match expr {
+            Expr::Identifier { name, .. } => matches!(
+                self.lookup_var(name).map(|slot| slot.value),
+                Some(NativeValue::HeapString)
+            ),
+            _ => false,
         }
     }
 
@@ -34368,6 +34502,53 @@ impl NativeCodeGenerator {
     /// scratch buffer pair first. An extension method's `this: String`
     /// parameter arrives as a heap string, so without this every string
     /// builtin written as `this.startsWith(...)` was refused.
+    /// `s == null` / `s != null` where one side is a string. Answers `None`
+    /// when this is not that comparison, so the caller falls through to the
+    /// ordinary string equality.
+    ///
+    /// A static or runtime string is a (data, length) pair in fixed storage,
+    /// so it is never null and the answer is settled while compiling. A heap
+    /// string is a pointer, so the answer is whether that pointer is zero.
+    fn compile_string_null_comparison(
+        &mut self,
+        lhs_value: NativeValue,
+        op: BinaryOp,
+        rhs: &Expr,
+        _span: Span,
+    ) -> Result<Option<NativeValue>, Diagnostic> {
+        if lhs_value == NativeValue::Null {
+            let rhs_value = self.compile_expr(rhs)?;
+            return Ok(self.emit_string_null_answer(rhs_value, op));
+        }
+        if !matches!(rhs, Expr::Null { .. }) {
+            return Ok(None);
+        }
+        Ok(self.emit_string_null_answer(lhs_value, op))
+    }
+
+    /// The answer for a string `value` compared with `null`, with the string
+    /// already in Rax. `None` when `value` is not a string.
+    fn emit_string_null_answer(&mut self, value: NativeValue, op: BinaryOp) -> Option<NativeValue> {
+        match value {
+            NativeValue::StaticString { .. } | NativeValue::RuntimeString { .. } => {
+                self.asm
+                    .mov_imm64(Reg::Rax, u64::from(op == BinaryOp::NotEqual));
+                Some(NativeValue::Bool)
+            }
+            NativeValue::HeapString => {
+                self.asm.cmp_reg_imm8(Reg::Rax, 0);
+                self.asm.setcc_al(if op == BinaryOp::Equal {
+                    Condition::Equal
+                } else {
+                    Condition::NotEqual
+                });
+                self.asm.movzx_rax_al();
+                Some(NativeValue::Bool)
+            }
+            _ => None,
+        }
+    }
+
     fn native_string_ref_or_copy(
         &mut self,
         value: NativeValue,
@@ -41591,9 +41772,7 @@ fn static_numeric_binary_value(
         1 => {
             let lhs = static_value_as_f32(lhs)?;
             let rhs = static_value_as_f32(rhs)?;
-            if matches!(op, BinaryOp::Divide) && rhs == 0.0 {
-                return None;
-            }
+
             let value = match op {
                 BinaryOp::Add => lhs + rhs,
                 BinaryOp::Subtract => lhs - rhs,
@@ -41606,9 +41785,7 @@ fn static_numeric_binary_value(
         2 => {
             let lhs = static_value_as_f64(lhs)?;
             let rhs = static_value_as_f64(rhs)?;
-            if matches!(op, BinaryOp::Divide) && rhs == 0.0 {
-                return None;
-            }
+
             let value = match op {
                 BinaryOp::Add => lhs + rhs,
                 BinaryOp::Subtract => lhs - rhs,

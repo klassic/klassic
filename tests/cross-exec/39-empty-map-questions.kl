@@ -1,0 +1,29 @@
+// Cross-target fixture: a map that is created and never put into.
+//
+// Creating one is what triggers the chain lowering, not growing it, so the
+// chain's helpers have to typecheck for a chain that stays empty. They did
+// not: two arms of the same `match` disagreed once an assignment started
+// yielding unit, and the whole program was refused for a type error inside
+// injected code the user never wrote.
+//
+// Asking such a map about a key is the other half. Nothing fixes its key or
+// value type, so it used to be refused for want of one -- but the answer does
+// not need a type: a map with no entries contains nothing.
+//
+// A map that *is* grown lives in fixtures 31-35. Keeping the two apart is
+// deliberate: the lowering is all-or-nothing per program, so a program with
+// both a grown map and an untouched one puts the untouched one on a path
+// neither case exercises alone.
+
+import std.map
+
+mutable never = Map#empty()
+println(Map#size(never))
+println(never.containsKey("a"))
+println(never.containsKey("zz"))
+println(never)
+println(Map#isEmpty(never))
+assertResult(0)(Map#size(never))
+assertResult(false)(never.containsKey("a"))
+
+println("done")

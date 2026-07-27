@@ -1903,6 +1903,170 @@ side of a branch.
   inherits the enclosing builtin's own name (e.g. `map: ...`) rather than
   naming the callback itself — an improvement over no name at all, but not
   fully precise; left as a documented limitation rather than chased further.
+- The lexer no longer decides whether a decimal integer literal is in range:
+  `-9223372036854775808` reaches it as digits one past `i64::MAX`, and only
+  the parser knows whether a unary minus is about to absorb them. Digits that
+  do not fit become `TokenKind::IntOutOfRange(magnitude, kind)`, which the
+  unary-minus arms in both the expression and the pattern parser turn into
+  `i64::MIN` when the magnitude is exactly `1 << 63` and reject otherwise;
+  anywhere else the token is the same "integer literal is out of range" it
+  always was (issue #628).
+- An assignment's right-hand side goes through `parse_assignment_rhs`, which
+  admits the expression keywords `if` / `while` / `foreach` before falling
+  back to `parse_assignment`. `x = if (c) a else b` used to need parentheses
+  because those keywords are handled above `parse_assignment`, so the
+  descent reported "expected an expression" at the `if` (issue #609).
+- The pattern parser now treats a name as a constructor when it was declared
+  as an enum variant, in addition to the existing leading-capital rule, so a
+  variant named with the `__` convention used for synthesized names matches.
+  An undeclared `_`-prefixed name stays a binding (issue #611).
+- `tests/book_examples.rs` extracts every ```klassic block under
+  `docs/book/src` and runs it through the evaluator; an info string of
+  ```klassic,norun documents a program that needs arguments or stdin and is
+  extracted but not run. Four blocks were missing the `import` line they
+  needed when the harness first ran (issue #629).
+- The seven system stdlib modules (`std.env`, `std.cli`, `std.dir`,
+  `std.process`, `std.file`, `std.path`, `std.time`) carry type annotations
+  now. They had none, which each backend then failed on for its own reason:
+  aarch64 could not give a binding a type it never learned ("a call to
+  `__mod_std_env_exists`, whose result type cannot be determined") and x86-64
+  could not tell the string `lastIndexOf` from the list one. Annotating also
+  uncovers what the missing annotations were hiding, which is the rest of this
+  entry (issue #622).
+- An annotated `String` parameter arrives as a heap string, so annotating a
+  definition used to be what stopped a program compiling. Three places on the
+  x86-64 side now take a heap string where they took only a static or runtime
+  one: the file and directory builtins' path and content arguments (through
+  `expr_yields_runtime_or_heap_string` plus `native_string_ref_or_copy`),
+  `indexOf`/`lastIndexOf`, and the `if` merge, which recognises a string
+  helper applied to a heap string as string-yielding and so joins
+  `if (c) heapString else substring(...)`. The general
+  `expr_may_yield_runtime_string` predicate is deliberately *not* widened --
+  that was measured to break programs whose other string paths cannot copy.
+- aarch64 canonicalises the v0.1 prelude spellings (`getEnv` ->
+  `Environment#get`, `args` -> `CommandLine#args`, and five more) in both
+  `builtin_call` and `static_type_under`, so the stdlib modules written
+  against the short names compile there (issue #623). It also gained
+  `Dir#current` (Darwin `__getcwd`, which fills a buffer and answers 0, so the
+  length comes from scanning to the terminator), `Dir#home`, `Dir#temp` and
+  `Dir#isFile`.
+- aarch64's `annotation_type` resolves a structural record written as its
+  fields, `{ year: Int; month: Int }`, interning it the way a record literal
+  interns; `std.time` returns one. `assignable` also accepts a `Nullable(T)`
+  body under a `T` return annotation, which is what `std.cli`'s `option`
+  is -- a String or nothing.
+- `tests/cross-exec/36-stdlib-system-modules.kl` covers all seven modules on
+  all three targets, imported under aliases (three of them declare `exists`,
+  two declare `join`).
+- aarch64 can print a value of an enum the program declared itself. The
+  shared lowering erases a monomorphic enum into `__gc_record` calls, so such
+  a value arrives as a bare pointer; x86-64 recovered its identity from the
+  `__enum_shape_named(value, "Variant")` marker the lowering leaves behind,
+  and aarch64 dropped the marker. It reads it now, giving the value
+  `ValueType::LoweredEnum(index)` into `LoweredEnumTable` -- built from the
+  lowering's own variant table plus each field's annotation text, which is
+  the only place a payload that is itself an enum still says *which* enum.
+  `emit_print_lowered_enum` / `emit_lowered_enum_to_str` switch on the boxed
+  tag in slot 0 and render the payloads from slots 1.. , descending into a
+  nested enum and refusing (like the generic path) an enum that holds itself
+  (issue #619).
+- `LoweredEnum` and `Ptr` are assignable to each other in both directions and
+  join as `Ptr`, because naming which enum a pointer is must only add what
+  printing needs and never narrow where the value can go. It is also
+  normalised to `Ptr` wherever a type is *stored* -- an enum shape's payload
+  -- so `Ok(step)` built from an argument and `Ok(step)` built from an
+  annotation stay one shape.
+- The enum lowering now descends into string interpolation. It did not, so
+  `"#{Some(1)}"` kept a constructor call no backend had declared -- a shared
+  middle-end gap that showed up as an unknown function on aarch64.
+- aarch64 steps over an `axiom` / `theorem` declaration instead of refusing
+  it. Proofs are checked before any backend runs, so a declaration produces no
+  code -- exactly like the other declaration forms already listed beside it.
+  `test-programs/proof-surface.kl` is the first `.kl` file in the repo using
+  either keyword, which is why a whole target refusing them went unnoticed for
+  a release (issue #625).
+- An assignment is typed `Unit` and evaluates to unit, on every path: the
+  checker, the evaluator, and both native backends. It used to take the
+  assigned value's type, so two `match` arms that both ended in an assignment
+  disagreed unless the values happened to share a type -- which is why every
+  loop-shaped helper in `map_chain.rs` ended its arms with a throwaway `0`.
+  Those eight are gone. aarch64 also gained an expression-position assignment
+  and printing of unit as `()` (issue #610).
+- Floating-point division by zero follows IEEE 754 -- `1.0 / 0.0` is infinity
+  and `0.0 / 0.0` is NaN -- in the evaluator and in the static fold both
+  native backends share. It was an error, so a program could reach infinity by
+  multiplying (`1e300 * 1e300` folded to `inf`) and not by dividing. Integer
+  division by zero stays an error: there is no integer infinity (issue #627).
+- aarch64 gained `Map#remove` and `Map#containsValue` (the same chain walk
+  `Map#put` does, and the mirror of `Map#containsKey`'s scan), and the rest of
+  `std.map` / `std.set` came with them by fixing what they had in common: a
+  collection rebuilt by folding from an empty one. `Set#add` on the empty set
+  now takes its element type from the element being added, and a map value is
+  allowed to be `Nullable` -- `Map#put(acc, k, Map#get(m, k))` is how
+  `filterKeys` and `merge` are written, and `Map#get` answers a value *or
+  nothing*. A nullable operand in arithmetic is unboxed to the value it holds,
+  which is what `mapValues`, `filterValues` and `foldMap` do (issue #615).
+  Still unsupported everywhere: `mapKeys`, which goes through
+  `Map#fromPairs`.
+- x86-64 compares a string with `null`. A static or runtime string is a
+  (data, length) pair in fixed storage, so it is never null and the answer is
+  settled while compiling; a heap string is a pointer, so the answer is
+  whether that pointer is zero. It reported "equality for values with
+  different types", which is the first thing a caller writes after a lookup
+  that may not have found anything (issue #624).
+- aarch64 holds a lowered enum in a list (`ListElem::LoweredEnum`), so
+  `[Sm(1), Nn]` builds and prints there. x86-64 still refuses it: its list
+  literals are static storage and a list of heap values needs the runtime
+  representation issue #433 tracks, which is a separate piece of work
+  (issue #620, half).
+- aarch64 folds an `if` whose condition is settled while compiling, taking
+  only that branch. `static_condition` answers narrowly -- the emptiness of a
+  collection whose type says it has no elements -- which is the shape a
+  generic helper's base case is written in, and compiling the other branch
+  anyway is what refused `if (isEmpty(xs)) xs else <something about head(xs)>`
+  when it was called with `[]`. x86-64 already did this (issue #616).
+- The GC's two call sites no longer carry register-save lists. aarch64 emits
+  one wrapper per routine -- save `BARRIER_SAVED` / `ALLOC_SAVED`, call the
+  routine, restore, return -- and every barriered read and every allocation
+  `bl`s the wrapper. The four `save_*_registers` / `restore_*_registers` trait
+  hooks are gone from `PortableAsm`, and with them the class of bug where one
+  site's list and the routine's actual clobbers drift apart (which is how the
+  V-register-named list mapped X10-X12 to the wrong physical registers when it
+  was first tried). x86-64 saved nothing at these sites and is unchanged; the
+  fast path -- the colour test and the strip, which is what almost every load
+  executes -- does not change on either (issue #618).
+- A map created by `Map#empty()` and never put into can be asked about a key,
+  its size and its emptiness. Creating one is what triggers the chain
+  lowering, so the chain's helpers have to typecheck for a chain that stays
+  empty -- they did not once an assignment started yielding unit, because the
+  arms of a `match` written for effect no longer agreed with a sibling arm
+  ending in a bare `0`. Covered by
+  `tests/cross-exec/39-empty-map-questions.kl`, kept separate from the
+  grown-map fixtures because the lowering is all-or-nothing per program
+  (issue #614).
+- aarch64 binds a lambda that a *call* produced: `val add3 = adder(3)`. A
+  lambda has no runtime representation there -- its body is compiled where it
+  is called -- so what is bound is the lambda plus the arguments it closed
+  over, each materialised into a slot of the caller's frame and carried in
+  `CapturedEnv::values`. The slots outlive the binding, so the body reads them
+  when the lambda is finally called, and a heap-reference capture is rooted.
+  Calling the result on the spot always worked; the binding is what ruled out
+  currying and partial application (issue #621). A list *of* such lambdas is
+  still refused -- a lambda has no value to put in a list.
+- A recursive generic definition compiles on aarch64 (it specialises per
+  argument-type tuple) and, on x86-64, wherever the call can be inlined with a
+  concrete list. `stdlibFilter` in the prelude carries an annotation now,
+  which moves its x86-64 diagnostic from "its result type is neither
+  annotated nor inferable" -- a fixable-sounding complaint that was not the
+  real one -- to "this backend cannot pass `xs` (`List<'a>`) by itself", which
+  is the actual blocker and the one issue #433 tracks (issue #613, half).
+- A `val` annotated with a generic enum applied to concrete types gives its
+  binding that shape. `val e: Chain<String, Int> = Nil` builds the empty case,
+  which fixes nothing on its own, so a helper walking it had no idea what its
+  fields hold. Reading the shape off the annotation is exact -- every type
+  argument is named -- so it is not the partial resolution issue #612 is
+  about, which stays refused. Covered by
+  `tests/cross-exec/41-annotated-generic-enum.kl` (issue #612, the safe part).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

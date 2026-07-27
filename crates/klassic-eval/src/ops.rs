@@ -249,10 +249,15 @@ fn eval_divide(lhs: Value, rhs: Value, span: Span) -> Result<Value, Diagnostic> 
         (Some(lhs), Some(rhs)) => {
             let (lhs, rhs, kind) = promote_numeric_pair(lhs, rhs);
             let value = match (lhs, rhs, kind) {
+                // Integer division by zero has no answer to give, so it is an
+                // error. Floating-point division does: IEEE 754, which is what
+                // the underlying f32/f64 implement, defines `1.0 / 0.0` as
+                // infinity and `0.0 / 0.0` as NaN. Refusing them meant a
+                // program could reach infinity by multiplying and not by
+                // dividing, so the same quantity behaved differently depending
+                // on how it was written.
                 (_, NumericValue::Int(0), NumericKind::Int)
-                | (_, NumericValue::Long(0), NumericKind::Long)
-                | (_, NumericValue::Float(0.0), NumericKind::Float)
-                | (_, NumericValue::Double(0.0), NumericKind::Double) => {
+                | (_, NumericValue::Long(0), NumericKind::Long) => {
                     return Err(Diagnostic::runtime(span, "division by zero"));
                 }
                 (NumericValue::Int(lhs), NumericValue::Int(rhs), NumericKind::Int) => lhs

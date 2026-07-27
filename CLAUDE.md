@@ -201,7 +201,8 @@ When adding syntax or semantics:
   `%["a":1 "b":2]`, `%(1 2 3)`.
 - String interpolation: `"Hello #{name}"`.
 - `cleanup { ... }` clauses run after the associated expression.
-- `module foo.bar { ... }` plus selective / aliased imports.
+- A module is a whole file, declared by `module foo.bar` on its first line
+  (there is no block form); imports may be selective or aliased.
 - Structural records (`record { x: 1; y: 2 }`) and nominal record declarations
   (`record Point { x: Int; y: Int }`), constructed positionally as `#Point(1, 2)`.
 - Algebraic data types: `enum Option<a> { case Some(value: a); case None }` and

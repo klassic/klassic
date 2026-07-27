@@ -4,10 +4,10 @@ module std.process
 // the StandardInput builtins. All members delegate to the existing
 // builtin so error semantics and native coverage are unchanged.
 
-def args() = CommandLine#args()
+def args(): List<String> = CommandLine#args()
 
-def stdinAll() = stdin()
+def stdinAll(): String = stdin()
 
-def stdinLines() = stdinLines()
+def stdinLines(): List<String> = StandardInput#lines()
 
-def exitWith(code) = Process#exit(code)
+def exitWith(code: Int): Unit = Process#exit(code)

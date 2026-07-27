@@ -221,6 +221,8 @@ enum Option<a> {
 Pattern-match on it directly when the helpers don't fit:
 
 ```klassic
+import std.option
+
 val n = some(42) match {
   case Some(v) => v
   case None    => 0
@@ -294,6 +296,8 @@ enum Result<a, e> {
 Direct pattern matching is also available:
 
 ```klassic
+import std.result
+
 val message = ok(42) match {
   case Ok(v)  => "got " + toString(v)
   case Err(m) => "error: " + m
@@ -399,7 +403,8 @@ import std.dir.{current, home, temp, isDirectory, list}
 
 println(current())            // current working directory
 println(home())               // user's home directory
-println(list("/tmp"))         // directory entries
+println(isDirectory(temp()))  // true
+println(list(temp()))         // directory entries
 ```
 
 ## std.process
@@ -407,7 +412,7 @@ println(list("/tmp"))         // directory entries
 Wraps `Process#exit`, `CommandLine#args`, and the StandardInput
 helpers under one module-qualified namespace.
 
-```klassic
+```klassic,norun
 import std.process.{args, stdinAll, exitWith}
 
 val files = args()            // CommandLine#args()

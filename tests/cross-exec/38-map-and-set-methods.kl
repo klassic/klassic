@@ -1,0 +1,63 @@
+// Cross-target fixture: the map and set methods that were arm64-only gaps.
+//
+// `remove` and `containsValue` were simply not implemented there. The rest --
+// `merge`, `filterKeys`, `filterValues`, `mapValues`, `setFilter`, `setMap` --
+// failed for one shared reason each backend expressed differently: every fold
+// that rebuilds a collection is written as `Map#put(acc, k, Map#get(m, k))` or
+// `Set#add(acc, x)` starting from an empty one, and the inference could not
+// carry a type through either. A lookup answers a value *or nothing*, and the
+// empty set's element type is fixed by the first thing added to it.
+//
+// Insertion order is the observable part of both types, so every case below
+// would disagree with the evaluator under an implementation that reordered.
+//
+// Not here, and still a gap on every target: `mapKeys`, which goes through
+// `Map#fromPairs`.
+
+import std.map
+import std.set
+
+val m = %["a": 1 "b": 2 "c": 3]
+
+// Dropping an entry, including one that is not there.
+println(m.remove("b"))
+println(m.remove("zz"))
+val dropped = m.remove("a")
+println(dropped.remove("c"))
+assertResult(2)(Map#size(dropped))
+
+// Asking about a value rather than a key.
+println(m.containsValue(2))
+println(m.containsValue(9))
+println(%[].containsValue(1))
+assertResult(true)(m.containsValue(3))
+
+// The folds that rebuild a map.
+println(m.merge(%["d": 4]))
+println(m.merge(%["a": 9]))
+println(m.filterKeys((k) => k == "a"))
+println(m.filterValues((v) => v > 1))
+println(m.mapValues((v) => v * 10))
+println(m.toPairs())
+println(m.foldMap(0)((acc, k, v) => acc + v))
+assertResult(6)(m.foldMap(0)((acc, k, v) => acc + v))
+val merged = m.merge(%["d": 4])
+assertResult(4)(Map#size(merged))
+
+// The same shape over a set.
+val s = %(1, 2, 3)
+println(s.setFilter((x) => x > 1))
+println(s.setFilter((x) => x > 9))
+println(s.setMap((x) => x * 2))
+println(s.setFold(0)((acc, x) => acc + x))
+assertResult(6)(s.setFold(0)((acc, x) => acc + x))
+
+// A map and a set of strings, so the comparisons go through the string path
+// rather than the scalar one.
+val words = %["one": "first" "two": "second"]
+println(words.remove("one"))
+println(words.containsValue("second"))
+println(words.containsValue("third"))
+val names = %("alpha", "beta")
+println(names.setFilter((n) => n == "beta"))
+println("done")
