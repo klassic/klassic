@@ -21298,6 +21298,56 @@ const GC_CHURN_PROGRAM: &str = "enum Tree { case Leaf(v: Int); case Branch(l: Tr
      }\n\
      println(acc)\n";
 
+/// The Windows PE64 backend shares x86-64's collector, and had no GC test of
+/// any kind -- 30 of the 39 were gated to Linux, 7 to macOS, none here. A
+/// mis-rooted pointer only shows up when a collection fires at the wrong
+/// moment, so the churn program is run with one forced before every
+/// allocation and with heap pointers poisoned.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[test]
+fn windows_gc_stress_and_poison_stay_correct() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let source_path = std::env::temp_dir().join(format!("klassic_win_gc_{stamp}.kl"));
+    let output_path = std::env::temp_dir().join(format!("klassic_win_gc_{stamp}.exe"));
+    fs::write(&source_path, GC_CHURN_PROGRAM).expect("temp source file should write");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "--gc-stress",
+            "--gc-poison",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            output_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "the stressed build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&output_path)
+        .output()
+        .expect("generated executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&output_path);
+    assert!(
+        run.status.success(),
+        "the stressed program exited with {:?}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "50000\n",
+        "a collection before every allocation must not change the answer"
+    );
+}
+
 /// Build the churn program with the given extra flags and return
 /// (stdout, stderr) of the compiled binary.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

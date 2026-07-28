@@ -2148,6 +2148,14 @@ side of a branch.
   callee up in, so the lambda's own parameters become the captures. Three
   levels deep is still refused -- the middle lambda's capture is not carried
   when it is itself produced by a call (issue #632).
+- CI runs every `tests/cross-exec/` fixture a second time under
+  `--gc-stress --gc-poison` on Linux, against the same evaluator output, and
+  the Windows target has a GC test at all. Neither existed: the flags did not
+  appear in `ci.yml`, and of the 39 GC tests 30 were gated to Linux and 7 to
+  macOS with none on Windows -- which shares x86-64's collector. The fixtures
+  are where the newest work lands, so they are the most likely to carry a
+  fresh rooting mistake, and a mis-rooted pointer only shows up when a
+  collection fires at the wrong moment (issue #653).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
