@@ -1,0 +1,55 @@
+// Cross-target fixture: a `match` whose arms build lists of different lengths.
+//
+// `std.option`'s `toList` is the shape everyone writes -- one arm yields a
+// one-element list, the other an empty one -- and x86-64 refused it while the
+// same shape written as an `if` built. A `match` is lowered to nested `if`s
+// ending in `__match_fail()`, and a branch that never returns has no list
+// length; that read as "length unknown" rather than "no constraint", so the
+// join above it fixed a static length from one side and then refused the
+// other for disagreeing with it.
+//
+// Taking the maximum over the arms that *can* return is what makes this both
+// build and be right: an earlier attempt forced a dynamic length without
+// fixing the capacity, and the three-arm case below silently printed `[0]`
+// for the longest arm. It is here to keep that from coming back.
+
+import std.option
+
+enum Colour { case Red; case Green; case Blue }
+
+def pick(c: Colour): List<Int> = c match {
+  case Red => [1]
+  case Green => []
+  case Blue => [1 2]
+}
+
+println(pick(Red))
+println(pick(Green))
+println(pick(Blue))
+
+// Four arms, so the widest one is not the last decision the join makes.
+enum Step { case One; case Two; case Three; case Four }
+
+def widths(s: Step): List<Int> = s match {
+  case One => [1]
+  case Two => []
+  case Three => [1 2]
+  case Four => [1 2 3]
+}
+
+println(widths(One))
+println(widths(Two))
+println(widths(Three))
+println(widths(Four))
+
+// Only Int arms here. Three arms of Strings -- or of nested lists -- still
+// refuse on x86-64, because the placeholder an empty arm is padded with is
+// typed `Int` and the copy into the shared output checks that source and
+// output agree. That refusal predates this change (it read as "incompatible
+// list lengths" before and as "incompatible scalar elements" now) and is
+// tracked on the issue.
+
+// The stdlib helper this issue was filed about, both ways round.
+println(toList(Some(1)))
+println(toList(None))
+println("done")

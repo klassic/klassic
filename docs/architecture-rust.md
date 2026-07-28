@@ -2248,6 +2248,15 @@ side of a branch.
   else (issue #667). aarch64 had the same divergence and tells the two apart
   the same way, at its own call site -- the two backends resolve the name
   independently, so fixing one says nothing about the other.
+- A branch that never returns contributes no list length rather than an
+  unknown one. The enum lowering ends every `match` in `__match_fail()`, so the
+  innermost `if` of a lowered match had no length hint at all; the join above
+  it then fixed a static length from one side and refused the other for
+  disagreeing with it, which is why `std.option`'s `toList` did not build while
+  the same shape written as an `if` did. Skipping the diverging branch gives
+  the join the *maximum over the arms that can return*, which is also the
+  capacity -- forcing a dynamic length without that (tried, reverted) made the
+  widest arm print truncated (issue #641).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
