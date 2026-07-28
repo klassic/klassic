@@ -19,7 +19,11 @@ target's OS-builtin coverage is ANSI-only — non-ASCII paths and
 environment values/keys are unsupported).
 
 Anything not yet supported fails at build time with a source-located
-diagnostic; there is no silent fallback to the evaluator.
+diagnostic; there is no silent fallback to the evaluator. That is the
+guarantee the backends are built around, and a program that compiles,
+runs and prints something other than what the evaluator prints is a bug
+rather than a limitation -- if you find one, it is worth reporting as
+such.
 
 ## Highlights
 
@@ -53,4 +57,7 @@ diagnostic; there is no silent fallback to the evaluator.
   values/keys are unsupported on Windows).
 - Source-located stderr diagnostics for runtime failures (`assert`,
   `assertResult`, `head([])`, negative `sleep`, FileOutput / Dir
-  errors).
+  errors). A failure raised inside a stdlib function is attributed to
+  the bundled prelude rather than to a position in your file, since the
+  two are different sources; the evaluator names the stdlib module and
+  the function you called.
