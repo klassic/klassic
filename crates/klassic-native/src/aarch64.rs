@@ -1715,6 +1715,47 @@ fn is_heap_pointer(ty: ValueType) -> bool {
     )
 }
 
+/// A type named the way the language names it, for a diagnostic. The `Debug`
+/// spelling of these is an emitter table index and a nesting depth --
+/// `Record(0)`, `Nested { depth: 1, base: Int }` -- which says nothing to
+/// someone reading their own program.
+fn type_display_name(ty: ValueType) -> String {
+    match ty {
+        ValueType::Int => "Int".to_string(),
+        ValueType::Double => "Double".to_string(),
+        ValueType::Bool => "Boolean".to_string(),
+        ValueType::Str => "String".to_string(),
+        ValueType::Unit => "Unit".to_string(),
+        ValueType::Null => "null".to_string(),
+        ValueType::Never => "a diverging expression".to_string(),
+        ValueType::Ptr => "a heap value".to_string(),
+        ValueType::Record(_) => "a record".to_string(),
+        ValueType::Enum(_) | ValueType::LoweredEnum(_) => "an enum".to_string(),
+        ValueType::EmptyList => "List".to_string(),
+        ValueType::EmptySet => "Set".to_string(),
+        ValueType::EmptyMap => "Map".to_string(),
+        ValueType::List(elem) => format!("List<{}>", elem_display_name(elem)),
+        ValueType::Set(elem) => format!("Set<{}>", elem_display_name(elem)),
+        ValueType::Map(key, value) => format!(
+            "Map<{}, {}>",
+            elem_display_name(key),
+            elem_display_name(value)
+        ),
+        ValueType::Nullable(elem) => format!("a nullable {}", elem_display_name(elem)),
+    }
+}
+
+/// The same for an element type.
+fn elem_display_name(elem: ListElem) -> String {
+    match elem {
+        ListElem::Nested { .. } => elem
+            .nested_inner()
+            .map(|inner| format!("List<{}>", elem_display_name(inner)))
+            .unwrap_or_else(|| "List".to_string()),
+        other => type_display_name(elem_value_type(other)),
+    }
+}
+
 fn elem_value_type(elem: ListElem) -> ValueType {
     match elem {
         ListElem::Int => ValueType::Int,
@@ -3882,7 +3923,7 @@ impl Emitter {
                     other => {
                         return Err(unsupported(
                             hole.span(),
-                            &format!("string interpolation of {other:?}"),
+                            &format!("string interpolation of {}", type_display_name(other)),
                         ));
                     }
                 }
@@ -6722,6 +6763,11 @@ impl Emitter {
                     }
                     match field_ty {
                         ValueType::Enum(inner) => self.emit_print_enum_inline(inner, span)?,
+                        // A payload that is an enum the shared pass lowered:
+                        // `Ok(Red)` where `Red` is the program's own enum.
+                        ValueType::LoweredEnum(inner) => {
+                            self.emit_print_lowered_enum(inner, span)?
+                        }
                         ValueType::Record(inner) => self.emit_print_record_inline(inner, span)?,
                         other => {
                             let Some(elem) = list_elem_of(other) else {
@@ -6930,7 +6976,10 @@ impl Emitter {
                     ValueType::Bool => self.emit_bool_to_str(),
                     ValueType::Str => {}
                     other => {
-                        return Err(unsupported(span, &format!("toString of {other:?}")));
+                        return Err(unsupported(
+                            span,
+                            &format!("toString of {}", type_display_name(other)),
+                        ));
                     }
                 }
                 Ok(Some(ValueType::Str))
@@ -9035,12 +9084,18 @@ impl Emitter {
                         ValueType::Bool => self.emit_bool_to_str(),
                         ValueType::Str => {}
                         ValueType::Enum(inner) => self.emit_enum_to_str(inner, span)?,
+                        ValueType::LoweredEnum(inner) => {
+                            self.emit_lowered_enum_to_str(inner, span)?
+                        }
                         ValueType::List(elem) => self.emit_list_to_str(elem, "[", "]", span)?,
                         ValueType::Set(elem) => self.emit_list_to_str(elem, "%(", ")", span)?,
                         other => {
                             return Err(unsupported(
                                 span,
-                                &format!("rendering an enum payload of type {other:?}"),
+                                &format!(
+                                    "rendering an enum payload of type {}",
+                                    type_display_name(other)
+                                ),
                             ));
                         }
                     }
@@ -11729,14 +11784,26 @@ impl Emitter {
                         self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
                         self.asm.bind(bool_end);
                     }
-                    ListElem::Double
-                    | ListElem::Enum(_)
+                    // Everything `emit_print_elem` can already render: a
+                    // lookup answers a value or nothing, and the value half is
+                    // an ordinary element. Only a Double is left out, because
+                    // this backend has no run-time formatter for one.
+                    ListElem::Enum(_)
                     | ListElem::Record(_)
                     | ListElem::LoweredEnum(_)
                     | ListElem::Nested { .. } => {
+                        self.emit_print_elem(elem, argument.span())?;
+                        self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+                        self.asm.branch(end_label, BranchKind::Unconditional);
+                        self.asm.bind(null_label);
+                        self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
+                        self.asm.bind(end_label);
+                        return Ok(());
+                    }
+                    ListElem::Double => {
                         return Err(unsupported(
                             argument.span(),
-                            &format!("printing a nullable {elem:?}"),
+                            &format!("printing a nullable {}", elem_display_name(elem)),
                         ));
                     }
                 }
@@ -11758,7 +11825,7 @@ impl Emitter {
             }
             other => Err(unsupported(
                 argument.span(),
-                &format!("printing a {other:?} value"),
+                &format!("printing {}", type_display_name(other)),
             )),
         }
     }

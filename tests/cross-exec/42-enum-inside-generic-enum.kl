@@ -1,0 +1,60 @@
+// Cross-target fixture: an enum the program declared, carried inside a
+// generic one.
+//
+// This is the fixture for the one *wrong answer* the sweep found. The shared
+// lowering erases a monomorphic enum, and a generic enum's display could not
+// name what its payload was, so it rendered a placeholder -- and printed it:
+//
+//   evaluator: Ok(Red)      x86-64 before: Ok(<enum>)
+//
+// It compiled, ran and exited zero, which is the one outcome this backend is
+// not allowed to produce. The placeholder is gone; where a payload genuinely
+// cannot be named the program is refused instead.
+//
+// `Result` and `Option` are the two generic enums anybody wraps a value in,
+// and the payload is exercised through printing, through interpolation and
+// through a `match` -- the last of which was always right, which is what made
+// the first two easy to miss.
+
+import std.result
+import std.option
+
+enum Colour { case Red; case Green; case Blue }
+enum Shape { case Circle(radius: Int); case Rect(w: Int, h: Int) }
+
+val ok: Result<Colour, String> = Ok(Red)
+val bad: Result<Colour, String> = Err("nope")
+println(ok)
+println(bad)
+println("ok=#{ok} bad=#{bad}")
+assertResult("Ok(Red)")("#{ok}")
+
+val some: Option<Colour> = Some(Green)
+val none: Option<Colour> = None
+println(some)
+println(none)
+println("some=#{some} none=#{none}")
+assertResult("Some(Green)")("#{some}")
+
+// A payload that carries fields of its own, so the nested renderer has to
+// descend and print them rather than only the variant name.
+val shaped: Result<Shape, String> = Ok(Rect(2, 5))
+println(shaped)
+println("shaped=#{shaped}")
+assertResult("Ok(Rect(2, 5))")("#{shaped}")
+
+val circled: Option<Shape> = Some(Circle(3))
+println(circled)
+
+// The match arm was correct all along; it is here so a change that fixes the
+// printing by breaking the matching cannot pass.
+println(ok match {
+  case Ok(c) => c match { case Red => "red"; case Green => "green"; case Blue => "blue" }
+  case Err(m) => m
+})
+println(shaped match {
+  case Ok(s) => s match { case Circle(r) => r; case Rect(w, h) => w * h }
+  case Err(m) => 0
+})
+assertResult(10)(shaped match { case Ok(s) => s match { case Circle(r) => r; case Rect(w, h) => w * h }; case Err(m) => 0 })
+println("done")

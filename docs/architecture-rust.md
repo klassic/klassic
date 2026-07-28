@@ -2067,6 +2067,23 @@ side of a branch.
   argument is named -- so it is not the partial resolution issue #612 is
   about, which stays refused. Covered by
   `tests/cross-exec/41-annotated-generic-enum.kl` (issue #612, the safe part).
+- An enum the program declared, carried inside a generic one, prints as
+  itself. `Ok(Red)` used to compile, run and print `Ok(<enum>)` on x86-64 --
+  a wrong answer rather than a diagnostic, which is the one outcome this
+  backend must not produce. `mono_enum_shapes` is keyed by the enum's own name
+  as well as by each variant's, so an *annotation* (`Result<Colour, String>`)
+  can find the payload's shape; the placeholder is replaced by a marker that
+  refuses the program where a payload genuinely cannot be named. aarch64
+  gained the same nested case in both its enum renderers (issue #647).
+- aarch64's diagnostics no longer print the emitter's internal type names.
+  `Record(0)` and `Nested { depth: 1, base: Int }` -- the `Debug` spelling of
+  a table index and a nesting depth -- are now `a record` and `List<Int>`,
+  through `type_display_name` / `elem_display_name` at the five sites that
+  formatted a type (issue #633).
+- aarch64 prints a nullable whose value half is a list, a record or an enum,
+  by routing it through `emit_print_elem` -- `Map#get` answers one, so a map
+  of lists could not be read. Only a nullable Double is still refused, for
+  want of a run-time Double formatter (issue #634).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
