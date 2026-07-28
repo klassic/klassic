@@ -86,6 +86,15 @@ const SYS_MMAP: u16 = 197;
 /// Darwin `__getcwd(buf, size)`: fills `buf`, answers 0 on success.
 const SYS_GETCWD: u16 = 326;
 
+/// Bytes reserved on the machine stack for one rendered Double. The front
+/// `DOUBLE_NUMERATOR_BYTES` hold the exact-fraction path's numerator digits
+/// and the rest holds the assembled text, whose longest form is a sign, a
+/// `0.`, and the 27 fractional digits the `k <= 27` bound allows.
+const DOUBLE_BUFFER_BYTES: u32 = 96;
+/// How much of that buffer the numerator's digits get. One that fits an i64
+/// has at most 19.
+const DOUBLE_NUMERATOR_BYTES: u32 = 24;
+
 /// `S_IFDIR` (0o040000) >> 12, the value `st_mode`'s type field takes for a
 /// directory; `S_IFREG` (0o100000) >> 12 for a regular file.
 const S_IFDIR_SHIFTED: u32 = 0o4;
@@ -190,6 +199,10 @@ enum Cond {
     Hi = 8,
     /// After `fcmp`: less-or-equal, unordered fails — the float `<=`.
     Ls = 9,
+    /// Overflow set. After `fcmp` this is precisely "unordered", i.e. either
+    /// operand was NaN -- which is how a Double renderer tells NaN from a
+    /// value that merely compares unequal.
+    Vs = 6,
     Ge = 10,
     Lt = 11,
     Gt = 12,
@@ -1538,9 +1551,8 @@ pub(crate) enum LoweredFieldRepr {
     /// index lazily, because a payload can name an enum whose own entry is
     /// still being built.
     Enum(String),
-    /// A payload this backend has no rendering for -- a Double, whose
-    /// shortest-round-trip formatter does not exist here.
-    Unrenderable,
+    /// An IEEE double, boxed like any other scalar.
+    Double,
 }
 
 impl LoweredFieldRepr {
@@ -1550,7 +1562,7 @@ impl LoweredFieldRepr {
             crate::EnumFieldRepr::BoolField => Self::Bool,
             crate::EnumFieldRepr::StringField => Self::Str,
             crate::EnumFieldRepr::EnumField => Self::Enum(annotation),
-            crate::EnumFieldRepr::DoubleField => Self::Unrenderable,
+            crate::EnumFieldRepr::DoubleField => Self::Double,
         }
     }
 }
@@ -3917,6 +3929,7 @@ impl Emitter {
                 match self.expression(hole)? {
                     ValueType::Str => {}
                     ValueType::Int => self.emit_int_to_str(),
+                    ValueType::Double => self.emit_double_to_str(),
                     ValueType::Bool => self.emit_bool_to_str(),
                     // A collection renders into the hole the way `println`
                     // renders it, through the same builder.
@@ -6107,6 +6120,319 @@ impl Emitter {
         self.asm.add_sp_imm(32);
     }
 
+    /// Write the Double whose bits are in x0 to stdout, no newline.
+    /// The scratch buffer lives on the machine stack, so nothing about it
+    /// needs the collector's attention.
+    fn emit_print_double(&mut self) {
+        self.asm.sub_sp_imm(DOUBLE_BUFFER_BYTES);
+        self.asm.add_reg_sp_imm(Reg::X12, 0);
+        self.emit_runtime_double_ascii(Reg::X12);
+        self.asm.mov_imm64(Reg::X0, STDOUT_FD);
+        self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+        self.asm.svc_0x80();
+        self.asm.add_sp_imm(DOUBLE_BUFFER_BYTES);
+    }
+
+    /// `toString` of the Double in x0 -> fresh string object in x0. The
+    /// Double sibling of `emit_int_to_str`, and copied out of the stack
+    /// buffer the same way, so the allocation that follows cannot disturb
+    /// the bytes it is about to copy.
+    fn emit_double_to_str(&mut self) {
+        self.asm.sub_sp_imm(DOUBLE_BUFFER_BYTES);
+        self.asm.add_reg_sp_imm(Reg::X12, 0);
+        self.emit_runtime_double_ascii(Reg::X12);
+        self.emit_alloc_raw_string(Reg::X2);
+        self.asm.str_imm(Reg::X2, Reg::X5, 0);
+        self.asm.add_reg_imm(Reg::X7, Reg::X5, 8);
+        self.emit_copy_bytes(Reg::X2, Reg::X1, Reg::X7, Reg::X3);
+        self.asm.mov_reg(Reg::X0, Reg::X5);
+        self.asm.add_sp_imm(DOUBLE_BUFFER_BYTES);
+    }
+
+    /// A whole-number Double: its integer digits followed by `.0`. The
+    /// truncated value is already in x0 (`fcvtzs` put it there), and the
+    /// digits are filled backwards from the buffer's end so the leading
+    /// position is wherever the loop stopped.
+    fn emit_double_whole_digits(&mut self, buffer: Reg) {
+        // Leave room at the end for the two `.0` bytes.
+        self.asm
+            .add_reg_imm(Reg::X1, buffer, DOUBLE_BUFFER_BYTES - 2);
+        self.emit_signed_digits_backwards(Reg::X0, Reg::X1);
+        // `.0`, contiguous with the ones digit the loop just wrote.
+        self.asm
+            .add_reg_imm(Reg::X3, buffer, DOUBLE_BUFFER_BYTES - 2);
+        self.asm.mov_imm64(Reg::X4, u64::from(b'.'));
+        self.asm.strb_post_increment(Reg::X4, Reg::X3);
+        self.asm.mov_imm64(Reg::X4, u64::from(b'0'));
+        self.asm.strb_post_increment(Reg::X4, Reg::X3);
+        // x1 = first byte, x2 = length.
+        self.asm.add_reg_imm(Reg::X2, buffer, DOUBLE_BUFFER_BYTES);
+        self.asm.sub_reg(Reg::X2, Reg::X2, Reg::X1);
+    }
+
+    /// A fraction, written out exactly. Every finite double is `M * 2^E`, and
+    /// for a fraction `E` is negative -- so with `k = -E` the value is
+    /// `M * 5^k / 10^k`, an integer numerator over a power of ten.
+    ///
+    /// Two bounds decide whether that numerator can be used. It has to fit an
+    /// i64, which is what `k <= 27` and the per-multiply overflow check
+    /// enforce. And it has to be the same text Rust's shortest-round-trip
+    /// formatter would print, which is what `D <= 15` enforces: a decimal with
+    /// at most `DBL_DIG` significant digits round-trips through a double
+    /// injectively, so no shorter alternative exists for it, while past that
+    /// the exact expansion is measurably longer than what the evaluator
+    /// prints. Either bound missed jumps to `overflow`.
+    fn emit_double_fraction_digits(&mut self, buffer: Reg, overflow: Label) {
+        // E0 = biased exponent - 1075, i.e. the exponent of the mantissa read
+        // as a 53-bit integer.
+        self.asm.lsr_imm(Reg::X0, Reg::X9, 52);
+        self.asm.mov_imm64(Reg::X4, 0x7ff);
+        self.asm.and_reg(Reg::X0, Reg::X0, Reg::X4);
+        self.asm.mov_imm64(Reg::X4, 1075);
+        self.asm.sub_reg(Reg::X8, Reg::X0, Reg::X4); // x8 = E0
+
+        // M0 = mantissa | (1 << 52). Reading a subnormal as if it were
+        // normalised overstates it, but a subnormal needs far more than the
+        // bound below allows either way, so it lands in `overflow` regardless.
+        self.asm.mov_imm64(Reg::X4, (1u64 << 52) - 1);
+        self.asm.and_reg(Reg::X0, Reg::X9, Reg::X4);
+        self.asm.mov_imm64(Reg::X4, 1u64 << 52);
+        self.asm.orr_reg(Reg::X0, Reg::X0, Reg::X4);
+
+        // Strip trailing zero bits: M0 = M1 * 2^t with M1 odd. The implicit
+        // leading bit is always set, so this stops within 53 turns.
+        self.asm.mov_imm64(Reg::X10, 0); // t
+        let tz_loop = self.asm.new_label();
+        let tz_done = self.asm.new_label();
+        self.asm.bind(tz_loop);
+        self.asm.mov_imm64(Reg::X4, 1);
+        self.asm.and_reg(Reg::X5, Reg::X0, Reg::X4);
+        self.asm
+            .branch(tz_done, BranchKind::CompareNonZero(Reg::X5));
+        self.asm.lsr_imm(Reg::X0, Reg::X0, 1);
+        self.asm.add_reg_imm(Reg::X10, Reg::X10, 1);
+        self.asm.branch(tz_loop, BranchKind::Unconditional);
+        self.asm.bind(tz_done);
+
+        // k = -(E0 + t). A whole number too large for the fast path, and an
+        // infinity, both land at `k <= 0` here rather than needing a test of
+        // their own.
+        self.asm.add_reg(Reg::X8, Reg::X8, Reg::X10);
+        self.asm.mov_imm64(Reg::X11, 0);
+        self.asm.sub_reg(Reg::X11, Reg::X11, Reg::X8); // x11 = k
+        self.asm.cmp_imm(Reg::X11, 0);
+        self.asm.branch(overflow, BranchKind::Conditional(Cond::Le));
+        self.asm.cmp_imm(Reg::X11, 27);
+        self.asm.branch(overflow, BranchKind::Conditional(Cond::Gt));
+
+        // N = M1 * 5^k. AArch64's multiply sets no flags, so the check is the
+        // pre-condition instead: `n * 5` fits a signed 64-bit value exactly
+        // when `n <= i64::MAX / 5`.
+        self.asm.mov_reg(Reg::X10, Reg::X11); // counter
+        let mul_loop = self.asm.new_label();
+        let mul_done = self.asm.new_label();
+        self.asm.bind(mul_loop);
+        self.asm.branch(mul_done, BranchKind::CompareZero(Reg::X10));
+        self.asm.mov_imm64(Reg::X4, (i64::MAX / 5) as u64);
+        self.asm.cmp_reg(Reg::X0, Reg::X4);
+        self.asm.branch(overflow, BranchKind::Conditional(Cond::Gt));
+        self.asm.mov_imm64(Reg::X4, 5);
+        self.asm.mul_reg(Reg::X0, Reg::X0, Reg::X4);
+        self.asm.sub_reg_imm(Reg::X10, Reg::X10, 1);
+        self.asm.branch(mul_loop, BranchKind::Unconditional);
+        self.asm.bind(mul_done);
+
+        // N's digits, most-significant first, filled backwards into the front
+        // of the buffer. The assembled text goes into the back half, so the
+        // two never overlap.
+        self.asm
+            .add_reg_imm(Reg::X1, buffer, DOUBLE_NUMERATOR_BYTES);
+        self.asm.mov_imm64(Reg::X6, 0); // D
+        let n_loop = self.asm.new_label();
+        self.asm.bind(n_loop);
+        self.asm.mov_imm64(Reg::X3, 10);
+        self.asm.sdiv_reg(Reg::X4, Reg::X0, Reg::X3);
+        self.asm.msub_reg(Reg::X2, Reg::X4, Reg::X3, Reg::X0);
+        self.asm.add_reg_imm(Reg::X2, Reg::X2, u32::from(b'0'));
+        self.asm.store_byte_pre_decrement(Reg::X2, Reg::X1);
+        self.asm.add_reg_imm(Reg::X6, Reg::X6, 1);
+        self.asm.mov_reg(Reg::X0, Reg::X4);
+        self.asm.branch(n_loop, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.cmp_imm(Reg::X6, 15);
+        self.asm.branch(overflow, BranchKind::Conditional(Cond::Gt));
+        // x1 -> N's most significant digit, x6 = D, x11 = k.
+
+        // Assemble "[-]<int>.<frac>" forwards into the back half.
+        self.asm
+            .add_reg_imm(Reg::X3, buffer, DOUBLE_NUMERATOR_BYTES); // start
+        self.asm.mov_reg(Reg::X2, Reg::X3); // write cursor
+        let no_sign = self.asm.new_label();
+        self.asm.lsr_imm(Reg::X4, Reg::X9, 63);
+        self.asm.branch(no_sign, BranchKind::CompareZero(Reg::X4));
+        self.asm.mov_imm64(Reg::X5, u64::from(b'-'));
+        self.asm.strb_post_increment(Reg::X5, Reg::X2);
+        self.asm.bind(no_sign);
+
+        let frac_only = self.asm.new_label();
+        let assembled = self.asm.new_label();
+        self.asm.cmp_reg(Reg::X6, Reg::X11);
+        self.asm
+            .branch(frac_only, BranchKind::Conditional(Cond::Le));
+
+        // D > k: the first D-k digits are the integer part.
+        self.asm.sub_reg(Reg::X7, Reg::X6, Reg::X11);
+        self.emit_copy_digit_run(Reg::X1, Reg::X2, Reg::X7);
+        self.asm.add_reg(Reg::X2, Reg::X2, Reg::X7);
+        self.asm.add_reg(Reg::X1, Reg::X1, Reg::X7);
+        self.asm.mov_imm64(Reg::X4, u64::from(b'.'));
+        self.asm.strb_post_increment(Reg::X4, Reg::X2);
+        self.emit_copy_digit_run(Reg::X1, Reg::X2, Reg::X11);
+        self.asm.add_reg(Reg::X2, Reg::X2, Reg::X11);
+        self.asm.branch(assembled, BranchKind::Unconditional);
+
+        // D <= k: no integer digit, and k-D leading zeros after the point.
+        self.asm.bind(frac_only);
+        self.asm.mov_imm64(Reg::X4, u64::from(b'0'));
+        self.asm.strb_post_increment(Reg::X4, Reg::X2);
+        self.asm.mov_imm64(Reg::X4, u64::from(b'.'));
+        self.asm.strb_post_increment(Reg::X4, Reg::X2);
+        self.asm.sub_reg(Reg::X7, Reg::X11, Reg::X6);
+        let pad_loop = self.asm.new_label();
+        let pad_done = self.asm.new_label();
+        self.asm.mov_imm64(Reg::X5, 0);
+        self.asm.bind(pad_loop);
+        self.asm.cmp_reg(Reg::X5, Reg::X7);
+        self.asm.branch(pad_done, BranchKind::Conditional(Cond::Eq));
+        self.asm.mov_imm64(Reg::X4, u64::from(b'0'));
+        self.asm.strb_reg_offset(Reg::X4, Reg::X2, Reg::X5);
+        self.asm.add_reg_imm(Reg::X5, Reg::X5, 1);
+        self.asm.branch(pad_loop, BranchKind::Unconditional);
+        self.asm.bind(pad_done);
+        self.asm.add_reg(Reg::X2, Reg::X2, Reg::X7);
+        self.emit_copy_digit_run(Reg::X1, Reg::X2, Reg::X6);
+        self.asm.add_reg(Reg::X2, Reg::X2, Reg::X6);
+
+        self.asm.bind(assembled);
+        self.asm.sub_reg(Reg::X2, Reg::X2, Reg::X3); // length
+        self.asm.mov_reg(Reg::X1, Reg::X3); // first byte
+    }
+
+    /// Copy `count` bytes from `src` to `dst` without moving either pointer;
+    /// the three assembly steps each advance their own cursor afterwards.
+    /// Clobbers x4 and x5.
+    fn emit_copy_digit_run(&mut self, src: Reg, dst: Reg, count: Reg) {
+        let loop_start = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.mov_imm64(Reg::X5, 0);
+        self.asm.bind(loop_start);
+        self.asm.cmp_reg(Reg::X5, count);
+        self.asm.branch(done, BranchKind::Conditional(Cond::Eq));
+        self.asm.ldrb_reg_offset(Reg::X4, src, Reg::X5);
+        self.asm.strb_reg_offset(Reg::X4, dst, Reg::X5);
+        self.asm.add_reg_imm(Reg::X5, Reg::X5, 1);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(done);
+    }
+
+    /// The refusal the two overflow paths share. x86-64 renders exactly the
+    /// same set of Doubles and errors on the rest, so this backend errors on
+    /// the rest too -- printing `NaN` or `inf` here where the other target
+    /// stops would be a silent disagreement between two builds of one
+    /// program, which is worse than either answer.
+    fn emit_double_format_error(&mut self) {
+        self.asm.emit_write_rodata(
+            STDERR_FD,
+            b"klassic: native Double formatting supports only whole numbers (e.g. 3.0) \
+and exact binary fractions with a short decimal expansion (e.g. 2.5); this value's \
+exact decimal expansion is too long, or it is NaN/Infinity\n",
+        );
+        self.asm.emit_exit(1);
+    }
+
+    /// The signed integer in `value`, written backwards from `cursor` (which
+    /// is decremented past each byte). Mirrors `emit_int_digits`, but over a
+    /// caller-chosen buffer rather than the stack frame.
+    fn emit_signed_digits_backwards(&mut self, value: Reg, cursor: Reg) {
+        self.asm.mov_reg(Reg::X0, value);
+        self.asm.cmp_imm(Reg::X0, 0);
+        self.asm.cset(Reg::X5, Cond::Lt);
+        let non_negative = self.asm.new_label();
+        self.asm
+            .branch(non_negative, BranchKind::Conditional(Cond::Ge));
+        self.asm.neg_x0();
+        self.asm.bind(non_negative);
+        let digit_loop = self.asm.new_label();
+        self.asm.bind(digit_loop);
+        self.asm.mov_imm64(Reg::X3, 10);
+        self.asm.sdiv_reg(Reg::X4, Reg::X0, Reg::X3);
+        self.asm.msub_reg(Reg::X2, Reg::X4, Reg::X3, Reg::X0);
+        self.asm.add_reg_imm(Reg::X2, Reg::X2, u32::from(b'0'));
+        self.asm.store_byte_pre_decrement(Reg::X2, cursor);
+        self.asm.mov_reg(Reg::X0, Reg::X4);
+        self.asm
+            .branch(digit_loop, BranchKind::CompareNonZero(Reg::X0));
+        let no_sign = self.asm.new_label();
+        self.asm.branch(no_sign, BranchKind::CompareZero(Reg::X5));
+        self.asm.mov_imm64(Reg::X3, u64::from(b'-'));
+        self.asm.store_byte_pre_decrement(Reg::X3, cursor);
+        self.asm.bind(no_sign);
+    }
+
+    /// Render the Double whose raw bits are in x0 into a 48-byte buffer on
+    /// the machine stack, leaving the first byte's address in x1 and the
+    /// length in x2. Clobbers x0-x11 and d0-d2; the caller reserves and
+    /// releases the stack space.
+    ///
+    /// The format is the evaluator's, which x86-64 also produces: a whole
+    /// number keeps one trailing decimal (`4.0`), and a fraction is written
+    /// out exactly rather than rounded, because every finite double *is* an
+    /// exact decimal -- `M / 2^k` is `M * 5^k / 10^k`.
+    ///
+    /// Three cases, in the order they are tested:
+    ///
+    /// * not a number, or too large for the exact path -- refused at run time
+    ///   rather than approximated, which is what x86-64 does with the same
+    ///   values;
+    /// * a whole number, which is the integer digits plus `.0`;
+    /// * a fraction, recovered from the bit pattern as `M1 * 5^k` scaled by
+    ///   `10^-k`, with `k` bounded so the numerator fits an i64.
+    fn emit_runtime_double_ascii(&mut self, buffer: Reg) {
+        // x9 keeps the raw bits: the FP round-trip below destroys x0, and the
+        // fraction path needs the pattern again.
+        self.asm.mov_reg(Reg::X9, Reg::X0);
+        self.asm.fmov_d_from_x(0, Reg::X0);
+        self.asm.fcvtzs_x_from_d(Reg::X0, 0);
+        self.asm.scvtf_d_from_x(1, Reg::X0);
+        self.asm.fcmp_d(0, 1);
+
+        let whole = self.asm.new_label();
+        let fraction = self.asm.new_label();
+        let special = self.asm.new_label();
+        let done = self.asm.new_label();
+
+        // An unordered compare (either side NaN) sets V, which `Vs` reads;
+        // it has to be tested before equality, since an unordered `fcmp`
+        // leaves Z set as well.
+        self.asm.branch(special, BranchKind::Conditional(Cond::Vs));
+        self.asm.branch(whole, BranchKind::Conditional(Cond::Eq));
+        self.asm.branch(fraction, BranchKind::Unconditional);
+
+        // ---- whole number: "<digits>.0" ----
+        self.asm.bind(whole);
+        self.emit_double_whole_digits(buffer);
+        self.asm.branch(done, BranchKind::Unconditional);
+
+        // ---- exact fraction ----
+        self.asm.bind(fraction);
+        self.emit_double_fraction_digits(buffer, special);
+        self.asm.branch(done, BranchKind::Unconditional);
+
+        // ---- NaN, the infinities, and anything past the exact bounds ----
+        self.asm.bind(special);
+        self.emit_double_format_error();
+        self.asm.bind(done);
+    }
+
     /// `toString` of the Bool in x0 → interned "true"/"false" object.
     fn emit_bool_to_str(&mut self) {
         let false_label = self.asm.new_label();
@@ -6623,11 +6949,8 @@ impl Emitter {
     /// x0-x5/x16.
     fn emit_print_elem(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         match elem {
-            // Rendering a Double needs the shortest-round-trip formatter this
-            // backend does not have yet; arithmetic and comparison on Doubles
-            // (including inside a list) work regardless.
             ListElem::Double => {
-                return Err(unsupported(span, "printing a Double element"));
+                self.emit_print_double();
             }
             ListElem::Enum(shape) => {
                 self.emit_print_enum_inline(shape, span)?;
@@ -6906,8 +7229,9 @@ impl Emitter {
                             };
                             self.emit_print_lowered_enum(inner, span)?;
                         }
-                        LoweredFieldRepr::Unrenderable => {
-                            return Err(unsupported(span, "printing an enum payload of this type"));
+                        LoweredFieldRepr::Double => {
+                            self.emit_unbox_scalar();
+                            self.emit_print_elem(ListElem::Double, span)?;
                         }
                     }
                 }
@@ -7016,6 +7340,7 @@ impl Emitter {
             ("toString", 1) => {
                 match self.expression(&arguments[0])? {
                     ValueType::Int => self.emit_int_to_str(),
+                    ValueType::Double => self.emit_double_to_str(),
                     ValueType::Bool => self.emit_bool_to_str(),
                     ValueType::Str => {}
                     other => {
@@ -8598,6 +8923,18 @@ impl Emitter {
                 }
                 Ok(Some(ValueType::Str))
             }
+            // The lowering wraps a Double enum payload in this so the x86-64
+            // partial evaluator turns a *literal* argument into real bits
+            // before storing it. Nothing here is folded -- a Double is always
+            // already bits in a register -- so the coercion is the identity,
+            // and only the type is worth checking.
+            ("__runtime_double", 1) => {
+                let ty = self.expression(&arguments[0])?;
+                if ty != ValueType::Double {
+                    return Err(unsupported(span, "__runtime_double of a non-Double"));
+                }
+                Ok(Some(ValueType::Double))
+            }
             // ---- numeric builtins ----
             // Doubles travel as their raw bits in a general register, so each
             // of these moves through d0 and back. `abs` is the only one that
@@ -9073,9 +9410,7 @@ impl Emitter {
                     .expect("a nested element is a list of its inner element");
                 self.emit_list_to_str(inner, "[", "]", span)?;
             }
-            // Guarded by the callers, which reject a Double element before
-            // building any text (see emit_print_elem).
-            ListElem::Double => return Err(unsupported(span, "rendering a Double element")),
+            ListElem::Double => self.emit_double_to_str(),
         }
         self.asm.mov_reg(Reg::X1, Reg::X0);
         self.asm.load_local(Reg::X0, acc);
@@ -9163,6 +9498,7 @@ impl Emitter {
                     }
                     match field_ty {
                         ValueType::Int => self.emit_int_to_str(),
+                        ValueType::Double => self.emit_double_to_str(),
                         ValueType::Bool => self.emit_bool_to_str(),
                         ValueType::Str => {}
                         ValueType::Enum(inner) => self.emit_enum_to_str(inner, span)?,
@@ -9272,11 +9608,9 @@ impl Emitter {
                             };
                             self.emit_lowered_enum_to_str(inner, span)?;
                         }
-                        LoweredFieldRepr::Unrenderable => {
-                            return Err(unsupported(
-                                span,
-                                "rendering an enum payload of this type",
-                            ));
+                        LoweredFieldRepr::Double => {
+                            self.emit_unbox_scalar();
+                            self.emit_double_to_str();
                         }
                     }
                     self.asm.mov_reg(Reg::X1, Reg::X0);
@@ -10445,6 +10779,7 @@ impl Emitter {
                     "__gc_record" | "__gc_alloc" | "__gc_string" => {
                         return Some(ValueType::Ptr);
                     }
+                    "__runtime_double" => return Some(ValueType::Double),
                     "__match_fail" => return Some(ValueType::Never),
                     "toString" | "substring" | "trim" | "toUpperCase" | "toLowerCase"
                     | "reverse" | "join" | "replaceAll" | "replace" | "repeat" | "at"
@@ -11884,6 +12219,11 @@ impl Emitter {
                 self.asm.emit_print_int_line();
                 Ok(())
             }
+            ValueType::Double => {
+                self.emit_print_double();
+                self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+                Ok(())
+            }
             ValueType::Str => {
                 self.emit_println_str();
                 Ok(())
@@ -11968,9 +12308,9 @@ impl Emitter {
                     }
                     // Everything `emit_print_elem` can already render: a
                     // lookup answers a value or nothing, and the value half is
-                    // an ordinary element. Only a Double is left out, because
-                    // this backend has no run-time formatter for one.
-                    ListElem::Enum(_)
+                    // an ordinary element.
+                    ListElem::Double
+                    | ListElem::Enum(_)
                     | ListElem::Record(_)
                     | ListElem::LoweredEnum(_)
                     | ListElem::Nested { .. } => {
@@ -11981,12 +12321,6 @@ impl Emitter {
                         self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
                         self.asm.bind(end_label);
                         return Ok(());
-                    }
-                    ListElem::Double => {
-                        return Err(unsupported(
-                            argument.span(),
-                            &format!("printing a nullable {}", elem_display_name(elem)),
-                        ));
                     }
                 }
                 self.asm.branch(end_label, BranchKind::Unconditional);
