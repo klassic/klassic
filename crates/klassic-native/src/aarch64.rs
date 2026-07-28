@@ -9956,12 +9956,10 @@ impl Emitter {
                     };
                     result = Some(match result {
                         None => arm_ty,
-                        Some(previous) => match self.merge_types(previous, arm_ty) {
-                            Some(merged) => merged,
-                            // Two arms this backend cannot reconcile is a real
-                            // disagreement, not a missing answer.
-                            None => return None,
-                        },
+                        // Two arms this backend cannot reconcile is a real
+                        // disagreement, not a missing answer, so the `?`
+                        // abandons the whole match rather than skipping one.
+                        Some(previous) => self.merge_types(previous, arm_ty)?,
                     });
                 }
                 result
