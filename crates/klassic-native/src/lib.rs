@@ -17432,7 +17432,29 @@ impl NativeCodeGenerator {
         if elements.len() >= capacity {
             return Some(elements);
         }
-        if stride == 0 || elements.len() < stride {
+        if stride == 0 {
+            return None;
+        }
+        // An empty branch has no element to copy a template from, which is why
+        // `[] else [1 2]` was refused while `[1] else []` built. It does not
+        // need one: the branch's run-time length is zero, so nothing ever
+        // reads these slots -- they exist only so both branches agree on the
+        // output's capacity. The null-list branch above fabricates the same
+        // placeholders for the same reason.
+        if elements.is_empty() {
+            return Some(
+                (0..capacity)
+                    .map(|_| {
+                        let slot = self.asm.data_label_with_i64s(&[0]);
+                        CompiledLiteralValue::Scalar {
+                            value: NativeValue::Int,
+                            slot,
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        if elements.len() < stride {
             return None;
         }
         let templates: Vec<CompiledLiteralValue> = elements[..stride].to_vec();
