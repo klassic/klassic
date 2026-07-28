@@ -4585,6 +4585,33 @@ impl Emitter {
                     }
                     return Ok(ValueType::Bool);
                 }
+                // The same holds for any other heap value: two separately
+                // built `Sm(1)`s are one value, and a nullary variant has
+                // nothing that *could* differ, so comparing the pointers
+                // called both of them unequal. `gc_deep_equal` is what x86-64
+                // has always used here.
+                // A map is a chain of two-slot entries, and its equality is
+                // insertion-ordered (`%[1: 2 3: 4] == %[3: 4 1: 2]` is false
+                // in the evaluator), so the structural walk is exactly right
+                // for one.
+                if matches!(
+                    lhs_ty,
+                    ValueType::LoweredEnum(_)
+                        | ValueType::Enum(_)
+                        | ValueType::Record(_)
+                        | ValueType::Map(..)
+                        | ValueType::Ptr
+                ) {
+                    let deep_equal = self.gc_deep_equal_label();
+                    self.asm.mov_reg(Reg::X5, Reg::X0);
+                    self.asm.mov_reg(Reg::X4, Reg::X1);
+                    self.asm.branch(deep_equal, BranchKind::Link);
+                    if op == BinaryOp::NotEqual {
+                        self.asm.cmp_imm(Reg::X0, 0);
+                        self.asm.cset(Reg::X0, Cond::Eq);
+                    }
+                    return Ok(ValueType::Bool);
+                }
                 let cond = if op == BinaryOp::Equal {
                     Cond::Eq
                 } else {
@@ -6564,6 +6591,34 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         self.asm.str_imm(Reg::X1, Reg::X0, 0); // [cell + 0] = head
     }
 
+    /// Compare the element in x0 against the one in x1 -> x0 = Bool, where
+    /// the right side is still boxed. Shared by the map builtins' scans, which
+    /// all had the same shape and all compared a heap element by address:
+    /// `Map#containsValue(%[1: Sm(1)], Sm(1))` answered false because the two
+    /// `Sm(1)`s were two allocations.
+    fn emit_elem_eq_boxed_rhs(&mut self, elem: ListElem) {
+        if elem == ListElem::Str {
+            self.emit_str_eq();
+            return;
+        }
+        let elem_ty = elem_value_type(elem);
+        if is_boxed_scalar(elem_ty) {
+            self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
+        }
+        if matches!(
+            elem_ty,
+            ValueType::LoweredEnum(_) | ValueType::Enum(_) | ValueType::Record(_) | ValueType::Ptr
+        ) {
+            let deep_equal = self.gc_deep_equal_label();
+            self.asm.mov_reg(Reg::X5, Reg::X0);
+            self.asm.mov_reg(Reg::X4, Reg::X1);
+            self.asm.branch(deep_equal, BranchKind::Link);
+            return;
+        }
+        self.asm.cmp_reg(Reg::X0, Reg::X1);
+        self.asm.cset(Reg::X0, Cond::Eq);
+    }
+
     /// Get/create the lazily-emitted membership-scan routine label for
     /// an element type. Both the routines take `x0` = list head and
     /// `x1` = candidate and return a Bool in `x0`.
@@ -8056,16 +8111,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     self.emit_unbox_scalar();
                 }
                 self.asm.load_local(Reg::X1, key_slot);
-                match key_elem {
-                    ListElem::Str => self.emit_str_eq(),
-                    _ => {
-                        if is_boxed_scalar(elem_value_type(key_elem)) {
-                            self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
-                        }
-                        self.asm.cmp_reg(Reg::X0, Reg::X1);
-                        self.asm.cset(Reg::X0, Cond::Eq);
-                    }
-                }
+                self.emit_elem_eq_boxed_rhs(key_elem);
                 self.asm.branch(keep, BranchKind::CompareZero(Reg::X0));
                 self.pop_rooted(Reg::X1); // the old entry, replaced
                 self.asm.mov_imm64(Reg::X0, 1);
@@ -8143,16 +8189,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     self.emit_unbox_scalar();
                 }
                 self.asm.load_local(Reg::X1, wanted);
-                match value_elem {
-                    ListElem::Str => self.emit_str_eq(),
-                    _ => {
-                        if is_boxed_scalar(elem_value_type(value_elem)) {
-                            self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
-                        }
-                        self.asm.cmp_reg(Reg::X0, Reg::X1);
-                        self.asm.cset(Reg::X0, Cond::Eq);
-                    }
-                }
+                self.emit_elem_eq_boxed_rhs(value_elem);
                 self.asm.branch(found, BranchKind::CompareNonZero(Reg::X0));
                 self.asm.load_local(Reg::X0, cursor);
                 self.emit_gc_load_ptr(Reg::X0, 8);
@@ -8219,16 +8256,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     self.emit_unbox_scalar();
                 }
                 self.asm.load_local(Reg::X1, key_slot);
-                match key_elem {
-                    ListElem::Str => self.emit_str_eq(),
-                    _ => {
-                        if is_boxed_scalar(elem_value_type(key_elem)) {
-                            self.asm.ldr_imm(Reg::X1, Reg::X1, 0);
-                        }
-                        self.asm.cmp_reg(Reg::X0, Reg::X1);
-                        self.asm.cset(Reg::X0, Cond::Eq);
-                    }
-                }
+                self.emit_elem_eq_boxed_rhs(key_elem);
                 self.asm.branch(keep, BranchKind::CompareZero(Reg::X0));
                 self.pop_rooted(Reg::X1); // the matching entry, dropped
                 self.asm.branch(next, BranchKind::Unconditional);
@@ -10200,6 +10228,16 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             // element type existed. The recursion is at codegen time and
             // terminates because the depth decreases.
             self.emit_list_eq(inner, span)?;
+        } else if matches!(
+            elem_ty,
+            ValueType::LoweredEnum(_) | ValueType::Enum(_) | ValueType::Record(_) | ValueType::Ptr
+        ) {
+            // A heap element compares by contents, for the same reason a
+            // nested list does: two separately built `Sm(1)`s are one value.
+            let deep_equal = self.gc_deep_equal_label();
+            self.asm.mov_reg(Reg::X5, Reg::X0);
+            self.asm.mov_reg(Reg::X4, Reg::X1);
+            self.asm.branch(deep_equal, BranchKind::Link);
         } else {
             self.asm.cmp_reg(Reg::X0, Reg::X1);
             self.asm.cset(Reg::X0, Cond::Eq);

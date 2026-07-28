@@ -48,6 +48,23 @@ println(toString([Sm(7) Nn]))
 println(size([Sm(1) Nn Sm(2)]))
 println(isEmpty([Nn]))
 
+// Equality on a heap value compares contents, not addresses -- two separately
+// built `Sm(1)`s are one value, and a nullary variant has nothing that *could*
+// differ. aarch64 compared the pointers and answered false for both.
+println(Sm(1) == Sm(1))
+println(Sm(1) == Sm(2))
+println(Nn == Nn)
+println(Nn == Sm(1))
+println(Sm(1) != Sm(2))
+println(Word("a") == Word("a"))
+println([Sm(1) Nn] == [Sm(1) Nn])
+println([Sm(1)] == [Sm(2)])
+println(Map#containsValue(%[1: Sm(1)], Sm(1)))
+println(Map#containsValue(%[1: Sm(1)], Sm(2)))
+// A map's equality is insertion-ordered, which the structural walk gives.
+println(%[1: 2] == %[1: 2])
+println(%[1: 2 3: 4] == %[3: 4 1: 2])
+
 // The same list bound to a `val` rather than written inline. These took a
 // different path on x86-64 -- the static-literal one, which refused it -- and
 // then a different renderer, which printed the elements' addresses. Reading an

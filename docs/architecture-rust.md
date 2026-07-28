@@ -2266,6 +2266,14 @@ side of a branch.
   and aarch64 through a third membership scan beside the scalar and string
   ones. A `RuntimeDouble` had the same hole and compares by bit pattern plus
   the `0.0 == -0.0` case the evaluator dedups (issue #670).
+- aarch64's `==` compares a heap value's contents. It compared the pointers,
+  so two separately built `Sm(1)`s were unequal -- and so were two `Nn`s, which
+  carry nothing that could differ. x86-64 had always used `gc_deep_equal` here;
+  aarch64 now does too, in the operator itself, in `emit_list_eq`'s element
+  comparison, and in the map builtins' scans (which shared one shape and are a
+  single helper now). A map joins the same path: its chain of two-slot entries
+  compares structurally, and its equality is insertion-ordered, which is what
+  the walk gives (issue #672).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
