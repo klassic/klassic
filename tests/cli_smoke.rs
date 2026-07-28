@@ -29568,3 +29568,58 @@ fn native_bare_map_builtins_match_the_evaluator(target: Option<&str>) {
         let _ = fs::remove_file(&bin_path);
     }
 }
+
+/// A `match` whose arms build lists of different lengths must take the
+/// *maximum* over the arms that can return, not merely agree to disagree.
+/// An earlier attempt forced a dynamic length without fixing the capacity,
+/// and the widest arm then printed a truncated list -- compiled, exit zero,
+/// wrong. This asserts every arm, so that failure mode cannot come back
+/// disguised as a build that merely succeeds.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_match_arms_of_different_list_lengths_keep_every_arm() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_match_widths_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_match_widths_{stamp}.bin"));
+    let program = "enum Step { case One; case Two; case Three; case Four }\n\
+         def widths(s: Step): List<Int> = s match {\n\
+           case One => [1]\n\
+           case Two => []\n\
+           case Three => [1 2]\n\
+           case Four => [1 2 3]\n\
+         }\n\
+         println(widths(One))\n\
+         println(widths(Two))\n\
+         println(widths(Three))\n\
+         println(widths(Four))\n";
+    fs::write(&source_path, program).expect("temp source file should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "match-arm build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("generated executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(run.status.success(), "match-arm run should succeed");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "[1]\n[]\n[1, 2]\n[1, 2, 3]\n",
+        "every arm must come out whole, the widest one included"
+    );
+}

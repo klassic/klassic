@@ -30090,9 +30090,23 @@ impl NativeCodeGenerator {
                 else_branch: Some(else_branch),
                 ..
             } => {
-                let then = self.expr_static_list_length_hint(then_branch)?;
-                let other = self.expr_static_list_length_hint(else_branch)?;
-                Some(then.max(other))
+                // A branch that never returns contributes no length, so it
+                // must not turn the answer into "unknown". The enum lowering
+                // ends every `match` in `__match_fail()`, so without this the
+                // innermost `if` of a lowered match had no hint, the join
+                // above it took a static length from one side, and copying the
+                // other side in was refused for disagreeing with it -- which
+                // is why a `match` with an empty arm did not build while the
+                // same shape written as an `if` did.
+                let then = (!Self::expr_always_diverges(then_branch))
+                    .then(|| self.expr_static_list_length_hint(then_branch));
+                let other = (!Self::expr_always_diverges(else_branch))
+                    .then(|| self.expr_static_list_length_hint(else_branch));
+                match (then, other) {
+                    (Some(then), Some(other)) => Some(then?.max(other?)),
+                    (Some(only), None) | (None, Some(only)) => only,
+                    (None, None) => None,
+                }
             }
             Expr::Call {
                 callee, arguments, ..
