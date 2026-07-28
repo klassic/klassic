@@ -29681,3 +29681,62 @@ fn native_set_removes_duplicate_enum_values() {
         let _ = fs::remove_file(&bin_path);
     }
 }
+
+/// `==` on a heap value compares contents, not addresses: two separately
+/// built `Sm(1)`s are one value, and two `Nn`s carry nothing that *could*
+/// differ. The same comparison backs list equality and the map scans, so all
+/// three are asserted.
+///
+/// This covers x86-64 only. aarch64 had the bug and building its image here
+/// would prove nothing -- a wrong comparison builds perfectly well -- so its
+/// half is checked by `tests/cross-exec/47-enum-collection-elements.kl`,
+/// which the macOS job *runs* on real hardware. Confirmed that fixture goes
+/// red when the aarch64 fix is reverted.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_equality_on_heap_values_compares_contents() {
+    let program = "enum Opt { case Sm(v: Int); case Nn }\n\
+         record P { a: Int; b: Int }\n\
+         println(Sm(1) == Sm(1))\n\
+         println(Sm(1) == Sm(2))\n\
+         println(Nn == Nn)\n\
+         println(Nn == Sm(1))\n\
+         println(#P(1, 2) == #P(1, 2))\n\
+         println([Sm(1) Nn] == [Sm(1) Nn])\n\
+         println(Map#containsValue(%[1: Sm(1)], Sm(1)))\n\
+         println(%[1: 2] == %[1: 2])\n\
+         println(%[1: 2 3: 4] == %[3: 4 1: 2])\n";
+    let expected = "true\nfalse\ntrue\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\n";
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_heap_eq_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_heap_eq_{stamp}.bin"));
+    fs::write(&source_path, program).expect("temp source file should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "heap-equality build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("generated executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected,
+        "two separately built values of the same shape are one value"
+    );
+}
