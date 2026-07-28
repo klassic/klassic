@@ -3807,6 +3807,20 @@ impl Emitter {
                 {
                     return self.expression(value);
                 }
+                // Three map builtins have no free-standing form in the
+                // language: the evaluator rejects `get(m, k)` as an undefined
+                // variable, and only `Map#get(m, k)` and `m.get(k)` exist.
+                // The method form reaches `builtin_call` with the same bare
+                // name, so the two are told apart here -- by the callee being
+                // a plain identifier -- rather than inside the dispatch.
+                if matches!(name.as_str(), "get" | "containsKey" | "containsValue")
+                    && !self.function_exists(name, arguments.len())
+                {
+                    return Err(Diagnostic::compile(
+                        *span,
+                        format!("undefined variable `{name}`"),
+                    ));
+                }
                 // Builtins first, mirroring the C backend's dispatch.
                 if let Some(ty) = self.builtin_call(name, arguments, *span)? {
                     return Ok(ty);

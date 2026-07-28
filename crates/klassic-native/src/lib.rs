@@ -8003,11 +8003,36 @@ impl NativeCodeGenerator {
         Ok(NativeValue::Bool)
     }
 
+    /// A call as the program wrote it.
     fn compile_call(
         &mut self,
         callee: &Expr,
         arguments: &[Expr],
         span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.compile_call_with_origin(callee, arguments, span, CallOrigin::Source)
+    }
+
+    /// A call this backend built while lowering something else -- a method
+    /// call rewritten to `helper(receiver, args...)`, a stream callback, the
+    /// `getOrElse` conditional. These are allowed to name builtins the
+    /// language has no free-standing spelling for, which is exactly what
+    /// `CallOrigin` separates.
+    fn compile_lowered_call(
+        &mut self,
+        callee: &Expr,
+        arguments: &[Expr],
+        span: Span,
+    ) -> Result<NativeValue, Diagnostic> {
+        self.compile_call_with_origin(callee, arguments, span, CallOrigin::Lowering)
+    }
+
+    fn compile_call_with_origin(
+        &mut self,
+        callee: &Expr,
+        arguments: &[Expr],
+        span: Span,
+        origin: CallOrigin,
     ) -> Result<NativeValue, Diagnostic> {
         if let Expr::If {
             condition,
@@ -8318,6 +8343,24 @@ impl NativeCodeGenerator {
             )
         {
             return self.compile_native_callable_value_call(slot.value, arguments, span);
+        }
+        // Three map builtins have no free-standing form in the language: the
+        // evaluator rejects `get(m, k)` as an undefined variable, and only
+        // `Map#get(m, k)` and `m.get(k)` exist. Codegen reached them by the
+        // bare name anyway, so the backend compiled programs the language
+        // refuses -- the one place measured where it is *more* permissive than
+        // its own oracle. The lowered method call spells them the same way, so
+        // where the call came from is what tells the two apart.
+        if origin == CallOrigin::Source
+            && matches!(
+                callee_name.as_str(),
+                "get" | "containsKey" | "containsValue"
+            )
+        {
+            return Err(Diagnostic::compile(
+                span,
+                format!("undefined variable `{callee_name}`"),
+            ));
         }
         let name = self.builtin_name_for_identifier(callee_name);
         match name.as_str() {
@@ -15678,7 +15721,7 @@ impl NativeCodeGenerator {
                 .cloned()
                 .ok_or_else(|| unsupported(span, "native static builtin method"))?;
             let callee = Expr::Identifier { name, span };
-            return self.compile_call(&callee, arguments, span);
+            return self.compile_lowered_call(&callee, arguments, span);
         }
         // Receiver-type-aware dispatch for an extension method whose name
         // is ambiguous (declared on more than one type, so the pre-codegen
@@ -15822,7 +15865,7 @@ impl NativeCodeGenerator {
             name: helper_name.to_string(),
             span,
         };
-        self.compile_call(&callee, &lowered, span)
+        self.compile_lowered_call(&callee, &lowered, span)
     }
 
     /// Lower `m.getOrElse(k, d)` to a temp-bound conditional that reuses the
@@ -16349,7 +16392,7 @@ impl NativeCodeGenerator {
         let mut lowered = Vec::with_capacity(arguments.len() + 1);
         lowered.push(target.clone());
         lowered.extend(arguments.iter().cloned());
-        Ok(Some(self.compile_call(&callee, &lowered, span)?))
+        Ok(Some(self.compile_lowered_call(&callee, &lowered, span)?))
     }
 
     fn compile_static_lambda_method_call(
@@ -42375,6 +42418,15 @@ fn native_feature_name(expr: &Expr) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TextLabel(usize);
+
+/// Whether a call is what the program wrote or one this backend synthesized
+/// while lowering something else. Only the first is held to the language's
+/// spelling: a lowering may name a builtin that has no free-standing form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallOrigin {
+    Source,
+    Lowering,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct DataLabel(usize);
