@@ -2098,6 +2098,14 @@ side of a branch.
   - A unit-typed binding is allowed. `val t = thread(...)` is how a thread is
     written even when the handle is unused, and since #631 an assignment is
     unit-typed too (issue #637).
+- A runtime error raised inside an inlined stdlib function no longer names a
+  line the user's file does not have. Such a module is parsed against its own
+  source, so its spans are offsets into *that* file; subtracting the prelude
+  offset from one landed past the end of the user's text and was still
+  reported as a position in it -- `program.kl:9:1` for an eight-line program.
+  A position outside the text is not a position in it, so the report falls
+  back to the bundle. A failure in the user's own code keeps its exact
+  position, which two tests pin (issue #636).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

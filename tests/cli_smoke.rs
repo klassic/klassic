@@ -281,6 +281,95 @@ fn native_compares_a_string_with_null() {
     );
 }
 
+/// A runtime error raised inside a stdlib function must not name a line the
+/// user's file does not have. An inlined module was parsed against its own
+/// source, so its spans are offsets into *that* file; mapping one into the
+/// user's view produced `program.kl:9:1` for an eight-line program.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_runtime_error_in_stdlib_does_not_invent_a_user_line() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after the epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("klassic-stdlib-span-{stamp}"));
+    fs::create_dir_all(&dir).expect("temp dir should be creatable");
+    let source_path = dir.join("program.kl");
+    let bin_path = dir.join("program");
+    let source =
+        "import std.list\n\nval a = 1\nval b = 2\nval c = 3\n\nprintln(at([1, 2, 3], 10))\n";
+    let line_count = source.lines().count();
+    fs::write(&source_path, source).expect("source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "the program should build\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("program should run");
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        stderr.contains("head expects a non-empty list"),
+        "the failure should still be reported: {stderr}"
+    );
+    for line in 1..=line_count + 3 {
+        let invented = format!("program.kl:{}:", line_count + line);
+        assert!(
+            !stderr.contains(&invented),
+            "reported a line the file does not have ({invented}): {stderr}"
+        );
+    }
+}
+
+/// The same failure raised by the user's own code keeps its exact position.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_runtime_error_in_user_code_keeps_its_position() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after the epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("klassic-user-span-{stamp}"));
+    fs::create_dir_all(&dir).expect("temp dir should be creatable");
+    let source_path = dir.join("program.kl");
+    let bin_path = dir.join("program");
+    fs::write(&source_path, "val a = 1\nval b = 2\nprintln(head([]))\n")
+        .expect("source should be writable");
+
+    let build = Command::new(klassic_bin())
+        .args([
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(build.status.success());
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("program should run");
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        stderr.contains("program.kl:3:9: head expects a non-empty list"),
+        "stderr:\n{stderr}"
+    );
+}
+
 /// std.option / std.result richer API via method-style dispatch. The
 /// clean names are restored now that native module namespacing (#449)
 /// makes the free names safe and receiver-type dispatch picks the right

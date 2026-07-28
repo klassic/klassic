@@ -37184,8 +37184,16 @@ impl NativeCodeGenerator {
             && span.start >= view.prelude_byte_offset
         {
             let user_start = span.start - view.prelude_byte_offset;
-            let (line, column) = view.source.line_col(user_start);
-            return format!("{}:{line}:{column}: ", view.source.name());
+            // An inlined stdlib module was parsed against its own source, so
+            // its spans are offsets into *that* file. Subtracting the prelude
+            // offset from one lands somewhere arbitrary, and past the end of
+            // the user's text it named a line the program does not have --
+            // `r8.kl:9:1` for an eight-line file. A position outside the text
+            // is not a position in it.
+            if user_start < view.source.text().len() {
+                let (line, column) = view.source.line_col(user_start);
+                return format!("{}:{line}:{column}: ", view.source.name());
+            }
         }
         let (line, column) = self.source.line_col(span.start);
         format!("{}:{line}:{column}: ", self.source.name())
