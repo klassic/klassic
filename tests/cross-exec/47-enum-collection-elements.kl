@@ -20,8 +20,16 @@ enum Colour { case Red; case Green; case Blue }
 // ones are only reachable through their cells.
 println([Sm(1) Nn Sm(2) Sm(3) Nn])
 
-// The same values as a set and as a map's values.
+// The same values as a set and as a map's values. A set removes duplicates by
+// comparing what its elements *are*, not where they live: two separately built
+// `Sm(1)`s are one value, and answering "different" for every heap element --
+// which is what a slot comparison did before it knew about them -- let a set
+// keep both.
 println(%(Sm(5) Nn Sm(6)))
+println(%(Sm(1) Sm(1) Nn))
+println(%(Sm(1) Sm(2) Sm(1)))
+println(%(Red Red Green Red))
+println(%(Word("a") Word("a") Comma))
 println(%["a": Sm(10) "b": Nn])
 
 // A payload that is itself a heap value, so the element's own field has to

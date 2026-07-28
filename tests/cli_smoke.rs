@@ -29623,3 +29623,61 @@ fn native_match_arms_of_different_list_lengths_keep_every_arm() {
         "every arm must come out whole, the widest one included"
     );
 }
+
+/// A set removes duplicates by comparing what its elements *are*. Two
+/// separately built `Sm(1)`s are one value; the slot comparison answered
+/// "different" for every heap element, so a set kept both -- compiled, exit
+/// zero, wrong. Both hand-emitted backends had it and both compare with
+/// `gc_deep_equal` now, so both are asserted here.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_set_removes_duplicate_enum_values() {
+    let program = "enum Opt { case Sm(v: Int); case Nn }\n\
+         enum T { case W(s: String); case E }\n\
+         println(%(Sm(1) Sm(1) Nn))\n\
+         println(%(Sm(1) Sm(2) Sm(1)))\n\
+         println(%(Nn Sm(1) Nn))\n\
+         println(%(W(\"a\") W(\"a\") E))\n";
+    let expected = "%(Sm(1), Nn)\n%(Sm(1), Sm(2))\n%(Nn, Sm(1))\n%(W(a), E)\n";
+    for target in [None, Some("aarch64-apple-darwin")] {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let source_path = dir.join(format!("klassic_set_dedup_{stamp}.kl"));
+        let bin_path = dir.join(format!("klassic_set_dedup_{stamp}.bin"));
+        fs::write(&source_path, program).expect("temp source file should write");
+        let mut command = Command::new(klassic_bin());
+        if let Some(target) = target {
+            command.args(["--target", target]);
+        }
+        let build = command
+            .args([
+                "build",
+                source_path.to_str().expect("path should be utf-8"),
+                "-o",
+                bin_path.to_str().expect("path should be utf-8"),
+            ])
+            .output()
+            .expect("binary should run");
+        assert!(
+            build.status.success(),
+            "set-dedup build should succeed for {target:?}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        // The aarch64 image is only built here; the host cannot run it.
+        if target.is_none() {
+            let run = Command::new(&bin_path)
+                .output()
+                .expect("generated executable should run");
+            assert_eq!(
+                String::from_utf8_lossy(&run.stdout),
+                expected,
+                "a set must keep one of each value"
+            );
+        }
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&bin_path);
+    }
+}
