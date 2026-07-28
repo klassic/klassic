@@ -2291,7 +2291,7 @@ impl TypeChecker {
                 condition,
                 then_branch,
                 else_branch,
-                span,
+                ..
             } => {
                 let condition_type = self.infer_expr(condition)?;
                 self.unify(Type::Bool, condition_type, condition.span())?;
