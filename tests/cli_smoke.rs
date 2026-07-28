@@ -21286,8 +21286,12 @@ fn native_build_survives_enum_allocation_churn_across_collections() {
 }
 
 /// A churn program that outlives the 1 MiB initial heap, used by the
-/// `--gc-log` / `--gc-stress` tests below.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// `--gc-log` / `--gc-stress` tests below and by the Windows one above --
+/// both x86-64 targets share the collector.
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    target_arch = "x86_64"
+))]
 const GC_CHURN_PROGRAM: &str = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
      mutable i = 0\n\
      mutable acc = 0\n\
