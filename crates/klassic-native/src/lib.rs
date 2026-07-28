@@ -12261,7 +12261,16 @@ impl NativeCodeGenerator {
     }
 
     fn compiled_literal_value_from_native(&mut self, value: NativeValue) -> CompiledLiteralValue {
-        if matches!(value, NativeValue::Int | NativeValue::Bool) {
+        // A `Native` element carries no storage -- it means "the value is in
+        // Rax", which stops being true as soon as the next element compiles.
+        // Anything that lives in Rax therefore has to be spilled here. A
+        // `RuntimeDouble` is its raw bits in Rax exactly like an `Int`, and
+        // leaving it out made `[aDouble]` render from a long-dead Rax: the
+        // list printed `[null]`, compiled clean and exited zero.
+        if matches!(
+            value,
+            NativeValue::Int | NativeValue::Bool | NativeValue::RuntimeDouble
+        ) {
             let slot = self.asm.data_label_with_i64s(&[0]);
             self.emit_store_rax_to_data_slot(slot);
             CompiledLiteralValue::Scalar { value, slot }
@@ -13469,6 +13478,17 @@ impl NativeCodeGenerator {
                         span,
                         overflow_message,
                     ),
+                    // The slot holds a Double's raw bits, which is what the
+                    // decimal formatter reads out of Rax. Without this arm a
+                    // list of Doubles printed as `[null, null]` -- a compiled,
+                    // zero-exit, wrong answer.
+                    NativeValue::RuntimeDouble => self
+                        .emit_append_whole_runtime_double_to_runtime_buffer_offset_label(
+                            data,
+                            offset,
+                            span,
+                            overflow_message,
+                        ),
                     _ => self.emit_append_text_to_runtime_buffer(
                         data,
                         offset,
@@ -13723,6 +13743,13 @@ impl NativeCodeGenerator {
             }
             "abs" => {
                 let value = self.compile_expr(&arguments[0])?;
+                // A Double's magnitude is the same bits with the sign cleared,
+                // which needs no SSE and no branch.
+                if value == NativeValue::RuntimeDouble {
+                    self.asm.mov_imm64(Reg::Rbx, 0x7fff_ffff_ffff_ffff);
+                    self.asm.and_reg_reg(Reg::Rax, Reg::Rbx);
+                    return Ok(NativeValue::RuntimeDouble);
+                }
                 if value != NativeValue::Int {
                     return Err(unsupported(span, "native abs for non-Int"));
                 }
@@ -13740,6 +13767,36 @@ impl NativeCodeGenerator {
                 self.asm.bind_text_label(ok);
                 self.asm.bind_text_label(done);
                 Ok(NativeValue::Int)
+            }
+            // The Double-valued helpers, for a value only known at run time.
+            // A `RuntimeDouble` is its raw bits in Rax, so each of these is a
+            // trip through Xmm0 and back -- except `abs`, which only has to
+            // clear the sign bit and can stay in the GPR.
+            "double" => {
+                let value = self.compile_expr(&arguments[0])?;
+                match value {
+                    NativeValue::Int => {
+                        self.asm.cvtsi2sd(XmmReg::Xmm0, Reg::Rax);
+                        self.asm.movq_gpr_from_xmm(Reg::Rax, XmmReg::Xmm0);
+                        Ok(NativeValue::RuntimeDouble)
+                    }
+                    NativeValue::RuntimeDouble => Ok(NativeValue::RuntimeDouble),
+                    _ => Err(unsupported(span, "native double of this value type")),
+                }
+            }
+            // The evaluator's `sqrt` is Double-valued for an Int argument too.
+            "sqrt" => {
+                let value = self.compile_expr(&arguments[0])?;
+                match value {
+                    NativeValue::Int => self.asm.cvtsi2sd(XmmReg::Xmm0, Reg::Rax),
+                    NativeValue::RuntimeDouble => {
+                        self.asm.movq_xmm_from_gpr(XmmReg::Xmm0, Reg::Rax)
+                    }
+                    _ => return Err(unsupported(span, "native sqrt of this value type")),
+                }
+                self.asm.sqrtsd(XmmReg::Xmm0, XmmReg::Xmm0);
+                self.asm.movq_gpr_from_xmm(Reg::Rax, XmmReg::Xmm0);
+                Ok(NativeValue::RuntimeDouble)
             }
             _ => Err(unsupported(
                 span,
@@ -26913,6 +26970,17 @@ impl NativeCodeGenerator {
                         span,
                         overflow_message,
                     ),
+                    // The slot holds a Double's raw bits, which is what the
+                    // decimal formatter reads out of Rax. Without this arm a
+                    // list of Doubles printed as `[null, null]` -- a compiled,
+                    // zero-exit, wrong answer.
+                    NativeValue::RuntimeDouble => self
+                        .emit_append_whole_runtime_double_to_runtime_buffer_offset_label(
+                            data,
+                            offset,
+                            span,
+                            overflow_message,
+                        ),
                     _ => self.emit_append_text_to_runtime_buffer(
                         data,
                         offset,
@@ -26956,6 +27024,17 @@ impl NativeCodeGenerator {
                 span,
                 overflow_message,
             ),
+            // Reads Rax, on the same terms as the `Int` arm above: a value
+            // that lives only in Rax is spilled to a slot before it can be
+            // rendered later (see `compiled_literal_value_from_native`), so
+            // reaching here means Rax is still the value.
+            NativeValue::RuntimeDouble => self
+                .emit_append_whole_runtime_double_to_runtime_buffer_offset_label(
+                    data,
+                    offset,
+                    span,
+                    overflow_message,
+                ),
             NativeValue::RuntimeLinesList { data: lines, len } => {
                 let rendered = self.emit_runtime_lines_list_to_runtime_string(
                     NativeStringRef {
@@ -42678,6 +42757,13 @@ impl Assembler {
         self.byte(0x66);
         self.bytes(&[0x0f, 0x2e]);
         self.modrm(lhs as u8, rhs as u8);
+    }
+
+    /// `SQRTSD xmm1, xmm2` (F2 0F 51 /r): `dst = sqrt(src)`.
+    fn sqrtsd(&mut self, dst: XmmReg, src: XmmReg) {
+        self.byte(0xf2);
+        self.bytes(&[0x0f, 0x51]);
+        self.modrm(dst as u8, src as u8);
     }
 
     /// `ADDSD xmm1, xmm2` (F2 0F 58 /r): `dst = dst + src`.
