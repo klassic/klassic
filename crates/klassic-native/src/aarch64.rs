@@ -3723,6 +3723,16 @@ impl Emitter {
                     let index = self.intern_lambda(params.clone(), body.as_ref().clone());
                     return self.emit_inline_lambda_call(index, arguments, *span);
                 }
+                // `outer(2)(3)` where `outer` is a lambda returning a
+                // lambda: bind the inner one the way a `val` would, then
+                // apply it. The binding path already knows how to carry the
+                // captures (`returned_lambda_binding`); this is the same
+                // thing without a name in between.
+                if let Expr::Call { .. } = callee.as_ref()
+                    && let Some(index) = self.returned_lambda_binding(callee)?
+                {
+                    return self.emit_inline_lambda_call(index, arguments, *span);
+                }
                 let Expr::Identifier { name, .. } = callee.as_ref() else {
                     return Err(unsupported(*span, "calling a non-identifier"));
                 };
@@ -11031,7 +11041,22 @@ impl Emitter {
                 .flatten()
                 .map(|(name, fields)| (name.clone(), fields.clone()))
                 .collect(),
-            values: Vec::new(),
+            // The frame slots in scope, so a lambda that closes over one can
+            // read it where it is finally compiled. A lambda has no runtime
+            // representation here -- its body is compiled at the call site --
+            // so without this a predicate like `(y) => y == x` lost the `x` it
+            // was written against, which is the shape of every caller-supplied
+            // bound (`std.list`'s `contains` is one).
+            //
+            // Outer scopes first so an inner binding of the same name wins
+            // when the environment is installed in order, matching the two
+            // above.
+            values: self
+                .scopes
+                .iter()
+                .flatten()
+                .map(|(name, (offset, ty))| (name.clone(), *offset, *ty))
+                .collect(),
         };
         self.lambdas.push((params, body));
         self.lambda_envs.push(env);
@@ -11052,6 +11077,40 @@ impl Emitter {
         let Expr::Identifier { name, .. } = callee.as_ref() else {
             return Ok(None);
         };
+        // `val outer = (x) => (y) => x + y; val inner = outer(2)`: the
+        // producer is itself a lambda, so there is no definition to look up.
+        // Its parameters become the captures, exactly as for a def below.
+        if let Some(index) = self.lookup_lambda(name) {
+            let (lambda_params, lambda_body) = self.lambdas[index].clone();
+            if lambda_params.len() != arguments.len() {
+                return Ok(None);
+            }
+            let Expr::Lambda {
+                params: inner_params,
+                body: inner_body,
+                ..
+            } = &lambda_body
+            else {
+                return Ok(None);
+            };
+            let inner_params = inner_params.clone();
+            let inner_body = inner_body.as_ref().clone();
+            let mut captured = Vec::with_capacity(arguments.len());
+            for (param, argument) in lambda_params.iter().zip(arguments) {
+                let ty = self.expression(argument)?;
+                let slot = self.reserve_locals(8);
+                self.asm.store_local(Reg::X0, slot);
+                if is_heap_pointer(ty) {
+                    self.emit_root_frame_slot(slot);
+                }
+                captured.push((param.clone(), slot, ty));
+            }
+            return Ok(Some(self.intern_lambda_capturing(
+                inner_params,
+                inner_body,
+                captured,
+            )));
+        }
         // A def whose return type this backend cannot model -- `(Int) => Int`
         // is one -- is kept whole as a generic function and specialised per
         // call, so that is where a lambda-returning def lives.

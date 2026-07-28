@@ -10,27 +10,27 @@ module std.map
 // returns a fresh map and never mutates the input.
 
 // mapValues — apply f to every value, keeping keys and order.
-def mapValues(m, f) =
+def mapValues(m: Map<'k, 'v>, f: ('v) => 'w): Map<'k, 'w> =
   foldLeft(Map#keys(m))(Map#empty())((acc, k) => Map#put(acc, k, f(Map#get(m, k))))
 
 // filterValues — keep only entries whose value satisfies p.
-def filterValues(m, p) =
+def filterValues(m: Map<'k, 'v>, p: ('v) => Boolean): Map<'k, 'v> =
   foldLeft(Map#keys(m))(Map#empty())((acc, k) =>
     if(p(Map#get(m, k))) Map#put(acc, k, Map#get(m, k)) else acc)
 
 // filterKeys — keep only entries whose key satisfies p.
-def filterKeys(m, p) =
+def filterKeys(m: Map<'k, 'v>, p: ('k) => Boolean): Map<'k, 'v> =
   foldLeft(Map#keys(m))(Map#empty())((acc, k) =>
     if(p(k)) Map#put(acc, k, Map#get(m, k)) else acc)
 
 // merge — overlay other on top of m; other's entries win on key clash.
-def merge(m, other) =
+def merge(m: Map<'k, 'v>, other: Map<'k, 'v>): Map<'k, 'v> =
   foldLeft(Map#keys(other))(m)((acc, k) => Map#put(acc, k, Map#get(other, k)))
 
 // Reverse a list using only the global `cons` / `foldLeft` builtins
 // (so std.map stays import-free). Used to undo the prepend order of
 // the fold-builders below, keeping insertion order.
-def mapReverse(xs) = foldLeft(xs)([])((acc, x) => cons(x)(acc))
+def mapReverse(xs: List<'a>): List<'a> = foldLeft(xs)([])((acc, x) => cons(x)(acc))
 
 // An entry as a value with named halves. It used to be a two-element
 // list, which read badly (`head(tail(pair))`) and typed worse: a list
@@ -51,10 +51,10 @@ def entries(m) = toPairs(m)
 // foldMap — fold over all entries of a map.
 // f takes (acc, key, value) as three separate arguments.
 // Also exported as `fold` for ergonomics.
-def foldMap(m, init, f) =
+def foldMap(m: Map<'k, 'v>, init: 'b, f: ('b, 'k, 'v) => 'b): 'b =
   foldLeft(Map#keys(m))(init)((acc, k) => f(acc, k, Map#get(m, k)))
 
-def fold(m, init, f) = foldMap(m, init, f)
+def fold(m: Map<'k, 'v>, init: 'b, f: ('b, 'k, 'v) => 'b): 'b = foldMap(m, init, f)
 
 // mapKeys — apply g to every key, keeping values.
 // If g produces duplicate keys the later key wins (insertion order of keys).

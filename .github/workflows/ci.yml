@@ -159,6 +159,33 @@ jobs:
             fi
             echo "  linux: build + run matches the evaluator"
 
+            # The same program again with a collection forced before every
+            # allocation, and with heap pointers poisoned so an unbarriered
+            # dereference faults. A mis-rooted pointer only shows up when a
+            # collection fires at the wrong moment, which is exactly what
+            # this manufactures -- and these fixtures are where the newest
+            # work lands, so they are the most likely to have a fresh
+            # rooting mistake. The evaluator's output is the oracle here,
+            # the same as above.
+            if ! "$bin" --gc-stress --gc-poison --target x86_64-unknown-linux-gnu \
+                 build "$src" -o "/tmp/$name.stress"; then
+              echo "FAIL: Linux --gc-stress build failed for $name"
+              status=1
+              continue
+            fi
+            chmod +x "/tmp/$name.stress"
+            if ! (cd /tmp && "/tmp/$name.stress" >"/tmp/$name.stress.out"); then
+              echo "FAIL: Linux --gc-stress run failed for $name"
+              status=1
+              continue
+            fi
+            if ! diff -u "cross-exec-out/windows/$name.expected" "/tmp/$name.stress.out"; then
+              echo "FAIL: --gc-stress output mismatch for $name"
+              status=1
+              continue
+            fi
+            echo "  linux: --gc-stress --gc-poison matches too"
+
             # Windows: full OS-builtin coverage, so every program here
             # is required to cross-build.
             if ! "$bin" --target x86_64-pc-windows-msvc build "$src" -o "cross-exec-out/windows/$name.exe"; then

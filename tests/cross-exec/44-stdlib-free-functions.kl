@@ -1,0 +1,78 @@
+// Cross-target fixture: the free functions of std.list, std.string and
+// std.map, which were the last of the nine unannotated modules.
+//
+// The extension-method spellings are exercised alongside them on purpose:
+// those are still unannotated and compile everywhere, which is what says the
+// annotations were needed for the *free* functions specifically -- a method's
+// receiver fixes its type at the call site, a free function's parameter does
+// not.
+//
+// `contains` is written over a lambda that captures its enclosing parameter,
+// which arm64 refused until this pass; it is here as the fixture for that.
+//
+// Not here: `partition`, which x86-64 still refuses (a recursive generic over
+// a list, #613/#433); `unlines`, which joins branches of different list
+// lengths on x86-64 (#641); and `all`, `reverse`, `indexOf` and `at`, which
+// collide with prelude names
+// of the same spelling once `std.string` is also imported selectively, which
+// the checker reports rather than any backend.
+//
+// `sort`, `sum`, `product`, `sumBy`, `maxBy` and `minBy` are deliberately
+// left generic: `std.list`'s own `List<Double>` extension calls them, so
+// pinning them to Int broke every Book example that sorts Doubles.
+
+// Selective on the string side: `std.list` and `std.string` both export
+// `count`, with different parameter types.
+import std.list
+import std.string.{capitalize, unlines, stripPrefix, stripSuffix, parseInt, parseIntOr}
+import std.map
+
+// Free functions over lists.
+println(range(0, 4))
+println(rangeInclusive(1, 3))
+println(take([1, 2, 3], 2))
+println(drop([1, 2, 3], 2))
+println(filter([1, 2, 3], (x) => x > 1))
+println(any([1, 2], (x) => x > 1))
+println(count([1, 2, 3], (x) => x > 1))
+println(replicate(3, 7))
+println(concat([1], [2, 3]))
+println(map([1, 2], (x) => x * 2))
+println(takeWhile([1, 2, 3], (x) => x < 3))
+println(dropWhile([1, 2, 3], (x) => x < 3))
+println(chunk([1, 2, 3, 4, 5], 2))
+println(slice([1, 2, 3, 4], 1, 3))
+println(flatten([[1, 2], [3]]))
+println(contains([1, 2], 2))
+assertResult([2, 3])(filter([1, 2, 3], (x) => x > 1))
+
+// Free functions over strings.
+println(capitalize("abc"))
+println(stripPrefix("xy-a", "xy-"))
+println(stripSuffix("a-xy", "-xy"))
+println(parseInt("42"))
+println(parseIntOr("42", 0))
+println(parseIntOr("nope", 7))
+println(parseIntOr("  9 ", 0))
+assertResult(7)(parseIntOr("nope", 7))
+
+// Free functions over maps.
+val m = %["a": 1 "b": 2]
+println(mapValues(m, (v) => v * 10))
+println(filterValues(m, (v) => v > 1))
+println(filterKeys(m, (k) => k == "a"))
+println(merge(m, %["c": 3]))
+println(mapKeys(m, (k) => k + "!"))
+println(foldMap(m, 0, (a, k, v) => a + v))
+assertResult(3)(foldMap(m, 0, (a, k, v) => a + v))
+
+// The method spellings, which never needed the annotations.
+println([1, 2, 3].filterBy((x) => x > 1))
+println([1, 2, 3].countBy((x) => x > 1))
+println([1, 2, 3].reversed())
+println([3, 1, 2].sortedBy((x) => x))
+println([1, 2].zipWith([3, 4]))
+println([1, 2, 3].takeN(2))
+println([1, 2, 3].headOr(0))
+println("abc".capitalized())
+println("done")

@@ -12686,9 +12686,13 @@ impl NativeCodeGenerator {
                     else {
                         return Err(unsupported(span, "native split for non-string"));
                     };
-                    if self.expr_may_yield_runtime_string(&arguments[1]) {
+                    if self.expr_yields_runtime_or_heap_string(&arguments[1]) {
                         let delimiter = self.compile_expr(&arguments[1])?;
-                        let Some(delimiter) = self.native_string_ref(delimiter) else {
+                        let Some(delimiter) = self.native_string_ref_or_copy(
+                            delimiter,
+                            span,
+                            "native split for non-string delimiter",
+                        ) else {
                             return Err(unsupported(span, "native split for non-string delimiter"));
                         };
                         return Ok(self
@@ -12703,13 +12707,17 @@ impl NativeCodeGenerator {
                 }
                 let input =
                     self.static_string_from_argument_preserving_effects(&arguments[0], span, name)?;
-                if self.expr_may_yield_runtime_string(&arguments[1]) {
+                if self.expr_yields_runtime_or_heap_string(&arguments[1]) {
                     let input = self.emit_static_string(input);
                     let input = self
                         .native_string_ref(input)
                         .expect("static string should expose native string ref");
                     let delimiter = self.compile_expr(&arguments[1])?;
-                    let Some(delimiter) = self.native_string_ref(delimiter) else {
+                    let Some(delimiter) = self.native_string_ref_or_copy(
+                        delimiter,
+                        span,
+                        "native split for non-string delimiter",
+                    ) else {
                         return Err(unsupported(span, "native split for non-string delimiter"));
                     };
                     return Ok(

@@ -4,31 +4,31 @@ module std.list
 // imports give the user a clean namespace; the v0.1 prelude aliases
 // (`stdlibRange` etc.) remain available without an import.
 
-def range(start, end) = if((start >= end)) [] else cons(start)(range(start + 1, end))
+def range(start: Int, end: Int): List<Int> = if((start >= end)) [] else cons(start)(range(start + 1, end))
 
-def rangeInclusive(start, end) = range(start, end + 1)
+def rangeInclusive(start: Int, end: Int): List<Int> = range(start, end + 1)
 
-def take(xs, n) = if((n <= 0)) [] else if(isEmpty(xs)) [] else cons(head(xs))(take(tail(xs), n - 1))
+def take(xs: List<'a>, n: Int): List<'a> = if((n <= 0)) [] else if(isEmpty(xs)) [] else cons(head(xs))(take(tail(xs), n - 1))
 
-def drop(xs, n) = if((n <= 0)) xs else if(isEmpty(xs)) xs else drop(tail(xs), n - 1)
+def drop(xs: List<'a>, n: Int): List<'a> = if((n <= 0)) xs else if(isEmpty(xs)) xs else drop(tail(xs), n - 1)
 
-def filter(xs, p) = if(isEmpty(xs)) [] else if(p(head(xs))) cons(head(xs))(filter(tail(xs), p)) else filter(tail(xs), p)
+def filter(xs: List<'a>, p: ('a) => Boolean): List<'a> = if(isEmpty(xs)) [] else if(p(head(xs))) cons(head(xs))(filter(tail(xs), p)) else filter(tail(xs), p)
 
-def find(xs, p) = if(isEmpty(xs)) null else if(p(head(xs))) head(xs) else find(tail(xs), p)
+def find(xs: List<'a>, p: ('a) => Boolean): 'a = if(isEmpty(xs)) null else if(p(head(xs))) head(xs) else find(tail(xs), p)
 
-def any(xs, p) = if(isEmpty(xs)) false else if(p(head(xs))) true else any(tail(xs), p)
+def any(xs: List<'a>, p: ('a) => Boolean): Boolean = if(isEmpty(xs)) false else if(p(head(xs))) true else any(tail(xs), p)
 
-def all(xs, p) = if(isEmpty(xs)) true else if(p(head(xs))) all(tail(xs), p) else false
+def all(xs: List<'a>, p: ('a) => Boolean): Boolean = if(isEmpty(xs)) true else if(p(head(xs))) all(tail(xs), p) else false
 
-def count(xs, p) = foldLeft(xs)(0)((acc, x) => if(p(x)) acc + 1 else acc)
+def count(xs: List<'a>, p: ('a) => Boolean): Int = foldLeft(xs)(0)((acc, x) => if(p(x)) acc + 1 else acc)
 
-def replicate(n, x) = if((n <= 0)) [] else cons(x)(replicate(n - 1, x))
+def replicate(n: Int, x: 'a): List<'a> = if((n <= 0)) [] else cons(x)(replicate(n - 1, x))
 
-def append(xs, x) = if(isEmpty(xs)) [x] else cons(head(xs))(append(tail(xs), x))
+def append(xs: List<'a>, x: 'a): List<'a> = if(isEmpty(xs)) [x] else cons(head(xs))(append(tail(xs), x))
 
-def concat(xs, ys) = if(isEmpty(xs)) ys else cons(head(xs))(concat(tail(xs), ys))
+def concat(xs: List<'a>, ys: List<'a>): List<'a> = if(isEmpty(xs)) ys else cons(head(xs))(concat(tail(xs), ys))
 
-def last(xs) = if(isEmpty(tail(xs))) head(xs) else last(tail(xs))
+def last(xs: List<'a>): 'a = if(isEmpty(tail(xs))) head(xs) else last(tail(xs))
 
 def sum(xs) = foldLeft(xs)(0)((acc, x) => acc + x)
 
@@ -39,23 +39,23 @@ def product(xs) = foldLeft(xs)(1)((acc, x) => acc * x)
 
 // Reverse a list. (`reverse` itself is a string builtin, hence the
 // distinct name; the extension method below reads as `.reversed()`.)
-def reverse(xs) = foldLeft(xs)([])((acc, x) => cons(x)(acc))
+def reverse(xs: List<'a>): List<'a> = foldLeft(xs)([])((acc, x) => cons(x)(acc))
 
 // Transform every element. (`map` exists as a value-method builtin;
 // this is the free-function form.)
-def map(xs, f) = if(isEmpty(xs)) [] else cons(f(head(xs)))(map(tail(xs), f))
+def map(xs: List<'a>, f: ('a) => 'b): List<'b> = if(isEmpty(xs)) [] else cons(f(head(xs)))(map(tail(xs), f))
 
 // Map each element to a list and flatten the results.
-def flatMap(xs, f) = if(isEmpty(xs)) [] else concat(f(head(xs)), flatMap(tail(xs), f))
+def flatMap(xs: List<'a>, f: ('a) => List<'b>): List<'b> = if(isEmpty(xs)) [] else concat(f(head(xs)), flatMap(tail(xs), f))
 
 // Whether the list contains a value, by `==`. (`contains` is a string
 // builtin; this is the list form.)
-def contains(xs, x) = any(xs, (y) => y == x)
+def contains(xs: List<'a>, x: 'a): Boolean = any(xs, (y) => y == x)
 
-def indexOfFrom(xs, x, i) = if(isEmpty(xs)) (0 - 1) else if(head(xs) == x) i else indexOfFrom(tail(xs), x, i + 1)
+def indexOfFrom(xs: List<'a>, x: 'a, i: Int): Int = if(isEmpty(xs)) (0 - 1) else if(head(xs) == x) i else indexOfFrom(tail(xs), x, i + 1)
 
 // The index of the first element equal to `x`, or -1 if absent.
-def indexOf(xs, x) = indexOfFrom(xs, x, 0)
+def indexOf(xs: List<'a>, x: 'a): Int = indexOfFrom(xs, x, 0)
 
 // Drop later duplicates, keeping each element's first occurrence.
 // Keep the first occurrence of each element, in order -- which is what a set
@@ -70,18 +70,18 @@ def distinct(xs: List<'a>): List<'a> = Set#toList(Set#fromList(xs))
 // ---------- flatten ---------------------------------------------------------
 
 // Flatten a list of lists into a single list.
-def flatten(xss) = foldLeft(xss)([])((acc, xs) => concat(acc, xs))
+def flatten(xss: List<List<'a>>): List<'a> = foldLeft(xss)([])((acc, xs) => concat(acc, xs))
 
 // ---------- takeWhile / dropWhile -------------------------------------------
 
 // Take elements from the front while predicate `p` holds.
-def takeWhile(xs, p) =
+def takeWhile(xs: List<'a>, p: ('a) => Boolean): List<'a> =
   if(isEmpty(xs)) []
   else if(p(head(xs))) cons(head(xs))(takeWhile(tail(xs), p))
   else []
 
 // Drop elements from the front while predicate `p` holds.
-def dropWhile(xs, p) =
+def dropWhile(xs: List<'a>, p: ('a) => Boolean): List<'a> =
   if(isEmpty(xs)) []
   else if(p(head(xs))) dropWhile(tail(xs), p)
   else xs
@@ -111,7 +111,7 @@ def minBy(xs, key) =
 // ---------- chunk -----------------------------------------------------------
 
 // Split `xs` into non-overlapping sublists of at most `n` elements.
-def chunk(xs, n) =
+def chunk(xs: List<'a>, n: Int): List<List<'a>> =
   if(n <= 0) []
   else if(isEmpty(xs)) []
   else cons(take(xs, n))(chunk(drop(xs, n), n))
@@ -120,7 +120,7 @@ def chunk(xs, n) =
 
 // Return elements at indices [from, to) — drop `from`, then take `to - from`.
 // Negative bounds clamp to 0 so the half-open range never over-returns.
-def slice(xs, from, to) = {
+def slice(xs: List<'a>, from: Int, to: Int): List<'a> = {
   val f = if(from < 0) 0 else from
   val t = if(to < 0) 0 else to
   take(drop(xs, f), t - f)
@@ -143,7 +143,7 @@ def at(xs: List<'a>, i: Int): 'a =
 
 // Like foldLeft but collect every intermediate accumulator value.
 // scanLeft([1,2,3], 0, f) = [0, f(0,1), f(f(0,1),2), f(f(f(0,1),2),3)]
-def scanLeft(xs, init, f) =
+def scanLeft(xs: List<'a>, init: 'b, f: ('b, 'a) => 'b): List<'b> =
   if(isEmpty(xs)) [init]
   else cons(init)(scanLeft(tail(xs), f(init, head(xs)), f))
 
@@ -152,7 +152,7 @@ def scanLeft(xs, init, f) =
 // Right fold: f is applied as f(x, acc) from the right.
 // foldRight([1,2,3], 0, (x, acc) => x + acc) = 6. Implemented by
 // reversing then folding left, so it stays tail-recursive.
-def foldRight(xs, init, f) = foldLeft(reverse(xs))(init)((acc, x) => f(x, acc))
+def foldRight(xs: List<'a>, init: 'b, f: ('a, 'b) => 'b): 'b = foldLeft(reverse(xs))(init)((acc, x) => f(x, acc))
 
 // ---------- sort / sortBy ---------------------------------------------------
 
@@ -181,7 +181,7 @@ def sortBy(xs, key) = foldLeft(xs)([])((acc, x) => insertSortedBy(key, acc, x))
 // ---------- zip -------------------------------------------------------------
 
 // Zip two lists into a list of 2-element lists, stopping at the shorter one.
-def zip(xs, ys) =
+def zip(xs: List<'a>, ys: List<'a>): List<List<'a>> =
   if(isEmpty(xs)) []
   else if(isEmpty(ys)) []
   else cons([head(xs), head(ys)])(zip(tail(xs), tail(ys)))
@@ -189,7 +189,7 @@ def zip(xs, ys) =
 // ---------- partition -------------------------------------------------------
 
 // Split `xs` into [[trueList], [falseList]] according to predicate `p`.
-def partition(xs, p) =
+def partition(xs: List<'a>, p: ('a) => Boolean): List<List<'a>> =
   [filter(xs, p), filter(xs, (x) => if(p(x)) false else true)]
 
 // ---------- groupBy ---------------------------------------------------------

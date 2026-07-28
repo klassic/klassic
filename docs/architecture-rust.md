@@ -2123,6 +2123,39 @@ side of a branch.
   annotated `String` parameter holds, and to trim before `parseInt` -- `isInt`
   trims and `parseInt` does not, so `" 9 "` was called a number and then
   failed to parse.
+- The remaining four stdlib modules carry annotations on their free
+  functions: `std.map`, `std.string`, `std.list` and the rest (issue #643 is
+  complete). Six numeric helpers stay generic on purpose -- `sort`, `sum`,
+  `product`, `sumBy`, `maxBy`, `minBy` -- because `std.list`'s own
+  `List<Double>` extension calls them, and pinning them to `Int` broke every
+  Book example that sorts Doubles. The extension-method spellings are still
+  unannotated and compile on every target, which is the evidence that the
+  annotations were needed for *free* functions specifically: a method's
+  receiver fixes its type at the call site, a free function's parameter does
+  not.
+- `split` takes a delimiter that is a heap string, and `String#isInt` takes a
+  heap string input, which is what a module function's own parameter is. That
+  is what `std.string`'s `count` and `parseIntOr` needed (issue #642).
+- A lambda passed as an *argument* carries the frame slots in scope where it
+  was written, the way a lambda a function returns already did since #621.
+  `intern_lambda` captures them, so `(y) => y == x` keeps the `x` it was
+  written against -- the shape of every caller-supplied bound, and what
+  `std.list`'s `contains` is (issue #645).
+- A lambda whose body is a lambda can be bound and applied on aarch64, both
+  through a name (`val inner = outer(2)`) and directly (`outer(2)(3)`). The
+  producer being a lambda rather than a definition is a second path into
+  `returned_lambda_binding`: there is no function-table entry to look the
+  callee up in, so the lambda's own parameters become the captures. Three
+  levels deep is still refused -- the middle lambda's capture is not carried
+  when it is itself produced by a call (issue #632).
+- CI runs every `tests/cross-exec/` fixture a second time under
+  `--gc-stress --gc-poison` on Linux, against the same evaluator output, and
+  the Windows target has a GC test at all. Neither existed: the flags did not
+  appear in `ci.yml`, and of the 39 GC tests 30 were gated to Linux and 7 to
+  macOS with none on Windows -- which shares x86-64's collector. The fixtures
+  are where the newest work lands, so they are the most likely to carry a
+  fresh rooting mistake, and a mis-rooted pointer only shows up when a
+  collection fires at the wrong moment (issue #653).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
