@@ -7,6 +7,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn klassic_bin() -> &'static str {
@@ -31,6 +32,27 @@ fn find_clang() -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A path fragment no other build in this process or any other can pick.
+///
+/// The timestamp alone is not enough: the suite runs its tests in parallel
+/// threads, and two that start in the same nanosecond chose the same output
+/// path -- one still being linked while the other executed it, which surfaces
+/// as `ETXTBSY` ("Text file busy") rather than as anything about the program.
+/// The same collision hit the C backend's intermediate `.c` and was fixed the
+/// same way.
+fn unique_stamp() -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Evaluate `source`, then build+run it through `--backend llvm`, and
 /// assert the two stdout streams match. No-op when clang is absent.
 fn assert_llvm_matches_evaluator(source: &str) {
@@ -38,10 +60,7 @@ fn assert_llvm_matches_evaluator(source: &str) {
         eprintln!("skipping: no clang >= 15 found");
         return;
     };
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
+    let stamp = unique_stamp();
     let dir = std::env::temp_dir();
     let src = dir.join(format!("klassic_llvm_{stamp}.kl"));
     let bin = dir.join(format!("klassic_llvm_{stamp}.bin"));
@@ -236,10 +255,7 @@ fn gc_log_reports_pause_statistics() {
         eprintln!("skipping: no clang >= 15 found");
         return;
     };
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
+    let stamp = unique_stamp();
     let dir = std::env::temp_dir();
     let src = dir.join(format!("klassic_gclog_{stamp}.kl"));
     let bin = dir.join(format!("klassic_gclog_{stamp}.bin"));
