@@ -2237,6 +2237,17 @@ side of a branch.
   `emit_compiled_literal_value` republishes the shape recorded beside the cell.
   Printing a heap pointer with no shape is now a refusal rather than an
   address.
+- A call carries where it came from (`CallOrigin`). The language has no
+  free-standing `get` / `containsKey` / `containsValue` -- only `Map#get(m, k)`
+  and `m.get(k)` -- but codegen reached them by the bare name, so
+  `klassic build` compiled programs `klassic` refuses to run: the one place
+  measured where a backend was *more* permissive than the evaluator. Refusing
+  the bare name is not enough on its own, because the dot form is lowered to a
+  call on that same name; the two are distinguished by whether the call is what
+  the program wrote or one this backend synthesized while lowering something
+  else (issue #667). aarch64 had the same divergence and tells the two apart
+  the same way, at its own call site -- the two backends resolve the name
+  independently, so fixing one says nothing about the other.
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

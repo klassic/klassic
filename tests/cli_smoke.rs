@@ -29477,3 +29477,94 @@ fn native_if_branches_pad_an_empty_list_on_either_side() {
         );
     }
 }
+
+/// The language has no free-standing `get` / `containsKey` / `containsValue`
+/// -- only `Map#get(m, k)` and `m.get(k)`. The backend reached them by the
+/// bare name anyway, so `klassic build` compiled a program `klassic` refuses
+/// to run. The dot form is lowered to a call on that same bare name, so the
+/// two are told apart by where the call came from, not by how it is spelled;
+/// this pins both halves.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_rejects_the_bare_map_builtins_the_evaluator_rejects() {
+    // Both hand-emitted backends had the divergence and both are asserted:
+    // they resolve the name separately, so fixing one says nothing about the
+    // other. The aarch64 build is only built here, never run, which is enough
+    // -- the whole point is which programs it accepts.
+    for target in [None, Some("aarch64-apple-darwin")] {
+        native_bare_map_builtins_match_the_evaluator(target);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn native_bare_map_builtins_match_the_evaluator(target: Option<&str>) {
+    let cases = [
+        ("get(m, \"a\")", None),
+        ("containsKey(m, \"a\")", None),
+        ("containsValue(m, 1)", None),
+        ("m.get(\"a\")", Some("1\n")),
+        ("m.containsKey(\"a\")", Some("true\n")),
+        ("m.containsValue(1)", Some("true\n")),
+        ("Map#get(m, \"a\")", Some("1\n")),
+        ("m.getOrElse(\"z\", -1)", Some("-1\n")),
+    ];
+    for (index, (call, expected)) in cases.iter().enumerate() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let source_path = dir.join(format!("klassic_bare_map_{index}_{stamp}.kl"));
+        let bin_path = dir.join(format!("klassic_bare_map_{index}_{stamp}.bin"));
+        let program = format!("val m = %[\"a\": 1]\nprintln({call})\n");
+        fs::write(&source_path, program).expect("temp source file should write");
+
+        let eval = Command::new(klassic_bin())
+            .arg(&source_path)
+            .output()
+            .expect("evaluator should run");
+        let mut command = Command::new(klassic_bin());
+        if let Some(target) = target {
+            command.args(["--target", target]);
+        }
+        let build = command
+            .args([
+                "build",
+                source_path.to_str().expect("path should be utf-8"),
+                "-o",
+                bin_path.to_str().expect("path should be utf-8"),
+            ])
+            .output()
+            .expect("binary should run");
+        assert_eq!(
+            eval.status.success(),
+            build.status.success(),
+            "`{call}`: the build must accept exactly what the evaluator accepts\n\
+             evaluator:\n{}\nbuild:\n{}",
+            String::from_utf8_lossy(&eval.stderr),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        match expected {
+            None => {
+                let stderr = String::from_utf8_lossy(&build.stderr);
+                assert!(
+                    stderr.contains("undefined variable"),
+                    "`{call}`: the build should say what the evaluator says:\n{stderr}"
+                );
+            }
+            Some(_) if target.is_some() => {}
+            Some(expected) => {
+                let run = Command::new(&bin_path)
+                    .output()
+                    .expect("generated executable should run");
+                assert_eq!(
+                    String::from_utf8_lossy(&run.stdout),
+                    *expected,
+                    "`{call}` should print what the evaluator prints"
+                );
+            }
+        }
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&bin_path);
+    }
+}
