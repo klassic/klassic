@@ -1,0 +1,67 @@
+// Cross-target fixture: Doubles whose value is only known at run time.
+//
+// Both native backends fold a Double they can see the value of, so
+// `println(1.5)` proved nothing about either one -- the text came out of
+// Rust's formatter at build time. Everything below is computed from
+// `size(args())`, which is zero but not knowably zero, so each value
+// reaches the backend's own decimal formatter.
+//
+// That formatter renders exactly the set the two backends agree on: a
+// whole number as `<digits>.0`, and a binary fraction whose exact decimal
+// expansion is short enough to be the same text the evaluator prints. A
+// value outside it (`1/5`, or an expansion past fifteen significant
+// digits) is refused at run time on both, so none appears here.
+//
+// A Double inside a record, inside a generic enum, or through `toString`
+// is still refused at build time by x86-64, so those live in the
+// aarch64-only test in tests/cli_smoke.rs rather than here.
+
+import std.process as R
+
+enum Boxed { case Num(v: Double); case Nothing }
+
+def q(n: Int, d: Int): Double = double(n) / double(d)
+def w(n: Int): Double = double(n)
+
+val k = size(R.args())
+
+// Whole numbers, including the sign and the wide end of the range.
+println(w(0 + k))
+println(w(1 + k))
+println(w(-1 + k))
+println(w(1000000 + k))
+println(w(-999999999999999 + k))
+
+// Fractions with an integer part and without one -- the two halves of the
+// assembly step, since a value below one has to grow a leading `0`, and a
+// short numerator has to grow leading zeros after the point.
+println(q(3 + k, 8))
+println(q(-3 + k, 8))
+println(q(123 + k, 64))
+println(q(1 + k, 1024))
+println(q(-1 + k, 32))
+println(q(1 + k, 131072))
+
+val a = q(3 + k, 8)
+val b = q(-5 + k, 16)
+
+// The same values through every renderer that is not `println` of a bare
+// Double. A collection element is the one that used to be wrong rather
+// than refused: with no spill slot of its own it rendered from a
+// long-dead register and printed `[null, null]`.
+println([a b])
+println(%(a b))
+println(%[1: a 2: b])
+println("a=#{a} b=#{b}")
+
+// A Double carried by an enum the shared pass lowers into records.
+val boxed: Boxed = Num(a)
+println(boxed)
+println("boxed=#{boxed}")
+
+// Arithmetic that produces a fresh Double rather than moving one around.
+println(sqrt(w(4 + k)))
+println(abs(q(-9 + k, 4)))
+println(a + b)
+println(a * w(2 + k))
+println("done")

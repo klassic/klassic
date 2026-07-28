@@ -2173,6 +2173,26 @@ side of a branch.
   plus the newline, so a list of maps -- what grouping produces -- renders at
   both levels. A list of *sets* is still refused there for the same reason
   maps were: `ListElem` has no entry for one (issue #635).
+- aarch64 renders a Double whose value is only known at run time. It follows
+  the shape x86-64 already had: a whole number is its digits plus `.0`, and a
+  fraction is recovered exactly from the bit pattern as `M1 * 5^k` scaled by
+  `10^-k`, bounded so the numerator fits an i64 and so the exact expansion is
+  short enough (fifteen significant digits) to be the same text Rust's
+  shortest-round-trip formatter produces. Anything outside that -- NaN, an
+  infinity, or a longer expansion -- is refused at run time with the same
+  message x86-64 uses, rather than approximated: two builds of one program
+  disagreeing quietly is worse than either answer. The renderer reaches
+  `println`, list/set/map elements, interpolation holes, `toString`, record
+  fields and both kinds of enum payload (issue #644).
+- x86-64 makes a Double at run time: `double` of a run-time Int, and `sqrt` /
+  `abs` of a run-time Double. Before this the backend could only fold a Double
+  it already knew, so its own decimal formatter was unreachable.
+- x86-64 gives a run-time Double in a collection literal a spill slot.
+  `compiled_literal_value_from_native` spilled `Int` and `Bool` -- the values
+  that live in Rax -- but not a `RuntimeDouble`, which lives in Rax the same
+  way. A list of them therefore rendered from a register the next element had
+  already overwritten, and printed `[null, null]` while compiling clean and
+  exiting zero. This was unreachable until run-time Doubles existed.
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
