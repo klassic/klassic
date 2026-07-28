@@ -2123,6 +2123,19 @@ side of a branch.
   annotated `String` parameter holds, and to trim before `parseInt` -- `isInt`
   trims and `parseInt` does not, so `" 9 "` was called a number and then
   failed to parse.
+- The remaining four stdlib modules carry annotations on their free
+  functions: `std.map`, `std.string`, `std.list` and the rest (issue #643 is
+  complete). Six numeric helpers stay generic on purpose -- `sort`, `sum`,
+  `product`, `sumBy`, `maxBy`, `minBy` -- because `std.list`'s own
+  `List<Double>` extension calls them, and pinning them to `Int` broke every
+  Book example that sorts Doubles. The extension-method spellings are still
+  unannotated and compile on every target, which is the evidence that the
+  annotations were needed for *free* functions specifically: a method's
+  receiver fixes its type at the call site, a free function's parameter does
+  not.
+- `split` takes a delimiter that is a heap string, and `String#isInt` takes a
+  heap string input, which is what a module function's own parameter is. That
+  is what `std.string`'s `count` and `parseIntOr` needed (issue #642).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

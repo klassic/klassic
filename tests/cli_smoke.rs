@@ -584,7 +584,7 @@ fn runtime_error_names_the_function_the_user_called() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         stderr.trim_end(),
-        "<stdlib std.list>:31:38: last: head expects a non-empty list"
+        "<stdlib std.list>:31:52: last: head expects a non-empty list"
     );
 }
 
@@ -622,7 +622,7 @@ fn runtime_error_through_wrapper_names_innermost_def() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         stderr.trim_end(),
-        "<stdlib std.list>:31:38: last: head expects a non-empty list"
+        "<stdlib std.list>:31:52: last: head expects a non-empty list"
     );
 }
 

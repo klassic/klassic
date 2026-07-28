@@ -89,13 +89,13 @@ extension (this: String) {
 
 // Number of non-overlapping occurrences of `sub` in `s`. Returns 0 for
 // an empty `sub`.
-def count(s, sub) = if(isEmptyString(sub)) 0 else size(split(s, sub)) - 1
+def count(s: String, sub: String): Int = if(isEmptyString(sub)) 0 else size(split(s, sub)) - 1
 
 // ---------- capitalize ------------------------------------------------------
 
 // Uppercase the first character of `s`; leave the rest unchanged.
 // Returns "" when `s` is empty.
-def capitalize(s) =
+def capitalize(s: String): String =
   if(isEmptyString(s)) ""
   else toUpperCase(substring(s, 0, 1)) + substring(s, 1, length(s))
 
@@ -103,40 +103,40 @@ def capitalize(s) =
 
 // Join a list of strings with newline separators (no trailing newline).
 // Returns "" for an empty list.
-def unlines(xs) =
+def unlines(xs: List<String>): String =
   if(isEmpty(xs)) ""
   else foldLeft(tail(xs))(toString(head(xs)))((acc, x) => acc + "\n" + toString(x))
 
 // ---------- indent ----------------------------------------------------------
 
 // Build a string of `n` space characters.
-def stringSpaces(n) = if((n <= 0)) "" else " " + stringSpaces(n - 1)
+def stringSpaces(n: Int): String = if((n <= 0)) "" else " " + stringSpaces(n - 1)
 
 // Join a non-empty list of lines with newline separators, prefixing
 // each line with `prefix`.
-def indentJoinLines(ls, prefix) =
+def indentJoinLines(ls: List<String>, prefix: String): String =
   foldLeft(tail(ls))(prefix + toString(head(ls)))((acc, x) => acc + "\n" + prefix + toString(x))
 
 // Indent every line of `s` by `n` spaces.
-def indent(s, n) = if(s == "") "" else indentJoinLines(split(s, "\n"), stringSpaces(n))
+def indent(s: String, n: Int): String = if(s == "") "" else indentJoinLines(split(s, "\n"), stringSpaces(n))
 
 // ---------- stripPrefix / stripSuffix ---------------------------------------
 
 // Return `s` with `prefix` removed from the front, or `s` unchanged when
 // `s` does not start with `prefix`.
-def stripPrefix(s, prefix) =
+def stripPrefix(s: String, prefix: String): String =
   if(startsWith(s, prefix)) substring(s, length(prefix), length(s)) else s
 
 // Return `s` with `suffix` removed from the end, or `s` unchanged when
 // `s` does not end with `suffix`.
-def stripSuffix(s, suffix) =
+def stripSuffix(s: String, suffix: String): String =
   if(endsWith(s, suffix)) substring(s, 0, length(s) - length(suffix)) else s
 
 // ---------- parse helpers ---------------------------------------------------
 
-def parseInt(s) = String#parseInt(s)
+def parseInt(s: String): Int = String#parseInt(s)
 
-def parseDouble(s) = String#parseDouble(s)
+def parseDouble(s: String): Double = String#parseDouble(s)
 
 // Written over `isInt` / `parseInt` rather than delegating to
 // `String#parseIntOr`, which no native backend implements. The two it is
@@ -147,4 +147,4 @@ def parseIntOr(s: String, d: Int): Int = if(String#isInt(s)) String#parseInt(tri
 // The Double counterpart. `parseDouble` has no native implementation either,
 // so this one still delegates and is refused there; splitting it out keeps
 // the Int case, which is the one a CLI reading a count or an index needs.
-def parseDoubleOr(s, d) = String#parseDoubleOr(s, d)
+def parseDoubleOr(s: String, d: Double): Double = String#parseDoubleOr(s, d)
