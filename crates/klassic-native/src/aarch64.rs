@@ -11031,7 +11031,22 @@ impl Emitter {
                 .flatten()
                 .map(|(name, fields)| (name.clone(), fields.clone()))
                 .collect(),
-            values: Vec::new(),
+            // The frame slots in scope, so a lambda that closes over one can
+            // read it where it is finally compiled. A lambda has no runtime
+            // representation here -- its body is compiled at the call site --
+            // so without this a predicate like `(y) => y == x` lost the `x` it
+            // was written against, which is the shape of every caller-supplied
+            // bound (`std.list`'s `contains` is one).
+            //
+            // Outer scopes first so an inner binding of the same name wins
+            // when the environment is installed in order, matching the two
+            // above.
+            values: self
+                .scopes
+                .iter()
+                .flatten()
+                .map(|(name, (offset, ty))| (name.clone(), *offset, *ty))
+                .collect(),
         };
         self.lambdas.push((params, body));
         self.lambda_envs.push(env);

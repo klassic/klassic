@@ -2136,6 +2136,11 @@ side of a branch.
 - `split` takes a delimiter that is a heap string, and `String#isInt` takes a
   heap string input, which is what a module function's own parameter is. That
   is what `std.string`'s `count` and `parseIntOr` needed (issue #642).
+- A lambda passed as an *argument* carries the frame slots in scope where it
+  was written, the way a lambda a function returns already did since #621.
+  `intern_lambda` captures them, so `(y) => y == x` keeps the `x` it was
+  written against -- the shape of every caller-supplied bound, and what
+  `std.list`'s `contains` is (issue #645).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
