@@ -39,4 +39,21 @@ println(toString([Sm(7) Nn]))
 // Sizes are answered from the literal's own shape rather than the elements.
 println(size([Sm(1) Nn Sm(2)]))
 println(isEmpty([Nn]))
+
+// The same list bound to a `val` rather than written inline. These took a
+// different path on x86-64 -- the static-literal one, which refused it -- and
+// then a different renderer, which printed the elements' addresses. Reading an
+// element back out has to republish which enum it is, or nothing downstream
+// can print or match on it.
+val bound = [Sm(1) Nn Sm(2)]
+println(bound)
+println(size(bound))
+println(head(bound))
+println("bound=#{bound}")
+println(toString(bound))
+println(head(bound) match { case Sm(v) => v; case Nn => 0 })
+
+val words = [Word("a") Comma Word("b")]
+println(words)
+println(head(words))
 println("done")
