@@ -2257,6 +2257,15 @@ side of a branch.
   the join the *maximum over the arms that can return*, which is also the
   capacity -- forcing a dynamic length without that (tried, reverted) made the
   widest arm print truncated (issue #641).
+- A set removes a duplicate heap value by comparing contents, not addresses.
+  Letting an enum into a collection made two separately built `Sm(1)`s reach
+  the dedup as two different pointers, and the comparison answered "different"
+  for anything that was not an Int or a Bool, so `%(Sm(1) Sm(1) Nn)` kept all
+  three. Both backends compare with `gc_deep_equal` now -- the routine `==` and
+  `assertResult` already used on a heap value -- x86-64 in its slot comparison
+  and aarch64 through a third membership scan beside the scalar and string
+  ones. A `RuntimeDouble` had the same hole and compares by bit pattern plus
+  the `0.0 == -0.0` case the evaluator dedups (issue #670).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

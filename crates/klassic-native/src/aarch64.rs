@@ -2123,6 +2123,11 @@ struct Emitter {
     /// membership scans and a cons-list reverse.
     member_scalar_label: Option<Label>,
     member_string_label: Option<Label>,
+    /// Membership for elements that are heap values (a lowered enum, a
+    /// record). Those compare by *contents*: two separately built `Sm(1)`s
+    /// are one value, so the scalar scan -- which compares the boxed word,
+    /// i.e. the address -- let a set keep both.
+    member_deep_label: Option<Label>,
     list_reverse_label: Option<Label>,
     /// Label of the GC load barrier's slow path (`gc_load_barrier_slow`).
     /// Created lazily so the first user -- a barriered read or
@@ -2144,6 +2149,10 @@ struct Emitter {
     /// Label of `gc_alloc`, shared between the mutator's allocation sites
     /// and the GC runtime that defines it.
     gc_alloc_label: Option<Label>,
+    /// `gc_deep_equal`, shared between the set literal's membership scan and
+    /// the GC runtime that defines it -- the same lazy hand-off `gc_alloc`
+    /// uses, because the scan is emitted before the runtime is.
+    gc_deep_equal_label: Option<Label>,
     /// Whether declining this program hands it to the portable C backend
     /// rather than failing the build. It decides what to do with a Double
     /// whose value is not known until run time: the emitted formatter is
@@ -4616,6 +4625,17 @@ impl Emitter {
         Ok(ValueType::Unit)
     }
 
+    fn gc_deep_equal_label(&mut self) -> Label {
+        match self.gc_deep_equal_label {
+            Some(label) => label,
+            None => {
+                let label = self.asm.new_label();
+                self.gc_deep_equal_label = Some(label);
+                label
+            }
+        }
+    }
+
     fn gc_alloc_entry_label(&mut self) -> Label {
         match self.gc_alloc_label {
             Some(label) => label,
@@ -6550,6 +6570,10 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
     fn member_label(&mut self, elem: ListElem) -> Label {
         let slot = match elem {
             ListElem::Str => &mut self.member_string_label,
+            ListElem::LoweredEnum(_)
+            | ListElem::Enum(_)
+            | ListElem::Record(_)
+            | ListElem::Nested { .. } => &mut self.member_deep_label,
             _ => &mut self.member_scalar_label,
         };
         match slot {
@@ -6917,6 +6941,56 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         self.asm.ret();
         self.asm.bind(not_found);
         self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.ret();
+    }
+
+    /// `bl`-called deep membership scan: x0 = list, x1 = candidate (a heap
+    /// pointer) -> x0 = Bool. Compares with `gc_deep_equal`, the routine `==`
+    /// already uses on a heap value, so a set removes a duplicate enum the way
+    /// the evaluator does.
+    ///
+    /// `gc_deep_equal` takes its operands in x5 and x4 (`V7`/`V6` in the
+    /// portable register naming) and is free to clobber x0-x9, so the cursor
+    /// and candidate are kept in a stack scratch addressed off x10 -- above
+    /// everything the callee can see.
+    fn emit_member_deep_routine(&mut self, label: Label) {
+        let deep_equal = self.gc_deep_equal_label();
+        self.asm.bind(label);
+        self.asm.push_frame_record();
+        self.asm.sub_sp_imm(16);
+        self.asm.add_reg_sp_imm(Reg::X10, 0);
+        self.asm.str_imm(Reg::X1, Reg::X10, 0); // candidate
+        self.asm.str_imm(Reg::X0, Reg::X10, 8); // cursor
+        let loop_start = self.asm.new_label();
+        let found = self.asm.new_label();
+        let not_found = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.bind(loop_start);
+        self.asm.add_reg_sp_imm(Reg::X10, 0);
+        self.asm.ldr_imm(Reg::X2, Reg::X10, 8);
+        self.asm.branch(not_found, BranchKind::CompareZero(Reg::X2));
+        self.emit_gc_load_ptr(Reg::X2, 0); // x0 = this element
+        self.asm.add_reg_sp_imm(Reg::X10, 0);
+        self.asm.mov_reg(Reg::X5, Reg::X0);
+        self.asm.ldr_imm(Reg::X4, Reg::X10, 0); // the candidate
+        self.asm.branch(deep_equal, BranchKind::Link);
+        // The callee restores sp but not x10, so the scratch base is
+        // re-derived rather than kept live across the call.
+        self.asm.add_reg_sp_imm(Reg::X10, 0);
+        self.asm.branch(found, BranchKind::CompareNonZero(Reg::X0));
+        self.asm.ldr_imm(Reg::X2, Reg::X10, 8);
+        self.emit_gc_load_ptr(Reg::X2, 8); // x0 = next
+        self.asm.add_reg_sp_imm(Reg::X10, 0);
+        self.asm.str_imm(Reg::X0, Reg::X10, 8);
+        self.asm.branch(loop_start, BranchKind::Unconditional);
+        self.asm.bind(found);
+        self.asm.mov_imm64(Reg::X0, 1);
+        self.asm.branch(done, BranchKind::Unconditional);
+        self.asm.bind(not_found);
+        self.asm.mov_imm64(Reg::X0, 0);
+        self.asm.bind(done);
+        self.asm.add_sp_imm(16);
+        self.asm.pop_frame_record();
         self.asm.ret();
     }
 
@@ -13241,6 +13315,7 @@ impl Emitter {
         let l_load_barrier_slow = self.load_barrier_label();
         // Likewise shared with every mutator allocation site.
         let l_alloc = self.gc_alloc_entry_label();
+        let l_deep_equal = self.gc_deep_equal_label();
 
         GcState {
             heap_base,
@@ -13301,7 +13376,7 @@ impl Emitter {
             l_mark_start: self.asm.new_label(),
             l_mark_end: self.asm.new_label(),
             l_mark_visit: self.asm.new_label(),
-            l_deep_equal: self.asm.new_label(),
+            l_deep_equal,
             l_load_barrier_slow,
             l_acquire_region: self.asm.new_label(),
             l_alloc_large: self.asm.new_label(),
@@ -13676,6 +13751,9 @@ pub(crate) fn emit_macho_program(
     }
     if let Some(label) = emitter.member_string_label {
         emitter.emit_member_string_routine(label);
+    }
+    if let Some(label) = emitter.member_deep_label {
+        emitter.emit_member_deep_routine(label);
     }
     if let Some(label) = emitter.list_reverse_label {
         emitter.emit_list_reverse_routine(label);

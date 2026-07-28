@@ -29097,6 +29097,50 @@ impl NativeCodeGenerator {
         actual_value: NativeValue,
         actual_slot: DataLabel,
     ) {
+        // Two heap values are equal when their *contents* are, not when they
+        // are the same address -- two separate `Sm(1)`s are one value. Saying
+        // "not equal" here instead is what let a set keep a duplicate enum:
+        // `%(Sm(1) Sm(1) Nn)` printed all three. `gc_deep_equal` is the same
+        // routine `==` and `assertResult` use on a heap value.
+        if expected_value == NativeValue::HeapPointer && actual_value == NativeValue::HeapPointer {
+            self.asm.mov_data_addr(Reg::R10, expected_slot);
+            self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
+            self.asm.mov_data_addr(Reg::R10, actual_slot);
+            self.asm.load_ptr_disp32(Reg::Rsi, Reg::R10, 0);
+            self.asm.call_label(self.gc_deep_equal);
+            return;
+        }
+        // Two Doubles are equal when IEEE says so, which is the bit pattern
+        // plus one exception: `0.0 == -0.0` is true and the evaluator dedups
+        // them, while their bits differ. NaN is left unequal, matching IEEE --
+        // and unreachable in a printed set anyway, since the formatter refuses
+        // to render one. Answering "not equal" for every Double, as this did,
+        // let a set keep a duplicate.
+        if expected_value == NativeValue::RuntimeDouble
+            && actual_value == NativeValue::RuntimeDouble
+        {
+            let equal = self.asm.create_text_label();
+            let done = self.asm.create_text_label();
+            self.asm.mov_data_addr(Reg::R10, expected_slot);
+            self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
+            self.asm.mov_data_addr(Reg::R10, actual_slot);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+            self.asm.cmp_reg_reg(Reg::Rcx, Reg::Rax);
+            self.asm.jcc_label(Condition::Equal, equal);
+            // Both zero, whatever their signs?
+            self.asm.mov_imm64(Reg::Rbx, 0x7fff_ffff_ffff_ffff);
+            self.asm.and_reg_reg(Reg::Rcx, Reg::Rbx);
+            self.asm.and_reg_reg(Reg::Rax, Reg::Rbx);
+            self.asm.or_reg_reg(Reg::Rax, Reg::Rcx);
+            self.asm.cmp_reg_imm8(Reg::Rax, 0);
+            self.asm.jcc_label(Condition::Equal, equal);
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.jmp_label(done);
+            self.asm.bind_text_label(equal);
+            self.asm.mov_imm64(Reg::Rax, 1);
+            self.asm.bind_text_label(done);
+            return;
+        }
         if expected_value != actual_value
             || !matches!(expected_value, NativeValue::Int | NativeValue::Bool)
         {
