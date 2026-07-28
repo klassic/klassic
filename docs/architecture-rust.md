@@ -2141,6 +2141,13 @@ side of a branch.
   `intern_lambda` captures them, so `(y) => y == x` keeps the `x` it was
   written against -- the shape of every caller-supplied bound, and what
   `std.list`'s `contains` is (issue #645).
+- A lambda whose body is a lambda can be bound and applied on aarch64, both
+  through a name (`val inner = outer(2)`) and directly (`outer(2)(3)`). The
+  producer being a lambda rather than a definition is a second path into
+  `returned_lambda_binding`: there is no function-table entry to look the
+  callee up in, so the lambda's own parameters become the captures. Three
+  levels deep is still refused -- the middle lambda's capture is not carried
+  when it is itself produced by a call (issue #632).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

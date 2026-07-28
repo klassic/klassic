@@ -9,6 +9,10 @@
 // Calling the result on the spot always worked; it is the binding that did
 // not, which rules out currying and partial application -- ordinary things to
 // write in this language.
+//
+// The producer can also be a lambda rather than a definition, which is a
+// second path: there is no entry in the function table to look the callee up
+// in, so the lambda's own parameters become the captures.
 
 def adder(n: Int): (Int) => Int = (x) => x + n
 def prefixer(p: String): (String) => String = (s) => p + s
@@ -51,4 +55,16 @@ println(addOne(100))
 println(addTen(100))
 assertResult(101)(addOne(100))
 assertResult(110)(addTen(100))
+// A lambda whose body is a lambda, bound and then applied, and applied
+// directly. Neither had a definition to look up.
+val addLambda = (x) => (y) => x + y
+val addFive = addLambda(5)
+println(addFive(1))
+println(addLambda(2)(3))
+assertResult(6)(addFive(1))
+assertResult(5)(addLambda(2)(3))
+
+// Three levels deep is still refused on arm64 -- the middle lambda's own
+// capture is not carried when it is itself produced by a call -- so this
+// fixture stops at two.
 println("done")
