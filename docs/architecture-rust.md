@@ -2184,6 +2184,13 @@ side of a branch.
   disagreeing quietly is worse than either answer. The renderer reaches
   `println`, list/set/map elements, interpolation holes, `toString`, record
   fields and both kinds of enum payload (issue #644).
+- That renderer is emitted only when declining would fail the build. On the
+  aarch64 host default the driver retries through the portable C backend, which
+  renders *every* Double, so a partial renderer there would trade a working
+  program for a run-time trap; `NativeCompilerConfig::fallback_backend_available`
+  says which situation the build is in, and the backend declines when a
+  fallback exists. A Double the folder can answer never reaches the renderer at
+  all, so the host default keeps compiling those directly.
 - x86-64 makes a Double at run time: `double` of a run-time Int, and `sqrt` /
   `abs` of a run-time Double. Before this the backend could only fold a Double
   it already knew, so its own decimal formatter was unreachable.

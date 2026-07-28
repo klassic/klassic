@@ -2144,6 +2144,14 @@ struct Emitter {
     /// Label of `gc_alloc`, shared between the mutator's allocation sites
     /// and the GC runtime that defines it.
     gc_alloc_label: Option<Label>,
+    /// Whether declining this program hands it to the portable C backend
+    /// rather than failing the build. It decides what to do with a Double
+    /// whose value is not known until run time: the emitted formatter is
+    /// exact for whole numbers and short binary fractions and traps on the
+    /// rest, which beats not building at all but loses to a C build that
+    /// renders every Double. So when a fallback exists, decline; when it does
+    /// not, render what can be rendered.
+    fallback_backend_available: bool,
     /// `--gc-log` / `--gc-stress` / `--gc-poison`, threaded in from the CLI.
     gc_log: bool,
     gc_stress: bool,
@@ -3929,7 +3937,7 @@ impl Emitter {
                 match self.expression(hole)? {
                     ValueType::Str => {}
                     ValueType::Int => self.emit_int_to_str(),
-                    ValueType::Double => self.emit_double_to_str(),
+                    ValueType::Double => self.emit_double_to_str(hole.span())?,
                     ValueType::Bool => self.emit_bool_to_str(),
                     // A collection renders into the hole the way `println`
                     // renders it, through the same builder.
@@ -6123,7 +6131,8 @@ impl Emitter {
     /// Write the Double whose bits are in x0 to stdout, no newline.
     /// The scratch buffer lives on the machine stack, so nothing about it
     /// needs the collector's attention.
-    fn emit_print_double(&mut self) {
+    fn emit_print_double(&mut self, span: Span) -> Result<(), Diagnostic> {
+        self.refuse_partial_double_rendering(span)?;
         self.asm.sub_sp_imm(DOUBLE_BUFFER_BYTES);
         self.asm.add_reg_sp_imm(Reg::X12, 0);
         self.emit_runtime_double_ascii(Reg::X12);
@@ -6131,13 +6140,15 @@ impl Emitter {
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
         self.asm.svc_0x80();
         self.asm.add_sp_imm(DOUBLE_BUFFER_BYTES);
+        Ok(())
     }
 
     /// `toString` of the Double in x0 -> fresh string object in x0. The
     /// Double sibling of `emit_int_to_str`, and copied out of the stack
     /// buffer the same way, so the allocation that follows cannot disturb
     /// the bytes it is about to copy.
-    fn emit_double_to_str(&mut self) {
+    fn emit_double_to_str(&mut self, span: Span) -> Result<(), Diagnostic> {
+        self.refuse_partial_double_rendering(span)?;
         self.asm.sub_sp_imm(DOUBLE_BUFFER_BYTES);
         self.asm.add_reg_sp_imm(Reg::X12, 0);
         self.emit_runtime_double_ascii(Reg::X12);
@@ -6147,6 +6158,27 @@ impl Emitter {
         self.emit_copy_bytes(Reg::X2, Reg::X1, Reg::X7, Reg::X3);
         self.asm.mov_reg(Reg::X0, Reg::X5);
         self.asm.add_sp_imm(DOUBLE_BUFFER_BYTES);
+        Ok(())
+    }
+
+    /// Decline a Double this backend can only sometimes render, when the
+    /// driver will hand the program to a backend that always can.
+    ///
+    /// The formatter below is exact for whole numbers and for binary
+    /// fractions with a short decimal expansion, and traps at run time on the
+    /// rest. A trap is the right answer when the alternative is refusing to
+    /// build -- which is what an explicit `--target` build faces. It is the
+    /// wrong answer when the alternative is the portable C backend, which
+    /// renders every Double: there, declining costs a slower build and
+    /// trapping costs a working program.
+    fn refuse_partial_double_rendering(&self, span: Span) -> Result<(), Diagnostic> {
+        if self.fallback_backend_available {
+            return Err(unsupported(
+                span,
+                "printing a Double whose value is not known at build time",
+            ));
+        }
+        Ok(())
     }
 
     /// A whole-number Double: its integer digits followed by `.0`. The
@@ -6950,7 +6982,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
     fn emit_print_elem(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         match elem {
             ListElem::Double => {
-                self.emit_print_double();
+                self.emit_print_double(span)?;
             }
             ListElem::Enum(shape) => {
                 self.emit_print_enum_inline(shape, span)?;
@@ -7340,7 +7372,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             ("toString", 1) => {
                 match self.expression(&arguments[0])? {
                     ValueType::Int => self.emit_int_to_str(),
-                    ValueType::Double => self.emit_double_to_str(),
+                    ValueType::Double => self.emit_double_to_str(arguments[0].span())?,
                     ValueType::Bool => self.emit_bool_to_str(),
                     ValueType::Str => {}
                     other => {
@@ -9410,7 +9442,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     .expect("a nested element is a list of its inner element");
                 self.emit_list_to_str(inner, "[", "]", span)?;
             }
-            ListElem::Double => self.emit_double_to_str(),
+            ListElem::Double => self.emit_double_to_str(span)?,
         }
         self.asm.mov_reg(Reg::X1, Reg::X0);
         self.asm.load_local(Reg::X0, acc);
@@ -9498,7 +9530,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     }
                     match field_ty {
                         ValueType::Int => self.emit_int_to_str(),
-                        ValueType::Double => self.emit_double_to_str(),
+                        ValueType::Double => self.emit_double_to_str(span)?,
                         ValueType::Bool => self.emit_bool_to_str(),
                         ValueType::Str => {}
                         ValueType::Enum(inner) => self.emit_enum_to_str(inner, span)?,
@@ -9610,7 +9642,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                         }
                         LoweredFieldRepr::Double => {
                             self.emit_unbox_scalar();
-                            self.emit_double_to_str();
+                            self.emit_double_to_str(span)?;
                         }
                     }
                     self.asm.mov_reg(Reg::X1, Reg::X0);
@@ -12220,7 +12252,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 Ok(())
             }
             ValueType::Double => {
-                self.emit_print_double();
+                self.emit_print_double(argument.span())?;
                 self.asm.emit_write_rodata(STDOUT_FD, b"\n");
                 Ok(())
             }
@@ -13553,6 +13585,7 @@ pub(crate) fn emit_macho_program(
     gc_log: bool,
     gc_stress: bool,
     gc_poison: bool,
+    fallback_backend_available: bool,
 ) -> Result<Vec<u8>, Diagnostic> {
     let mut emitter = Emitter {
         lowered_enums,
@@ -13560,6 +13593,7 @@ pub(crate) fn emit_macho_program(
         gc_log,
         gc_stress,
         gc_poison,
+        fallback_backend_available,
         ..Emitter::default()
     };
     emitter.scopes.push(HashMap::new());

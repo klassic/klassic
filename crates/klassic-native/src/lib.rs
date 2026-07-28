@@ -31,6 +31,18 @@ pub struct NativeCompilerConfig {
     /// color, so the load-barrier slow path runs on every load and any
     /// unbarriered dereference faults on a non-canonical address.
     pub gc_poison: bool,
+    /// Whether the driver will retry through the portable C backend if this
+    /// build reports a `Diagnostic` -- true for the aarch64 host default,
+    /// false for an explicit `--target` and for the ELF/PE backends.
+    ///
+    /// A backend that can only *partly* implement a construct has to know
+    /// this. Rendering a run-time Double is the case: the emitted formatter
+    /// covers whole numbers and short exact fractions and traps on the rest,
+    /// which is the best answer available when the alternative is not
+    /// building at all -- and strictly worse than declining when the
+    /// alternative is a C build that renders every Double. Declining at build
+    /// time degrades; trapping at run time does not.
+    pub fallback_backend_available: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -700,6 +712,7 @@ fn compile_internal(
             config.gc_log,
             config.gc_stress,
             config.gc_poison,
+            config.fallback_backend_available,
         )
         .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic)),
     }
@@ -43268,6 +43281,47 @@ mod tests {
         let bytes = compile_source_for_target("<test>", "println(1)", config)
             .expect("program should compile for linux x86_64");
         assert_eq!(&bytes[..4], b"\x7fELF");
+    }
+
+    /// A Double this backend can only sometimes render is declined when the
+    /// driver has a fallback that always can, and emitted when it does not.
+    /// Getting this backwards turns a program that used to build and print
+    /// through the C backend into one that builds and traps at run time.
+    #[test]
+    fn aarch64_declines_a_partial_double_only_when_a_fallback_exists() {
+        let program = "def area(r: Double): Double = r * r * 3.14159\nprintln(area(2.0))\n";
+        let with_fallback = NativeCompilerConfig {
+            target: NativeTarget::MacosAarch64,
+            fallback_backend_available: true,
+            ..NativeCompilerConfig::default()
+        };
+        let declined = compile_source_for_target("<test>", program, with_fallback)
+            .expect_err("a partial Double renderer must defer to the C backend");
+        assert!(
+            format!("{declined}").contains("Double whose value is not known at build time"),
+            "the diagnostic should name what was declined: {declined}"
+        );
+
+        let without_fallback = NativeCompilerConfig {
+            target: NativeTarget::MacosAarch64,
+            fallback_backend_available: false,
+            ..NativeCompilerConfig::default()
+        };
+        compile_source_for_target("<test>", program, without_fallback)
+            .expect("an explicit --target build has no fallback, so it renders what it can");
+    }
+
+    /// A Double the folder can answer never reaches the run-time renderer, so
+    /// the host default keeps compiling it directly.
+    #[test]
+    fn aarch64_still_builds_a_folded_double_with_a_fallback_available() {
+        let config = NativeCompilerConfig {
+            target: NativeTarget::MacosAarch64,
+            fallback_backend_available: true,
+            ..NativeCompilerConfig::default()
+        };
+        compile_source_for_target("<test>", "println(1.5)\nprintln(2.0 + 0.5)\n", config)
+            .expect("a folded Double is formatted at build time, not by the emitted code");
     }
 
     #[test]

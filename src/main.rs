@@ -167,6 +167,12 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 gc_log: command.config.gc_log,
                 gc_stress: command.config.gc_stress,
                 gc_poison: command.config.gc_poison,
+                // Kept in step with the fallback branch below: a backend that
+                // has to choose between a partial implementation and
+                // declining needs to know which of the two the driver will
+                // turn into a working program.
+                fallback_backend_available: !command.config.explicit_target
+                    && target.backend() == NativeBackend::DirectAarch64,
             };
             let user_modules = user_modules_for(&input, &text)?;
             let bytes = match compile_source_with_prelude_and_modules_for_target(
