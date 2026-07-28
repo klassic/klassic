@@ -2156,6 +2156,18 @@ side of a branch.
   are where the newest work lands, so they are the most likely to carry a
   fresh rooting mistake, and a mis-rooted pointer only shows up when a
   collection fires at the wrong moment (issue #653).
+- A generic definition's type variables are solved from a variable *inside* a
+  parameter's annotation, not only from one that is the whole annotation:
+  `xs: List<'a>` against a `List<Int>` argument says `'a` is `Int`. The
+  solutions are then substituted into the *return* annotation too, so a return
+  like `List<{ item: 'a; index: Int }>` -- `std.list`'s `zipWithIndex` --
+  resolves instead of being given up on, which the body then disagreed with
+  (issue #649).
+- aarch64 holds a map in a list (`ListElem::Map`, over scalar key and value
+  types, since `ListElem` is `Copy`). Printing such a list is still refused:
+  it would need the map renderer without its trailing newline, which
+  `emit_println_map` does not separate out (issue #635, holding but not
+  printing).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

@@ -90,13 +90,13 @@ def dropWhile(xs: List<'a>, p: ('a) => Boolean): List<'a> =
 
 // Helper: pair each element with its index starting at `i`.
 // Returns a list of records { item: a; index: Int }.
-def zipWithIndexFrom(xs, i) =
+def zipWithIndexFrom(xs: List<'a>, i: Int): List<{ item: 'a; index: Int }> =
   if(isEmpty(xs)) []
   else cons(record { item: head(xs); index: i })(zipWithIndexFrom(tail(xs), i + 1))
 
 // Pair each element with its zero-based index.
 // Returns List<{ item: a; index: Int }>.
-def zipWithIndex(xs) = zipWithIndexFrom(xs, 0)
+def zipWithIndex(xs: List<'a>): List<{ item: 'a; index: Int }> = zipWithIndexFrom(xs, 0)
 
 // ---------- maxBy / minBy ---------------------------------------------------
 
