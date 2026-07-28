@@ -43,6 +43,7 @@ println(dropWhile([1, 2, 3], (x) => x < 3))
 println(chunk([1, 2, 3, 4, 5], 2))
 println(slice([1, 2, 3, 4], 1, 3))
 println(flatten([[1, 2], [3]]))
+println(zipWithIndex([1, 2]))
 println(contains([1, 2], 2))
 assertResult([2, 3])(filter([1, 2, 3], (x) => x > 1))
 

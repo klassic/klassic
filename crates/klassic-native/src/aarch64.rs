@@ -1301,6 +1301,10 @@ enum ListElem {
     /// `__gc_record` calls -- carrying its entry in the lowered-enum table so
     /// a list of them can be printed. A pointer, like the two above.
     LoweredEnum(u32),
+    /// An element that is a map: a cons chain of two-slot entries, which is
+    /// the same pointer a set or a list element already is. A list of them is
+    /// what grouping produces.
+    Map(ScalarElem, ScalarElem),
     /// An element that is itself a list: `depth` levels of list over `base`.
     /// `List<List<Int>>`'s element is `Nested { depth: 1, base: Int }` and
     /// `List<List<List<Int>>>`'s is `depth: 2`.
@@ -1345,6 +1349,7 @@ impl ListElem {
             ListElem::Enum(_)
             | ListElem::Record(_)
             | ListElem::LoweredEnum(_)
+            | ListElem::Map(..)
             | ListElem::Nested { .. } => None,
         }
     }
@@ -1765,6 +1770,7 @@ fn elem_value_type(elem: ListElem) -> ValueType {
         ListElem::Enum(shape) => ValueType::Enum(shape),
         ListElem::Record(index) => ValueType::Record(index),
         ListElem::LoweredEnum(index) => ValueType::LoweredEnum(index),
+        ListElem::Map(key, value) => ValueType::Map(key.as_elem(), value.as_elem()),
         ListElem::Nested { .. } => ValueType::List(
             elem.nested_inner()
                 .expect("a nested element is a list of its inner element"),
@@ -1991,6 +1997,10 @@ fn list_elem_of(ty: ValueType) -> Option<ListElem> {
         ValueType::Enum(shape) => Some(ListElem::Enum(shape)),
         ValueType::Record(index) => Some(ListElem::Record(index)),
         ValueType::LoweredEnum(index) => Some(ListElem::LoweredEnum(index)),
+        // Only a map over scalars: `ListElem` is `Copy`, so a nested key or
+        // value type has nowhere to live -- the same reason `Nested` carries a
+        // depth rather than a boxed element.
+        ValueType::Map(key, value) => Some(ListElem::Map(key.as_scalar()?, value.as_scalar()?)),
         // A list of lists: one more level over whatever the inner list holds.
         ValueType::List(inner) => Some(match inner.as_scalar() {
             Some(base) => ListElem::Nested { depth: 1, base },
@@ -6612,6 +6622,13 @@ impl Emitter {
             ListElem::LoweredEnum(index) => {
                 self.emit_print_lowered_enum(index, span)?;
             }
+            // A map *element* would need the map renderer without its
+            // trailing newline, which `emit_println_map` does not separate
+            // out. Holding one in a list works; printing the list does not
+            // yet.
+            ListElem::Map(..) => {
+                return Err(unsupported(span, "printing a map element"));
+            }
             ListElem::Record(index) => {
                 self.emit_print_record_inline(index, span)?;
             }
@@ -9033,6 +9050,9 @@ impl Emitter {
             ListElem::Str => {}
             ListElem::Enum(shape) => self.emit_enum_to_str(shape, span)?,
             ListElem::LoweredEnum(index) => self.emit_lowered_enum_to_str(index, span)?,
+            ListElem::Map(..) => {
+                return Err(unsupported(span, "rendering a map element"));
+            }
             ListElem::Record(_) => {
                 return Err(unsupported(span, "rendering a record element"));
             }
@@ -10549,7 +10569,7 @@ impl Emitter {
             name,
             params,
             body,
-            declared_return,
+            mut declared_return,
             param_annotations,
             return_annotation,
         } = self.generic_functions[generic].clone();
@@ -10632,14 +10652,36 @@ impl Emitter {
                 continue;
             };
             let text = annotation.trim();
-            if !text.starts_with('\'') {
+            if text.starts_with('\'') {
+                let Some(name) = type_annotation_name(*ty) else {
+                    continue;
+                };
+                if !bindings.iter().any(|(known, _)| known == text) {
+                    bindings.push((text.to_string(), name));
+                }
                 continue;
             }
-            let Some(name) = type_annotation_name(*ty) else {
-                continue;
-            };
-            if !bindings.iter().any(|(known, _)| known == text) {
-                bindings.push((text.to_string(), name));
+            // A variable *inside* a larger annotation: `xs: List<'a>` against
+            // a `List<Int>` argument says `'a` is `Int`. Only the one-level
+            // application is read, which is what the stdlib's own signatures
+            // are written in, and it is what lets a return type mentioning
+            // the same variable be resolved below.
+            if let Some((head, args)) = split_type_arguments(text)
+                && args.len() == 1
+                && args[0].trim().starts_with('\'')
+            {
+                let solved = match (head, *ty) {
+                    ("List", ValueType::List(elem)) | ("Set", ValueType::Set(elem)) => {
+                        type_annotation_name(elem_value_type(elem))
+                    }
+                    _ => None,
+                };
+                let variable = args[0].trim().to_string();
+                if let Some(name) = solved
+                    && !bindings.iter().any(|(known, _)| *known == variable)
+                {
+                    bindings.push((variable, name));
+                }
             }
         }
         if !bindings.is_empty() {
@@ -10666,6 +10708,22 @@ impl Emitter {
                 if let Ok(resolved @ ValueType::Enum(_)) = self.annotation_type(&applied, span) {
                     value_params[position].1 = resolved;
                     argument_types[position] = resolved;
+                }
+            }
+            // The *return* annotation gets the same substitution. A return
+            // that mentions a type variable inside a larger type --
+            // `List<{ item: 'a; index: Int }>`, which is what
+            // `std.list`'s `zipWithIndex` answers -- cannot be resolved as
+            // written, and the body then disagreed with a return type the
+            // backend had given up on.
+            if declared_return.is_none()
+                && let Some(annotation) = return_annotation.as_ref()
+            {
+                let applied = substitute_type_params(annotation, &variables, &solutions);
+                if applied != *annotation
+                    && let Ok(resolved) = self.annotation_type(&applied, span)
+                {
+                    declared_return = Some(resolved);
                 }
             }
         }
@@ -11883,6 +11941,9 @@ impl Emitter {
                     self.emit_unbox_scalar();
                 }
                 match elem {
+                    ListElem::Map(..) => {
+                        return Err(unsupported(argument.span(), "printing a nullable map"));
+                    }
                     ListElem::Int => self.asm.emit_print_int_line(),
                     ListElem::Str => self.emit_println_str(),
                     ListElem::Bool => {
