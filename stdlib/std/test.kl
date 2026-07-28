@@ -6,24 +6,24 @@ module std.test
 // readable failure messages so a failed script prints something
 // closer to a unit-test report.
 
-def passed(name) = println("[ OK ] " + name)
+def passed(name: String): Unit = println("[ OK ] " + name)
 
-def failed(name, reason) = printlnError("[FAIL] " + name + ": " + reason)
+def failed(name: String, reason: String): Unit = printlnError("[FAIL] " + name + ": " + reason)
 
-def expectTrue(name, value) = if(value) passed(name) else failed(name, "expected true but got false")
+def expectTrue(name: String, value: Boolean): Unit = if(value) passed(name) else failed(name, "expected true but got false")
 
-def expectFalse(name, value) = if(value) failed(name, "expected false but got true") else passed(name)
+def expectFalse(name: String, value: Boolean): Unit = if(value) failed(name, "expected false but got true") else passed(name)
 
-def expectEqualsInt(name, expected, actual) = if((expected == actual)) passed(name) else failed(name, "expected " + toString(expected) + " but got " + toString(actual))
+def expectEqualsInt(name: String, expected: Int, actual: Int): Unit = if((expected == actual)) passed(name) else failed(name, "expected " + toString(expected) + " but got " + toString(actual))
 
-def expectEqualsString(name, expected, actual) = if((expected == actual)) passed(name) else failed(name, "expected " + expected + " but got " + actual)
+def expectEqualsString(name: String, expected: String, actual: String): Unit = if((expected == actual)) passed(name) else failed(name, "expected " + expected + " but got " + actual)
 
-def fail(name, reason) = failed(name, reason)
+def fail(name: String, reason: String): Unit = failed(name, reason)
 
 // Runs `body` as a named test suite. The header `[suite] <name>`
 // prints first; `body` must be a thunk (`() => { ... }`) so the
 // header lands before the contained `expect...` lines.
-def suite(name, body) = {
+def suite(name: String, body: () => Unit): Unit = {
   println("[suite] " + name)
   body()
 }

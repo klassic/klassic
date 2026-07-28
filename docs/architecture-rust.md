@@ -2067,6 +2067,62 @@ side of a branch.
   argument is named -- so it is not the partial resolution issue #612 is
   about, which stays refused. Covered by
   `tests/cross-exec/41-annotated-generic-enum.kl` (issue #612, the safe part).
+- An enum the program declared, carried inside a generic one, prints as
+  itself. `Ok(Red)` used to compile, run and print `Ok(<enum>)` on x86-64 --
+  a wrong answer rather than a diagnostic, which is the one outcome this
+  backend must not produce. `mono_enum_shapes` is keyed by the enum's own name
+  as well as by each variant's, so an *annotation* (`Result<Colour, String>`)
+  can find the payload's shape; the placeholder is replaced by a marker that
+  refuses the program where a payload genuinely cannot be named. aarch64
+  gained the same nested case in both its enum renderers (issue #647).
+- aarch64's diagnostics no longer print the emitter's internal type names.
+  `Record(0)` and `Nested { depth: 1, base: Int }` -- the `Debug` spelling of
+  a table index and a nesting depth -- are now `a record` and `List<Int>`,
+  through `type_display_name` / `elem_display_name` at the five sites that
+  formatted a type (issue #633).
+- aarch64 prints a nullable whose value half is a list, a record or an enum,
+  by routing it through `emit_print_elem` -- `Map#get` answers one, so a map
+  of lists could not be read. Only a nullable Double is still refused, for
+  want of a run-time Double formatter (issue #634).
+- Five more stdlib modules carry type annotations: `std.test`, `std.set`,
+  `std.math`, `std.option`, `std.result` (issue #643, first half). As with
+  #622, annotating uncovered the real gaps rather than only fixing the
+  diagnostic:
+  - `static_type_under`'s `match` arm vetoed the whole expression when any one
+    arm could not be typed, where an `if` in the same position lets the known
+    branch stand. `case None => None` says nothing about the payload, so every
+    `Option`-returning helper was untypeable on aarch64. An untypeable arm is
+    skipped now; two arms that genuinely disagree still answer `None`.
+  - `Expr::Unit` had no aarch64 codegen, so a helper written for its effect --
+    `ifPresent` is `{ f(v); () }` -- could not be compiled there.
+  - A unit-typed binding is allowed. `val t = thread(...)` is how a thread is
+    written even when the handle is unused, and since #631 an assignment is
+    unit-typed too (issue #637).
+- A runtime error raised inside an inlined stdlib function no longer names a
+  line the user's file does not have. Such a module is parsed against its own
+  source, so its spans are offsets into *that* file; subtracting the prelude
+  offset from one landed past the end of the user's text and was still
+  reported as a position in it -- `program.kl:9:1` for an eight-line program.
+  A position outside the text is not a position in it, so the report falls
+  back to the bundle. A failure in the user's own code keeps its exact
+  position, which two tests pin (issue #636).
+- An `if` whose branches disagree reports at the else branch rather than at
+  the whole expression, which pointed at the `if` keyword -- often several
+  lines above, since `else` may start a continuation line. A list and a
+  `match` already named the offending element (issue #654).
+- aarch64 gained `Environment#vars`: the same `envp` walk `Environment#get`
+  does, without a key, building its list the way `CommandLine#args` does
+  (issue #646).
+- Three stdlib members that no native backend could take are written in terms
+  of ones every backend has: `mapKeys` folds over `Map#put` instead of going
+  through `Map#fromPairs` (issue #640), `at` gets its error branch an element
+  type by dropping the whole list rather than asking for the head of a bare
+  `[]` (issue #649), and `parseIntOr` is `isInt` plus `parseInt` rather than a
+  delegation to the unimplemented `String#parseIntOr` (issue #639). The last
+  one also needed `String#isInt` to accept a heap string, which is what an
+  annotated `String` parameter holds, and to trim before `parseInt` -- `isInt`
+  trims and `parseInt` does not, so `" 9 "` was called a number and then
+  failed to parse.
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

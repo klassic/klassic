@@ -2097,6 +2097,16 @@ fn desugar_enums(expr: Expr) -> DesugaredEnums {
                 .or_insert_with(|| shape.clone());
         }
     }
+    // Also keyed by the enum's own name. A variant name is what a
+    // construction site has, but an *annotation* -- `Result<Colour, String>`
+    // -- names the enum, and rendering a payload declared that way needs its
+    // shape. Without this the display fell back to a `<enum>` placeholder and
+    // printed it, which is a wrong answer rather than a refusal.
+    for (enum_name, shape) in &enum_shapes {
+        mono_enum_shapes
+            .entry(enum_name.clone())
+            .or_insert_with(|| shape.clone());
+    }
 
     let mut lowering = EnumLowering {
         variants: variants.clone(),
@@ -2666,6 +2676,12 @@ impl EnumLowering {
     }
 }
 
+/// The marker `en_build_enum_display` leaves where a nested enum payload has
+/// no shape to render with. Reaching it at codegen is a refusal, not output:
+/// the alternative was a `<enum>` placeholder that printed as if it were the
+/// value.
+const UNRENDERABLE_ENUM_PAYLOAD: &str = "__enum_payload_unrenderable";
+
 /// Wrap a lowered monomorphic-enum construction in a marker call that
 /// publishes the value's variant name to codegen. The codegen handler
 /// (`compile_enum_shape_named`) looks the name up in `mono_enum_shapes`
@@ -2909,9 +2925,12 @@ fn en_build_variant_display(
                     nested_enabled,
                     span,
                 ),
-                // Nested display not enabled (or no tracked nested shape):
-                // render a placeholder rather than a raw pointer.
-                _ => en_string("<enum>", span),
+                // No shape to render this payload with. Marked so the caller
+                // refuses the program: printing a placeholder here compiled,
+                // ran and printed `Ok(<enum>)` where the evaluator prints
+                // `Ok(Red)` -- a wrong answer rather than a diagnostic, which
+                // is the one thing this backend must never produce.
+                _ => en_call(UNRENDERABLE_ENUM_PAYLOAD, Vec::new(), span),
             },
         };
         acc = en_str_concat(acc, field_text, span);
@@ -5214,7 +5233,12 @@ impl NativeCodeGenerator {
             _ => {}
         }
         if self.lowered_enum_names.contains(trimmed) {
-            return Some((EnumFieldRepr::EnumField, None));
+            // A lowered enum's own shape, so a payload declared as one can be
+            // rendered rather than printed as a placeholder.
+            return Some((
+                EnumFieldRepr::EnumField,
+                self.mono_enum_shapes.get(trimmed).cloned(),
+            ));
         }
         let nested = self.generic_enum_annotation_shape(trimmed)?;
         Some((EnumFieldRepr::EnumField, Some(nested)))
@@ -8301,6 +8325,10 @@ impl NativeCodeGenerator {
             "__runtime_double" => self.compile_runtime_double_of(arguments, span),
             "__gc_write" => self.compile_gc_write(arguments, span),
             "__enum_shape_hint" => self.compile_enum_shape_hint(arguments, span),
+            UNRENDERABLE_ENUM_PAYLOAD => Err(unsupported(
+                span,
+                "printing an enum whose payload is an enum this backend cannot name",
+            )),
             "__enum_shape_named" => self.compile_enum_shape_named(arguments, span),
             "__match_fail" => self.compile_match_fail(span),
             "assert" => {
@@ -8550,9 +8578,13 @@ impl NativeCodeGenerator {
             // known while compiling (Rust's own parse decides, so the answer
             // is the evaluator's by construction), scanned when it is not.
             "String#isInt" | "String#isDouble" if arguments.len() == 1 => {
-                if self.expr_may_yield_runtime_string(&arguments[0]) {
+                // A heap string counts as one only known at run time: it is
+                // what an annotated `String` parameter holds, and `std.string`
+                // asks this of its own parameter.
+                if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) = self.native_string_ref_or_copy(input, span, name.as_str())
+                    else {
                         return Err(unsupported(span, &format!("native {name} for non-string")));
                     };
                     return Ok(if name == "String#isInt" {
@@ -9367,6 +9399,10 @@ impl NativeCodeGenerator {
             "__runtime_double" => self.compile_runtime_double_of(arguments, span).map(Some),
             "__gc_write" => self.compile_gc_write(arguments, span).map(Some),
             "__enum_shape_hint" => self.compile_enum_shape_hint(arguments, span).map(Some),
+            UNRENDERABLE_ENUM_PAYLOAD => Err(unsupported(
+                span,
+                "printing an enum whose payload is an enum this backend cannot name",
+            )),
             "__enum_shape_named" => self.compile_enum_shape_named(arguments, span).map(Some),
             "__match_fail" => self.compile_match_fail(span).map(Some),
             "head" => self.compile_static_head(arguments, span).map(Some),
@@ -37152,8 +37188,16 @@ impl NativeCodeGenerator {
             && span.start >= view.prelude_byte_offset
         {
             let user_start = span.start - view.prelude_byte_offset;
-            let (line, column) = view.source.line_col(user_start);
-            return format!("{}:{line}:{column}: ", view.source.name());
+            // An inlined stdlib module was parsed against its own source, so
+            // its spans are offsets into *that* file. Subtracting the prelude
+            // offset from one lands somewhere arbitrary, and past the end of
+            // the user's text it named a line the program does not have --
+            // `r8.kl:9:1` for an eight-line file. A position outside the text
+            // is not a position in it.
+            if user_start < view.source.text().len() {
+                let (line, column) = view.source.line_col(user_start);
+                return format!("{}:{line}:{column}: ", view.source.name());
+            }
         }
         let (line, column) = self.source.line_col(span.start);
         format!("{}:{line}:{column}: ", self.source.name())

@@ -1,0 +1,61 @@
+// Cross-target fixture: the free functions of std.option.
+//
+// The module was unannotated, so a backend that compiles a function once
+// could not give `map`'s result a type -- the diagnostic named
+// `__mod_std_option_map`, a function the user never wrote. Annotating it is
+// what makes the calls below compile, and it uncovered two things underneath:
+//
+//   - a `match` whose arms could not all be typed vetoed the whole
+//     expression, where an `if` in the same position does not. `case None =>
+//     None` says nothing about the payload, so every Option-returning helper
+//     was untypeable.
+//   - `()` had no aarch64 codegen at all, so a helper written for its effect
+//     -- `ifPresent` is `{ f(v); () }` -- could not be compiled there.
+//
+// std.result is not here: the two modules export the same free names
+// (`map`, `fold`, `filter`, `contains`, `exists`), so importing both
+// unaliased makes every shared call ambiguous, and aliasing them hides the
+// constructors a fixture needs. Its own coverage waits on that being
+// resolved.
+//
+// The `None` side of each helper is exercised through `isNone`/`getOrElse`
+// rather than through `map(none, ...)`: a helper applied to the empty case
+// answers `None`, whose payload type nothing fixes, and that is issue #612's
+// territory rather than this fixture's.
+
+import std.option
+// Selective, because `std.set` also exports `contains` with a different
+// arity and `std.math` a `min`/`max` that would shadow nothing here but
+// keeps the intent clear.
+import std.set.{setFilter, setMap, setFold}
+import std.math.{mod, clamp, lcm, factorial, isPrime}
+
+val some: Option<Int> = Some(2)
+val none: Option<Int> = None
+println(map(some, (x) => x + 1))
+println(flatMap(some, (x) => Some(x * 10)))
+println(filter(some, (x) => x > 1))
+println(filter(some, (x) => x > 9))
+println(fold(some, 0, (x) => x * 100))
+println(isSome(some))
+println(isNone(none))
+println(getOrElse(none, 9))
+println(contains(some, 2))
+println(exists(some, (x) => x > 1))
+assertResult("Some(3)")("#{map(some, (x) => x + 1)}")
+assertResult(200)(fold(some, 0, (x) => x * 100))
+
+// A helper written for its effect, which is where the unit literal turns up.
+println(ifPresent(some, (x) => println(x)))
+
+// std.set and std.math, annotated in the same pass.
+println(setFilter(%(1, 2, 3), (x) => x > 1))
+println(setMap(%(1, 2), (x) => x * 2))
+println(setFold(%(1, 2, 3), 0, (a, x) => a + x))
+println(mod(7, 3))
+println(clamp(9, 0, 5))
+println(lcm(4, 6))
+println(factorial(5))
+println(isPrime(7))
+assertResult(6)(setFold(%(1, 2, 3), 0, (a, x) => a + x))
+println("done")

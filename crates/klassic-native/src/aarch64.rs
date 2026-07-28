@@ -1715,6 +1715,47 @@ fn is_heap_pointer(ty: ValueType) -> bool {
     )
 }
 
+/// A type named the way the language names it, for a diagnostic. The `Debug`
+/// spelling of these is an emitter table index and a nesting depth --
+/// `Record(0)`, `Nested { depth: 1, base: Int }` -- which says nothing to
+/// someone reading their own program.
+fn type_display_name(ty: ValueType) -> String {
+    match ty {
+        ValueType::Int => "Int".to_string(),
+        ValueType::Double => "Double".to_string(),
+        ValueType::Bool => "Boolean".to_string(),
+        ValueType::Str => "String".to_string(),
+        ValueType::Unit => "Unit".to_string(),
+        ValueType::Null => "null".to_string(),
+        ValueType::Never => "a diverging expression".to_string(),
+        ValueType::Ptr => "a heap value".to_string(),
+        ValueType::Record(_) => "a record".to_string(),
+        ValueType::Enum(_) | ValueType::LoweredEnum(_) => "an enum".to_string(),
+        ValueType::EmptyList => "List".to_string(),
+        ValueType::EmptySet => "Set".to_string(),
+        ValueType::EmptyMap => "Map".to_string(),
+        ValueType::List(elem) => format!("List<{}>", elem_display_name(elem)),
+        ValueType::Set(elem) => format!("Set<{}>", elem_display_name(elem)),
+        ValueType::Map(key, value) => format!(
+            "Map<{}, {}>",
+            elem_display_name(key),
+            elem_display_name(value)
+        ),
+        ValueType::Nullable(elem) => format!("a nullable {}", elem_display_name(elem)),
+    }
+}
+
+/// The same for an element type.
+fn elem_display_name(elem: ListElem) -> String {
+    match elem {
+        ListElem::Nested { .. } => elem
+            .nested_inner()
+            .map(|inner| format!("List<{}>", elem_display_name(inner)))
+            .unwrap_or_else(|| "List".to_string()),
+        other => type_display_name(elem_value_type(other)),
+    }
+}
+
 fn elem_value_type(elem: ListElem) -> ValueType {
     match elem {
         ListElem::Int => ValueType::Int,
@@ -3137,6 +3178,13 @@ impl Emitter {
                 self.asm.mov_imm64(Reg::X0, *value as u64);
                 Ok(ValueType::Int)
             }
+            // The unit literal. `()` is what a function written for its
+            // effect ends with -- `std.option`'s `ifPresent` is
+            // `{ f(v); () }` -- so without it every such helper was refused.
+            Expr::Unit { .. } => {
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(ValueType::Unit)
+            }
             // An assignment in expression position: done for its effect, so
             // it yields unit. Two `match` arms that both end in one therefore
             // agree, which is what lets a `match` be written for effect.
@@ -3882,7 +3930,7 @@ impl Emitter {
                     other => {
                         return Err(unsupported(
                             hole.span(),
-                            &format!("string interpolation of {other:?}"),
+                            &format!("string interpolation of {}", type_display_name(other)),
                         ));
                     }
                 }
@@ -6722,6 +6770,11 @@ impl Emitter {
                     }
                     match field_ty {
                         ValueType::Enum(inner) => self.emit_print_enum_inline(inner, span)?,
+                        // A payload that is an enum the shared pass lowered:
+                        // `Ok(Red)` where `Red` is the program's own enum.
+                        ValueType::LoweredEnum(inner) => {
+                            self.emit_print_lowered_enum(inner, span)?
+                        }
                         ValueType::Record(inner) => self.emit_print_record_inline(inner, span)?,
                         other => {
                             let Some(elem) = list_elem_of(other) else {
@@ -6930,7 +6983,10 @@ impl Emitter {
                     ValueType::Bool => self.emit_bool_to_str(),
                     ValueType::Str => {}
                     other => {
-                        return Err(unsupported(span, &format!("toString of {other:?}")));
+                        return Err(unsupported(
+                            span,
+                            &format!("toString of {}", type_display_name(other)),
+                        ));
                     }
                 }
                 Ok(Some(ValueType::Str))
@@ -7879,6 +7935,42 @@ impl Emitter {
             // as a list of strings, taken from the `argv` the entry point
             // stashed. Skips element 0, the program name, like the
             // evaluator's script arguments do.
+            // `Environment#vars()`: every `KEY=VALUE` entry of the `envp`
+            // array captured at entry, as a list of heap strings. The same
+            // walk `Environment#get` does, without a key to match, and built
+            // the way `CommandLine#args` builds its list -- prepend, then
+            // reverse, so the order is the environment's own.
+            ("Environment#vars", 0) => {
+                let acc = self.reserve_locals(16);
+                let cursor = acc + 8;
+                let mark = self.open_temp_roots();
+                self.asm.mov_imm64(Reg::X0, 0); // nil
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                self.asm.mov_reg(Reg::X0, Reg::X23); // envp
+                self.asm.store_local(Reg::X0, cursor);
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.ldr_imm(Reg::X0, Reg::X0, 0); // this entry
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+                self.emit_heap_string_from_cstring();
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.add_reg_imm(Reg::X0, Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::List(ListElem::Str)))
+            }
             ("CommandLine#args", 0) => {
                 let acc = self.reserve_locals(8);
                 let mark = self.open_temp_roots();
@@ -9035,12 +9127,18 @@ impl Emitter {
                         ValueType::Bool => self.emit_bool_to_str(),
                         ValueType::Str => {}
                         ValueType::Enum(inner) => self.emit_enum_to_str(inner, span)?,
+                        ValueType::LoweredEnum(inner) => {
+                            self.emit_lowered_enum_to_str(inner, span)?
+                        }
                         ValueType::List(elem) => self.emit_list_to_str(elem, "[", "]", span)?,
                         ValueType::Set(elem) => self.emit_list_to_str(elem, "%(", ")", span)?,
                         other => {
                             return Err(unsupported(
                                 span,
-                                &format!("rendering an enum payload of type {other:?}"),
+                                &format!(
+                                    "rendering an enum payload of type {}",
+                                    type_display_name(other)
+                                ),
                             ));
                         }
                     }
@@ -9884,9 +9982,19 @@ impl Emitter {
                     }
                     let arm_ty = self.static_type_under(&arm.body, locals, depth + 1);
                     locals.truncate(mark);
-                    let arm_ty = arm_ty?;
+                    // An arm whose type is unknown does not veto the arms that
+                    // are known, the same way an `if`'s unknown branch does
+                    // not. `case None => None` says nothing about the payload
+                    // -- the empty case carries none -- so vetoing on it left
+                    // every `Option`-returning helper untypeable.
+                    let Some(arm_ty) = arm_ty else {
+                        continue;
+                    };
                     result = Some(match result {
                         None => arm_ty,
+                        // Two arms this backend cannot reconcile is a real
+                        // disagreement, not a missing answer, so the `?`
+                        // abandons the whole match rather than skipping one.
                         Some(previous) => self.merge_types(previous, arm_ty)?,
                     });
                 }
@@ -11729,14 +11837,26 @@ impl Emitter {
                         self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
                         self.asm.bind(bool_end);
                     }
-                    ListElem::Double
-                    | ListElem::Enum(_)
+                    // Everything `emit_print_elem` can already render: a
+                    // lookup answers a value or nothing, and the value half is
+                    // an ordinary element. Only a Double is left out, because
+                    // this backend has no run-time formatter for one.
+                    ListElem::Enum(_)
                     | ListElem::Record(_)
                     | ListElem::LoweredEnum(_)
                     | ListElem::Nested { .. } => {
+                        self.emit_print_elem(elem, argument.span())?;
+                        self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+                        self.asm.branch(end_label, BranchKind::Unconditional);
+                        self.asm.bind(null_label);
+                        self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
+                        self.asm.bind(end_label);
+                        return Ok(());
+                    }
+                    ListElem::Double => {
                         return Err(unsupported(
                             argument.span(),
-                            &format!("printing a nullable {elem:?}"),
+                            &format!("printing a nullable {}", elem_display_name(elem)),
                         ));
                     }
                 }
@@ -11758,7 +11878,7 @@ impl Emitter {
             }
             other => Err(unsupported(
                 argument.span(),
-                &format!("printing a {other:?} value"),
+                &format!("printing {}", type_display_name(other)),
             )),
         }
     }
@@ -11945,10 +12065,13 @@ impl Emitter {
                         .insert(name.clone(), mapping);
                     return Ok(());
                 }
+                // A unit-typed binding holds nothing worth storing, but the
+                // name still has to exist: `val t = thread(...)` is how a
+                // thread is written even when the handle is unused, and since
+                // an assignment became unit-typed there is a second way to
+                // reach one. The slot is written like any other -- the value
+                // in x0 is zero -- so nothing downstream needs a special case.
                 let ty = self.expression(value)?;
-                if ty == ValueType::Unit {
-                    return Err(unsupported(value.span(), "a unit-typed binding"));
-                }
                 // A `mutable` slot has to hold everything that will be
                 // assigned to it, not just what it starts as: `mutable c =
                 // Nil` followed by `c = Cons(v, c)` starts as an enum shape

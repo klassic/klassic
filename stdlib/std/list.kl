@@ -132,7 +132,12 @@ def slice(xs, from, to) = {
 // index raises the existing head-on-empty error. A negative index is
 // out of range too (without the guard `drop` treats it as 0 and returns
 // the head).
-def at(xs, i) = if(i < 0) head([]) else head(drop(xs, i))
+// A negative index raises the same out-of-range error a too-large one does,
+// and it does so by asking for the head of an empty list. Dropping every
+// element of `xs` is how that empty list gets an element type: a bare `[]`
+// has none, so the branch could not be compiled for any instantiation.
+def at(xs: List<'a>, i: Int): 'a =
+  if(i < 0) head(drop(xs, size(xs))) else head(drop(xs, i))
 
 // ---------- scanLeft --------------------------------------------------------
 

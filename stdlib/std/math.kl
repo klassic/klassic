@@ -4,19 +4,19 @@ module std.math
 // (`abs`, `floor`, `ceil`, `sqrt`, `Math#powInt`, ...) stay accessible
 // directly without going through this module.
 
-def mod(n, m) = n - (n / m) * m
+def mod(n: Int, m: Int): Int = n - (n / m) * m
 
-def min(a, b) = if((a <= b)) a else b
+def min(a: Int, b: Int): Int = if((a <= b)) a else b
 
-def max(a, b) = if((a >= b)) a else b
+def max(a: Int, b: Int): Int = if((a >= b)) a else b
 
-def clamp(n, lo, hi) = if((n < lo)) lo else if((n > hi)) hi else n
+def clamp(n: Int, lo: Int, hi: Int): Int = if((n < lo)) lo else if((n > hi)) hi else n
 
-def isEven(n) = mod(n, 2) == 0
+def isEven(n: Int): Boolean = mod(n, 2) == 0
 
-def isOdd(n) = mod(n, 2) != 0
+def isOdd(n: Int): Boolean = mod(n, 2) != 0
 
-def sign(n) = if((n > 0)) 1 else if((n < 0)) -1 else 0
+def sign(n: Int): Int = if((n > 0)) 1 else if((n < 0)) -1 else 0
 
 // Method-style access for integer-typed receivers. The dispatch key is
 // the outer type constructor `Int`, so Byte / Short / Long values also
@@ -39,32 +39,32 @@ extension (this: Double) {
 }
 
 // Constants (as 0-argument defs since Klassic has no const)
-def pi() = atan2(0.0, -1.0)
+def pi(): Double = atan2(0.0, -1.0)
 
-def e() = exp(1.0)
+def e(): Double = exp(1.0)
 
 // Angle conversions
-def degreesToRadians(d) = d * pi() / 180.0
+def degreesToRadians(d: Double): Double = d * pi() / 180.0
 
-def radiansToDegrees(r) = r * 180.0 / pi()
+def radiansToDegrees(r: Double): Double = r * 180.0 / pi()
 
 // LCM: Least Common Multiple
-def lcm(a, b) = if((a == 0 || b == 0)) 0 else abs(a * b) / Math#gcd(a, b)
+def lcm(a: Int, b: Int): Int = if((a == 0 || b == 0)) 0 else abs(a * b) / Math#gcd(a, b)
 
 // Hypot: sqrt(x^2 + y^2) for computing hypotenuse
-def hypot(x, y) = sqrt(double(x) * double(x) + double(y) * double(y))
+def hypot(x: Int, y: Int): Double = sqrt(double(x) * double(x) + double(y) * double(y))
 
 // Factorial: recursive definition
-def factorial(n) = if((n <= 1)) 1 else n * factorial(n - 1)
+def factorial(n: Int): Int = if((n <= 1)) 1 else n * factorial(n - 1)
 
 // isPrime: check if a number is prime
-def isPrime(n) =
+def isPrime(n: Int): Boolean =
   if((n < 2)) false
   else if((n == 2)) true
   else if((mod(n, 2) == 0)) false
   else isPrimeHelper(n, 3)
 
-def isPrimeHelper(n, divisor) =
+def isPrimeHelper(n: Int, divisor: Int): Boolean =
   if((divisor * divisor > n)) true
   else if((mod(n, divisor) == 0)) false
   else isPrimeHelper(n, divisor + 2)
