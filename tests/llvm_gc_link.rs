@@ -115,10 +115,19 @@ fn c_gc_links_and_runs_from_llvm_ir() {
     };
     let gc_src = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/gc/klassic_gc.c");
     let dir = std::env::temp_dir();
-    let stamp = std::time::SystemTime::now()
+    // Unique per build, not merely per nanosecond: parallel tests that start
+    // together otherwise share an output path and execute each other's
+    // half-linked file (`ETXTBSY`).
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
+    let stamp = format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let ll = dir.join(format!("klassic-gc-link-{stamp}.ll"));
     let exe = dir.join(format!("klassic-gc-link-{stamp}"));
     std::fs::write(&ll, IR).expect("write IR");

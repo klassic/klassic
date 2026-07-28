@@ -4558,6 +4558,21 @@ struct NativeCodeGenerator {
     /// same one.
     gc_shadow_push: TextLabel,
     gc_shadow_pop: TextLabel,
+    /// Called once at startup, and emitted after every collection literal has
+    /// been compiled, so it can push a root for each cell those literals
+    /// spilled a heap pointer into.
+    literal_root_seed: TextLabel,
+    /// The cells themselves. A collection element that is a GC pointer lives
+    /// in one for the whole program, which is what makes it a root the
+    /// collector can trace and update -- a `.data` cell is invisible to it
+    /// otherwise, and the element would be stale the first time a collection
+    /// moved the object.
+    literal_root_cells: Vec<DataLabel>,
+    /// What each of those cells holds, for the ones whose value is a lowered
+    /// enum. Rendering the element needs the enum's shape, which the value
+    /// itself does not carry; the cell is the key because `CompiledLiteralValue`
+    /// already identifies the element by it.
+    literal_enum_shapes: HashMap<DataLabel, ConcreteEnumShape>,
     gc_bounds_error_text: DataLabel,
     /// Lowest rsp the program may reach before the prologue probe
     /// aborts: initial rsp minus RLIMIT_STACK plus a safety margin,
@@ -4800,6 +4815,7 @@ impl NativeCodeGenerator {
             asm.data_label_with_bytes(b"klassic gc: shadow stack overflow\n");
         let gc_shadow_underflow_text =
             asm.data_label_with_bytes(b"klassic gc: shadow stack underflow\n");
+        let literal_root_seed = asm.create_text_label();
         let gc_shadow_push = asm.create_text_label();
         let gc_shadow_pop = asm.create_text_label();
         let gc_bounds_error_text = asm.data_label_with_bytes(b"klassic gc: index out of bounds\n");
@@ -4969,6 +4985,9 @@ impl NativeCodeGenerator {
             gc_shadow_underflow_text,
             gc_shadow_push,
             gc_shadow_pop,
+            literal_root_seed,
+            literal_root_cells: Vec::new(),
+            literal_enum_shapes: HashMap::new(),
             gc_bounds_error_text,
             stack_floor,
             stack_overflow_abort,
@@ -5591,6 +5610,11 @@ impl NativeCodeGenerator {
         self.emit_initialize_stack_floor();
         self.emit_initialize_gc_heap();
         self.emit_initialize_color_registers();
+        // Roots the cells that collection literals spill heap pointers into.
+        // The routine is emitted after every literal has been compiled, so
+        // this call is a forward reference to a body whose size is not known
+        // until then.
+        self.asm.call_label(self.literal_root_seed);
         self.compile_top_level(expr)?;
         self.emit_queued_threads()?;
         if self.gc_log {
@@ -5598,6 +5622,9 @@ impl NativeCodeGenerator {
         }
         self.emit_exit_success();
         self.emit_functions()?;
+        // After `emit_functions`, because a literal inside a function body
+        // allocates its cell while that body compiles.
+        self.emit_literal_root_seed();
         self.emit_stack_overflow_abort_runtime();
         self.emit_print_i64_runtime();
         self.emit_gc_mark_visit_runtime();
@@ -12286,10 +12313,24 @@ impl NativeCodeGenerator {
         ) {
             let slot = self.asm.data_label_with_i64s(&[0]);
             self.emit_store_rax_to_data_slot(slot);
-            CompiledLiteralValue::Scalar { value, slot }
-        } else {
-            CompiledLiteralValue::Native(value)
+            return CompiledLiteralValue::Scalar { value, slot };
         }
+        // A GC pointer spills the same way, but its cell also has to be a
+        // root: the collector traces and *moves* what it points at, and a
+        // plain `.data` cell is invisible to both walks. `emit_literal_root_seed`
+        // pushes one shadow-stack entry per cell at startup.
+        if value == NativeValue::HeapPointer {
+            let slot = self.asm.data_label_with_i64s(&[0]);
+            self.emit_store_rax_to_data_slot(slot);
+            self.literal_root_cells.push(slot);
+            // The value itself does not say which enum it is; the marker the
+            // lowering leaves does, and it published the shape just now.
+            if let Some(shape) = self.pending_enum_shape.clone() {
+                self.literal_enum_shapes.insert(slot, shape);
+            }
+            return CompiledLiteralValue::Scalar { value, slot };
+        }
+        CompiledLiteralValue::Native(value)
     }
 
     fn emit_tail_list_literal_runtime_lines(
@@ -12334,10 +12375,14 @@ impl NativeCodeGenerator {
 
     fn compile_literal_value(&mut self, expr: &Expr) -> Result<CompiledLiteralValue, Diagnostic> {
         let value = self.compile_expr(expr)?;
-        if matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
+        // A heap *string* still has no durable form here -- it is a pointer to
+        // a GC object whose text the renderers read through a different path
+        // than a rooted cell provides. A heap *pointer* (a lowered enum value)
+        // does: see `compiled_literal_value_from_native`.
+        if value == NativeValue::HeapString {
             return Err(unsupported(
                 expr.span(),
-                "native high-level collection literals containing GC heap pointers",
+                "native high-level collection literals containing GC heap strings",
             ));
         }
         Ok(self.compiled_literal_value_from_native(value))
@@ -13298,7 +13343,7 @@ impl NativeCodeGenerator {
                 element,
                 span,
                 overflow_message,
-            );
+            )?;
         }
         self.emit_append_text_to_runtime_buffer(output, output_offset, "]", span, overflow_message);
         self.emit_store_runtime_string_len_from_offset(output_len, output_offset);
@@ -13356,7 +13401,7 @@ impl NativeCodeGenerator {
                 key,
                 span,
                 overflow_message,
-            );
+            )?;
             self.emit_append_text_to_runtime_buffer(
                 output,
                 output_offset,
@@ -13370,7 +13415,7 @@ impl NativeCodeGenerator {
                 value,
                 span,
                 overflow_message,
-            );
+            )?;
         }
         self.emit_append_text_to_runtime_buffer(output, output_offset, "]", span, overflow_message);
         self.emit_store_runtime_string_len_from_offset(output_len, output_offset);
@@ -13439,7 +13484,7 @@ impl NativeCodeGenerator {
                 element,
                 span,
                 overflow_message,
-            );
+            )?;
             self.asm.mov_data_addr(Reg::R10, printed_count);
             self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
             self.asm.inc_reg(Reg::Rax);
@@ -13464,7 +13509,7 @@ impl NativeCodeGenerator {
         value: CompiledLiteralValue,
         span: Span,
         overflow_message: &str,
-    ) {
+    ) -> Result<(), Diagnostic> {
         match value {
             CompiledLiteralValue::Native(value) => {
                 self.emit_append_native_value_display_to_runtime_buffer(
@@ -13473,7 +13518,7 @@ impl NativeCodeGenerator {
                     value,
                     span,
                     overflow_message,
-                );
+                )?;
             }
             CompiledLiteralValue::Scalar { value, slot } => {
                 self.asm.mov_data_addr(Reg::R10, slot);
@@ -13502,6 +13547,36 @@ impl NativeCodeGenerator {
                             span,
                             overflow_message,
                         ),
+                    // A lowered enum value. Rax holds the pointer the cell was
+                    // rooted with; the shape recorded beside the cell says
+                    // which enum it is, which the pointer alone does not.
+                    NativeValue::HeapPointer => {
+                        let Some(shape) = self.literal_enum_shapes.get(&slot).cloned() else {
+                            return Err(unsupported(
+                                span,
+                                "rendering a collection element whose enum could not be named",
+                            ));
+                        };
+                        let rendered = self.emit_enum_display_runtime_string(&shape, span)?;
+                        // The display tree can end in a heap string (a
+                        // concatenation whose last piece is one), which the
+                        // buffer append does not read directly.
+                        let rendered =
+                            self.coerce_heap_string_to_runtime(rendered, span, overflow_message);
+                        let Some(text) = self.native_string_ref(rendered) else {
+                            return Err(unsupported(
+                                span,
+                                "rendering a collection element of this enum",
+                            ));
+                        };
+                        self.emit_append_native_string_to_runtime_buffer_offset_label(
+                            data,
+                            offset,
+                            text,
+                            span,
+                            overflow_message,
+                        );
+                    }
                     _ => self.emit_append_text_to_runtime_buffer(
                         data,
                         offset,
@@ -13512,6 +13587,7 @@ impl NativeCodeGenerator {
                 }
             }
         }
+        Ok(())
     }
 
     fn emit_runtime_list_display_runtime_string(
@@ -13519,7 +13595,7 @@ impl NativeCodeGenerator {
         label: RuntimeListLabel,
         span: Span,
         overflow_message: &str,
-    ) -> NativeValue {
+    ) -> Result<NativeValue, Diagnostic> {
         let output = self.runtime_string_scratch_value();
         let NativeValue::RuntimeString { data, len } = output else {
             unreachable!("runtime string scratch should be a runtime string")
@@ -13532,9 +13608,9 @@ impl NativeCodeGenerator {
             label,
             span,
             overflow_message,
-        );
+        )?;
         self.emit_store_runtime_string_len_from_offset(len, offset);
-        output
+        Ok(output)
     }
 
     fn emit_append_runtime_list_display_to_runtime_buffer(
@@ -13544,7 +13620,7 @@ impl NativeCodeGenerator {
         label: RuntimeListLabel,
         span: Span,
         overflow_message: &str,
-    ) {
+    ) -> Result<(), Diagnostic> {
         let kind = self.runtime_list_kind(label);
         let (open, close) = match kind {
             RuntimeListKind::List => ("[", "]"),
@@ -13554,7 +13630,7 @@ impl NativeCodeGenerator {
         let Some(elements) = self.runtime_list_elements(label) else {
             let empty = format!("{open}{close}");
             self.emit_append_text_to_runtime_buffer(data, offset, &empty, span, overflow_message);
-            return;
+            return Ok(());
         };
         self.emit_append_text_to_runtime_buffer(data, offset, open, span, overflow_message);
         match kind {
@@ -13579,7 +13655,7 @@ impl NativeCodeGenerator {
                             *key,
                             span,
                             overflow_message,
-                        );
+                        )?;
                     }
                     self.emit_append_text_to_runtime_buffer(
                         data,
@@ -13595,7 +13671,7 @@ impl NativeCodeGenerator {
                             *value,
                             span,
                             overflow_message,
-                        );
+                        )?;
                     }
                     self.end_runtime_list_dynamic_index_guard(skip);
                 }
@@ -13618,12 +13694,13 @@ impl NativeCodeGenerator {
                         element,
                         span,
                         overflow_message,
-                    );
+                    )?;
                     self.end_runtime_list_dynamic_index_guard(skip);
                 }
             }
         }
         self.emit_append_text_to_runtime_buffer(data, offset, close, span, overflow_message);
+        Ok(())
     }
 
     fn emit_static_string_list_join_runtime_delimiter(
@@ -21325,18 +21402,18 @@ impl NativeCodeGenerator {
             ));
         }
         if let NativeValue::RuntimeRecord { label } = value {
-            return Ok(self.emit_runtime_record_display_runtime_string(
+            return self.emit_runtime_record_display_runtime_string(
                 label,
                 span,
                 "toString result exceeds 65536 bytes",
-            ));
+            );
         }
         if let NativeValue::RuntimeList { label } = value {
-            return Ok(self.emit_runtime_list_display_runtime_string(
+            return self.emit_runtime_list_display_runtime_string(
                 label,
                 span,
                 "toString result exceeds 65536 bytes",
-            ));
+            );
         }
         if value == NativeValue::HeapString {
             return Ok(self.emit_heap_string_to_runtime_string_value(
@@ -26890,7 +26967,7 @@ impl NativeCodeGenerator {
         label: RuntimeRecordLabel,
         span: Span,
         overflow_message: &str,
-    ) -> NativeValue {
+    ) -> Result<NativeValue, Diagnostic> {
         let output = self.runtime_string_scratch_value();
         let NativeValue::RuntimeString { data, len } = output else {
             unreachable!("runtime string scratch should be a runtime string")
@@ -26903,9 +26980,9 @@ impl NativeCodeGenerator {
             label,
             span,
             overflow_message,
-        );
+        )?;
         self.emit_store_runtime_string_len_from_offset(len, offset);
-        output
+        Ok(output)
     }
 
     fn emit_append_runtime_record_display_to_runtime_buffer(
@@ -26915,10 +26992,10 @@ impl NativeCodeGenerator {
         label: RuntimeRecordLabel,
         span: Span,
         overflow_message: &str,
-    ) {
+    ) -> Result<(), Diagnostic> {
         let Some(record) = self.runtime_records.get(label.0).cloned() else {
             self.emit_append_text_to_runtime_buffer(data, offset, "#()", span, overflow_message);
-            return;
+            return Ok(());
         };
         self.emit_append_text_to_runtime_buffer(data, offset, "#", span, overflow_message);
         if !record.name.is_empty() {
@@ -26941,9 +27018,10 @@ impl NativeCodeGenerator {
                 field,
                 span,
                 overflow_message,
-            );
+            )?;
         }
         self.emit_append_text_to_runtime_buffer(data, offset, ")", span, overflow_message);
+        Ok(())
     }
 
     fn emit_append_runtime_record_field_display_to_runtime_buffer(
@@ -26953,7 +27031,7 @@ impl NativeCodeGenerator {
         field: &RuntimeRecordField,
         span: Span,
         overflow_message: &str,
-    ) {
+    ) -> Result<(), Diagnostic> {
         match field {
             RuntimeRecordField::Static(value) => {
                 self.emit_append_static_value_display_to_runtime_buffer(data, offset, value, span);
@@ -26965,7 +27043,7 @@ impl NativeCodeGenerator {
                     *value,
                     span,
                     overflow_message,
-                );
+                )?;
             }
             RuntimeRecordField::Scalar { value, slot } => {
                 self.asm.mov_data_addr(Reg::R10, *slot);
@@ -27004,6 +27082,7 @@ impl NativeCodeGenerator {
                 }
             }
         }
+        Ok(())
     }
 
     fn emit_append_native_value_display_to_runtime_buffer(
@@ -27013,7 +27092,7 @@ impl NativeCodeGenerator {
         value: NativeValue,
         span: Span,
         overflow_message: &str,
-    ) {
+    ) -> Result<(), Diagnostic> {
         if let Some(value) = self.native_string_ref(value) {
             self.emit_append_native_string_to_runtime_buffer_offset_label(
                 data,
@@ -27022,7 +27101,7 @@ impl NativeCodeGenerator {
                 span,
                 overflow_message,
             );
-            return;
+            return Ok(());
         }
         match value {
             NativeValue::Int => self.emit_append_i64_rax_to_runtime_buffer_offset_label(
@@ -27073,7 +27152,7 @@ impl NativeCodeGenerator {
                     label,
                     span,
                     overflow_message,
-                );
+                )?;
             }
             NativeValue::RuntimeList { label } => {
                 self.emit_append_runtime_list_display_to_runtime_buffer(
@@ -27082,7 +27161,7 @@ impl NativeCodeGenerator {
                     label,
                     span,
                     overflow_message,
-                );
+                )?;
             }
             NativeValue::RuntimeMapCallableDispatch(label) => {
                 self.emit_append_runtime_map_callable_dispatch_display_to_runtime_buffer(
@@ -27112,6 +27191,7 @@ impl NativeCodeGenerator {
                 }
             }
         }
+        Ok(())
     }
 
     fn emit_append_callable_value_display_to_runtime_buffer(
@@ -29693,7 +29773,7 @@ impl NativeCodeGenerator {
                 label,
                 span,
                 "string concatenation result exceeds 65536 bytes",
-            );
+            )?;
             return self
                 .native_string_ref(rendered)
                 .ok_or_else(|| unsupported(span, "native string concatenation"));
@@ -29703,7 +29783,7 @@ impl NativeCodeGenerator {
                 label,
                 span,
                 "string concatenation result exceeds 65536 bytes",
-            );
+            )?;
             return self
                 .native_string_ref(rendered)
                 .ok_or_else(|| unsupported(span, "native string concatenation"));
@@ -32875,7 +32955,7 @@ impl NativeCodeGenerator {
                         label,
                         span,
                         "string interpolation result exceeds 65536 bytes",
-                    );
+                    )?;
                 } else if let NativeValue::RuntimeList { label } = fragment {
                     self.emit_append_runtime_list_display_to_runtime_buffer(
                         data,
@@ -32883,7 +32963,7 @@ impl NativeCodeGenerator {
                         label,
                         span,
                         "string interpolation result exceeds 65536 bytes",
-                    );
+                    )?;
                 } else if let Some(static_value) = self.static_value_from_native(fragment) {
                     if self.static_value_has_conditional_builtin_display(&static_value) {
                         self.emit_append_static_value_display_to_runtime_buffer(
@@ -39916,6 +39996,25 @@ impl NativeCodeGenerator {
         self.asm.lea_reg_rbp_neg_disp32(Reg::Rax, rbp_offset);
         self.asm.call_label(self.gc_shadow_push);
         self.asm.pop_reg(Reg::Rax);
+    }
+
+    /// Push one permanent shadow-stack root per cell a collection literal
+    /// spilled a heap pointer into, then return.
+    ///
+    /// Pushed at startup and never popped, which is what the cells need: they
+    /// are allocated once at compile time and reused by every execution of the
+    /// literal, so a push beside the literal itself would run once per loop
+    /// iteration and overflow the shadow stack. A cell that has not been
+    /// written yet reads zero, and both root walks skip a null slot, so
+    /// seeding every cell up front is safe before any of them is live.
+    fn emit_literal_root_seed(&mut self) {
+        let entry = self.literal_root_seed;
+        self.asm.bind_text_label(entry);
+        for cell in self.literal_root_cells.clone() {
+            self.asm.mov_data_addr(Reg::Rax, cell);
+            self.asm.call_label(self.gc_shadow_push);
+        }
+        self.asm.ret();
     }
 
     /// Emit `gc_shadow_top -= count` so a closing scope drops its

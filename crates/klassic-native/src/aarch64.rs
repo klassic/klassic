@@ -3934,47 +3934,8 @@ impl Emitter {
                     self.emit_heap_string_copy();
                     return Ok(());
                 }
-                match self.expression(hole)? {
-                    ValueType::Str => {}
-                    ValueType::Int => self.emit_int_to_str(),
-                    ValueType::Double => self.emit_double_to_str(hole.span())?,
-                    ValueType::Bool => self.emit_bool_to_str(),
-                    // A collection renders into the hole the way `println`
-                    // renders it, through the same builder.
-                    ValueType::List(elem) => {
-                        self.emit_list_to_str(elem, "[", "]", hole.span())?;
-                    }
-                    ValueType::Set(elem) => {
-                        self.emit_list_to_str(elem, "%(", ")", hole.span())?;
-                    }
-                    ValueType::EmptyList => {
-                        let offset = self.asm.intern_string_object("[]");
-                        self.asm.load_rodata_address(Reg::X0, offset);
-                        self.emit_heap_string_copy();
-                    }
-                    ValueType::EmptySet => {
-                        let offset = self.asm.intern_string_object("%()");
-                        self.asm.load_rodata_address(Reg::X0, offset);
-                        self.emit_heap_string_copy();
-                    }
-                    ValueType::EmptyMap => {
-                        let offset = self.asm.intern_string_object("%[]");
-                        self.asm.load_rodata_address(Reg::X0, offset);
-                        self.emit_heap_string_copy();
-                    }
-                    ValueType::Enum(shape) => {
-                        self.emit_enum_to_str(shape, hole.span())?;
-                    }
-                    ValueType::LoweredEnum(index) => {
-                        self.emit_lowered_enum_to_str(index, hole.span())?;
-                    }
-                    other => {
-                        return Err(unsupported(
-                            hole.span(),
-                            &format!("string interpolation of {}", type_display_name(other)),
-                        ));
-                    }
-                }
+                let ty = self.expression(hole)?;
+                self.emit_value_to_str(ty, "string interpolation of", hole.span())?;
                 Ok(())
             }
         }
@@ -6465,6 +6426,50 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         self.asm.bind(done);
     }
 
+    /// Convert the value in x0, of type `ty`, into a string object in x0.
+    ///
+    /// Shared by the two places that need a value's text without printing it:
+    /// a `#{...}` hole and `toString`. They rendered different sets before --
+    /// a hole took a collection or an enum, `toString` took only the scalars --
+    /// which is not a difference anyone writing the program would expect.
+    /// `context` names the caller for the refusal a type neither can render.
+    fn emit_value_to_str(
+        &mut self,
+        ty: ValueType,
+        context: &str,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        match ty {
+            ValueType::Str => {}
+            ValueType::Int => self.emit_int_to_str(),
+            ValueType::Double => self.emit_double_to_str(span)?,
+            ValueType::Bool => self.emit_bool_to_str(),
+            // A collection renders the way `println` renders it, through the
+            // same builder.
+            ValueType::List(elem) => self.emit_list_to_str(elem, "[", "]", span)?,
+            ValueType::Set(elem) => self.emit_list_to_str(elem, "%(", ")", span)?,
+            ValueType::EmptyList => self.emit_interned_string("[]"),
+            ValueType::EmptySet => self.emit_interned_string("%()"),
+            ValueType::EmptyMap => self.emit_interned_string("%[]"),
+            ValueType::Enum(shape) => self.emit_enum_to_str(shape, span)?,
+            ValueType::LoweredEnum(index) => self.emit_lowered_enum_to_str(index, span)?,
+            other => {
+                return Err(unsupported(
+                    span,
+                    &format!("{context} {}", type_display_name(other)),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A fixed string as a fresh heap object in x0.
+    fn emit_interned_string(&mut self, text: &str) {
+        let offset = self.asm.intern_string_object(text);
+        self.asm.load_rodata_address(Reg::X0, offset);
+        self.emit_heap_string_copy();
+    }
+
     /// `toString` of the Bool in x0 → interned "true"/"false" object.
     fn emit_bool_to_str(&mut self) {
         let false_label = self.asm.new_label();
@@ -7370,18 +7375,8 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 Ok(Some(ValueType::Bool))
             }
             ("toString", 1) => {
-                match self.expression(&arguments[0])? {
-                    ValueType::Int => self.emit_int_to_str(),
-                    ValueType::Double => self.emit_double_to_str(arguments[0].span())?,
-                    ValueType::Bool => self.emit_bool_to_str(),
-                    ValueType::Str => {}
-                    other => {
-                        return Err(unsupported(
-                            span,
-                            &format!("toString of {}", type_display_name(other)),
-                        ));
-                    }
-                }
+                let ty = self.expression(&arguments[0])?;
+                self.emit_value_to_str(ty, "toString of", span)?;
                 Ok(Some(ValueType::Str))
             }
             ("toUpperCase", 1) => {

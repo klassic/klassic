@@ -29352,3 +29352,74 @@ fn build_target_aarch64_apple_darwin_renders_runtime_doubles() {
         "every renderer must agree with the evaluator"
     );
 }
+
+/// A collection element that is a GC pointer has to survive a *moving*
+/// collection, not just be traced through one: the cell it lives in is a
+/// shadow-stack root, so `relocate_fix_roots` rewrites it when the object it
+/// names is evacuated. The churn between the second element and the third is
+/// what forces that, and `--gc-log` confirms the evacuation actually happened
+/// rather than the test passing because nothing moved.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_enum_collection_element_survives_evacuation() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_enum_elem_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_enum_elem_{stamp}.bin"));
+    let program = "enum Opt { case Sm(v: Int); case Nn }\n\
+         def churn(n: Int): Int = {\n\
+           mutable i = 0\n\
+           while (i < n) {\n\
+             val garbage = Sm(i)\n\
+             i = i + 1\n\
+           }\n\
+           n\n\
+         }\n\
+         println([Sm(1) Nn Sm(churn(300000))])\n";
+    fs::write(&source_path, program).expect("temp source file should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "--gc-log",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "enum-element build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("generated executable should run");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run.status.success(),
+        "enum-element run exited with {:?}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "[Sm(1), Nn, Sm(300000)]\n",
+        "the rooted cells must still name the right objects after evacuation"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let relocated = stderr
+        .split(" relocated=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("stats line should report relocated=<n>:\n{stderr}"));
+    assert!(
+        relocated > 0,
+        "the run has to actually evacuate for this to test anything: {stderr}"
+    );
+}
