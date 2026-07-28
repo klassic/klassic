@@ -2113,6 +2113,16 @@ side of a branch.
 - aarch64 gained `Environment#vars`: the same `envp` walk `Environment#get`
   does, without a key, building its list the way `CommandLine#args` does
   (issue #646).
+- Three stdlib members that no native backend could take are written in terms
+  of ones every backend has: `mapKeys` folds over `Map#put` instead of going
+  through `Map#fromPairs` (issue #640), `at` gets its error branch an element
+  type by dropping the whole list rather than asking for the head of a bare
+  `[]` (issue #649), and `parseIntOr` is `isInt` plus `parseInt` rather than a
+  delegation to the unimplemented `String#parseIntOr` (issue #639). The last
+  one also needed `String#isInt` to accept a heap string, which is what an
+  annotated `String` parameter holds, and to trim before `parseInt` -- `isInt`
+  trims and `parseInt` does not, so `" 9 "` was called a number and then
+  failed to parse.
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

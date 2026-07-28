@@ -8578,9 +8578,13 @@ impl NativeCodeGenerator {
             // known while compiling (Rust's own parse decides, so the answer
             // is the evaluator's by construction), scanned when it is not.
             "String#isInt" | "String#isDouble" if arguments.len() == 1 => {
-                if self.expr_may_yield_runtime_string(&arguments[0]) {
+                // A heap string counts as one only known at run time: it is
+                // what an annotated `String` parameter holds, and `std.string`
+                // asks this of its own parameter.
+                if self.expr_yields_runtime_or_heap_string(&arguments[0]) {
                     let input = self.compile_expr(&arguments[0])?;
-                    let Some(input) = self.native_string_ref(input) else {
+                    let Some(input) = self.native_string_ref_or_copy(input, span, name.as_str())
+                    else {
                         return Err(unsupported(span, &format!("native {name} for non-string")));
                     };
                     return Ok(if name == "String#isInt" {

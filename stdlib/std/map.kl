@@ -58,8 +58,12 @@ def fold(m, init, f) = foldMap(m, init, f)
 
 // mapKeys — apply g to every key, keeping values.
 // If g produces duplicate keys the later key wins (insertion order of keys).
-def mapKeys(m, g) =
-  Map#fromPairs(mapReverse(foldLeft(Map#keys(m))([])((acc, k) => cons([g(k), Map#get(m, k)])(acc))))
+// Written as a fold over `Map#put`, the shape `filterKeys` and `merge`
+// already use. It used to go through `Map#fromPairs`, which no native
+// backend implements -- and whose argument is a list of two-element lists
+// holding a key and a value at once, which has no element type.
+def mapKeys(m: Map<'k, 'v>, g: ('k) => 'j): Map<'j, 'v> =
+  foldLeft(Map#keys(m))(Map#empty())((acc, k) => Map#put(acc, g(k), Map#get(m, k)))
 
 extension <k, v>(this: Map<k, v>) {
   def containsKey(key) = Map#containsKey(this, key)

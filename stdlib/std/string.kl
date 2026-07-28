@@ -138,6 +138,13 @@ def parseInt(s) = String#parseInt(s)
 
 def parseDouble(s) = String#parseDouble(s)
 
-def parseIntOr(s, d) = String#parseIntOr(s, d)
+// Written over `isInt` / `parseInt` rather than delegating to
+// `String#parseIntOr`, which no native backend implements. The two it is
+// built from are on every target, and the meaning is the evaluator's: the
+// parsed value when the text is a number, the fallback when it is not.
+def parseIntOr(s: String, d: Int): Int = if(String#isInt(s)) String#parseInt(trim(s)) else d
 
+// The Double counterpart. `parseDouble` has no native implementation either,
+// so this one still delegates and is refused there; splitting it out keeps
+// the Int case, which is the one a CLI reading a count or an index needs.
 def parseDoubleOr(s, d) = String#parseDoubleOr(s, d)
