@@ -6433,6 +6433,19 @@ impl Emitter {
         value: ListElem,
         span: Span,
     ) -> Result<(), Diagnostic> {
+        self.emit_print_map(key, value, span)?;
+        self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+        Ok(())
+    }
+
+    /// The same rendering without the trailing newline, so a map can be an
+    /// element of something else -- a list of maps is what grouping produces.
+    fn emit_print_map(
+        &mut self,
+        key: ListElem,
+        value: ListElem,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
         let loop_start = self.asm.new_label();
         let close = self.asm.new_label();
         self.push_rooted(Reg::X0); // cursor
@@ -6466,7 +6479,7 @@ impl Emitter {
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(close);
         self.pop_rooted(Reg::X3); // discard the cursor
-        self.asm.emit_write_rodata(STDOUT_FD, b"]\n");
+        self.asm.emit_write_rodata(STDOUT_FD, b"]");
         Ok(())
     }
 
@@ -6622,12 +6635,8 @@ impl Emitter {
             ListElem::LoweredEnum(index) => {
                 self.emit_print_lowered_enum(index, span)?;
             }
-            // A map *element* would need the map renderer without its
-            // trailing newline, which `emit_println_map` does not separate
-            // out. Holding one in a list works; printing the list does not
-            // yet.
-            ListElem::Map(..) => {
-                return Err(unsupported(span, "printing a map element"));
+            ListElem::Map(key, value) => {
+                self.emit_print_map(key.as_elem(), value.as_elem(), span)?;
             }
             ListElem::Record(index) => {
                 self.emit_print_record_inline(index, span)?;

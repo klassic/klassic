@@ -2168,6 +2168,11 @@ side of a branch.
   it would need the map renderer without its trailing newline, which
   `emit_println_map` does not separate out (issue #635, holding but not
   printing).
+- aarch64 prints a map that is an element of something else. `emit_print_map`
+  is the renderer without the trailing newline and `emit_println_map` is it
+  plus the newline, so a list of maps -- what grouping produces -- renders at
+  both levels. A list of *sets* is still refused there for the same reason
+  maps were: `ListElem` has no entry for one (issue #635).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

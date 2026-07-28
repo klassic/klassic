@@ -1,0 +1,38 @@
+// Cross-target fixture: collections holding other collections.
+//
+// A list of lists and a list of records already worked everywhere; a list of
+// *maps* did not -- `ListElem` had no entry for one, though a map there is a
+// cons chain of two-slot entries, the same pointer a set or a list element
+// already is. Printing one needed the map renderer without its trailing
+// newline, which was not separated out.
+//
+// The nesting is what makes this worth a fixture: each renderer has to be
+// reachable from inside another, and the separators have to come out right at
+// every level.
+
+import std.map
+
+// A list of maps, printed whole and walked.
+val ms = [%["a": 1], %["b": 2 "c": 3]]
+println(ms)
+println(size(ms))
+println(head(ms))
+assertResult(2)(size(ms))
+
+// A list of lists, which already worked -- here so a change that fixes maps
+// by breaking them cannot pass. A list of *sets* is still refused on arm64
+// (`ListElem` has no entry for one either), which is the same shape of gap
+// maps just came out of.
+println([[1, 2], [3]])
+println([[[1]], [[2, 3]]])
+
+// A map whose values are lists, printed whole.
+val byKey = %["evens": [2, 4] "odds": [1, 3]]
+println(byKey)
+println(Map#size(byKey))
+assertResult(2)(Map#size(byKey))
+
+// A list of maps of strings, so the element rendering goes through the string
+// path rather than the scalar one at both levels.
+println([%["k": "v"], %["x": "y"]])
+println("done")
