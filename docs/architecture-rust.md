@@ -2225,6 +2225,18 @@ side of a branch.
   other side holds strings, bools or nested lists still refuses, because the
   placeholder is typed `Int` and the copy into the shared output checks that
   the two agree (issue #641, partially).
+- x86-64 binds a list of enum values to a `val`, and reads an element back out
+  of one (issue #663). Three things were in the way, and each would have been a
+  wrong answer on its own. The literal took the *static* path, because
+  `expr_may_yield_runtime_list_element` did not know an expression can build a
+  GC object. Printing a bound list took the element-by-element fd printer,
+  which reads a heap pointer as an integer, so the list printed as addresses --
+  a bound list is rendered through the buffer path instead, which knows to name
+  the enum. And taking an element out did not republish which enum it is, so
+  `head(xs)` produced a value nothing downstream could print or match on;
+  `emit_compiled_literal_value` republishes the shape recorded beside the cell.
+  Printing a heap pointer with no shape is now a refusal rather than an
+  address.
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

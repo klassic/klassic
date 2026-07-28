@@ -12394,6 +12394,16 @@ impl NativeCodeGenerator {
             CompiledLiteralValue::Scalar { value, slot } => {
                 self.asm.mov_data_addr(Reg::R10, slot);
                 self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                // Taking an element out of a collection has to republish what
+                // the element is, the way constructing one does: a heap
+                // pointer alone does not say which enum it names, so without
+                // this `head(xs)` produced a value nothing downstream could
+                // print or match on.
+                if value == NativeValue::HeapPointer
+                    && let Some(shape) = self.literal_enum_shapes.get(&slot).cloned()
+                {
+                    self.pending_enum_shape = Some(shape);
+                }
                 value
             }
         }
@@ -30311,6 +30321,39 @@ impl NativeCodeGenerator {
             || self.expr_may_yield_runtime_list(expr)
             || self.expr_may_yield_runtime_record(expr)
             || self.expr_may_yield_runtime_scalar(expr)
+            || self.expr_may_yield_heap_pointer(expr)
+    }
+
+    /// Whether the expression builds a GC object -- in practice a lowered enum
+    /// value, which reaches codegen as the marker call the lowering wraps its
+    /// `__gc_record` block in.
+    ///
+    /// Without this a list of enum values took the *static* literal path and
+    /// was refused, while the same list written inline as a `println` argument
+    /// took the runtime path and built: `val xs = [Sm(1) Nn]` failed where
+    /// `println([Sm(1) Nn])` worked.
+    fn expr_may_yield_heap_pointer(&self, expr: &Expr) -> bool {
+        if matches!(
+            self.native_value_hint_for_expr(expr),
+            Some(NativeValue::HeapPointer)
+        ) {
+            return true;
+        }
+        match expr {
+            Expr::Call { callee, .. } => matches!(
+                callee.as_ref(),
+                Expr::Identifier { name, .. }
+                    if name == "__enum_shape_named" || name == "__gc_record"
+            ),
+            Expr::Block { expressions, .. } => expressions
+                .last()
+                .is_some_and(|expr| self.expr_may_yield_heap_pointer(expr)),
+            Expr::Identifier { name, .. } => matches!(
+                self.lookup_var(name).map(|slot| slot.value),
+                Some(NativeValue::HeapPointer)
+            ),
+            _ => false,
+        }
     }
 
     fn expr_may_yield_runtime_record(&self, expr: &Expr) -> bool {
@@ -32554,15 +32597,53 @@ impl NativeCodeGenerator {
         }
 
         let value = self.compile_expr(expr)?;
-        if value == NativeValue::HeapPointer
-            && let Some(shape) = self.pending_enum_shape.take()
-        {
+        if value == NativeValue::HeapPointer {
+            // A heap pointer prints as the value it names, never as the
+            // address. Without a shape there is no way to name it, and the
+            // fragment printer below would take it for an integer and print
+            // the address -- a compiled, zero-exit, wrong answer. Refuse
+            // instead, so the gap shows up as a diagnostic.
+            let Some(shape) = self.pending_enum_shape.take() else {
+                return Err(unsupported(
+                    span,
+                    "printing a heap value whose enum could not be named",
+                ));
+            };
             let formatted = self.emit_enum_display_runtime_string(&shape, span)?;
             self.emit_print_value_fragment(fd, formatted, span);
             return Ok(());
         }
+        // A list holding heap pointers cannot take the element-by-element
+        // printer below: that one writes each element straight to the fd and
+        // reads a heap pointer as an integer, so a list of enum values printed
+        // as a list of addresses. The buffer renderer knows to name the enum
+        // from the shape recorded beside the element's cell, so render the
+        // whole list through it and print the text it produced.
+        if let NativeValue::RuntimeList { label } = value
+            && self.runtime_list_holds_heap_pointer(label)
+        {
+            let rendered = self.emit_runtime_list_display_runtime_string(
+                label,
+                span,
+                "collection print result exceeds 65536 bytes",
+            )?;
+            self.emit_print_value_fragment(fd, rendered, span);
+            return Ok(());
+        }
         self.emit_print_value_fragment(fd, value, span);
         Ok(())
+    }
+
+    /// Whether any element of the runtime list is a GC pointer, which decides
+    /// whether printing it can stream element by element.
+    fn runtime_list_holds_heap_pointer(&self, label: RuntimeListLabel) -> bool {
+        self.runtime_list_elements(label)
+            .into_iter()
+            .flatten()
+            .any(|element| match element {
+                CompiledLiteralValue::Scalar { value, .. }
+                | CompiledLiteralValue::Native(value) => value == NativeValue::HeapPointer,
+            })
     }
 
     fn file_input_all_print_call_name(&self, expr: &Expr) -> Option<String> {
