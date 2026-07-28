@@ -2298,7 +2298,12 @@ impl TypeChecker {
                 let then_type = self.infer_expr(then_branch)?;
                 if let Some(branch) = else_branch {
                     let else_type = self.infer_expr(branch)?;
-                    self.unify(then_type, else_type, *span)
+                    // Reported at the else branch, which is the one the reader
+                    // has to change. The whole `if`'s span points at the
+                    // keyword -- often several lines above, since `else` may
+                    // start a continuation line -- while a list and a `match`
+                    // both name the offending element.
+                    self.unify(then_type, else_type, branch.span())
                 } else {
                     Ok(Type::Unit)
                 }

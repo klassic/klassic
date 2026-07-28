@@ -7935,6 +7935,42 @@ impl Emitter {
             // as a list of strings, taken from the `argv` the entry point
             // stashed. Skips element 0, the program name, like the
             // evaluator's script arguments do.
+            // `Environment#vars()`: every `KEY=VALUE` entry of the `envp`
+            // array captured at entry, as a list of heap strings. The same
+            // walk `Environment#get` does, without a key to match, and built
+            // the way `CommandLine#args` builds its list -- prepend, then
+            // reverse, so the order is the environment's own.
+            ("Environment#vars", 0) => {
+                let acc = self.reserve_locals(16);
+                let cursor = acc + 8;
+                let mark = self.open_temp_roots();
+                self.asm.mov_imm64(Reg::X0, 0); // nil
+                self.asm.store_local(Reg::X0, acc);
+                self.emit_root_frame_slot(acc);
+                self.asm.mov_reg(Reg::X0, Reg::X23); // envp
+                self.asm.store_local(Reg::X0, cursor);
+                let loop_start = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.bind(loop_start);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.ldr_imm(Reg::X0, Reg::X0, 0); // this entry
+                self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
+                self.emit_heap_string_from_cstring();
+                self.push_rooted(Reg::X0);
+                self.asm.load_local(Reg::X0, acc);
+                self.emit_cons_cell();
+                self.asm.store_local(Reg::X0, acc);
+                self.asm.load_local(Reg::X0, cursor);
+                self.asm.add_reg_imm(Reg::X0, Reg::X0, 8);
+                self.asm.store_local(Reg::X0, cursor);
+                self.asm.branch(loop_start, BranchKind::Unconditional);
+                self.asm.bind(done);
+                self.asm.load_local(Reg::X0, acc);
+                let reverse = self.reverse_label();
+                self.asm.branch(reverse, BranchKind::Link);
+                self.close_temp_roots(mark);
+                Ok(Some(ValueType::List(ListElem::Str)))
+            }
             ("CommandLine#args", 0) => {
                 let acc = self.reserve_locals(8);
                 let mark = self.open_temp_roots();

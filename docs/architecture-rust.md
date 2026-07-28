@@ -2106,6 +2106,13 @@ side of a branch.
   A position outside the text is not a position in it, so the report falls
   back to the bundle. A failure in the user's own code keeps its exact
   position, which two tests pin (issue #636).
+- An `if` whose branches disagree reports at the else branch rather than at
+  the whole expression, which pointed at the `if` keyword -- often several
+  lines above, since `else` may start a continuation line. A list and a
+  `match` already named the offending element (issue #654).
+- aarch64 gained `Environment#vars`: the same `envp` walk `Environment#get`
+  does, without a key, building its list the way `CommandLine#args` does
+  (issue #646).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

@@ -370,6 +370,27 @@ fn native_runtime_error_in_user_code_keeps_its_position() {
     );
 }
 
+/// An `if` whose branches disagree reports at the branch, not at the `if`.
+/// The whole expression's span points at the keyword, often several lines
+/// above -- `else` may start a continuation line -- while a list and a
+/// `match` both name the offending element.
+#[test]
+fn if_branch_mismatch_points_at_the_branch() {
+    let output = Command::new(klassic_bin())
+        .args([
+            "-e",
+            "val a = 1\nval b = 2\nval c = if (true) 1\n        else \"a\"",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(!output.status.success(), "the branches disagree");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("4:14:"),
+        "should point at the else branch on line 4, got:\n{stderr}"
+    );
+}
+
 /// std.option / std.result richer API via method-style dispatch. The
 /// clean names are restored now that native module namespacing (#449)
 /// makes the free names safe and receiver-type dispatch picks the right
