@@ -3178,6 +3178,13 @@ impl Emitter {
                 self.asm.mov_imm64(Reg::X0, *value as u64);
                 Ok(ValueType::Int)
             }
+            // The unit literal. `()` is what a function written for its
+            // effect ends with -- `std.option`'s `ifPresent` is
+            // `{ f(v); () }` -- so without it every such helper was refused.
+            Expr::Unit { .. } => {
+                self.asm.mov_imm64(Reg::X0, 0);
+                Ok(ValueType::Unit)
+            }
             // An assignment in expression position: done for its effect, so
             // it yields unit. Two `match` arms that both end in one therefore
             // agree, which is what lets a `match` be written for effect.
@@ -9939,10 +9946,22 @@ impl Emitter {
                     }
                     let arm_ty = self.static_type_under(&arm.body, locals, depth + 1);
                     locals.truncate(mark);
-                    let arm_ty = arm_ty?;
+                    // An arm whose type is unknown does not veto the arms that
+                    // are known, the same way an `if`'s unknown branch does
+                    // not. `case None => None` says nothing about the payload
+                    // -- the empty case carries none -- so vetoing on it left
+                    // every `Option`-returning helper untypeable.
+                    let Some(arm_ty) = arm_ty else {
+                        continue;
+                    };
                     result = Some(match result {
                         None => arm_ty,
-                        Some(previous) => self.merge_types(previous, arm_ty)?,
+                        Some(previous) => match self.merge_types(previous, arm_ty) {
+                            Some(merged) => merged,
+                            // Two arms this backend cannot reconcile is a real
+                            // disagreement, not a missing answer.
+                            None => return None,
+                        },
                     });
                 }
                 result
@@ -12012,10 +12031,13 @@ impl Emitter {
                         .insert(name.clone(), mapping);
                     return Ok(());
                 }
+                // A unit-typed binding holds nothing worth storing, but the
+                // name still has to exist: `val t = thread(...)` is how a
+                // thread is written even when the handle is unused, and since
+                // an assignment became unit-typed there is a second way to
+                // reach one. The slot is written like any other -- the value
+                // in x0 is zero -- so nothing downstream needs a special case.
                 let ty = self.expression(value)?;
-                if ty == ValueType::Unit {
-                    return Err(unsupported(value.span(), "a unit-typed binding"));
-                }
                 // A `mutable` slot has to hold everything that will be
                 // assigned to it, not just what it starts as: `mutable c =
                 // Nil` followed by `c = Cons(v, c)` starts as an enum shape

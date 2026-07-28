@@ -9,7 +9,7 @@ enum Option<a> {
   case None
 }
 
-def some(value) = Some(value)
+def some(value: 'a): Option<'a> = Some(value)
 
 // `none` is a value, not a function: the nullary `None` constructor
 // generalizes to a polymorphic `Option<a>`, so callers write `none`
@@ -18,32 +18,32 @@ def some(value) = Some(value)
 // payload.
 val none = None
 
-def isSome(o) = o match {
+def isSome(o: Option<'a>): Boolean = o match {
   case Some(v) => true
   case None => false
 }
 
-def isNone(o) = o match {
+def isNone(o: Option<'a>): Boolean = o match {
   case Some(v) => false
   case None => true
 }
 
-def getOrElse(o, fallback) = o match {
+def getOrElse(o: Option<'a>, fallback: 'a): 'a = o match {
   case Some(v) => v
   case None => fallback
 }
 
-def map(o, f) = o match {
+def map(o: Option<'a>, f: ('a) => 'b): Option<'b> = o match {
   case Some(v) => Some(f(v))
   case None => None
 }
 
-def flatMap(o, f) = o match {
+def flatMap(o: Option<'a>, f: ('a) => Option<'b>): Option<'b> = o match {
   case Some(v) => f(v)
   case None => None
 }
 
-def orElse(o, alternative) = o match {
+def orElse(o: Option<'a>, alternative: Option<'a>): Option<'a> = o match {
   case Some(v) => Some(v)
   case None => alternative
 }
@@ -51,38 +51,38 @@ def orElse(o, alternative) = o match {
 // filter(o, p): Some(v) if o is Some(v) and p(v), else None
 // (free name suffixed to avoid colliding with std.list.filter when
 // both are imported and inlined into one native type scope.)
-def filter(o, p) = o match {
+def filter(o: Option<'a>, p: ('a) => Boolean): Option<'a> = o match {
   case Some(v) => if(p(v)) Some(v) else None
   case None => None
 }
 
 // toList(o): [v] if o is Some(v), [] if None
-def toList(o) = o match {
+def toList(o: Option<'a>): List<'a> = o match {
   case Some(v) => [v]
   case None => []
 }
 
 // fold(o, ifNone, f): ifNone if None, f(v) if Some(v)
 // (suffixed; std.map also has a free `fold`.)
-def fold(o, ifNone, f) = o match {
+def fold(o: Option<'a>, ifNone: 'b, f: ('a) => 'b): 'b = o match {
   case Some(v) => f(v)
   case None => ifNone
 }
 
 // ifPresent(o, f): runs f(v) if Some(v), unit if None
-def ifPresent(o, f) = o match {
+def ifPresent(o: Option<'a>, f: ('a) => Unit): Unit = o match {
   case Some(v) => {f(v); ()}
   case None => ()
 }
 
 // contains(o, x): Some(v) -> v == x, None -> false.
-def contains(o, x) = o match {
+def contains(o: Option<'a>, x: 'a): Boolean = o match {
   case Some(v) => v == x
   case None => false
 }
 
 // exists(o, p): Some(v) -> p(v), None -> false.
-def exists(o, p) = o match {
+def exists(o: Option<'a>, p: ('a) => Boolean): Boolean = o match {
   case Some(v) => p(v)
   case None => false
 }

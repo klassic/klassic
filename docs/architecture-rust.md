@@ -2084,6 +2084,20 @@ side of a branch.
   by routing it through `emit_print_elem` -- `Map#get` answers one, so a map
   of lists could not be read. Only a nullable Double is still refused, for
   want of a run-time Double formatter (issue #634).
+- Five more stdlib modules carry type annotations: `std.test`, `std.set`,
+  `std.math`, `std.option`, `std.result` (issue #643, first half). As with
+  #622, annotating uncovered the real gaps rather than only fixing the
+  diagnostic:
+  - `static_type_under`'s `match` arm vetoed the whole expression when any one
+    arm could not be typed, where an `if` in the same position lets the known
+    branch stand. `case None => None` says nothing about the payload, so every
+    `Option`-returning helper was untypeable on aarch64. An untypeable arm is
+    skipped now; two arms that genuinely disagree still answer `None`.
+  - `Expr::Unit` had no aarch64 codegen, so a helper written for its effect --
+    `ifPresent` is `{ f(v); () }` -- could not be compiled there.
+  - A unit-typed binding is allowed. `val t = thread(...)` is how a thread is
+    written even when the handle is unused, and since #631 an assignment is
+    unit-typed too (issue #637).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
