@@ -130,7 +130,8 @@ The repository contains a Rust-native language implementation with:
   zero-argument literal or lambda-value `stopwatch` via Linux `clock_gettime`, Int numeric
   helpers (`abs`, `int`, `floor`, `ceil`), static Double/Float literals and
   numeric helper folding (`double`, `sqrt`,
-  `abs`, `floor`, `ceil`) with Float preserving f32 rounding/display and
+  `abs`, `floor`, `ceil`) plus their run-time forms (`double` of a run-time
+  Int, `sqrt` / `abs` of a run-time Double) with Float preserving f32 rounding/display and
   effectful block-prefix arguments preserved before static numeric recovery, static
   Int-list `foreach`, static Int list literals
   with constant arithmetic and bitwise elements, generic static list arenas,

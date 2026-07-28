@@ -29286,3 +29286,69 @@ fn build_target_aarch64_apple_darwin_gc_evacuation_moves_objects() {
         "evacuation should move live objects out of sparse regions: {stderr}"
     );
 }
+
+/// The Double paths this backend renders and x86-64 still refuses at build
+/// time, so they cannot live in tests/cross-exec/46-runtime-doubles.kl: a
+/// Double through `toString`, inside a record, and inside a *generic* enum
+/// (which the shared lowering leaves as constructor calls rather than
+/// records). Each value is derived from `size(args())` so the compile-time
+/// folder cannot answer it and the run-time formatter has to.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_renders_runtime_doubles() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let source_path = dir.join(format!("klassic_arm_double_{stamp}.kl"));
+    let bin_path = dir.join(format!("klassic_arm_double_{stamp}.bin"));
+    let program = "import std.process as R\n\
+         enum Opt<a> { case Sm(v: a); case Nn }\n\
+         record Pt { x: Double; y: Double }\n\
+         def q(n: Int, d: Int): Double = double(n) / double(d)\n\
+         val k = size(R.args())\n\
+         val a = q(3 + k, 8)\n\
+         val b = q(-5 + k, 16)\n\
+         println(toString(a))\n\
+         val opt: Opt<Double> = Sm(b)\n\
+         println(opt)\n\
+         val point = #Pt(a, b)\n\
+         println(point)\n\
+         println([point])\n\
+         assertResult(0.375)(a)\n\
+         println(\"done\")\n";
+    fs::write(&source_path, program).expect("temp source file should write");
+    let build = Command::new(klassic_bin())
+        .args([
+            "--target",
+            "aarch64-apple-darwin",
+            "build",
+            source_path.to_str().expect("path should be utf-8"),
+            "-o",
+            bin_path.to_str().expect("path should be utf-8"),
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        build.status.success(),
+        "runtime-Double build should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("generated Mach-O should execute");
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        run.status.success(),
+        "runtime-Double run exited with {:?}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "0.375\nSm(-0.3125)\n#Pt(0.375, -0.3125)\n[#Pt(0.375, -0.3125)]\ndone\n",
+        "every renderer must agree with the evaluator"
+    );
+}
