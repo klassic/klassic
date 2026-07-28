@@ -365,6 +365,21 @@ fn find_runtime_staticlib() -> Option<std::path::PathBuf> {
 
 /// Compile generated C and link it with the runtime staticlib using
 /// the system C compiler.
+/// Distinguishes intermediate files written by this process. Two builds
+/// started in the same nanosecond -- which the test suite does, running in
+/// parallel threads -- otherwise chose the same path and compiled each
+/// other's source.
+static INTERMEDIATE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_intermediate_id() -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let seq = INTERMEDIATE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{stamp}-{seq}", std::process::id())
+}
+
 fn link_c_program(c_source: &str, output: &Path) -> Result<(), u8> {
     let Some(runtime) = find_runtime_staticlib() else {
         eprintln!(
@@ -388,11 +403,8 @@ fn link_c_program(c_source: &str, output: &Path) -> Result<(), u8> {
         );
         return Err(1);
     };
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let c_path = std::env::temp_dir().join(format!("klassic-cbackend-{stamp}.c"));
+    let c_path =
+        std::env::temp_dir().join(format!("klassic-cbackend-{}.c", next_intermediate_id()));
     if let Err(error) = fs::write(&c_path, c_source) {
         eprintln!("{}: {error}", c_path.display());
         return Err(1);
@@ -459,11 +471,7 @@ fn link_llvm_program(ir: &str, output: &Path, gc_log: bool) -> Result<(), u8> {
         );
         return Err(1);
     };
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let ir_path = std::env::temp_dir().join(format!("klassic-llvm-{stamp}.ll"));
+    let ir_path = std::env::temp_dir().join(format!("klassic-llvm-{}.ll", next_intermediate_id()));
     if let Err(error) = fs::write(&ir_path, ir) {
         eprintln!("{}: {error}", ir_path.display());
         return Err(1);
