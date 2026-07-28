@@ -2214,6 +2214,17 @@ side of a branch.
 - aarch64's `toString` renders everything a `#{...}` hole does. The two had
   drifted -- a hole took a collection or an enum, `toString` took only the
   scalars -- and they share `emit_value_to_str` now.
+- x86-64 pads an *empty* list branch of an `if` up to the other branch's
+  length. The padding copies a template from the branch's own elements, and an
+  empty branch has none, so `[] else [1 2]` was refused while `[1] else []`
+  built -- a difference in which side the empty literal sat on rather than in
+  what the program meant. The placeholders are never read (the branch's
+  run-time length is zero); they exist so both branches agree on the output's
+  capacity, which is what the null-list branch beside it already fabricated for
+  the same reason. Scalar Int, map and set branches build now; a branch whose
+  other side holds strings, bools or nested lists still refuses, because the
+  placeholder is typed `Int` and the copy into the shared output checks that
+  the two agree (issue #641, partially).
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 

@@ -29423,3 +29423,57 @@ fn native_enum_collection_element_survives_evacuation() {
         "the run has to actually evacuate for this to test anything: {stderr}"
     );
 }
+
+/// An `if` whose branches are lists of different lengths builds when the
+/// *empty* one comes first, not only when it comes second. The shorter branch
+/// is padded up to the shared capacity by copying a template from its own
+/// elements, and an empty branch has none -- so `[] else [1 2]` was refused
+/// while `[1] else []` built, purely from which side the empty literal was on.
+/// Both directions are asserted because the padding must not change which
+/// branch's values come out.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_if_branches_pad_an_empty_list_on_either_side() {
+    for (condition, expected) in [(0, "[]\n"), (1, "[1, 2]\n")] {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let source_path = dir.join(format!("klassic_empty_branch_{condition}_{stamp}.kl"));
+        let bin_path = dir.join(format!("klassic_empty_branch_{condition}_{stamp}.bin"));
+        // `size(args())` is zero, but not knowably zero, so neither branch is
+        // folded away and the join has to be compiled.
+        let program = format!(
+            "import std.process as R\n\
+             val k = size(R.args())\n\
+             println(if (k == {condition}) [] else [1 2])\n"
+        );
+        fs::write(&source_path, program).expect("temp source file should write");
+        let build = Command::new(klassic_bin())
+            .args([
+                "build",
+                source_path.to_str().expect("path should be utf-8"),
+                "-o",
+                bin_path.to_str().expect("path should be utf-8"),
+            ])
+            .output()
+            .expect("binary should run");
+        assert!(
+            build.status.success(),
+            "empty-branch build should succeed\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let run = Command::new(&bin_path)
+            .output()
+            .expect("generated executable should run");
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&bin_path);
+        assert!(run.status.success(), "empty-branch run should succeed");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            expected,
+            "the padding must not change which branch's values come out"
+        );
+    }
+}
