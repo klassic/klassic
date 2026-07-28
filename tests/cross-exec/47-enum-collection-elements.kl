@@ -1,0 +1,42 @@
+// Cross-target fixture: a user-declared enum value as a collection element.
+//
+// A list of results, a map from a key to a case, a set of tokens -- all of
+// them put an enum value inside a collection, and x86-64 refused every one:
+// a collection element there is a compile-time cell, and a cell is invisible
+// to the collector, so admitting a GC pointer into one would have handed the
+// renderer an address the collector had already moved or freed. The cells are
+// shadow-stack roots now, seeded once at startup, which is what makes the
+// pointer safe to keep and what lets a moving collection update it in place.
+//
+// Every value below is built inside the literal, so under `--gc-stress` a
+// collection runs between one element and the next -- the case that fails
+// first if a cell is not a root.
+
+enum Opt { case Sm(v: Int); case Nn }
+enum Token { case Word(s: String); case Comma }
+enum Colour { case Red; case Green; case Blue }
+
+// A list, including several elements so an element is built while earlier
+// ones are only reachable through their cells.
+println([Sm(1) Nn Sm(2) Sm(3) Nn])
+
+// The same values as a set and as a map's values.
+println(%(Sm(5) Nn Sm(6)))
+println(%["a": Sm(10) "b": Nn])
+
+// A payload that is itself a heap value, so the element's own field has to
+// survive the same collections.
+println([Word("one") Comma Word("two")])
+
+// A nullary-only enum, whose values carry nothing at all.
+println([Red Green Blue])
+println(%(Red Blue))
+
+// Through the two renderers that are not `println` of the collection.
+println("tokens=#{[Word("x") Comma]}")
+println(toString([Sm(7) Nn]))
+
+// Sizes are answered from the literal's own shape rather than the elements.
+println(size([Sm(1) Nn Sm(2)]))
+println(isEmpty([Nn]))
+println("done")

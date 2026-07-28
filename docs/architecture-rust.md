@@ -2200,6 +2200,20 @@ side of a branch.
   way. A list of them therefore rendered from a register the next element had
   already overwritten, and printed `[null, null]` while compiling clean and
   exiting zero. This was unreachable until run-time Doubles existed.
+- x86-64 admits a user-declared enum value into a list, set or map literal
+  (issues #620, #648). A collection element there is a compile-time cell, and a
+  cell is invisible to the collector, which is why a GC pointer was refused
+  outright: the renderer would have read an address a collection had already
+  moved or freed. The cells are shadow-stack roots now -- `emit_literal_root_seed`
+  pushes one entry per cell once at startup, which is also why the push cannot
+  sit beside the literal (a literal in a loop would push per iteration). Both
+  root walks skip a null slot, so seeding a cell before it is written is safe.
+  Rendering needs the enum's identity, which the pointer does not carry, so the
+  shape published by the `__enum_shape_named` marker is recorded beside the
+  cell and read back by the element renderer.
+- aarch64's `toString` renders everything a `#{...}` hole does. The two had
+  drifted -- a hole took a collection or an enum, `toString` took only the
+  scalars -- and they share `emit_value_to_str` now.
 - The workspace keeps crate boundaries explicit so future optimizer or runtime
   work can stay isolated.
 
