@@ -21,6 +21,8 @@ use klassic_syntax::{BinaryOp, Expr, MatchArm, Pattern, StringPart, UnaryOp};
 
 use crate::macho::{self, DataFixup, FixupSection};
 use crate::portable_asm;
+#[path = "gc_codegen/macos.rs"]
+mod gc_macos;
 
 const SYS_EXIT: u16 = 1;
 const SYS_WRITE: u16 = 4;
@@ -228,6 +230,8 @@ struct Label(usize);
 struct DataLabel(usize);
 
 enum BranchKind {
+    /// `adr xd, label` for a nearby runtime entry (checked +/- 1 MiB).
+    Address(Reg),
     /// `b label` — 26-bit signed word offset.
     Unconditional,
     /// `bl label` — 26-bit signed word offset, link register.
@@ -251,6 +255,7 @@ struct Assembler {
     code: Vec<u8>,
     rodata: Vec<u8>,
     fixups: Vec<DataFixup>,
+    imports: Vec<macho::ImportSymbol>,
     labels: Vec<Option<usize>>,
     branches: Vec<BranchFixup>,
     /// Total bytes reserved in `__DATA,__bss` (the GC's zero-init cells).
@@ -304,6 +309,103 @@ const BARRIER_SAVED: [Reg; 11] = [
 ];
 
 impl Assembler {
+    /// Preserve every live volatile register around a foreign clock call.
+    /// Stack layout: 9 GPR pairs (144), all 32 Q registers (512), timespec (16).
+    /// FP/LR have a separate frame record. Only x0 and flags change on return.
+    fn emit_gc_monotonic_ns(&mut self) {
+        let failed = self.new_label();
+        let done = self.new_label();
+        self.push_frame_record();
+        self.sub_sp_imm(672);
+        for pair in 0..9_u32 {
+            let first = 1 + pair * 2;
+            let second = if pair == 8 { 31 } else { first + 1 };
+            self.word(0xa900_0000 | ((pair * 2) << 15) | (second << 10) | (31 << 5) | first);
+        }
+        for pair in 0..16_u32 {
+            self.word(
+                0xad00_0000
+                    | ((9 + pair * 2) << 15)
+                    | ((pair * 2 + 1) << 10)
+                    | (31 << 5)
+                    | (pair * 2),
+            );
+        }
+        self.mov_imm64(Reg::X0, 6); // Darwin CLOCK_MONOTONIC, not Linux's clock id
+        self.add_reg_sp_imm(Reg::X1, 656);
+        self.call_import(macho::ImportSymbol::ClockGettime);
+        self.word(0x2a00_03e0); // mov w0, w0: C int result's upper half is unspecified
+        self.branch(failed, BranchKind::CompareNonZero(Reg::X0));
+        self.add_reg_sp_imm(Reg::X1, 656);
+        self.ldr_imm(Reg::X0, Reg::X1, 0);
+        self.ldr_imm(Reg::X2, Reg::X1, 8);
+        self.mov_imm64(Reg::X1, u64::MAX / 1_000_000_000);
+        self.cmp_reg(Reg::X0, Reg::X1); // also rejects negative time_t values
+        self.branch(failed, BranchKind::Conditional(Cond::Hi));
+        self.mov_imm64(Reg::X1, 1_000_000_000);
+        self.cmp_reg(Reg::X2, Reg::X1);
+        self.branch(failed, BranchKind::Conditional(Cond::Hs));
+        self.mul_reg(Reg::X0, Reg::X0, Reg::X1);
+        self.word(0xab02_0000); // adds x0, x0, x2
+        self.branch(failed, BranchKind::Conditional(Cond::Hs)); // unsigned sum overflow
+        for pair in 0..16_u32 {
+            self.word(
+                0xad40_0000
+                    | ((9 + pair * 2) << 15)
+                    | ((pair * 2 + 1) << 10)
+                    | (31 << 5)
+                    | (pair * 2),
+            );
+        }
+        for pair in 0..9_u32 {
+            let first = 1 + pair * 2;
+            let second = if pair == 8 { 31 } else { first + 1 };
+            self.word(0xa940_0000 | ((pair * 2) << 15) | (second << 10) | (31 << 5) | first);
+        }
+        self.add_sp_imm(672);
+        self.pop_frame_record();
+        self.branch(done, BranchKind::Unconditional);
+        self.bind(failed);
+        let message = b"GC monotonic clock failed\n";
+        let offset = self.rodata.len();
+        self.rodata.extend_from_slice(message);
+        self.mov_imm64(Reg::X0, 2);
+        self.load_rodata_address(Reg::X1, offset);
+        self.mov_imm64(Reg::X2, message.len() as u64);
+        self.mov_imm64(Reg::X16, SYS_WRITE as u64);
+        self.svc_0x80();
+        self.mov_imm64(Reg::X0, 1);
+        self.mov_imm64(Reg::X16, SYS_EXIT as u64);
+        self.svc_0x80();
+        self.word(0xd420_0000); // brk: exit cannot return
+        self.bind(done);
+        self.bt_pending = false;
+    }
+    /// Eager libSystem import through a GOT slot. IP0/x16 is caller-saved;
+    /// callers preserve LR and any live volatile registers before this call.
+    fn call_import(&mut self, symbol: macho::ImportSymbol) {
+        let slot = self
+            .imports
+            .iter()
+            .position(|&s| s == symbol)
+            .unwrap_or_else(|| {
+                self.imports.push(symbol);
+                self.imports.len() - 1
+            });
+        let adrp_offset = self.code.len();
+        self.word(0x9000_0010); // adrp x16, GOT page
+        let add_offset = self.code.len();
+        self.word(0x9100_0210); // add x16, x16, page offset
+        self.fixups.push(DataFixup {
+            adrp_offset,
+            add_offset,
+            data_offset: slot * 8,
+            section: FixupSection::Imports,
+        });
+        self.ldr_imm(Reg::X16, Reg::X16, 0);
+        self.word(0xd63f_0200); // blr x16
+        self.bt_pending = false;
+    }
     fn word(&mut self, instruction: u32) {
         self.code.extend_from_slice(&instruction.to_le_bytes());
     }
@@ -326,6 +428,7 @@ impl Assembler {
         });
         // Placeholder opcodes; offsets are patched in `finish`.
         match self.branches.last().expect("just pushed").kind {
+            BranchKind::Address(reg) => self.word(0x1000_0000 | reg as u32),
             BranchKind::Unconditional => self.word(0x1400_0000),
             BranchKind::Link => self.word(0x9400_0000),
             BranchKind::Conditional(cond) => self.word(0x5400_0000 | cond as u32),
@@ -343,6 +446,14 @@ impl Assembler {
             word_bytes.copy_from_slice(&self.code[fixup.code_offset..fixup.code_offset + 4]);
             let word = u32::from_le_bytes(word_bytes);
             let patched = match fixup.kind {
+                BranchKind::Address(_) => {
+                    let delta = target as i64 - fixup.code_offset as i64;
+                    assert!(
+                        (-(1 << 20)..(1 << 20)).contains(&delta),
+                        "ADR runtime target out of range"
+                    );
+                    word | (((delta as u32) & 3) << 29) | ((((delta as u32) >> 2) & 0x7ffff) << 5)
+                }
                 BranchKind::Unconditional | BranchKind::Link => {
                     word | ((delta_words as u32) & 0x03ff_ffff)
                 }
@@ -1081,6 +1192,21 @@ impl portable_asm::PortableAsm for Assembler {
         self.branch(label, BranchKind::Link);
         self.pop_frame_record(); // ldp x29, x30, [sp], #16
     }
+    fn call_native_unary(&mut self, target: portable_asm::Reg) {
+        self.mov_reg(Reg::X16, port_reg(target));
+        self.mov_reg(Reg::X0, Reg::X5);
+        self.push_frame_record();
+        self.word(0xd63f_0000 | (16 << 5)); // blr x16
+        self.pop_frame_record();
+    }
+    fn call_native_binary(&mut self, target: portable_asm::Reg) {
+        self.mov_reg(Reg::X16, port_reg(target));
+        self.mov_reg(Reg::X0, Reg::X5);
+        self.mov_reg(Reg::X1, Reg::X4);
+        self.push_frame_record();
+        self.word(0xd63f_0000 | (16 << 5)); // blr x16
+        self.pop_frame_record();
+    }
     fn ret(&mut self) {
         Assembler::ret(self);
     }
@@ -1105,6 +1231,7 @@ impl portable_asm::PortableAsm for Assembler {
         use portable_asm::Reg as P;
         match (dst, src) {
             (P::V5, P::V4) => self.mov_fp_sp(), // mov x29, sp
+            (_, P::V5) => self.mov_reg(port_reg(dst), Reg::X29), // local control-record address
             _ => self.mov_reg(port_reg(dst), port_reg(src)),
         }
     }
@@ -1140,6 +1267,71 @@ impl portable_asm::PortableAsm for Assembler {
             Assembler::mov_imm64(self, PORT_SCRATCH, disp as i64 as u64);
             self.str_reg_offset(s, b, PORT_SCRATCH);
         }
+    }
+    fn atomic_load_acquire(&mut self, dst: portable_asm::Reg, address: portable_asm::Reg) {
+        portable_asm::check_atomic_registers(&[dst, address]);
+        self.word(0xc8df_fc00 | ((port_reg(address) as u32) << 5) | port_reg(dst) as u32); // ldar
+    }
+    fn atomic_store_release(&mut self, address: portable_asm::Reg, value: portable_asm::Reg) {
+        portable_asm::check_atomic_registers(&[address, value]);
+        self.word(0xc89f_fc00 | ((port_reg(address) as u32) << 5) | port_reg(value) as u32); // stlr
+    }
+    fn atomic_compare_exchange(&mut self, address: portable_asm::Reg, desired: portable_asm::Reg) {
+        use portable_asm::Reg as P;
+        portable_asm::check_atomic_registers(&[address, desired]);
+        assert!(address != P::V0 && desired != P::V0);
+        let (base, value) = (port_reg(address), port_reg(desired));
+        let retry = self.new_label();
+        let mismatch = self.new_label();
+        let done = self.new_label();
+        self.mov_reg(Reg::X12, Reg::X0); // preserve expected across exclusive retries
+        self.bind(retry);
+        self.word(0xc85f_fc00 | ((base as u32) << 5)); // ldaxr x0, [base]
+        self.cmp_reg(Reg::X0, Reg::X12);
+        self.branch(mismatch, BranchKind::Conditional(Cond::Ne));
+        self.word(0xc800_fc00 | (11 << 16) | ((base as u32) << 5) | value as u32); // stlxr w11
+        self.branch(retry, BranchKind::CompareNonZero(Reg::X11));
+        self.branch(done, BranchKind::Unconditional);
+        self.bind(mismatch);
+        self.word(0xd503_3f5f); // clrex: abandon the monitor on comparison failure
+        self.bind(done);
+        self.bt_pending = false;
+    }
+    fn atomic_fence(&mut self) {
+        self.word(0xd503_3bbf); // dmb ish
+    }
+    fn atomic_load_acquire_u32(&mut self, dst: portable_asm::Reg, address: portable_asm::Reg) {
+        portable_asm::check_atomic_registers(&[dst, address]);
+        self.word(0x88df_fc00 | ((port_reg(address) as u32) << 5) | port_reg(dst) as u32);
+    }
+    fn atomic_store_release_u32(&mut self, address: portable_asm::Reg, value: portable_asm::Reg) {
+        portable_asm::check_atomic_registers(&[address, value]);
+        self.word(0x889f_fc00 | ((port_reg(address) as u32) << 5) | port_reg(value) as u32);
+    }
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        address: portable_asm::Reg,
+        desired: portable_asm::Reg,
+    ) {
+        use portable_asm::Reg as P;
+        portable_asm::check_atomic_registers(&[address, desired]);
+        assert!(address != P::V0 && desired != P::V0);
+        let (base, value) = (port_reg(address), port_reg(desired));
+        let retry = self.new_label();
+        let mismatch = self.new_label();
+        let done = self.new_label();
+        self.word(0x2a00_03ec); // mov w12, w0: discard expected's high half
+        self.bind(retry);
+        self.word(0x885f_fc00 | ((base as u32) << 5)); // ldaxr w0, [base]
+        self.word(0x6b0c_001f); // cmp w0, w12
+        self.branch(mismatch, BranchKind::Conditional(Cond::Ne));
+        self.word(0x8800_fc00 | (11 << 16) | ((base as u32) << 5) | value as u32);
+        self.branch(retry, BranchKind::CompareNonZero(Reg::X11));
+        self.branch(done, BranchKind::Unconditional);
+        self.bind(mismatch);
+        self.word(0xd503_3f5f); // clrex
+        self.bind(done);
+        self.bt_pending = false;
     }
     fn load_rbp_slot(&mut self, dst: portable_asm::Reg, offset: i32) {
         // x86 `[rbp - offset]`; x29 sits at the frame top, so `[x29, -off]`.
@@ -1242,6 +1434,33 @@ impl portable_asm::PortableAsm for Assembler {
         let d = port_reg(r);
         self.lsr_imm(d, d, u32::from(imm));
     }
+    fn shl_reg_count(&mut self, r: portable_asm::Reg) {
+        portable_asm::check_atomic_registers(&[r]);
+        let d = port_reg(r) as u32;
+        self.word(0x9ac0_2000 | ((Reg::X1 as u32) << 16) | (d << 5) | d); // LSLV
+    }
+    fn mul_unsigned_wide(&mut self, rhs: portable_asm::Reg) {
+        use portable_asm::Reg as P;
+        portable_asm::check_atomic_registers(&[rhs]);
+        assert!(![P::V0, P::V2].contains(&rhs));
+        let rhs = port_reg(rhs);
+        self.word(0x9bc0_7c00 | ((rhs as u32) << 16) | Reg::X2 as u32); // UMULH x2,x0,rhs
+        self.mul_reg(Reg::X0, Reg::X0, rhs);
+    }
+    fn shr_reg_count(&mut self, r: portable_asm::Reg) {
+        portable_asm::check_atomic_registers(&[r]);
+        let d = port_reg(r) as u32;
+        self.word(0x9ac0_2400 | ((Reg::X1 as u32) << 16) | (d << 5) | d); // LSRV
+    }
+    fn div_unsigned(&mut self, rhs: portable_asm::Reg) {
+        use portable_asm::Reg as P;
+        portable_asm::check_atomic_registers(&[rhs]);
+        assert!(![P::V0, P::V2].contains(&rhs));
+        let rhs = port_reg(rhs);
+        self.mov_reg(Reg::X2, Reg::X0);
+        self.word(0x9ac0_0800 | ((rhs as u32) << 16)); // UDIV x0,x0,rhs
+        self.msub_reg(Reg::X2, Reg::X0, rhs, Reg::X2);
+    }
     fn bt_reg_imm8(&mut self, r: portable_asm::Reg, bit: u8) {
         // Flag-setting `tst reg, #(1<<bit)` via a materialized mask;
         // `jcc_label` remaps the following branch (see `bt_pending`).
@@ -1279,11 +1498,7 @@ impl portable_asm::PortableAsm for Assembler {
         self.svc_0x80();
     }
     fn plat_read_monotonic_ns(&mut self) {
-        // Minimal: report 0 ns (like the x86 Windows path, whose pauses
-        // also read 0). The GC wiring keeps `--gc-log` timing disabled on
-        // AArch64, so this is never emitted; a real monotonic clock can
-        // replace it later.
-        Assembler::mov_imm64(self, Reg::X0, 0);
+        self.emit_gc_monotonic_ns();
     }
 }
 
@@ -2140,6 +2355,7 @@ struct Emitter {
     /// what the routine actually clobbers.
     gc_barrier_trampoline_label: Option<Label>,
     gc_alloc_trampoline_label: Option<Label>,
+    gc_store_trampoline_label: Option<Label>,
     /// `__bss` cells for the GC shadow stack (base pointer, top index),
     /// shared by `reserve_gc_state` and the mutator's root pushes.
     shadow_stack_cells: Option<(DataLabel, DataLabel)>,
@@ -2149,6 +2365,7 @@ struct Emitter {
     /// Label of `gc_alloc`, shared between the mutator's allocation sites
     /// and the GC runtime that defines it.
     gc_alloc_label: Option<Label>,
+    gc_store_pointer_label: Option<Label>,
     /// `gc_deep_equal`, shared between the set literal's membership scan and
     /// the GC runtime that defines it -- the same lazy hand-off `gc_alloc`
     /// uses, because the scan is emitted before the runtime is.
@@ -4675,7 +4892,7 @@ impl Emitter {
     }
 
     /// M7 (go-live): call the collector's `gc_alloc` -- payload size in x5,
-    /// type tag in x4, user pointer (block + 16) back in x0.
+    /// logical shape supplied here, user pointer (block + 16) back in x0.
     ///
     /// This replaces the old bump allocator, so an allocation is now a
     /// *collection point*: it can mark, sweep and (from M9) relocate. Two
@@ -4687,11 +4904,36 @@ impl Emitter {
     /// a register (or on the invisible machine stack) is not reachability:
     /// callers park those with `push_rooted` and take them back afterwards,
     /// which also picks up the new address once the collector moves objects.
-    fn emit_gc_alloc_call(&mut self) {
+    fn emit_gc_alloc_call(&mut self, shape: crate::gc_shape::BuiltinShape) {
         let entry = self.alloc_trampoline_label();
         self.asm.push_frame_record(); // the bl clobbers x30
-        self.asm.branch(entry, BranchKind::Link);
+        crate::portable_asm::emit_gc_alloc_dynamic(&mut self.asm, entry, shape);
         self.asm.pop_frame_record();
+    }
+
+    /// Validate the source count before scaling/alignment can wrap it.
+    /// The accepted x0 is preserved for the allocation argument conversion.
+    fn emit_gc_allocation_size_check(&mut self, name: &str, maximum: u64) {
+        let non_negative = self.asm.new_label();
+        self.asm.cmp_x0_zero();
+        self.asm
+            .branch(non_negative, BranchKind::Conditional(Cond::Ge));
+        self.asm.emit_write_rodata(
+            STDERR_FD,
+            format!("klassic: {name} expects a non-negative integer index\n").as_bytes(),
+        );
+        self.asm.emit_exit(1);
+        self.asm.bind(non_negative);
+        let valid = self.asm.new_label();
+        self.asm.mov_imm64(Reg::X4, maximum);
+        self.asm.cmp_reg(Reg::X0, Reg::X4);
+        self.asm.branch(valid, BranchKind::Conditional(Cond::Ls));
+        self.asm.emit_write_rodata(
+            STDERR_FD,
+            format!("klassic: {name} allocation size overflow\n").as_bytes(),
+        );
+        self.asm.emit_exit(1);
+        self.asm.bind(valid);
     }
 
     /// Allocate a GC-shaped heap object: a 16-byte header
@@ -4701,9 +4943,9 @@ impl Emitter {
     /// unchanged. The tag distinguishes RAW_BYTES (no inner pointers) from
     /// POINTER_RECORD (every payload slot a heap pointer), so the collector
     /// traces only the latter.
-    fn emit_gc_alloc_object(&mut self, words: usize, tag: u64) {
+    fn emit_gc_alloc_object(&mut self, words: usize, shape: crate::gc_shape::BuiltinShape) {
         let entry = self.gc_alloc_entry_label();
-        crate::portable_asm::emit_gc_alloc_object(&mut self.asm, entry, (words * 8) as u64, tag);
+        crate::portable_asm::emit_gc_alloc_object(&mut self.asm, entry, (words * 8) as u64, shape);
     }
 
     /// Box a scalar (in x0) into its own single-slot `RAW_BYTES` object,
@@ -4722,40 +4964,32 @@ impl Emitter {
         crate::portable_asm::emit_gc_unbox_scalar(&mut self.asm);
     }
 
-    /// M7: colour a heap reference on its way into a heap slot --
-    /// `dst = src == 0 ? 0 : src | GoodColor`.
-    ///
-    /// The write half of the mutator contract, and the dual of the load
-    /// barrier. Stored references carry the cycle's good colour, so when
-    /// MarkStart flips the colours every reference already in the heap
-    /// becomes "bad" and the next load of it takes the slow path, which is
-    /// how the collector observes -- and marks -- what the mutator reaches.
-    /// A raw, uncoloured pointer would always look good and never be
-    /// marked, so this is what makes the barrier work at all.
-    ///
-    /// Null stays raw zero: `0 | colour` would be a bogus pointer, and the
-    /// root scan and barriers all treat 0 as "nothing here".
-    fn emit_color_ptr(&mut self, dst: Reg, src: Reg) {
-        if dst != src {
-            self.asm.mov_reg(dst, src);
+    /// Shared pointer-store barrier: marks old/new references during Mark.
+    fn gc_store_pointer_entry(&mut self) -> Label {
+        if let Some(label) = self.gc_store_pointer_label {
+            return label;
         }
-        // The colouring itself is the shared one: a heap slot holds a
-        // coloured pointer on every backend, and null stays raw on every
-        // backend, so the rule lives in one place.
-        let portable = match dst {
-            Reg::X0 => crate::portable_asm::Reg::V0,
-            Reg::X1 => crate::portable_asm::Reg::V1,
-            Reg::X2 => crate::portable_asm::Reg::V2,
-            Reg::X3 => crate::portable_asm::Reg::V3,
-            other => {
-                let raw = self.asm.new_label();
-                self.asm.branch(raw, BranchKind::CompareZero(other));
-                self.asm.orr_reg(other, other, Reg::X25);
-                self.asm.bind(raw);
-                return;
-            }
-        };
-        crate::portable_asm::emit_gc_colour_pointer(&mut self.asm, portable);
+        let label = self.asm.new_label();
+        self.gc_store_pointer_label = Some(label);
+        label
+    }
+
+    /// Store a raw reference while preserving every live caller register.
+    /// The legacy store routine never polls or allocates, so temporary raw
+    /// addresses remain valid across this call.
+    fn emit_gc_store_field(&mut self, base: Reg, offset: u32, value: Reg) {
+        assert!(base != Reg::X5 && value != Reg::X5);
+        let entry = self.store_trampoline_label();
+        self.asm.push_frame_record();
+        self.asm.push(Reg::X4);
+        self.asm.push(Reg::X5);
+        self.asm.mov_imm64(Reg::X5, offset as u64);
+        self.asm.add_reg(Reg::X5, base, Reg::X5);
+        self.asm.mov_reg(Reg::X4, value);
+        self.asm.branch(entry, BranchKind::Link);
+        self.asm.pop(Reg::X5);
+        self.asm.pop(Reg::X4);
+        self.asm.pop_frame_record();
     }
 
     /// The two shadow-stack cells, reserved on first use.
@@ -5102,12 +5336,37 @@ impl Emitter {
         }
     }
 
-    /// Emit both wrappers. Each saves the registers this backend has live
+    fn store_trampoline_label(&mut self) -> Label {
+        if let Some(label) = self.gc_store_trampoline_label {
+            return label;
+        }
+        let label = self.asm.new_label();
+        self.gc_store_trampoline_label = Some(label);
+        label
+    }
+
+    /// Emit the call wrappers. Each saves the registers this backend has live
     /// across its routine, calls it, restores, and returns -- so the policy
     /// lives in one place instead of at every call site, and a register the
     /// routine clobbers cannot be forgotten at one site and remembered at
     /// another.
     fn emit_gc_call_trampolines(&mut self) {
+        let store_wrapper = self.store_trampoline_label();
+        let store = self.gc_store_pointer_entry();
+        self.asm.bind(store_wrapper);
+        self.asm.push_frame_record();
+        self.asm.push(Reg::X0);
+        for reg in ALLOC_SAVED {
+            self.asm.push(reg);
+        }
+        self.asm.branch(store, BranchKind::Link);
+        for reg in ALLOC_SAVED.into_iter().rev() {
+            self.asm.pop(reg);
+        }
+        self.asm.pop(Reg::X0);
+        self.asm.pop_frame_record();
+        self.asm.ret();
+
         let barrier = self.barrier_trampoline_label();
         let slow = self.load_barrier_label();
         self.asm.bind(barrier);
@@ -5204,9 +5463,7 @@ impl Emitter {
         self.asm.add_reg_imm(Reg::X5, len, 15);
         self.asm.lsr_imm(Reg::X5, Reg::X5, 3);
         self.asm.lsl_imm(Reg::X5, Reg::X5, 3);
-        self.asm
-            .mov_imm64(Reg::X4, crate::gc_layout::GC_TYPE_RAW_BYTES);
-        self.emit_gc_alloc_call(); // x0 = user pointer
+        self.emit_gc_alloc_call(crate::gc_shape::BuiltinShape::RawBytes); // x0 = user pointer
         self.asm.mov_reg(Reg::X5, Reg::X0); // the documented result register
     }
 
@@ -6557,12 +6814,11 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         // so the collector can trace the payload uniformly. The 16-byte
         // header shifts the user pointer to block + 16, but fields still
         // live at [user_ptr + position*8], so field access is unchanged.
-        self.emit_gc_alloc_object(count, crate::gc_layout::GC_TYPE_POINTER_RECORD); // x0 = user ptr
+        self.emit_gc_alloc_object(count, crate::gc_shape::BuiltinShape::PointerRecord); // x0 = user ptr
         for position in (0..count).rev() {
             // The caller parked each field as a rooted machine-stack slot.
             self.pop_rooted(Reg::X1);
-            self.emit_color_ptr(Reg::X1, Reg::X1); // colour on store
-            self.asm.str_imm(Reg::X1, Reg::X0, (position * 8) as u32);
+            self.emit_gc_store_field(Reg::X0, (position * 8) as u32, Reg::X1);
         }
     }
 
@@ -6582,13 +6838,11 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         // heap references waiting across an allocation, so both machine-
         // stack slots are GC roots for that window.
         self.push_rooted(Reg::X0); // `next`
-        self.emit_gc_alloc_object(2, crate::gc_layout::GC_TYPE_POINTER_RECORD); // x0 = user ptr
+        self.emit_gc_alloc_object(2, crate::gc_shape::BuiltinShape::PointerRecord); // x0 = user ptr
         self.pop_rooted(Reg::X1);
-        self.emit_color_ptr(Reg::X1, Reg::X1); // colour on store
-        self.asm.str_imm(Reg::X1, Reg::X0, 8); // [cell + 8] = next
+        self.emit_gc_store_field(Reg::X0, 8, Reg::X1); // next
         self.pop_rooted(Reg::X1);
-        self.emit_color_ptr(Reg::X1, Reg::X1);
-        self.asm.str_imm(Reg::X1, Reg::X0, 0); // [cell + 0] = head
+        self.emit_gc_store_field(Reg::X0, 0, Reg::X1); // head
     }
 
     /// Compare the element in x0 against the one in x1 -> x0 = Bool, where
@@ -7108,15 +7362,13 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         self.push_rooted(Reg::X0);
         self.push_rooted(Reg::X1);
         self.push_rooted(Reg::X2);
-        self.emit_gc_alloc_object(2, crate::gc_layout::GC_TYPE_POINTER_RECORD);
+        self.emit_gc_alloc_object(2, crate::gc_shape::BuiltinShape::PointerRecord);
         self.asm.mov_reg(Reg::X3, Reg::X0); // the fresh cell
         self.pop_rooted(Reg::X2); // head
         self.pop_rooted(Reg::X1); // acc
         self.pop_rooted(Reg::X0); // cursor
-        self.emit_color_ptr(Reg::X4, Reg::X2);
-        self.asm.str_imm(Reg::X4, Reg::X3, 0); // [cell + 0] = head
-        self.emit_color_ptr(Reg::X4, Reg::X1);
-        self.asm.str_imm(Reg::X4, Reg::X3, 8); // [cell + 8] = next = acc
+        self.emit_gc_store_field(Reg::X3, 0, Reg::X2); // head
+        self.emit_gc_store_field(Reg::X3, 8, Reg::X1); // next = acc
         self.asm.mov_reg(Reg::X1, Reg::X3); // acc = the new cell (raw)
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(done);
@@ -8985,6 +9237,14 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 if self.expression(&arguments[0])? != ValueType::Int {
                     return Err(unsupported(span, &format!("{name} with a non-Int size")));
                 }
+                self.emit_gc_allocation_size_check(
+                    name,
+                    if name == "__gc_record" {
+                        crate::gc_layout::GC_MAX_POINTER_SLOT_COUNT
+                    } else {
+                        crate::gc_layout::GC_MAX_PAYLOAD_SIZE
+                    },
+                );
                 // M6: a GC-shaped object with a 16-byte header. The enum
                 // lowering boxes every scalar/bool/double field and the
                 // discriminant, so a `__gc_record`'s n slots are all heap
@@ -8992,18 +9252,17 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 // `__gc_alloc` cell is raw bytes (RAW_BYTES). Both return the
                 // user pointer (block + 16), so the `__gc_write`/`__gc_read`
                 // payload offsets are unchanged.
-                let tag = if name == "__gc_record" {
+                let shape = if name == "__gc_record" {
                     // n pointer slots -> n * 8 bytes of payload.
                     self.asm.lsl_imm(Reg::X5, Reg::X0, 3);
-                    crate::gc_layout::GC_TYPE_POINTER_RECORD
+                    crate::gc_shape::BuiltinShape::PointerRecord
                 } else {
-                    self.asm.add_reg_imm(Reg::X5, Reg::X0, 7);
-                    self.asm.lsr_imm(Reg::X5, Reg::X5, 3);
-                    self.asm.lsl_imm(Reg::X5, Reg::X5, 3);
-                    crate::gc_layout::GC_TYPE_RAW_BYTES
+                    // Preserve the logical byte count. The allocator owns
+                    // block alignment; descriptor sizing must not see padding.
+                    self.asm.mov_reg(Reg::X5, Reg::X0);
+                    crate::gc_shape::BuiltinShape::RawBytes
                 };
-                self.asm.mov_imm64(Reg::X4, tag);
-                self.emit_gc_alloc_call(); // x0 = user pointer
+                self.emit_gc_alloc_call(shape); // x0 = user pointer
                 Ok(Some(ValueType::Ptr))
             }
             ("__gc_write", 3) => {
@@ -9025,13 +9284,14 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 self.asm.mov_reg(Reg::X2, Reg::X0);
                 self.asm.pop(Reg::X1);
                 self.pop_rooted(Reg::X0);
-                // Colour a stored heap reference. A boxed scalar's contents
-                // goes through the same primitive and stays raw -- it is a
-                // value, not a pointer.
                 if is_heap_pointer(value_ty) {
-                    self.emit_color_ptr(Reg::X2, Reg::X2);
+                    self.asm.add_reg(Reg::X5, Reg::X0, Reg::X1);
+                    self.asm.mov_reg(Reg::X4, Reg::X2);
+                    let store = self.gc_store_pointer_entry();
+                    self.asm.branch(store, BranchKind::Link);
+                } else {
+                    self.asm.str_reg_offset(Reg::X2, Reg::X0, Reg::X1);
                 }
-                self.asm.str_reg_offset(Reg::X2, Reg::X0, Reg::X1);
                 Ok(Some(ValueType::Unit))
             }
             ("__gc_read", 2) | ("__gc_read_ptr", 2) | ("__gc_read_string", 2) => {
@@ -13073,6 +13333,8 @@ struct GcState {
     free_region_head: PortDataAddr,
     mark_worklist: PortDataAddr,
     mark_worklist_top: PortDataAddr,
+    trace_cursor: PortDataAddr,
+    trace_end: PortDataAddr,
     shadow_stack: PortDataAddr,
     shadow_stack_top: PortDataAddr,
     region_base: PortDataAddr,
@@ -13125,6 +13387,7 @@ struct GcState {
     l_mark_start: Label,
     l_mark_end: Label,
     l_mark_visit: Label,
+    l_store_pointer: Label,
     l_deep_equal: Label,
     l_load_barrier_slow: Label,
     l_acquire_region: Label,
@@ -13307,6 +13570,8 @@ impl Emitter {
         let free_region_head = cell();
         let mark_worklist = cell();
         let mark_worklist_top = cell();
+        let trace_cursor = cell();
+        let trace_end = cell();
         let shadow_stack = PortDataAddr::Bss(shadow_stack_cell);
         let shadow_stack_top = PortDataAddr::Bss(shadow_stack_top_cell);
         let region_base = cell();
@@ -13362,6 +13627,8 @@ impl Emitter {
             free_region_head,
             mark_worklist,
             mark_worklist_top,
+            trace_cursor,
+            trace_end,
             shadow_stack,
             shadow_stack_top,
             region_base,
@@ -13414,6 +13681,7 @@ impl Emitter {
             l_mark_start: self.asm.new_label(),
             l_mark_end: self.asm.new_label(),
             l_mark_visit: self.asm.new_label(),
+            l_store_pointer: self.gc_store_pointer_entry(),
             l_deep_equal,
             l_load_barrier_slow,
             l_acquire_region: self.asm.new_label(),
@@ -13423,18 +13691,20 @@ impl Emitter {
         }
     }
 
-    /// Emit all 24 portable GC runtime routines into the code buffer.
-    /// M5: evacuation is off (non-moving) and pause timing is disabled
-    /// (`plat_read_monotonic_ns` is a stub); the `--gc-log`/`--gc-stress`
-    /// flags are threaded in at go-live (M7). Emitted after the program
-    /// body and its exit, so the routines are reachable only once the
-    /// mutator calls `gc_alloc` (M7) -- dead but linked until then.
+    /// Emit the shared GC runtime routines into the code buffer.
+    /// Pause timestamps use libSystem's monotonic clock when logging is enabled.
+    /// The routines are emitted after the program body and reached by GC calls.
     fn emit_gc_runtime(&mut self, gc: &GcState) {
         use portable_asm as pa;
         let asm = &mut self.asm;
         let evac_off = GC_EVAC_OFF;
         let poison = self.gc_poison;
-        let timing = false;
+        let timing = self.gc_log;
+        let scan = pa::MarkScanCells {
+            top: gc.mark_worklist_top,
+            cursor: gc.trace_cursor,
+            end: gc.trace_end,
+        };
         let stderr_fd = 2u64;
         let tables = pa::RegionTables {
             heap_base: gc.heap_base,
@@ -13460,6 +13730,7 @@ impl Emitter {
                 stw_fallback_pending: gc.stw_fallback_pending,
             },
         );
+        pa::emit_gc_store_pointer(asm, gc.l_store_pointer, gc.phase, gc.l_mark_visit);
         pa::emit_gc_deep_equal(asm, gc.l_deep_equal);
         pa::emit_gc_load_barrier_slow(
             asm,
@@ -13478,7 +13749,7 @@ impl Emitter {
                 bytes_since_cycle: gc.bytes_since_cycle,
                 budget_regions: gc.budget_regions,
                 bytes_since_quantum: gc.bytes_since_quantum,
-                mark_worklist_top: gc.mark_worklist_top,
+                mark_scan: scan,
                 header_mark: gc.header_mark,
                 alloc_count: gc.alloc_count,
                 bytes_allocated: gc.bytes_allocated,
@@ -13526,13 +13797,7 @@ impl Emitter {
             gc.shadow_stack_top,
             gc.l_mark_visit,
         );
-        pa::emit_gc_trace(
-            asm,
-            gc.l_trace,
-            gc.mark_worklist_top,
-            gc.mark_worklist,
-            gc.l_mark_visit,
-        );
+        pa::emit_gc_trace(asm, gc.l_trace, scan, gc.mark_worklist, gc.l_mark_visit);
         pa::emit_gc_sweep(
             asm,
             gc.l_sweep,
@@ -13552,11 +13817,11 @@ impl Emitter {
                 drain: gc.l_drain,
             },
             gc.stw_fallback_pending,
-            gc.mark_worklist_top,
+            scan,
             gc.worklist_overflow.0,
             gc.worklist_overflow.1,
         );
-        pa::emit_gc_drain(asm, gc.l_drain, gc.l_trace, gc.mark_worklist_top);
+        pa::emit_gc_drain(asm, gc.l_drain, gc.l_trace, scan);
         pa::emit_gc_evacuate(
             asm,
             gc.l_evacuate,
@@ -13660,7 +13925,7 @@ impl Emitter {
                 good_color: gc.good_color,
                 bad_mask: gc.bad_mask,
                 mark_color: gc.mark_color,
-                worklist_top: gc.mark_worklist_top,
+                scan,
                 phase: gc.phase,
             },
             gc.l_mark_roots,
@@ -13804,23 +14069,15 @@ pub(crate) fn emit_macho_program(
         emitter.emit_shadow_pop_routine(label);
     }
 
-    // M5: emit all 24 portable ZGC runtime routines after the program's
-    // exit (the cells were reserved and the region heap/colour registers
-    // seeded at startup above). Nothing calls gc_alloc yet (the bump
-    // allocator is still live), so the routines are dead but linked -- they
-    // exercise the __DATA segment, the data fixups, and the whole
-    // PortableAsm lowering end-to-end, and must encode validly. The go-live
-    // (M7) routes the mutator through gc_alloc and adds roots/barriers.
+    // Emit the shared runtime and this backend's allocation/barrier wrappers.
     emitter.emit_gc_runtime(&gc);
     // The two wrappers that save this backend's live registers around the
     // routines above, so no call site carries a list of its own.
     emitter.emit_gc_call_trampolines();
 
     emitter.asm.finish();
-    // `bss_len` is 0 for every program today (no codegen reserves GC
-    // cells until M5), so no writable segment is emitted and the image
-    // stays byte-for-byte the pre-GC layout. The data-label machinery
-    // (reserve_data_cells / load_data_address) is wired to it and ready.
+    // Writable GC cells and any libSystem imports share the signed image's
+    // __DATA mapping, with BSS kept separate from file-backed binding slots.
     let bss_len = emitter.asm.bss_len as u64;
     Ok(macho::write_executable(
         emitter.asm.code,
@@ -13828,7 +14085,112 @@ pub(crate) fn emit_macho_program(
         &emitter.asm.fixups,
         "klassic",
         bss_len,
+        &emitter.asm.imports,
     ))
+}
+
+#[cfg(test)]
+pub(super) fn gc_clock_test_image() -> Vec<u8> {
+    let mut asm = Assembler::default();
+    let sample = asm.new_label();
+    let not_first = asm.new_label();
+    let failed = asm.new_label();
+    asm.mov_imm64(Reg::X19, 10000);
+    asm.mov_imm64(Reg::X20, 0);
+    asm.mov_imm64(Reg::X21, 0);
+    asm.bind(sample);
+    asm.emit_gc_monotonic_ns();
+    asm.cmp_reg(Reg::X0, Reg::X20);
+    asm.branch(failed, BranchKind::Conditional(Cond::Cc));
+    asm.mov_imm64(Reg::X1, 10000);
+    asm.cmp_reg(Reg::X19, Reg::X1);
+    asm.branch(not_first, BranchKind::Conditional(Cond::Ne));
+    asm.mov_reg(Reg::X21, Reg::X0);
+    asm.bind(not_first);
+    asm.mov_reg(Reg::X20, Reg::X0);
+    asm.mov_imm64(Reg::X1, 1);
+    asm.sub_reg(Reg::X19, Reg::X19, Reg::X1);
+    asm.branch(sample, BranchKind::CompareNonZero(Reg::X19));
+    asm.cmp_reg(Reg::X20, Reg::X21);
+    asm.branch(failed, BranchKind::Conditional(Cond::Ls));
+    asm.mov_imm64(Reg::X0, 0);
+    asm.mov_imm64(Reg::X16, SYS_EXIT as u64);
+    asm.svc_0x80();
+    asm.bind(failed);
+    asm.mov_imm64(Reg::X0, 1);
+    asm.mov_imm64(Reg::X16, SYS_EXIT as u64);
+    asm.svc_0x80();
+    asm.finish();
+    macho::write_executable(
+        asm.code,
+        asm.rodata,
+        &asm.fixups,
+        "klassic-clock-test",
+        0,
+        &asm.imports,
+    )
+}
+
+/// Relocatable metadata helpers for the native conformance owner. ADR replaces
+/// each page-relative GOT address pair, so the payload works at any load base.
+#[cfg(test)]
+pub(super) fn gc_metadata_test_payload() -> (Vec<u8>, [usize; 8]) {
+    let mut asm = Assembler::default();
+    gc_macos::emit_metadata_map(&mut asm);
+    let unmap = asm.code.len();
+    gc_macos::emit_metadata_unmap(&mut asm);
+    let roots_prepare = asm.code.len();
+    gc_macos::emit_roots_prepare(&mut asm);
+    let roots_dispose = asm.code.len();
+    gc_macos::emit_roots_dispose(&mut asm);
+    let builtin_registry_prepare = asm.code.len();
+    gc_macos::emit_builtin_registry_prepare(&mut asm);
+    let startup_prepare = asm.code.len();
+    gc_macos::emit_startup_prepare(&mut asm);
+    asm.finish();
+    assert_eq!(
+        asm.imports,
+        [macho::ImportSymbol::Mmap, macho::ImportSymbol::Munmap]
+    );
+    let got = asm.code.len().next_multiple_of(8);
+    asm.code.resize(got + 16, 0);
+    for fixup in &asm.fixups {
+        assert_eq!(fixup.section, FixupSection::Imports);
+        assert_eq!(fixup.add_offset, fixup.adrp_offset + 4);
+        let delta = i32::try_from(got + fixup.data_offset).unwrap()
+            - i32::try_from(fixup.adrp_offset).unwrap();
+        assert!((-0x100000..0x100000).contains(&delta));
+        let imm = delta as u32 & 0x1f_ffff;
+        let adr = 0x1000_0010 | ((imm & 3) << 29) | ((imm >> 2) << 5);
+        asm.code[fixup.adrp_offset..fixup.adrp_offset + 4].copy_from_slice(&adr.to_le_bytes());
+        asm.code[fixup.add_offset..fixup.add_offset + 4]
+            .copy_from_slice(&0xd503_201f_u32.to_le_bytes());
+    }
+    (
+        asm.code,
+        [
+            0,
+            unmap,
+            got,
+            got + 8,
+            roots_prepare,
+            roots_dispose,
+            builtin_registry_prepare,
+            startup_prepare,
+        ],
+    )
+}
+
+#[cfg(test)]
+pub(super) fn gc_atomic_test_code(operation: crate::gc_atomic_tests::Operation) -> Vec<u8> {
+    let mut asm = Assembler::default();
+    // Normalize the AAPCS64 parameters into the portable operation registers.
+    asm.mov_reg(Reg::X5, Reg::X0); // address: V7
+    asm.mov_reg(Reg::X4, Reg::X1); // argument: V6
+    crate::gc_atomic_tests::emit_body(&mut asm, operation);
+    asm.ret();
+    asm.finish();
+    asm.code
 }
 
 #[cfg(test)]
@@ -13840,6 +14202,140 @@ mod tests {
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn gc_allocation_size_lowering_fixtures() {
+        // These are compiler-internal intrinsics, introduced after typecheck.
+        // Exercise the actual lowering with ASTs, not user-visible builtins.
+        let export =
+            std::env::var_os("KLASSIC_ARM_ALLOCATION_FIXTURES").map(std::path::PathBuf::from);
+        let directory = export.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "klassic-arm-allocation-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+        });
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut manifest = String::new();
+        for (name, maximum) in [
+            ("__gc_alloc", crate::gc_layout::GC_MAX_PAYLOAD_SIZE),
+            ("__gc_record", crate::gc_layout::GC_MAX_POINTER_SLOT_COUNT),
+        ] {
+            for count in [
+                -1,
+                i64::MIN,
+                0,
+                1,
+                7,
+                8,
+                9,
+                17,
+                maximum as i64 + 1,
+                i64::MAX,
+            ] {
+                let span = Span::new(0, 0);
+                let expr = crate::en_call(name, vec![crate::en_int(count, span)], span);
+                let image = emit_macho_program(
+                    &expr,
+                    Default::default(),
+                    Default::default(),
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+                let filename = format!("{name}_{count}.macho");
+                let path = directory.join(&filename);
+                std::fs::write(&path, image).unwrap();
+                let (status, message) = if count < 0 {
+                    (1, "expects a non-negative integer index")
+                } else if count as u64 > maximum {
+                    (1, "allocation size overflow")
+                } else {
+                    (0, "")
+                };
+                manifest.push_str(&format!("{filename}\t{status}\t{message}\n"));
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    let output = std::process::Command::new(&path).output().unwrap();
+                    assert_eq!(output.status.code(), Some(status), "{filename}");
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr).contains(message),
+                        "{filename}"
+                    );
+                }
+            }
+        }
+        std::fs::write(directory.join("cases.tsv"), manifest).unwrap();
+        if export.is_none() {
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn gc_atomic_arm_acquire_release_and_fence_encodings() {
+        use crate::portable_asm::{PortableAsm, Reg as P};
+        let mut asm = Assembler::default();
+        asm.atomic_load_acquire(P::V0, P::V7);
+        asm.atomic_store_release(P::V7, P::V2);
+        asm.atomic_fence();
+        assert_eq!(words(&asm), [0xc8df_fca0, 0xc89f_fca2, 0xd503_3bbf]);
+    }
+
+    #[test]
+    fn gc_atomic_arm_strong_cas_exclusive_retry_and_mismatch() {
+        use crate::portable_asm::{PortableAsm, Reg as P};
+        let mut asm = Assembler::default();
+        asm.atomic_compare_exchange(P::V7, P::V2);
+        asm.finish();
+        // LLVM MC 15 independently assembled the fixed instruction sequence.
+        assert_eq!(
+            words(&asm),
+            [
+                0xaa00_03ec,
+                0xc85f_fca0,
+                0xeb0c_001f,
+                0x5400_0081,
+                0xc80b_fca2,
+                0xb5ff_ff8b,
+                0x1400_0002,
+                0xd503_3f5f,
+            ]
+        );
+    }
+
+    #[test]
+    fn gc_atomic_u32_arm_encodings_preserve_width() {
+        use crate::portable_asm::{PortableAsm, Reg as P};
+        let mut asm = Assembler::default();
+        asm.atomic_load_acquire_u32(P::V0, P::V7);
+        asm.atomic_store_release_u32(P::V7, P::V2);
+        asm.atomic_compare_exchange_u32(P::V7, P::V2);
+        asm.finish();
+        assert_eq!(
+            words(&asm),
+            [
+                0x88df_fca0,
+                0x889f_fca2,
+                0x2a00_03ec,
+                0x885f_fca0,
+                0x6b0c_001f,
+                0x5400_0081,
+                0x880b_fca2,
+                0xb5ff_ff8b,
+                0x1400_0002,
+                0xd503_3f5f,
+            ]
+        );
     }
 
     #[test]
@@ -13947,7 +14443,12 @@ mod tests {
         let trace = asm.new_label();
         asm.bind(trace); // a stand-in body so `finish` can resolve the call
         asm.ret();
-        crate::portable_asm::emit_gc_drain(&mut asm, drain, trace, worklist_top);
+        let scan = crate::portable_asm::MarkScanCells {
+            top: worklist_top,
+            cursor: PortDataAddr::Bss(asm.reserve_data_cells(1)),
+            end: PortDataAddr::Bss(asm.reserve_data_cells(1)),
+        };
+        crate::portable_asm::emit_gc_drain(&mut asm, drain, trace, scan);
 
         // mark_roots exercises the rbp-relative frame slots ([x29,#-N]).
         let shadow = PortDataAddr::Bss(asm.reserve_data_cells(1));

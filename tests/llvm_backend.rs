@@ -1,8 +1,8 @@
 //! Differential tests for the LLVM backend (`--backend llvm`, migration
 //! plan `docs/llvm-backend-plan.md`). Each program is run through both
 //! the evaluator (the oracle) and the LLVM backend, asserting
-//! byte-identical stdout. Gated on a clang >= 15 being present so CI
-//! without the toolchain stays green; the emitter itself is also covered
+//! byte-identical stdout. Clang >= 15 is required for this validation;
+//! the emitter itself is also covered
 //! by hermetic unit tests in `crates/klassic-native/src/llvm.rs`.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
@@ -14,7 +14,7 @@ fn klassic_bin() -> &'static str {
     env!("CARGO_BIN_EXE_klassic")
 }
 
-/// A clang that accepts opaque-pointer IR, or None (tests then skip).
+/// Locate clang; required validation fails when no compiler is available.
 fn find_clang() -> Option<String> {
     if let Ok(explicit) = std::env::var("KLASSIC_CLANG") {
         return Some(explicit);
@@ -54,12 +54,9 @@ fn unique_stamp() -> String {
 }
 
 /// Evaluate `source`, then build+run it through `--backend llvm`, and
-/// assert the two stdout streams match. No-op when clang is absent.
+/// assert the two stdout streams match. Missing clang is a validation failure.
 fn assert_llvm_matches_evaluator(source: &str) {
-    let Some(clang) = find_clang() else {
-        eprintln!("skipping: no clang >= 15 found");
-        return;
-    };
+    let clang = find_clang().expect("LLVM validation requires clang >= 15; set KLASSIC_CLANG");
     let stamp = unique_stamp();
     let dir = std::env::temp_dir();
     let src = dir.join(format!("klassic_llvm_{stamp}.kl"));
@@ -250,11 +247,8 @@ fn gc_log_reports_pause_statistics() {
     // --gc-log builds the C collector with its statistics + at-exit report
     // compiled in (true-zgc M6). The churn forces collections; the program's
     // stdout must be unchanged and a single stats line must appear on stderr
-    // reporting the collection count and the O(roots) handshake pauses.
-    let Some(clang) = find_clang() else {
-        eprintln!("skipping: no clang >= 15 found");
-        return;
-    };
+    // reporting action, request-to-quiescence, stopped and mutator-park times.
+    let clang = find_clang().expect("LLVM validation requires clang >= 15; set KLASSIC_CLANG");
     let stamp = unique_stamp();
     let dir = std::env::temp_dir();
     let src = dir.join(format!("klassic_gclog_{stamp}.kl"));
@@ -302,4 +296,24 @@ fn gc_log_reports_pause_statistics() {
             && stderr.contains("pause_max="),
         "expected a GC stats line on stderr, got:\n{stderr}"
     );
+    for key in [
+        "pauses",
+        "safepoint_max",
+        "safepoint_total",
+        "stopped_max",
+        "stopped_total",
+        "parks",
+        "park_max",
+        "park_total",
+    ] {
+        let value = stderr
+            .split_whitespace()
+            .find_map(|field| {
+                field
+                    .strip_prefix(&format!("{key}="))
+                    .and_then(|v| v.trim_end_matches("ns").parse::<u64>().ok())
+            })
+            .unwrap_or_else(|| panic!("missing GC statistic {key}: {stderr}"));
+        assert!(value > 0, "expected a measured nonzero {key}: {stderr}");
+    }
 }

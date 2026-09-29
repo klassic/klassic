@@ -40,6 +40,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "gc_threads.h"
 
 /* Type tags (word1). */
 #define KLASSIC_GC_RAW_BYTES 1
@@ -58,14 +59,16 @@ void klassic_gc_init(void);
 /* Thread table: every thread that touches the heap runs as a registered
  * "mutator" with its own shadow stack and TLAB. The main thread is registered
  * by klassic_gc_init and extra threads are auto-registered on their first
- * allocation, so single-threaded programs need call neither; a thread that
- * spawns mutators and later exits should deregister them. */
+ * allocation, so single-threaded programs need call neither. Each owner must
+ * deregister itself before exit. These legacy names use the same context as
+ * gc_thread_attach/detach. Blocking/native calls use gc_enter/leave_native. */
 void klassic_gc_register_thread(void);
 void klassic_gc_unregister_thread(void);
 
 /* Allocate `size` payload bytes for an object of `type_tag`; returns the
- * user pointer (past the 16-byte header). Never returns NULL: on
- * exhaustion it prints an error and exits. */
+ * user pointer (past the 16-byte header). Pointer-bearing payloads are zeroed
+ * before return so initial stores have valid null pre-barrier values. Never
+ * returns NULL: on exhaustion it prints an error and exits. */
 void *klassic_gc_alloc(uint64_t size, uint64_t type_tag);
 
 /* Precise roots: push the ADDRESS of a stack slot holding a heap pointer,
@@ -74,7 +77,8 @@ void *klassic_gc_alloc(uint64_t size, uint64_t type_tag);
 void klassic_gc_shadow_push(void **slot_addr);
 void klassic_gc_shadow_pop_n(uint64_t count);
 
-/* Force a collection (stop-the-world mark-sweep for now). */
+/* Request and await a fresh legacy concurrent collection, polling meanwhile.
+ * Phase transitions still contain unbounded stopped work; see capabilities. */
 void klassic_gc_collect(void);
 
 /* --- Colored pointers + load barrier ----------------------------- *
@@ -93,8 +97,9 @@ extern uint64_t gc_strip_mask;  /* AND with this to strip a color -> raw */
 
 /* Slow path: in: `value` = the bad-colored slot value, `slot` = the
  * field address it was loaded from. Returns the raw (stripped, and in
- * later milestones remapped) pointer, self-healing the slot to the good
- * color. */
+ * later milestones remapped) pointer. Self-healing uses CAS against `value`,
+ * preserving any intervening store. A failed heal still returns the resolved
+ * original observation, never the CAS failure replacement. */
 uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot);
 
 /* Read a heap pointer slot through the barrier (fast path inline, slow
@@ -102,11 +107,15 @@ uint64_t klassic_gc_load_barrier_slow(uint64_t value, void **slot);
  * C entry point exists for the runtime and the tests. NOT a safepoint:
  * `slot` is derived from a raw heap pointer that a safepoint would
  * invalidate, so this call must stay poll-free (see the safepoint
- * contract below). */
+ * contract below). Caller must already be registered; an unattached raw
+ * read/write/slow-barrier call exits with a diagnostic, never attaches. */
 void *klassic_gc_read(void **slot);
 
 /* Store a heap pointer into a slot, coloring it good (null stays null).
- * NOT a safepoint (same contract as klassic_gc_read). */
+ * During legacy Mark, preserve the overwritten target and mark the canonical
+ * new target before a CAS publication; contention rechecks the overwritten
+ * value. This is immediate mark assistance, not a generational remset/SATB
+ * buffer or relocation source guard. NOT a safepoint. */
 void klassic_gc_write(void **slot, void *value);
 
 /* --- The safepoint contract (a MOVING, CONCURRENT collector) ------ *

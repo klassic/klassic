@@ -7,11 +7,58 @@
 //! `LC_LOAD_DYLINKER` + `LC_MAIN`; fully static `LC_UNIXTHREAD`
 //! images are rejected with EBADEXEC) and carry a valid embedded
 //! ad-hoc code signature (a SHA-256 CodeDirectory). dyld also needs
-//! empty `LC_SYMTAB` / `LC_DYSYMTAB` to not crash. The generated
-//! code still imports nothing — it talks to the kernel through
-//! `svc #0x80` exactly like the ELF backend talks through `syscall`
-//! — and no external `codesign` / `cc` / `ld` is involved, keeping
-//! the no-toolchain policy of the direct backends.
+//! `LC_SYMTAB` / `LC_DYSYMTAB`. Optional libSystem imports use eager dyld
+//! bindings into writable GOT slots. No external `codesign` / `cc` / `ld`
+//! is involved, keeping the direct backend's no-toolchain policy.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImportSymbol {
+    ClockGettime,
+    Mmap,
+    Munmap,
+    Mprotect,
+    Madvise,
+    PthreadCreate,
+    PthreadJoin,
+    PthreadKeyCreate,
+    PthreadKeyDelete,
+    PthreadSetSpecific,
+    PthreadGetSpecific,
+    PthreadMutexInit,
+    PthreadMutexDestroy,
+    PthreadMutexLock,
+    PthreadMutexUnlock,
+    PthreadCondInit,
+    PthreadCondDestroy,
+    PthreadCondWait,
+    PthreadCondSignal,
+}
+
+impl ImportSymbol {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::ClockGettime => "_clock_gettime",
+            Self::Mmap => "_mmap",
+            Self::Munmap => "_munmap",
+            Self::Mprotect => "_mprotect",
+            Self::Madvise => "_madvise",
+            Self::PthreadCreate => "_pthread_create",
+            Self::PthreadJoin => "_pthread_join",
+            Self::PthreadKeyCreate => "_pthread_key_create",
+            Self::PthreadKeyDelete => "_pthread_key_delete",
+            Self::PthreadSetSpecific => "_pthread_setspecific",
+            Self::PthreadGetSpecific => "_pthread_getspecific",
+            Self::PthreadMutexInit => "_pthread_mutex_init",
+            Self::PthreadMutexDestroy => "_pthread_mutex_destroy",
+            Self::PthreadMutexLock => "_pthread_mutex_lock",
+            Self::PthreadMutexUnlock => "_pthread_mutex_unlock",
+            Self::PthreadCondInit => "_pthread_cond_init",
+            Self::PthreadCondDestroy => "_pthread_cond_destroy",
+            Self::PthreadCondWait => "_pthread_cond_wait",
+            Self::PthreadCondSignal => "_pthread_cond_signal",
+        }
+    }
+}
 
 /// Which segment a `DataFixup` addresses: the read-only `__TEXT,__const`
 /// (constants, strings) or the writable `__DATA,__bss` (the GC's cells).
@@ -19,6 +66,7 @@
 pub(crate) enum FixupSection {
     Rodata,
     Data,
+    Imports,
 }
 
 /// An `adrp`+`add` pair in `code` that must be patched to address a byte
@@ -50,6 +98,11 @@ const LC_LOAD_DYLINKER: u32 = 0xe;
 const LC_MAIN: u32 = 0x8000_0028;
 const LC_BUILD_VERSION: u32 = 0x32;
 const LC_CODE_SIGNATURE: u32 = 0x1d;
+const LC_LOAD_DYLIB: u32 = 0xc;
+const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
+const LIBSYSTEM: &[u8] = b"/usr/lib/libSystem.B.dylib\0";
+const LOAD_DYLIB_COMMAND_SIZE: u32 = 56;
+const DYLD_INFO_COMMAND_SIZE: u32 = 48;
 
 const VM_PROT_READ: u32 = 0x1;
 const VM_PROT_WRITE: u32 = 0x2;
@@ -122,16 +175,16 @@ pub(crate) fn write_executable(
     fixups: &[DataFixup],
     identifier: &str,
     bss_size: u64,
+    imports: &[ImportSymbol],
 ) -> Vec<u8> {
-    // A writable `__DATA` segment (one zero-fill `__bss` section) is
-    // emitted only when the codegen requested mutable global cells (the
-    // GC's). It carries no on-disk bytes, so it shifts nothing in the
-    // payload or the signature — only the two extra load commands grow
-    // `sizeofcmds`, which cascades through the file offsets. When
-    // `bss_size == 0` the layout is byte-for-byte the pre-GC image.
-    let has_data = bss_size > 0;
+    // Imports require a file-backed GOT; GC globals require zero-fill BSS.
+    // Omit both sections when unused. Without imports, preserve the existing
+    // zero-fill-only layout so non-importing executables keep their format.
+    let has_imports = !imports.is_empty();
+    let has_data = bss_size > 0 || has_imports;
+    let data_sections = u32::from(bss_size > 0) + u32::from(has_imports);
     let data_cmd_size = if has_data {
-        SEGMENT_COMMAND_SIZE + SECTION_SIZE
+        SEGMENT_COMMAND_SIZE + data_sections * SECTION_SIZE
     } else {
         0
     };
@@ -144,19 +197,22 @@ pub(crate) fn write_executable(
         + SYMTAB_COMMAND_SIZE
         + DYSYMTAB_COMMAND_SIZE
         + BUILD_VERSION_COMMAND_SIZE
-        + CODE_SIGNATURE_COMMAND_SIZE;
-    let ncmds = if has_data { 10u32 } else { 9u32 };
+        + CODE_SIGNATURE_COMMAND_SIZE
+        + if has_imports { LOAD_DYLIB_COMMAND_SIZE + DYLD_INFO_COMMAND_SIZE } else { 0 };
+    let ncmds = 9 + u32::from(has_data) + 2 * u32::from(has_imports);
     let header_end = 32 + u64::from(sizeofcmds);
     let code_offset = align_to(header_end, 16);
     let rodata_offset = align_to(code_offset + code.len() as u64, 8);
     let text_filesize = align_to(rodata_offset + rodata.len() as u64, PAGE_SIZE);
-    // The zero-fill __bss adds no file bytes, so the signature still
-    // begins at the end of __TEXT regardless of the data segment.
-    let signature_offset = text_filesize;
+    // Signed file bytes include the GOT and binding/symbol tables, but no BSS.
+    let data_filesize = align_to(imports.len() as u64 * 8, PAGE_SIZE);
+    let linkedit_offset = text_filesize + data_filesize;
+    let linkedit = ImportTables::new(imports, linkedit_offset);
+    let signature_offset = linkedit_offset + linkedit.bytes.len() as u64;
     // __DATA maps in VM immediately after __TEXT; __LINKEDIT then moves
     // past __DATA's (page-rounded) vm size.
     let data_vmaddr = TEXT_BASE + text_filesize;
-    let data_vmsize = align_to(bss_size, PAGE_SIZE);
+    let data_vmsize = align_to(data_filesize + bss_size, PAGE_SIZE);
     let linkedit_vmaddr = if has_data {
         data_vmaddr + data_vmsize
     } else {
@@ -166,9 +222,14 @@ pub(crate) fn write_executable(
     for fixup in fixups {
         let section_base = match fixup.section {
             FixupSection::Rodata => TEXT_BASE + rodata_offset,
-            // __DATA maps right after __TEXT; the zero-fill __bss shares
-            // the segment's vmaddr (its file offset is meaningless).
-            FixupSection::Data => data_vmaddr,
+            // BSS follows any file-backed GOT pages in __DATA.
+            FixupSection::Data => data_vmaddr + data_filesize,
+            FixupSection::Imports => {
+                assert!(
+                    fixup.data_offset.is_multiple_of(8) && fixup.data_offset / 8 < imports.len()
+                );
+                data_vmaddr
+            }
         };
         patch_data_fixup(&mut code, code_offset, section_base, fixup);
     }
@@ -191,7 +252,7 @@ pub(crate) fn write_executable(
     out.u32(MH_EXECUTE);
     out.u32(ncmds);
     out.u32(sizeofcmds);
-    out.u32(MH_NOUNDEFS | MH_DYLDLINK | MH_PIE);
+    out.u32(MH_NOUNDEFS | MH_DYLDLINK | MH_PIE | if has_imports { 0x80 } else { 0 }); // MH_TWOLEVEL
     out.u32(0); // reserved
 
     // __PAGEZERO
@@ -248,45 +309,60 @@ pub(crate) fn write_executable(
     out.u32(0);
     out.u32(0);
 
-    // __DATA: the GC's writable globals. One zero-fill __bss section, so
-    // the segment has no on-disk bytes (fileoff points just past __TEXT,
-    // filesize 0) and dyld zeroes the whole vm range at map time.
+    // The GOT is file-backed; BSS begins after its padded file page. This
+    // keeps zero-fill globals out of the signed bytes while binding locations
+    // are mapped writable before dyld applies eager binds.
     if has_data {
         out.u32(LC_SEGMENT_64);
-        out.u32(SEGMENT_COMMAND_SIZE + SECTION_SIZE);
+        out.u32(SEGMENT_COMMAND_SIZE + data_sections * SECTION_SIZE);
         out.name16("__DATA");
         out.u64(data_vmaddr);
         out.u64(data_vmsize);
-        out.u64(text_filesize); // fileoff (filesize 0, so unmapped from file)
-        out.u64(0); // filesize
+        out.u64(text_filesize);
+        out.u64(data_filesize);
         out.u32(VM_PROT_READ | VM_PROT_WRITE);
         out.u32(VM_PROT_READ | VM_PROT_WRITE);
-        out.u32(1); // nsects
+        out.u32(data_sections);
         out.u32(0);
-
-        // __DATA,__bss
-        out.name16("__bss");
-        out.name16("__DATA");
-        out.u64(data_vmaddr);
-        out.u64(bss_size);
-        out.u32(0); // offset: S_ZEROFILL has no file backing
-        out.u32(3); // 2^3 alignment
-        out.u32(0);
-        out.u32(0);
-        out.u32(S_ZEROFILL);
-        out.u32(0);
-        out.u32(0);
-        out.u32(0);
+        if has_imports {
+            out.name16("__got");
+            out.name16("__DATA");
+            out.u64(data_vmaddr);
+            out.u64(imports.len() as u64 * 8);
+            out.u32(text_filesize as u32);
+            out.u32(3);
+            out.u32(0);
+            out.u32(0);
+            out.u32(6); // S_NON_LAZY_SYMBOL_POINTERS
+            out.u32(0); // first indirect-symbol-table index
+            out.u32(0);
+            out.u32(0);
+        }
+        if bss_size > 0 {
+            out.name16("__bss");
+            out.name16("__DATA");
+            out.u64(data_vmaddr + data_filesize);
+            out.u64(bss_size);
+            out.u32(0);
+            out.u32(3);
+            out.u32(0);
+            out.u32(0);
+            out.u32(S_ZEROFILL);
+            out.u32(0);
+            out.u32(0);
+            out.u32(0);
+        }
     }
 
-    // __LINKEDIT: holds exactly the code signature.
+    // __LINKEDIT holds binding/symbol tables (if any) and the signature.
+    let linkedit_size = linkedit.bytes.len() as u64 + signature_size;
     out.u32(LC_SEGMENT_64);
     out.u32(SEGMENT_COMMAND_SIZE);
     out.name16("__LINKEDIT");
     out.u64(linkedit_vmaddr);
-    out.u64(align_to(signature_size, PAGE_SIZE));
-    out.u64(signature_offset);
-    out.u64(signature_size);
+    out.u64(align_to(linkedit_size, PAGE_SIZE));
+    out.u64(linkedit_offset);
+    out.u64(linkedit_size);
     out.u32(VM_PROT_READ);
     out.u32(VM_PROT_READ);
     out.u32(0);
@@ -294,8 +370,7 @@ pub(crate) fn write_executable(
 
     // LC_LOAD_DYLINKER: the Apple Silicon kernel refuses arm64 main
     // executables that are not dyld-linked (MH_DYLDLINK + dyld are
-    // load-time requirements even though the generated code never
-    // imports a dylib and talks to the kernel via raw syscalls).
+    // load-time requirements even for images using only raw syscalls).
     out.u32(LC_LOAD_DYLINKER);
     out.u32(LOAD_DYLINKER_COMMAND_SIZE);
     out.u32(12); // name offset
@@ -308,19 +383,45 @@ pub(crate) fn write_executable(
     out.u64(code_offset); // entryoff
     out.u64(0); // stacksize: default
 
-    // Empty LC_SYMTAB / LC_DYSYMTAB: dyld dereferences both
-    // unconditionally and crashes when they are absent.
+    if has_imports {
+        out.u32(LC_LOAD_DYLIB);
+        out.u32(LOAD_DYLIB_COMMAND_SIZE);
+        out.u32(24); // dylib name offset
+        out.u32(0); // timestamp
+        out.u32(0x10000); // current version 1.0.0
+        out.u32(0x10000); // compatibility version 1.0.0
+        out.bytes.extend_from_slice(LIBSYSTEM);
+        out.bytes.resize(
+            out.bytes.len() + LOAD_DYLIB_COMMAND_SIZE as usize - 24 - LIBSYSTEM.len(),
+            0,
+        );
+
+        out.u32(LC_DYLD_INFO_ONLY);
+        out.u32(DYLD_INFO_COMMAND_SIZE);
+        out.u32(0);
+        out.u32(0); // no rebase stream: all internal references are PC-relative
+        out.u32(linkedit_offset as u32);
+        out.u32(linkedit.bind_size);
+        for _ in 0..6 {
+            out.u32(0);
+        } // no weak/lazy bindings or exports
+    }
+
+    // The dynamic symbol table describes exactly the eager import slots.
     out.u32(LC_SYMTAB);
     out.u32(SYMTAB_COMMAND_SIZE);
-    out.u32(0); // symoff
-    out.u32(0); // nsyms
-    out.u32(0); // stroff
-    out.u32(0); // strsize
-
+    out.u32(linkedit.symoff);
+    out.u32(imports.len() as u32);
+    out.u32(linkedit.stroff);
+    out.u32(linkedit.strsize);
     out.u32(LC_DYSYMTAB);
     out.u32(DYSYMTAB_COMMAND_SIZE);
-    for _ in 0..18 {
-        out.u32(0);
+    for field in 0..18 {
+        out.u32(match field {
+            5 | 13 => imports.len() as u32, // nundefsym, nindirectsyms
+            12 => linkedit.indirectoff,
+            _ => 0,
+        });
     }
 
     // LC_BUILD_VERSION
@@ -341,6 +442,8 @@ pub(crate) fn write_executable(
     out.bytes.extend_from_slice(&code);
     out.pad_to(rodata_offset);
     out.bytes.extend_from_slice(&rodata);
+    out.pad_to(linkedit_offset);
+    out.bytes.extend_from_slice(&linkedit.bytes);
     out.pad_to(signature_offset);
 
     let signature = build_adhoc_signature(
@@ -366,6 +469,78 @@ fn patch_data_fixup(code: &mut [u8], code_offset: u64, section_base: u64, fixup:
     });
     let page_offset = (target & 0xfff) as u32;
     patch_instruction(code, fixup.add_offset, |word| word | (page_offset << 10));
+}
+
+#[derive(Default)]
+struct ImportTables {
+    bytes: Vec<u8>,
+    bind_size: u32,
+    symoff: u32,
+    stroff: u32,
+    strsize: u32,
+    indirectoff: u32,
+}
+
+impl ImportTables {
+    fn new(imports: &[ImportSymbol], file_offset: u64) -> Self {
+        if imports.is_empty() {
+            return Self::default();
+        }
+        let mut bytes = vec![0x11, 0x51]; // dylib ordinal 1; BIND_TYPE_POINTER
+        for (index, symbol) in imports.iter().enumerate() {
+            assert!(!imports[..index].contains(symbol), "duplicate import slot");
+            bytes.push(0x40); // SET_SYMBOL_TRAILING_FLAGS_IMM, no weak flags
+            bytes.extend_from_slice(symbol.name().as_bytes());
+            bytes.push(0);
+            bytes.push(0x72); // SET_SEGMENT_AND_OFFSET_ULEB: __DATA is segment 2
+            push_uleb(&mut bytes, index as u64 * 8);
+            bytes.push(0x90); // DO_BIND, advances the location by a pointer
+        }
+        bytes.push(0); // DONE
+        let bind_size = bytes.len() as u32;
+        bytes.resize(bytes.len().next_multiple_of(8), 0);
+        let symoff =
+            u32::try_from(file_offset + bytes.len() as u64).expect("Mach-O symoff overflow");
+        let mut strings = vec![0];
+        for symbol in imports {
+            bytes.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&[1, 0]); // N_UNDF | N_EXT, NO_SECT
+            bytes.extend_from_slice(&0x100_u16.to_le_bytes()); // dylib ordinal 1, non-lazy
+            bytes.extend_from_slice(&0_u64.to_le_bytes());
+            strings.extend_from_slice(symbol.name().as_bytes());
+            strings.push(0);
+        }
+        let stroff =
+            u32::try_from(file_offset + bytes.len() as u64).expect("Mach-O stroff overflow");
+        let strsize = strings.len() as u32;
+        bytes.extend_from_slice(&strings);
+        bytes.resize(bytes.len().next_multiple_of(4), 0);
+        let indirectoff =
+            u32::try_from(file_offset + bytes.len() as u64).expect("Mach-O indirectoff overflow");
+        for index in 0..imports.len() {
+            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+        }
+        bytes.resize(bytes.len().next_multiple_of(16), 0); // signature alignment
+        Self {
+            bytes,
+            bind_size,
+            symoff,
+            stroff,
+            strsize,
+            indirectoff,
+        }
+    }
+}
+
+fn push_uleb(bytes: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let low = (value & 0x7f) as u8;
+        value >>= 7;
+        bytes.push(low | if value == 0 { 0 } else { 0x80 });
+        if value == 0 {
+            break;
+        }
+    }
 }
 
 fn patch_instruction(code: &mut [u8], offset: usize, patch: impl FnOnce(u32) -> u32) {
@@ -512,6 +687,196 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gc_macho_clock_is_connected_to_all_logged_phases() {
+        for enabled in [false, true] {
+            let image = crate::compile_source_for_target(
+                "<gc-clock>",
+                "1",
+                crate::NativeCompilerConfig {
+                    target: crate::NativeTarget::MacosAarch64,
+                    gc_log: enabled,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap());
+            let text =
+                find_segment(&image, ncmds, "__TEXT").unwrap() + SEGMENT_COMMAND_SIZE as usize;
+            let offset =
+                u32::from_le_bytes(image[text + 48..text + 52].try_into().unwrap()) as usize;
+            let size = u64::from_le_bytes(image[text + 40..text + 48].try_into().unwrap()) as usize;
+            let calls = image[offset..offset + size]
+                .chunks_exact(4)
+                .filter(|w| *w == 0xd63f_0200_u32.to_le_bytes())
+                .count();
+            assert_eq!(calls, if enabled { 6 } else { 0 }); // start/end for each of three phases
+            let symbol = b"_clock_gettime\0";
+            assert_eq!(image.windows(symbol.len()).any(|s| s == symbol), enabled);
+        }
+    }
+    #[test]
+    fn gc_macho_clock_fixture_has_real_import() {
+        let image = crate::aarch64::gc_clock_test_image();
+        let symbol = b"_clock_gettime\0";
+        assert!(image.windows(symbol.len()).any(|s| s == symbol));
+        // Optional artifact export for external LLVM/dyld inspection. Tests do
+        // not mistake structural parsing on Linux for execution on macOS.
+        if let Some(path) = std::env::var_os("KLASSIC_GC_CLOCK_IMAGE") {
+            std::fs::write(path, image).unwrap();
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gc_macho_clock_executes_10000_monotonic_samples() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "klassic-clock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, crate::aarch64::gc_clock_test_image()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = crate::gc_atomic_tests::run_with_deadline(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            output.status.success(),
+            "macOS clock/loader execution {:?}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    fn gc_macho_import_layout_bindings_fixups_and_signature_agree() {
+        for bss_size in [0, PAGE_SIZE * 2] {
+            let code: Vec<u8> = [
+                0x90000010_u32,
+                0x91000210,
+                0xf9400210,
+                0xd63f0200,
+                0x90000001,
+                0x91000021,
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+            let mut fixups = vec![DataFixup {
+                adrp_offset: 0,
+                add_offset: 4,
+                data_offset: 0,
+                section: FixupSection::Imports,
+            }];
+            if bss_size != 0 {
+                fixups.push(DataFixup {
+                    adrp_offset: 16,
+                    add_offset: 20,
+                    data_offset: 8,
+                    section: FixupSection::Data,
+                });
+            }
+            let image = write_executable(
+                code,
+                vec![],
+                &fixups,
+                "binding-test",
+                bss_size,
+                &[ImportSymbol::ClockGettime],
+            );
+            let u32_at = |p| u32::from_le_bytes(image[p..p + 4].try_into().unwrap()) as usize;
+            let u64_at = |p| u64::from_le_bytes(image[p..p + 8].try_into().unwrap());
+            let ncmds = u32_at(16) as u32;
+            let command = |kind| {
+                let mut p = 32;
+                for _ in 0..ncmds {
+                    if u32_at(p) == kind as usize {
+                        return p;
+                    }
+                    p += u32_at(p + 4);
+                }
+                panic!("missing load command {kind:x}");
+            };
+            let data = find_segment(&image, ncmds, "__DATA").unwrap();
+            let linkedit = find_segment(&image, ncmds, "__LINKEDIT").unwrap();
+            let got = data + 72;
+            let got_vm = u64_at(got + 32);
+            let got_file = u32_at(got + 48);
+            assert_eq!(&image[got..got + 5], b"__got");
+            assert_eq!(u32_at(got + 64), 6);
+            assert_eq!(u64_at(got + 40), 8);
+            assert_eq!(u64_at(data + 48), PAGE_SIZE);
+            assert_eq!(u32_at(data + 60), 3); // writable, not executable
+            assert_eq!(u32_at(data + 64), 1 + usize::from(bss_size != 0));
+            assert_eq!(&image[got_file..got_file + 8], &[0; 8]);
+            assert_eq!(u64_at(linkedit + 24), u64_at(data + 24) + u64_at(data + 32));
+            let entry = u64_at(command(LC_MAIN) + 8) as usize;
+            assert_eq!(decode_adrp_add(&image, entry), got_vm);
+            if bss_size != 0 {
+                let bss = got + 80;
+                assert_eq!(u32_at(bss + 64), S_ZEROFILL as usize);
+                assert_eq!(u64_at(bss + 32), got_vm + PAGE_SIZE);
+                assert_eq!(decode_adrp_add(&image, entry + 16), u64_at(bss + 32) + 8);
+            }
+            let dyld = command(LC_DYLD_INFO_ONLY);
+            assert_eq!(u32_at(dyld + 8), 0); // no rebases of zero initial GOT entries
+            let bind = &image[u32_at(dyld + 16)..u32_at(dyld + 16) + u32_at(dyld + 20)];
+            assert_eq!(&bind[..3], &[0x11, 0x51, 0x40]); // ordinal, type, symbol
+            let end = bind[3..].iter().position(|&b| b == 0).unwrap() + 3;
+            assert_eq!(&bind[3..end], b"_clock_gettime");
+            assert_eq!(&bind[end + 1..], &[0x72, 0, 0x90, 0]); // __DATA+0, bind, done
+            let symtab = command(LC_SYMTAB);
+            let symbol = u32_at(symtab + 8);
+            let strings = u32_at(symtab + 16);
+            assert_eq!(u32_at(symtab + 12), 1);
+            assert_eq!(&image[symbol + 4..symbol + 8], &[1, 0, 0, 1]);
+            assert_eq!(
+                &image[strings + u32_at(symbol)..strings + u32_at(symtab + 20)],
+                b"_clock_gettime\0"
+            );
+            let dynamic = command(LC_DYSYMTAB);
+            assert_eq!(u32_at(dynamic + 28), 1); // nundefsym
+            assert_eq!(u32_at(dynamic + 60), 1); // nindirectsyms
+            assert_eq!(u32_at(u32_at(dynamic + 56)), 0); // symbol index for GOT[0]
+            let sigcmd = command(LC_CODE_SIGNATURE);
+            let signature = u32_at(sigcmd + 8);
+            let directory = signature + 20;
+            let be32 = |p| u32::from_be_bytes(image[p..p + 4].try_into().unwrap()) as usize;
+            assert_eq!(be32(directory + 32), signature);
+            assert_eq!(be32(directory + 28), signature.div_ceil(SIGN_PAGE_SIZE));
+            assert_eq!(
+                u64_at(linkedit + 40) + u64_at(linkedit + 48),
+                image.len() as u64
+            );
+            let hashes = directory + be32(directory + 16);
+            for (i, page) in image[..signature].chunks(SIGN_PAGE_SIZE).enumerate() {
+                assert_eq!(
+                    &image[hashes + i * 32..hashes + (i + 1) * 32],
+                    &sha256(page)
+                );
+            }
+        }
+    }
+    #[test]
+    fn imports_have_dyld_binding_metadata() {
+        let image = super::write_executable(
+            vec![0xc0, 0x03, 0x5f, 0xd6],
+            vec![],
+            &[],
+            "imports",
+            16,
+            &[super::ImportSymbol::ClockGettime],
+        );
+        assert!(
+            image
+                .windows(super::LIBSYSTEM.len())
+                .any(|s| s == super::LIBSYSTEM)
+        );
+        let symbol = b"_clock_gettime\0";
+        assert!(image.windows(symbol.len()).any(|s| s == symbol));
+    }
     use super::*;
 
     fn hex(bytes: &[u8]) -> String {
@@ -545,7 +910,7 @@ mod tests {
     fn executable_layout_is_structurally_sound() {
         let code = vec![0xd2, 0x80, 0x00, 0x40]; // mov x0, #2
         let rodata = b"hi\n".to_vec();
-        let image = write_executable(code, rodata, &[], "klassic", 0);
+        let image = write_executable(code, rodata, &[], "klassic", 0, &[]);
 
         assert_eq!(&image[0..4], &MH_MAGIC_64.to_le_bytes());
         assert_eq!(&image[4..8], &CPU_TYPE_ARM64.to_le_bytes());
@@ -604,7 +969,7 @@ mod tests {
     fn writable_data_segment_is_gated_and_structurally_sound() {
         let code = vec![0xd2, 0x80, 0x00, 0x40]; // mov x0, #2
         let bss_size = 30 * 8; // ~30 zero-init GC cells
-        let image = write_executable(code, b"hi\n".to_vec(), &[], "klassic", bss_size);
+        let image = write_executable(code, b"hi\n".to_vec(), &[], "klassic", bss_size, &[]);
 
         // The data segment bumps the command count.
         let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap());
@@ -670,7 +1035,7 @@ mod tests {
             data_offset: 0,
             section: FixupSection::Rodata,
         }];
-        let image = write_executable(code, b"x".to_vec(), &fixups, "klassic", 0);
+        let image = write_executable(code, b"x".to_vec(), &fixups, "klassic", 0, &[]);
         // Locate the code from the layout formula: header (32) +
         // sizeofcmds, aligned to 16.
         let sizeofcmds = u32::from_le_bytes(image[20..24].try_into().unwrap()) as u64;
@@ -714,7 +1079,7 @@ mod tests {
             data_offset: 8,
             section: FixupSection::Data,
         }];
-        let image = write_executable(code, b"x".to_vec(), &fixups, "klassic", 16);
+        let image = write_executable(code, b"x".to_vec(), &fixups, "klassic", 16, &[]);
 
         let ncmds = u32::from_le_bytes(image[16..20].try_into().unwrap());
         let text = find_segment(&image, ncmds, "__TEXT").unwrap();

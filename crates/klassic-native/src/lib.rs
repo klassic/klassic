@@ -1,3 +1,11 @@
+pub mod gc_abi;
+#[cfg(test)]
+mod gc_atomic_tests;
+mod gc_codegen;
+mod gc_model;
+#[cfg(test)]
+mod gc_windows_tests;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
@@ -501,6 +509,7 @@ pub fn compile_source_to_elf(
 
 mod cbackend;
 mod gc_layout;
+mod gc_shape;
 mod llvm;
 #[allow(clippy::result_large_err)]
 mod map_chain;
@@ -4224,6 +4233,8 @@ struct WindowsRuntime {
     /// Monotonic counter frequency shim: no input, rax=ticks-per-second
     /// out. Wraps `QueryPerformanceFrequency`.
     win_qpf: TextLabel,
+    /// Concurrent-safe GC clock: legacy register contract, nanoseconds in RAX.
+    win_monotonic_ns: TextLabel,
     /// Cached `GetStdHandle(STD_OUTPUT_HANDLE)` result, populated by
     /// `win_init`.
     stdout_handle: DataLabel,
@@ -4443,6 +4454,8 @@ struct NativeCodeGenerator {
     gc_free_region_head: DataLabel,
     gc_mark_worklist: DataLabel,
     gc_mark_worklist_top: DataLabel,
+    gc_trace_cursor: DataLabel,
+    gc_trace_end: DataLabel,
     gc_shadow_stack: DataLabel,
     gc_shadow_stack_top: DataLabel,
     /// Per-region bump watermark, indexed by region number
@@ -4491,7 +4504,7 @@ struct NativeCodeGenerator {
     /// `--gc-log` statistics cells (all `.data` i64, initialised 0):
     /// total allocations, total payload+header bytes handed out, and
     /// the max / cumulative collection-pause nanoseconds measured via
-    /// the `clock_gettime` shim around each `gc_collect`.
+    /// the platform monotonic clock around each collection pause.
     gc_alloc_count: DataLabel,
     gc_bytes_allocated: DataLabel,
     gc_pause_max_ns: DataLabel,
@@ -4521,6 +4534,7 @@ struct NativeCodeGenerator {
     /// M6: the collector factored into separately-callable STW pieces.
     gc_mark_roots: TextLabel,
     gc_trace: TextLabel,
+    gc_store_pointer: TextLabel,
     gc_sweep: TextLabel,
     gc_clear_all_marks: TextLabel,
     gc_stw_mark_complete: TextLabel,
@@ -4747,6 +4761,8 @@ impl NativeCodeGenerator {
         // binaries don't embed hundreds of KB of zeros.
         let gc_mark_worklist = asm.data_label_with_i64s(&[0]);
         let gc_mark_worklist_top = asm.data_label_with_i64s(&[0]);
+        let gc_trace_cursor = asm.data_label_with_i64s(&[0]);
+        let gc_trace_end = asm.data_label_with_i64s(&[0]);
         let gc_shadow_stack = asm.data_label_with_i64s(&[0]);
         let gc_shadow_stack_top = asm.data_label_with_i64s(&[0]);
         // Per-region watermark array (one qword per reservable region);
@@ -4788,6 +4804,7 @@ impl NativeCodeGenerator {
         let gc_collect = asm.create_text_label();
         let gc_mark_roots = asm.create_text_label();
         let gc_trace = asm.create_text_label();
+        let gc_store_pointer = asm.create_text_label();
         let gc_sweep = asm.create_text_label();
         let gc_clear_all_marks = asm.create_text_label();
         let gc_stw_mark_complete = asm.create_text_label();
@@ -4836,6 +4853,7 @@ impl NativeCodeGenerator {
                 win_time_now_millis: asm.create_text_label(),
                 win_qpc: asm.create_text_label(),
                 win_qpf: asm.create_text_label(),
+                win_monotonic_ns: asm.create_text_label(),
                 stdout_handle: asm.data_label_with_i64s(&[0]),
                 stderr_handle: asm.data_label_with_i64s(&[0]),
                 write_bytes_scratch: asm.data_label_with_i64s(&[0]),
@@ -4918,6 +4936,8 @@ impl NativeCodeGenerator {
             gc_free_region_head,
             gc_mark_worklist,
             gc_mark_worklist_top,
+            gc_trace_cursor,
+            gc_trace_end,
             gc_shadow_stack,
             gc_shadow_stack_top,
             gc_region_top,
@@ -4959,6 +4979,7 @@ impl NativeCodeGenerator {
             gc_collect,
             gc_mark_roots,
             gc_trace,
+            gc_store_pointer,
             gc_sweep,
             gc_clear_all_marks,
             gc_stw_mark_complete,
@@ -5634,6 +5655,7 @@ impl NativeCodeGenerator {
         self.emit_gc_collect_runtime();
         self.emit_gc_mark_roots_runtime();
         self.emit_gc_trace_runtime();
+        self.emit_gc_store_pointer_runtime();
         self.emit_gc_sweep_runtime();
         self.emit_gc_clear_all_marks_runtime();
         self.emit_gc_stw_mark_complete_runtime();
@@ -5661,6 +5683,7 @@ impl NativeCodeGenerator {
             self.emit_win_time_now_millis_runtime();
             self.emit_win_qpc_runtime();
             self.emit_win_qpf_runtime();
+            self.emit_win_monotonic_ns_runtime();
             self.emit_win_mkdir_runtime();
             self.emit_win_rmdir_runtime();
             self.emit_win_move_runtime();
@@ -14034,11 +14057,12 @@ impl NativeCodeGenerator {
         self.emit_non_negative_builtin_int_check(span, "__gc_alloc");
         self.emit_builtin_allocation_size_check(span, "__gc_alloc", Self::GC_MAX_PAYLOAD_SIZE);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        // Type tag 1 = "raw bytes" (no pointer fields). The size is already
-        // in the argument register, so only the tag and the call come from
-        // the shared sequence here.
-        self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
-        self.asm.call_label(self.gc_alloc);
+        // The checked byte count is already in the shared allocation register.
+        crate::portable_asm::emit_gc_alloc_dynamic(
+            self,
+            self.gc_alloc,
+            crate::gc_shape::BuiltinShape::RawBytes,
+        );
         Ok(NativeValue::HeapPointer)
     }
 
@@ -14074,8 +14098,11 @@ impl NativeCodeGenerator {
         // size in bytes = field_count * 8
         self.asm.shl_reg_imm8(Reg::Rax, 3);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_POINTER_RECORD);
-        self.asm.call_label(self.gc_alloc);
+        crate::portable_asm::emit_gc_alloc_dynamic(
+            self,
+            self.gc_alloc,
+            crate::gc_shape::BuiltinShape::PointerRecord,
+        );
         // The payload arrives zeroed: a fresh tail region is mmap-zero,
         // and a region reused from the free pool is zeroed whole on
         // acquisition (see gc_acquire_region). This is soundness-
@@ -14112,8 +14139,11 @@ impl NativeCodeGenerator {
             NativeValue::StaticString { label, len } => {
                 let payload_size = (8 + len.next_multiple_of(8)) as u64;
                 self.asm.mov_imm64(Reg::Rdi, payload_size);
-                self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
-                self.asm.call_label(self.gc_alloc);
+                crate::portable_asm::emit_gc_alloc_dynamic(
+                    self,
+                    self.gc_alloc,
+                    crate::gc_shape::BuiltinShape::RawBytes,
+                );
                 // rax = heap pointer; store len at offset 0.
                 self.asm.mov_imm64(Reg::Rdi, len as u64);
                 self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rdi);
@@ -14135,8 +14165,11 @@ impl NativeCodeGenerator {
                 self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
                 self.asm.add_reg_imm32(Reg::Rdi, 8 + 7);
                 self.asm.and_reg_imm32(Reg::Rdi, -8);
-                self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
-                self.asm.call_label(self.gc_alloc);
+                crate::portable_asm::emit_gc_alloc_dynamic(
+                    self,
+                    self.gc_alloc,
+                    crate::gc_shape::BuiltinShape::RawBytes,
+                );
 
                 // Reload the runtime length after gc_alloc, store it in the
                 // heap string header, then copy that many bytes from the
@@ -14248,8 +14281,11 @@ impl NativeCodeGenerator {
     fn emit_static_string_to_heap_string(&mut self, label: DataLabel, len: usize) {
         let payload_size = (8 + len.next_multiple_of(8)) as u64;
         self.asm.mov_imm64(Reg::Rdi, payload_size);
-        self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
-        self.asm.call_label(self.gc_alloc);
+        crate::portable_asm::emit_gc_alloc_dynamic(
+            self,
+            self.gc_alloc,
+            crate::gc_shape::BuiltinShape::RawBytes,
+        );
         // rax = heap pointer; store len at offset 0.
         self.asm.mov_imm64(Reg::Rdi, len as u64);
         self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rdi);
@@ -14271,8 +14307,11 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
         self.asm.add_reg_imm32(Reg::Rdi, 8 + 7);
         self.asm.and_reg_imm32(Reg::Rdi, -8);
-        self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
-        self.asm.call_label(self.gc_alloc);
+        crate::portable_asm::emit_gc_alloc_dynamic(
+            self,
+            self.gc_alloc,
+            crate::gc_shape::BuiltinShape::RawBytes,
+        );
 
         // Reload the runtime length after gc_alloc, store it in the heap
         // string header, then copy that many bytes from the fixed runtime
@@ -14365,8 +14404,11 @@ impl NativeCodeGenerator {
         self.asm.add_reg_reg(Reg::Rdi, Reg::R9);
         self.asm.add_reg_imm32(Reg::Rdi, 8 + 7);
         self.asm.and_reg_imm32(Reg::Rdi, -8);
-        self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
-        self.asm.call_label(self.gc_alloc);
+        crate::portable_asm::emit_gc_alloc_dynamic(
+            self,
+            self.gc_alloc,
+            crate::gc_shape::BuiltinShape::RawBytes,
+        );
 
         // Stash the new pointer in its own tracked slot — defensive in
         // case future reorganization adds another collection point
@@ -14553,8 +14595,11 @@ impl NativeCodeGenerator {
         self.asm.add_reg_imm32(Reg::Rcx, 8 + 7);
         self.asm.and_reg_imm32(Reg::Rcx, -8);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rcx);
-        self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_RAW_BYTES);
-        self.asm.call_label(self.gc_alloc);
+        crate::portable_asm::emit_gc_alloc_dynamic(
+            self,
+            self.gc_alloc,
+            crate::gc_shape::BuiltinShape::RawBytes,
+        );
 
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
         self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
@@ -14601,116 +14646,6 @@ impl NativeCodeGenerator {
 
         self.asm.load_rbp_slot(Reg::Rax, new_slot.offset);
         Ok(NativeValue::HeapString)
-    }
-
-    fn compile_gc_smap_keys_or_values(
-        &mut self,
-        arguments: &[Expr],
-        span: Span,
-        is_values: bool,
-    ) -> Result<NativeValue, Diagnostic> {
-        let label = if is_values {
-            "__gc_smap_values"
-        } else {
-            "__gc_smap_keys"
-        };
-        if arguments.len() != 1 {
-            return Err(Diagnostic::compile(
-                span,
-                format!("{label} expects 1 argument but got {}", arguments.len()),
-            ));
-        }
-        let m = self.compile_expr(&arguments[0])?;
-        if !matches!(m, NativeValue::HeapPointer | NativeValue::HeapString) {
-            return Err(unsupported(
-                span,
-                "native __gc_smap_keys/values for non-address",
-            ));
-        }
-        let m_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(m_slot.offset, Reg::Rax);
-        let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        let pair_count_slot = self.allocate_anonymous_slot(NativeValue::Int);
-        let i_slot = self.allocate_anonymous_slot(NativeValue::Int);
-
-        // pair_count = map_len / 2
-        self.asm.load_rbp_slot(Reg::R10, m_slot.offset);
-        self.asm.load_ptr_disp32(Reg::R11, Reg::R10, 0);
-        self.emit_gc_smap_length_check(span, label, Reg::R11);
-        self.asm.shr_reg_imm8(Reg::R11, 1);
-        self.asm.store_rbp_slot(pair_count_slot.offset, Reg::R11);
-
-        // Allocate.
-        self.asm.mov_reg_reg(Reg::Rax, Reg::R11);
-        self.asm.shl_reg_imm8(Reg::Rax, 3);
-        self.asm.add_reg_imm32(Reg::Rax, 8);
-        self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
-        self.asm.mov_imm64(Reg::Rsi, Self::GC_TYPE_POINTER_LIST);
-        self.asm.call_label(self.gc_alloc);
-        self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
-        self.asm.load_rbp_slot(Reg::R11, pair_count_slot.offset);
-        self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::R11);
-
-        // Zero-init.
-        self.asm.add_reg_imm32(Reg::Rax, 8);
-        self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::R11);
-        let zero_loop = self.asm.create_text_label();
-        let zero_done = self.asm.create_text_label();
-        self.asm.bind_text_label(zero_loop);
-        self.asm.test_reg_reg(Reg::Rcx, Reg::Rcx);
-        self.asm.jcc_label(Condition::Equal, zero_done);
-        self.asm.mov_imm64(Reg::Rdi, 0);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdi);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.sub_reg_imm8(Reg::Rcx, 1);
-        self.asm.jmp_label(zero_loop);
-        self.asm.bind_text_label(zero_done);
-
-        // Copy loop.
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.store_rbp_slot(i_slot.offset, Reg::Rax);
-        let copy_loop = self.asm.create_text_label();
-        let copy_done = self.asm.create_text_label();
-        self.asm.bind_text_label(copy_loop);
-        self.asm.load_rbp_slot(Reg::Rcx, i_slot.offset);
-        self.asm.load_rbp_slot(Reg::R11, pair_count_slot.offset);
-        self.asm.cmp_reg_reg(Reg::Rcx, Reg::R11);
-        self.asm.jcc_label(Condition::AboveOrEqual, copy_done);
-        // src bytes = i*16 (+ 8 for values).
-        self.asm.mov_reg_reg(Reg::R8, Reg::Rcx);
-        self.asm.shl_reg_imm8(Reg::R8, 4);
-        if is_values {
-            self.asm.add_reg_imm32(Reg::R8, 8);
-        }
-        self.asm.load_rbp_slot(Reg::R10, m_slot.offset);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.add_reg_reg(Reg::R10, Reg::R8);
-        // Verbatim copy of a COLORED key/value slot into the new list:
-        // no load barrier, no re-color -- the color bits pass through
-        // untouched, and the result list is read back through the
-        // barriered read funnel later. This is sound only because rdi
-        // holds the colored pointer across just these two instructions
-        // with NO allocation, shadow-push, or collection point between
-        // them. M7 WARNING: once the collector moves objects, a colored
-        // pointer briefly live in a register here would be invisible to
-        // the root walk / relocation -- do not introduce a GC-triggering
-        // step between this load and the store below.
-        self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
-        // dst at new[i].
-        self.asm.mov_reg_reg(Reg::R8, Reg::Rcx);
-        self.asm.shl_reg_imm8(Reg::R8, 3);
-        self.asm.load_rbp_slot(Reg::R10, new_slot.offset);
-        self.asm.add_reg_imm32(Reg::R10, 8);
-        self.asm.add_reg_reg(Reg::R10, Reg::R8);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rdi);
-        self.asm.add_reg_imm32(Reg::Rcx, 1);
-        self.asm.store_rbp_slot(i_slot.offset, Reg::Rcx);
-        self.asm.jmp_label(copy_loop);
-        self.asm.bind_text_label(copy_done);
-
-        self.asm.load_rbp_slot(Reg::Rax, new_slot.offset);
-        Ok(NativeValue::HeapPointer)
     }
 
     fn compile_gc_read_qword(
@@ -14993,14 +14928,12 @@ impl NativeCodeGenerator {
         self.asm.load_rbp_slot(Reg::Rdx, offset_slot.offset);
         self.asm.add_reg_reg(Reg::Rcx, Reg::Rdx); // rcx = base + offset
         if matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
-            // ZGC color-on-store: a heap slot holds a COLORED pointer.
-            // Never color a null, though -- `0 | good_color` would be a
-            // bogus non-null pointer; a genuine null stays a raw 0 (which
-            // the load barrier passes through untouched). An Int/Double
-            // value stored through this same funnel is left uncolored.
-            portable_asm::emit_gc_colour_pointer(self, portable_asm::Reg::V0);
+            self.asm.mov_reg_reg(Reg::Rdi, Reg::Rcx);
+            self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
+            self.asm.call_label(self.gc_store_pointer);
+        } else {
+            self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
         }
-        self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
         self.pop_scope();
         Ok(NativeValue::Unit)
     }
@@ -15944,9 +15877,9 @@ impl NativeCodeGenerator {
     }
 
     /// `m.keys()` / `m.values()` — return the key (or value) list of a map.
-    /// A runtime map reuses the existing `__gc_smap_keys`/`__gc_smap_values`
-    /// codegen; a static map literal projects its compile-time entries into a
-    /// fresh static list.
+    /// Runtime maps hold typed element cells, not a GC heap-array address.
+    /// Snapshot the selected cells through the typed copy funnel; static maps
+    /// project their compile-time entries into a fresh static list.
     fn compile_map_keys_or_values(
         &mut self,
         target: &Expr,
@@ -15954,11 +15887,43 @@ impl NativeCodeGenerator {
         is_values: bool,
     ) -> Result<NativeValue, Diagnostic> {
         if self.expr_yields_runtime_map(target) {
-            return self.compile_gc_smap_keys_or_values(
-                std::slice::from_ref(target),
-                span,
-                is_values,
-            );
+            let NativeValue::RuntimeList { label } = self.compile_expr(target)? else {
+                return Err(unsupported(
+                    span,
+                    "native runtime map projection representation",
+                ));
+            };
+            let source = self
+                .runtime_list_elements(label)
+                .ok_or_else(|| unsupported(span, "native runtime map projection elements"))?;
+            let selected: Vec<_> = source
+                .into_iter()
+                .skip(usize::from(is_values))
+                .step_by(2)
+                .collect();
+            let dynamic = self.runtime_list_dynamic_len(label).is_some();
+            let output =
+                self.prepare_runtime_list_branch_output_from_elements(&selected, dynamic, span)?;
+            if let Some(length) = self.runtime_list_dynamic_len(output) {
+                self.emit_runtime_list_len_to_rax(label);
+                self.asm.shr_reg_imm8(Reg::Rax, 1);
+                self.emit_store_rax_to_data_slot(length);
+            }
+            let destinations = self
+                .runtime_list_elements(output)
+                .expect("new projection list");
+            for (index, (source, destination)) in selected.into_iter().zip(destinations).enumerate()
+            {
+                let skip = self.begin_runtime_list_dynamic_index_guard(output, index);
+                self.emit_copy_compiled_literal_value_to_branch_output(
+                    source,
+                    destination,
+                    span,
+                    "map projection element exceeds 65536 bytes",
+                )?;
+                self.end_runtime_list_dynamic_index_guard(skip);
+            }
+            return Ok(NativeValue::RuntimeList { label: output });
         }
         let entries = self.static_map_entries_from_expr(target, span)?;
         let elements = entries
@@ -37641,24 +37606,6 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(ok);
     }
 
-    fn emit_gc_smap_length_check(&mut self, span: Span, name: &str, len: Reg) {
-        let ok = self.asm.create_text_label();
-        let overflow = self.asm.create_text_label();
-        self.asm.cmp_reg_imm8(len, 0);
-        self.asm.jcc_label(Condition::Less, overflow);
-        self.asm.mov_imm64(Reg::Rdi, Self::GC_MAX_LIST_LENGTH);
-        self.asm.cmp_reg_reg(len, Reg::Rdi);
-        self.asm.jcc_label(Condition::Above, overflow);
-        self.asm.mov_reg_reg(Reg::Rdi, len);
-        self.asm.and_reg_imm32(Reg::Rdi, 1);
-        self.asm.cmp_reg_imm8(Reg::Rdi, 0);
-        self.asm.jcc_label(Condition::NotEqual, overflow);
-        self.asm.jmp_label(ok);
-        self.asm.bind_text_label(overflow);
-        self.emit_runtime_error(span, &format!("{name} map length overflow"));
-        self.asm.bind_text_label(ok);
-    }
-
     fn emit_runtime_error_if_rax_negative_except_errno(
         &mut self,
         span: Span,
@@ -38125,10 +38072,6 @@ impl NativeCodeGenerator {
     const GC_MAX_PAYLOAD_SIZE: u64 = crate::gc_layout::GC_MAX_PAYLOAD_SIZE;
     const GC_MAX_STRING_ALLOC_SIZE: u64 = crate::gc_layout::GC_MAX_STRING_ALLOC_SIZE;
     const GC_MAX_POINTER_SLOT_COUNT: u64 = crate::gc_layout::GC_MAX_POINTER_SLOT_COUNT;
-    const GC_MAX_LIST_LENGTH: u64 = crate::gc_layout::GC_MAX_LIST_LENGTH;
-    const GC_TYPE_RAW_BYTES: u64 = crate::gc_layout::GC_TYPE_RAW_BYTES;
-    const GC_TYPE_POINTER_RECORD: u64 = crate::gc_layout::GC_TYPE_POINTER_RECORD;
-    const GC_TYPE_POINTER_LIST: u64 = crate::gc_layout::GC_TYPE_POINTER_LIST;
 
     /// Initialize the GC heap: mmap a private anonymous region and seed the
     /// heap_base / heap_top / heap_end globals.
@@ -38562,6 +38505,30 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
 
         self.emit_win_shim_epilogue();
+    }
+
+    /// Adapt the native Win64 clock to the direct emitter's register/stack
+    /// convention. Every scratch and result slot belongs to this call's stack.
+    fn emit_win_monotonic_ns_runtime(&mut self) {
+        let leaf = self.asm.create_text_label();
+        let ok = self.asm.create_text_label();
+        self.asm
+            .bind_text_label(self.windows_runtime().win_monotonic_ns);
+        self.asm.push_reg(Reg::Rbp);
+        self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+        self.emit_win_shim_save_registers();
+        self.emit_win_shim_align_stack(0x30); // shadow + private output
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::Rsp);
+        self.asm.add_reg_imm32(Reg::Rcx, 32);
+        self.asm.call_label(leaf);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, ok);
+        self.emit_runtime_error_text("GC monotonic clock failed\n");
+        self.asm.bind_text_label(ok);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::Rsp, 32);
+        self.emit_win_shim_epilogue();
+        self.asm.bind_text_label(leaf);
+        gc_codegen::windows::emit_monotonic_ns(self);
     }
 
     // ---- Slice 2 (directory operations) shims ----
@@ -39255,7 +39222,7 @@ impl NativeCodeGenerator {
     const GC_COLOR_STRIP: u64 = crate::gc_layout::GC_COLOR_STRIP;
     const GC_COLOR_BAD_MASK: u64 = crate::gc_layout::GC_COLOR_BAD_MASK;
     // The GC phase tags and mark quantum sizes (GC_PHASE_IDLE/MARK/RELOCATE,
-    // GC_QUANTUM_POPS/BYTES) have no `Self::` users left in this file: every
+    // GC_MARK_QUANTUM/BYTES) have no `Self::` users left in this file: every
     // GC routine that referenced them moved to the portable emitter, which
     // reads them from crate::gc_layout directly.
     // GC_FWD's last lib.rs user moved to the portable emitter; reference
@@ -39450,12 +39417,16 @@ impl NativeCodeGenerator {
     ///   [rbp -  8]: saved rbx
     ///   [rbp - 16]: total block size (header + payload, 16-byte aligned)
     ///   [rbp - 24]: type tag
-    /// Read `CLOCK_MONOTONIC` into `gc_pause_timespec` and fold it to
-    /// nanoseconds in `rax` (`tv_sec * 1e9 + tv_nsec`). Clobbers
+    /// Read a monotonic nanosecond timestamp into RAX. Windows calls a QPC shim
+    /// with private stack scratch. Linux folds CLOCK_MONOTONIC's timespec.
+    /// The Linux path clobbers
     /// rax/rcx/rdi/rsi/r8/r11 (the clock_gettime syscall's registers
-    /// plus the fold). Linux-only — the syscall path panics on Windows,
-    /// so pause timing is gated `!is_windows` at every call site.
+    /// plus the fold); the Windows shim preserves the legacy scratch registers.
     fn emit_read_monotonic_ns_to_rax(&mut self) {
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_monotonic_ns);
+            return;
+        }
         self.emit_clock_gettime(self.gc_pause_timespec);
         self.asm.mov_data_addr(Reg::Rcx, self.gc_pause_timespec);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::Rcx, 0); // tv_sec
@@ -39496,17 +39467,23 @@ impl NativeCodeGenerator {
         self.emit_write_data(self.platform.stderr_fd(), newline, 1);
     }
 
-    /// Capture the monotonic clock into gc_pause_start_ns (Linux only;
-    /// the clock syscall path panics on Windows, and no cell is written
-    /// there, so a pause simply reads 0). Emitted at the start of each
+    /// Capture the monotonic clock into gc_pause_start_ns on Linux/Windows.
+    /// Emitted at the start of each
     /// STW pause (MarkStart, MarkEnd, and the synchronous full collect).
     ///
     /// The STW pauses themselves are now emitted by the portable
     /// `portable_asm::emit_gc_pause_start` / `emit_gc_pause_end` free
     /// functions; every GC routine that brackets a pause has been migrated
     /// onto the trait, so the former inherent wrappers are gone. Callers
-    /// build a `PauseCells` here and compute `timing = gc_log &&
-    /// !is_windows` at the call site.
+    /// build a `PauseCells` here and use `gc_log` to enable timing.
+    fn gc_mark_scan_cells(&self) -> portable_asm::MarkScanCells<DataLabel> {
+        portable_asm::MarkScanCells {
+            top: self.gc_mark_worklist_top,
+            cursor: self.gc_trace_cursor,
+            end: self.gc_trace_end,
+        }
+    }
+
     fn gc_pause_cells(&self) -> portable_asm::PauseCells<DataLabel> {
         portable_asm::PauseCells {
             start_ns: self.gc_pause_start_ns,
@@ -39516,17 +39493,15 @@ impl NativeCodeGenerator {
     }
 
     fn emit_gc_alloc_runtime(&mut self) {
-        // Migrated onto the portable `PortableAsm` emitter trait; behavior
-        // is byte-identical (the x86-64 impl is a 1:1 wrapper). The
-        // gc_stress / gc_log codegen flags and the oom diagnostic are
-        // resolved here and passed in.
+        // Pass runtime scan state, codegen flags and diagnostics to the
+        // shared allocator, including its partial-mark completion check.
         let entry = self.gc_alloc;
         let cells = portable_asm::AllocCells {
             phase: self.gc_phase,
             bytes_since_cycle: self.gc_bytes_since_cycle,
             budget_regions: self.gc_budget_regions,
             bytes_since_quantum: self.gc_bytes_since_quantum,
-            mark_worklist_top: self.gc_mark_worklist_top,
+            mark_scan: self.gc_mark_scan_cells(),
             header_mark: self.gc_header_mark,
             alloc_count: self.gc_alloc_count,
             bytes_allocated: self.gc_bytes_allocated,
@@ -39565,7 +39540,7 @@ impl NativeCodeGenerator {
         // is byte-identical (the x86-64 impl is a 1:1 wrapper). The
         // collection counter is bumped once per cycle inside gc_sweep.
         let entry = self.gc_collect;
-        let timing = self.gc_log && !self.is_windows;
+        let timing = self.gc_log;
         let pause = self.gc_pause_cells();
         let targets = portable_asm::CollectTargets {
             stw_mark_complete: self.gc_stw_mark_complete,
@@ -39593,16 +39568,23 @@ impl NativeCodeGenerator {
         );
     }
 
-    /// Trace: drain the mark worklist, walking each pointer object's
-    /// payload and marking its children (the strong tricolor closure).
+    /// No-poll pointer store with current-epoch marking assistance.
+    fn emit_gc_store_pointer_runtime(&mut self) {
+        portable_asm::emit_gc_store_pointer(
+            self,
+            self.gc_store_pointer,
+            self.gc_phase,
+            self.gc_mark_visit,
+        );
+    }
+
+    /// Trace a bounded number of object openings and pointer fields.
     fn emit_gc_trace_runtime(&mut self) {
-        // Migrated onto the portable `PortableAsm` emitter trait; behavior
-        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
         let entry = self.gc_trace;
         portable_asm::emit_gc_trace(
             self,
             entry,
-            self.gc_mark_worklist_top,
+            self.gc_mark_scan_cells(),
             self.gc_mark_worklist,
             self.gc_mark_visit,
         );
@@ -39659,8 +39641,6 @@ impl NativeCodeGenerator {
     /// fixpoint. Does NOT flip the mark color and does NOT sweep -- the
     /// caller sweeps.
     fn emit_gc_stw_mark_complete_runtime(&mut self) {
-        // Migrated onto the portable `PortableAsm` emitter trait; behavior
-        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
         let entry = self.gc_stw_mark_complete;
         let targets = portable_asm::StwMarkTargets {
             clear_all_marks: self.gc_clear_all_marks,
@@ -39672,7 +39652,7 @@ impl NativeCodeGenerator {
             entry,
             targets,
             self.gc_stw_fallback_pending,
-            self.gc_mark_worklist_top,
+            self.gc_mark_scan_cells(),
             self.gc_worklist_overflow_text,
             b"klassic gc: mark worklist overflow\n".len(),
         );
@@ -39681,31 +39661,27 @@ impl NativeCodeGenerator {
     /// Drain the mark worklist to fixpoint by running quanta back to
     /// back. Used by the STW paths (gc_stw_mark_complete, gc_mark_end).
     fn emit_gc_drain_runtime(&mut self) {
-        // Migrated onto the portable `PortableAsm` emitter trait; behavior
-        // is byte-identical (the x86-64 impl is a 1:1 wrapper).
         let entry = self.gc_drain;
         let trace = self.gc_trace;
-        let worklist_top = self.gc_mark_worklist_top;
-        portable_asm::emit_gc_drain(self, entry, trace, worklist_top);
+        let scan = self.gc_mark_scan_cells();
+        portable_asm::emit_gc_drain(self, entry, trace, scan);
     }
 
     /// MarkStart (short STW pause): flip the mark color to the new cycle,
     /// reload the reserved color-register caches, reset the worklist,
     /// scan roots, and enter the Mark phase. O(roots).
     fn emit_gc_mark_start_runtime(&mut self) {
-        // Migrated onto the portable `PortableAsm` emitter trait; behavior
-        // is byte-identical (the x86-64 impl is a 1:1 wrapper). The two
-        // host-config flags that selected inline `if` branches -- evac_off
-        // and poison -- are passed through so the same code is chosen.
+        // Shared MarkStart resets both the queue and any old scan cursor;
+        // the host supplies its color-mode flags and runtime data cells.
         let entry = self.gc_mark_start;
-        let timing = self.gc_log && !self.is_windows;
+        let timing = self.gc_log;
         let pause = self.gc_pause_cells();
         let cells = portable_asm::MarkStartCells {
             header_mark: self.gc_header_mark,
             good_color: self.gc_good_color,
             bad_mask: self.gc_bad_mask,
             mark_color: self.gc_mark_color,
-            worklist_top: self.gc_mark_worklist_top,
+            scan: self.gc_mark_scan_cells(),
             phase: self.gc_phase,
         };
         let mode = portable_asm::MarkColorMode {
@@ -39732,7 +39708,7 @@ impl NativeCodeGenerator {
         // Migrated onto the portable `PortableAsm` emitter trait; behavior
         // is byte-identical (the x86-64 impl is a 1:1 wrapper).
         let entry = self.gc_mark_end;
-        let timing = self.gc_log && !self.is_windows;
+        let timing = self.gc_log;
         let pause = self.gc_pause_cells();
         let targets = portable_asm::MarkEndTargets {
             drain: self.gc_drain,
@@ -40158,13 +40134,16 @@ impl NativeCodeGenerator {
             .scope_gc_root_counts
             .pop()
             .expect("native compiler GC root counts should be balanced");
+        // Registered roots still name this frame's slots. Keep their storage
+        // below RSP until retirement: even CALL's return address can otherwise
+        // overwrite a live slot before the shadow-pop routine runs.
+        if gc_count > 0 {
+            self.emit_gc_shadow_pop_n(gc_count);
+        }
         let allocated = self.next_stack_offset - base_offset;
         if allocated > 0 {
             self.asm.add_reg_imm32(Reg::Rsp, allocated);
             self.next_stack_offset = base_offset;
-        }
-        if gc_count > 0 {
-            self.emit_gc_shadow_pop_n(gc_count);
         }
         self.scopes.pop();
         self.static_scopes.pop();
@@ -42538,6 +42517,7 @@ enum ImportSymbol {
     WriteFile,
     ExitProcess,
     VirtualAlloc,
+    VirtualFree,
     GetSystemTimeAsFileTime,
     Sleep,
     QueryPerformanceCounter,
@@ -42560,14 +42540,24 @@ enum ImportSymbol {
     CloseHandle,
     DeleteFileA,
     GetEnvironmentVariableA,
+    CreateThread,
+    WaitForSingleObject,
+    GetExitCodeThread,
+    TlsAlloc,
+    TlsFree,
+    TlsSetValue,
+    TlsGetValue,
+    CreateEventA,
+    SetEvent,
 }
 
 impl ImportSymbol {
-    const ALL: [ImportSymbol; 26] = [
+    const ALL: [ImportSymbol; 36] = [
         ImportSymbol::GetStdHandle,
         ImportSymbol::WriteFile,
         ImportSymbol::ExitProcess,
         ImportSymbol::VirtualAlloc,
+        ImportSymbol::VirtualFree,
         ImportSymbol::GetSystemTimeAsFileTime,
         ImportSymbol::Sleep,
         ImportSymbol::QueryPerformanceCounter,
@@ -42590,6 +42580,15 @@ impl ImportSymbol {
         ImportSymbol::CloseHandle,
         ImportSymbol::DeleteFileA,
         ImportSymbol::GetEnvironmentVariableA,
+        ImportSymbol::CreateThread,
+        ImportSymbol::WaitForSingleObject,
+        ImportSymbol::GetExitCodeThread,
+        ImportSymbol::TlsAlloc,
+        ImportSymbol::TlsFree,
+        ImportSymbol::TlsSetValue,
+        ImportSymbol::TlsGetValue,
+        ImportSymbol::CreateEventA,
+        ImportSymbol::SetEvent,
     ];
 
     /// Exact, case-sensitive export name from `kernel32.dll`.
@@ -42599,6 +42598,7 @@ impl ImportSymbol {
             ImportSymbol::WriteFile => "WriteFile",
             ImportSymbol::ExitProcess => "ExitProcess",
             ImportSymbol::VirtualAlloc => "VirtualAlloc",
+            ImportSymbol::VirtualFree => "VirtualFree",
             ImportSymbol::GetSystemTimeAsFileTime => "GetSystemTimeAsFileTime",
             ImportSymbol::Sleep => "Sleep",
             ImportSymbol::QueryPerformanceCounter => "QueryPerformanceCounter",
@@ -42621,6 +42621,15 @@ impl ImportSymbol {
             ImportSymbol::CloseHandle => "CloseHandle",
             ImportSymbol::DeleteFileA => "DeleteFileA",
             ImportSymbol::GetEnvironmentVariableA => "GetEnvironmentVariableA",
+            ImportSymbol::CreateThread => "CreateThread",
+            ImportSymbol::WaitForSingleObject => "WaitForSingleObject",
+            ImportSymbol::GetExitCodeThread => "GetExitCodeThread",
+            ImportSymbol::TlsAlloc => "TlsAlloc",
+            ImportSymbol::TlsFree => "TlsFree",
+            ImportSymbol::TlsSetValue => "TlsSetValue",
+            ImportSymbol::TlsGetValue => "TlsGetValue",
+            ImportSymbol::CreateEventA => "CreateEventA",
+            ImportSymbol::SetEvent => "SetEvent",
         }
     }
 
@@ -42676,8 +42685,8 @@ enum Reg {
     R9 = 9,
     R10 = 10,
     R11 = 11,
-    // R12 is intentionally omitted (unused; naming an unconstructed
-    // variant would trip the dead-code lint). R13-R15 are the ZGC
+    R12 = 12,
+    // R13-R15 are the ZGC
     // reserved registers: r13 = color strip mask, r14 = good color,
     // r15 = bad-color test mask. They are set once in the prologue and,
     // being callee-saved, survive every syscall and Windows shim.
@@ -42882,6 +42891,28 @@ impl Assembler {
         self.modrm(src as u8, dst as u8);
     }
 
+    fn mov_u32_reg_reg(&mut self, dst: Reg, src: Reg) {
+        let rex = 0x40 | (((src as u8) >> 3) << 2) | ((dst as u8) >> 3);
+        if rex != 0x40 {
+            self.byte(rex);
+        }
+        self.byte(0x89);
+        self.modrm(src as u8, dst as u8);
+    }
+
+    fn lea_text_addr(&mut self, dst: Reg, label: TextLabel) {
+        self.byte(0x48 | (((dst as u8) >> 3) << 2));
+        self.byte(0x8d);
+        self.byte((((dst as u8) & 7) << 3) | 5); // RIP-relative disp32
+        let pos = self.text.len();
+        self.imm32(0);
+        self.relocs.push(Reloc {
+            pos,
+            kind: RelocKind::Rel32,
+            target: RelocTarget::Text(label),
+        });
+    }
+
     fn load_rbp_slot(&mut self, dst: Reg, offset: i32) {
         self.rex_w(dst, Reg::Rbp);
         self.byte(0x8b);
@@ -42910,6 +42941,80 @@ impl Assembler {
             self.byte(0x24);
         }
         self.text.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// Aligned 64-bit CAS. RAX is both expected input and observed output.
+    fn lock_cmpxchg(&mut self, base: Reg, desired: Reg) {
+        assert!(base != Reg::Rax && desired != Reg::Rax);
+        self.byte(0xf0); // LOCK must precede REX
+        self.rex_w(desired, base);
+        self.bytes(&[0x0f, 0xb1]);
+        self.byte(0x80 | (((desired as u8) & 7) << 3) | ((base as u8) & 7));
+        if (base as u8) & 7 == 4 {
+            self.byte(0x24);
+        }
+        self.imm32(0);
+    }
+
+    fn load_u32_ptr_disp32(&mut self, dst: Reg, base: Reg, disp: i32) {
+        let rex = 0x40 | (((dst as u8) >> 3) << 2) | ((base as u8) >> 3);
+        if rex != 0x40 {
+            self.byte(rex);
+        }
+        self.byte(0x8b);
+        self.byte(0x80 | (((dst as u8) & 7) << 3) | ((base as u8) & 7));
+        if (base as u8) & 7 == 4 {
+            self.byte(0x24);
+        }
+        self.imm32(disp);
+    }
+
+    fn store_u32_ptr_disp32(&mut self, base: Reg, disp: i32, src: Reg) {
+        let rex = 0x40 | (((src as u8) >> 3) << 2) | ((base as u8) >> 3);
+        if rex != 0x40 {
+            self.byte(rex);
+        }
+        self.byte(0x89);
+        self.byte(0x80 | (((src as u8) & 7) << 3) | ((base as u8) & 7));
+        if (base as u8) & 7 == 4 {
+            self.byte(0x24);
+        }
+        self.imm32(disp);
+    }
+
+    fn lock_cmpxchg_u32(&mut self, base: Reg, desired: Reg) {
+        assert!(base != Reg::Rax && desired != Reg::Rax);
+        self.byte(0xf0);
+        let rex = 0x40 | (((desired as u8) >> 3) << 2) | ((base as u8) >> 3);
+        if rex != 0x40 {
+            self.byte(rex);
+        }
+        self.bytes(&[0x0f, 0xb1]);
+        self.byte(0x80 | (((desired as u8) & 7) << 3) | ((base as u8) & 7));
+        if (base as u8) & 7 == 4 {
+            self.byte(0x24);
+        }
+        self.imm32(0);
+        // On successful CMPXCHG, EAX need not be written by the CPU. Normalize
+        // the full return register even when the caller supplied dirty high bits.
+        self.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+    }
+
+    fn load_fs_u64(&mut self, dst: Reg, offset: i32) {
+        self.byte(0x64); // FS segment: the direct Linux runtime owns its TLS block
+        self.rex_w(dst, Reg::Rsp);
+        self.byte(0x8b);
+        self.byte((((dst as u8) & 7) << 3) | 4);
+        self.byte(0x25); // absolute disp32 SIB, no base/index
+        self.imm32(offset);
+    }
+
+    fn call_reg(&mut self, target: Reg) {
+        if target as u8 >= 8 {
+            self.byte(0x41);
+        }
+        self.byte(0xff);
+        self.modrm(2, target as u8);
     }
 
     fn movzx_byte_indexed(&mut self, dst: Reg, base: Reg, index: Reg) {
@@ -43016,6 +43121,13 @@ impl Assembler {
         self.rex_w(Reg::Rsi, reg);
         self.byte(0xf7);
         self.modrm(6, reg as u8);
+    }
+
+    /// Unsigned full-width product, RDX:RAX = RAX * reg.
+    fn mul_reg(&mut self, reg: Reg) {
+        self.rex_w(Reg::Rsp, reg);
+        self.byte(0xf7);
+        self.modrm(4, reg as u8);
     }
 
     fn cqo(&mut self) {

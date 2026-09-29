@@ -2279,7 +2279,755 @@ side of a branch.
 
 ## Engineering Work
 
+Generational GC migration adds shared C/PortableAsm components for nonmoving
+root cells, lifetime leases, bounded inventory discovery and detach progress.
+The helpers retain owner contexts until their native resources are released;
+detach reports work that the caller must perform outside the registry lock.
+Native barrier buffers now publish and transfer complete entries to bounded
+worker batches. Generation-tagged metadata leases retain pages across buffer
+consumption and reject stale tokens after slot reuse. Page reservation excludes
+held metadata. Canonical references select run-head leases using published
+object starts, including starts in tail pages; graph jobs release by token.
+Mark stamps now commit with queue insertion, worker claims retain
+in-flight work, and bounded atomic heap scans feed child jobs. Prepared per-object
+overflow cells allow child admission even when all ordinary task slots are
+claimed; deferred jobs remain counted and refill one slot at a time. A stationary
+heap fixture connects roots and delayed SATB entries to two-worker graph marking.
+Native metadata charges now share the page-pool budget. The graph fixture admits
+task/mark-record/lease storage before object allocation and returns its charge
+after worker/job retirement. The generational TLAB leaf now consumes a prepared
+stable mark record and publishes its pointer in the object header; full arenas
+leave the heap unchanged. Production OS admission/refill still needs integration.
+Forwarding ownership now uses a shared C/emitted atomic tagged word; a
+source guard closes admission and drains existing actors before copy. The
+fixture checks delayed source users, competing copies and retained-only reopen.
+Production guard coverage and phase adoption remain unfinished.
+Published-page retirement, production phase/barrier integration and remembered-set
+consumers remain separate work.
+C sanitizers, emitted x86 execution and ARM instruction replay validate these
+components. Normal programs still use the legacy collector. Production integration and
+remaining acceptance gates are tracked in [GC capabilities](gc/capabilities.md).
+
 1. Keep Rust tests aligned with newly promoted `.kl` examples.
 2. Move shared runtime code from `klassic-eval` into `klassic-runtime` when it
    reduces coupling.
 3. Keep CLI and REPL behavior covered by integration tests.
+
+Generational TLAB allocation now installs stable source forwarding cells before
+object-start publication. C and PortableAsm share bounded metadata-only lookup,
+allowing the actual mark-graph fixture to acquire source guards before header
+reads and bounded scans. Forward-table backing is admitted with graph metadata;
+production refill, retirement, moving barrier integration and default
+Generational collector selection remain open.
+
+A shared C/PortableAsm resolver now composes source-table lookup, forwarding
+READ and source guard admission in one bounded step. Protected-source chain
+fixtures preserve a strong root across each forwarding handoff, including root
+journal exhaustion; ordinary graph scans and copy-race source users call the
+same resolver. Full public barriers, phase adoption and default generational
+integration remain open.
+
+Physical relocation copying and complete-copy forwarding publication now have
+shared C/PortableAsm leaves. Each slice copies at most 256 payload bytes after
+checking claim ownership, drained source admission and disjoint committed
+ranges; the destination shares its source MarkRecord. Competing-copy and
+protected two-hop fixtures use these leaves. Production candidate preparation,
+promotion/remsets, retirement and default Generational integration remain open.
+
+
+The shared generational handshake now maintains a lock-protected intrusive
+thread inventory in C and both emitted ISAs. Graph integration traverses all
+registered owners for root certificates and pending buffers; production cycle
+orchestration and the default generational migration remain incomplete.
+
+The generational mark-end check now has matching C and PortableAsm implementations,
+bound to an active completed handshake and reusing root-audit/queue checks. Real
+graph integration calls the shared helper; production cycle transitions and the
+default generational collector remain unfinished.
+
+The shared generational marking boundary now performs real MarkEndCheck to
+ConcurrentMark/Select transitions and a second adoption rendezvous before owner
+resume. C and both emitted ISAs share the protocol; the real-worker graph caught
+and now covers native entry racing phase publication after poll. Whole-cycle
+requests, remaining phases and default generational migration are still open.
+
+The shared cycle-ticket ledger now tracks fresh requests, starts and whole-cycle
+completion independently for Young/Major. The current C collector uses its Major
+lane for real full collections, with deterministic late-request tests; direct
+helpers share the contract but production generational scheduling is unfinished.
+
+The C cycle-ticket await now enters native blocking and sleeps on a dedicated
+completion condition, with predicate rechecks and controlled managed reentry.
+Real collector tests force wake-before-wait, spurious wakes and reentry races,
+and wake 1/2/8 rooted owners. Mixed consecutive-ticket cohorts also prove that
+current waiters return while next-cycle waiters remain blocked, with per-owner
+wait accounting. Direct generational wait integration remains open.
+
+Prepared MarkStart now uses the shared C/PortableAsm phase coordinator for two
+adoption rendezvous before ConcurrentMark work. Both OS graph workers register
+before activation; epoch/color preparation, whole cycles and default migration
+remain unfinished.
+
+Precise remembered slot banks now share C/PortableAsm RECORD/FLIP/TAKE/ACK/CHECK
+operations. The guarded-store relocation fixture replays a captured buffered
+owner into its moved destination slot after a flip. Global Young termination,
+promotion, inventory retirement and default runtime activation remain open.
+
+The shared Young mark-end predicate now includes aggregate remembered-page work:
+unflipped sets, pending slots and active claims block completion without a page
+scan. Registered C/PortableAsm operations maintain those counts, and moved-buffer
+fixtures use the wrapper. Production Old-page registration and whole cycles
+remain unfinished.
+
+A shared remembered-load leaf now transfers a retained Old slot claim into a
+reserved output root. OS-backed conformance connects it through owner/referent
+moves to a Young mark queue: journal retry retains the claim, and only a
+successful mark handoff permits ACK. This is a controlled integration fixture;
+production consumer scheduling, page retirement and default activation remain
+unfinished.
+
+Canonical mark routing now shares guarded preparation across C/PortableAsm.
+Young work skips null and canonical Old targets while preserving cleanup
+ownership; Old work includes Young intermediaries. Remembered fixtures route
+null, Young and promoted Old results without clearing interposed current-bank
+records. Production dispatch and generational cycle scheduling remain open.
+
+Moved remembered claims now transfer their slot banks and pending obligation
+between registered Old pages in the shared C/PortableAsm path. Actual-page
+fixtures retain aggregate work across that transfer and revisit canonical slots
+after another flip. Staged old-location records remain work requiring another
+remap; source inventory emptiness does not authorize metadata retirement.
+Production dispatch, retirement and default generational activation remain open.
+
+Remembered slot claims now have a metadata-only owner-candidate lookup shared
+by C/PortableAsm. It respects forwarding-table/allocation publication ordering,
+validates source starts and preserves nonzero field offsets across protected
+source moves. The actual slot read still requires canonical descriptor access;
+production live-owner binding, dispatch and retirement remain unfinished.
+
+The shared C/emitted mark-graph fixture now dispatches remembered slots through
+registered OS workers: an otherwise unreachable Young child is marked from an
+Old slot, with real mark-end retries while the slot is pending or claimed.
+Worker output roots, journals and segment retirement participate in the same
+registry. The production collector and default migration remain unfinished.
+
+Registered remembered-worker tests now cover journal-full load/release retries
+and a phase rendezvous between guarded load and mark handoff. Bounded journal
+consumption completes its claim before polling; the remembered claim and output
+root remain live until mark handoff. Production integration remains open.
+
+Remembered-page dispatch now has a shared bounded C/PortableAsm cursor that
+retains native registry membership across polls. Active walks prevent page-set
+unlink and next-epoch BEGIN, and participate in Young mark-end checks. The
+registered-worker integration walks/locally flips an empty Old page before
+claiming another page's slot, then transfers lifetime to that claim. Production
+live-owner binding, retirement and default activation remain unfinished.
+
+The registered remembered consumer now continues dispatch after its first ACK.
+A late previous-epoch record injected during a live claim survives that ACK
+and is consumed by a second worker pass; progress counters do not substitute
+for inventory/queue/producer termination. Default generational integration
+and production owner lifetime management remain open.
+
+Remembered workers can now acquire an Old run's metadata from the retained
+slot claim and captured incarnation, without a preknown owner GcRef. The
+shared C/PortableAsm helper preserves state on failure and works with protected
+source mappings; owner lookup, liveness and canonical descriptor validation
+remain separate. Production integration/default activation are still open.
+
+Registered remembered-worker integration now retries claim-derived metadata
+acquisition after a genuinely full lease pool. The claimant retains its job
+while native-blocked, adopts the updated phase on reentry, and resumes after
+token release. Production stall scheduling, reservation and OOM policy remain
+open alongside the default generational migration.
+
+The generational remembered-worker pressure fixture uses OS condition-variable
+wait/wake while BlockedNative, with the predicate and token release protected by
+the registry mutex. Shared C and emitted leaves still run in the same harness;
+production collector scheduling and default migration remain incomplete.
+
+The remembered consumer now publishes its owner into a registered root and
+uses the shared RootAccess operation to journal each forwarding hop before
+polling. A real-worker fixture moves an Old owner twice, performs a phase
+rendezvous between hops, and decommits both source mappings before the final
+guarded field load. Owner/output journal pressure and root retirement are
+checked together with delayed remembered records. Metadata exhaustion between
+hops uses a registered native condition wait while retaining the owner root;
+resumption adopts the phase and retries after a second move and token release. Journal offers and mark
+scans still rely on a fixture-only no-poll resolver; production retry
+scheduling, source retirement and default activation remain incomplete.
+
+Default direct GC slow-load self-healing and mark-trace recoloring now use CAS
+against the originally observed colored value, matching the C/LLVM runtime.
+Concurrent logical stores cannot be overwritten by a stale repair; failed
+repair still returns/marks the original resolved observation. C forced-store
+races and a test executing the production x86 emitters cover this migration
+fix. Full generational store/publication and moving-source contracts remain open.
+
+The production C/LLVM legacy collector retries MarkEnd when its quiescent root
+rescan/worklist check finds work. It resumes mutators and traces concurrently
+without resetting the mark epoch; only an empty end check permits ghost
+retirement and sweep. A late-frontier regression checks 16 actual cycles with
+mutator progress outside the pause. Root/sweep/selection pauses and the direct
+legacy synchronous termination paths remain open migration work.
+
+C/LLVM legacy mark quanta now charge object openings and individual fields,
+retaining an unfinished payload cursor across calls. Completion includes that
+cursor even when the shared queue is empty. Tests cover large record/list scans,
+null fields and actual collection after bounded scans. This relies on the
+legacy single-marker, mark-before-relocate lifecycle; direct trace and the full
+generational pipeline remain separate migration work.
+
+Shared direct GC tracing now budgets object openings and pointer fields with
+persistent cursor/end cells on ELF, PE and Mach-O. Allocation completion and
+synchronous drain include unfinished scans; fresh/restarted marking clears
+scan state. Emitted x86 tests exercise actual trace/drain/allocation routines,
+and a 2048-reference Klassic list survives repeated collections with and
+without poison. This bounds each trace call, not legacy synchronous drain,
+root/sweep pauses or the unfinished generational collector as a whole.
+
+C/LLVM legacy pointer stores now pre-mark overwritten/current targets during
+Mark and publish by CAS, rechecking a competing value on failure. Pointer
+payloads are zeroed before black allocation returns; forwarded new values are
+canonicalized before coloring. A new C store suite covers real last-edge
+removal and controlled black-initialization/competing-store schedules. This
+remains legacy immediate assistance, with generation-aware buffers, direct
+store parity and concurrent relocation source guards still to integrate.
+
+Pointer-valued `__gc_write` now calls a shared mark-aware store routine on
+ELF/PE/Mach-O: canonical new target and observed old target are marked before
+CAS publication, with competing values rechecked on failure. The emitted x86
+harness uses the real mark visitor, including a deterministic failed-CAS
+schedule; existing native GC regressions cover the compiler connection. This
+is one typed write funnel, not full list/closure/container barrier coverage or
+concurrent relocation protection.
+
+AArch64 record and cons-cell construction, including list reversal, also use
+that shared pointer-store routine. A preserving trampoline retains live
+constructor registers across its no-poll call. These paths now protect old/new
+referents under legacy marking; generation-specific buffering and source-access
+exclusion are still required before concurrent generational default migration.
+
+Runtime-map key/value projections use the typed element-cell representation,
+with independent snapshot storage and a projected dynamic length. They no longer
+route `RuntimeList` metadata into the obsolete heap-pointer-array copy helper.
+The access inventory distinguishes these typed storage/root copies from actual
+heap-field barrier sites.
+
+
+The registered mark-worker fixture now retargets moved in-flight array claims
+between bounded scans. Queue-owned metadata leases survive until authenticated
+claim replacement; separate access leases cover forwarding and guarded reads.
+Cursor and logical record identity persist, stale receipts reject, and protected
+source-page tests ensure later slices use the destination. Initial scan lease
+exhaustion retains the complete claim through a registered native wait and
+phase adoption. If forwarding-destination acquisition fills the pool, temporary
+access ownership is released and retry starts at the unchanged queue claim
+after native wait. Busy scan resolution releases temporary ownership and
+polls the registered phase protocol before retry; delayed publication tests
+require a rendezvous while forwarding is still claimed. Offer pressure,
+multihop budgeting, source retirement and generational default activation
+are still incomplete.
+
+
+Graph workers now register bounded pending-child root segments before marking.
+Nonnull scan results move into those roots before polling and are reread after
+metadata-pressure waits; copied worker journal claims remain unacknowledged
+through offer retries. Parent cursors advance after all handoffs and root/journal
+cleanup. Shared lifecycle retirement clears the segments before worker detach.
+This closes the fixture's private-child-reference gap. Worker offers also poll
+on Busy while retaining their root or journal producer, and delayed child
+publication tests require a rendezvous before marking starts. Target admission
+and installation share the heap lock with readers of already-installed objects.
+Production coordinator scheduling, retirement and default migration remain open.
+
+The shared generational worker fixture injects scan metadata exhaustion under
+the acquisition mutex immediately before the partial-array claimant asks for
+its lease. A TSan/debugger reproduction showed that rendezvous-time exhaustion
+could be undone by a concurrent token return, leaving the test coordinator
+waiting for a FULL notification that never occurred. The corrected schedule
+retains native-wait, phase-adoption and claim-preservation checks.
+
+The shared generational remembered-worker fixture now retries queue handoff
+through its registered output root instead of requiring immediate metadata
+capacity. Its Young-cycle pressure schedule verifies that the child and slot
+claim survive native waiting and phase adoption before queue publication.
+
+Rooted offers in the shared generational worker fixture use one RootAccess
+step per forwarding edge and poll only after publishing the edge in the root.
+Canonical guards feed the existing queue route directly. The C/emitted
+regression performs two child moves with real phase rendezvous between root
+adoptions before allowing queue publication; immutable journal offers and
+scan claims retain their separate chain-resolution limitations.
+
+The C runtime's optional GC log now distinguishes action time, request-to-safe
+latency, the stopped interval through release, and each mutator's park-to-resume
+interval. An early parker's wait for later owners is included; native-blocked
+owners and calls without a request create no park sample. The actual handshake
+paths have deterministic-clock sanitizer coverage, and LLVM logging checks
+use the OS monotonic clock. These aggregate legacy metrics do not establish
+generational latency or replace the remaining performance matrix.
+
+The C timing regression now also forces two real rendezvous before either
+mutator can resume. The shared locked operation is reused by the production
+wrapper and the controlled schedule; park accounting must retain the whole
+continuous interval while recording the two actions separately.
+
+Shared generational worker journal offers now advance their private COPY
+cursor one forwarding edge at a time while retaining the producer claim and
+matching metadata token across polls. Full destination capacity leaves that
+cursor intact during native waiting. The C/emitted schedule checks both hops,
+unchanged producer entries and mark-end rejection before queue handoff. This
+remains integration-fixture work; source retirement and default activation
+are not inferred from it.
+
+The shared generational scan worker now retains its original queue receipt
+while a separate metadata-protected cursor follows one forwarding edge per
+poll. Canonical guarded preparation alone permits retargeting. Tests cover
+64 pre-retarget rendezvous, 48 second array moves, destination pressure with
+both tokens retained, and the existing 16 protected source pages. This does
+not activate the generational collector or prove metadata retirement.
+
+The shared generational ABI now includes guarded physical slot repair in C
+and PortableAsm. It validates the reference slot/phase and uses exact-observed
+CAS, preserving logical stores without adding mutator barrier records. Caller
+identity/liveness obligations remain explicit. The candidate is used in moving
+graph and stale-heal/store/copy interleavings; full-memory cases also replay on
+ARM emulation. Default collector migration and source retirement remain open.
+
+Concurrent root inventory scans now have a C/shared-emitter exact-CAS repair
+operation authenticated by the scanner's native lease. The moving-graph fixture
+uses it to remap registered array roots while preserving observed colors,
+logical revisions and publication journals. Delayed repairs preserve owner
+stores/releases. This does not yet establish a complete root remap certificate
+or enable source/address reuse in the default collector.
+
+The root walker now retains one counted snapshot through forwarding-edge polls
+and acknowledges it by lease serial plus captured index. Pending snapshots
+block iterator advance and alternate scans. The moving graph uses this durable
+record for mark handoff and root repair instead of requiring a no-poll offer;
+production retirement and independent generation coordination remain open.
+
+The moving graph now runs a root audit on its own registered OS worker, using
+that worker's context for guards and phase adoption. Forced source/destination
+metadata waits cross real phase retries; owner null stores during the wait
+survive delayed repair. The scanner detaches and joins before native storage
+is released. This remains conformance integration rather than default activation.
+
+The generational conformance pipeline now enrolls moves in a relocation admission
+gate until publication or private-copy cleanup plus source retention. Its OS-backed
+failure schedules retain usable source objects at four pre-installation stages,
+while successful moves reuse the private target space. Empty admission alone does
+not authorize uncommit: a retained forwarding entry still prevents source sealing.
+These C/shared-emitter integration tests do not switch the default collector or
+supply production cancellation and final metadata retirement.
+
+Installed relocation targets now have an explicit conformance recovery path:
+interrupted jobs retain ownership and their admission permits, finish or verify
+forwarding, then release once. Installed metadata cannot use private-copy cleanup.
+Successful fixture source runs are sealed with closed/empty admission before OS
+decommit; retained sources remain mapped. Production durable-job rescheduling
+and generation-specific recovery remain to be connected.
+
+Installed relocation jobs now use a shared C/PortableAsm native receipt that binds
+the original claim and exact destination to a live admission permit serial/epoch.
+Recovery distinguishes pending publication from authenticated completion and
+rejects copied controls or completion after permit release. The conformance
+pipeline uses this helper for all installed objects; production durable storage,
+exclusive scheduling and generation handoff remain caller responsibilities.
+
+A relocation permit now binds one installed job until explicit FINISH verifies
+its checked forwarding publication. Gate RELEASE rejects bound jobs, including
+a job whose CHECK succeeded. Both the OS-backed pipeline and concurrent moving
+graph use the C/shared-emitter binding; private-copy cleanup and one permit per
+source claim still require scheduler ownership.
+
+Installed relocation completion now has one resumable C/shared-PortableAsm
+runtime funnel: bind, publish/check, FINISH, release. The OS-backed pipeline and
+concurrent graph call this funnel, including resumption after publication.
+Ordinary direct/LLVM program lowering still uses the legacy header/reference
+contract and must migrate allocation, roots and barriers together before this
+runtime can become the default collector.
+
+The common relocation entry funnel now acquires admission before claiming a
+source and derives the forwarding ticket from its permit serial. Losing attempts
+return their permits. Installed-job validation requires the same serial, linking
+entry through completion within the canonical heap gate. Pipeline and concurrent
+graph moves use this shared C/emitted path; source liveness/metadata leasing and
+production heap-gate/scheduler wiring remain separate responsibilities.
+
+Private relocation cleanup now has a bounded C/shared-emitter cursor: at most
+256 bytes are cleared per call after validating the frozen claim and unchanged
+target top. The OS-backed pipeline retains its permit through cleanup, then
+retains the source or prepares a fresh copy request. Installed target ranges
+cannot use this cleanup path. Production cancellation scheduling remains open.
+
+The generational conformance runtime now shares a bounded relocation cancellation
+funnel across C/x86/ARM: private cleanup, source retention, guarded access reopening
+and permit release. The OS-backed target pipeline uses it for 32 cancellation
+rounds; ordinary compiler output still uses the legacy GC ABI.
+
+The generational C/shared emitter now provides finite TLAB allocation into an
+already reserved empty output root. Journal/refill failures precede allocation;
+success journals and roots the initializing object before returning. The real
+page-mapping fixture uses this path, while ordinary native lowering remains legacy.
+
+Moving-graph construction now uses shared rooted allocation while a registered
+OS observer holds root leases and scans publications. A one-entry journal forces
+pre-allocation flush retries; all construction roots and journal claims retire
+before the existing moving/marking workload starts. Active-mark allocation and
+ordinary compiler integration remain separate unfinished work.
+
+Generational mark routing now distinguishes a validated initializing header
+(WAIT, ownership preserved) from malformed input. Root/journal offer adapters
+exit guards before retrying; ordinary field barriers and direct mark preparation
+continue to reject unpublished payloads. Active-mark allocation integration is
+not yet complete.
+
+Native x86 scope exit now removes shadow roots before releasing their stack
+storage, so the retirement call's return address cannot overwrite a registered
+slot. A generated-code observer regression covers 1/2/8 roots; generational
+RootHandle lowering remains tracked in `docs/gc/compiler-migration.md`.
+
+The generational conformance runtime now shares Select-to-RelocateStart-to-
+ConcurrentRelocate adoption in C and direct x86-64/AArch64 emission. Two worker
+rendezvous keep relocation admission closed until the new remap snapshot is
+adopted, including counted private-producer and address-guard gates. The graph
+owner uses this boundary before selected-survivor placement; ordinary native
+programs still use the legacy collector, and Retire/Idle cycle completion remains
+open (see `docs/gc/compiler-migration.md`).
+
+The shared generational phase coordinator also admits ConcurrentRelocate-to-
+Retire only after move admission is closed and drained. Actor adoption completes
+without reopening the gate; the graph's cooperative audits and root cleanup now
+run in that phase. Source/metadata retirement proofs and Idle/cycle completion
+remain separate unfinished work.
+
+A separate shared Retire root-audit entry now rejects any changed phase snapshot
+or owner revision. The conformance owner keeps registered roots across promotion,
+repairs them through leased pending snapshots and exact CAS, rejects a later
+logical root update, and re-audits under a final handshake. This does not switch
+ordinary programs to the new ABI or authorize source reuse/cycle completion.
+
+Retire owner certification now also waits for context buffers, registered
+consumers and private producers, including owners without root segments. A
+conservative old-reference transport fixture verifies publication, COPY retention
+and ACK/metadata cleanup before certification; full source retirement remains open.
+
+A shared read-only Retire inventory predicate now combines completed root audits,
+all registered managed/native owner certificates, selected queue drainage and
+remembered work under one active rendezvous. It is connected to the conformance
+graph's stale-root and retained-job cases; heap/forwarding/source reuse and full
+cycle completion remain separate obligations.
+
+The generational shared emitter now includes a bounded uncommitted-source
+metadata retirement transaction. It binds cleanup ownership to one request,
+blocks on leases/unfinished cleanup, releases one tail per slice and credits
+bitmap bytes once. An exclusive OS-backed fixture verifies same-range recommit
+with a new ObjectId while the moved object keeps its identity and payload; the
+ordinary collector and full concurrent-cycle retirement remain unconverted.
+
+
+The joined-worker generational graph now owns retiring source forwarding tables
+separately from live graph storage. Full-range forwarding/heap/root audits and
+rendezvous-bound inventory checks feed SourceRetire, with actual native table
+and bitmap frees outside the heap lock, exact metadata credits and surviving
+canonical identity checks. This remains an exclusive post-worker conformance
+owner; ordinary runtime activation and complete concurrent retirement are open.
+
+
+A shared rooted scalar owner now canonicalizes a retained receiver root, performs
+one descriptor-checked scalar load/store and releases its guard and lease through
+explicit lock-domain steps. C and direct generated code preserve exactly-once
+access across abort and cleanup retries, including decommitted forwarding
+sources in OS-backed tests. Standard compiler lowering remains on the legacy
+collector and still needs the full generational runtime connection.
+
+
+Existing-root value preparation now shares the rooted-load mark, root-color
+publication and cancellation controller in C and direct generated code. It skips
+field observation/healing, preserves the logical root and supports snapshot
+restart and rearm. This supplies a preparation stage for reference operations;
+complete store/CAS ownership and ordinary compiler integration remain open.
+
+
+Prepared-root store commit now rereads a retained marked root under the receiver
+guard and feeds current store colors into the existing pre-barrier/CAS. C and
+direct emitters preserve transferred lease ownership even when CAS loses, while
+leaving desired scratch empty. The OS-backed preparation pipeline exercises real
+SATB lease handoff; full public store retry/cancellation and default integration
+remain open.
+
+
+A rooted store attempt now owns receiver access and buffer-entry leases across
+one commit, abort and sliced cleanup in both C and direct code. Failed partial
+admission exits its guard before releasing metadata; transferred leases stay
+with consumers, including on a losing CAS. The prepared-value OS pipeline uses
+this owner. The outer public store retry/admission controller and default
+compiler integration remain unfinished.
+
+
+The composed `RootedStore` now retains its own private-producer obligation across
+existing-root preparation, rooted field observation, CAS and cleanup. C and
+shared direct code retry only after dropping guards and untransferred leases;
+cancellation preserves a successful commit. The OS-backed pipeline invokes
+this controller for its 128 stores. Runtime lock/assist and poll/rearm dispatch, plus ordinary compiler lowering,
+remain to be connected.
+
+
+Cancelled rooted stores can now rearm after resuming Running. Rearm rejects
+remaining local access/lease obligations and clears obsolete observation and
+snapshot state, requiring new registry admission before work resumes. Successful
+stores stay complete. C/direct OS-backed schedules and emitted ARM worker flows
+exercise changed fields across the handshake; ordinary call lowering is pending.
+
+
+`RootedStoreRuntime` now supplies native heap/registry/queue lock bindings to a
+shared C/direct slow-store dispatcher. It automatically admits fresh requests
+and recaptures preparation snapshots, while guarded ACCESS remains free of
+native lock calls. A shared native-callback bridge handles SysV, Win64 and ARM
+calling conventions. Ordinary startup still needs the coherent heap/root ABI
+migration and runtime bindings; this dispatcher does not activate generational
+collection in ordinary programs.
+
+The slow-store dispatch conformance now also runs 1/2/8 OS mutators against a
+shared field with independent registered contexts, roots and common native locks. Forced
+stale CAS attempts must retry after cleanup; post-join consumers verify complete
+buffer entries and metadata lease conservation. This fixed-epoch fixture does
+not activate ordinary generational collection or prove concurrent cycle closure.
+
+The shared-store OS fixture also now coordinates a snapshot handshake while
+stores remain admitted. Owners cancel with live guards/leases, clean up before
+ACK, and rearm/readmit after resuming. Previously queued mark work survives the
+rendezvous. This exercises runtime scheduling contracts with generated store
+code, but does not retire epochs or connect the ordinary compiler ABI.
+
+Shared-store conformance now includes one-entry barrier rings drained by a
+concurrent native worker. Actual ring pressure forces guarded store cleanup
+before waiting; SATB offers and exact remembered-slot registration complete
+before buffer ACK. The fixed Old-object graph validates retry progress and
+lease ownership across the worker handoff. Generic moving-graph consumption
+and ordinary-program integration remain open.
+
+The concurrent buffer-consumer fixture now acquires independent SATB referent
+leases while retaining the entry's owner lease through all generation handoffs.
+An Old-owner/Young-target schedule checks distinct pages and incarnations, both
+mark queues, and source-slot remembered recording under buffer pressure. This
+is conformance integration of existing primitives; ordinary collection and
+moving-source consumption are still unfinished.
+
+A load-side native-lock dispatcher now complements the store entry in C and
+shared direct emission. It performs fresh or restarted snapshot admission,
+selects heap/queue mutexes, and leaves guarded access free of lock callbacks.
+Cancelled captured loads rearm without rereading their field. Concurrent
+load/store and captured-result tests exercise this entry; ordinary compiler
+startup/allocation/root ABI integration is still required.
+
+The C/shared-direct `gc_barrier_poll` entry now connects a rooted load/store's
+bounded cancellation cleanup to registry polling and post-resume rearm. It
+returns explicit park/assistance statuses and performs no OS wait loop. Only
+clean terminal controls can poll; completed operations cannot replay. Ordinary
+compiler ABI migration and the outer assistance/scheduling loop remain open.
+
+`gc_barrier_assist` supplies finite TLAB close and buffer-publication actions
+for the barrier poll loop in C/shared direct code. Close finds the owned run
+head under the heap mutex; publication exposes complete entries without
+consuming them or releasing their leases. Success requests another poll.
+General scheduling/pressure assistance and ordinary ABI integration remain open.
+
+
+Committed native root mappings can now be published into the owner scope and
+registry through C/shared direct code. Package validation precedes registration;
+the backing charge survives retirement and every reader lease. OS-backed tests
+connect publication to complete disposal, and ARM checks exact state changes.
+This does not activate the new ABI in ordinary compiler output.
+
+
+The OS-backed allocation owner now publishes startup, growth and caller-return
+root packages through the committed native publisher. It retains the generated
+entry until all scopes retire and verifies the caller return after callee
+storage unmapping. This connects conformance startup to allocation and cleanup;
+ordinary compiler startup still needs the complete new runtime ownership.
+
+
+The 1/2/8-mutator shared-slot owner now uses registered root scopes and API root
+publication. Joined-owner teardown routes leased root/journal values through
+both retained mark queues before cleanup and detach, including independent
+Old-owner/Young-child metadata leases. This improves barrier-owner integration;
+ordinary runtime ownership and complete collection cycles remain unfinished.
+
+
+The concurrent barrier owner now drains registered root journals while its
+1/2/8 mutators run. Eight-entry rings force clean FLUSH retries; counted batches
+retain both old/new references through Young/Old queue handoff before ACK.
+Per-record spill/refill handles bounded mark queue saturation. Ordinary compiler
+integration and complete moving collection cycles remain open.
+
+
+Counted pending references now have a C/shared-direct one-edge forwarding entry.
+It retains source metadata on pressure and acquires the destination lease before
+releasing the source. The live journal owner uses it before marking. This is a
+bounded runtime primitive; counted producer lifetime, guarded canonical access
+and full cycle/ordinary compiler integration remain separate obligations.
+
+
+The protected two-hop relocation owner now consumes registered copied journal
+items through pending follow after clearing their source root. Forced metadata
+pressure retains the journal and source token; retry reaches a guarded canonical
+payload without reading either inaccessible source page. This idle-phase
+conformance path does not establish a complete concurrent moving collector.
+
+
+C/shared direct pending access now retries movement between forwarding checks
+and canonical guard acquisition. It discards a newly observed private destination
+while retaining the counted original reference and token; READY retains the
+actual guard until EXIT. The live-journal consumer uses this path. Full moving
+collector and ordinary compiler integration remain unfinished.
+
+
+The pending journal owner now exercises a distinct OS mover between follow DONE
+and guard acquisition. It waits in native context state while retaining the
+journal/source leases; after physical source protection it discards the observed
+destination and retries to the guarded canonical object. This deterministic
+interleaving is conformance evidence, not complete cycle/compiler integration.
+
+
+The generational conformance ABI now shares weak-table scan ownership and the
+complete per-entry capture/access/commit/cancel lifecycle between C and direct
+x86/ARM emission. Bounded scan steps retain admission closure through incomplete
+coverage or cleanup, and cancelled extant slots are retried. These helpers run
+in joined mark/weak/relocation and two-OS-actor fixtures. The shared relocation
+handoff starts phase adoption before releasing weak claims; ordinary compiler
+and runtime migration remain incomplete.
+
+The joined weak conformance sequence also invokes the emitted mark-admission
+owner directly, including load-before-close RETRY and close-before-load SELECT.
+The ordinary collector has not been switched by this test integration.
+
+
+Page pin admission now has a C runtime-owner registry indexed by authenticated
+run-head metadata leases. Each bound record owns an independent lease and a
+page gate; outstanding pins prevent selection and unbind, while selection
+prevents new pins. A marked-relocation bridge checks the selected page,
+incarnation, source bounds and generation before registering the mover. Serial
+history survives unbind/rebind. This remains conformance infrastructure:
+normal runtime inventory allocation, rooted canonical pin acquisition/native
+cleanup and all ordinary selection/retirement paths are not yet connected.
+
+
+The C RootPin owner transfers a reserved private root through the root journal,
+uses RootAccess for bounded canonical forwarding, and acquires the page permit
+before dropping its ordinary source guard. Only then does it expose the payload
+address. Cancellation retains cleanup state across metadata or root-journal
+failure. Native root-storage ownership, public safepoint/assist and FFI cleanup
+loops, and normal runtime selection/retirement integration remain outstanding.
+
+
+NativePin now owns the C pin's registered private root package independently
+of the caller scope. Its retirement gate rejects live pins and incomplete root
+release, then delegates deletion, reader, journal and cleaner retirement to the
+existing root lifecycle. Disposal requires BlockedNative without a source guard;
+failed unmapping preserves its mapping and metadata budget charge. Joined
+conformance tests use actual mappings and worker transitions in an idle mark
+phase. Public acquisition/unwind loops, active-cycle handoff and ordinary
+runtime startup/selection integration are still outstanding.
+
+
+The NativePin lifecycle fixture now uses registered journal claims rather than
+raw drains for both caller and private roots. It keeps ring entries and the
+counted journal lease through both generations' PendingMark routing and actual
+guarded descriptor scans, ACKs before root CLEAN, and covers 40 stable-phase
+Young/Old/overlapping mark combinations. This validates pin publication and
+cleanup handoff within a captured phase; epoch transitions, termination and
+normal runtime integration remain separate obligations.
+
+
+Pin ownership now has a C native-mutex dispatcher. It acquires the heap mutex
+only without a source guard, performs EXIT without a new lock, and preserves
+cancellation until pin/metadata/root cleanup finishes. Blocked root operations
+request worker resumption, while guarded EXIT retries cannot poll. The joined
+native package fixture uses this dispatcher, but public package allocation,
+OS wait/assist and error-unwind loops and default runtime integration are not
+yet implemented.
+
+
+The generational pin inventory has native mapped backing with rounded metadata
+budget reservation/commit and quiescent unmap/release. Its fixed-prefix lookup
+binds the record count to the heap page table, while disposal requires all page
+bindings and pin/selection obligations to be gone. The 40 joined NativePin
+lifecycles now use this backing instead of stack records. The default C heap
+still uses the legacy header/reference representation; migration and sole
+runtime publication of this inventory remain explicit integration work.
+
+
+Pin-aware C source drain and uncommit now authenticate the same exclusive page
+selection as the marked-relocation bridge. Draining captures the registry,
+page/incarnation and epoch so selection reopening cannot reuse a partial
+cursor. Uncommit retains its captured selection through unlocked OS work and
+credits payload only after successful decommit. Conformance covers real source
+decommit and surviving destination bytes; ordinary scheduler callers, metadata/
+virtual-range retirement and shared emitted integration remain outstanding.
+
+The generational NativePin owner now shares disposal-gated budget release across C and PortableAsm. Its terminal state follows successful unmap and heap-locked credit return; failed accounting preserves the retry obligation. This remains part of the generational integration work, not the default legacy collector.
+
+The shared generational NativePin close driver now sequences cancellation, root retirement, OS disposal and budget release with separate mutex callbacks. It requests the existing worker boundary protocol explicitly; normal runtime scheduling and compiler integration remain open.
+
+A C owner-progress adapter now joins generational pin shutdown to worker polling and native transitions, retaining packages across handshake and service requests. Native conformance invokes the generated close and worker leaves through this adapter; the adapter emitter and default runtime wiring remain unfinished.
+
+The generational pin worker-progress adapter now has a shared PortableAsm entry. Native lifecycle fixtures execute the complete generated adapter, including worker polling, boundary transitions and callback-safe result handling; production wait/notification services remain open.
+
+Generational root-storage disposal now acquires FINISH completion before reading cleaner-owned metadata. A real collector/owner race fixture reproduces the previous read-order race under TSan and verifies safe completion-gated unmap; concurrent reattachment remains excluded by ownership.
+
+A shared native-pin wait arm now rechecks cleanup under the registry lock before clearing a private u32 event. Real Linux fixtures connect it to generated sticky notification and futex park; production event registration and non-Linux wait routing remain open.
+
+The shared root FINISH notifier now retains failed native wakes separately from completed cleanup. Notification retries can run after root backing is unmapped and never replay FINISH; event and notification control lifetime remain explicit scheduler obligations.
+
+The C generational native heap adapter now owns private virtual reservation and
+page-table bootstrap, including the unused zero-offset page and rounded table
+metadata accounting. Partial OS release retains ownership for retry and hides
+the partially disposed pool. Final disposal requires externally established
+quiescence and returned page/metadata obligations. It does not yet initialize
+contexts, descriptors or workers, provide emitted bootstrap, or replace the
+legacy default heap.
+
+The C native bitmap adapter composes the existing pool bitmap reservation with
+an additional charge for OS rounding padding. A unique owner retains the mapping
+through private preparation, page publication and never-installed PageRelease
+detachment. Failed publication or unmap preserves the corresponding obligations;
+metadata budget return follows actual unmap. This is not yet the retired-source
+bitmap lifetime owner or the default runtime allocator.
+
+The native PageRelease payload adapter validates detached never-installed runs
+before OS decommit. Partial protection/discard failures retain the mapping
+receipt and all budget; only successful decommit permits the existing locked
+FINISH to return credit. Private reserved-page cleanup shares its OS leaf.
+Installed-source cleanup and generated/default runtime wiring remain separate.
+
+The C native source-uncommit adapter now joins evacuation/SourceUncommit BEGIN
+with OS payload discard. Exact request ownership and immutable run geometry are
+checked before the OS call. Metadata leases remain valid for weak/forwarding
+users, and budget credit occurs only in locked FINISH after successful discard.
+The existing actual-copy source-retirement fixture exercises this path, including
+partial protection failure and retry. Default runtime and emitted adapter wiring
+remain incomplete.
+
+Native bitmap ownership now binds the stable HeapPool and original PageLease,
+allowing mapped backing to survive into SourceRetire. Disposal checks the exact
+retirement request bound in the retained head before unmapping; failures retain
+both the receipt and accounting. Padding credit follows successful unmap, while
+logical bitmap credit remains the bounded retirement STEP's responsibility.
+The actual-copy source lifecycle now tests this path with OS-mapped bitmaps.
+Ordinary runtime backing inventories and emitted adapters remain unfinished.
+
+Source payload cleanup now also has a shared PortableAsm entry receiving an
+explicit native decommit callback. It matches the C request/geometry checks,
+normalizes narrow bool results, and leaves accounting to the existing locked
+FINISH transaction. The native actual-copy retirement fixture uses this generated
+controller. This does not yet activate it in ordinary runtime scheduling.
+
+Payload decommit callbacks are now emitted directly for Linux, Windows and Darwin.
+Linux source retirement composes the shared controller with the syscall leaf;
+Win64 normalizes the full BOOL and retains the reservation with MEM_DECOMMIT.
+Darwin preserves callback arguments across libSystem calls and uses MADV_FREE,
+matching the corrected C Darwin branch. Actual target OS and RSS verification
+remain required; model execution is not that evidence.

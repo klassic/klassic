@@ -40,10 +40,11 @@ cargo run -- --gc-poison build program.kl -o program # bad-color heap ptrs; unba
 runtime/gc/run_tests.sh                              # standalone C-GC tests (single + multi-thread)
 ```
 
-The three GC flags apply to the hand-emitted x86_64 ELF backend. The LLVM/C-GC
-tests (`tests/llvm_gc*.rs`, `tests/llvm_backend.rs`) are gated on a `clang >= 15`
-being present (set `KLASSIC_CLANG` to pick one); without clang they skip so CI
-stays green.
+The direct backends share GC emission through `portable_asm.rs`; consult the
+current target tests for flag coverage and timing support. The LLVM/C-GC
+tests (`tests/llvm_gc*.rs`, `tests/llvm_backend.rs`) require `clang >= 15` on their supported Linux host
+(set `KLASSIC_CLANG` to pick one). Missing tooling fails validation; it does not
+turn an unexecuted test into a passing result.
 
 ## Architecture
 
@@ -86,12 +87,12 @@ files, not one monolith:
   enum ABI and the complete hand-written **ZGC-style garbage collector** (colored
   pointers, an inline load barrier, a region heap, incremental marking, and
   moving evacuation). This is where the `--gc-*` flags live. Note: this GC is
-  x86_64-only machine code; extracting its architecture-independent parts behind
-  a `PortableAsm` emitter trait (so a future AArch64 backend can share the design)
-  is an active refactoring direction — see `docs/superpowers/specs/` if present.
+  shared through the `PortableAsm` trait in `portable_asm.rs`, with x86_64 and
+  AArch64 adapters. Generational migration status and outstanding correctness
+  and latency gates are tracked in `docs/gc/capabilities.md`.
 - `pe.rs` — PE64 writer (Windows x86_64), reusing `lib.rs`'s x86_64 codegen.
 - `macho.rs` + `aarch64.rs` — Mach-O writer + AArch64 codegen (Apple Silicon).
-  This is a **wholly separate** backend with no GC of its own.
+  Its codegen is separate, but it uses the shared moving GC emitter.
 - `cbackend.rs` — `--backend c`: emits a portable C translation unit (a subset).
 - `llvm.rs` — `--backend llvm`: emits textual LLVM IR that `clang` compiles and
   links against `libklassic_runtime.a`, using the **C garbage collector** in
@@ -102,12 +103,13 @@ files, not one monolith:
 
 There are two distinct GC implementations — do not confuse them:
 
-- **Hand-written ZGC in `lib.rs`** (x86_64 ELF/PE backend). Design in
-  `docs/zgc-plan.md`. Object header is 16 bytes `[size | mark@bit63][type_tag]`;
+- **Hand-emitted ZGC-style collector** (`portable_asm.rs`, ELF/PE/Mach-O adapters). Design in
+  `docs/zgc-plan.md`. Object header is 16 bytes `[size | low-bit flags][type_tag]`;
+  bit 0 denotes forwarding and bits 1/2 are alternating mark bits.
   pointers are *colored* (bits 60-62) and non-canonical until stripped by the
   load barrier. Observability/debug flags: `--gc-log`, `--gc-stress`, `--gc-poison`.
-  The ~25 `emit_gc_*_runtime` functions in `lib.rs` are the hand-emitted machine
-  code for this collector.
+  The adapters in `lib.rs` and `aarch64.rs` call shared routines in
+  `portable_asm.rs` to emit this collector.
 - **C garbage collector** `runtime/gc/klassic_gc.{c,h}`, driven by the LLVM
   backend through the `klassic_gc_*` ABI (`klassic_gc_init`/`_alloc`/`_write`/
   `_read`/`_collect`/`shadow_push`/`shadow_pop_n`, the inline load-barrier fast
@@ -126,7 +128,7 @@ There are two distinct GC implementations — do not confuse them:
     both the evaluator and the native compiler on Linux x86_64.
   - `tests/language_regressions.rs` — language-level regression suite.
   - `tests/llvm_backend.rs`, `tests/llvm_gc.rs`, `tests/llvm_gc_link.rs` — the LLVM
-    backend and its C-GC linking (gated on clang; see Common Commands).
+    backend and its C-GC linking (require clang on the supported host; see Common Commands).
   - `tests/cross-exec/` — cross-target execution fixtures.
 - Klassic sample programs live under `test-programs/` and `examples/`.
 - Native integration tests are cfg-gated by host: ELF path `#[cfg(all(target_os
@@ -138,7 +140,9 @@ There are two distinct GC implementations — do not confuse them:
 - `docs/architecture-rust.md` — running log of the hand-emitted backend's covered
   paths (append one or two sentences per native change).
 - `docs/native-coverage.md`, `docs/native-backend-strategy.md` — native scope.
-- `docs/zgc-plan.md` — the hand-written x86_64 GC plan (M0-M8, complete).
+- `docs/zgc-plan.md` — historical single-generation GC milestones. These do not
+  establish completion of the Generational ZGC contract; see
+  `docs/gc/capabilities.md`.
 - `docs/true-zgc-plan.md` — the concurrent/N-mutator C GC plan.
 - `docs/llvm-backend-plan.md` — the LLVM backend migration plan.
 - `docs/roadmap-targets-stdlib.md` — long-term multi-target + shared-stdlib

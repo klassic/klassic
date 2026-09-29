@@ -207,6 +207,17 @@ jobs:
 
           exit "$status"
 
+      - name: Cross-build required macOS GC helper fixtures
+        env:
+          KLASSIC_GC_MACOS_WORKER_DIR: ${{ github.workspace }}/cross-exec-out/macos/gc
+          KLASSIC_GC_CLOCK_IMAGE: ${{ github.workspace }}/cross-exec-out/macos/gc/clock.macho
+        run: |
+          mkdir -p cross-exec-out/macos/gc
+          cargo test -p klassic-native gc_macos_worker_fixture
+          cargo test -p klassic-native gc_macho_clock_fixture_has_real_import
+          test -s cross-exec-out/macos/gc/worker.macho
+          test -s cross-exec-out/macos/gc/clock.macho
+
       - name: Upload Windows cross-exec bundle
         uses: actions/upload-artifact@v4
         with:
@@ -284,6 +295,24 @@ jobs:
         with:
           name: cross-exec-macos
           path: cross-exec-out
+
+      - name: Execute required cross-built GC workers and clock
+        run: |
+          python3 - <<'PY'
+          import platform
+          import subprocess
+          from pathlib import Path
+
+          assert platform.system() == "Darwin" and platform.machine() == "arm64"
+          for name in ("worker", "clock"):
+              image = Path("cross-exec-out/gc") / (name + ".macho")
+              assert image.is_file(), f"required GC fixture missing: {image}"
+              image.chmod(0o755)
+              result = subprocess.run([str(image.resolve())], capture_output=True,
+                                      timeout=45, check=True)
+              assert not result.stdout and not result.stderr, result
+              print(f"PASS: Linux-generated GC {name} fixture on macOS ARM64")
+          PY
 
       - name: Run each cross-built program and diff against the evaluator
         run: |

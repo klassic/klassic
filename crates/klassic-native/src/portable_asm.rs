@@ -90,6 +90,14 @@ pub trait PortableAsm {
     fn jcc_label(&mut self, cond: Condition, label: Self::TextLabel);
     /// Direct call to a code-section label (pushes a return address).
     fn call_label(&mut self, label: Self::TextLabel);
+    /// Call a native-ABI callback with V7 as its sole pointer argument.
+    /// The raw return register is V0; void callers ignore it.
+    /// The caller supplies aligned stack/frame storage and saves live values.
+    /// Native lock adapters must not poll or execute managed callbacks.
+    fn call_native_unary(&mut self, target: Reg);
+    /// Call a native-ABI callback with V7/V6 arguments; raw result is in V0.
+    /// The caller saves live values and normalizes narrow native return types.
+    fn call_native_binary(&mut self, target: Reg);
     fn ret(&mut self);
     /// Standard frame teardown (`mov rsp, rbp; pop rbp` on x86-64).
     fn leave(&mut self);
@@ -104,6 +112,50 @@ pub trait PortableAsm {
     fn load_ptr_disp32(&mut self, dst: Reg, base: Reg, disp: i32);
     /// `[base + disp] = src` (64-bit store).
     fn store_ptr_disp32(&mut self, base: Reg, disp: i32, src: Reg);
+    // Generational concurrency primitives. The u64 operations need 8-byte
+    // alignment; the explicitly suffixed u32 operations need 4-byte alignment.
+    // Use normal heap/metadata memory, never V4/V5 as general operands.
+    // These are executed by the conformance harness before runtime migration.
+    #[allow(dead_code)]
+    fn atomic_load_acquire(&mut self, dst: Reg, address: Reg);
+    #[allow(dead_code)]
+    fn atomic_store_release(&mut self, address: Reg, value: Reg);
+    /// Strong CAS: V0 contains expected on entry and observed on return.
+    /// AcqRel on success, Acquire on failure. Address/desired cannot alias V0.
+    /// Portable registers other than V0 survive; flags are unspecified. The ARM
+    /// adapter may also clobber its nonportable scratch registers x11/x12.
+    #[allow(dead_code)]
+    fn atomic_compare_exchange(&mut self, address: Reg, desired: Reg);
+    /// Exact-width state/futex operations on naturally 4-byte aligned storage.
+    /// Results are zero-extended; store/CAS inputs use their low 32 bits only.
+    /// CAS has the same ordering, expected/observed and scratch contract as u64.
+    #[allow(dead_code)]
+    fn atomic_load_acquire_u32(&mut self, dst: Reg, address: Reg);
+    #[allow(dead_code)]
+    fn atomic_store_release_u32(&mut self, address: Reg, value: Reg);
+    #[allow(dead_code)]
+    fn atomic_compare_exchange_u32(&mut self, address: Reg, desired: Reg);
+    /// Full SeqCst fence (normal shareable memory).
+    #[allow(dead_code)]
+    fn atomic_fence(&mut self);
+    /// AcqRel fetch-or via CAS. Returns previous value in V0, clobbers V8/V9
+    /// and flags. Inputs must be distinct from V0/V8/V9 and frame registers.
+    #[allow(dead_code)]
+    fn atomic_fetch_or(&mut self, address: Reg, bits: Reg) {
+        check_atomic_registers(&[address, bits]);
+        assert!(![Reg::V0, Reg::V8, Reg::V9].contains(&address));
+        assert!(![Reg::V0, Reg::V8, Reg::V9].contains(&bits));
+        let retry = self.create_text_label();
+        self.atomic_load_acquire(Reg::V0, address);
+        self.bind_text_label(retry);
+        self.mov_reg_reg(Reg::V8, Reg::V0);
+        self.mov_reg_reg(Reg::V9, Reg::V0);
+        self.or_reg_reg(Reg::V9, bits);
+        self.atomic_compare_exchange(address, Reg::V9);
+        self.cmp_reg_reg(Reg::V0, Reg::V8);
+        self.jcc_label(Condition::NotEqual, retry);
+    }
+
     /// `dst = [rbp - offset]` -- read a local frame slot.
     fn load_rbp_slot(&mut self, dst: Reg, offset: i32);
     /// `[rbp - offset] = src` -- write a local frame slot.
@@ -125,6 +177,15 @@ pub trait PortableAsm {
     fn cmp_reg_imm32(&mut self, r: Reg, imm: i32);
     fn shl_reg_imm8(&mut self, r: Reg, imm: u8);
     fn shr_reg_imm8(&mut self, r: Reg, imm: u8);
+    /// Shift left by V1 modulo 64; preserves V1 unless r itself is V1.
+    fn shl_reg_count(&mut self, r: Reg);
+    fn shr_reg_count(&mut self, r: Reg);
+    /// Unsigned full product V2:V0 = V0 * rhs. Only V0/V2 and flags change;
+    /// rhs must not alias V0/V2 or the stack/frame registers.
+    fn mul_unsigned_wide(&mut self, rhs: Reg);
+    /// V0 / nonzero rhs -> quotient V0, remainder V2. rhs must not alias either
+    /// result or frame/stack registers. Other portable registers survive.
+    fn div_unsigned(&mut self, rhs: Reg);
     /// Bit-test: copy bit `bit` of `r` into the carry flag (x86-64 `bt`),
     /// so a following Below/AboveOrEqual jump branches on it without a
     /// scratch register.
@@ -150,6 +211,13 @@ pub trait PortableAsm {
     /// rather than a syscall op plus portable arithmetic. Clobbers scratch
     /// registers (V0/V1/V8 on x86-64) like any subroutine-free helper.
     fn plat_read_monotonic_ns(&mut self);
+}
+
+pub(crate) fn check_atomic_registers(registers: &[Reg]) {
+    assert!(
+        registers.iter().all(|r| !matches!(r, Reg::V4 | Reg::V5)),
+        "atomic primitives require general registers, not stack/frame pointers"
+    );
 }
 
 impl From<Reg> for crate::Reg {
@@ -220,6 +288,29 @@ impl PortableAsm for crate::NativeCodeGenerator {
     fn call_label(&mut self, label: Self::TextLabel) {
         self.asm.call_label(label);
     }
+    fn call_native_unary(&mut self, target: Reg) {
+        self.asm.mov_reg_reg(crate::Reg::R11, target.into());
+        if self.is_windows {
+            self.asm.mov_reg_reg(crate::Reg::Rcx, crate::Reg::Rdi);
+            self.asm.sub_reg_imm8(crate::Reg::Rsp, 32);
+        }
+        self.asm.call_reg(crate::Reg::R11);
+        if self.is_windows {
+            self.asm.add_reg_imm32(crate::Reg::Rsp, 32);
+        }
+    }
+    fn call_native_binary(&mut self, target: Reg) {
+        self.asm.mov_reg_reg(crate::Reg::R11, target.into());
+        if self.is_windows {
+            self.asm.mov_reg_reg(crate::Reg::Rdx, crate::Reg::Rsi);
+            self.asm.mov_reg_reg(crate::Reg::Rcx, crate::Reg::Rdi);
+            self.asm.sub_reg_imm8(crate::Reg::Rsp, 32);
+        }
+        self.asm.call_reg(crate::Reg::R11);
+        if self.is_windows {
+            self.asm.add_reg_imm32(crate::Reg::Rsp, 32);
+        }
+    }
     fn ret(&mut self) {
         self.asm.ret();
     }
@@ -246,6 +337,37 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
     fn store_ptr_disp32(&mut self, base: Reg, disp: i32, src: Reg) {
         self.asm.store_ptr_disp32(base.into(), disp, src.into());
+    }
+    fn atomic_load_acquire(&mut self, dst: Reg, address: Reg) {
+        check_atomic_registers(&[dst, address]);
+        // Aligned ordinary MOV implements Acquire for x86 normal WB memory.
+        self.asm.load_ptr_disp32(dst.into(), address.into(), 0);
+    }
+    fn atomic_store_release(&mut self, address: Reg, value: Reg) {
+        check_atomic_registers(&[address, value]);
+        self.asm.store_ptr_disp32(address.into(), 0, value.into());
+    }
+    fn atomic_compare_exchange(&mut self, address: Reg, desired: Reg) {
+        check_atomic_registers(&[address, desired]);
+        assert!(address != Reg::V0 && desired != Reg::V0);
+        self.asm.lock_cmpxchg(address.into(), desired.into());
+    }
+    fn atomic_fence(&mut self) {
+        self.asm.bytes(&[0x0f, 0xae, 0xf0]); // mfence
+    }
+    fn atomic_load_acquire_u32(&mut self, dst: Reg, address: Reg) {
+        check_atomic_registers(&[dst, address]);
+        self.asm.load_u32_ptr_disp32(dst.into(), address.into(), 0);
+    }
+    fn atomic_store_release_u32(&mut self, address: Reg, value: Reg) {
+        check_atomic_registers(&[address, value]);
+        self.asm
+            .store_u32_ptr_disp32(address.into(), 0, value.into());
+    }
+    fn atomic_compare_exchange_u32(&mut self, address: Reg, desired: Reg) {
+        check_atomic_registers(&[address, desired]);
+        assert!(address != Reg::V0 && desired != Reg::V0);
+        self.asm.lock_cmpxchg_u32(address.into(), desired.into());
     }
     fn load_rbp_slot(&mut self, dst: Reg, offset: i32) {
         self.asm.load_rbp_slot(dst.into(), offset);
@@ -297,6 +419,29 @@ impl PortableAsm for crate::NativeCodeGenerator {
     }
     fn shr_reg_imm8(&mut self, r: Reg, imm: u8) {
         self.asm.shr_reg_imm8(r.into(), imm);
+    }
+    fn shl_reg_count(&mut self, r: Reg) {
+        check_atomic_registers(&[r]);
+        self.asm.rex_w(crate::Reg::Rsp, r.into());
+        self.asm.byte(0xd3);
+        self.asm.modrm(4, crate::Reg::from(r) as u8);
+    }
+    fn mul_unsigned_wide(&mut self, rhs: Reg) {
+        check_atomic_registers(&[rhs]);
+        assert!(![Reg::V0, Reg::V2].contains(&rhs));
+        self.asm.mul_reg(rhs.into());
+    }
+    fn shr_reg_count(&mut self, r: Reg) {
+        check_atomic_registers(&[r]);
+        self.asm.rex_w(crate::Reg::Rbp, r.into());
+        self.asm.byte(0xd3);
+        self.asm.modrm(5, crate::Reg::from(r) as u8);
+    }
+    fn div_unsigned(&mut self, rhs: Reg) {
+        check_atomic_registers(&[rhs]);
+        assert!(![Reg::V0, Reg::V2].contains(&rhs));
+        self.asm.xor_reg_reg(crate::Reg::Rdx, crate::Reg::Rdx);
+        self.asm.div_reg(rhs.into());
     }
     fn bt_reg_imm8(&mut self, r: Reg, bit: u8) {
         self.asm.bt_reg_imm8(r.into(), bit);
@@ -443,14 +588,25 @@ pub fn emit_gc_grow_budget<E: PortableAsm>(
 /// The argument registers are the shared `gc_alloc`'s own -- `V7` the size
 /// and `V6` the tag -- which is why this can be written once. What a backend
 /// needs kept across the call is the routine's own job, as with the barrier.
-pub fn emit_gc_alloc_object<E: PortableAsm>(
+pub(crate) fn emit_gc_alloc_object<E: PortableAsm>(
     out: &mut E,
     entry: E::TextLabel,
     payload_bytes: u64,
-    tag: u64,
+    shape: crate::gc_shape::BuiltinShape,
 ) {
     out.mov_imm64(Reg::V7, payload_bytes);
-    out.mov_imm64(Reg::V6, tag);
+    emit_gc_alloc_dynamic(out, entry, shape);
+}
+
+/// Allocate a logical shape with the checked payload byte count already in V7.
+/// This remains the legacy ABI boundary until context, roots and publication
+/// migrate together; the shape also supplies the generational descriptor.
+pub(crate) fn emit_gc_alloc_dynamic<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    shape: crate::gc_shape::BuiltinShape,
+) {
+    out.mov_imm64(Reg::V6, shape.legacy_tag());
     out.call_label(entry);
 }
 
@@ -464,7 +620,7 @@ pub fn emit_gc_alloc_object<E: PortableAsm>(
 /// mean.
 pub fn emit_gc_box_scalar<E: PortableAsm>(out: &mut E, entry: E::TextLabel) {
     out.push_reg(Reg::V0); // the scalar, across the allocation
-    emit_gc_alloc_object(out, entry, 8, crate::gc_layout::GC_TYPE_RAW_BYTES);
+    emit_gc_alloc_object(out, entry, 8, crate::gc_shape::BuiltinShape::RawBytes);
     out.pop_reg(Reg::V1);
     out.store_ptr_disp32(Reg::V0, 0, Reg::V1);
 }
@@ -514,6 +670,75 @@ pub fn emit_gc_colour_pointer<E: PortableAsm>(out: &mut E, reg: Reg) {
     out.jcc_label(Condition::Equal, raw);
     out.or_reg_reg(reg, Reg::GoodColor);
     out.bind_text_label(raw);
+}
+
+/// Legacy pointer-store entry: V7 = stable field address, V6 = raw value.
+/// Mark assistance never polls or allocates, so phase/source stay stable in
+/// the current single-owner direct runtime. This is not a moving-source guard
+/// or a generational SATB/remset buffer. Pointer payload must start zeroed.
+pub fn emit_gc_store_pointer<E: PortableAsm>(
+    out: &mut E,
+    entry: E::TextLabel,
+    phase: E::DataLabel,
+    mark_visit: E::TextLabel,
+) {
+    use crate::gc_layout::{GC_FWD, GC_PHASE_MARK};
+    out.bind_text_label(entry);
+    out.push_reg(Reg::V5);
+    out.mov_reg_reg(Reg::V5, Reg::V4);
+    out.sub_reg_imm8(Reg::V4, 32);
+    out.store_rbp_slot(8, Reg::V7);
+    out.store_rbp_slot(16, Reg::V6);
+    let simple = out.create_text_label();
+    let canonical = out.create_text_label();
+    let color = out.create_text_label();
+    let retry = out.create_text_label();
+    let done = out.create_text_label();
+    out.mov_data_addr(Reg::V10, phase);
+    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+    out.cmp_reg_imm8(Reg::V0, GC_PHASE_MARK as i8);
+    out.jcc_label(Condition::NotEqual, simple);
+    out.mov_reg_reg(Reg::V7, Reg::V6);
+    out.and_reg_reg(Reg::V7, Reg::ColorStrip);
+    out.test_reg_reg(Reg::V7, Reg::V7);
+    out.jcc_label(Condition::Equal, color);
+    out.load_ptr_disp32(Reg::V0, Reg::V7, -16);
+    out.mov_reg_reg(Reg::V1, Reg::V0);
+    out.and_reg_imm32(Reg::V1, GC_FWD as i32);
+    out.test_reg_reg(Reg::V1, Reg::V1);
+    out.jcc_label(Condition::Equal, canonical);
+    out.and_reg_imm32(Reg::V0, -16);
+    out.mov_reg_reg(Reg::V7, Reg::V0);
+    out.bind_text_label(canonical);
+    out.store_rbp_slot(16, Reg::V7);
+    out.call_label(mark_visit);
+    out.bind_text_label(color);
+    out.load_rbp_slot(Reg::V0, 16);
+    emit_gc_colour_pointer(out, Reg::V0);
+    out.store_rbp_slot(16, Reg::V0);
+    out.bind_text_label(retry);
+    out.load_rbp_slot(Reg::V10, 8);
+    out.atomic_load_acquire(Reg::V0, Reg::V10);
+    out.store_rbp_slot(24, Reg::V0);
+    out.mov_reg_reg(Reg::V7, Reg::V0);
+    out.and_reg_reg(Reg::V7, Reg::ColorStrip);
+    out.call_label(mark_visit);
+    out.load_rbp_slot(Reg::V10, 8);
+    out.load_rbp_slot(Reg::V11, 16);
+    out.load_rbp_slot(Reg::V0, 24);
+    out.atomic_compare_exchange(Reg::V10, Reg::V11);
+    out.load_rbp_slot(Reg::V1, 24);
+    out.cmp_reg_reg(Reg::V0, Reg::V1);
+    out.jcc_label(Condition::NotEqual, retry);
+    out.jmp_label(done);
+    out.bind_text_label(simple);
+    out.load_rbp_slot(Reg::V0, 16);
+    emit_gc_colour_pointer(out, Reg::V0);
+    out.load_rbp_slot(Reg::V10, 8);
+    out.atomic_store_release(Reg::V10, Reg::V0);
+    out.bind_text_label(done);
+    out.leave();
+    out.ret();
 }
 
 /// The shadow stack's push, as one routine both backends call.
@@ -608,30 +833,57 @@ pub fn emit_gc_bounds_error<E: PortableAsm>(
     out.plat_exit(1);
 }
 
+/// Legacy single-owner scan state. A partial payload is live work even when
+/// the object queue is empty. Relocation cannot start until both are empty.
+#[derive(Clone, Copy)]
+pub struct MarkScanCells<D: Copy> {
+    pub top: D,
+    pub cursor: D,
+    pub end: D,
+}
+
+fn emit_gc_reset_scan<E: PortableAsm>(out: &mut E, scan: MarkScanCells<E::DataLabel>) {
+    out.mov_imm64(Reg::V0, 0);
+    for cell in [scan.top, scan.cursor, scan.end] {
+        out.mov_data_addr(Reg::V10, cell);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    }
+}
+
+fn emit_gc_branch_scan_pending<E: PortableAsm>(
+    out: &mut E,
+    scan: MarkScanCells<E::DataLabel>,
+    pending: E::TextLabel,
+) {
+    for cell in [scan.top, scan.cursor] {
+        out.mov_data_addr(Reg::V10, cell);
+        out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
+        out.test_reg_reg(Reg::V0, Reg::V0);
+        out.jcc_label(Condition::NotEqual, pending);
+    }
+}
+
 /// Portable version of `gc_drain`: run mark quanta until the worklist is
-/// empty. Each iteration traces up to `GC_QUANTUM_POPS` objects via the
-/// `gc_trace` subroutine, then loops while `gc_mark_worklist_top != 0`.
+/// empty. Each iteration spends up to `GC_MARK_QUANTUM` object/field units via the
+/// `gc_trace` subroutine, then loops while the queue or partial payload is nonempty.
 /// Sets up a frame (some callees expect an aligned stack) and tears it
 /// down with `leave`.
 pub fn emit_gc_drain<E: PortableAsm>(
     out: &mut E,
     entry: E::TextLabel,
     gc_trace: E::TextLabel,
-    mark_worklist_top: E::DataLabel,
+    scan: MarkScanCells<E::DataLabel>,
 ) {
-    use crate::gc_layout::GC_QUANTUM_POPS;
+    use crate::gc_layout::GC_MARK_QUANTUM;
 
     out.bind_text_label(entry);
     out.push_reg(Reg::V5); // rbp
     out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
     let drain_loop = out.create_text_label();
     out.bind_text_label(drain_loop);
-    out.mov_imm64(Reg::V7, GC_QUANTUM_POPS); // rdi = quantum
+    out.mov_imm64(Reg::V7, GC_MARK_QUANTUM); // rdi = quantum
     out.call_label(gc_trace);
-    out.mov_data_addr(Reg::V10, mark_worklist_top);
-    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
-    out.test_reg_reg(Reg::V0, Reg::V0);
-    out.jcc_label(Condition::NotEqual, drain_loop);
+    emit_gc_branch_scan_pending(out, scan, drain_loop);
     out.leave();
     out.ret();
 }
@@ -741,18 +993,20 @@ pub fn emit_gc_clear_all_marks<E: PortableAsm>(
     out.ret();
 }
 
-/// Portable version of `gc_trace` (V7/rdi = pop budget): drain the mark
-/// worklist up to the budget, walking each popped pointer object's
+/// Portable version of `gc_trace` (V7/rdi = object/field budget): resume
+/// a partial payload before popping another object, walking each object's
 /// payload -- stripping the color off each child slot, following an M7
 /// forwarding word, recoloring the slot to the good/to-space value, then
 /// marking the child (the strong tricolor closure). Handles the
 /// pointer-list tag's leading length qword. Frame slots: 8 = remaining
-/// budget, 24 = field cursor, 32 = field end. Uses the reserved
+/// budget, 16 = observed field value, 24 = cursor, 32 = end. The persistent
+/// cursor participates in completion; legacy phase exclusion keeps its
+/// source stable between calls. Uses the reserved
 /// ColorStrip (R13) and GoodColor (R14) registers.
 pub fn emit_gc_trace<E: PortableAsm>(
     out: &mut E,
     entry: E::TextLabel,
-    mark_worklist_top: E::DataLabel,
+    scan: MarkScanCells<E::DataLabel>,
     mark_worklist: E::DataLabel,
     mark_visit: E::TextLabel,
 ) {
@@ -762,20 +1016,33 @@ pub fn emit_gc_trace<E: PortableAsm>(
     out.push_reg(Reg::V5); // rbp
     out.mov_reg_reg(Reg::V5, Reg::V4); // rbp = rsp
     out.sub_reg_imm8(Reg::V4, 32);
-    // rdi = pop budget for this quantum; [rbp-8] holds the remaining
+    // rdi = object/field budget for this quantum; [rbp-8] holds the remaining
     // budget, [rbp-24] the field cursor, [rbp-32] the field end.
     out.store_rbp_slot(8, Reg::V7);
     let trace_loop = out.create_text_label();
     let trace_done = out.create_text_label();
     let trace_field_loop = out.create_text_label();
     let trace_skip_field = out.create_text_label();
+    let trace_suspend = out.create_text_label();
+    let trace_finish_object = out.create_text_label();
+    let trace_pop = out.create_text_label();
     out.bind_text_label(trace_loop);
     // Budget exhausted? (an incremental quantum stops here; gc_drain
-    // passes a large budget and loops until the worklist empties.)
+    // repeats finite quanta until both queue and partial scan empty.)
     out.load_rbp_slot(Reg::V0, 8);
     out.test_reg_reg(Reg::V0, Reg::V0);
     out.jcc_label(Condition::Equal, trace_done);
-    out.mov_data_addr(Reg::V10, mark_worklist_top);
+    out.mov_data_addr(Reg::V10, scan.cursor);
+    out.load_ptr_disp32(Reg::V1, Reg::V10, 0);
+    out.test_reg_reg(Reg::V1, Reg::V1);
+    out.jcc_label(Condition::Equal, trace_pop);
+    out.store_rbp_slot(24, Reg::V1);
+    out.mov_data_addr(Reg::V10, scan.end);
+    out.load_ptr_disp32(Reg::V1, Reg::V10, 0);
+    out.store_rbp_slot(32, Reg::V1);
+    out.jmp_label(trace_field_loop);
+    out.bind_text_label(trace_pop);
+    out.mov_data_addr(Reg::V10, scan.top);
     out.load_ptr_disp32(Reg::V1, Reg::V10, 0);
     out.test_reg_reg(Reg::V1, Reg::V1);
     out.jcc_label(Condition::Equal, trace_done);
@@ -821,8 +1088,14 @@ pub fn emit_gc_trace<E: PortableAsm>(
     out.load_rbp_slot(Reg::V10, 24);
     out.load_rbp_slot(Reg::V11, 32);
     out.cmp_reg_reg(Reg::V10, Reg::V11);
-    out.jcc_label(Condition::AboveOrEqual, trace_loop);
-    out.load_ptr_disp32(Reg::V7, Reg::V10, 0);
+    out.jcc_label(Condition::AboveOrEqual, trace_finish_object);
+    out.load_rbp_slot(Reg::V0, 8);
+    out.test_reg_reg(Reg::V0, Reg::V0);
+    out.jcc_label(Condition::Equal, trace_suspend);
+    out.sub_reg_imm8(Reg::V0, 1);
+    out.store_rbp_slot(8, Reg::V0); // null slots also consume one unit
+    out.atomic_load_acquire(Reg::V7, Reg::V10);
+    out.store_rbp_slot(16, Reg::V7); // exact observed colored value
     // Heap slots hold colored pointers; strip the color before
     // gc_mark_visit dereferences the block header at [rdi-16].
     out.and_reg_reg(Reg::V7, Reg::ColorStrip);
@@ -843,20 +1116,37 @@ pub fn emit_gc_trace<E: PortableAsm>(
     out.mov_reg_reg(Reg::V7, Reg::V11);
     out.bind_text_label(trace_child_not_fwd);
     // Recolor-on-trace: write the good-colored (to-space) child back into
-    // this field slot (r10 = slot address) BEFORE marking, so a later
+    // this field slot only if its observed value is unchanged. A logical
+    // store racing the repair must win. Mark the observed child even when
+    // CAS fails. Repair BEFORE marking, so a later
     // barriered load of the same field takes the fast path instead of
     // re-entering the slow path. Must precede the call, which clobbers
     // r10; the cursor is reloaded afterward. Inert until the mark color
     // flips (recoloring good->good is a no-op).
     out.mov_reg_reg(Reg::V11, Reg::V7);
     out.or_reg_reg(Reg::V11, Reg::GoodColor);
-    out.store_ptr_disp32(Reg::V10, 0, Reg::V11);
+    out.load_rbp_slot(Reg::V0, 16);
+    out.atomic_compare_exchange(Reg::V10, Reg::V11);
     out.call_label(mark_visit);
     out.bind_text_label(trace_skip_field);
     out.load_rbp_slot(Reg::V10, 24);
     out.add_reg_imm32(Reg::V10, 8);
     out.store_rbp_slot(24, Reg::V10);
     out.jmp_label(trace_field_loop);
+    out.bind_text_label(trace_finish_object);
+    out.mov_imm64(Reg::V0, 0);
+    for cell in [scan.cursor, scan.end] {
+        out.mov_data_addr(Reg::V10, cell);
+        out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    }
+    out.jmp_label(trace_loop);
+    out.bind_text_label(trace_suspend);
+    out.load_rbp_slot(Reg::V0, 24);
+    out.mov_data_addr(Reg::V10, scan.cursor);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    out.load_rbp_slot(Reg::V0, 32);
+    out.mov_data_addr(Reg::V10, scan.end);
+    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
     out.bind_text_label(trace_done);
     out.leave();
     out.ret();
@@ -1068,6 +1358,10 @@ pub fn emit_gc_load_barrier_slow<E: PortableAsm>(
     use crate::gc_layout::{GC_PHASE_MARK, GC_PHASE_RELOCATE, GC_REGION_SHIFT};
 
     out.bind_text_label(entry);
+    // Keep the exact colored observation across forwarding/evacuation. Two
+    // pushes preserve the call-stack alignment of the existing slow path.
+    out.push_reg(Reg::V0);
+    out.push_reg(Reg::V11); // alignment pad, not a live value
     out.and_reg_reg(Reg::V0, Reg::ColorStrip); // strip -> raw P
     let healed = out.create_text_label();
     let not_fwd = out.create_text_label();
@@ -1119,11 +1413,17 @@ pub fn emit_gc_load_barrier_slow<E: PortableAsm>(
     out.pop_reg(Reg::V10);
     out.bind_text_label(healed);
     // Self-heal: write the good-colored (remapped) pointer back to the
-    // slot. r10 = the field address, carried from the barrier fast path
+    // slot only if it still contains the exact observed value. Never retry
+    // on CAS failure: it may now contain a different logical reference.
+    // r10 = the field address, carried from the barrier fast path
     // (and preserved across gc_evacuate above).
-    out.mov_reg_reg(Reg::V11, Reg::V0);
-    out.or_reg_reg(Reg::V11, Reg::GoodColor); // recolor to good
-    out.store_ptr_disp32(Reg::V10, 0, Reg::V11); // self-heal
+    out.mov_reg_reg(Reg::V11, Reg::V0); // preserve canonical read result
+    out.pop_reg(Reg::V0); // discard alignment pad
+    out.pop_reg(Reg::V0); // exact observation, CAS expected
+    out.push_reg(Reg::V11); // return value survives a failed CAS
+    out.or_reg_reg(Reg::V11, Reg::GoodColor);
+    out.atomic_compare_exchange(Reg::V10, Reg::V11);
+    out.pop_reg(Reg::V0); // return our observation, not CAS's replacement
     // During Mark, the mutator has just loaded a raw pointer into a
     // register, so it must be marked to keep the strong tricolor invariant
     // (load-barrier-driven incremental update). rax (the raw result) is
@@ -1357,7 +1657,7 @@ pub fn emit_gc_stw_mark_complete<E: PortableAsm>(
     entry: E::TextLabel,
     targets: StwMarkTargets<E::TextLabel>,
     stw_fallback_pending: E::DataLabel,
-    mark_worklist_top: E::DataLabel,
+    scan: MarkScanCells<E::DataLabel>,
     worklist_overflow_text: E::DataLabel,
     worklist_overflow_len: usize,
 ) {
@@ -1371,10 +1671,8 @@ pub fn emit_gc_stw_mark_complete<E: PortableAsm>(
     out.mov_imm64(Reg::V0, 0);
     out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
     out.call_label(targets.clear_all_marks);
-    // Reset the worklist top.
-    out.mov_data_addr(Reg::V10, mark_worklist_top);
-    out.mov_imm64(Reg::V0, 0);
-    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    // A from-scratch traversal must also discard the old partial cursor.
+    emit_gc_reset_scan(out, scan);
     out.call_label(targets.mark_roots);
     out.call_label(targets.drain);
     // If the flag is set again, the worklist overflowed even on the
@@ -1748,7 +2046,7 @@ pub struct AllocCells<D: Copy> {
     pub bytes_since_cycle: D,
     pub budget_regions: D,
     pub bytes_since_quantum: D,
-    pub mark_worklist_top: D,
+    pub mark_scan: MarkScanCells<D>,
     pub header_mark: D,
     pub alloc_count: D,
     pub bytes_allocated: D,
@@ -1860,7 +2158,7 @@ pub fn emit_gc_alloc<E: PortableAsm>(
     stderr_fd: u64,
 ) {
     use crate::gc_layout::{
-        GC_PHASE_MARK, GC_PHASE_RELOCATE, GC_QUANTUM_BYTES, GC_QUANTUM_POPS, GC_REGION_SHIFT,
+        GC_MARK_QUANTUM, GC_PHASE_MARK, GC_PHASE_RELOCATE, GC_QUANTUM_BYTES, GC_REGION_SHIFT,
     };
 
     out.bind_text_label(entry);
@@ -1920,12 +2218,9 @@ pub fn emit_gc_alloc<E: PortableAsm>(
     out.jcc_label(Condition::Below, driver_done);
     out.mov_imm64(Reg::V0, 0);
     out.store_ptr_disp32(Reg::V10, 0, Reg::V0); // reset counter
-    out.mov_imm64(Reg::V7, GC_QUANTUM_POPS);
+    out.mov_imm64(Reg::V7, GC_MARK_QUANTUM);
     out.call_label(t.trace);
-    out.mov_data_addr(Reg::V10, c.mark_worklist_top);
-    out.load_ptr_disp32(Reg::V0, Reg::V10, 0);
-    out.test_reg_reg(Reg::V0, Reg::V0);
-    out.jcc_label(Condition::NotEqual, driver_done);
+    emit_gc_branch_scan_pending(out, c.mark_scan, driver_done);
     out.call_label(t.mark_end);
     out.jmp_label(driver_done);
     // Relocate: run one bounded evacuation quantum per GC_QUANTUM_BYTES.
@@ -2909,7 +3204,7 @@ pub struct MarkStartCells<D: Copy> {
     pub good_color: D,
     pub bad_mask: D,
     pub mark_color: D,
-    pub worklist_top: D,
+    pub scan: MarkScanCells<D>,
     pub phase: D,
 }
 
@@ -3010,9 +3305,7 @@ pub fn emit_gc_mark_start<E: PortableAsm>(
     out.mov_data_addr(Reg::BadMask, cells.bad_mask);
     out.load_ptr_disp32(Reg::BadMask, Reg::BadMask, 0);
     // Reset the worklist and scan roots into it (marked new-color).
-    out.mov_data_addr(Reg::V10, cells.worklist_top);
-    out.mov_imm64(Reg::V0, 0);
-    out.store_ptr_disp32(Reg::V10, 0, Reg::V0);
+    emit_gc_reset_scan(out, cells.scan);
     out.call_label(mark_roots);
     // Enter the Mark phase.
     out.mov_data_addr(Reg::V10, cells.phase);

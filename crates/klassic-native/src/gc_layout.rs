@@ -1,24 +1,13 @@
-//! Architecture-independent GC design constants and object-format ABI.
+//! Legacy direct collector constants and object-format ABI.
 //!
-//! This module is the single, non-x86-64 home for the collector's
-//! *design*: every value here is a number or a documented convention,
-//! never an instruction sequence. The actual code generation (register
-//! allocation, addressing modes, syscall/shim encoding) stays in
-//! `lib.rs`, which is currently the only backend that emits this
-//! collector. If a future direct-ELF AArch64 backend (or any other
-//! architecture) ever adopts the same precise/moving collector, this
-//! file is exactly the set of facts it must agree on to stay
-//! object-format compatible with the x86-64 backend -- the constants
-//! below and the layout described in prose where a value cannot stand
-//! alone.
+//! ELF/PE x86-64 and Mach-O AArch64 use these constants through the shared
+//! `portable_asm` emitter and their architecture adapters. This module contains
+//! numeric layout conventions, not instruction sequences.
 //!
-//! This is a deliberately narrow slice of "architecture independence":
-//! the numbers and the format they describe, extracted out of the
-//! instruction-emission code. A full shared instruction-emission
-//! abstraction that both backends lower through (see
-//! `docs/superpowers/specs/` and `docs/zgc-plan.md`) is a separate,
-//! larger effort; what belongs *here* is only the part that is already
-//! truly independent of any instruction set.
+//! The generational ABI in `gc_abi.rs` uses a separate 32-byte header and
+//! offset/metadata references. Its conformance helpers do not yet replace the
+//! legacy ABI used by ordinary direct compiler output. Migration status and
+//! remaining activation gates are recorded in `docs/gc/capabilities.md`.
 //!
 //! ## Object header layout
 //!
@@ -84,7 +73,6 @@ pub const GC_TABLES_BYTES: u64 = ((GC_SHADOW_STACK_LEN + GC_MARK_WORKLIST_LEN) *
 pub const GC_MAX_PAYLOAD_SIZE: u64 = i64::MAX as u64 - 31 - 4095;
 pub const GC_MAX_STRING_ALLOC_SIZE: u64 = GC_MAX_PAYLOAD_SIZE - 15;
 pub const GC_MAX_POINTER_SLOT_COUNT: u64 = GC_MAX_PAYLOAD_SIZE / 8;
-pub const GC_MAX_LIST_LENGTH: u64 = (GC_MAX_PAYLOAD_SIZE - 8) / 8;
 
 /// Type tag stored in the second header word. 0 marks a free block, 1
 /// marks a raw-bytes payload (no pointer fields), 2 marks a "pointer
@@ -112,10 +100,10 @@ pub const GC_COLOR_STRIP: u64 = !GC_COLOR_MASK;
 pub const GC_COLOR_BAD_MASK: u64 = GC_COLOR_M1 | GC_COLOR_R;
 
 /// M6 incremental-marking tuning. A mark quantum traces up to
-/// `GC_QUANTUM_POPS` worklist objects; the driver runs one quantum per
+/// `GC_MARK_QUANTUM` object openings and pointer slots; the driver runs one quantum per
 /// `GC_QUANTUM_BYTES` allocated during the Mark phase. A cycle starts
 /// proactively when live regions exceed 5/8 of the soft budget.
-pub const GC_QUANTUM_POPS: u64 = 512;
+pub const GC_MARK_QUANTUM: u64 = 512;
 pub const GC_QUANTUM_BYTES: u64 = 8192;
 
 pub const GC_PHASE_IDLE: u64 = 0;

@@ -109,10 +109,7 @@ ok:
 
 #[test]
 fn c_gc_links_and_runs_from_llvm_ir() {
-    let Some(cc) = find_cc() else {
-        eprintln!("skipping: no clang >= 15 found");
-        return;
-    };
+    let cc = find_cc().expect("LLVM validation requires clang >= 15; set KLASSIC_CLANG");
     let gc_src = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/gc/klassic_gc.c");
     let dir = std::env::temp_dir();
     // Unique per build, not merely per nanosecond: parallel tests that start

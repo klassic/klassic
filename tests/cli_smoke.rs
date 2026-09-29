@@ -21321,6 +21321,7 @@ fn windows_gc_stress_and_poison_stay_correct() {
     let build = Command::new(klassic_bin())
         .args([
             "--gc-stress",
+            "--gc-log",
             "--gc-poison",
             "build",
             source_path.to_str().expect("path should be utf-8"),
@@ -21349,6 +21350,21 @@ fn windows_gc_stress_and_poison_stay_correct() {
         String::from_utf8_lossy(&run.stdout),
         "50000\n",
         "a collection before every allocation must not change the answer"
+    );
+    let stderr = String::from_utf8(run.stderr).expect("GC log should be UTF-8");
+    let field = |name: &str| -> u64 {
+        stderr
+            .split(name)
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("GC timing field should exist")
+    };
+    let maximum = field(" max_pause_ns=");
+    let total = field(" total_pause_ns=");
+    assert!(
+        maximum > 0 && total >= maximum,
+        "Windows GC must use a real monotonic clock: {stderr}"
     );
 }
 
@@ -21617,6 +21633,37 @@ fn native_gc_incremental_runs_many_cycles() {
         collections >= 5,
         "proactive incremental cycles should fire repeatedly, got {collections}"
     );
+}
+
+/// A flat pointer list exceeds one field quantum. Its later children must
+/// remain reachable while allocations resume between partial scans.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_gc_large_pointer_list_survives_field_quanta() {
+    let elements = (0..2048)
+        .map(|i| format!("Leaf({i})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let program = format!(
+        "enum Item {{ case Leaf(n: Int) }}\n\
+         def value(x: Item): Int = x match {{ case Leaf(n) => n }}\n\
+         val keeper = [{elements}]\n\
+         mutable i = 0\n\
+         while (i < 50000) {{ val garbage = Leaf(i); i = i + 1 }}\n\
+         println(foldLeft(keeper)(0)((acc, x) => acc + value(x)))\n"
+    );
+    for flags in [vec!["--gc-log"], vec!["--gc-log", "--gc-poison"]] {
+        let (stdout, stderr) = build_and_run_gc_program(&program, &flags);
+        assert_eq!(stdout, "2096128\n", "flags={flags:?}");
+        let collections = stderr
+            .split("collections=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap();
+        assert!(collections >= 2, "{stderr}");
+        assert!(stderr.contains("stw_fallbacks=0 "), "{stderr}");
+    }
 }
 
 /// M7: the moving collector actually evacuates live objects. A long-run
@@ -26699,6 +26746,7 @@ fn build_target_windows_x86_64_emits_pe() {
             "WriteFile",
             "ExitProcess",
             "VirtualAlloc",
+            "VirtualFree",
             "GetSystemTimeAsFileTime",
             "Sleep",
             "QueryPerformanceCounter",
@@ -26721,6 +26769,15 @@ fn build_target_windows_x86_64_emits_pe() {
             "CloseHandle",
             "DeleteFileA",
             "GetEnvironmentVariableA",
+            "CreateThread",
+            "WaitForSingleObject",
+            "GetExitCodeThread",
+            "TlsAlloc",
+            "TlsFree",
+            "TlsSetValue",
+            "TlsGetValue",
+            "CreateEventA",
+            "SetEvent",
         ]
     );
 
@@ -29207,6 +29264,12 @@ fn build_target_aarch64_apple_darwin_gc_log_reports_real_collections() {
         field("allocs=") > 0,
         "no allocations were counted: {stderr}"
     );
+    let maximum = field("max_pause_ns=");
+    let total = field("total_pause_ns=");
+    assert!(
+        maximum > 0 && total >= maximum,
+        "macOS GC must use real monotonic timestamps: {stderr}"
+    );
 }
 
 /// M9: the moving collector really moves things. Compaction needs *sparse*
@@ -29739,4 +29802,46 @@ fn native_equality_on_heap_values_compares_contents() {
         expected,
         "two separately built values of the same shape are one value"
     );
+}
+
+/// A runtime-map projection snapshots typed cells and preserves dynamic length;
+/// the map representation is not an address of a GC heap pointer-list.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_runtime_map_projections_snapshot_typed_cells() {
+    let program = r#"
+mutable i = 0
+while (i < 3) {
+  val m = if (i == 0) %["a": "alpha", "b": "bravo"] else if (i == 1) %["z": "zed"] else %[]
+  println(m.keys())
+  println(m.values())
+  println(m.keys().size())
+  println(m.values().size())
+  i = i + 1
+}
+mutable n = if (i == 3) %["x": 11, "y": 22] else %["x": 33]
+val snapshot = n.values()
+n = %["x": 99]
+println(snapshot)
+println(n.values())
+"#;
+    let expected = "[a, b]\n[alpha, bravo]\n2\n2\n[z]\n[zed]\n1\n1\n[]\n[]\n0\n0\n[11, 22]\n[99]\n";
+    let eval = Command::new(klassic_bin())
+        .args(["-e", program])
+        .output()
+        .expect("evaluator runs");
+    assert!(
+        eval.status.success(),
+        "{}",
+        String::from_utf8_lossy(&eval.stderr)
+    );
+    // Expression mode also prints the final Unit result.
+    assert_eq!(
+        String::from_utf8_lossy(&eval.stdout),
+        format!("{expected}()\n")
+    );
+    for flags in [vec![], vec!["--gc-stress", "--gc-poison"]] {
+        let (stdout, _) = build_and_run_gc_program(program, &flags);
+        assert_eq!(stdout, expected, "flags={flags:?}");
+    }
 }
