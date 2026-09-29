@@ -3031,3 +3031,15 @@ Win64 normalizes the full BOOL and retains the reservation with MEM_DECOMMIT.
 Darwin preserves callback arguments across libSystem calls and uses MADV_FREE,
 matching the corrected C Darwin branch. Actual target OS and RSS verification
 remain required; model execution is not that evidence.
+
+`--gc=generational` (M-G1, Linux x86-64 ELF only) is the first production
+path through the generational components. Heap strings are allocated by the
+emitted `alloc_into` TLAB leaf into Young pages prepared at startup, published
+through source-access ENTER, guarded initialization publish and EXIT, and
+answered as payload addresses decoded from offset references. Every GC-managed
+frame slot holds a RootCell pointer (LIFO-reused over RESERVE/STORE), so loads
+and stores go through root READ_RAW/STORE, and printing copies heap bytes to a
+native buffer before `write`. M-G1 never collects: exhausting the 64 MiB of
+Young pages is an honest OOM, objects larger than one 128 KiB page are a
+run-time error, and enums are declined at build time. The default collector is
+unchanged and byte-identical; see `docs/gc/production-integration-plan.md`.

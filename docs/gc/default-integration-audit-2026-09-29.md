@@ -4,6 +4,14 @@ The default compiler/runtime still uses the legacy collector. Direct OS payload
 cleanup is now emitted for all three targets, but its conformance execution does
 not activate the offset-reference collector in ordinary programs.
 
+Update 2026-09-30: an opt-in `--gc=generational` path (M-G1) now routes heap
+strings on the direct Linux x86-64 backend through the shared components:
+emitted startup, `alloc_into` TLAB allocation, guarded publication and RootCell
+frame roots. It never collects, declines enums and every other target, and
+leaves the default compiler on the legacy collector (byte-identical). It is
+integration evidence, not a collector; see
+[the M-G1 plan and results](production-integration-plan.md).
+
 This audit follows the actual call sites after the native decommit revision. It
 retains the full G01–G15 target and identifies the production connection that must
 accompany further component work.
@@ -120,7 +128,7 @@ cycle scheduler or default compiler routing.
 | LLVM subset | `llvm.rs` emits `call ptr @klassic_gc_alloc` and `klassic_gc_shadow_push(ptr)` | The same new rooted allocation/publication and native-boundary ABI as direct backends |
 | New allocation component | `gc_alloc_start.h::gc_try_allocate_start` reserves an empty handle and returns a rooted INITIALIZING object; failure cancels the empty cell | A real caller that handles ROOT_FULL/TLAB/budget/service results and retains live arguments while retrying |
 | Native backing and cleanup | `gc_native_heap.h`, `gc_native_bitmap.h`, shared source-uncommit controller and direct OS callbacks operate in lifecycle fixtures | Stable runtime ownership through allocation, source retirement, failed OS retry and shutdown; no stack-fixture owner substitution |
-| CLI and end-to-end gates | `src/cli.rs` has logging/stress flags but no generational selector; planned `gc_generational.rs`, `gc_differential.rs`, `gc_latency.rs` are absent | Default generational execution and explicit selector, full behavior/failure matrix, real OS and dedicated performance evidence |
+| CLI and end-to-end gates | `src/cli.rs` has `--gc=legacy|generational` (M-G1, x86-64 ELF, heap strings, no collection); `tests/gc_generational.rs` covers that scaffold. `gc_differential.rs`, `gc_latency.rs` are absent | Default generational execution, collection under the selector, full behavior/failure matrix, real OS and dedicated performance evidence |
 
 ## Integration consequence
 

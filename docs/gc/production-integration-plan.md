@@ -1,7 +1,9 @@
 # Production integration plan — M-G1 (2026-09-29)
 
-Status: planned, not started. Branch `gc/generational-wip` (checkpoint
-`0d674e8` holds the interrupted Codex session's component work).
+Status: M-G1 implemented on branch `gc/generational-wip` (2026-09-30), as an
+opt-in integration scaffold; it does not collect and does not make any G01-G15
+item complete. Checkpoint `0d674e8` holds the interrupted Codex session's
+component work. See "M-G1 as implemented" below.
 
 ## Why this milestone
 
@@ -102,6 +104,68 @@ runtime bootstrap/activation and initial mutator registration
 
 Each step: `cargo fmt --check`, clippy `-D warnings`, targeted tests, then the
 existing legacy suites must stay green (default path unchanged).
+
+## M-G1 as implemented
+
+- Selector: `--gc=legacy|generational` (`src/cli.rs`). The driver declines
+  `--backend c/llvm`, every target other than direct `x86_64-unknown-linux-gnu`,
+  and `--gc-stress/--gc-poison`; the native compiler declines enum programs with
+  a source-located diagnostic. `--gc-log` is accepted and prints
+  `gc[generational]: collections=0 allocated_bytes= pages_used= objects= published=`
+  after walking every used page.
+- Emitted routines: `gc_codegen/production.rs` (+ `production/roots.rs`)
+  compose the existing leaves (`roots::emit_step`, `heap::emit_tlab_page_locked`,
+  `alloc_into`, `source_access`, `initialization::emit_publish`,
+  `descriptors::emit_builtin_prepare`, `root_storage::emit_prepare`) and the
+  Linux mapping leaf. One anonymous mapping holds the runtime block, 512 Young
+  page descriptors, start bitmaps, forward tables, the mark-record arena and root
+  storage; the heap payload is a second mapping. The earlier idea of emitting
+  `gc_native_heap_reserve` / runtime bootstrap / run provisioning in full was
+  replaced by this minimal single-mutator preparation: pages are READY with
+  their own identity range, forward table and start bitmap before the first
+  allocation, so REFILL is close-then-bind of the next prepared page.
+- Allocation: `gc_alloc` keeps its legacy ABI (rdi = payload bytes, rax =
+  payload address), so none of the eight sites changed. The allocator publishes
+  the previous object (ENTER, guarded publish, EXIT), empties the scratch root,
+  and loops on `alloc_into` (REFILL = close/bind, ROOT_FLUSH = drain the
+  unconsumed journal, METADATA_REFILL or page exhaustion = OOM).
+- Roots: `emit_gc_shadow_push/pop_n` call `root_adopt` / `root_pop`. RESERVE
+  never reissues a cell, so frame cells are reused LIFO (reserve only above the
+  high-water mark; pop is a STORE of null, never RELEASE). Every `HeapString` /
+  `HeapPointer` VarSlot load/store goes through `load_var_slot` /
+  `store_var_slot` (74 sites plus the pointer-ABI argument and slice paths),
+  which call READ_RAW / STORE with flags and registers preserved. A slot that
+  still held a raw address would fail the READ_RAW range check loudly.
+- Raw bytes: after the switch, every byte reader obtains its address from a
+  root load after the last allocation point (the legacy moving collector already
+  required that discipline). Print is the only path that handed heap memory to
+  the kernel; it now copies through a 4 KiB native buffer in the runtime block
+  (verified with `strace -e raw=write`). Other kernel-facing paths copy heap
+  strings through `native_string_ref_or_copy` first.
+- Evidence: `tests/gc_generational.rs` (selector/rejections, startup, heap
+  strings across pages with objects == published, 100000-iteration LIFO root
+  reuse and journal drains, honest OOM where legacy succeeds, oversize-object
+  error, multi-chunk printing, and the `test-programs/` corpus against the
+  evaluator). With a temporary local hook making generational the default,
+  `cli_smoke` passed 405/511, and all 106 failures were the intended rejections
+  (70 enum, 31 non-Linux-x86 target, 5 legacy debug flag). The default path was
+  compared byte-for-byte against `0d674e8` for 59 corpus programs plus 162
+  `--gc-log/--gc-stress/--gc-poison` builds: all identical.
+
+### Known limits (M-G1)
+
+- No collection of any kind; programs whose total allocation exceeds 64 MiB of
+  Young pages stop with `klassic gc: out of memory (--gc=generational heap
+  exhausted; M-G1 does not collect)` even when the legacy collector would run
+  them.
+- One object must fit one 128 KiB page (heap strings up to 131032 bytes);
+  larger ones stop with a run-time error. The legacy path has no such limit.
+- Enums (reference descriptors, barriers, deep equality, literal roots) are
+  declined; this is M-G3.
+- Linux x86-64 ELF only; no workers, scheduler, SATB/remembered-set work,
+  relocation or native pins are active.
+- Objects are published lazily (at the next allocation, or at the `--gc-log`
+  walk), which is equivalent here because no site allocates while filling.
 
 ## Next milestones (outline)
 

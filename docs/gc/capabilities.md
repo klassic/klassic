@@ -9,6 +9,14 @@ are dated snapshots, not assertions about the current tree.
 
 ## Current contract audit (2026-09-29)
 
+Update 2026-09-30: `--gc=generational` (M-G1) is the first ordinary compilation
+path that calls these components: on direct Linux x86-64 it allocates heap
+strings with the emitted `alloc_into` leaf, publishes them under a source guard,
+and keeps frame references in RootCells. It performs no collection, rejects
+enums and other targets, and the default collector is unchanged. No G01-G15
+capability becomes complete through it. See
+[the M-G1 plan and results](production-integration-plan.md).
+
 The owned source-retirement receipt now also requires a bounded audit of all
 registered SATB/remset owners. It checks one context per step, requires real
 owner handoff and consumer ACK, and invalidates saved cursors before borrowing
