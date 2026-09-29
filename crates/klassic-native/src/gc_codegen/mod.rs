@@ -9,6 +9,7 @@ pub(crate) mod native_builtin_registry;
 pub(crate) mod native_metadata;
 pub(crate) mod native_roots;
 pub(crate) mod pages;
+pub(crate) mod production;
 pub(crate) mod root_lifetime;
 pub(crate) mod root_storage;
 pub(crate) mod roots;

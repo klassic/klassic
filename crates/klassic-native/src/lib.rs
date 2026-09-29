@@ -4449,6 +4449,15 @@ struct WindowsRuntime {
     win_get_env_var: TextLabel,
 }
 
+/// The M-G1 `--gc=generational` routines' labels and data.
+struct GenerationalRuntime {
+    labels: gc_codegen::production::Labels<TextLabel>,
+    data: gc_codegen::production::Data<DataLabel>,
+    /// rax = heap-string payload, rdi = fd: write the bytes through the
+    /// runtime's copy-out buffer.
+    write_heap_string: TextLabel,
+}
+
 struct NativeCodeGenerator {
     source: SourceFile,
     user_view: Option<UserSourceView>,
@@ -4571,6 +4580,9 @@ struct NativeCodeGenerator {
     /// ABI (offset references, RootCells, TLAB allocation) instead of the
     /// legacy collector. Off by default; the default path is unchanged.
     gc_generational: bool,
+    /// Labels and data of the M-G1 routines, created by `compile` when
+    /// `gc_generational` is set.
+    gc_gen: Option<GenerationalRuntime>,
     gc_alloc: TextLabel,
     gc_collect: TextLabel,
     /// M6: the collector factored into separately-callable STW pieces.
@@ -5018,6 +5030,7 @@ impl NativeCodeGenerator {
             // the M6 non-moving mark-sweep for bisection.
             gc_evac_off: false,
             gc_generational: false,
+            gc_gen: None,
             gc_alloc,
             gc_collect,
             gc_mark_roots,
@@ -5353,7 +5366,7 @@ impl NativeCodeGenerator {
             | NativeValue::HeapPointer
             | NativeValue::HeapString => {
                 let slot = self.allocate_slot(name.clone(), value);
-                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                self.store_var_slot(slot, Reg::Rax);
                 Ok(name)
             }
             // Normalize a static / runtime string to a GC heap string so it
@@ -5366,7 +5379,7 @@ impl NativeCodeGenerator {
                     false,
                 )?;
                 let slot = self.allocate_slot(name.clone(), NativeValue::HeapString);
-                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                self.store_var_slot(slot, Reg::Rax);
                 Ok(name)
             }
             _ => Err(unsupported(
@@ -5508,7 +5521,7 @@ impl NativeCodeGenerator {
         self.generic_enum_counter += 1;
         let temp = format!("__gen_scrut{}", self.generic_enum_counter);
         let slot = self.allocate_slot(temp.clone(), NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+        self.store_var_slot(slot, Reg::Rax);
         self.enum_shapes.insert(slot.id, shape.clone());
         let result =
             self.compile_generic_enum_match_shaped(en_ident(&temp, span), &shape, arms, span);
@@ -5626,7 +5639,7 @@ impl NativeCodeGenerator {
         self.generic_enum_counter += 1;
         let temp = format!("__enum_disp{}", self.generic_enum_counter);
         let slot = self.allocate_slot(temp.clone(), NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+        self.store_var_slot(slot, Reg::Rax);
         let tree = en_build_enum_display(
             &mut self.generic_enum_counter,
             shape,
@@ -5672,8 +5685,17 @@ impl NativeCodeGenerator {
         }
         self.emit_store_command_line_state();
         self.emit_initialize_stack_floor();
-        self.emit_initialize_gc_heap();
-        self.emit_initialize_color_registers();
+        if self.gc_generational {
+            self.prepare_generational_runtime();
+        }
+        if let Some(runtime) = &self.gc_gen {
+            let startup = runtime.labels.startup;
+            self.asm.call_label(startup);
+        }
+        if self.gc_gen.is_none() {
+            self.emit_initialize_gc_heap();
+            self.emit_initialize_color_registers();
+        }
         // Roots the cells that collection literals spill heap pointers into.
         // The routine is emitted after every literal has been compiled, so
         // this call is a forward reference to a body whose size is not known
@@ -5682,7 +5704,11 @@ impl NativeCodeGenerator {
         self.compile_top_level(expr)?;
         self.emit_queued_threads()?;
         if self.gc_log {
-            self.emit_gc_log_report();
+            if self.gc_gen.is_some() {
+                self.emit_generational_log_report();
+            } else {
+                self.emit_gc_log_report();
+            }
         }
         self.emit_exit_success();
         self.emit_functions()?;
@@ -5694,7 +5720,9 @@ impl NativeCodeGenerator {
         self.emit_gc_mark_visit_runtime();
         self.emit_gc_deep_equal_runtime();
         self.emit_gc_load_barrier_slow_runtime();
-        self.emit_gc_alloc_runtime();
+        if self.gc_gen.is_none() {
+            self.emit_gc_alloc_runtime();
+        }
         self.emit_gc_collect_runtime();
         self.emit_gc_mark_roots_runtime();
         self.emit_gc_trace_runtime();
@@ -5717,6 +5745,7 @@ impl NativeCodeGenerator {
         self.emit_gc_grow_budget_runtime();
         self.emit_gc_bounds_error_runtime();
         self.emit_gc_shadow_runtime();
+        self.emit_generational_runtime();
         if self.is_windows {
             self.emit_win_init_runtime();
             self.emit_win_write_runtime();
@@ -6565,7 +6594,7 @@ impl NativeCodeGenerator {
             self.static_lambdas.len()
         );
         let condition_slot = self.allocate_slot(condition_name.clone(), NativeValue::Bool);
-        self.asm.store_rbp_slot(condition_slot.offset, Reg::Rax);
+        self.store_var_slot(condition_slot, Reg::Rax);
         let builtin_display =
             self.conditional_builtin_display(condition_slot, then_branch, else_branch);
 
@@ -7041,7 +7070,7 @@ impl NativeCodeGenerator {
                         | NativeValue::HeapString
                         | NativeValue::RuntimeDouble
                 ) {
-                    self.asm.load_rbp_slot(Reg::Rax, slot.offset);
+                    self.load_var_slot(Reg::Rax, slot);
                 }
                 // Propagate a generic enum value's shape so passing it on
                 // (e.g. as a function argument or rebinding it) carries the
@@ -7084,7 +7113,7 @@ impl NativeCodeGenerator {
                         if let Some(shape) = annotated_shape {
                             self.enum_shapes.insert(slot.id, shape);
                         }
-                        self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                        self.store_var_slot(slot, Reg::Rax);
                         if static_expr_is_pure(value)
                             && let Some(value) = self.static_value_from_expr(value)
                         {
@@ -7365,7 +7394,7 @@ impl NativeCodeGenerator {
                         "native assignment with changed value type",
                     ));
                 }
-                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                self.store_var_slot(slot, Reg::Rax);
                 // Assigning a generic enum value merges its shape into the
                 // slot's, resolved reprs winning over defaulted ones. A
                 // binding seeded with a nullary constructor -- `mutable m =
@@ -7800,7 +7829,7 @@ impl NativeCodeGenerator {
             // 100k iterations.
             self.push_scope();
             let lhs_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-            self.asm.store_rbp_slot(lhs_slot.offset, Reg::Rax);
+            self.store_var_slot(lhs_slot, Reg::Rax);
             let rhs_value = self.compile_expr(rhs)?;
             if !matches!(rhs_value, NativeValue::HeapPointer) {
                 return Err(unsupported(
@@ -7813,7 +7842,7 @@ impl NativeCodeGenerator {
             // never allocates, so the operands are safe unrooted once
             // the scope pops.
             self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
-            self.asm.load_rbp_slot(Reg::Rdi, lhs_slot.offset);
+            self.load_var_slot(Reg::Rdi, lhs_slot);
             self.pop_scope();
             self.asm.call_label(self.gc_deep_equal);
             if op == BinaryOp::NotEqual {
@@ -8930,7 +8959,7 @@ impl NativeCodeGenerator {
     ) {
         match key {
             RuntimeMapCallableDispatchScalarKey::Stack(slot) => {
-                self.asm.load_rbp_slot(Reg::R10, slot.offset);
+                self.load_var_slot(Reg::R10, slot);
             }
             RuntimeMapCallableDispatchScalarKey::Data(slot) => {
                 self.asm.mov_data_addr(Reg::R10, slot);
@@ -9322,7 +9351,7 @@ impl NativeCodeGenerator {
                 // Root the argument (heap slots become GC roots; Int/Bool
                 // slots are plain storage) and remember where it lives.
                 let slot = self.allocate_anonymous_slot(*expected_value);
-                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                self.store_var_slot(slot, Reg::Rax);
                 qword_arg_slots.push((slot.offset, *expected_value));
                 continue;
             }
@@ -9365,8 +9394,8 @@ impl NativeCodeGenerator {
             // next_stack_offset is not bumped, so the scope's pop only
             // reclaims the argument slots, and the explicit `add rsp`
             // after the call removes these pushed copies.
-            for (offset, _) in &qword_arg_slots {
-                self.asm.load_rbp_slot(Reg::Rax, *offset);
+            for (offset, value) in &qword_arg_slots {
+                self.load_value_slot(Reg::Rax, *offset, *value);
                 self.asm.push_reg(Reg::Rax);
             }
         } else {
@@ -9374,8 +9403,8 @@ impl NativeCodeGenerator {
             // The slots are rbp-relative, so the load order is
             // independent and nothing between the loads and the call
             // clobbers an argument register.
-            for (reg, (offset, _)) in arg_regs.iter().zip(qword_arg_slots.iter()) {
-                self.asm.load_rbp_slot(*reg, *offset);
+            for (reg, (offset, value)) in arg_regs.iter().zip(qword_arg_slots.iter()) {
+                self.load_value_slot(*reg, *offset, *value);
             }
         }
         self.asm.call_label(function.label);
@@ -9684,7 +9713,7 @@ impl NativeCodeGenerator {
                 // "anonymous slot => own scope bracket" invariant.
                 self.push_scope();
                 let expected_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-                self.asm.store_rbp_slot(expected_slot.offset, Reg::Rax);
+                self.store_var_slot(expected_slot, Reg::Rax);
                 let actual = self.compile_expr(&actual_arguments[0])?;
                 // Lift a fixed-buffer / static actual to the heap so
                 // both sides compare through the heap equality (the
@@ -9707,7 +9736,7 @@ impl NativeCodeGenerator {
                         ));
                     }
                 }
-                self.asm.load_rbp_slot(Reg::R10, expected_slot.offset);
+                self.load_var_slot(Reg::R10, expected_slot);
                 self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
                 self.emit_heap_string_equality_from_regs(
                     Reg::R10,
@@ -9766,7 +9795,7 @@ impl NativeCodeGenerator {
                 // collected).
                 self.push_scope();
                 let expected_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-                self.asm.store_rbp_slot(expected_slot.offset, Reg::Rax);
+                self.store_var_slot(expected_slot, Reg::Rax);
                 let actual = self.compile_expr(&actual_arguments[0])?;
                 if !matches!(actual, NativeValue::HeapPointer) {
                     return Err(unsupported(
@@ -9775,7 +9804,7 @@ impl NativeCodeGenerator {
                     ));
                 }
                 self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
-                self.asm.load_rbp_slot(Reg::Rdi, expected_slot.offset);
+                self.load_var_slot(Reg::Rdi, expected_slot);
                 self.pop_scope();
                 self.asm.call_label(self.gc_deep_equal);
                 let ok = self.asm.create_text_label();
@@ -9799,7 +9828,7 @@ impl NativeCodeGenerator {
                     // HeapString-expected arm above.
                     self.push_scope();
                     let actual_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-                    self.asm.store_rbp_slot(actual_slot.offset, Reg::Rax);
+                    self.store_var_slot(actual_slot, Reg::Rax);
                     self.emit_heap_string_concat_fragment(
                         expected,
                         span,
@@ -9807,7 +9836,7 @@ impl NativeCodeGenerator {
                         false,
                     )?;
                     self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
-                    self.asm.load_rbp_slot(Reg::R11, actual_slot.offset);
+                    self.load_var_slot(Reg::R11, actual_slot);
                     self.emit_heap_string_equality_from_regs(
                         Reg::R10,
                         Reg::R11,
@@ -10159,7 +10188,7 @@ impl NativeCodeGenerator {
                     }
                 };
                 let slot = self.allocate_slot(param.clone(), value);
-                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                self.store_var_slot(slot, Reg::Rax);
                 if let Some(value) = static_argument {
                     self.bind_static_value(param.clone(), value);
                 }
@@ -10186,7 +10215,7 @@ impl NativeCodeGenerator {
                 | NativeValue::HeapString
                 | NativeValue::RuntimeDouble => {
                     let slot = self.allocate_slot(param.clone(), value);
-                    self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                    self.store_var_slot(slot, Reg::Rax);
                     if let Some(text) = annotation_text
                         && text.trim().contains('\'')
                         && !text.trim().starts_with('\'')
@@ -10329,7 +10358,7 @@ impl NativeCodeGenerator {
                     | NativeValue::HeapString
                     | NativeValue::RuntimeDouble => {
                         let slot = self.allocate_slot(param.clone(), value);
-                        self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                        self.store_var_slot(slot, Reg::Rax);
                         if let Some(value) = static_argument {
                             self.bind_static_value(param.clone(), value);
                             self.inline_static_params.push(param.clone());
@@ -11727,7 +11756,7 @@ impl NativeCodeGenerator {
                     self.asm.mov_data_addr(Reg::Rax, *storage);
                     self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
                     let acc_slot = self.allocate_slot(acc_param.clone(), *value_kind);
-                    self.asm.store_rbp_slot(acc_slot.offset, Reg::Rax);
+                    self.store_var_slot(acc_slot, Reg::Rax);
                 }
                 LiteralFoldAccumulator::Record { output } => {
                     self.bind_constant(
@@ -12152,7 +12181,7 @@ impl NativeCodeGenerator {
                     self.asm.mov_data_addr(Reg::Rax, *value);
                     self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
                     let slot = self.allocate_slot(acc_param.clone(), *value_kind);
-                    self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                    self.store_var_slot(slot, Reg::Rax);
                 }
                 RuntimeLineFoldAccumulator::Lines { data, len } => {
                     self.bind_constant(
@@ -12607,7 +12636,7 @@ impl NativeCodeGenerator {
                     let input = match value {
                         NativeValue::HeapString => {
                             let slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-                            self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                            self.store_var_slot(slot, Reg::Rax);
                             SliceInput::HeapSlot(slot.offset)
                         }
                         other => match self.native_string_ref(other) {
@@ -12738,7 +12767,7 @@ impl NativeCodeGenerator {
                     let input = match value {
                         NativeValue::HeapString => {
                             let slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-                            self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                            self.store_var_slot(slot, Reg::Rax);
                             SliceInput::HeapSlot(slot.offset)
                         }
                         other => match self.native_string_ref(other) {
@@ -14251,7 +14280,7 @@ impl NativeCodeGenerator {
             false,
         )?;
         let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
+        self.store_var_slot(a_slot, Reg::Rax);
 
         let b_value = self.compile_expr(rhs)?;
         self.emit_heap_string_concat_fragment(
@@ -14261,7 +14290,7 @@ impl NativeCodeGenerator {
             false,
         )?;
         let b_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(b_slot.offset, Reg::Rax);
+        self.store_var_slot(b_slot, Reg::Rax);
 
         Ok(self.emit_heap_string_concat_from_slots(
             a_slot,
@@ -14301,7 +14330,7 @@ impl NativeCodeGenerator {
         // result is a Bool in rax, which `pop_scope` preserves.
         self.push_scope();
         let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
+        self.store_var_slot(a_slot, Reg::Rax);
         let b = self.compile_expr(rhs)?;
         self.emit_heap_string_concat_fragment(
             b,
@@ -14309,7 +14338,7 @@ impl NativeCodeGenerator {
             "native heap string equality second argument",
             false,
         )?;
-        self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
+        self.load_var_slot(Reg::R10, a_slot);
         self.asm.mov_reg_reg(Reg::R11, Reg::Rax);
         self.emit_heap_string_equality_from_regs(Reg::R10, Reg::R11, span, "heap string equality");
         if op == BinaryOp::NotEqual {
@@ -14415,9 +14444,9 @@ impl NativeCodeGenerator {
         overflow_context: &str,
     ) -> NativeValue {
         // total_len = len_a + len_b
-        self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
+        self.load_var_slot(Reg::R10, a_slot);
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
-        self.asm.load_rbp_slot(Reg::R10, b_slot.offset);
+        self.load_var_slot(Reg::R10, b_slot);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
 
         let size_ok = self.asm.create_text_label();
@@ -14457,35 +14486,35 @@ impl NativeCodeGenerator {
         // case future reorganization adds another collection point
         // before the bytes are written.
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
+        self.store_var_slot(new_slot, Reg::Rax);
 
         // Reload len_a / len_b (the heap inputs are unchanged) and write
         // total_len into the destination's first qword.
-        self.asm.load_rbp_slot(Reg::R10, a_slot.offset);
+        self.load_var_slot(Reg::R10, a_slot);
         self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
-        self.asm.load_rbp_slot(Reg::R10, b_slot.offset);
+        self.load_var_slot(Reg::R10, b_slot);
         self.asm.load_ptr_disp32(Reg::R9, Reg::R10, 0);
         self.asm.mov_reg_reg(Reg::R11, Reg::R8);
         self.asm.add_reg_reg(Reg::R11, Reg::R9);
-        self.asm.load_rbp_slot(Reg::R10, new_slot.offset);
+        self.load_var_slot(Reg::R10, new_slot);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::R11);
 
         // Copy a's bytes: rsi = a + 8, rdi = new + 8, rcx = len_a.
-        self.asm.load_rbp_slot(Reg::Rsi, a_slot.offset);
+        self.load_var_slot(Reg::Rsi, a_slot);
         self.asm.add_reg_imm32(Reg::Rsi, 8);
-        self.asm.load_rbp_slot(Reg::Rdi, new_slot.offset);
+        self.load_var_slot(Reg::Rdi, new_slot);
         self.asm.add_reg_imm32(Reg::Rdi, 8);
         self.asm.mov_reg_reg(Reg::Rcx, Reg::R8);
         self.asm.rep_movsb();
 
         // Copy b's bytes: rdi already points at new + 8 + len_a thanks
         // to the previous rep movsb advancing it.
-        self.asm.load_rbp_slot(Reg::Rsi, b_slot.offset);
+        self.load_var_slot(Reg::Rsi, b_slot);
         self.asm.add_reg_imm32(Reg::Rsi, 8);
         self.asm.mov_reg_reg(Reg::Rcx, Reg::R9);
         self.asm.rep_movsb();
 
-        self.asm.load_rbp_slot(Reg::Rax, new_slot.offset);
+        self.load_var_slot(Reg::Rax, new_slot);
         NativeValue::HeapString
     }
 
@@ -14545,7 +14574,7 @@ impl NativeCodeGenerator {
             true,
         )?;
         let a_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(a_slot.offset, Reg::Rax);
+        self.store_var_slot(a_slot, Reg::Rax);
 
         let b_value = self.compile_expr(&arguments[1])?;
         self.emit_heap_string_concat_fragment(
@@ -14555,7 +14584,7 @@ impl NativeCodeGenerator {
             true,
         )?;
         let b_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(b_slot.offset, Reg::Rax);
+        self.store_var_slot(b_slot, Reg::Rax);
 
         Ok(self.emit_heap_string_concat_from_slots(a_slot, b_slot, span, "__gc_string_concat"))
     }
@@ -14588,10 +14617,10 @@ impl NativeCodeGenerator {
         }
 
         let n_slot = self.allocate_anonymous_slot(NativeValue::Int);
-        self.asm.store_rbp_slot(n_slot.offset, Reg::Rax);
+        self.store_var_slot(n_slot, Reg::Rax);
 
         // |n| → abs_slot; sign_flag (1 = negative) → sign_slot.
-        self.asm.load_rbp_slot(Reg::Rax, n_slot.offset);
+        self.load_var_slot(Reg::Rax, n_slot);
         self.asm.mov_imm64(Reg::R9, 0);
         let no_neg = self.asm.create_text_label();
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
@@ -14600,9 +14629,9 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::R9, 1);
         self.asm.bind_text_label(no_neg);
         let abs_slot = self.allocate_anonymous_slot(NativeValue::Int);
-        self.asm.store_rbp_slot(abs_slot.offset, Reg::Rax);
+        self.store_var_slot(abs_slot, Reg::Rax);
         let sign_slot = self.allocate_anonymous_slot(NativeValue::Int);
-        self.asm.store_rbp_slot(sign_slot.offset, Reg::R9);
+        self.store_var_slot(sign_slot, Reg::R9);
 
         // Count digits in |n|. n=0 is a special case (one digit).
         self.asm.mov_imm64(Reg::Rcx, 0);
@@ -14624,7 +14653,7 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(count_done);
 
         // If negative, reserve one more byte for the leading '-'.
-        self.asm.load_rbp_slot(Reg::R9, sign_slot.offset);
+        self.load_var_slot(Reg::R9, sign_slot);
         let no_extra = self.asm.create_text_label();
         self.asm.test_reg_reg(Reg::R9, Reg::R9);
         self.asm.jcc_label(Condition::Equal, no_extra);
@@ -14632,7 +14661,7 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(no_extra);
 
         let count_slot = self.allocate_anonymous_slot(NativeValue::Int);
-        self.asm.store_rbp_slot(count_slot.offset, Reg::Rcx);
+        self.store_var_slot(count_slot, Reg::Rcx);
 
         // payload_size = 8 + align_up(count, 8)
         self.asm.add_reg_imm32(Reg::Rcx, 8 + 7);
@@ -14645,19 +14674,19 @@ impl NativeCodeGenerator {
         );
 
         let new_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(new_slot.offset, Reg::Rax);
+        self.store_var_slot(new_slot, Reg::Rax);
 
         // Store length at [new+0].
-        self.asm.load_rbp_slot(Reg::Rcx, count_slot.offset);
-        self.asm.load_rbp_slot(Reg::Rax, new_slot.offset);
+        self.load_var_slot(Reg::Rcx, count_slot);
+        self.load_var_slot(Reg::Rax, new_slot);
         self.asm.store_ptr_disp32(Reg::Rax, 0, Reg::Rcx);
 
         // Render digits backwards into the payload, from the end inward.
         // r10 = current write cursor, starts at one-past-the-end.
-        self.asm.load_rbp_slot(Reg::R10, new_slot.offset);
+        self.load_var_slot(Reg::R10, new_slot);
         self.asm.add_reg_imm32(Reg::R10, 8);
         self.asm.add_reg_reg(Reg::R10, Reg::Rcx);
-        self.asm.load_rbp_slot(Reg::Rax, abs_slot.offset);
+        self.load_var_slot(Reg::Rax, abs_slot);
         self.asm.mov_imm64(Reg::Rbx, 10);
         let render_loop = self.asm.create_text_label();
         let render_done = self.asm.create_text_label();
@@ -14679,7 +14708,7 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(render_done);
 
         // If sign was set, place '-' at the very front.
-        self.asm.load_rbp_slot(Reg::R9, sign_slot.offset);
+        self.load_var_slot(Reg::R9, sign_slot);
         let sign_done = self.asm.create_text_label();
         self.asm.test_reg_reg(Reg::R9, Reg::R9);
         self.asm.jcc_label(Condition::Equal, sign_done);
@@ -14687,7 +14716,7 @@ impl NativeCodeGenerator {
         self.asm.mov_byte_ptr_reg_imm8(Reg::R10, b'-');
         self.asm.bind_text_label(sign_done);
 
-        self.asm.load_rbp_slot(Reg::Rax, new_slot.offset);
+        self.load_var_slot(Reg::Rax, new_slot);
         Ok(NativeValue::HeapString)
     }
 
@@ -14723,7 +14752,7 @@ impl NativeCodeGenerator {
         // the load site a ZGC load barrier will attach to (M5).
         self.push_scope();
         let base_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(base_slot.offset, Reg::Rax);
+        self.store_var_slot(base_slot, Reg::Rax);
         let offset = self.compile_expr(&arguments[1])?;
         if offset != NativeValue::Int {
             self.pop_scope();
@@ -14735,7 +14764,7 @@ impl NativeCodeGenerator {
         // rax = offset; add the rooted base to form the interior
         // pointer, then load. No allocation occurs between here and the
         // load, so holding the result raw in rax afterward is safe.
-        self.asm.load_rbp_slot(Reg::Rcx, base_slot.offset);
+        self.load_var_slot(Reg::Rcx, base_slot);
         self.asm.add_reg_reg(Reg::Rax, Reg::Rcx); // rax = offset + base
         if matches!(result, NativeValue::HeapPointer | NativeValue::HeapString) {
             // ZGC load barrier: a heap slot holds a COLORED pointer. Save
@@ -14939,7 +14968,7 @@ impl NativeCodeGenerator {
         // sat on the stack.)
         self.push_scope();
         let base_slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-        self.asm.store_rbp_slot(base_slot.offset, Reg::Rax);
+        self.store_var_slot(base_slot, Reg::Rax);
         let offset = self.compile_expr(&arguments[1])?;
         if offset != NativeValue::Int {
             self.pop_scope();
@@ -14949,7 +14978,7 @@ impl NativeCodeGenerator {
             ));
         }
         let offset_slot = self.allocate_anonymous_slot(NativeValue::Int);
-        self.asm.store_rbp_slot(offset_slot.offset, Reg::Rax);
+        self.store_var_slot(offset_slot, Reg::Rax);
         let value = self.compile_expr(&arguments[2])?;
         if !matches!(
             value,
@@ -14967,8 +14996,8 @@ impl NativeCodeGenerator {
         // value is in rax. Recompute the interior pointer from the
         // rooted base (updated in place if the value's allocation
         // relocated it) plus the stashed offset, then store.
-        self.asm.load_rbp_slot(Reg::Rcx, base_slot.offset);
-        self.asm.load_rbp_slot(Reg::Rdx, offset_slot.offset);
+        self.load_var_slot(Reg::Rcx, base_slot);
+        self.load_var_slot(Reg::Rdx, offset_slot);
         self.asm.add_reg_reg(Reg::Rcx, Reg::Rdx); // rcx = base + offset
         if matches!(value, NativeValue::HeapPointer | NativeValue::HeapString) {
             self.asm.mov_reg_reg(Reg::Rdi, Reg::Rcx);
@@ -16489,7 +16518,7 @@ impl NativeCodeGenerator {
                     | NativeValue::HeapString
                     | NativeValue::RuntimeDouble => {
                         let slot = self.allocate_slot(param.clone(), value);
-                        self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                        self.store_var_slot(slot, Reg::Rax);
                         if let Some(value) = static_argument {
                             self.bind_static_value(param.clone(), value);
                         }
@@ -20085,7 +20114,7 @@ impl NativeCodeGenerator {
     ) -> RuntimeMapCallableDispatchScalarKey {
         if self.active_function_name.is_some() {
             let slot = self.allocate_anonymous_slot(value);
-            self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+            self.store_var_slot(slot, Reg::Rax);
             RuntimeMapCallableDispatchScalarKey::Stack(slot)
         } else {
             let slot = self.asm.data_label_with_i64s(&[0]);
@@ -25497,7 +25526,7 @@ impl NativeCodeGenerator {
                     | NativeValue::HeapString
                     | NativeValue::RuntimeDouble => {
                         let slot = self.allocate_slot(param.clone(), value);
-                        self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                        self.store_var_slot(slot, Reg::Rax);
                         if let Some(value) = static_argument {
                             self.bind_static_value(param.clone(), value);
                             self.inline_static_params.push(param.clone());
@@ -31636,7 +31665,7 @@ impl NativeCodeGenerator {
                 "native if heap-string then branch",
                 false,
             )?;
-            self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+            self.store_var_slot(slot, Reg::Rax);
         }
         if self.native_value_captures_current_scope(then_value)
             || self.queued_threads_capture_current_scope()
@@ -31822,7 +31851,7 @@ impl NativeCodeGenerator {
                 "native if heap-string else branch",
                 false,
             )?;
-            self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+            self.store_var_slot(slot, Reg::Rax);
         }
         if self.native_value_captures_current_scope(else_value)
             || self.queued_threads_capture_current_scope()
@@ -31929,7 +31958,7 @@ impl NativeCodeGenerator {
             }
         }
         if let Some(slot) = heap_string_slot {
-            self.asm.load_rbp_slot(Reg::Rax, slot.offset);
+            self.load_var_slot(Reg::Rax, slot);
             return Ok(NativeValue::HeapString);
         }
         if then_value == else_value
@@ -32323,7 +32352,7 @@ impl NativeCodeGenerator {
                         .push(self.next_stack_offset);
                     self.asm.mov_imm64(Reg::Rax, element as u64);
                     let slot = self.allocate_slot(binding.to_string(), NativeValue::Int);
-                    self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                    self.store_var_slot(slot, Reg::Rax);
                     self.bind_static_value(binding.to_string(), StaticValue::Int(element));
                     let body_result = self.compile_expr(body);
                     self.loop_body_scope_base_offsets.pop();
@@ -32534,7 +32563,7 @@ impl NativeCodeGenerator {
                 self.asm.mov_data_addr(Reg::R10, slot);
                 self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
                 let slot = self.allocate_slot(binding.to_string(), value);
-                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                self.store_var_slot(slot, Reg::Rax);
             }
         }
     }
@@ -32552,7 +32581,7 @@ impl NativeCodeGenerator {
             | NativeValue::HeapString
             | NativeValue::RuntimeDouble => {
                 let slot = self.allocate_slot(binding.to_string(), value);
-                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                self.store_var_slot(slot, Reg::Rax);
             }
             NativeValue::Unit
             | NativeValue::Null
@@ -33070,7 +33099,7 @@ impl NativeCodeGenerator {
                     self.push_scope();
                     self.emit_runtime_string_to_heap_string(data, offset);
                     let slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
-                    self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                    self.store_var_slot(slot, Reg::Rax);
                     Some(slot)
                 } else {
                     None
@@ -33087,16 +33116,16 @@ impl NativeCodeGenerator {
                     // The restore emits no allocation, so the unrooted spill
                     // cannot be freed before the reload.
                     let frag_slot = self.allocate_anonymous_slot(NativeValue::Int);
-                    self.asm.store_rbp_slot(frag_slot.offset, Reg::Rax);
+                    self.store_var_slot(frag_slot, Reg::Rax);
                     self.emit_reset_runtime_buffer_offset_label(offset);
-                    self.asm.load_rbp_slot(Reg::Rax, snapshot_slot.offset);
+                    self.load_var_slot(Reg::Rax, snapshot_slot);
                     self.emit_append_heap_string_to_runtime_buffer_offset_label(
                         data,
                         offset,
                         span,
                         "string interpolation result exceeds 65536 bytes",
                     );
-                    self.asm.load_rbp_slot(Reg::Rax, frag_slot.offset);
+                    self.load_var_slot(Reg::Rax, frag_slot);
                 }
                 if let Some(shape) = enum_shape {
                     let formatted = self.emit_enum_display_runtime_string(&shape, span)?;
@@ -33218,6 +33247,15 @@ impl NativeCodeGenerator {
                 self.asm.mov_imm64(Reg::Rsi, fd);
                 self.asm.mov_imm64(Reg::Rdx, 0);
                 self.asm.call_label(self.print_i64);
+            }
+            NativeValue::HeapString if self.gc_gen.is_some() => {
+                let write = self
+                    .gc_gen
+                    .as_ref()
+                    .map(|runtime| runtime.write_heap_string)
+                    .expect("checked by the guard");
+                self.asm.mov_imm64(Reg::Rdi, fd);
+                self.asm.call_label(write);
             }
             NativeValue::HeapString => {
                 // rax = heap pointer to [len: i64][bytes]. Emit
@@ -35300,7 +35338,7 @@ impl NativeCodeGenerator {
                 self.emit_load_native_string_len(Reg::Rdx, string.len);
             }
             SliceInput::HeapSlot(offset) => {
-                self.asm.load_rbp_slot(Reg::Rsi, *offset);
+                self.load_value_slot(Reg::Rsi, *offset, NativeValue::HeapString);
                 self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rsi, 0);
                 self.asm.add_reg_imm32(Reg::Rsi, 8);
             }
@@ -39482,6 +39520,121 @@ impl NativeCodeGenerator {
     /// One `<label><number>` field of the `--gc-log` exit report,
     /// written to stderr. `print_i64` reloads all its inputs, so no
     /// register is live across this helper.
+    /// Create the M-G1 labels and data (`--gc=generational`).
+    fn prepare_generational_runtime(&mut self) {
+        use gc_codegen::production::{Data, FAIL_TEXT, Labels, OOM_TEXT, TOO_LARGE_TEXT};
+        let map = self.asm.create_text_label();
+        // Every allocation site calls `gc_alloc`; M-G1 binds its allocator
+        // there, so none of the sites change.
+        let alloc = self.gc_alloc;
+        let labels = Labels::new(|| self.asm.create_text_label(), map, alloc);
+        let data = Data {
+            runtime: self.asm.data_label_with_bytes(&[0; 8]),
+            fail_text: self.asm.data_label_with_bytes(FAIL_TEXT),
+            oom_text: self.asm.data_label_with_bytes(OOM_TEXT),
+            too_large_text: self.asm.data_label_with_bytes(TOO_LARGE_TEXT),
+        };
+        let write_heap_string = self.asm.create_text_label();
+        self.gc_gen = Some(GenerationalRuntime {
+            labels,
+            data,
+            write_heap_string,
+        });
+    }
+
+    /// Emit the M-G1 routines and the mapping leaf they call.
+    fn emit_generational_runtime(&mut self) {
+        let Some(runtime) = self.gc_gen.take() else {
+            return;
+        };
+        self.asm.bind_text_label(runtime.labels.map);
+        gc_codegen::native_metadata::emit_linux_map(self);
+        let stderr_fd = self.platform.stderr_fd();
+        gc_codegen::production::emit(self, &runtime.labels, &runtime.data, stderr_fd);
+        self.emit_generational_write_heap_string(runtime.write_heap_string, runtime.data.runtime);
+        self.gc_gen = Some(runtime);
+    }
+
+    /// `write(fd, bytes)` for a heap string without handing the kernel a
+    /// managed address: copy at most `COPY_OUT_BYTES` at a time into the
+    /// runtime's native buffer and write from there. Like the legacy path it
+    /// issues one `write` per chunk. rax = payload, rdi = fd.
+    fn emit_generational_write_heap_string(&mut self, entry: TextLabel, runtime: DataLabel) {
+        use gc_codegen::production::{COPY_OUT_BYTES, copy_out_offset};
+        let chunk = self.asm.create_text_label();
+        let sized = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.bind_text_label(entry);
+        self.asm.push_reg(Reg::Rbx);
+        self.asm.push_reg(Reg::R12);
+        self.asm.push_reg(Reg::R13);
+        self.asm.mov_reg_reg(Reg::R12, Reg::Rdi);
+        self.asm.load_ptr_disp32(Reg::R13, Reg::Rax, 0);
+        self.asm.mov_reg_reg(Reg::Rbx, Reg::Rax);
+        self.asm.add_reg_imm32(Reg::Rbx, 8);
+        self.asm.bind_text_label(chunk);
+        self.asm.test_reg_reg(Reg::R13, Reg::R13);
+        self.asm.jcc_label(Condition::Equal, done);
+        self.asm.mov_imm64(Reg::Rcx, COPY_OUT_BYTES);
+        self.asm.cmp_reg_reg(Reg::R13, Reg::Rcx);
+        self.asm.jcc_label(Condition::AboveOrEqual, sized);
+        self.asm.mov_reg_reg(Reg::Rcx, Reg::R13);
+        self.asm.bind_text_label(sized);
+        self.asm.mov_reg_reg(Reg::Rsi, Reg::Rbx);
+        self.asm.mov_data_addr(Reg::Rdi, runtime);
+        self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rdi, 0);
+        self.asm.add_reg_imm32(Reg::Rdi, copy_out_offset());
+        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rcx);
+        self.asm.add_reg_reg(Reg::Rbx, Reg::Rcx);
+        self.asm.sub_reg_reg(Reg::R13, Reg::Rcx);
+        self.asm.rep_movsb();
+        self.asm.mov_data_addr(Reg::Rsi, runtime);
+        self.asm.load_ptr_disp32(Reg::Rsi, Reg::Rsi, 0);
+        self.asm.add_reg_imm32(Reg::Rsi, copy_out_offset());
+        self.asm.mov_reg_reg(Reg::Rdi, Reg::R12);
+        self.emit_syscall_number(PlatformSyscall::Write);
+        self.asm.syscall();
+        self.asm.jmp_label(chunk);
+        self.asm.bind_text_label(done);
+        self.asm.pop_reg(Reg::R13);
+        self.asm.pop_reg(Reg::R12);
+        self.asm.pop_reg(Reg::Rbx);
+        self.asm.ret();
+    }
+
+    /// `--gc-log` under `--gc=generational`: publish the pending object,
+    /// walk the used pages, and print what the M-G1 heap holds. There is no
+    /// collection in M-G1, so `collections=0` is a fact, not a placeholder.
+    fn emit_generational_log_report(&mut self) {
+        let Some(runtime) = &self.gc_gen else {
+            return;
+        };
+        let verify = runtime.labels.verify;
+        let cell = runtime.data.runtime;
+        self.asm.call_label(verify);
+        let stats = gc_codegen::production::stat_offsets();
+        let text = b"gc[generational]: collections=0";
+        let label = self.asm.data_label_with_bytes(text);
+        self.emit_write_data(self.platform.stderr_fd(), label, text.len());
+        for (name, offset) in [
+            (&b" allocated_bytes="[..], stats.allocated_bytes),
+            (&b" pages_used="[..], stats.pages_used),
+            (&b" objects="[..], stats.objects),
+            (&b" published="[..], stats.published),
+        ] {
+            let label = self.asm.data_label_with_bytes(name);
+            self.emit_write_data(self.platform.stderr_fd(), label, name.len());
+            self.asm.mov_data_addr(Reg::Rdi, cell);
+            self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rdi, 0);
+            self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rdi, offset);
+            self.asm.mov_imm64(Reg::Rsi, self.platform.stderr_fd());
+            self.asm.mov_imm64(Reg::Rdx, 0);
+            self.asm.call_label(self.print_i64);
+        }
+        let newline = self.asm.data_label_with_bytes(b"\n");
+        self.emit_write_data(self.platform.stderr_fd(), newline, 1);
+    }
+
     fn emit_gc_log_field(&mut self, label: &[u8], cell: DataLabel) {
         let text = self.asm.data_label_with_bytes(label);
         self.emit_write_data(self.platform.stderr_fd(), text, label.len());
@@ -40218,9 +40371,15 @@ impl NativeCodeGenerator {
         // The routine takes the slot's address in rax and preserves every
         // register it can see, so the caller only has to park its own rax --
         // most callers have the just-computed heap pointer there.
+        // Under --gc=generational the slot is adopted into a RootCell and
+        // keeps the cell pointer from here on (see store_value_slot).
+        let push = self
+            .gc_gen
+            .as_ref()
+            .map_or(self.gc_shadow_push, |runtime| runtime.labels.root_adopt);
         self.asm.push_reg(Reg::Rax);
         self.asm.lea_reg_rbp_neg_disp32(Reg::Rax, rbp_offset);
-        self.asm.call_label(self.gc_shadow_push);
+        self.asm.call_label(push);
         self.asm.pop_reg(Reg::Rax);
     }
 
@@ -40246,8 +40405,12 @@ impl NativeCodeGenerator {
     /// Emit `gc_shadow_top -= count` so a closing scope drops its
     /// tracked heap-pointer slots from the shadow stack in one shot.
     fn emit_gc_shadow_pop_n(&mut self, count: usize) {
+        let pop = self
+            .gc_gen
+            .as_ref()
+            .map_or(self.gc_shadow_pop, |runtime| runtime.labels.root_pop);
         for _ in 0..count {
-            self.asm.call_label(self.gc_shadow_pop);
+            self.asm.call_label(pop);
         }
     }
 
@@ -40346,6 +40509,69 @@ impl NativeCodeGenerator {
     /// Zero the slot and add it to the shadow stack so the GC sees a
     /// stable null until the caller stores the just-computed heap
     /// pointer. The caller's rax is preserved.
+    /// Store `src` into a variable slot. A GC-managed slot (`HeapString` /
+    /// `HeapPointer`) is rooted: under `--gc=generational` it holds its
+    /// RootCell and the value goes through the root STORE; otherwise this
+    /// is the plain frame store.
+    fn store_var_slot(&mut self, slot: VarSlot, src: Reg) {
+        self.store_value_slot(slot.offset, src, slot.value);
+    }
+
+    /// Load a variable slot into `dst`; see `store_var_slot`.
+    fn load_var_slot(&mut self, dst: Reg, slot: VarSlot) {
+        self.load_value_slot(dst, slot.offset, slot.value);
+    }
+
+    fn store_value_slot(&mut self, offset: i32, src: Reg, value: NativeValue) {
+        let Some(store) = self.generational_root_label(value, |labels| labels.root_store) else {
+            self.asm.store_rbp_slot(offset, src);
+            return;
+        };
+        // The replaced frame store was a plain `mov`, so flags and every
+        // register survive: pushfq / push rax, rcx around the call.
+        self.asm.bytes(&[0x9c]);
+        self.asm.push_reg(Reg::Rax);
+        self.asm.push_reg(Reg::Rcx);
+        if src != Reg::Rax {
+            self.asm.mov_reg_reg(Reg::Rax, src);
+        }
+        self.asm.lea_reg_rbp_neg_disp32(Reg::Rcx, offset);
+        self.asm.call_label(store);
+        self.asm.pop_reg(Reg::Rcx);
+        self.asm.pop_reg(Reg::Rax);
+        self.asm.bytes(&[0x9d]);
+    }
+
+    fn load_value_slot(&mut self, dst: Reg, offset: i32, value: NativeValue) {
+        let Some(load) = self.generational_root_label(value, |labels| labels.root_load) else {
+            self.asm.load_rbp_slot(dst, offset);
+            return;
+        };
+        self.asm.bytes(&[0x9c]);
+        if dst != Reg::Rax {
+            self.asm.push_reg(Reg::Rax);
+        }
+        self.asm.load_rbp_slot(Reg::Rax, offset);
+        self.asm.call_label(load);
+        if dst != Reg::Rax {
+            self.asm.mov_reg_reg(dst, Reg::Rax);
+            self.asm.pop_reg(Reg::Rax);
+        }
+        self.asm.bytes(&[0x9d]);
+    }
+
+    /// The M-G1 root routine for a GC-managed slot value, or `None` on the
+    /// legacy path and for unmanaged values.
+    fn generational_root_label(
+        &self,
+        value: NativeValue,
+        pick: impl Fn(&gc_codegen::production::Labels<TextLabel>) -> TextLabel,
+    ) -> Option<TextLabel> {
+        let runtime = self.gc_gen.as_ref()?;
+        matches!(value, NativeValue::HeapPointer | NativeValue::HeapString)
+            .then(|| pick(&runtime.labels))
+    }
+
     fn register_heap_pointer_slot(&mut self, rbp_offset: i32) {
         // Zero the slot; use rcx to avoid clobbering rax (which holds
         // the just-allocated heap pointer in the typical val-binding flow).
@@ -40400,7 +40626,7 @@ impl NativeCodeGenerator {
             | NativeValue::HeapString
             | NativeValue::RuntimeDouble => {
                 let slot = self.allocate_slot(name.clone(), native);
-                self.asm.store_rbp_slot(slot.offset, Reg::Rax);
+                self.store_var_slot(slot, Reg::Rax);
                 self.bind_static_value(name, value);
             }
             NativeValue::Null
