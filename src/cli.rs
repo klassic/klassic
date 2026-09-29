@@ -30,6 +30,12 @@ pub struct ExecutionConfig {
     /// unbarriered dereference faults on a non-canonical address and the
     /// load-barrier slow path runs on every load.
     pub gc_poison: bool,
+    /// `--gc=generational`: the direct x86-64 ELF backend routes heap
+    /// strings through the generational GC ABI (M-G1 integration
+    /// scaffold: offset references, RootCells, TLAB allocation, no
+    /// collection). `--gc=legacy` (the default) keeps the existing
+    /// collector.
+    pub gc_generational: bool,
 }
 
 impl ExecutionConfig {
@@ -44,6 +50,7 @@ impl ExecutionConfig {
             gc_log: false,
             gc_stress: false,
             gc_poison: false,
+            gc_generational: false,
         }
     }
 }
@@ -87,6 +94,9 @@ pub enum CommandLineError {
     /// `--target X` named something the compiler does not recognise at
     /// all (typo, future triple).
     UnknownTarget(String),
+    /// `--gc=<mode>` named something other than `legacy` or
+    /// `generational`.
+    UnknownGcMode(String),
 }
 
 pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineError> {
@@ -99,6 +109,7 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     let mut gc_log = false;
     let mut gc_stress = false;
     let mut gc_poison = false;
+    let mut gc_generational = false;
     let mut others = Vec::new();
     let mut script_args = Vec::new();
     let mut seen_separator = false;
@@ -133,6 +144,14 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
             }
             "--gc-poison" => {
                 gc_poison = true;
+                index += 1;
+            }
+            mode if mode.starts_with("--gc=") => {
+                match &mode["--gc=".len()..] {
+                    "legacy" => gc_generational = false,
+                    "generational" => gc_generational = true,
+                    other => return Err(CommandLineError::UnknownGcMode(other.to_owned())),
+                }
                 index += 1;
             }
             "--backend" => {
@@ -179,6 +198,7 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     config.gc_log = gc_log;
     config.gc_stress = gc_stress;
     config.gc_poison = gc_poison;
+    config.gc_generational = gc_generational;
     let action = match others.as_slice() {
         [command] if command == "targets" => RunAction::ListTargets,
         [flag] if flag == "--version" || flag == "-V" => RunAction::ShowVersion,
@@ -218,6 +238,8 @@ pub fn usage() -> String {
        --target <target>  : native build target (supported: {})\n\
        --backend c        : `build` emits a portable C translation unit instead of an ELF executable\n\
        --backend llvm     : `build` emits LLVM IR and compiles it with clang (>= 15); an .ll output writes the IR\n\
+       --gc=<mode>        : `build` collector: legacy (default) or generational \
+(Linux x86-64 only; M-G1 scaffold that never collects)\n\
        <fileName>         : read a program from <fileName> and execute it\n\
        run <fileName>     : same as <fileName>; pairs naturally with `-- <args>`\n\
        -e <expression>    : evaluate <expression>\n\
@@ -258,6 +280,9 @@ pub fn render_command_line_error(error: &CommandLineError) -> String {
         CommandLineError::UnknownTarget(argument) => format!(
             "error: unknown target '{}'\n  help: run `klassic targets` to list known targets\n",
             argument
+        ),
+        CommandLineError::UnknownGcMode(argument) => format!(
+            "error: unknown --gc mode '{argument}'\n  help: supported modes: legacy, generational\n"
         ),
     }
 }
@@ -358,6 +383,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_gc_mode_selector() {
+        let build = |flag: &str| {
+            vec![
+                flag.to_string(),
+                "build".to_string(),
+                "sample.kl".to_string(),
+                "-o".to_string(),
+                "sample".to_string(),
+            ]
+        };
+        let parsed = parse_command_line(&build("--gc=generational")).expect("should parse");
+        assert!(parsed.config.gc_generational);
+        let parsed = parse_command_line(&build("--gc=legacy")).expect("should parse");
+        assert!(!parsed.config.gc_generational);
+        match parse_command_line(&build("--gc=nope")) {
+            Err(error @ CommandLineError::UnknownGcMode(_)) => {
+                assert!(render_command_line_error(&error).contains("unknown --gc mode 'nope'"));
+            }
+            other => panic!("expected UnknownGcMode, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn gc_flags_default_off() {
         let args = vec![
             "build".to_string(),
@@ -369,6 +417,7 @@ mod tests {
         assert!(!parsed.config.gc_log);
         assert!(!parsed.config.gc_stress);
         assert!(!parsed.config.gc_poison);
+        assert!(!parsed.config.gc_generational);
     }
 
     #[test]

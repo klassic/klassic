@@ -39,6 +39,10 @@ pub struct NativeCompilerConfig {
     /// color, so the load-barrier slow path runs on every load and any
     /// unbarriered dereference faults on a non-canonical address.
     pub gc_poison: bool,
+    /// `--gc=generational`: route heap strings through the generational
+    /// GC ABI (M-G1 integration scaffold; never collects). Direct x86-64
+    /// ELF only; the driver rejects every other target and backend.
+    pub gc_generational: bool,
     /// Whether the driver will retry through the portable C backend if this
     /// build reports a `Diagnostic` -- true for the aarch64 host default,
     /// false for an explicit `--target` and for the ELF/PE backends.
@@ -657,6 +661,17 @@ fn compile_internal(
     {
         let mut enum_decls = Vec::new();
         collect_enum_decls(&expr, &mut enum_decls);
+        // M-G1 routes only reference-free heap strings through the
+        // generational ABI; enums need reference descriptors and barriers
+        // (M-G3), so they are declined before any code is emitted.
+        if config.gc_generational && !enum_decls.is_empty() {
+            let span = first_enum_decl_span(&expr).unwrap_or_else(|| expr.span());
+            return Err(NativeCompileError::with_view(
+                source.clone(),
+                user_view.clone(),
+                unsupported(span, "enums under --gc=generational (M-G1)"),
+            ));
+        }
         for (enum_name, _type_params, variants) in &enum_decls {
             for variant in variants {
                 variant_owner_enum.insert(variant.name.clone(), enum_name.clone());
@@ -705,6 +720,7 @@ fn compile_internal(
             generator.gc_log = config.gc_log;
             generator.gc_stress = config.gc_stress;
             generator.gc_poison = config.gc_poison;
+            generator.gc_generational = config.gc_generational;
             let object = generator.compile(&expr).map_err(|diagnostic| {
                 NativeCompileError::with_view(source, user_view, diagnostic)
             })?;
@@ -1916,6 +1932,28 @@ fn enum_field_repr_for_native_value(value: NativeValue) -> Option<EnumFieldRepr>
         // Nested enums / records / lists are all heap pointers (M3 widens
         // read support); a bare heap pointer is the common nested-enum case.
         NativeValue::HeapPointer => Some(EnumFieldRepr::EnumField),
+        _ => None,
+    }
+}
+
+/// The span of the first enum declaration `collect_enum_decls` would
+/// visit, for the `--gc=generational` rejection diagnostic.
+fn first_enum_decl_span(expr: &Expr) -> Option<Span> {
+    match expr {
+        Expr::EnumDeclaration { span, .. } => Some(*span),
+        Expr::Block { expressions, .. } => expressions.iter().find_map(first_enum_decl_span),
+        Expr::DefDecl { body, .. } | Expr::Lambda { body, .. } => first_enum_decl_span(body),
+        Expr::ExtensionDeclaration { methods, .. } | Expr::InstanceDeclaration { methods, .. } => {
+            methods.iter().find_map(first_enum_decl_span)
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => first_enum_decl_span(condition)
+            .or_else(|| first_enum_decl_span(then_branch))
+            .or_else(|| else_branch.as_deref().and_then(first_enum_decl_span)),
         _ => None,
     }
 }
@@ -4529,6 +4567,10 @@ struct NativeCodeGenerator {
     /// collector behaves exactly as M6 (mark-sweep, non-moving). A
     /// bisection anchor for the moving-GC milestone.
     gc_evac_off: bool,
+    /// `--gc=generational` (M-G1): heap strings use the generational GC
+    /// ABI (offset references, RootCells, TLAB allocation) instead of the
+    /// legacy collector. Off by default; the default path is unchanged.
+    gc_generational: bool,
     gc_alloc: TextLabel,
     gc_collect: TextLabel,
     /// M6: the collector factored into separately-callable STW pieces.
@@ -4975,6 +5017,7 @@ impl NativeCodeGenerator {
             // sparse regions (heap compaction). Set true to degrade to
             // the M6 non-moving mark-sweep for bisection.
             gc_evac_off: false,
+            gc_generational: false,
             gc_alloc,
             gc_collect,
             gc_mark_roots,

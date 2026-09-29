@@ -129,6 +129,32 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     return Err(1);
                 }
             };
+            if command.config.gc_generational {
+                // M-G1 wires the generational GC ABI into the direct
+                // x86-64 ELF backend only; decline everything else rather
+                // than silently building with the legacy collector.
+                let direct_linux_x86 = !command.config.c_backend
+                    && !command.config.llvm_backend
+                    && (if command.config.explicit_target {
+                        Some(command.config.native_target)
+                    } else {
+                        NativeTarget::host()
+                    }) == Some(NativeTarget::LinuxX86_64);
+                if !direct_linux_x86 {
+                    eprintln!(
+                        "error: --gc=generational is only supported by the direct x86_64-unknown-linux-gnu backend\n  \
+                         note: M-G1 is an opt-in integration scaffold; other targets and --backend c/llvm keep the legacy collector"
+                    );
+                    return Err(1);
+                }
+                if command.config.gc_stress || command.config.gc_poison {
+                    eprintln!(
+                        "error: --gc-stress / --gc-poison are not accepted with --gc=generational\n  \
+                         note: they drive the legacy collector; M-G1 does not collect"
+                    );
+                    return Err(1);
+                }
+            }
             if command.config.c_backend {
                 return build_with_c_backend(&input, &text, &output);
             }
@@ -167,6 +193,7 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 gc_log: command.config.gc_log,
                 gc_stress: command.config.gc_stress,
                 gc_poison: command.config.gc_poison,
+                gc_generational: command.config.gc_generational,
                 // Kept in step with the fallback branch below: a backend that
                 // has to choose between a partial implementation and
                 // declining needs to know which of the two the driver will
