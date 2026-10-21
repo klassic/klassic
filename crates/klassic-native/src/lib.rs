@@ -726,6 +726,7 @@ fn compile_internal(
             config.gc_log,
             config.gc_stress,
             config.gc_poison,
+            config.gc_generational,
             config.fallback_backend_available,
         )
         .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic)),

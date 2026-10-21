@@ -3064,3 +3064,10 @@ M-G6 (steps 1-3): `--gc=generational` relocates lazily. The pause only flips
 and forwards roots; to-space scanning continues in 64-object quanta per
 allocation, and the heap-field load barrier relocates and heals any word
 still addressing from-space.
+
+M-G6 step 6 (Mach-O): `--gc=generational` now builds for
+`aarch64-apple-darwin`. The generational routines emit through the AArch64
+adapter with x86 flag semantics restored (`FlagAsm`), frame roots stay on the
+shadow stack and are forwarded in place through the `literals` hook, and the
+legacy allocation/store/equality labels wrap the generational routines. Checked
+under the unicorn emulator only; the default AArch64 output is byte-identical.

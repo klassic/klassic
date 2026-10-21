@@ -21,6 +21,8 @@ use klassic_syntax::{BinaryOp, Expr, MatchArm, Pattern, StringPart, UnaryOp};
 
 use crate::macho::{self, DataFixup, FixupSection};
 use crate::portable_asm;
+#[path = "gc_codegen/macos_generational.rs"]
+mod gc_generational;
 #[path = "gc_codegen/macos.rs"]
 mod gc_macos;
 
@@ -2382,6 +2384,9 @@ struct Emitter {
     gc_log: bool,
     gc_stress: bool,
     gc_poison: bool,
+    /// `--gc=generational`: the generational runtime replaces the legacy
+    /// collector (see `gc_generational`).
+    gc_gen: Option<gc_generational::GenRuntime>,
     /// Number of shadow-stack roots pushed in each open scope, so leaving
     /// a scope pops exactly its own.
     scope_root_counts: Vec<usize>,
@@ -4244,6 +4249,10 @@ impl Emitter {
     /// nobody opened, which is why this is separate from opening a file.
     fn emit_read_fd_to_string(&mut self) {
         const READ_CAP: u64 = 1_048_576;
+        if self.gc_gen.is_some() {
+            self.emit_generational_read_fd_to_string(READ_CAP);
+            return;
+        }
 
         self.asm.push(Reg::X0); // fd
 
@@ -5368,7 +5377,10 @@ impl Emitter {
         self.asm.ret();
 
         let barrier = self.barrier_trampoline_label();
-        let slow = self.load_barrier_label();
+        let slow = match &self.gc_gen {
+            Some(_) => self.gen_labels().field_load,
+            None => self.load_barrier_label(),
+        };
         self.asm.bind(barrier);
         self.asm.push_frame_record(); // the bl clobbers x30
         for reg in BARRIER_SAVED {
@@ -5443,6 +5455,10 @@ impl Emitter {
     /// that saves the registers it has live there -- once, rather than at
     /// each of these sites.
     fn emit_gc_load_barriered(&mut self) {
+        if self.gc_gen.is_some() {
+            self.emit_generational_field_load();
+            return;
+        }
         self.asm.ldr_imm(Reg::X0, Reg::X8, 0);
         let slow = self.barrier_trampoline_label();
         crate::portable_asm::emit_gc_load_barrier(&mut self.asm, slow);
@@ -13965,6 +13981,7 @@ impl Emitter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_macho_program(
     expr: &Expr,
     lowered_enums: std::collections::HashSet<String>,
@@ -13972,6 +13989,7 @@ pub(crate) fn emit_macho_program(
     gc_log: bool,
     gc_stress: bool,
     gc_poison: bool,
+    gc_generational: bool,
     fallback_backend_available: bool,
 ) -> Result<Vec<u8>, Diagnostic> {
     let mut emitter = Emitter {
@@ -14007,8 +14025,13 @@ pub(crate) fn emit_macho_program(
     // (it only reserves __bss cells / rodata / labels), so calling it here
     // and emitting the routine bodies after main is unchanged.
     let gc = emitter.reserve_gc_state();
-    emitter.emit_gc_init_heap(&gc);
-    emitter.emit_gc_init_colors(&gc, GC_EVAC_OFF);
+    if gc_generational {
+        emitter.prepare_generational();
+        emitter.emit_generational_startup(gc.shadow_stack);
+    } else {
+        emitter.emit_gc_init_heap(&gc);
+        emitter.emit_gc_init_colors(&gc, GC_EVAC_OFF);
+    }
 
     // Reserved now, sized once the program has been compiled -- see
     // `sub_sp_placeholder`.
@@ -14027,7 +14050,9 @@ pub(crate) fn emit_macho_program(
         return Err(unsupported(expr.span(), "this many local variables"));
     }
     emitter.asm.patch_sub_sp(frame_patch, frame_size);
-    if gc_log {
+    if gc_log && gc_generational {
+        emitter.emit_generational_log_report();
+    } else if gc_log {
         emitter.emit_gc_log_report(&gc);
     }
     emitter.asm.emit_exit(0);
@@ -14070,7 +14095,11 @@ pub(crate) fn emit_macho_program(
     }
 
     // Emit the shared runtime and this backend's allocation/barrier wrappers.
-    emitter.emit_gc_runtime(&gc);
+    if gc_generational {
+        emitter.emit_generational_runtime(gc.shadow_stack, gc.shadow_stack_top);
+    } else {
+        emitter.emit_gc_runtime(&gc);
+    }
     // The two wrappers that save this backend's live registers around the
     // routines above, so no call site carries a list of its own.
     emitter.emit_gc_call_trampolines();
@@ -14244,6 +14273,7 @@ mod tests {
                     &expr,
                     Default::default(),
                     Default::default(),
+                    false,
                     false,
                     false,
                     false,

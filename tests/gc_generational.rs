@@ -57,6 +57,37 @@ fn build_failure_stderr(tag: &str, flags: &[&str], source: &str) -> String {
     String::from_utf8_lossy(&result.stderr).into_owned()
 }
 
+#[allow(dead_code)]
+fn gc_stats(stderr: &str) -> std::collections::HashMap<String, u64> {
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with("gc[generational]:"))
+        .unwrap_or_else(|| panic!("no generational --gc-log line in:\n{stderr}"));
+    line["gc[generational]:".len()..]
+        .split_whitespace()
+        .map(|field| {
+            let (name, value) = field.split_once('=').expect("name=value field");
+            (name.to_string(), value.parse().expect("numeric field"))
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn evaluate(tag: &str, source: &str) -> String {
+    let source_path = write_source(tag, source);
+    let result = Command::new(klassic_bin())
+        .arg(&source_path)
+        .output()
+        .expect("klassic should run");
+    let _ = fs::remove_file(&source_path);
+    assert!(
+        result.status.success(),
+        "evaluator should accept the program\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8_lossy(&result.stdout).into_owned()
+}
+
 #[test]
 fn unknown_gc_mode_is_rejected() {
     let stderr = build_failure_stderr("unknown_mode", &["--gc=bogus"], "println(1)\n");
@@ -75,23 +106,36 @@ fn generational_rejects_llvm_and_c_backends() {
             "println(1)\n",
         );
         assert!(
-            stderr.contains("--gc=generational is only supported by the direct x86_64"),
+            stderr.contains("--gc=generational is only supported by the direct native backends"),
             "backend {backend} stderr:\n{stderr}"
         );
     }
 }
 
 #[test]
-fn generational_rejects_non_x86_targets() {
-    let stderr = build_failure_stderr(
-        "target",
-        &["--gc=generational", "--target", "aarch64-apple-darwin"],
-        "println(1)\n",
-    );
-    assert!(
-        stderr.contains("--gc=generational is only supported by the direct x86_64"),
-        "stderr:\n{stderr}"
-    );
+fn generational_builds_for_every_direct_target() {
+    // Every direct backend carries the generational runtime; only
+    // --backend c/llvm are declined.
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "aarch64-apple-darwin",
+    ] {
+        let source_path = write_source("target", "println(\"hi\")\n");
+        let output_path = temp_path("target", "bin");
+        let result = build(
+            &["--gc=generational", "--target", target],
+            &source_path,
+            &output_path,
+        );
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&output_path);
+        assert!(
+            result.status.success(),
+            "{target}: stderr:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 }
 
 #[test]
@@ -243,20 +287,6 @@ mod linux_x86_64 {
     }
 
     /// The `--gc-log` line of a generational run, parsed into its fields.
-    pub(super) fn gc_stats(stderr: &str) -> std::collections::HashMap<String, u64> {
-        let line = stderr
-            .lines()
-            .find(|line| line.starts_with("gc[generational]:"))
-            .unwrap_or_else(|| panic!("no generational --gc-log line in:\n{stderr}"));
-        line["gc[generational]:".len()..]
-            .split_whitespace()
-            .map(|field| {
-                let (name, value) = field.split_once('=').expect("name=value field");
-                (name.to_string(), value.parse().expect("numeric field"))
-            })
-            .collect()
-    }
-
     #[test]
     fn generational_startup_runs_and_reports_an_empty_heap() {
         let run = build_and_run(
@@ -273,21 +303,6 @@ mod linux_x86_64 {
     }
 
     /// Evaluator stdout for `source`, the oracle for native output.
-    pub(super) fn evaluate(tag: &str, source: &str) -> String {
-        let source_path = write_source(tag, source);
-        let result = Command::new(klassic_bin())
-            .arg(&source_path)
-            .output()
-            .expect("klassic should run");
-        let _ = fs::remove_file(&source_path);
-        assert!(
-            result.status.success(),
-            "evaluator should accept the program\nstderr:\n{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        String::from_utf8_lossy(&result.stdout).into_owned()
-    }
-
     /// Heap strings cross function calls through the pointer ABI, so these
     /// programs allocate on the generational heap (asserted via --gc-log).
     const HEAP_STRING_PROGRAM: &str = "def describe(s: String, n: Int): String = if (n <= 0) s else describe(s + \"x\", n - 1)\n\
@@ -540,3 +555,6 @@ mod linux_x86_64 {
         assert_eq!(String::from_utf8_lossy(&run.stdout), "6765\n");
     }
 }
+
+#[path = "gc_generational/aarch64_macho.rs"]
+mod aarch64_macho;

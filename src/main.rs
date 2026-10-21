@@ -130,26 +130,17 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 }
             };
             if command.config.gc_generational {
-                // M-G1 wires the generational GC ABI into the direct
-                // x86-64 ELF backend only; decline everything else rather
-                // than silently building with the legacy collector.
-                let direct_linux_x86 = !command.config.c_backend
+                // The generational GC is wired into every direct backend
+                // (x86-64 ELF/PE, AArch64 Mach-O); --backend c/llvm (and a
+                // host with no direct backend, which routes to C) keep the
+                // legacy collector, so decline rather than silently use it.
+                let direct = !command.config.c_backend
                     && !command.config.llvm_backend
-                    && (if command.config.explicit_target {
-                        Some(command.config.native_target)
-                    } else {
-                        NativeTarget::host()
-                    })
-                    .is_some_and(|target| {
-                        matches!(
-                            target,
-                            NativeTarget::LinuxX86_64 | NativeTarget::WindowsX86_64
-                        )
-                    });
-                if !direct_linux_x86 {
+                    && (command.config.explicit_target || NativeTarget::host().is_some());
+                if !direct {
                     eprintln!(
-                        "error: --gc=generational is only supported by the direct x86_64 Linux and Windows backends\n  \
-                         note: M-G1 is an opt-in integration scaffold; other targets and --backend c/llvm keep the legacy collector"
+                        "error: --gc=generational is only supported by the direct native backends\n  \
+                         note: --backend c/llvm keep the legacy collector"
                     );
                     return Err(1);
                 }
@@ -204,7 +195,10 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 // has to choose between a partial implementation and
                 // declining needs to know which of the two the driver will
                 // turn into a working program.
+                // The C fallback keeps the legacy collector, so it is not
+                // available under --gc=generational.
                 fallback_backend_available: !command.config.explicit_target
+                    && !command.config.gc_generational
                     && target.backend() == NativeBackend::DirectAarch64,
             };
             let user_modules = user_modules_for(&input, &text)?;

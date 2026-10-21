@@ -77,6 +77,22 @@ the runtime through a realigned VirtualAlloc leaf and writes heap strings
 through the Win64 write shim; the generational test runs the .exe under WSL
 interop when available (stress, full collections and nested enums matched).
 
-Still open: concurrent marking (step 4), a GC worker thread (step 5), and the
-Mach-O port (step 6). Relocation is incremental on the mutator thread,
-not concurrent on another core.
+Step 6 (Mach-O): done. `--target aarch64-apple-darwin --gc=generational`
+emits the same routines through the AArch64 `PortableAsm` adapter, wrapped in
+`FlagAsm` (`gc_codegen/macos_generational.rs`): the routines were written for
+x86, where `sub`/`and`/`or`/shifts set the flags a following `jcc` reads, and
+AArch64's plain forms do not. Roots differ from x86 on purpose: this backend
+already roots frame slots by address on its shadow stack (the legacy collector
+moves objects too), so the generational collector reaches them through the
+backend `literals` hook, which forwards every shadow-stack slot in place;
+`root_adopt`/`root_load` are unused there. The legacy `gc_alloc` /
+`gc_store_pointer` / `gc_deep_equal` labels become wrappers that keep x1-x12
+around the generational routines. `FileInput` reads into a native mapping
+instead of a 1 MiB heap buffer (larger than a page). Heap strings are still
+written to the kernel straight from the heap (no copy-out buffer as on x86).
+Evidence is the unicorn emulator (`tools/run-macho-aarch64.py`), not arm64
+hardware; the arm64 CI runner remains the authority.
+
+Still open: concurrent marking (step 4) and a GC worker thread (step 5).
+Relocation is incremental on the mutator thread, not concurrent on another
+core.
