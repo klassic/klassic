@@ -8,11 +8,12 @@
 //! each object once and then scans to-space Cheney-style, so every
 //! reference reachable from roots and collection-literal cells moves.
 use super::{
-    L, Labels, RT_ALLOC_SIZE, RT_ALLOC_TAG, RT_CS_COUNT, RT_CS_FIELD, RT_CS_OFF, RT_CS_PAGE,
-    RT_FORWARD_CELL, RT_HEAP_BASE, RT_NEXT_PAGE, RT_PAGES, RT_PENDING_REF, RT_SCAN_OLD,
-    RT_SPACE_BASE, d, decode, encode, load_runtime,
+    HEAP_BYTES, L, Labels, REMSET_ENTRIES, RT_ALLOC_SIZE, RT_ALLOC_TAG, RT_CS_COUNT, RT_CS_FIELD,
+    RT_CS_OFF, RT_CS_PAGE, RT_FORWARD_CELL, RT_HEAP_BASE, RT_NEXT_PAGE, RT_OLD_SCAN, RT_OLD_TOP,
+    RT_PAGES, RT_PENDING_REF, RT_PROMOTED, RT_REMSET_LEN, RT_RS_INDEX, RT_RS_WRITE, RT_SCAN_NEW,
+    RT_SCAN_OLD, RT_SPACE_BASE, YOUNG_END, d, decode, encode, load_runtime,
 };
-use crate::gc_abi::{AllocationPage, ObjectHeader};
+use crate::gc_abi::{AllocationPage, MarkRecord, OBJECT_PUBLISHED, ObjectHeader};
 use crate::portable_asm::{Condition as C, PortableAsm, Reg as R};
 use std::mem::{offset_of, size_of};
 
@@ -26,6 +27,48 @@ const PAYLOAD: i32 = offset_of!(ObjectHeader, payload_bytes) as i32 - HEADER;
 const MARK_RECORD: i32 = offset_of!(ObjectHeader, mark_record) as i32 - HEADER;
 const _: () = assert!(L.pages > 0);
 const HEAP_PAGE: u64 = crate::gc_abi::HEAP_PAGE_BYTES;
+const AGE: i32 = offset_of!(MarkRecord, age) as i32;
+/// Lowest heap offset of a Young payload (first page + one header).
+const YOUNG_LOW: i32 = HEAP_PAGE as i32 + HEADER;
+
+/// Jump to `outside` unless `value - heap_base` (left in `scratch`) is a
+/// Young payload offset.
+fn young_offset<E: PortableAsm>(a: &mut E, value: R, scratch: R, outside: E::TextLabel) {
+    a.mov_reg_reg(scratch, value);
+    a.load_ptr_disp32(value, R::V3, d(RT_HEAP_BASE));
+    a.sub_reg_reg(scratch, value);
+    a.jcc_label(C::Below, outside);
+    a.cmp_reg_imm32(scratch, YOUNG_LOW);
+    a.jcc_label(C::Below, outside);
+    a.cmp_reg_imm32(scratch, YOUNG_END as i32);
+    a.jcc_label(C::AboveOrEqual, outside);
+}
+
+/// Like `young_offset`, for any heap payload offset (Young or Old).
+fn heap_offset<E: PortableAsm>(a: &mut E, value: R, scratch: R, outside: E::TextLabel) {
+    a.mov_reg_reg(scratch, value);
+    a.load_ptr_disp32(value, R::V3, d(RT_HEAP_BASE));
+    a.sub_reg_reg(scratch, value);
+    a.jcc_label(C::Below, outside);
+    a.cmp_reg_imm32(scratch, YOUNG_LOW);
+    a.jcc_label(C::Below, outside);
+    a.mov_imm64(value, HEAP_BYTES);
+    a.cmp_reg_reg(scratch, value);
+    a.jcc_label(C::AboveOrEqual, outside);
+}
+
+/// Append the field address in `field` to the remembered set (V3 = runtime).
+fn remember<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, field: R, scratch: R, index: R) {
+    a.load_ptr_disp32(index, R::V3, d(RT_REMSET_LEN));
+    a.cmp_reg_imm32(index, REMSET_ENTRIES as i32);
+    a.jcc_label(C::AboveOrEqual, l.old_full);
+    a.mov_reg_reg(scratch, index);
+    a.shl_reg_imm8(scratch, 3);
+    a.add_reg_reg(scratch, R::V3);
+    a.store_ptr_disp32(scratch, L.remset as i32, field);
+    a.add_reg_imm32(index, 1);
+    a.store_ptr_disp32(R::V3, d(RT_REMSET_LEN), index);
+}
 
 pub(super) fn emit_enums<E: PortableAsm>(
     a: &mut E,
@@ -42,8 +85,35 @@ fn emit_field_access<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtim
     let _ = runtime;
     a.bind_text_label(l.field_load);
     a.ret();
+    // field_store: the store, then the generational write barrier: an Old
+    // field that now holds a Young payload address joins the remset.
+    let done = a.create_text_label();
     a.bind_text_label(l.field_store);
     a.store_ptr_disp32(R::V7, 0, R::V6);
+    a.push_reg(R::V0);
+    a.push_reg(R::V1);
+    a.push_reg(R::V2);
+    a.push_reg(R::V3);
+    load_runtime(a, runtime);
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
+    a.mov_reg_reg(R::V0, R::V7);
+    a.sub_reg_reg(R::V0, R::V1);
+    a.jcc_label(C::Below, done);
+    a.cmp_reg_imm32(R::V0, YOUNG_END as i32);
+    a.jcc_label(C::Below, done);
+    a.mov_imm64(R::V1, HEAP_BYTES);
+    a.cmp_reg_reg(R::V0, R::V1);
+    a.jcc_label(C::AboveOrEqual, done);
+    young_offset(a, R::V6, R::V0, done);
+    // young_offset left heap_base in V6; restore the stored value.
+    a.load_ptr_disp32(R::V6, R::V7, 0);
+    remember(a, l, R::V7, R::V1, R::V2);
+    a.bind_text_label(done);
+    a.load_ptr_disp32(R::V6, R::V7, 0);
+    a.pop_reg(R::V3);
+    a.pop_reg(R::V2);
+    a.pop_reg(R::V1);
+    a.pop_reg(R::V0);
     a.ret();
 }
 
@@ -71,6 +141,21 @@ fn emit_forward<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E:
     a.bind_text_label(not_ref);
     a.ret();
     a.bind_text_label(heap);
+    // Old objects never move in a Young collection; in a full collection
+    // only those already in the new Old half stay.
+    let young = a.create_text_label();
+    a.cmp_reg_imm32(R::V1, YOUNG_END as i32);
+    a.jcc_label(C::Below, young);
+    a.load_ptr_disp32(R::V2, R::V3, d(super::RT_FULL));
+    a.test_reg_reg(R::V2, R::V2);
+    a.jcc_label(C::Equal, not_ref);
+    a.load_ptr_disp32(R::V2, R::V3, d(super::RT_OLD_BASE));
+    a.cmp_reg_reg(R::V1, R::V2);
+    a.jcc_label(C::Below, young);
+    a.add_reg_imm32(R::V2, super::OLD_HALF as i32);
+    a.cmp_reg_reg(R::V1, R::V2);
+    a.jcc_label(C::Below, not_ref);
+    a.bind_text_label(young);
     a.shr_reg_imm8(R::V0, 16);
     a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
     a.add_reg_reg(R::V0, R::V1);
@@ -83,9 +168,19 @@ fn emit_forward<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E:
     a.bind_text_label(copy);
     a.store_ptr_disp32(R::V3, d(RT_SCAN_OLD), R::V0);
     a.store_ptr_disp32(R::V3, d(RT_ALLOC_TAG), R::V1);
+    // A Young object that already survived one collection is promoted.
+    let promote = a.create_text_label();
+    a.load_ptr_disp32(R::V2, R::V3, d(super::RT_FULL));
+    a.test_reg_reg(R::V2, R::V2);
+    a.jcc_label(C::NotEqual, promote);
+    a.load_ptr_disp32(R::V2, R::V0, MARK_RECORD);
+    a.load_ptr_disp32(R::V2, R::V2, AGE);
+    a.test_reg_reg(R::V2, R::V2);
+    a.jcc_label(C::NotEqual, promote);
     a.load_ptr_disp32(R::V1, R::V0, PAYLOAD);
     a.store_ptr_disp32(R::V3, d(RT_ALLOC_SIZE), R::V1);
     a.call_label(l.alloc_raw);
+    a.store_ptr_disp32(R::V3, d(RT_SCAN_NEW), R::V0);
     a.mov_reg_reg(R::V7, R::V0);
     a.load_ptr_disp32(R::V6, R::V3, d(RT_SCAN_OLD));
     a.load_ptr_disp32(R::V1, R::V3, d(RT_ALLOC_SIZE));
@@ -95,7 +190,62 @@ fn emit_forward<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E:
     a.store_ptr_disp32(R::V6, DESCRIPTOR, R::V1);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_PENDING_REF));
     a.store_ptr_disp32(R::V6, MARK_RECORD, R::V0);
+    // The copy has survived once.
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_SCAN_NEW));
+    a.load_ptr_disp32(R::V1, R::V1, MARK_RECORD);
+    a.mov_imm64(R::V2, 1);
+    a.store_ptr_disp32(R::V1, AGE, R::V2);
     a.ret();
+
+    // Promotion: bump-allocate in Old with a published header and copy.
+    let sized = a.create_text_label();
+    a.bind_text_label(promote);
+    a.load_ptr_disp32(R::V1, R::V0, PAYLOAD);
+    a.mov_reg_reg(R::V2, R::V1);
+    a.add_reg_imm32(R::V2, 15);
+    a.and_reg_imm32(R::V2, -16);
+    a.test_reg_reg(R::V2, R::V2);
+    a.jcc_label(C::NotEqual, sized);
+    a.mov_imm64(R::V2, 16);
+    a.bind_text_label(sized);
+    a.add_reg_imm32(R::V2, HEADER);
+    a.load_ptr_disp32(R::V6, R::V3, d(RT_OLD_TOP));
+    a.mov_reg_reg(R::V7, R::V6);
+    a.add_reg_reg(R::V7, R::V2);
+    a.load_ptr_disp32(R::V8, R::V3, d(super::RT_OLD_BASE));
+    a.add_reg_imm32(R::V8, super::OLD_HALF as i32);
+    a.cmp_reg_reg(R::V7, R::V8);
+    a.jcc_label(C::Above, l.old_full);
+    a.store_ptr_disp32(R::V3, d(RT_OLD_TOP), R::V7);
+    a.load_ptr_disp32(R::V8, R::V3, d(RT_PROMOTED));
+    a.add_reg_reg(R::V8, R::V2);
+    a.store_ptr_disp32(R::V3, d(RT_PROMOTED), R::V8);
+    // V8 = header address, V6 = header offset.
+    a.load_ptr_disp32(R::V8, R::V3, d(RT_HEAP_BASE));
+    a.add_reg_reg(R::V8, R::V6);
+    a.store_ptr_disp32(R::V8, d(offset_of!(ObjectHeader, payload_bytes)), R::V1);
+    a.load_ptr_disp32(R::V2, R::V0, DESCRIPTOR);
+    a.store_ptr_disp32(R::V8, d(offset_of!(ObjectHeader, descriptor_id)), R::V2);
+    a.mov_imm64(R::V2, OBJECT_PUBLISHED);
+    a.store_ptr_disp32(R::V8, d(offset_of!(ObjectHeader, state)), R::V2);
+    // New reference bits for the promoted copy.
+    a.add_reg_imm32(R::V6, HEADER);
+    a.shl_reg_imm8(R::V6, 16);
+    a.mov_imm64(R::V2, super::color());
+    a.or_reg_reg(R::V6, R::V2);
+    a.store_ptr_disp32(R::V3, d(RT_SCAN_NEW), R::V6);
+    a.mov_reg_reg(R::V7, R::V8);
+    a.add_reg_imm32(R::V7, HEADER);
+    a.mov_reg_reg(R::V6, R::V0);
+    a.rep_movsb();
+    a.load_ptr_disp32(R::V6, R::V3, d(RT_SCAN_OLD));
+    a.mov_imm64(R::V1, FORWARDED);
+    a.store_ptr_disp32(R::V6, DESCRIPTOR, R::V1);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_SCAN_NEW));
+    a.store_ptr_disp32(R::V6, MARK_RECORD, R::V0);
+    a.ret();
+
+    emit_remset_roots(a, l);
 
     // forward_cell_entry: V0 = native cell holding a payload address.
     // Called (by the backend's `literals` routine) from inside `collect`;
@@ -115,6 +265,63 @@ fn emit_forward<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E:
     a.store_ptr_disp32(R::V1, 0, R::V0);
     a.bind_text_label(empty);
     a.pop_reg(R::V3);
+    a.ret();
+}
+
+/// Remembered Old fields are roots of a Young collection: forward each
+/// referent and keep the entry only while it still points into Young.
+fn emit_remset_roots<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    let next = a.create_text_label();
+    let keep = a.create_text_label();
+    let done = a.create_text_label();
+    let lp = a.create_text_label();
+    a.bind_text_label(l.remset_roots);
+    a.mov_imm64(R::V0, 0);
+    a.store_ptr_disp32(R::V3, d(RT_RS_INDEX), R::V0);
+    a.store_ptr_disp32(R::V3, d(RT_RS_WRITE), R::V0);
+    a.bind_text_label(lp);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_RS_INDEX));
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_REMSET_LEN));
+    a.cmp_reg_reg(R::V0, R::V1);
+    a.jcc_label(C::AboveOrEqual, done);
+    a.shl_reg_imm8(R::V0, 3);
+    a.add_reg_reg(R::V0, R::V3);
+    a.load_ptr_disp32(R::V7, R::V0, L.remset as i32);
+    a.store_ptr_disp32(R::V3, d(RT_FORWARD_CELL), R::V7);
+    a.load_ptr_disp32(R::V0, R::V7, 0);
+    young_offset(a, R::V0, R::V1, next);
+    // V1 = Young offset -> reference bits.
+    a.mov_reg_reg(R::V0, R::V1);
+    a.shl_reg_imm8(R::V0, 16);
+    a.mov_imm64(R::V1, super::color());
+    a.or_reg_reg(R::V0, R::V1);
+    a.call_label(l.forward);
+    a.mov_reg_reg(R::V1, R::V0);
+    a.shr_reg_imm8(R::V0, 16);
+    a.load_ptr_disp32(R::V2, R::V3, d(RT_HEAP_BASE));
+    a.add_reg_reg(R::V0, R::V2);
+    a.load_ptr_disp32(R::V7, R::V3, d(RT_FORWARD_CELL));
+    a.store_ptr_disp32(R::V7, 0, R::V0);
+    a.shr_reg_imm8(R::V1, 16);
+    a.cmp_reg_imm32(R::V1, YOUNG_END as i32);
+    a.jcc_label(C::Below, keep);
+    a.jmp_label(next);
+    a.bind_text_label(keep);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_RS_WRITE));
+    a.mov_reg_reg(R::V1, R::V0);
+    a.shl_reg_imm8(R::V1, 3);
+    a.add_reg_reg(R::V1, R::V3);
+    a.store_ptr_disp32(R::V1, L.remset as i32, R::V7);
+    a.add_reg_imm32(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(RT_RS_WRITE), R::V0);
+    a.bind_text_label(next);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_RS_INDEX));
+    a.add_reg_imm32(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(RT_RS_INDEX), R::V0);
+    a.jmp_label(lp);
+    a.bind_text_label(done);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_RS_WRITE));
+    a.store_ptr_disp32(R::V3, d(RT_REMSET_LEN), R::V0);
     a.ret();
 }
 
@@ -190,10 +397,9 @@ pub(super) fn emit_cheney_scan<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabe
     a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
     a.sub_reg_reg(R::V0, R::V1);
     a.jcc_label(C::Below, next_field);
-    a.cmp_reg_imm32(R::V0, HEAP_PAGE as i32 + HEADER);
+    a.cmp_reg_imm32(R::V0, YOUNG_LOW);
     a.jcc_label(C::Below, next_field);
-    a.mov_imm64(R::V1, super::HEAP_BYTES);
-    a.cmp_reg_reg(R::V0, R::V1);
+    a.cmp_reg_imm32(R::V0, YOUNG_END as i32);
     a.jcc_label(C::AboveOrEqual, next_field);
     a.shl_reg_imm8(R::V0, 16);
     a.mov_imm64(R::V1, super::color());
@@ -227,7 +433,96 @@ pub(super) fn emit_cheney_scan<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabe
     a.add_reg_reg(R::V1, R::V0);
     a.store_ptr_disp32(R::V3, d(RT_CS_OFF), R::V1);
     a.jmp_label(objects);
+    // Young caught up: scan objects promoted during this collection, which
+    // may copy more Young objects (then resume the Young scan).
+    let finished = a.create_text_label();
+    let old_object = a.create_text_label();
+    let old_fields = a.create_text_label();
+    let old_field = a.create_text_label();
+    let old_next_field = a.create_text_label();
+    let old_next_object = a.create_text_label();
     a.bind_text_label(done);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_OLD_SCAN));
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_OLD_TOP));
+    a.cmp_reg_reg(R::V0, R::V1);
+    a.jcc_label(C::AboveOrEqual, finished);
+    a.bind_text_label(old_object);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_OLD_SCAN));
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_OLD_TOP));
+    a.cmp_reg_reg(R::V0, R::V1);
+    a.jcc_label(C::AboveOrEqual, pages);
+    a.load_ptr_disp32(R::V2, R::V3, d(RT_HEAP_BASE));
+    a.add_reg_reg(R::V2, R::V0);
+    a.load_ptr_disp32(R::V0, R::V2, d(offset_of!(ObjectHeader, descriptor_id)));
+    a.load_ptr_disp32(R::V6, R::V2, d(offset_of!(ObjectHeader, payload_bytes)));
+    a.shr_reg_imm8(R::V6, 3);
+    a.store_ptr_disp32(R::V3, d(RT_CS_COUNT), R::V6);
+    a.mov_imm64(R::V7, 0);
+    a.cmp_reg_imm8(R::V0, 2);
+    a.jcc_label(C::Equal, old_fields);
+    a.cmp_reg_imm8(R::V0, 4);
+    a.jcc_label(C::NotEqual, old_next_object);
+    a.mov_imm64(R::V7, 1);
+    a.bind_text_label(old_fields);
+    a.store_ptr_disp32(R::V3, d(RT_CS_FIELD), R::V7);
+    a.bind_text_label(old_field);
+    a.load_ptr_disp32(R::V7, R::V3, d(RT_CS_FIELD));
+    a.load_ptr_disp32(R::V6, R::V3, d(RT_CS_COUNT));
+    a.cmp_reg_reg(R::V7, R::V6);
+    a.jcc_label(C::AboveOrEqual, old_next_object);
+    old_field_address(a, R::V2, R::V7);
+    a.load_ptr_disp32(R::V0, R::V2, 0);
+    // Any heap payload address (Young, or old-half Old in a full
+    // collection) is forwarded; forward leaves non-moving ones alone.
+    heap_offset(a, R::V0, R::V1, old_next_field);
+    a.mov_reg_reg(R::V0, R::V1);
+    a.shl_reg_imm8(R::V0, 16);
+    a.mov_imm64(R::V1, super::color());
+    a.or_reg_reg(R::V0, R::V1);
+    a.call_label(l.forward);
+    a.mov_reg_reg(R::V1, R::V0);
+    a.shr_reg_imm8(R::V0, 16);
+    a.load_ptr_disp32(R::V2, R::V3, d(RT_HEAP_BASE));
+    a.add_reg_reg(R::V0, R::V2);
+    a.load_ptr_disp32(R::V7, R::V3, d(RT_CS_FIELD));
+    old_field_address(a, R::V2, R::V7);
+    a.store_ptr_disp32(R::V2, 0, R::V0);
+    a.shr_reg_imm8(R::V1, 16);
+    a.cmp_reg_imm32(R::V1, YOUNG_END as i32);
+    a.jcc_label(C::AboveOrEqual, old_next_field);
+    remember(a, l, R::V2, R::V1, R::V6);
+    a.bind_text_label(old_next_field);
+    a.load_ptr_disp32(R::V7, R::V3, d(RT_CS_FIELD));
+    a.add_reg_imm32(R::V7, 1);
+    a.store_ptr_disp32(R::V3, d(RT_CS_FIELD), R::V7);
+    a.jmp_label(old_field);
+    a.bind_text_label(old_next_object);
+    let old_sized = a.create_text_label();
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_OLD_SCAN));
+    a.load_ptr_disp32(R::V2, R::V3, d(RT_HEAP_BASE));
+    a.add_reg_reg(R::V2, R::V1);
+    a.load_ptr_disp32(R::V0, R::V2, d(offset_of!(ObjectHeader, payload_bytes)));
+    a.add_reg_imm32(R::V0, 15);
+    a.and_reg_imm32(R::V0, -16);
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::NotEqual, old_sized);
+    a.mov_imm64(R::V0, 16);
+    a.bind_text_label(old_sized);
+    a.add_reg_imm32(R::V0, HEADER);
+    a.add_reg_reg(R::V1, R::V0);
+    a.store_ptr_disp32(R::V3, d(RT_OLD_SCAN), R::V1);
+    a.jmp_label(old_object);
+    a.bind_text_label(finished);
+}
+
+/// `dst = heap_base + old_scan + header + index * 8`.
+fn old_field_address<E: PortableAsm>(a: &mut E, dst: R, index: R) {
+    a.load_ptr_disp32(dst, R::V3, d(RT_HEAP_BASE));
+    a.shl_reg_imm8(index, 3);
+    a.add_reg_reg(dst, index);
+    a.load_ptr_disp32(index, R::V3, d(RT_OLD_SCAN));
+    a.add_reg_reg(dst, index);
+    a.add_reg_imm32(dst, HEADER);
 }
 
 /// `dst = heap_base + cs_off + header + index * 8`.

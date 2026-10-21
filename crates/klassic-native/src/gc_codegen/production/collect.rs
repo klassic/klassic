@@ -117,6 +117,45 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.store_ptr_disp32(R::V3, d(RT_SPACE_END), R::V1);
     a.mov_imm64(R::V0, 0);
     a.store_ptr_disp32(R::V3, d(RT_MARKS + offset_of!(MarkArena, used)), R::V0);
+    // Full collection when Old could not absorb a worst-case promotion:
+    // flip Old too and evacuate every live object into the new Old half.
+    let young_only = a.create_text_label();
+    let decided = a.create_text_label();
+    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_OLD_TOP));
+    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_OLD_BASE));
+    a.sub_reg_reg(R::V0, R::V1);
+    a.cmp_reg_imm32(R::V0, imm(super::OLD_HALF - super::YOUNG_SEMI_BYTES));
+    a.jcc_label(C::Below, young_only);
+    a.mov_imm64(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(super::RT_FULL), R::V0);
+    a.store_ptr_disp32(R::V3, d(super::RT_OLD_FROM), R::V1);
+    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_OLD_TOP));
+    a.store_ptr_disp32(R::V3, d(super::RT_OLD_FROM_END), R::V0);
+    let second = a.create_text_label();
+    let flipped = a.create_text_label();
+    a.cmp_reg_imm32(R::V1, imm(super::YOUNG_END));
+    a.jcc_label(C::Equal, second);
+    a.mov_imm64(R::V1, super::YOUNG_END);
+    a.jmp_label(flipped);
+    a.bind_text_label(second);
+    a.mov_imm64(R::V1, super::YOUNG_END + super::OLD_HALF);
+    a.bind_text_label(flipped);
+    a.store_ptr_disp32(R::V3, d(super::RT_OLD_BASE), R::V1);
+    a.store_ptr_disp32(R::V3, d(super::RT_OLD_TOP), R::V1);
+    // Everything is promoted, so no Young survivor needs a remembered field.
+    a.mov_imm64(R::V0, 0);
+    a.store_ptr_disp32(R::V3, d(super::RT_REMSET_LEN), R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_FULL_COLLECTIONS));
+    a.add_reg_imm32(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(super::RT_FULL_COLLECTIONS), R::V0);
+    a.jmp_label(decided);
+    a.bind_text_label(young_only);
+    a.mov_imm64(R::V0, 0);
+    a.store_ptr_disp32(R::V3, d(super::RT_FULL), R::V0);
+    a.bind_text_label(decided);
+    // Objects promoted from here on are scanned by the Cheney pass.
+    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_OLD_TOP));
+    a.store_ptr_disp32(R::V3, d(super::RT_OLD_SCAN), R::V0);
     a.mov_imm64(R::V0, 1);
     a.store_ptr_disp32(R::V3, d(RT_COLLECTING), R::V0);
 
@@ -147,6 +186,8 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.store_ptr_disp32(R::V3, d(RT_SCAN_INDEX), R::V0);
     a.jmp_label(scan);
     a.bind_text_label(scanned);
+    // Old fields that point into Young are roots of a Young collection.
+    a.call_label(l.remset_roots);
     // Collection-literal cells hold payload addresses in native data.
     a.call_label(l.literals);
     super::enums::emit_cheney_scan(a, l);
@@ -219,6 +260,22 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.add_reg_reg(R::V1, R::V2);
     a.call_label(l.zero);
 
+    // After a full collection the old Old half is garbage: zero it so the
+    // next flip bump-allocates over clean memory (padding compares equal).
+    let no_full = a.create_text_label();
+    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_FULL));
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::Equal, no_full);
+    a.load_ptr_disp32(R::V7, R::V3, d(super::RT_OLD_FROM));
+    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_OLD_FROM_END));
+    a.sub_reg_reg(R::V1, R::V7);
+    a.shr_reg_imm8(R::V1, 3);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_HEAP_BASE));
+    a.add_reg_reg(R::V7, R::V0);
+    a.call_label(l.zero);
+    a.mov_imm64(R::V0, 0);
+    a.store_ptr_disp32(R::V3, d(super::RT_FULL), R::V0);
+    a.bind_text_label(no_full);
     a.mov_imm64(R::V0, 0);
     a.store_ptr_disp32(R::V3, d(RT_COLLECTING), R::V0);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_COLLECTIONS));

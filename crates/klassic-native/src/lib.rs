@@ -39499,7 +39499,9 @@ impl NativeCodeGenerator {
     /// register is live across this helper.
     /// Create the M-G1 labels and data (`--gc=generational`).
     fn prepare_generational_runtime(&mut self) {
-        use gc_codegen::production::{Backend, Data, FAIL_TEXT, Labels, OOM_TEXT, TOO_LARGE_TEXT};
+        use gc_codegen::production::{
+            Backend, Data, FAIL_TEXT, Labels, OLD_FULL_TEXT, OOM_TEXT, TOO_LARGE_TEXT,
+        };
         let map = self.asm.create_text_label();
         // Every allocation site calls `gc_alloc`; M-G1 binds its allocator
         // there, so none of the sites change.
@@ -39517,6 +39519,7 @@ impl NativeCodeGenerator {
             fail_text: self.asm.data_label_with_bytes(FAIL_TEXT),
             oom_text: self.asm.data_label_with_bytes(OOM_TEXT),
             too_large_text: self.asm.data_label_with_bytes(TOO_LARGE_TEXT),
+            old_full_text: self.asm.data_label_with_bytes(OLD_FULL_TEXT),
         };
         let write_heap_string = self.asm.create_text_label();
         self.gc_gen = Some(GenerationalRuntime {
@@ -39602,6 +39605,8 @@ impl NativeCodeGenerator {
         self.emit_write_data(self.platform.stderr_fd(), label, text.len());
         for (name, offset) in [
             (&b" collections="[..], stats.collections),
+            (&b" full_collections="[..], stats.full_collections),
+            (&b" promoted_bytes="[..], stats.promoted),
             (&b" allocated_bytes="[..], stats.allocated_bytes),
             (&b" pages_used="[..], stats.pages_used),
             (&b" objects="[..], stats.objects),

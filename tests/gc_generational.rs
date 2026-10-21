@@ -133,6 +133,44 @@ mod linux_x86_64 {
     }
 
     #[test]
+    fn generational_promotes_long_lived_data_and_collects_old() {
+        // A long-lived tree is promoted to Old and stays reachable while
+        // Young churns; under stress every survivor is promoted, so Old
+        // fills and full collections compact it.
+        let source = "enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+                      def total(t: Tree): Int = t match { case Leaf(v) => v; case Branch(l, r) => total(l) + total(r) }\n\
+                      def build(n: Int): Tree = if (n <= 0) Leaf(1) else Branch(build(n - 1), Leaf(n))\n\
+                      def describe(s: String, n: Int): String = if (n <= 0) s else describe(s + \"x\", n - 1)\n\
+                      val keep = build(200)\n\
+                      mutable i = 0\n\
+                      mutable acc = 0\n\
+                      while(i < 40000) {\n\
+                        acc += length(describe(\"abcdefghij\", i / 60000 + 20))\n\
+                        i += 1\n\
+                      }\n\
+                      println(acc)\n\
+                      println(total(keep))\n";
+        let expected = evaluate("old_eval", source);
+        let run = build_and_run("old", &["--gc=generational", "--gc-log"], source);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "stderr:\n{stderr}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+        let stats = gc_stats(&stderr);
+        assert!(stats["collections"] >= 2, "stats: {stats:?}");
+        assert!(stats["promoted_bytes"] > 0, "stats: {stats:?}");
+        let run = build_and_run(
+            "old_stress",
+            &["--gc=generational", "--gc-log", "--gc-stress"],
+            source,
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "stderr:\n{stderr}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+        let stats = gc_stats(&stderr);
+        assert!(stats["full_collections"] >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
     fn generational_enums_survive_evacuation() {
         // Records hold references (payload addresses) to boxes, strings and
         // nested records; stress evacuates before every allocation.

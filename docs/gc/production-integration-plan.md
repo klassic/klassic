@@ -1,6 +1,6 @@
 # Production integration plan — M-G1 (2026-09-29)
 
-Status: M-G1, M-G2 (stop-the-world Young evacuation) and M-G3 (enums) implemented on branch `gc/generational-wip` (2026-09-30), as an
+Status: M-G1, M-G2 (stop-the-world Young evacuation) M-G3 (enums) and M-G4/5 (Old generation, remset, full collection) implemented on branch `gc/generational-wip` (2026-09-30), as an
 opt-in integration scaffold; it does not collect and does not make any G01-G15
 item complete. Checkpoint `0d674e8` holds the interrupted Codex session's
 component work. See "M-G1 as implemented" below.
@@ -230,6 +230,34 @@ rejection is gone (`gc_codegen/production/enums.rs`).
 Still not ZGC: stop-the-world semispace copying, Young only, conservative
 range rule for heap slots, no concurrent marking/relocation, no load/store
 barriers, no workers, Linux x86-64 only.
+
+## M-G4/M-G5 as implemented (2026-10-22): Old generation
+
+- Heap layout: Young pages, then a 128 MiB Old region in two 64 MiB halves.
+- Promotion: a Young object that already survived one evacuation (its
+  MarkRecord `age`) is promoted on the next: bump-allocated in the current Old
+  half with a published header. Old objects never move in a Young collection.
+- Remembered set (1M entries): Old fields that hold Young payload addresses.
+  Entries come from scanning newly promoted objects and from the write
+  barrier in `field_store` (an Old field receiving a Young address). Each
+  Young collection forwards remembered referents first and keeps only
+  entries still pointing into Young.
+- Full collection: when the current Old half could not absorb a worst-case
+  promotion (one Young semispace), the collection flips Old as well,
+  promotes every live object (Young and Old) into the other half, clears the
+  remset and zeroes the abandoned half. Live data beyond an Old half is an
+  honest OOM.
+- Root cells raised to 2^20 (a 40000-deep recursion with per-frame enums
+  exhausted 2^16).
+- `--gc-log` adds `full_collections=` and `promoted_bytes=`.
+- Evidence: `generational_promotes_long_lived_data_and_collects_old`
+  (promotion without stress, full collections under stress); stress-default
+  `cli_smoke` 466/510 with every failure an intended rejection or a legacy
+  `--gc-log` format check.
+
+Still not ZGC: every collection (Young and full) is stop-the-world copying;
+no concurrent marking or relocation, no load barrier, no workers, and the
+heap-slot rule is the conservative legacy range check.
 
 ## Next milestones (outline)
 

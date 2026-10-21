@@ -26,6 +26,7 @@ mod alloc;
 mod collect;
 mod enums;
 mod roots;
+mod startup;
 
 /// Young pages prepared at startup (64 MiB of payload), split into two
 /// semispaces of `HALF` pages: allocation fills one, a collection evacuates
@@ -40,7 +41,7 @@ const STARTS_WORDS: u64 = HEAP_PAGE_BYTES / 16 / 64;
 /// Distinct identity range per page (granules per page).
 const IDENTITY_STRIDE: u64 = HEAP_PAGE_BYTES / 16;
 /// Frame root cells (LIFO) plus the allocation scratch root.
-const ROOT_CELLS: u64 = 1 << 16;
+const ROOT_CELLS: u64 = 1 << 20;
 /// Root journal entries; M-G1 has no consumer and drains on FLUSH.
 const JOURNAL_ENTRIES: u64 = 4096;
 /// Largest payload one page can hold.
@@ -106,6 +107,18 @@ struct Runtime {
     cs_field: u64,
     cs_count: u64,
     forward_cell: u64,
+    scan_new: u64,
+    old_top: u64,
+    old_base: u64,
+    old_from: u64,
+    old_from_end: u64,
+    full: u64,
+    full_collections: u64,
+    old_scan: u64,
+    promoted: u64,
+    remset_len: u64,
+    rs_index: u64,
+    rs_write: u64,
     marks: MarkArena,
     request: AllocationRequest,
     into: AllocationInto,
@@ -139,6 +152,7 @@ struct Layout {
     marks: u64,
     roots: u64,
     roots_bytes: u64,
+    remset: u64,
     total: u64,
 }
 
@@ -155,7 +169,8 @@ const fn layout() -> Layout {
     let roots_bytes = size_of::<RootStorage>() as u64
         + ROOT_CELLS * size_of::<RootCell>() as u64
         + JOURNAL_ENTRIES * size_of::<RootChange>() as u64;
-    let total = round_up(roots + roots_bytes, 4096);
+    let remset = round_up(roots + roots_bytes, 64);
+    let total = round_up(remset + REMSET_ENTRIES * 8, 4096);
     Layout {
         pages,
         starts,
@@ -164,12 +179,24 @@ const fn layout() -> Layout {
         marks,
         roots,
         roots_bytes,
+        remset,
         total,
     }
 }
 
 const L: Layout = layout();
-pub(super) const HEAP_BYTES: u64 = (PAGES + 1) * HEAP_PAGE_BYTES;
+/// End of the Young pages (heap offset); the Old region follows.
+pub(super) const YOUNG_END: u64 = (PAGES + 1) * HEAP_PAGE_BYTES;
+/// Old generation: two semispaces of `OLD_HALF`. Promotion bump-allocates
+/// into the current half; a full collection copies every live object into
+/// the other half.
+pub(super) const OLD_HALF: u64 = 64 << 20;
+pub(super) const OLD_BYTES: u64 = 2 * OLD_HALF;
+/// A Young collection may promote at most one Young semispace.
+pub(super) const YOUNG_SEMI_BYTES: u64 = (PAGES / 2) * HEAP_PAGE_BYTES;
+pub(super) const HEAP_BYTES: u64 = YOUNG_END + OLD_BYTES;
+/// Remembered-set capacity: Old fields that hold Young payload addresses.
+pub(super) const REMSET_ENTRIES: u64 = 1 << 20;
 const _: () = assert!(L.total < i32::MAX as u64);
 const _: () = assert!(L.pages >= size_of::<Runtime>() as u64);
 const _: () = assert!(L.pages < L.starts && L.starts < L.tables && L.tables < L.cells);
@@ -227,6 +254,18 @@ const RT_CS_OFF: usize = offset_of!(Runtime, cs_off);
 const RT_CS_FIELD: usize = offset_of!(Runtime, cs_field);
 const RT_CS_COUNT: usize = offset_of!(Runtime, cs_count);
 const RT_FORWARD_CELL: usize = offset_of!(Runtime, forward_cell);
+const RT_SCAN_NEW: usize = offset_of!(Runtime, scan_new);
+const RT_OLD_TOP: usize = offset_of!(Runtime, old_top);
+const RT_OLD_BASE: usize = offset_of!(Runtime, old_base);
+const RT_OLD_FROM: usize = offset_of!(Runtime, old_from);
+const RT_OLD_FROM_END: usize = offset_of!(Runtime, old_from_end);
+const RT_FULL: usize = offset_of!(Runtime, full);
+const RT_FULL_COLLECTIONS: usize = offset_of!(Runtime, full_collections);
+const RT_OLD_SCAN: usize = offset_of!(Runtime, old_scan);
+const RT_PROMOTED: usize = offset_of!(Runtime, promoted);
+const RT_REMSET_LEN: usize = offset_of!(Runtime, remset_len);
+const RT_RS_INDEX: usize = offset_of!(Runtime, rs_index);
+const RT_RS_WRITE: usize = offset_of!(Runtime, rs_write);
 const RT_REQUEST: usize = offset_of!(Runtime, request);
 const RT_INTO: usize = offset_of!(Runtime, into);
 const RT_RESULT: usize = offset_of!(Runtime, result);
@@ -248,6 +287,8 @@ const SEGMENT_SCOPE: u64 = 1;
 /// runtime block.
 pub(crate) struct StatOffsets {
     pub collections: i32,
+    pub full_collections: i32,
+    pub promoted: i32,
     pub allocated_bytes: i32,
     pub pages_used: i32,
     pub objects: i32,
@@ -262,6 +303,8 @@ pub(crate) fn copy_out_offset() -> i32 {
 pub(crate) fn stat_offsets() -> StatOffsets {
     StatOffsets {
         collections: d(RT_COLLECTIONS),
+        full_collections: d(RT_FULL_COLLECTIONS),
+        promoted: d(RT_PROMOTED),
         allocated_bytes: d(RT_CTX + offset_of!(MutatorContext, allocated_bytes)),
         pages_used: d(RT_PAGES_USED),
         objects: d(RT_OBJECTS),
@@ -305,6 +348,7 @@ pub(crate) struct Labels<T> {
     alloc_raw: T,
     collect: T,
     forward: T,
+    remset_roots: T,
     /// Heap-field load: V0 = reference bits -> V0 = payload address.
     /// Preserves every other register.
     pub field_load: T,
@@ -324,6 +368,7 @@ pub(crate) struct Labels<T> {
     fail: T,
     oom: T,
     too_large: T,
+    old_full: T,
 }
 
 /// Labels the backend already calls, bound to M-G routines under the flag.
@@ -362,6 +407,7 @@ impl<T: Copy> Labels<T> {
             alloc_raw: create(),
             collect: create(),
             forward: create(),
+            remset_roots: create(),
             field_load: create(),
             field_store: backend.field_store,
             deep_equal: backend.deep_equal,
@@ -372,6 +418,7 @@ impl<T: Copy> Labels<T> {
             fail: create(),
             oom: create(),
             too_large: create(),
+            old_full: create(),
         }
     }
 }
@@ -379,6 +426,8 @@ impl<T: Copy> Labels<T> {
 pub(crate) const FAIL_TEXT: &[u8] = b"klassic gc: --gc=generational runtime invariant violated\n";
 pub(crate) const OOM_TEXT: &[u8] =
     b"klassic gc: out of memory (--gc=generational live data exceeds a young semispace)\n";
+pub(crate) const OLD_FULL_TEXT: &[u8] =
+    b"klassic gc: out of memory (--gc=generational live data exceeds an Old semispace)\n";
 pub(crate) const TOO_LARGE_TEXT: &[u8] =
     b"klassic gc: object larger than one --gc=generational page (M-G1 limit)\n";
 
@@ -389,6 +438,7 @@ pub(crate) struct Data<D> {
     pub fail_text: D,
     pub oom_text: D,
     pub too_large_text: D,
+    pub old_full_text: D,
 }
 
 fn load_runtime<E: PortableAsm>(a: &mut E, runtime: E::DataLabel) {
@@ -488,7 +538,7 @@ pub(crate) fn emit<E: PortableAsm>(
     stress: bool,
 ) {
     emit_leaves(a, l);
-    emit_startup(a, l, data.runtime);
+    startup::emit_startup(a, l, data.runtime);
     alloc::emit_alloc(a, l, data.runtime, stress);
     collect::emit_collect(a, l);
     enums::emit_enums(a, l, data.runtime);
@@ -513,6 +563,7 @@ pub(crate) fn emit<E: PortableAsm>(
         (l.fail, data.fail_text, FAIL_TEXT.len()),
         (l.oom, data.oom_text, OOM_TEXT.len()),
         (l.too_large, data.too_large_text, TOO_LARGE_TEXT.len()),
+        (l.old_full, data.old_full_text, OLD_FULL_TEXT.len()),
     ] {
         a.bind_text_label(label);
         a.plat_write_data(stderr_fd, text, len);
@@ -542,166 +593,6 @@ fn emit_leaves<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.ret();
     a.bind_text_label(l.root_storage_prepare);
     root_storage::emit_prepare(a);
-    a.ret();
-}
-
-fn emit_startup<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::DataLabel) {
-    a.bind_text_label(l.startup);
-    a.push_reg(R::V3);
-    // Metadata mapping; the runtime block sits at its start.
-    a.mov_imm64(R::V7, L.total);
-    a.call_label(l.map);
-    a.test_reg_reg(R::V0, R::V0);
-    a.jcc_label(C::Equal, l.oom);
-    a.mov_reg_reg(R::V3, R::V0);
-    a.mov_data_addr(R::V1, runtime);
-    a.store_ptr_disp32(R::V1, 0, R::V3);
-    // Heap mapping: offset 0 is never a page, so page i starts at (i+1) pages.
-    a.mov_imm64(R::V7, HEAP_BYTES);
-    a.call_label(l.map);
-    a.test_reg_reg(R::V0, R::V0);
-    a.jcc_label(C::Equal, l.oom);
-    a.store_ptr_disp32(R::V3, d(RT_HEAP_BASE), R::V0);
-    // The single mutator: ABI version, Running (0), thread 1, initial phase.
-    store_rt_imm(a, RT_CTX, u64::from(ABI_VERSION));
-    store_rt_imm(a, RT_CTX + offset_of!(MutatorContext, thread_id), 1);
-    // Page table: every page READY, owning its start bitmap and forward table.
-    let page = |field: usize| d(field);
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
-    lea_rt(a, R::V8, L.pages as usize);
-    lea_rt(a, R::V10, L.starts as usize);
-    lea_rt(a, R::V11, L.tables as usize);
-    lea_rt(a, R::V2, L.cells as usize);
-    a.mov_imm64(R::V6, HEAP_PAGE_BYTES);
-    a.mov_imm64(R::V7, 1);
-    a.mov_imm64(R::V9, 0);
-    let fill = a.create_text_label();
-    a.bind_text_label(fill);
-    a.store_ptr_disp32(R::V8, page(offset_of!(AllocationPage, heap_base)), R::V1);
-    a.store_ptr_disp32(R::V8, page(offset_of!(AllocationPage, start)), R::V6);
-    a.store_ptr_disp32(
-        R::V8,
-        page(offset_of!(AllocationPage, allocated_top)),
-        R::V6,
-    );
-    a.mov_reg_reg(R::V0, R::V6);
-    a.add_reg_imm32(R::V0, imm(HEAP_PAGE_BYTES));
-    a.store_ptr_disp32(R::V8, page(offset_of!(AllocationPage, limit)), R::V0);
-    a.mov_reg_reg(R::V0, R::V9);
-    a.add_reg_imm32(R::V0, 1);
-    a.store_ptr_disp32(R::V8, page(offset_of!(AllocationPage, incarnation)), R::V0);
-    a.store_ptr_disp32(
-        R::V8,
-        page(offset_of!(AllocationPage, identity_base)),
-        R::V7,
-    );
-    a.store_ptr_disp32(R::V8, page(offset_of!(AllocationPage, run_head)), R::V9);
-    a.mov_imm64(R::V0, PAGE_READY);
-    a.store_ptr_disp32(R::V8, page(offset_of!(AllocationPage, state)), R::V0);
-    a.store_ptr_disp32(R::V8, page(offset_of!(AllocationPage, starts)), R::V10);
-    a.mov_imm64(R::V0, STARTS_WORDS);
-    a.store_ptr_disp32(R::V8, page(offset_of!(AllocationPage, starts_words)), R::V0);
-    a.store_ptr_disp32(
-        R::V8,
-        page(offset_of!(AllocationPage, forward_table)),
-        R::V11,
-    );
-    a.store_ptr_disp32(R::V11, d(offset_of!(ForwardTable, cells)), R::V2);
-    a.mov_imm64(R::V0, CELLS_PER_PAGE);
-    a.store_ptr_disp32(R::V11, d(offset_of!(ForwardTable, capacity)), R::V0);
-    a.add_reg_imm32(R::V8, d(size_of::<AllocationPage>()));
-    a.add_reg_imm32(R::V10, imm(STARTS_WORDS * 8));
-    a.add_reg_imm32(R::V11, d(size_of::<ForwardTable>()));
-    a.add_reg_imm32(R::V2, imm(CELLS_PER_PAGE * size_of::<ForwardCell>() as u64));
-    a.add_reg_imm32(R::V6, imm(HEAP_PAGE_BYTES));
-    a.add_reg_imm32(R::V7, imm(IDENTITY_STRIDE));
-    a.add_reg_imm32(R::V9, 1);
-    a.cmp_reg_imm32(R::V9, imm(PAGES));
-    a.jcc_label(C::Below, fill);
-    store_rt_addr(a, RT_PAGES, L.pages as usize);
-    // Mark-record arena covering every possible object.
-    store_rt_addr(
-        a,
-        RT_MARKS + offset_of!(MarkArena, records),
-        L.marks as usize,
-    );
-    store_rt_imm(
-        a,
-        RT_MARKS + offset_of!(MarkArena, capacity),
-        HALF * CELLS_PER_PAGE,
-    );
-    store_rt_imm(a, RT_SPACE_END, HALF);
-    // Builtin descriptors; raw bytes (id 1) is the only one M-G1 allocates.
-    lea_rt(a, R::V7, RT_BUILTINS);
-    a.call_label(l.builtin_prepare);
-    // Root storage: one unregistered segment owned by thread 1, scope 1.
-    store_rt_imm(a, RT_SPEC + offset_of!(RootStorageSpec, owner), 1);
-    store_rt_imm(a, RT_SPEC + offset_of!(RootStorageSpec, cells), ROOT_CELLS);
-    store_rt_imm(
-        a,
-        RT_SPEC + offset_of!(RootStorageSpec, entries),
-        JOURNAL_ENTRIES,
-    );
-    store_rt_imm(
-        a,
-        RT_SPEC + offset_of!(RootStorageSpec, bytes),
-        L.roots_bytes,
-    );
-    lea_rt(a, R::V7, L.roots as usize);
-    lea_rt(a, R::V6, RT_SPEC);
-    a.call_label(l.root_storage_prepare);
-    a.test_reg_reg(R::V0, R::V0);
-    a.jcc_label(C::NotEqual, l.fail);
-    lea_rt(
-        a,
-        R::V1,
-        L.roots as usize + offset_of!(RootStorage, segment),
-    );
-    a.store_ptr_disp32(R::V3, d(RT_SEGMENT), R::V1);
-    a.mov_imm64(R::V0, SEGMENT_SCOPE);
-    a.store_ptr_disp32(R::V1, d(offset_of!(RootSegment, scope)), R::V0);
-    a.mov_imm64(R::V0, ROOT_SEGMENT_ACTIVE);
-    a.store_ptr_disp32(R::V1, d(offset_of!(RootSegment, state)), R::V0);
-    a.store_ptr_disp32(
-        R::V3,
-        d(RT_ALLOC_ROOT + offset_of!(RootRequest, segment)),
-        R::V1,
-    );
-    a.store_ptr_disp32(
-        R::V3,
-        d(RT_FRAME_ROOT + offset_of!(RootRequest, segment)),
-        R::V1,
-    );
-    store_rt_addr(
-        a,
-        RT_JOURNAL,
-        L.roots as usize + offset_of!(RootStorage, journal),
-    );
-    // Allocation requests: raw-bytes descriptor, result, mark arena.
-    store_rt_addr(
-        a,
-        RT_REQUEST + offset_of!(AllocationRequest, descriptor),
-        RT_BUILTINS + 8,
-    );
-    store_rt_addr(
-        a,
-        RT_REQUEST + offset_of!(AllocationRequest, output),
-        RT_RESULT,
-    );
-    store_rt_addr(
-        a,
-        RT_REQUEST + offset_of!(AllocationRequest, marks),
-        RT_MARKS,
-    );
-    store_rt_addr(
-        a,
-        RT_INTO + offset_of!(AllocationInto, allocation),
-        RT_REQUEST,
-    );
-    store_rt_addr(a, RT_INTO + offset_of!(AllocationInto, root), RT_ALLOC_ROOT);
-    // Cell 0 is the allocation scratch root; frame roots use cells 1...
-    root_step(a, l, RT_ALLOC_ROOT, ROOT_RESERVE);
-    a.pop_reg(R::V3);
     a.ret();
 }
 

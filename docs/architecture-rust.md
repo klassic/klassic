@@ -3054,3 +3054,8 @@ M-G3: enums build under `--gc=generational`. Allocation maps the legacy shape
 tag to builtin descriptors 1/2/4, heap fields keep payload addresses, and
 evacuation forwards roots, collection-literal cells and then scans to-space
 Cheney-style over reference-bearing records with the legacy range rule.
+
+M-G4/5: `--gc=generational` has an Old generation. Twice-surviving objects
+are promoted into a bump-allocated Old half; a write barrier in `field_store`
+and the promotion scan feed a remembered set that roots Young collections; a
+full collection copies everything live into the other Old half.
