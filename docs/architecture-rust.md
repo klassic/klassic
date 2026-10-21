@@ -3043,3 +3043,9 @@ native buffer before `write`. M-G1 never collects: exhausting the 64 MiB of
 Young pages is an honest OOM, objects larger than one 128 KiB page are a
 run-time error, and enums are declined at build time. The default collector is
 unchanged and byte-identical; see `docs/gc/production-integration-plan.md`.
+
+M-G2: `--gc=generational` now collects. The Young pages are two semispaces;
+exhausting one triggers a stop-the-world evacuation of every RootCell referent
+through the normal allocate/publish path (shared referents forwarded once),
+after which from-space pages and metadata are zeroed and made READY again.
+`--gc-stress` evacuates before every allocation under the flag.

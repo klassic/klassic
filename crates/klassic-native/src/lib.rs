@@ -39550,7 +39550,8 @@ impl NativeCodeGenerator {
         self.asm.bind_text_label(runtime.labels.map);
         gc_codegen::native_metadata::emit_linux_map(self);
         let stderr_fd = self.platform.stderr_fd();
-        gc_codegen::production::emit(self, &runtime.labels, &runtime.data, stderr_fd);
+        let stress = self.gc_stress;
+        gc_codegen::production::emit(self, &runtime.labels, &runtime.data, stderr_fd, stress);
         self.emit_generational_write_heap_string(runtime.write_heap_string, runtime.data.runtime);
         self.gc_gen = Some(runtime);
     }
@@ -39603,8 +39604,7 @@ impl NativeCodeGenerator {
     }
 
     /// `--gc-log` under `--gc=generational`: publish the pending object,
-    /// walk the used pages, and print what the M-G1 heap holds. There is no
-    /// collection in M-G1, so `collections=0` is a fact, not a placeholder.
+    /// walk the current semispace, and print collections and what it holds.
     fn emit_generational_log_report(&mut self) {
         let Some(runtime) = &self.gc_gen else {
             return;
@@ -39613,10 +39613,11 @@ impl NativeCodeGenerator {
         let cell = runtime.data.runtime;
         self.asm.call_label(verify);
         let stats = gc_codegen::production::stat_offsets();
-        let text = b"gc[generational]: collections=0";
+        let text = b"gc[generational]:";
         let label = self.asm.data_label_with_bytes(text);
         self.emit_write_data(self.platform.stderr_fd(), label, text.len());
         for (name, offset) in [
+            (&b" collections="[..], stats.collections),
             (&b" allocated_bytes="[..], stats.allocated_bytes),
             (&b" pages_used="[..], stats.pages_used),
             (&b" objects="[..], stats.objects),

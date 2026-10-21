@@ -98,13 +98,15 @@ fn generational_rejects_non_linux_x86_targets() {
 
 #[test]
 fn generational_rejects_legacy_gc_debug_flags() {
-    for flag in ["--gc-stress", "--gc-poison"] {
-        let stderr = build_failure_stderr("debug", &["--gc=generational", flag], "println(1)\n");
-        assert!(
-            stderr.contains("not accepted with --gc=generational"),
-            "flag {flag} stderr:\n{stderr}"
-        );
-    }
+    let stderr = build_failure_stderr(
+        "debug",
+        &["--gc=generational", "--gc-poison"],
+        "println(1)\n",
+    );
+    assert!(
+        stderr.contains("not accepted with --gc=generational"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -254,10 +256,10 @@ mod linux_x86_64 {
     }
 
     #[test]
-    fn generational_heap_exhaustion_is_an_honest_oom() {
-        // Every iteration drops ~1.3 KB of heap strings: the legacy collector
-        // reclaims them, M-G1 never collects and must stop with a clear OOM
-        // once the 64 MiB of Young pages are used up.
+    fn generational_collects_garbage_across_semispace_flips() {
+        // Every iteration drops ~1.3 KB of heap strings, ~80 MB in total:
+        // more than the 64 MiB heap, so this only finishes by evacuating
+        // the live strings and recycling the dead pages.
         let source = "def describe(s: String, n: Int): String = if (n <= 0) s else describe(s + \"x\", n - 1)\n\
                       mutable i = 0\n\
                       mutable total = 0\n\
@@ -266,19 +268,51 @@ mod linux_x86_64 {
                         i += 1\n\
                       }\n\
                       println(total)\n";
+        let run = build_and_run("collect", &["--gc=generational", "--gc-log"], source);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "stderr:\n{stderr}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "1800000\n");
+        let stats = gc_stats(&stderr);
+        assert!(stats["collections"] >= 2, "stats: {stats:?}");
+        assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
+    }
+
+    #[test]
+    fn generational_live_data_beyond_a_semispace_is_an_honest_oom() {
+        // Recursion keeps every intermediate string live (~36 MB), which
+        // cannot fit one 32 MiB semispace; the legacy heap holds it.
+        let source = "def churn(s: String, n: Int): Int = if (n <= 0) length(s) else churn(s + \"ab\", n - 1)\n\
+                      mutable k = 0\n\
+                      while(k < 1) {\n\
+                        println(churn(\"\", k + 6000))\n\
+                        k += 1\n\
+                      }\n";
         let legacy = build_and_run("oom_legacy", &[], source);
-        assert!(legacy.status.success());
-        assert_eq!(String::from_utf8_lossy(&legacy.stdout), "1800000\n");
+        assert_eq!(String::from_utf8_lossy(&legacy.stdout), "12000\n");
         let run = build_and_run("oom", &["--gc=generational"], source);
         let stderr = String::from_utf8_lossy(&run.stderr);
         assert_eq!(run.status.code(), Some(1), "stderr:\n{stderr}");
         assert!(
-            stderr.contains(
-                "out of memory (--gc=generational heap exhausted; M-G1 does not collect)"
-            ),
+            stderr
+                .contains("out of memory (--gc=generational live data exceeds a young semispace)"),
             "stderr:\n{stderr}"
         );
-        assert!(run.stdout.is_empty());
+    }
+
+    #[test]
+    fn generational_stress_collects_before_every_allocation() {
+        let expected = evaluate("stress_eval", HEAP_STRING_PROGRAM);
+        let run = build_and_run(
+            "stress",
+            &["--gc=generational", "--gc-stress", "--gc-log"],
+            HEAP_STRING_PROGRAM,
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "stderr:\n{stderr}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+        let stats = gc_stats(&stderr);
+        assert!(stats["collections"] > 2000, "stats: {stats:?}");
+        assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
     }
 
     #[test]

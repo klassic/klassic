@@ -147,10 +147,10 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     );
                     return Err(1);
                 }
-                if command.config.gc_stress || command.config.gc_poison {
+                if command.config.gc_poison {
                     eprintln!(
-                        "error: --gc-stress / --gc-poison are not accepted with --gc=generational\n  \
-                         note: they drive the legacy collector; M-G1 does not collect"
+                        "error: --gc-poison is not accepted with --gc=generational\n  \
+                         note: it colors legacy absolute pointers; generational references are offsets"
                     );
                     return Err(1);
                 }

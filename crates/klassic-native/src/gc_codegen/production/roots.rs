@@ -2,15 +2,15 @@
 use super::{
     HANDLE_CELL, HANDLE_GENERATION, HANDLE_SCOPE, Labels, REQUEST_VALUE, ROOT_READ_RAW,
     ROOT_RESERVE, ROOT_STORE, RT_ADOPT_SLOT, RT_CELL_SP, RT_FRAME_ROOT, RT_HEAP_BASE, RT_NEXT_PAGE,
-    RT_OBJECTS, RT_PAGES, RT_SEGMENT, RT_VERIFIED, SEGMENT_SCOPE, d, decode, encode, load_runtime,
-    root_step,
+    RT_OBJECTS, RT_PAGES, RT_PAGES_USED, RT_SEGMENT, RT_SPACE_BASE, RT_VERIFIED, SEGMENT_SCOPE, d,
+    decode, encode, load_runtime, root_step,
 };
 use crate::gc_abi::{AllocationPage, OBJECT_PUBLISHED, ObjectHeader, RootCell, RootSegment};
 use crate::portable_asm::{Condition as C, PortableAsm, Reg as R};
 use std::mem::{offset_of, size_of};
 
 /// Fill `frame_root.handle` for the cell pointer in `cell`.
-fn frame_handle<E: PortableAsm>(a: &mut E, cell: R, scratch: R) {
+pub(super) fn frame_handle<E: PortableAsm>(a: &mut E, cell: R, scratch: R) {
     a.store_ptr_disp32(R::V3, d(RT_FRAME_ROOT + HANDLE_CELL), cell);
     a.load_ptr_disp32(scratch, cell, d(offset_of!(RootCell, reuse_generation)));
     a.store_ptr_disp32(R::V3, d(RT_FRAME_ROOT + HANDLE_GENERATION), scratch);
@@ -164,10 +164,21 @@ pub(super) fn emit_verify<E: PortableAsm>(
     let next_page = a.create_text_label();
     let unpublished = a.create_text_label();
     let done = a.create_text_label();
-    a.mov_imm64(R::V9, 0); // page index
+    // Walk the current semispace: pages [space_base, next_page).
+    a.load_ptr_disp32(R::V9, R::V3, d(RT_SPACE_BASE)); // page index
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_NEXT_PAGE));
+    a.sub_reg_reg(R::V0, R::V9);
+    a.store_ptr_disp32(R::V3, d(RT_PAGES_USED), R::V0);
     a.mov_imm64(R::V10, 0); // objects
     a.mov_imm64(R::V11, 0); // published
-    a.load_ptr_disp32(R::V8, R::V3, d(RT_PAGES));
+    // page = pages + index * 112
+    a.mov_reg_reg(R::V8, R::V9);
+    a.shl_reg_imm8(R::V8, 7);
+    a.mov_reg_reg(R::V0, R::V9);
+    a.shl_reg_imm8(R::V0, 4);
+    a.sub_reg_reg(R::V8, R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_PAGES));
+    a.add_reg_reg(R::V8, R::V0);
     a.bind_text_label(pages);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_NEXT_PAGE));
     a.cmp_reg_reg(R::V9, R::V0);

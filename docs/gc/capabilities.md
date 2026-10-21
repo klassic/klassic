@@ -16,6 +16,9 @@ and keeps frame references in RootCells. It performs no collection, rejects
 enums and other targets, and the default collector is unchanged. No G01-G15
 capability becomes complete through it. See
 [the M-G1 plan and results](production-integration-plan.md).
+Update 2026-10-22 (M-G2): that path now collects. A stop-the-world semispace
+evacuation of RootCell referents recycles Young pages; it is not concurrent,
+has no Old generation or barriers, and completes no G01-G15 capability.
 
 The owned source-retirement receipt now also requires a bounded audit of all
 registered SATB/remset owners. It checks one context per step, requires real

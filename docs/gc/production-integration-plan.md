@@ -1,6 +1,6 @@
 # Production integration plan — M-G1 (2026-09-29)
 
-Status: M-G1 implemented on branch `gc/generational-wip` (2026-09-30), as an
+Status: M-G1 and M-G2 (stop-the-world Young evacuation) implemented on branch `gc/generational-wip` (2026-09-30), as an
 opt-in integration scaffold; it does not collect and does not make any G01-G15
 item complete. Checkpoint `0d674e8` holds the interrupted Codex session's
 component work. See "M-G1 as implemented" below.
@@ -167,11 +167,42 @@ existing legacy suites must stay green (default path unchanged).
 - Objects are published lazily (at the next allocation, or at the `--gc-log`
   walk), which is equivalent here because no site allocates while filling.
 
+## M-G2 as implemented (2026-10-22)
+
+Stop-the-world Young evacuation under `--gc=generational`
+(`gc_codegen/production/collect.rs`):
+
+- The 512 pages form two 256-page semispaces with separate mark-record
+  arenas. When `alloc_raw` finds its semispace exhausted, `collect` closes the
+  allocating page, flips, and evacuates the referent of every RootCell
+  `[1, used)` through the ordinary `alloc_into` + guarded-publish path, storing
+  the new reference with a journaled root STORE. A shared referent is copied
+  once: its dead source header becomes a forwarding record. From-space pages
+  are then recycled: payload, start bitmap, forward cells and mark records are
+  zeroed, and each page returns to READY under a new incarnation.
+- The interrupted allocation resumes at `attempt` (evacuation may already
+  have bound a to-space page). Exhaustion while evacuating, or immediately
+  after a collection, is the honest OOM: live data exceeds a 32 MiB semispace.
+- `--gc-stress` is accepted with `--gc=generational` and evacuates before
+  every allocation; `--gc-log` reports the collection count.
+- Evidence: `tests/gc_generational.rs` (80 MB of garbage completes with
+  `collections >= 2`, live data beyond a semispace is an honest OOM, stress
+  over the heap-string program). With a temporary local hook making
+  `--gc=generational --gc-stress` the default, `cli_smoke` passed 405/511 with
+  every failure an intended rejection (73 enum, 31 target, 2 `--gc-poison`);
+  `sample_programs`, `language_regressions` and `book_examples` passed. The
+  default path is byte-identical to `75ad3dc` (177 builds incl. `--gc-log` and
+  `--gc-stress`).
+
+Still not ZGC: the collection is stop-the-world and copying, there is no Old
+generation, no concurrent mark/relocate, no load or store barriers (no heap
+object holds a reference yet), no workers, and only Linux x86-64.
+
 ## Next milestones (outline)
 
-- M-G2: young-only collection for the M-G1 subset (roots are RootCells, so a
-  moving young cycle can run at allocation-triggered safepoints first, then
-  move toward concurrent phases with the existing mark/relocate emitters).
+- M-G2: done as stop-the-world semispace evacuation (above). The concurrent
+  form (existing mark/relocate emitters, colored-reference load barrier)
+  remains open.
 - M-G3: enums (reference descriptors ids 2/4, store barrier, load barrier,
   `gc_deep_equal`, literal roots).
 - M-G4: PE and Mach-O parity, then workers/scheduler (G02, G12).

@@ -22,10 +22,15 @@ use crate::gc_abi::{
 use crate::portable_asm::{Condition as C, PortableAsm, Reg as R};
 use std::mem::{offset_of, size_of};
 
+mod alloc;
+mod collect;
 mod roots;
 
-/// Young pages prepared at startup (64 MiB of payload).
+/// Young pages prepared at startup (64 MiB of payload), split into two
+/// semispaces of `HALF` pages: allocation fills one, a collection evacuates
+/// the live objects into the other and recycles the first.
 pub(crate) const PAGES: u64 = 512;
+const HALF: u64 = PAGES / 2;
 /// Forward cells per page: one per smallest object (32-byte header plus
 /// 16-byte minimum payload), so a page can never exhaust its table first.
 const CELLS_PER_PAGE: u64 = HEAP_PAGE_BYTES / 48;
@@ -80,6 +85,18 @@ struct Runtime {
     published: u64,
     objects: u64,
     verified: u64,
+    pages_used: u64,
+    space_base: u64,
+    space_end: u64,
+    collecting: u64,
+    collections: u64,
+    scan_index: u64,
+    scan_old: u64,
+    saved_size: u64,
+    saved_elements: u64,
+    from_base: u64,
+    from_end: u64,
+    from_marks: u64,
     marks: MarkArena,
     request: AllocationRequest,
     into: AllocationInto,
@@ -181,6 +198,18 @@ const RT_PUBLISHED: usize = offset_of!(Runtime, published);
 const RT_OBJECTS: usize = offset_of!(Runtime, objects);
 const RT_VERIFIED: usize = offset_of!(Runtime, verified);
 const RT_MARKS: usize = offset_of!(Runtime, marks);
+const RT_PAGES_USED: usize = offset_of!(Runtime, pages_used);
+const RT_SPACE_BASE: usize = offset_of!(Runtime, space_base);
+const RT_SPACE_END: usize = offset_of!(Runtime, space_end);
+const RT_COLLECTING: usize = offset_of!(Runtime, collecting);
+const RT_COLLECTIONS: usize = offset_of!(Runtime, collections);
+const RT_SCAN_INDEX: usize = offset_of!(Runtime, scan_index);
+const RT_SCAN_OLD: usize = offset_of!(Runtime, scan_old);
+const RT_SAVED_SIZE: usize = offset_of!(Runtime, saved_size);
+const RT_SAVED_ELEMENTS: usize = offset_of!(Runtime, saved_elements);
+const RT_FROM_BASE: usize = offset_of!(Runtime, from_base);
+const RT_FROM_END: usize = offset_of!(Runtime, from_end);
+const RT_FROM_MARKS: usize = offset_of!(Runtime, from_marks);
 const RT_REQUEST: usize = offset_of!(Runtime, request);
 const RT_INTO: usize = offset_of!(Runtime, into);
 const RT_RESULT: usize = offset_of!(Runtime, result);
@@ -201,6 +230,7 @@ const SEGMENT_SCOPE: u64 = 1;
 /// Stats readable by the backend's `--gc-log` report, as offsets into the
 /// runtime block.
 pub(crate) struct StatOffsets {
+    pub collections: i32,
     pub allocated_bytes: i32,
     pub pages_used: i32,
     pub objects: i32,
@@ -214,8 +244,9 @@ pub(crate) fn copy_out_offset() -> i32 {
 
 pub(crate) fn stat_offsets() -> StatOffsets {
     StatOffsets {
+        collections: d(RT_COLLECTIONS),
         allocated_bytes: d(RT_CTX + offset_of!(MutatorContext, allocated_bytes)),
-        pages_used: d(RT_NEXT_PAGE),
+        pages_used: d(RT_PAGES_USED),
         objects: d(RT_OBJECTS),
         published: d(RT_VERIFIED),
     }
@@ -254,6 +285,9 @@ pub(crate) struct Labels<T> {
     builtin_prepare: T,
     root_storage_prepare: T,
     publish_pending: T,
+    alloc_raw: T,
+    collect: T,
+    zero: T,
     drain: T,
     fail: T,
     oom: T,
@@ -281,6 +315,9 @@ impl<T: Copy> Labels<T> {
             builtin_prepare: create(),
             root_storage_prepare: create(),
             publish_pending: create(),
+            alloc_raw: create(),
+            collect: create(),
+            zero: create(),
             drain: create(),
             fail: create(),
             oom: create(),
@@ -291,7 +328,7 @@ impl<T: Copy> Labels<T> {
 
 pub(crate) const FAIL_TEXT: &[u8] = b"klassic gc: --gc=generational runtime invariant violated\n";
 pub(crate) const OOM_TEXT: &[u8] =
-    b"klassic gc: out of memory (--gc=generational heap exhausted; M-G1 does not collect)\n";
+    b"klassic gc: out of memory (--gc=generational live data exceeds a young semispace)\n";
 pub(crate) const TOO_LARGE_TEXT: &[u8] =
     b"klassic gc: object larger than one --gc=generational page (M-G1 limit)\n";
 
@@ -374,10 +411,12 @@ pub(crate) fn emit<E: PortableAsm>(
     l: &Labels<E::TextLabel>,
     data: &Data<E::DataLabel>,
     stderr_fd: u64,
+    stress: bool,
 ) {
     emit_leaves(a, l);
     emit_startup(a, l, data.runtime);
-    emit_alloc(a, l, data.runtime);
+    alloc::emit_alloc(a, l, data.runtime, stress);
+    collect::emit_collect(a, l);
     emit_publish_pending(a, l);
     roots::emit_roots(a, l, data.runtime);
     roots::emit_verify(a, l, data.runtime);
@@ -514,8 +553,9 @@ fn emit_startup<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E:
     store_rt_imm(
         a,
         RT_MARKS + offset_of!(MarkArena, capacity),
-        PAGES * CELLS_PER_PAGE,
+        HALF * CELLS_PER_PAGE,
     );
+    store_rt_imm(a, RT_SPACE_END, HALF);
     // Builtin descriptors; raw bytes (id 1) is the only one M-G1 allocates.
     lea_rt(a, R::V7, RT_BUILTINS);
     a.call_label(l.builtin_prepare);
@@ -586,120 +626,6 @@ fn emit_startup<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E:
     store_rt_addr(a, RT_INTO + offset_of!(AllocationInto, root), RT_ALLOC_ROOT);
     // Cell 0 is the allocation scratch root; frame roots use cells 1...
     root_step(a, l, RT_ALLOC_ROOT, ROOT_RESERVE);
-    a.pop_reg(R::V3);
-    a.ret();
-}
-
-fn emit_alloc<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::DataLabel) {
-    a.bind_text_label(l.alloc);
-    a.push_reg(R::V3);
-    load_runtime(a, runtime);
-    a.store_ptr_disp32(R::V3, d(RT_ALLOC_SIZE), R::V7);
-    // Publish the previous object before its page can close, then empty the
-    // scratch root that alloc_into requires.
-    a.call_label(l.publish_pending);
-    a.mov_imm64(R::V0, 0);
-    a.store_ptr_disp32(R::V3, d(RT_ALLOC_ROOT + REQUEST_VALUE), R::V0);
-    root_step(a, l, RT_ALLOC_ROOT, ROOT_STORE);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_ALLOC_SIZE));
-    a.mov_imm64(R::V1, MAX_PAYLOAD);
-    a.cmp_reg_reg(R::V0, R::V1);
-    a.jcc_label(C::Above, l.too_large);
-    a.store_ptr_disp32(
-        R::V3,
-        d(RT_REQUEST + offset_of!(AllocationRequest, elements)),
-        R::V0,
-    );
-    let attempt = a.create_text_label();
-    let done = a.create_text_label();
-    let refill = a.create_text_label();
-    let not_refill = a.create_text_label();
-    let bind = a.create_text_label();
-    a.bind_text_label(attempt);
-    lea_rt(a, R::V7, RT_CTX);
-    lea_rt(a, R::V6, RT_INTO);
-    a.call_label(l.alloc_into);
-    a.test_reg_reg(R::V0, R::V0);
-    a.jcc_label(C::Equal, done);
-    a.cmp_reg_imm8(R::V0, ALLOC_REFILL as i8);
-    a.jcc_label(C::Equal, refill);
-    a.bind_text_label(not_refill);
-    a.cmp_reg_imm8(R::V0, ALLOC_METADATA_REFILL as i8);
-    a.jcc_label(C::Equal, l.oom);
-    a.cmp_reg_imm8(R::V0, ALLOC_ROOT_FLUSH as i8);
-    a.jcc_label(C::NotEqual, l.fail);
-    a.call_label(l.drain);
-    a.jmp_label(attempt);
-    // Refill: close the current page (if any) and bind the next prepared one.
-    a.bind_text_label(refill);
-    a.load_ptr_disp32(
-        R::V6,
-        R::V3,
-        d(RT_REQUEST + offset_of!(AllocationRequest, page)),
-    );
-    a.test_reg_reg(R::V6, R::V6);
-    a.jcc_label(C::Equal, bind);
-    lea_rt(a, R::V7, RT_CTX);
-    a.mov_imm64(R::V2, 1);
-    a.call_label(l.tlab_page);
-    a.test_reg_reg(R::V0, R::V0);
-    a.jcc_label(C::NotEqual, l.fail);
-    a.mov_imm64(R::V0, 0);
-    a.store_ptr_disp32(
-        R::V3,
-        d(RT_REQUEST + offset_of!(AllocationRequest, page)),
-        R::V0,
-    );
-    a.bind_text_label(bind);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_NEXT_PAGE));
-    a.cmp_reg_imm32(R::V0, imm(PAGES));
-    a.jcc_label(C::AboveOrEqual, l.oom);
-    // page = pages + index * 112 (= index*128 - index*16).
-    a.mov_reg_reg(R::V6, R::V0);
-    a.shl_reg_imm8(R::V6, 7);
-    a.mov_reg_reg(R::V1, R::V0);
-    a.shl_reg_imm8(R::V1, 4);
-    a.sub_reg_reg(R::V6, R::V1);
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_PAGES));
-    a.add_reg_reg(R::V6, R::V1);
-    a.add_reg_imm32(R::V0, 1);
-    a.store_ptr_disp32(R::V3, d(RT_NEXT_PAGE), R::V0);
-    a.store_ptr_disp32(R::V3, d(RT_BIND_PAGE), R::V6);
-    lea_rt(a, R::V7, RT_CTX);
-    a.mov_imm64(R::V2, 0);
-    a.call_label(l.tlab_page);
-    a.test_reg_reg(R::V0, R::V0);
-    a.jcc_label(C::NotEqual, l.fail);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_BIND_PAGE));
-    a.store_ptr_disp32(
-        R::V3,
-        d(RT_REQUEST + offset_of!(AllocationRequest, page)),
-        R::V0,
-    );
-    a.jmp_label(attempt);
-    // Success: remember the object for publication and answer its address.
-    a.bind_text_label(done);
-    a.load_ptr_disp32(
-        R::V0,
-        R::V3,
-        d(RT_RESULT + offset_of!(AllocationResult, reference)),
-    );
-    a.store_ptr_disp32(R::V3, d(RT_PENDING_REF), R::V0);
-    a.load_ptr_disp32(
-        R::V1,
-        R::V3,
-        d(RT_REQUEST + offset_of!(AllocationRequest, page)),
-    );
-    a.store_ptr_disp32(R::V3, d(RT_PENDING_PAGE), R::V1);
-    // The object's forward cell is the table's last used cell.
-    a.load_ptr_disp32(R::V1, R::V1, d(offset_of!(AllocationPage, forward_table)));
-    a.load_ptr_disp32(R::V2, R::V1, d(offset_of!(ForwardTable, used)));
-    a.sub_reg_imm8(R::V2, 1);
-    a.shl_reg_imm8(R::V2, 5);
-    a.load_ptr_disp32(R::V1, R::V1, d(offset_of!(ForwardTable, cells)));
-    a.add_reg_reg(R::V1, R::V2);
-    a.store_ptr_disp32(R::V3, d(RT_PENDING_CELL), R::V1);
-    decode(a, R::V0, R::V1);
     a.pop_reg(R::V3);
     a.ret();
 }
