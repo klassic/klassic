@@ -24,6 +24,7 @@ use std::mem::{offset_of, size_of};
 
 mod alloc;
 mod collect;
+mod enums;
 mod roots;
 
 /// Young pages prepared at startup (64 MiB of payload), split into two
@@ -61,7 +62,7 @@ const SOURCE_ENTER: u64 = 0;
 const SOURCE_EXIT: u64 = 1;
 
 /// Color bits of every reference while the adopted phase stays initial.
-fn color() -> u64 {
+pub(super) fn color() -> u64 {
     u64::from(PhaseSnapshot::initial().color())
 }
 
@@ -94,9 +95,17 @@ struct Runtime {
     scan_old: u64,
     saved_size: u64,
     saved_elements: u64,
+    saved_tag: u64,
+    saved_descriptor: u64,
     from_base: u64,
     from_end: u64,
     from_marks: u64,
+    alloc_tag: u64,
+    cs_page: u64,
+    cs_off: u64,
+    cs_field: u64,
+    cs_count: u64,
+    forward_cell: u64,
     marks: MarkArena,
     request: AllocationRequest,
     into: AllocationInto,
@@ -160,7 +169,7 @@ const fn layout() -> Layout {
 }
 
 const L: Layout = layout();
-const HEAP_BYTES: u64 = (PAGES + 1) * HEAP_PAGE_BYTES;
+pub(super) const HEAP_BYTES: u64 = (PAGES + 1) * HEAP_PAGE_BYTES;
 const _: () = assert!(L.total < i32::MAX as u64);
 const _: () = assert!(L.pages >= size_of::<Runtime>() as u64);
 const _: () = assert!(L.pages < L.starts && L.starts < L.tables && L.tables < L.cells);
@@ -207,9 +216,17 @@ const RT_SCAN_INDEX: usize = offset_of!(Runtime, scan_index);
 const RT_SCAN_OLD: usize = offset_of!(Runtime, scan_old);
 const RT_SAVED_SIZE: usize = offset_of!(Runtime, saved_size);
 const RT_SAVED_ELEMENTS: usize = offset_of!(Runtime, saved_elements);
+const RT_SAVED_TAG: usize = offset_of!(Runtime, saved_tag);
+const RT_SAVED_DESCRIPTOR: usize = offset_of!(Runtime, saved_descriptor);
 const RT_FROM_BASE: usize = offset_of!(Runtime, from_base);
 const RT_FROM_END: usize = offset_of!(Runtime, from_end);
 const RT_FROM_MARKS: usize = offset_of!(Runtime, from_marks);
+const RT_ALLOC_TAG: usize = offset_of!(Runtime, alloc_tag);
+const RT_CS_PAGE: usize = offset_of!(Runtime, cs_page);
+const RT_CS_OFF: usize = offset_of!(Runtime, cs_off);
+const RT_CS_FIELD: usize = offset_of!(Runtime, cs_field);
+const RT_CS_COUNT: usize = offset_of!(Runtime, cs_count);
+const RT_FORWARD_CELL: usize = offset_of!(Runtime, forward_cell);
 const RT_REQUEST: usize = offset_of!(Runtime, request);
 const RT_INTO: usize = offset_of!(Runtime, into);
 const RT_RESULT: usize = offset_of!(Runtime, result);
@@ -287,6 +304,21 @@ pub(crate) struct Labels<T> {
     publish_pending: T,
     alloc_raw: T,
     collect: T,
+    forward: T,
+    /// Heap-field load: V0 = reference bits -> V0 = payload address.
+    /// Preserves every other register.
+    pub field_load: T,
+    /// Heap-field store (legacy `gc_store_pointer` ABI): V7 = field
+    /// address, V6 = payload address or null.
+    pub field_store: T,
+    /// Legacy `gc_deep_equal` ABI: V7, V6 = payload addresses -> V0 bool.
+    pub deep_equal: T,
+    /// V0 = address of a native cell holding a payload address (or null):
+    /// evacuate its referent and rewrite the cell. Called from `literals`.
+    pub forward_cell_entry: T,
+    /// Backend routine visiting every collection-literal cell through
+    /// `forward_cell_entry` (just `ret` when there are none).
+    pub literals: T,
     zero: T,
     drain: T,
     fail: T,
@@ -294,10 +326,22 @@ pub(crate) struct Labels<T> {
     too_large: T,
 }
 
+/// Labels the backend already calls, bound to M-G routines under the flag.
+pub(crate) struct Backend<T> {
+    pub field_store: T,
+    pub deep_equal: T,
+    pub literals: T,
+}
+
 impl<T: Copy> Labels<T> {
     /// `map` and `alloc` are backend labels: the mapping leaf and the
     /// existing allocation entry every site already calls.
-    pub(crate) fn new(mut create: impl FnMut() -> T, map: T, alloc: T) -> Self {
+    pub(crate) fn new(
+        mut create: impl FnMut() -> T,
+        map: T,
+        alloc: T,
+        backend: Backend<T>,
+    ) -> Self {
         Self {
             startup: create(),
             alloc,
@@ -317,6 +361,12 @@ impl<T: Copy> Labels<T> {
             publish_pending: create(),
             alloc_raw: create(),
             collect: create(),
+            forward: create(),
+            field_load: create(),
+            field_store: backend.field_store,
+            deep_equal: backend.deep_equal,
+            forward_cell_entry: create(),
+            literals: backend.literals,
             zero: create(),
             drain: create(),
             fail: create(),
@@ -381,27 +431,51 @@ fn root_step<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, request: usize
     a.bind_text_label(done);
 }
 
+/// Tag bit marking an immortal pointer outside the managed heap (static
+/// enum constants in native data). Heap references always have bit 0
+/// clear (their metadata is a phase color), so the tag is unambiguous; such
+/// values are carried verbatim and never traced or moved.
+pub(super) const EXTERNAL: i32 = 1;
+
 /// `value` (a payload address or null) -> reference bits, in place.
 fn encode<E: PortableAsm>(a: &mut E, value: R, scratch: R) {
     let null = a.create_text_label();
+    let external = a.create_text_label();
     a.test_reg_reg(value, value);
     a.jcc_label(C::Equal, null);
     a.load_ptr_disp32(scratch, R::V3, d(RT_HEAP_BASE));
     a.sub_reg_reg(value, scratch);
+    a.jcc_label(C::Below, external);
+    a.mov_imm64(scratch, HEAP_BYTES);
+    a.cmp_reg_reg(value, scratch);
+    a.jcc_label(C::AboveOrEqual, external);
     a.shl_reg_imm8(value, 16);
     a.mov_imm64(scratch, color());
+    a.or_reg_reg(value, scratch);
+    a.jmp_label(null);
+    a.bind_text_label(external);
+    a.load_ptr_disp32(scratch, R::V3, d(RT_HEAP_BASE));
+    a.add_reg_reg(value, scratch);
+    a.mov_imm64(scratch, EXTERNAL as u64);
     a.or_reg_reg(value, scratch);
     a.bind_text_label(null);
 }
 
-/// Reference bits (or null) -> payload address, in place.
+/// Reference bits (or null, or an external tagged pointer) -> address.
 fn decode<E: PortableAsm>(a: &mut E, value: R, scratch: R) {
     let null = a.create_text_label();
+    let external = a.create_text_label();
     a.test_reg_reg(value, value);
     a.jcc_label(C::Equal, null);
+    a.bt_reg_imm8(value, 0);
+    a.jcc_label(C::Below, external);
     a.shr_reg_imm8(value, 16);
     a.load_ptr_disp32(scratch, R::V3, d(RT_HEAP_BASE));
     a.add_reg_reg(value, scratch);
+    a.jmp_label(null);
+    a.bind_text_label(external);
+    a.mov_imm64(scratch, !1);
+    a.and_reg_reg(value, scratch);
     a.bind_text_label(null);
 }
 
@@ -417,6 +491,7 @@ pub(crate) fn emit<E: PortableAsm>(
     emit_startup(a, l, data.runtime);
     alloc::emit_alloc(a, l, data.runtime, stress);
     collect::emit_collect(a, l);
+    enums::emit_enums(a, l, data.runtime);
     emit_publish_pending(a, l);
     roots::emit_roots(a, l, data.runtime);
     roots::emit_verify(a, l, data.runtime);

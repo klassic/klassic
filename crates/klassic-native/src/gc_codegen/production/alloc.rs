@@ -13,6 +13,8 @@ pub(super) fn emit_alloc<E: PortableAsm>(
     a.push_reg(R::V3);
     load_runtime(a, runtime);
     a.store_ptr_disp32(R::V3, d(RT_ALLOC_SIZE), R::V7);
+    // Legacy shape tags equal the builtin descriptor ids (1, 2, 4).
+    a.store_ptr_disp32(R::V3, d(RT_ALLOC_TAG), R::V6);
     if stress {
         // --gc-stress: evacuate before every allocation, so any reference
         // left outside a RootCell across an allocation is caught at once.
@@ -34,6 +36,34 @@ pub(super) fn emit_alloc<E: PortableAsm>(
     a.mov_imm64(R::V1, MAX_PAYLOAD);
     a.cmp_reg_reg(R::V0, R::V1);
     a.jcc_label(C::Above, l.too_large);
+    // Descriptor and element count from the tag: raw bytes count bytes,
+    // records count reference words, lists add one fixed length word.
+    let record = a.create_text_label();
+    let list = a.create_text_label();
+    let chosen = a.create_text_label();
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_ALLOC_TAG));
+    a.cmp_reg_imm8(R::V1, 2);
+    a.jcc_label(C::Equal, record);
+    a.cmp_reg_imm8(R::V1, 4);
+    a.jcc_label(C::Equal, list);
+    a.cmp_reg_imm8(R::V1, 1);
+    a.jcc_label(C::NotEqual, l.fail);
+    lea_rt(a, R::V2, RT_BUILTINS + 8);
+    a.jmp_label(chosen);
+    a.bind_text_label(record);
+    lea_rt(a, R::V2, RT_BUILTINS + 72);
+    a.shr_reg_imm8(R::V0, 3);
+    a.jmp_label(chosen);
+    a.bind_text_label(list);
+    lea_rt(a, R::V2, RT_BUILTINS + 136);
+    a.sub_reg_imm8(R::V0, 8);
+    a.shr_reg_imm8(R::V0, 3);
+    a.bind_text_label(chosen);
+    a.store_ptr_disp32(
+        R::V3,
+        d(RT_REQUEST + offset_of!(AllocationRequest, descriptor)),
+        R::V2,
+    );
     a.store_ptr_disp32(
         R::V3,
         d(RT_REQUEST + offset_of!(AllocationRequest, elements)),

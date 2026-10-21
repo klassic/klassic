@@ -19,6 +19,7 @@ capability becomes complete through it. See
 Update 2026-10-22 (M-G2): that path now collects. A stop-the-world semispace
 evacuation of RootCell referents recycles Young pages; it is not concurrent,
 has no Old generation or barriers, and completes no G01-G15 capability.
+M-G3 adds enums (reference-bearing records) to that path; same limits.
 
 The owned source-retirement receipt now also requires a bounded audit of all
 registered SATB/remset owners. It checks one context per step, requires real

@@ -1,6 +1,6 @@
 # Production integration plan — M-G1 (2026-09-29)
 
-Status: M-G1 and M-G2 (stop-the-world Young evacuation) implemented on branch `gc/generational-wip` (2026-09-30), as an
+Status: M-G1, M-G2 (stop-the-world Young evacuation) and M-G3 (enums) implemented on branch `gc/generational-wip` (2026-09-30), as an
 opt-in integration scaffold; it does not collect and does not make any G01-G15
 item complete. Checkpoint `0d674e8` holds the interrupted Codex session's
 component work. See "M-G1 as implemented" below.
@@ -197,6 +197,39 @@ Stop-the-world Young evacuation under `--gc=generational`
 Still not ZGC: the collection is stop-the-world and copying, there is no Old
 generation, no concurrent mark/relocate, no load or store barriers (no heap
 object holds a reference yet), no workers, and only Linux x86-64.
+
+## M-G3 as implemented (2026-10-22)
+
+Enums (monomorphic and generic records, boxes, nested payloads, collection
+literal cells) now build and run under `--gc=generational`; the enum
+rejection is gone (`gc_codegen/production/enums.rs`).
+
+- Allocation picks the builtin descriptor from the legacy shape tag (raw
+  bytes 1, pointer record 2, pointer list 4) with the matching element count.
+- Heap fields hold payload addresses, as on the legacy path: generic enum
+  payloads travel through untyped funnels, so field words cannot carry
+  reference bits. RootCells keep reference bits; pointers outside the heap
+  (static enum constants) are carried in root cells with tag bit 0.
+- Evacuation forwards RootCell referents, then every collection-literal
+  cell (backend `literals` routine), then scans to-space Cheney-style; a word
+  in a record/list slot is a reference iff it addresses heap payload (the
+  legacy range rule), and is rewritten with the copy's address.
+- `gc_store_pointer` / `gc_deep_equal` keep their ABIs; M-G binds plain field
+  stores and a recursive structural equality over payload addresses there.
+- Root-caused fix: `collect` restores the interrupted allocation's shape tag
+  and descriptor (evacuation copies overwrite them), otherwise a pending
+  record could be allocated as raw bytes and lose its referents.
+- Evidence: `generational_enums_survive_evacuation` (nested generic and
+  recursive enums, equality, with and without stress). Under a temporary
+  local hook making `--gc=generational --gc-stress` the default, `cli_smoke`
+  passed 466/510 (one 50k-deep recursion test skipped: evacuating before each
+  of 50k allocations is quadratic); every failure was an intended rejection
+  (other targets, C backend, `--gc-poison`) or a test reading the legacy
+  `--gc-log` format.
+
+Still not ZGC: stop-the-world semispace copying, Young only, conservative
+range rule for heap slots, no concurrent marking/relocation, no load/store
+barriers, no workers, Linux x86-64 only.
 
 ## Next milestones (outline)
 

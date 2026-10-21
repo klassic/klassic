@@ -192,8 +192,8 @@ pub(super) fn emit_verify<E: PortableAsm>(
     a.add_reg_reg(R::V1, R::V6);
     a.add_reg_imm32(R::V10, 1);
     a.load_ptr_disp32(R::V2, R::V1, d(offset_of!(ObjectHeader, descriptor_id)));
-    a.cmp_reg_imm8(R::V2, 1);
-    a.jcc_label(C::NotEqual, unpublished);
+    a.test_reg_reg(R::V2, R::V2);
+    a.jcc_label(C::Equal, unpublished);
     a.load_ptr_disp32(R::V2, R::V1, d(offset_of!(ObjectHeader, state)));
     a.cmp_reg_imm8(R::V2, OBJECT_PUBLISHED as i8);
     a.jcc_label(C::NotEqual, unpublished);

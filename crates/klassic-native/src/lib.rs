@@ -661,17 +661,6 @@ fn compile_internal(
     {
         let mut enum_decls = Vec::new();
         collect_enum_decls(&expr, &mut enum_decls);
-        // M-G1 routes only reference-free heap strings through the
-        // generational ABI; enums need reference descriptors and barriers
-        // (M-G3), so they are declined before any code is emitted.
-        if config.gc_generational && !enum_decls.is_empty() {
-            let span = first_enum_decl_span(&expr).unwrap_or_else(|| expr.span());
-            return Err(NativeCompileError::with_view(
-                source.clone(),
-                user_view.clone(),
-                unsupported(span, "enums under --gc=generational (M-G1)"),
-            ));
-        }
         for (enum_name, _type_params, variants) in &enum_decls {
             for variant in variants {
                 variant_owner_enum.insert(variant.name.clone(), enum_name.clone());
@@ -1932,28 +1921,6 @@ fn enum_field_repr_for_native_value(value: NativeValue) -> Option<EnumFieldRepr>
         // Nested enums / records / lists are all heap pointers (M3 widens
         // read support); a bare heap pointer is the common nested-enum case.
         NativeValue::HeapPointer => Some(EnumFieldRepr::EnumField),
-        _ => None,
-    }
-}
-
-/// The span of the first enum declaration `collect_enum_decls` would
-/// visit, for the `--gc=generational` rejection diagnostic.
-fn first_enum_decl_span(expr: &Expr) -> Option<Span> {
-    match expr {
-        Expr::EnumDeclaration { span, .. } => Some(*span),
-        Expr::Block { expressions, .. } => expressions.iter().find_map(first_enum_decl_span),
-        Expr::DefDecl { body, .. } | Expr::Lambda { body, .. } => first_enum_decl_span(body),
-        Expr::ExtensionDeclaration { methods, .. } | Expr::InstanceDeclaration { methods, .. } => {
-            methods.iter().find_map(first_enum_decl_span)
-        }
-        Expr::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => first_enum_decl_span(condition)
-            .or_else(|| first_enum_decl_span(then_branch))
-            .or_else(|| else_branch.as_deref().and_then(first_enum_decl_span)),
         _ => None,
     }
 }
@@ -5718,7 +5685,9 @@ impl NativeCodeGenerator {
         self.emit_stack_overflow_abort_runtime();
         self.emit_print_i64_runtime();
         self.emit_gc_mark_visit_runtime();
-        self.emit_gc_deep_equal_runtime();
+        if self.gc_gen.is_none() {
+            self.emit_gc_deep_equal_runtime();
+        }
         self.emit_gc_load_barrier_slow_runtime();
         if self.gc_gen.is_none() {
             self.emit_gc_alloc_runtime();
@@ -5726,7 +5695,9 @@ impl NativeCodeGenerator {
         self.emit_gc_collect_runtime();
         self.emit_gc_mark_roots_runtime();
         self.emit_gc_trace_runtime();
-        self.emit_gc_store_pointer_runtime();
+        if self.gc_gen.is_none() {
+            self.emit_gc_store_pointer_runtime();
+        }
         self.emit_gc_sweep_runtime();
         self.emit_gc_clear_all_marks_runtime();
         self.emit_gc_stw_mark_complete_runtime();
@@ -14775,10 +14746,16 @@ impl NativeCodeGenerator {
             // this same funnel must NOT strip (its high bits are data).
             self.asm.mov_reg_reg(Reg::R10, Reg::Rax); // field addr, for self-heal
             self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0); // colored value
-            let slow = self.gc_load_barrier_slow;
-            // Nothing to save: the slow routine keeps what this backend's
-            // callers hold.
-            portable_asm::emit_gc_load_barrier(self, slow);
+            if let Some(runtime) = &self.gc_gen {
+                // Heap fields hold reference bits under --gc=generational.
+                let load = runtime.labels.field_load;
+                self.asm.call_label(load);
+            } else {
+                let slow = self.gc_load_barrier_slow;
+                // Nothing to save: the slow routine keeps what this
+                // backend's callers hold.
+                portable_asm::emit_gc_load_barrier(self, slow);
+            }
         } else {
             self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
         }
@@ -39522,12 +39499,19 @@ impl NativeCodeGenerator {
     /// register is live across this helper.
     /// Create the M-G1 labels and data (`--gc=generational`).
     fn prepare_generational_runtime(&mut self) {
-        use gc_codegen::production::{Data, FAIL_TEXT, Labels, OOM_TEXT, TOO_LARGE_TEXT};
+        use gc_codegen::production::{Backend, Data, FAIL_TEXT, Labels, OOM_TEXT, TOO_LARGE_TEXT};
         let map = self.asm.create_text_label();
         // Every allocation site calls `gc_alloc`; M-G1 binds its allocator
         // there, so none of the sites change.
         let alloc = self.gc_alloc;
-        let labels = Labels::new(|| self.asm.create_text_label(), map, alloc);
+        // The heap-field store and deep-equality entries keep their legacy
+        // ABIs; M-G binds its own bodies at those labels.
+        let backend = Backend {
+            field_store: self.gc_store_pointer,
+            deep_equal: self.gc_deep_equal,
+            literals: self.asm.create_text_label(),
+        };
+        let labels = Labels::new(|| self.asm.create_text_label(), map, alloc, backend);
         let data = Data {
             runtime: self.asm.data_label_with_bytes(&[0; 8]),
             fail_text: self.asm.data_label_with_bytes(FAIL_TEXT),
@@ -40395,6 +40379,20 @@ impl NativeCodeGenerator {
     /// seeding every cell up front is safe before any of them is live.
     fn emit_literal_root_seed(&mut self) {
         let entry = self.literal_root_seed;
+        if let Some(runtime) = &self.gc_gen {
+            // --gc=generational: no shadow stack; evacuation visits each
+            // cell through `literals` and rewrites its payload address.
+            let (literals, forward) = (runtime.labels.literals, runtime.labels.forward_cell_entry);
+            self.asm.bind_text_label(entry);
+            self.asm.ret();
+            self.asm.bind_text_label(literals);
+            for cell in self.literal_root_cells.clone() {
+                self.asm.mov_data_addr(Reg::Rax, cell);
+                self.asm.call_label(forward);
+            }
+            self.asm.ret();
+            return;
+        }
         self.asm.bind_text_label(entry);
         for cell in self.literal_root_cells.clone() {
             self.asm.mov_data_addr(Reg::Rax, cell);

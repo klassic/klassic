@@ -133,17 +133,31 @@ mod linux_x86_64 {
     }
 
     #[test]
-    fn generational_rejects_enums_with_a_diagnostic() {
-        let source = "enum Color {\n  case Red\n  case Green\n}\nval c = Red\nprintln(c match { case Red => 1; case Green => 2 })\n";
-        let stderr = build_failure_stderr("enum", &["--gc=generational"], source);
-        assert!(
-            stderr.contains("enums under --gc=generational (M-G1)"),
-            "stderr:\n{stderr}"
-        );
-        // The same program still builds on the default (legacy) path.
-        let run = build_and_run("enum_legacy", &[], source);
-        assert!(run.status.success());
-        assert_eq!(String::from_utf8_lossy(&run.stdout), "1\n");
+    fn generational_enums_survive_evacuation() {
+        // Records hold references (payload addresses) to boxes, strings and
+        // nested records; stress evacuates before every allocation.
+        let source = "enum Option<a> { case Some(value: a); case None }\n\
+                      enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
+                      def total(t: Tree): Int = t match { case Leaf(v) => v; case Branch(l, r) => total(l) + total(r) }\n\
+                      def build(n: Int): Tree = if (n <= 0) Leaf(1) else Branch(build(n - 1), Leaf(n))\n\
+                      val o = Some(Some(\"hi\"))\n\
+                      println(o match { case Some(Some(v)) => v; case _ => \"x\" })\n\
+                      println(total(build(50)))\n\
+                      println(Some(Some(\"hi\")) == o)\n\
+                      println(Some(Some(\"ho\")) == o)\n";
+        let expected = evaluate("enum_eval", source);
+        for flags in [
+            &["--gc=generational"][..],
+            &["--gc=generational", "--gc-stress"],
+        ] {
+            let run = build_and_run("enum", flags, source);
+            assert!(
+                run.status.success(),
+                "{flags:?} stderr:\n{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&run.stdout), expected, "{flags:?}");
+        }
     }
 
     /// The `--gc-log` line of a generational run, parsed into its fields.

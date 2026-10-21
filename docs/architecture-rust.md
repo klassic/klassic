@@ -3049,3 +3049,8 @@ exhausting one triggers a stop-the-world evacuation of every RootCell referent
 through the normal allocate/publish path (shared referents forwarded once),
 after which from-space pages and metadata are zeroed and made READY again.
 `--gc-stress` evacuates before every allocation under the flag.
+
+M-G3: enums build under `--gc=generational`. Allocation maps the legacy shape
+tag to builtin descriptors 1/2/4, heap fields keep payload addresses, and
+evacuation forwards roots, collection-literal cells and then scans to-space
+Cheney-style over reference-bearing records with the legacy range rule.
