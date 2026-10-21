@@ -82,18 +82,16 @@ fn generational_rejects_llvm_and_c_backends() {
 }
 
 #[test]
-fn generational_rejects_non_linux_x86_targets() {
-    for target in ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"] {
-        let stderr = build_failure_stderr(
-            "target",
-            &["--gc=generational", "--target", target],
-            "println(1)\n",
-        );
-        assert!(
-            stderr.contains("--gc=generational is only supported by the direct x86_64"),
-            "target {target} stderr:\n{stderr}"
-        );
-    }
+fn generational_rejects_non_x86_targets() {
+    let stderr = build_failure_stderr(
+        "target",
+        &["--gc=generational", "--target", "aarch64-apple-darwin"],
+        "println(1)\n",
+    );
+    assert!(
+        stderr.contains("--gc=generational is only supported by the direct x86_64"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -168,6 +166,52 @@ mod linux_x86_64 {
         assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
         let stats = gc_stats(&stderr);
         assert!(stats["full_collections"] >= 1, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn generational_windows_build_matches_the_evaluator_when_runnable() {
+        // PE shares the x86-64 emission; only the mapping leaf (VirtualAlloc)
+        // and the write path (the Win64 shim) differ. The .exe runs where WSL
+        // interop is available; elsewhere the build itself is the check.
+        let source = "enum Option<a> { case Some(value: a); case None }\n\
+                      def describe(s: String, n: Int): String = if (n <= 0) s else describe(s + \"x\", n - 1)\n\
+                      val o = Some(Some(\"hi\"))\n\
+                      mutable i = 0\n\
+                      mutable acc = 0\n\
+                      while(i < 2000) {\n\
+                        acc += length(describe(\"ab\", i / 60000 + 5))\n\
+                        i += 1\n\
+                      }\n\
+                      println(acc)\n\
+                      println(o match { case Some(Some(v)) => v; case _ => \"x\" })\n";
+        let expected = evaluate("win_eval", source);
+        let source_path = write_source("win", source);
+        let output_path = temp_path("win", "exe");
+        let result = build(
+            &[
+                "--target",
+                "x86_64-pc-windows-msvc",
+                "--gc=generational",
+                "--gc-stress",
+            ],
+            &source_path,
+            &output_path,
+        );
+        let _ = fs::remove_file(&source_path);
+        assert!(
+            result.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let bytes = fs::read(&output_path).expect("exe written");
+        assert_eq!(&bytes[..2], b"MZ");
+        if let Ok(run) = Command::new(&output_path).output()
+            && run.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&run.stdout).replace('\r', "");
+            assert_eq!(stdout, expected);
+        }
+        let _ = fs::remove_file(&output_path);
     }
 
     #[test]

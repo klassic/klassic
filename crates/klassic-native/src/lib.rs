@@ -39542,7 +39542,22 @@ impl NativeCodeGenerator {
             return;
         };
         self.asm.bind_text_label(runtime.labels.map);
-        gc_codegen::native_metadata::emit_linux_map(self);
+        if self.is_windows {
+            // (rdi = bytes) -> rax: realign for the Win64 VirtualAlloc leaf,
+            // which takes its size in rcx.
+            let leaf = self.asm.create_text_label();
+            self.asm.push_reg(Reg::Rbp);
+            self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
+            self.asm.and_reg_imm32(Reg::Rsp, -16);
+            self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
+            self.asm.call_label(leaf);
+            self.asm.leave();
+            self.asm.ret();
+            self.asm.bind_text_label(leaf);
+            gc_codegen::native_metadata::emit_windows_map(self);
+        } else {
+            gc_codegen::native_metadata::emit_linux_map(self);
+        }
         let stderr_fd = self.platform.stderr_fd();
         let stress = self.gc_stress;
         gc_codegen::production::emit(self, &runtime.labels, &runtime.data, stderr_fd, stress);
@@ -39587,8 +39602,12 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::Rsi, Reg::Rsi, 0);
         self.asm.add_reg_imm32(Reg::Rsi, copy_out_offset());
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R12);
-        self.emit_syscall_number(PlatformSyscall::Write);
-        self.asm.syscall();
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.emit_syscall_number(PlatformSyscall::Write);
+            self.asm.syscall();
+        }
         self.asm.jmp_label(chunk);
         self.asm.bind_text_label(done);
         self.asm.pop_reg(Reg::R13);

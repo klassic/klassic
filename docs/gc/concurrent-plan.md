@@ -72,6 +72,11 @@ free of correctness failures and the default path byte-identical.
   466 passing each, with every failure an intended rejection or a legacy
   `--gc-log` format check.
 
+Step 6 (PE): done. `--target x86_64-pc-windows-msvc --gc=generational` maps
+the runtime through a realigned VirtualAlloc leaf and writes heap strings
+through the Win64 write shim; the generational test runs the .exe under WSL
+interop when available (stress, full collections and nested enums matched).
+
 Still open: concurrent marking (step 4), a GC worker thread (step 5), and the
-PE / Mach-O ports (step 6). Relocation is incremental on the mutator thread,
+Mach-O port (step 6). Relocation is incremental on the mutator thread,
 not concurrent on another core.

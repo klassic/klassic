@@ -139,10 +139,16 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                         Some(command.config.native_target)
                     } else {
                         NativeTarget::host()
-                    }) == Some(NativeTarget::LinuxX86_64);
+                    })
+                    .is_some_and(|target| {
+                        matches!(
+                            target,
+                            NativeTarget::LinuxX86_64 | NativeTarget::WindowsX86_64
+                        )
+                    });
                 if !direct_linux_x86 {
                     eprintln!(
-                        "error: --gc=generational is only supported by the direct x86_64-unknown-linux-gnu backend\n  \
+                        "error: --gc=generational is only supported by the direct x86_64 Linux and Windows backends\n  \
                          note: M-G1 is an opt-in integration scaffold; other targets and --backend c/llvm keep the legacy collector"
                     );
                     return Err(1);
