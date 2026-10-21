@@ -12,6 +12,12 @@ pub(super) fn emit_alloc<E: PortableAsm>(
     a.bind_text_label(l.alloc);
     a.push_reg(R::V3);
     load_runtime(a, runtime);
+    // Advance an open relocation phase by one bounded quantum.
+    a.push_reg(R::V7);
+    a.push_reg(R::V6);
+    a.call_label(l.quantum);
+    a.pop_reg(R::V6);
+    a.pop_reg(R::V7);
     a.store_ptr_disp32(R::V3, d(RT_ALLOC_SIZE), R::V7);
     // Legacy shape tags equal the builtin descriptor ids (1, 2, 4).
     a.store_ptr_disp32(R::V3, d(RT_ALLOC_TAG), R::V6);

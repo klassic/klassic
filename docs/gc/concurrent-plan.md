@@ -1,6 +1,6 @@
 # M-G6 plan: concurrent relocation and marking for `--gc=generational`
 
-Status: planned (2026-10-22). Builds on M-G1..M-G5
+Status: steps 1-3 implemented (2026-10-22); steps 4-6 open. Builds on M-G1..M-G5
 (`production-integration-plan.md`), where every collection is stop-the-world
 semispace copying.
 
@@ -53,3 +53,25 @@ allocation-driven quanta (and later on a worker thread), as in ZGC.
 
 Each step keeps the stress-default `cli_smoke` run (temporary local hook)
 free of correctness failures and the default path byte-identical.
+
+## Steps 1-3 as implemented
+
+- The pause now ends after flipping, forwarding root cells, remembered
+  fields and collection-literal cells (shallow copies). A relocation phase
+  stays open: each allocation scans `QUANTUM_OBJECTS` (64) to-space/promoted
+  objects; when both Cheney cursors catch up, `finish` recycles from-space.
+  The next collection completes an open phase first.
+- Load barrier: `field_load` (reference reads, field address in R10) and the
+  scalar `__gc_read` funnel. A loaded word inside this collection's
+  from-space ranges is relocated and the field healed (`--gc-log healed=`).
+- Forwarding is gated by the from-space ranges, so to-space objects reached
+  through healed fields or new allocations are never copied twice (this was
+  the cause of a published-after-forwarding crash under stress).
+- `gc_deep_equal` follows forwarding records for evacuated operands.
+- Evidence: gen tests 16/16; stress-default and plain-default `cli_smoke`
+  466 passing each, with every failure an intended rejection or a legacy
+  `--gc-log` format check.
+
+Still open: concurrent marking (step 4), a GC worker thread (step 5), and the
+PE / Mach-O ports (step 6). Relocation is incremental on the mutator thread,
+not concurrent on another core.

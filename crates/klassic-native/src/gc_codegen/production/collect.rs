@@ -53,6 +53,7 @@ fn cell_ptr<E: PortableAsm>(a: &mut E, dst: R, index: R) {
 }
 
 pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    emit_phase(a, l);
     let elements = d(RT_REQUEST + offset_of!(AllocationRequest, elements));
     let descriptor = d(RT_REQUEST + offset_of!(AllocationRequest, descriptor));
     let page_field = d(RT_REQUEST + offset_of!(AllocationRequest, page));
@@ -85,6 +86,9 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.store_ptr_disp32(R::V3, d(RT_SAVED_TAG), R::V0);
     a.load_ptr_disp32(R::V0, R::V3, descriptor);
     a.store_ptr_disp32(R::V3, d(RT_SAVED_DESCRIPTOR), R::V0);
+    // A relocation phase still open from the previous collection must
+    // complete before its spaces can flip again.
+    a.call_label(l.finish);
     clear_scratch(a, l);
     // Close the allocating page: it belongs to the space being evacuated.
     let closed = a.create_text_label();
@@ -153,6 +157,28 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.mov_imm64(R::V0, 0);
     a.store_ptr_disp32(R::V3, d(super::RT_FULL), R::V0);
     a.bind_text_label(decided);
+    // From-space ranges: exactly the objects this collection moves.
+    let full_range = a.create_text_label();
+    let ranges = a.create_text_label();
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_FROM_BASE));
+    a.add_reg_imm32(R::V0, 1);
+    a.shl_reg_imm8(R::V0, 17);
+    a.store_ptr_disp32(R::V3, d(super::RT_RY_LO), R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_FROM_END));
+    a.add_reg_imm32(R::V0, 1);
+    a.shl_reg_imm8(R::V0, 17);
+    a.store_ptr_disp32(R::V3, d(super::RT_RY_HI), R::V0);
+    a.mov_imm64(R::V0, 0);
+    a.mov_imm64(R::V1, 0);
+    a.load_ptr_disp32(R::V2, R::V3, d(super::RT_FULL));
+    a.test_reg_reg(R::V2, R::V2);
+    a.jcc_label(C::Equal, ranges);
+    a.bind_text_label(full_range);
+    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_OLD_FROM));
+    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_OLD_FROM_END));
+    a.bind_text_label(ranges);
+    a.store_ptr_disp32(R::V3, d(super::RT_RO_LO), R::V0);
+    a.store_ptr_disp32(R::V3, d(super::RT_RO_HI), R::V1);
     // Objects promoted from here on are scanned by the Cheney pass.
     a.load_ptr_disp32(R::V0, R::V3, d(super::RT_OLD_TOP));
     a.store_ptr_disp32(R::V3, d(super::RT_OLD_SCAN), R::V0);
@@ -190,9 +216,59 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.call_label(l.remset_roots);
     // Collection-literal cells hold payload addresses in native data.
     a.call_label(l.literals);
-    super::enums::emit_cheney_scan(a, l);
+    // The pause ends here: to-space and promoted objects are scanned by the
+    // open relocation phase (allocation quanta, load barriers), and
+    // from-space is recycled when that phase finishes.
+    super::enums::emit_cheney_init(a);
+    a.mov_imm64(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(super::RT_PHASE_OPEN), R::V0);
     clear_scratch(a, l);
 
+    a.mov_imm64(R::V0, 0);
+    a.store_ptr_disp32(R::V3, d(RT_COLLECTING), R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_COLLECTIONS));
+    a.add_reg_imm32(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(RT_COLLECTIONS), R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_SAVED_SIZE));
+    a.store_ptr_disp32(R::V3, d(RT_ALLOC_SIZE), R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_SAVED_ELEMENTS));
+    a.store_ptr_disp32(R::V3, elements, R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_SAVED_TAG));
+    a.store_ptr_disp32(R::V3, d(RT_ALLOC_TAG), R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_SAVED_DESCRIPTOR));
+    a.store_ptr_disp32(R::V3, descriptor, R::V0);
+    a.ret();
+}
+
+/// `finish`: complete an open relocation phase and recycle from-space;
+/// `quantum`: advance it by a bounded number of objects. V3 = runtime.
+fn emit_phase<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    let closed = a.create_text_label();
+    a.bind_text_label(l.quantum);
+    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_PHASE_OPEN));
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::Equal, closed);
+    a.mov_imm64(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(RT_COLLECTING), R::V0);
+    a.mov_imm64(R::V0, super::QUANTUM_OBJECTS);
+    a.store_ptr_disp32(R::V3, d(super::RT_BUDGET), R::V0);
+    a.call_label(l.cheney);
+    a.mov_imm64(R::V1, 0);
+    a.store_ptr_disp32(R::V3, d(RT_COLLECTING), R::V1);
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::Equal, closed);
+    a.jmp_label(l.finish);
+
+    a.bind_text_label(l.finish);
+    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_PHASE_OPEN));
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::Equal, closed);
+    a.mov_imm64(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(RT_COLLECTING), R::V0);
+    a.mov_imm64(R::V0, u64::MAX);
+    a.store_ptr_disp32(R::V3, d(super::RT_BUDGET), R::V0);
+    a.call_label(l.cheney);
+    clear_scratch(a, l);
     // Recycle from-space pages [from_base, from_end): zero payload, start
     // bits and forward cells, then make each READY under a new incarnation.
     let pages = a.create_text_label();
@@ -277,18 +353,17 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.store_ptr_disp32(R::V3, d(super::RT_FULL), R::V0);
     a.bind_text_label(no_full);
     a.mov_imm64(R::V0, 0);
-    a.store_ptr_disp32(R::V3, d(RT_COLLECTING), R::V0);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_COLLECTIONS));
-    a.add_reg_imm32(R::V0, 1);
-    a.store_ptr_disp32(R::V3, d(RT_COLLECTIONS), R::V0);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_SAVED_SIZE));
-    a.store_ptr_disp32(R::V3, d(RT_ALLOC_SIZE), R::V0);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_SAVED_ELEMENTS));
-    a.store_ptr_disp32(R::V3, elements, R::V0);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_SAVED_TAG));
-    a.store_ptr_disp32(R::V3, d(RT_ALLOC_TAG), R::V0);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_SAVED_DESCRIPTOR));
-    a.store_ptr_disp32(R::V3, descriptor, R::V0);
+    for field in [
+        super::RT_PHASE_OPEN,
+        super::RT_RY_LO,
+        super::RT_RY_HI,
+        super::RT_RO_LO,
+        super::RT_RO_HI,
+        RT_COLLECTING,
+    ] {
+        a.store_ptr_disp32(R::V3, d(field), R::V0);
+    }
+    a.bind_text_label(closed);
     a.ret();
 }
 

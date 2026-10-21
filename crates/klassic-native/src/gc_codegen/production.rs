@@ -114,6 +114,13 @@ struct Runtime {
     old_from_end: u64,
     full: u64,
     full_collections: u64,
+    phase_open: u64,
+    budget: u64,
+    ry_lo: u64,
+    ry_hi: u64,
+    ro_lo: u64,
+    ro_hi: u64,
+    healed: u64,
     old_scan: u64,
     promoted: u64,
     remset_len: u64,
@@ -261,6 +268,15 @@ const RT_OLD_FROM: usize = offset_of!(Runtime, old_from);
 const RT_OLD_FROM_END: usize = offset_of!(Runtime, old_from_end);
 const RT_FULL: usize = offset_of!(Runtime, full);
 const RT_FULL_COLLECTIONS: usize = offset_of!(Runtime, full_collections);
+const RT_PHASE_OPEN: usize = offset_of!(Runtime, phase_open);
+const RT_BUDGET: usize = offset_of!(Runtime, budget);
+const RT_RY_LO: usize = offset_of!(Runtime, ry_lo);
+const RT_RY_HI: usize = offset_of!(Runtime, ry_hi);
+const RT_RO_LO: usize = offset_of!(Runtime, ro_lo);
+const RT_RO_HI: usize = offset_of!(Runtime, ro_hi);
+const RT_HEALED: usize = offset_of!(Runtime, healed);
+/// Objects scanned per allocation while a relocation phase is open.
+const QUANTUM_OBJECTS: u64 = 64;
 const RT_OLD_SCAN: usize = offset_of!(Runtime, old_scan);
 const RT_PROMOTED: usize = offset_of!(Runtime, promoted);
 const RT_REMSET_LEN: usize = offset_of!(Runtime, remset_len);
@@ -288,6 +304,7 @@ const SEGMENT_SCOPE: u64 = 1;
 pub(crate) struct StatOffsets {
     pub collections: i32,
     pub full_collections: i32,
+    pub healed: i32,
     pub promoted: i32,
     pub allocated_bytes: i32,
     pub pages_used: i32,
@@ -304,6 +321,7 @@ pub(crate) fn stat_offsets() -> StatOffsets {
     StatOffsets {
         collections: d(RT_COLLECTIONS),
         full_collections: d(RT_FULL_COLLECTIONS),
+        healed: d(RT_HEALED),
         promoted: d(RT_PROMOTED),
         allocated_bytes: d(RT_CTX + offset_of!(MutatorContext, allocated_bytes)),
         pages_used: d(RT_PAGES_USED),
@@ -349,6 +367,9 @@ pub(crate) struct Labels<T> {
     collect: T,
     forward: T,
     remset_roots: T,
+    cheney: T,
+    finish: T,
+    quantum: T,
     /// Heap-field load: V0 = reference bits -> V0 = payload address.
     /// Preserves every other register.
     pub field_load: T,
@@ -408,6 +429,9 @@ impl<T: Copy> Labels<T> {
             collect: create(),
             forward: create(),
             remset_roots: create(),
+            cheney: create(),
+            finish: create(),
+            quantum: create(),
             field_load: create(),
             field_store: backend.field_store,
             deep_equal: backend.deep_equal,

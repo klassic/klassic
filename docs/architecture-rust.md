@@ -3059,3 +3059,8 @@ M-G4/5: `--gc=generational` has an Old generation. Twice-surviving objects
 are promoted into a bump-allocated Old half; a write barrier in `field_store`
 and the promotion scan feed a remembered set that roots Young collections; a
 full collection copies everything live into the other Old half.
+
+M-G6 (steps 1-3): `--gc=generational` relocates lazily. The pause only flips
+and forwards roots; to-space scanning continues in 64-object quanta per
+allocation, and the heap-field load barrier relocates and heals any word
+still addressing from-space.

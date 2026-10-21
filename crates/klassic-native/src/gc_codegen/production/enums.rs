@@ -77,13 +77,83 @@ pub(super) fn emit_enums<E: PortableAsm>(
 ) {
     emit_field_access(a, l, runtime);
     emit_forward(a, l, runtime);
-    emit_deep_equal(a, l);
+    emit_deep_equal(a, l, runtime);
+    emit_cheney(a, l);
 }
 
 fn emit_field_access<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::DataLabel) {
     // Fields hold payload addresses: both funnels are plain moves.
     let _ = runtime;
+    // field_load: the load barrier. V0 = loaded word, V10 = field address.
+    // While a relocation phase is open, a word that addresses from-space is
+    // relocated (copied once) and the field healed; preserves the rest.
+    let pass = a.create_text_label();
+    let hit = a.create_text_label();
+    let restore = a.create_text_label();
     a.bind_text_label(l.field_load);
+    a.push_reg(R::V3);
+    a.push_reg(R::V1);
+    a.push_reg(R::V2);
+    load_runtime(a, runtime);
+    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_PHASE_OPEN));
+    a.test_reg_reg(R::V1, R::V1);
+    a.jcc_label(C::Equal, pass);
+    a.mov_reg_reg(R::V1, R::V0);
+    a.load_ptr_disp32(R::V2, R::V3, d(RT_HEAP_BASE));
+    a.sub_reg_reg(R::V1, R::V2);
+    a.jcc_label(C::Below, pass);
+    // V1 = heap offset; keep the loaded word on the stack while testing.
+    let restore_word = a.create_text_label();
+    a.push_reg(R::V0);
+    for (lo, hi) in [
+        (super::RT_RY_LO, super::RT_RY_HI),
+        (super::RT_RO_LO, super::RT_RO_HI),
+    ] {
+        a.mov_reg_reg(R::V2, R::V1);
+        a.load_ptr_disp32(R::V0, R::V3, d(lo));
+        a.sub_reg_reg(R::V2, R::V0);
+        a.load_ptr_disp32(R::V0, R::V3, d(hi));
+        a.push_reg(R::V1);
+        a.load_ptr_disp32(R::V1, R::V3, d(lo));
+        a.sub_reg_reg(R::V0, R::V1);
+        a.pop_reg(R::V1);
+        a.cmp_reg_reg(R::V2, R::V0);
+        a.jcc_label(C::Below, hit);
+    }
+    a.bind_text_label(restore_word);
+    a.pop_reg(R::V0);
+    a.jmp_label(pass);
+    a.bind_text_label(hit);
+    a.pop_reg(R::V0); // the stale word; replaced below
+    // Relocate: forward clobbers the caller-saved registers.
+    for reg in [R::V6, R::V7, R::V8, R::V9, R::V10, R::V11] {
+        a.push_reg(reg);
+    }
+    a.mov_imm64(R::V2, 1);
+    a.store_ptr_disp32(R::V3, d(super::RT_COLLECTING), R::V2);
+    a.shl_reg_imm8(R::V1, 16);
+    a.mov_imm64(R::V2, super::color());
+    a.or_reg_reg(R::V1, R::V2);
+    a.mov_reg_reg(R::V0, R::V1);
+    a.call_label(l.forward);
+    a.shr_reg_imm8(R::V0, 16);
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
+    a.add_reg_reg(R::V0, R::V1);
+    a.mov_imm64(R::V1, 0);
+    a.store_ptr_disp32(R::V3, d(super::RT_COLLECTING), R::V1);
+    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_HEALED));
+    a.add_reg_imm32(R::V1, 1);
+    a.store_ptr_disp32(R::V3, d(super::RT_HEALED), R::V1);
+    for reg in [R::V11, R::V10, R::V9, R::V8, R::V7, R::V6] {
+        a.pop_reg(reg);
+    }
+    a.store_ptr_disp32(R::V10, 0, R::V0);
+    a.jmp_label(restore);
+    a.bind_text_label(pass);
+    a.bind_text_label(restore);
+    a.pop_reg(R::V2);
+    a.pop_reg(R::V1);
+    a.pop_reg(R::V3);
     a.ret();
     // field_store: the store, then the generational write barrier: an Old
     // field that now holds a Young payload address joins the remset.
@@ -141,20 +211,27 @@ fn emit_forward<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E:
     a.bind_text_label(not_ref);
     a.ret();
     a.bind_text_label(heap);
-    // Old objects never move in a Young collection; in a full collection
-    // only those already in the new Old half stay.
+    // Only objects in this collection's from-space ranges move; everything
+    // else (to-space, Old outside a full collection) stays.
     let young = a.create_text_label();
-    a.cmp_reg_imm32(R::V1, YOUNG_END as i32);
-    a.jcc_label(C::Below, young);
-    a.load_ptr_disp32(R::V2, R::V3, d(super::RT_FULL));
-    a.test_reg_reg(R::V2, R::V2);
-    a.jcc_label(C::Equal, not_ref);
-    a.load_ptr_disp32(R::V2, R::V3, d(super::RT_OLD_BASE));
-    a.cmp_reg_reg(R::V1, R::V2);
-    a.jcc_label(C::Below, young);
-    a.add_reg_imm32(R::V2, super::OLD_HALF as i32);
-    a.cmp_reg_reg(R::V1, R::V2);
-    a.jcc_label(C::Below, not_ref);
+    for (lo, hi) in [
+        (super::RT_RY_LO, super::RT_RY_HI),
+        (super::RT_RO_LO, super::RT_RO_HI),
+    ] {
+        a.mov_reg_reg(R::V2, R::V1);
+        a.push_reg(R::V1);
+        a.load_ptr_disp32(R::V1, R::V3, d(lo));
+        a.sub_reg_reg(R::V2, R::V1);
+        a.load_ptr_disp32(R::V1, R::V3, d(hi));
+        a.push_reg(R::V0);
+        a.load_ptr_disp32(R::V0, R::V3, d(lo));
+        a.sub_reg_reg(R::V1, R::V0);
+        a.pop_reg(R::V0);
+        a.cmp_reg_reg(R::V2, R::V1);
+        a.pop_reg(R::V1);
+        a.jcc_label(C::Below, young);
+    }
+    a.jmp_label(not_ref);
     a.bind_text_label(young);
     a.shr_reg_imm8(R::V0, 16);
     a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
@@ -327,19 +404,26 @@ fn emit_remset_roots<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
 
 /// Scan to-space objects in allocation order, forwarding every reference
 /// field; copies append behind the cursor until it catches up.
-pub(super) fn emit_cheney_scan<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+pub(super) fn emit_cheney_init<E: PortableAsm>(a: &mut E) {
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_SPACE_BASE));
+    a.store_ptr_disp32(R::V3, d(RT_CS_PAGE), R::V0);
+    page_ptr(a, R::V8, R::V0, R::V1);
+    a.load_ptr_disp32(R::V0, R::V8, d(offset_of!(AllocationPage, start)));
+    a.store_ptr_disp32(R::V3, d(RT_CS_OFF), R::V0);
+}
+
+/// Resumable scan (`cheney`, V3 = runtime): processes objects until both
+/// cursors catch up (V0 = 1) or the object budget runs out (V0 = 0).
+fn emit_cheney<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     let pages = a.create_text_label();
     let objects = a.create_text_label();
     let fields = a.create_text_label();
     let next_object = a.create_text_label();
     let next_field = a.create_text_label();
     let done = a.create_text_label();
+    let paused = a.create_text_label();
     let page = |field: usize| d(field);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_SPACE_BASE));
-    a.store_ptr_disp32(R::V3, d(RT_CS_PAGE), R::V0);
-    page_ptr(a, R::V8, R::V0, R::V1);
-    a.load_ptr_disp32(R::V0, R::V8, page(offset_of!(AllocationPage, start)));
-    a.store_ptr_disp32(R::V3, d(RT_CS_OFF), R::V0);
+    a.bind_text_label(l.cheney);
     a.bind_text_label(pages);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_CS_PAGE));
     a.load_ptr_disp32(R::V1, R::V3, d(RT_NEXT_PAGE));
@@ -369,6 +453,8 @@ pub(super) fn emit_cheney_scan<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabe
     a.store_ptr_disp32(R::V3, d(RT_CS_OFF), R::V0);
     a.jmp_label(pages);
     a.bind_text_label(in_page);
+    spend(a, paused);
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_CS_OFF));
     // V1 = header offset. Reference-bearing descriptors: 2 and 4 (skip
     // the list's length word).
     a.load_ptr_disp32(R::V2, R::V3, d(RT_HEAP_BASE));
@@ -451,6 +537,8 @@ pub(super) fn emit_cheney_scan<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabe
     a.load_ptr_disp32(R::V1, R::V3, d(RT_OLD_TOP));
     a.cmp_reg_reg(R::V0, R::V1);
     a.jcc_label(C::AboveOrEqual, pages);
+    spend(a, paused);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_OLD_SCAN));
     a.load_ptr_disp32(R::V2, R::V3, d(RT_HEAP_BASE));
     a.add_reg_reg(R::V2, R::V0);
     a.load_ptr_disp32(R::V0, R::V2, d(offset_of!(ObjectHeader, descriptor_id)));
@@ -513,6 +601,20 @@ pub(super) fn emit_cheney_scan<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabe
     a.store_ptr_disp32(R::V3, d(RT_OLD_SCAN), R::V1);
     a.jmp_label(old_object);
     a.bind_text_label(finished);
+    a.mov_imm64(R::V0, 1);
+    a.ret();
+    a.bind_text_label(paused);
+    a.mov_imm64(R::V0, 0);
+    a.ret();
+}
+
+/// Take one object from the scan budget, or jump to `paused`.
+fn spend<E: PortableAsm>(a: &mut E, paused: E::TextLabel) {
+    a.load_ptr_disp32(R::V9, R::V3, d(super::RT_BUDGET));
+    a.test_reg_reg(R::V9, R::V9);
+    a.jcc_label(C::Equal, paused);
+    a.sub_reg_imm8(R::V9, 1);
+    a.store_ptr_disp32(R::V3, d(super::RT_BUDGET), R::V9);
 }
 
 /// `dst = heap_base + old_scan + header + index * 8`.
@@ -549,7 +651,7 @@ fn page_ptr<E: PortableAsm>(a: &mut E, dst: R, index: R, scratch: R) {
 /// shared 16-byte-rounded prefix, like the legacy routine: raw bytes word
 /// by word, records/lists slot by slot (a list's length word directly),
 /// recursing through referenced payloads. No allocation, no poll.
-fn emit_deep_equal<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+fn emit_deep_equal<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::DataLabel) {
     let yes = a.create_text_label();
     let no = a.create_text_label();
     let raw = a.create_text_label();
@@ -559,6 +661,23 @@ fn emit_deep_equal<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     let slot_next = a.create_text_label();
     let min_done = a.create_text_label();
     a.bind_text_label(l.deep_equal);
+    // During an open relocation phase an operand may be an evacuated
+    // source: follow its forwarding record to the copy.
+    for operand in [R::V7, R::V6] {
+        let direct = a.create_text_label();
+        a.test_reg_reg(operand, operand);
+        a.jcc_label(C::Equal, direct);
+        a.load_ptr_disp32(R::V0, operand, DESCRIPTOR);
+        a.mov_imm64(R::V1, FORWARDED);
+        a.cmp_reg_reg(R::V0, R::V1);
+        a.jcc_label(C::NotEqual, direct);
+        a.load_ptr_disp32(operand, operand, MARK_RECORD);
+        a.push_reg(R::V3);
+        load_runtime(a, runtime);
+        decode(a, operand, R::V0);
+        a.pop_reg(R::V3);
+        a.bind_text_label(direct);
+    }
     a.cmp_reg_reg(R::V7, R::V6);
     a.jcc_label(C::Equal, yes);
     a.test_reg_reg(R::V7, R::V7);

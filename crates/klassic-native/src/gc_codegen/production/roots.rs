@@ -158,6 +158,7 @@ pub(super) fn emit_verify<E: PortableAsm>(
     a.bind_text_label(l.verify);
     a.push_reg(R::V3);
     load_runtime(a, runtime);
+    a.call_label(l.finish);
     a.call_label(l.publish_pending);
     let pages = a.create_text_label();
     let objects = a.create_text_label();

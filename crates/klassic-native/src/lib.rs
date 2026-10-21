@@ -14756,6 +14756,13 @@ impl NativeCodeGenerator {
                 // backend's callers hold.
                 portable_asm::emit_gc_load_barrier(self, slow);
             }
+        } else if let Some(runtime) = &self.gc_gen {
+            // Untyped (scalar) reads also see generic payload addresses, so
+            // they take the generational load barrier too.
+            let load = runtime.labels.field_load;
+            self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
+            self.asm.call_label(load);
         } else {
             self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
         }
@@ -39606,6 +39613,7 @@ impl NativeCodeGenerator {
         for (name, offset) in [
             (&b" collections="[..], stats.collections),
             (&b" full_collections="[..], stats.full_collections),
+            (&b" healed="[..], stats.healed),
             (&b" promoted_bytes="[..], stats.promoted),
             (&b" allocated_bytes="[..], stats.allocated_bytes),
             (&b" pages_used="[..], stats.pages_used),
