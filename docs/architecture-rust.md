@@ -3098,3 +3098,15 @@ negative control that bypasses `field_store`. The runtime field offsets moved
 to `production/offsets.rs` to keep `production.rs` under 800 lines. Default,
 Windows and AArch64 non-generational output is byte-identical (177 of 177
 release builds of `test-programs/` and `examples/` compared).
+
+AArch64 fixed-size object allocation and scalar boxing now call the same
+register-preserving allocation trampoline as dynamic allocation. Incremental
+tracing's CAS adapter uses x12 as scratch; a direct call corrupted the split
+builder's x12 element count under `--gc-stress`, eventually overwriting live
+shadow roots with stack frame records. The focused macOS regression
+`build_target_aarch64_apple_darwin_gc_split_preserves_allocation_registers`
+executes split with retained list roots under stress and stress+poison; the
+existing GC corpus also exercises this path. This correctness repair changes
+AArch64 default code bytes intentionally. Linux/Windows emission is unchanged.
+The Linux ELF barrier harness is compiled only on Linux x86-64; fixed-width
+byte decoding uses array chunks for compatibility with current stable Clippy.

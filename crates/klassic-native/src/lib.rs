@@ -1,7 +1,7 @@
 pub mod gc_abi;
 #[cfg(test)]
 mod gc_atomic_tests;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod gc_barrier_harness_tests;
 mod gc_codegen;
 mod gc_model;
@@ -41308,7 +41308,7 @@ fn param_used_as_string_with_shadowing(
                 name: callee_name, ..
             } = callee.as_ref()
                 && is_string_only_receiver_builtin(callee_name)
-                && arguments.first().is_some_and(&names_param)
+                && arguments.first().is_some_and(names_param)
             {
                 return true;
             }
@@ -43289,8 +43289,10 @@ impl Assembler {
     fn i64s_for_label(&self, label: DataLabel, len: usize) -> Vec<i64> {
         let offset = self.data_labels[label.0];
         self.data[offset..offset + len * 8]
-            .chunks_exact(8)
-            .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("i64 chunk should be 8 bytes")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| i64::from_le_bytes(*bytes))
             .collect()
     }
 

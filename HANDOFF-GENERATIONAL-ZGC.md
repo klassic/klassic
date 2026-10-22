@@ -21,8 +21,9 @@ copying, a load barrier), but it covers a narrow program subset and a fraction
 of the spec: **0 of G01-G15 are met, 10 are partial, 5 are open**, no latency
 has been measured, and the spec's final audit does not exist. Do not say
 "complete" until `docs/gc/g01-g15-status.md` says so row by row with a named
-test, and spec sections 11 and 12 are done. The default collector is
-untouched and its output is byte-identical to before.
+test, and spec sections 11 and 12 are done. The default collector remains
+the default. The follow-up CI repair below intentionally changes AArch64
+allocation calls to preserve live registers.
 
 ---
 
@@ -398,6 +399,21 @@ evidence), implement, run the verification recipe, update
   backend. Kota chose **not** to add it for now.
 
 ---
+
+## Follow-up: cross-platform CI repair (PR #674)
+
+The initial handoff PR exposed three existing failures in the merged code:
+Linux stable Clippy rejected fixed-size `chunks_exact` decoding and a needless
+closure borrow; Windows tried to compile the Linux ELF barrier harness; and
+macOS GC stress corrupted the split builder's x12 loop counter. Fixed-size
+object allocation and scalar boxing bypassed the AArch64 allocation trampoline,
+so tracing's CAS scratch register escaped into caller state. Both now use the
+register-preserving trampoline. The focused regression is
+`build_target_aarch64_apple_darwin_gc_split_preserves_allocation_registers`;
+the existing stress/poison corpus and GC-log tests cover the wider path.
+AArch64 default output bytes change intentionally for this correctness fix;
+Linux and Windows output must remain byte-identical. The Linux ELF barrier
+harness is gated to Linux x86-64; it cannot execute on macOS or Windows.
 
 ## 10. Known soft spots (be suspicious here first)
 

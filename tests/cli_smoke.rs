@@ -29137,6 +29137,29 @@ println(total(keptTree))\n\
 const GC_CORPUS_EXPECTED: &str =
     "7880\n#Point(7, 11)\n[alpha, beta, gamma]\nalpha/beta/gamma\n22\n";
 
+// The split builder keeps its pending element count in x12 while it
+// allocates cons cells. GC tracing uses x12 as CAS scratch; bypassing the
+// allocation trampoline corrupts the count and then the machine stack.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn build_target_aarch64_apple_darwin_gc_split_preserves_allocation_registers() {
+    let source = r#"
+val keep = ["kept", "alive"]
+val parts = "a,b,c,d".split(",")
+println(size(parts))
+println(parts.join("-"))
+println(keep.join("/"))
+"#;
+    for flags in [vec!["--gc-stress"], vec!["--gc-stress", "--gc-poison"]] {
+        run_gc_corpus_program(
+            "split_registers",
+            &flags,
+            source,
+            "4\na-b-c-d\nkept/alive\n",
+        );
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn build_target_aarch64_apple_darwin_gc_corpus_runs_clean() {

@@ -4953,7 +4953,9 @@ impl Emitter {
     /// POINTER_RECORD (every payload slot a heap pointer), so the collector
     /// traces only the latter.
     fn emit_gc_alloc_object(&mut self, words: usize, shape: crate::gc_shape::BuiltinShape) {
-        let entry = self.gc_alloc_entry_label();
+        // Collection can use adapter scratch registers (including x12 in
+        // CAS). Preserve live caller state just as dynamic allocations do.
+        let entry = self.alloc_trampoline_label();
         crate::portable_asm::emit_gc_alloc_object(&mut self.asm, entry, (words * 8) as u64, shape);
     }
 
@@ -4963,7 +4965,7 @@ impl Emitter {
     /// list elements are boxed on write and unboxed on read (the uniform
     /// representation the shared enum lowering already uses).
     fn emit_box_scalar(&mut self) {
-        let entry = self.gc_alloc_entry_label();
+        let entry = self.alloc_trampoline_label();
         crate::portable_asm::emit_gc_box_scalar(&mut self.asm, entry);
     }
 
@@ -14249,8 +14251,10 @@ mod tests {
 
     fn words(asm: &Assembler) -> Vec<u32> {
         asm.code
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect()
     }
 

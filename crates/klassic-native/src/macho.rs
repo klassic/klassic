@@ -631,9 +631,9 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     }
     message.extend_from_slice(&bit_length.to_be_bytes());
 
-    for block in message.chunks_exact(64) {
+    for block in message.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (index, word) in block.chunks_exact(4).enumerate() {
+        for (index, word) in block.as_chunks::<4>().0.iter().enumerate() {
             w[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for index in 16..64 {
@@ -707,8 +707,10 @@ mod tests {
                 u32::from_le_bytes(image[text + 48..text + 52].try_into().unwrap()) as usize;
             let size = u64::from_le_bytes(image[text + 40..text + 48].try_into().unwrap()) as usize;
             let calls = image[offset..offset + size]
-                .chunks_exact(4)
-                .filter(|w| *w == 0xd63f_0200_u32.to_le_bytes())
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|w| **w == 0xd63f_0200_u32.to_le_bytes())
                 .count();
             assert_eq!(calls, if enabled { 6 } else { 0 }); // start/end for each of three phases
             let symbol = b"_clock_gettime\0";
