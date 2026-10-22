@@ -599,20 +599,42 @@ pub(super) fn emit_body<E: PortableAsm>(out: &mut E, operation: Operation) {
 
 fn x86_code(operation: Operation, windows: bool) -> Vec<u8> {
     let mut g = generator();
+    // Callback calls inside emitted routines need the host ABI too, not only
+    // the entry wrapper's argument-register conversion.
+    g.is_windows = windows;
     if windows {
+        let body = g.create_text_label();
         g.push_reg(P::V7); // Win64 rdi/rsi are nonvolatile
         g.push_reg(P::V6);
+        g.sub_reg_imm8(P::V4, 8); // align the internal call
         g.mov_reg_reg(P::V7, P::V1); // rcx -> rdi (address)
         g.mov_reg_reg(P::V6, P::V2); // rdx -> rsi (expected/value)
         g.mov_reg_reg(P::V2, P::V8); // r8 -> rdx (desired)
-    }
-    emit_body(&mut g, operation);
-    if windows {
+        // Some emitters contain their own RETs and nested routines. Call the
+        // body so every return reaches the register-restoring outer wrapper.
+        g.call_label(body);
+        g.add_reg_imm32(P::V4, 8);
         g.pop_reg(P::V6);
         g.pop_reg(P::V7);
+        g.ret();
+        g.bind_text_label(body);
     }
+    emit_body(&mut g, operation);
     g.ret();
     finish_code(g)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn gc_atomic_windows_nested_returns_restore_entry_registers() {
+    let bytes = x86_code(Operation::RootCopy, true)
+        .into_iter()
+        .map(|byte| byte.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let header = format!("static const unsigned char code[] = {{{bytes}}};\n");
+    let output = run_c_driver("gc_win_return_code.h", &header, "win_return_harness.c");
+    assert!(output.contains("Win64 nested returns restore entry registers PASS"));
 }
 
 fn finish_code(g: NativeCodeGenerator) -> Vec<u8> {
@@ -1053,15 +1075,8 @@ fn gc_atomic_all_operations_lower_for_both_isas() {
     }
 }
 
-#[test]
-fn gc_atomic_emitted_code_two_threads() {
+fn atomic_header(windows: bool, aarch64: bool, linux_workers: bool) -> String {
     use std::fmt::Write;
-    const {
-        assert!(
-            cfg!(any(target_arch = "x86_64", target_arch = "aarch64")),
-            "unsupported conformance host; no skip-success"
-        );
-    }
     let mut header = String::new();
     for (name, operation) in [
         ("load", Operation::Load),
@@ -1246,10 +1261,10 @@ fn gc_atomic_emitted_code_two_threads() {
         ("source_retire", Operation::SourceRetire),
         ("forward_incoming", Operation::ForwardIncoming),
     ] {
-        let bytes = if cfg!(target_arch = "aarch64") {
+        let bytes = if aarch64 {
             crate::aarch64::gc_atomic_test_code(operation)
         } else {
-            x86_code(operation, cfg!(target_os = "windows"))
+            x86_code(operation, windows)
         };
         write!(header, "static const unsigned char gc_code_{name}[] = {{").unwrap();
         for byte in bytes {
@@ -1257,7 +1272,7 @@ fn gc_atomic_emitted_code_two_threads() {
         }
         header.push_str("};\n");
     }
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    if linux_workers {
         header.push_str("#define GC_LINUX_WORKERS 1\n");
         for (name, bytes) in linux_worker_code() {
             write!(header, "static const unsigned char gc_code_{name}[] = {{").unwrap();
@@ -1269,6 +1284,26 @@ fn gc_atomic_emitted_code_two_threads() {
     }
     append_windows_metadata_header(&mut header);
     append_darwin_metadata_header(&mut header);
+    header
+}
+
+#[test]
+fn gc_atomic_emitted_code_two_threads() {
+    const {
+        assert!(
+            cfg!(any(target_arch = "x86_64", target_arch = "aarch64")),
+            "unsupported conformance host; no skip-success"
+        );
+    }
+    let header = atomic_header(
+        cfg!(target_os = "windows"),
+        cfg!(target_arch = "aarch64"),
+        cfg!(all(target_os = "linux", target_arch = "x86_64")),
+    );
+    // Export real Win64 bytes for independent cross-build / execution probes.
+    if let Some(path) = std::env::var_os("KLASSIC_GC_WINDOWS_ATOMIC_HEADER") {
+        std::fs::write(path, atomic_header(true, false, false)).unwrap();
+    }
     let stdout = run_c_driver("gc_atomic_code.h", &header, "atomic_harness.c");
     assert!(stdout.contains("root disposal race: 64 reader-release/FINISH races acquire completion before metadata and unmap PASS"), "{stdout}");
     assert!(stdout.contains("root finish notification: 96 owner-bound completions, 48 failed-wake retries and terminal replay PASS"), "{stdout}");
@@ -1855,6 +1890,11 @@ fn gc_atomic_emitted_code_two_threads() {
     assert!(stdout.contains("source retire OS: 16 copied objects and weak handles survive payload uncommit, metadata retirement and same-range recommit PASS"), "{stdout}");
     assert!(stdout.contains("native source payload: request-bound OS retry preserves weak metadata and defers budget credit PASS"), "{stdout}");
     assert!(
+        stdout.contains("native payload decommit: OS callback drives source retirement PASS"),
+        "{stdout}"
+    );
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    assert!(
         stdout.contains(
             "Linux payload decommit: direct syscall callback drives source retirement PASS"
         ),
@@ -2000,7 +2040,9 @@ pub(super) fn run_c_driver(header_name: &str, header: &str, harness: &str) -> St
     });
     let mut command = Command::new(cc);
     command.args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]);
-    if !cfg!(windows) {
+    if cfg!(windows) {
+        command.args(["-D_CRT_SECURE_NO_WARNINGS", "-D_CRT_USE_BUILTIN_OFFSETOF"]);
+    } else {
         command.arg("-pthread");
     }
     let output = command
@@ -2059,5 +2101,7 @@ pub(super) fn run_with_deadline(executable: &std::path::Path) -> std::process::O
 #[path = "gc_legacy_heal_tests.rs"]
 mod legacy_heal;
 
+// This fixture executes the ELF/PE x86-64 emitter, not AArch64 code.
+#[cfg(target_arch = "x86_64")]
 #[path = "gc_scope_lifetime_tests.rs"]
 mod scope_lifetime;

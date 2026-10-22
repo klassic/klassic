@@ -1,7 +1,9 @@
 # Handoff: Generational ZGC for Klassic
 
-Written 2026-10-23 for Codex. State as of branch `gc/generational-wip`,
-HEAD `6c8ab23` (base `9346bff` on `main`; **not pushed, not merged**).
+Written 2026-10-23 for Codex. **Already merged into `main` and pushed**:
+`origin/main` = `5c17545` (fast-forward from `9346bff`). The working branch
+`gc/generational-wip` still exists locally at the same commit; new work
+should branch from `main`.
 
 Read in this order: this file -> `docs/gc/g01-g15-status.md` (the scoreboard)
 -> `klassic-generational-zgc-instructions.md` (the spec, 13 sections) ->
@@ -19,8 +21,9 @@ copying, a load barrier), but it covers a narrow program subset and a fraction
 of the spec: **0 of G01-G15 are met, 10 are partial, 5 are open**, no latency
 has been measured, and the spec's final audit does not exist. Do not say
 "complete" until `docs/gc/g01-g15-status.md` says so row by row with a named
-test, and spec sections 11 and 12 are done. The default collector is
-untouched and its output is byte-identical to before.
+test, and spec sections 11 and 12 are done. The default collector remains
+the default. The follow-up CI repair below intentionally changes AArch64
+allocation calls to preserve live registers.
 
 ---
 
@@ -31,7 +34,7 @@ untouched and its output is byte-identical to before.
   `0d674e8`). **None of them was reachable from an ordinary compile**; ~211
   emitters were `#[allow(dead_code)]` and tested only in isolation. More
   isolated components do not advance G01-G15; one production path does.
-- This session built that path in milestones (all on `gc/generational-wip`):
+- This session built that path in milestones (built on `gc/generational-wip`, now in `main`):
 
 | Milestone | Commit(s) | What |
 |---|---|---|
@@ -245,7 +248,10 @@ callers add `ret`; relocations inside blobs are Rel32 to text labels only.
 ## 5. Rules of the repo and of this work
 
 - **Never `git add -A`** (a `.mcp.json` holding a secret exists). Add by path.
-  Commit only when asked. This branch: commits yes, **no push**.
+  Commit and push only when asked. Note `main` is branch-protected on GitHub
+  ("Changes must be made through a pull request"); the one direct push of
+  this work (`9346bff..5c17545`) was accepted by the remote anyway, but new
+  work should go through a PR.
 - `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D
   warnings`; full `cargo test` (includes a ~5 min sanitizer test
   `c_gc_passes_under_sanitizers`) must be green. Rust 2024.
@@ -370,11 +376,14 @@ evidence), implement, run the verification recipe, update
 
 ## 9. Decisions waiting on the owner (Kota)
 
-- **How to integrate `gc/generational-wip` into `main`.** 19 commits on top of `main` (the diff against `9346bff` is 511 files /
-  ~159k lines, almost all of it the earlier component work preserved in the
-  WIP checkpoint `0d674e8`; this session's own changes are the 18 commits
-  after it), nothing pushed. Needs a PR split/review order. Do not push or open
-  PRs without being asked.
+- **Integration is done**, by Kota's instruction: `gc/generational-wip` was
+  fast-forwarded into `main` and pushed directly (20 commits; the diff against
+  `9346bff` is 511 files / ~159k lines, almost all of it the earlier
+  component work preserved in the WIP checkpoint `0d674e8`; this session's
+  own changes are the commits after it). Full `cargo test` (26 suites),
+  fmt and clippy were green on `main` at `5c17545`. It bypassed the PR rule
+  noted in section 5, so reviewers have not seen it; expect to answer
+  review-style questions about it.
 - **AI-only-grown language.** Kota wants Klassic to be developed by AI only
   once the GC is stable, modelled on `onion-lang/onion` (README/AGENTS.md/
   CLAUDE.md there describe an "evolution loop": hourly Maintainer, half-hourly
@@ -390,6 +399,29 @@ evidence), implement, run the verification recipe, update
   backend. Kota chose **not** to add it for now.
 
 ---
+
+## Follow-up: cross-platform CI repair (PR #674)
+
+The initial handoff PR exposed three existing failures in the merged code:
+Linux stable Clippy rejected fixed-size `chunks_exact` decoding and a needless
+closure borrow; Windows tried to compile the Linux ELF barrier harness; and
+macOS GC stress corrupted the split builder's x12 loop counter. Fixed-size
+object allocation and scalar boxing bypassed the AArch64 allocation trampoline,
+so tracing's CAS scratch register escaped into caller state. Both now use the
+register-preserving trampoline. The focused regression is
+`build_target_aarch64_apple_darwin_gc_split_preserves_allocation_registers`;
+the existing stress/poison corpus and GC-log tests cover the wider path.
+AArch64 default output bytes change intentionally for this correctness fix;
+Linux and Windows output must remain byte-identical. The legacy AArch64 log
+also reports its existing monotonic `max_pause_ns`/`total_pause_ns` counters;
+the C/Rust ABI test normalizes Windows C stdout's CRLF line endings before
+comparing numeric output. Low-level conformance fixtures also use native test
+thread/mutex/park and aligned-allocation adapters on each OS. `GcHeapWalk` is
+the C cursor type (same layout and Rust `HeapWalk` type), avoiding the Win32
+API name. The x86 scope fixture is gated by ISA and uses host executable-memory
+APIs; atomic fixture callbacks use Win64 conventions on Windows and internal
+returns pass through a register-restoring outer wrapper. The Linux ELF barrier
+harness is gated to Linux x86-64; it cannot execute on macOS or Windows.
 
 ## 10. Known soft spots (be suspicious here first)
 

@@ -142,10 +142,11 @@ fn c_and_rust_layouts_and_reference_bits_match() {
     let mut source =
         String::from("#include \"gc_abi.h\"\n#include <assert.h>\n#include <stdio.h>\n");
     macro_rules! layout {
-        ($ty:ty $(, $field:ident)*) => {{
-            writeln!(source, "_Static_assert(sizeof({}) == {}, \"size\");", stringify!($ty), size_of::<$ty>()).unwrap();
-            writeln!(source, "_Static_assert(_Alignof({}) == {}, \"alignment\");", stringify!($ty), align_of::<$ty>()).unwrap();
-            $(writeln!(source, "_Static_assert(offsetof({}, {}) == {}, \"offset\");", stringify!($ty), stringify!($field), offset_of!($ty, $field)).unwrap();)*
+        ($ty:ty $(, $field:ident)*) => { layout!($ty => $ty $(, $field)*); };
+        ($ty:ty => $c_ty:ty $(, $field:ident)*) => {{
+            writeln!(source, "_Static_assert(sizeof({}) == {}, \"size\");", stringify!($c_ty), size_of::<$ty>()).unwrap();
+            writeln!(source, "_Static_assert(_Alignof({}) == {}, \"alignment\");", stringify!($c_ty), align_of::<$ty>()).unwrap();
+            $(writeln!(source, "_Static_assert(offsetof({}, {}) == {}, \"offset\");", stringify!($c_ty), stringify!($field), offset_of!($ty, $field)).unwrap();)*
         }};
     }
     layout!(GcRef);
@@ -856,7 +857,7 @@ fn c_and_rust_layouts_and_reference_bits_match() {
         cursor,
         observed
     );
-    layout!(HeapWalk, pool, heap, pages, page_count, cursor, lease);
+    layout!(HeapWalk => GcHeapWalk, pool, heap, pages, page_count, cursor, lease);
     layout!(
         ObjectWalk,
         lease,
@@ -1222,7 +1223,12 @@ int main(void) {
             format!("{} {}\n", r.bits(), decode_ref(r, 4096).unwrap())
         })
         .collect();
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    // Windows' C text stdout expands LF to CRLF; reference bits and decoded
+    // offsets must match exactly after normalizing that platform encoding.
+    let actual = String::from_utf8(output.stdout)
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert_eq!(actual, expected);
 }
 
 #[test]

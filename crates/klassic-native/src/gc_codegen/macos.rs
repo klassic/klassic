@@ -943,8 +943,10 @@ mod tests {
         a.finish();
         let words: Vec<_> = a
             .code
-            .chunks_exact(4)
-            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
             .collect();
         assert_eq!(words, [0x1000_0042, 0x10ff_ffe3]);
     }

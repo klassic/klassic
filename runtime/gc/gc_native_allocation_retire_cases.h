@@ -9,20 +9,19 @@
 #include "gc_relocate.h"
 #include "gc_forward_incoming.h"
 #include "gc_resolve.h"
-#include <pthread.h>
-#include <sched.h>
+#include "gc_test_threads.h"
 typedef struct {
     NativeAllocationRun *run;
-    pthread_mutex_t heap_lock;
+    GcTestMutex heap_lock;
     _Atomic unsigned attempts,done;
 } NativeRecordSealRace;
 static void *gc_record_seal_probe(void *arg){
     NativeRecordSealRace *race=arg;RelocationCopy stale={0};
     do{
-        assert(!pthread_mutex_lock(&race->heap_lock));
+        assert(!gc_test_mutex_lock(&race->heap_lock));
         assert(gc_native_allocation_install_copy_locked(race->run,race->run,&stale)==GC_TARGET_INVALID);
         assert(gc_native_records_begin_locked(race->run)==GC_SR_INVALID);
-        assert(!pthread_mutex_unlock(&race->heap_lock));
+        assert(!gc_test_mutex_unlock(&race->heap_lock));
         atomic_fetch_add_explicit(&race->attempts,1,memory_order_release);
     }while(!atomic_load_explicit(&race->done,memory_order_acquire));
     return NULL;
@@ -30,15 +29,15 @@ static void *gc_record_seal_probe(void *arg){
 /* Native disposal leaves the lock-published sealed state immutable. Even late
  * invalid admissions must reject before reading metadata being unmapped. */
 static void gc_record_seal_dispose_race(NativeAllocationRun *run,const NativeMetadataOps *ops){
-    NativeRecordSealRace race={.run=run};pthread_t thread;
-    assert(!pthread_mutex_init(&race.heap_lock,NULL));
-    assert(!pthread_create(&thread,NULL,gc_record_seal_probe,&race));
-    while(atomic_load_explicit(&race.attempts,memory_order_acquire)<32)sched_yield();
+    NativeRecordSealRace race={.run=run};GcTestThread thread;
+    assert(!gc_test_mutex_init(&race.heap_lock,NULL));
+    assert(!gc_test_thread_create(&thread,NULL,gc_record_seal_probe,&race));
+    while(atomic_load_explicit(&race.attempts,memory_order_acquire)<32)gc_test_yield();
     assert(gc_native_records_dispose(run,ops)==GC_POOL_OK);
     unsigned after=atomic_load_explicit(&race.attempts,memory_order_acquire);
-    while(atomic_load_explicit(&race.attempts,memory_order_acquire)-after<32)sched_yield();
+    while(atomic_load_explicit(&race.attempts,memory_order_acquire)-after<32)gc_test_yield();
     atomic_store_explicit(&race.done,1,memory_order_release);
-    assert(!pthread_join(thread,NULL));assert(!pthread_mutex_destroy(&race.heap_lock));
+    assert(!gc_test_thread_join(thread,NULL));assert(!gc_test_mutex_destroy(&race.heap_lock));
 }
 /* One scalar object, one registered root, no other actors/jobs/handles. The
  * root and its journal move away from the source, both tables are audited,

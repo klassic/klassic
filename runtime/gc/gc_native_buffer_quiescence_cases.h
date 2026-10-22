@@ -2,7 +2,7 @@
 #define KLASSIC_GC_NATIVE_BUFFER_QUIESCENCE_CASES_H
 #include "gc_native_buffer_quiescence.h"
 #include "gc_buffer_job_cases.h"
-#include <pthread.h>
+#include "gc_test_threads.h"
 typedef struct {
     MutatorContext ctx;
     HandshakeState handshake;
@@ -47,11 +47,11 @@ static void gc_run_native_buffer_quiescence_cases(BufferJobStep step){
         assert(gc_nbq_check(&f)==GC_NBQ_WAIT);
         f.job=(BarrierJob){.identity=f.ctx.thread_id,.selector=selector,.output=(uintptr_t)f.output,.capacity=256};
         assert(step(&f.ctx,&f.job,GC_BJ_CLAIM)==GC_BJ_OK);
-        pthread_t copier;assert(!pthread_create(&copier,NULL,gc_nbq_copy,&f));
+        GcTestThread copier;assert(!gc_test_thread_create(&copier,NULL,gc_nbq_copy,&f));
         /* COPY owns cursor outside the registry lock. The checker only reads
          * serial (unchanged until ACK), so these concurrent calls are valid. */
         for(unsigned i=0;i<4096;i++)assert(gc_nbq_check(&f)==GC_NBQ_WAIT);
-        assert(!pthread_join(copier,NULL));
+        assert(!gc_test_thread_join(copier,NULL));
         assert(gc_nbq_check(&f)==GC_NBQ_WAIT);
         assert(f.job.written==256&&!atomic_load(&b->consumed));
         /* All entries are null and token-free; complete processing is trivial. */

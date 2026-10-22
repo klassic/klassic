@@ -3098,3 +3098,38 @@ negative control that bypasses `field_store`. The runtime field offsets moved
 to `production/offsets.rs` to keep `production.rs` under 800 lines. Default,
 Windows and AArch64 non-generational output is byte-identical (177 of 177
 release builds of `test-programs/` and `examples/` compared).
+
+AArch64 fixed-size object allocation and scalar boxing now call the same
+register-preserving allocation trampoline as dynamic allocation. Incremental
+tracing's CAS adapter uses x12 as scratch; a direct call corrupted the split
+builder's x12 element count under `--gc-stress`, eventually overwriting live
+shadow roots with stack frame records. The focused macOS regression
+`build_target_aarch64_apple_darwin_gc_split_preserves_allocation_registers`
+executes split with retained list roots under stress and stress+poison; the
+existing GC corpus also exercises this path. This correctness repair changes
+AArch64 default code bytes intentionally. Linux/Windows emission is unchanged.
+The Linux ELF barrier harness is compiled only on Linux x86-64; fixed-width
+byte decoding uses array chunks for compatibility with current stable Clippy.
+
+The AArch64 legacy `--gc-log` report now includes `max_pause_ns` and
+`total_pause_ns`, connected to the existing monotonic-clock pause counters.
+The host-independent Mach-O clock wiring test checks that the report labels
+are present only with logging; real macOS stress execution checks positive
+and consistent timings. The C/Rust reference ABI comparison normalizes C
+stdout's Windows CRLF encoding before comparing exact numeric output.
+
+GC conformance fixtures now use test-only native thread/mutex adapters for the
+previously POSIX-only pin, retirement and buffer races. The pin-wait fixture
+keeps emitted futex leaves on Linux and uses native condition-variable parks
+on Windows/macOS; each target's dedicated worker tests retain OS-emitter
+coverage. Windows fixture payloads use matched aligned allocation/free calls.
+The C ABI cursor is named `GcHeapWalk` to avoid Win32's `HeapWalk` API, with
+unchanged layout and Rust type name verified by the ABI test. Atomic fixture
+callback emission now selects the Win64 ABI as well as adapting entry arguments.
+The Win64 wrapper calls the portable body as a separate subroutine, so emitters
+with internal RETs cannot bypass nonvolatile-register restoration. The executable
+regression `gc_atomic_windows_nested_returns_restore_entry_registers` also runs
+the Win64 wrapper on SysV x86-64 hosts.
+`KLASSIC_GC_WINDOWS_ATOMIC_HEADER` can export that fixture for independent
+cross-build execution. Scope-retirement fixtures execute only on x86-64,
+preserve Win64 nonvolatile registers and use the host's executable-memory API.

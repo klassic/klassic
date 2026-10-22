@@ -1,5 +1,7 @@
 #ifndef KLASSIC_GC_NATIVE_PIN_CASES_H
 #define KLASSIC_GC_NATIVE_PIN_CASES_H
+#include "gc_test_memory.h"
+#include "gc_test_threads.h"
 #include "gc_native_pin_progress.h"
 #include "gc_native_pin_registry.h"
 #include "gc_root_pin_cases.h"
@@ -120,7 +122,7 @@ static void gc_native_pin_progress_guard(PinDispatcher dispatch,NativePinOwnerOp
     WorkerRequest worker={(uintptr_t)&hs,(uintptr_t)&participant};
     assert(owner.worker(&roots,&worker,GC_WK_ATTACH)==GC_WK_OK);
     PinDispatchLock heap_lock={.context=&f.ctx},registry_lock={.context=&f.ctx};
-    assert(!pthread_mutex_init(&heap_lock.mutex,NULL)&&!pthread_mutex_init(&registry_lock.mutex,NULL));
+    assert(!gc_test_mutex_init(&heap_lock.mutex,NULL)&&!gc_test_mutex_init(&registry_lock.mutex,NULL));
     PinRuntime pins={&f.registry,(uintptr_t)&heap_lock,gc_pin_dispatch_lock,gc_pin_dispatch_unlock};
     NativeMetadataOps native=gc_native_metadata_ops();MetadataCharge charge={.owner=(uintptr_t)&f.heap};
     NativePinRuntime runtime={&pins,&roots,(uintptr_t)&registry_lock,
@@ -154,14 +156,14 @@ static void gc_native_pin_progress_guard(PinDispatcher dispatch,NativePinOwnerOp
     }
     assert(!f.pool.active&&!heap_lock.held&&!registry_lock.held);
     assert(heap_lock.locks==heap_lock.unlocks&&registry_lock.locks==registry_lock.unlocks);
-    assert(!pthread_mutex_destroy(&heap_lock.mutex)&&!pthread_mutex_destroy(&registry_lock.mutex));
+    assert(!gc_test_mutex_destroy(&heap_lock.mutex)&&!gc_test_mutex_destroy(&registry_lock.mutex));
 }
 static void gc_run_native_pin_cases(PinDispatcher dispatch,NativePinOwnerOps owner){
     NativeMetadataOps ops=gc_native_metadata_ops();
     gc_native_pin_progress_guard(dispatch,owner);
     for(unsigned marking=0;marking<4;marking++)for(unsigned generation=0;generation<2;generation++)for(unsigned mode=0;mode<5;mode++){
         RootPinFixture f;gc_root_pin_fixture(&f);
-        void *payload=aligned_alloc(16,3*GC_HEAP_PAGE_BYTES);assert(payload);
+        void *payload=gc_test_aligned_alloc(16,3*GC_HEAP_PAGE_BYTES);assert(payload);
         f.heap.heap_base=(uintptr_t)payload;
         for(unsigned i=0;i<2;i++)f.pages[i].heap_base=(uintptr_t)payload;
         f.pages[0].generation=generation;
@@ -215,10 +217,10 @@ static void gc_run_native_pin_cases(PinDispatcher dispatch,NativePinOwnerOps own
             assert(gc_pin_registry_bind_locked(inventory,&lease)==GC_RG_OK);
             assert(gc_metadata_step_locked(&f.pool,&lease,GC_ML_RELEASE)==GC_ML_OK);
         }
-        PinDispatchLock pin_lock={.context=&f.ctx};assert(!pthread_mutex_init(&pin_lock.mutex,NULL));
+        PinDispatchLock pin_lock={.context=&f.ctx};assert(!gc_test_mutex_init(&pin_lock.mutex,NULL));
         PinRuntime pin_runtime={inventory,(uintptr_t)&pin_lock,gc_pin_dispatch_lock,gc_pin_dispatch_unlock};
         PinDispatchLock registry_lock={.context=&f.ctx};
-        assert(!pthread_mutex_init(&registry_lock.mutex,NULL));
+        assert(!gc_test_mutex_init(&registry_lock.mutex,NULL));
         NativePinRuntime runtime={&pin_runtime,&registry,(uintptr_t)&registry_lock,
             gc_pin_dispatch_lock,gc_pin_dispatch_unlock,&f.heap,&ops};
         NativePin pin={0};
@@ -347,11 +349,11 @@ static void gc_run_native_pin_cases(PinDispatcher dispatch,NativePinOwnerOps own
         assert(gc_worker_step_locked(&registry,&worker,GC_WK_LEAVE_NATIVE)==GC_WK_OK);
         atomic_store(&f.ctx.state,GC_DETACHING);
         assert(gc_handshake_step_locked(&hs,&participant,GC_HS_DETACH)==GC_HS_OK&&!hs.members);
-        assert(!f.pool.active);free(payload);
+        assert(!f.pool.active);gc_test_aligned_free(payload);
         assert(!pin_lock.held&&pin_lock.locks==pin_lock.unlocks);
-        assert(!pthread_mutex_destroy(&pin_lock.mutex));
+        assert(!gc_test_mutex_destroy(&pin_lock.mutex));
         assert(!registry_lock.held&&registry_lock.locks==registry_lock.unlocks&&registry_lock.locks>1);
-        assert(!pthread_mutex_destroy(&registry_lock.mutex));
+        assert(!gc_test_mutex_destroy(&registry_lock.mutex));
     }
     puts("native pin progress: 40 worker-bound shutdowns, native retry, phase park and resume PASS");
     puts("native pin close: 40 package shutdowns, boundary requests, balanced locks and retry ownership PASS");

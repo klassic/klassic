@@ -559,6 +559,8 @@ static uint64_t emitted_pin_registry_step(PinPageRegistry *r,const MetadataLease
 #include "../../../runtime/gc/gc_weak_incoming_cases.h"
 #include "../../../runtime/gc/gc_weak_follow_cases.h"
 int main(void) {
+    /* Keep the last completed fixture visible if emitted code faults. */
+    assert(setvbuf(stdout,NULL,_IONBF,0)==0);
 #ifdef _WIN32
     InitializeCriticalSection(&latch.mutex);
     InitializeConditionVariable(&latch.condition);
@@ -694,11 +696,15 @@ int main(void) {
     Code pin_worker_step=load_code(gc_code_worker_step,sizeof(gc_code_worker_step));
     Code finish_notify=load_code(gc_code_root_finish_notify,sizeof(gc_code_root_finish_notify));
     Code pin_wait=load_code(gc_code_native_pin_wait,sizeof(gc_code_native_pin_wait));
+#ifdef GC_LINUX_WORKERS
     Code pin_notify=load_code(gc_code_registry_notify,sizeof(gc_code_registry_notify));
     Code pin_park=load_code(gc_code_worker_park,sizeof(gc_code_worker_park));
     gc_run_native_pin_wait_cases((NativePinWaitArm)pin_wait.memory,(PinEventNotify)pin_notify.memory,(PinEventPark)pin_park.memory,(RootFinishNotifier)finish_notify.memory);
-    unload_code(finish_notify);
-    unload_code(pin_wait);unload_code(pin_notify);unload_code(pin_park);
+    unload_code(pin_notify);unload_code(pin_park);
+#else
+    gc_run_native_pin_wait_cases((NativePinWaitArm)pin_wait.memory,gc_pin_event_notify,gc_pin_event_park,(RootFinishNotifier)finish_notify.memory);
+#endif
+    unload_code(pin_wait);unload_code(finish_notify);
     gc_run_native_heap_cases();
     gc_run_native_runtime_cases();
     gc_run_native_bitmap_cases();
@@ -866,16 +872,23 @@ int main(void) {
     Code weak_incoming=load_code(gc_code_weak_incoming,sizeof(gc_code_weak_incoming));
     gc_run_weak_incoming_cases((PendingFollower)pending_follow.memory,(WeakIncomingMetadata)metadata.memory,(WeakIncomingStepper)weak_incoming.memory);
     Code source_payload=load_code(gc_code_native_source_uncommit,sizeof(gc_code_native_source_uncommit));
+#ifdef GC_LINUX_WORKERS
     Code source_os_decommit=load_code(gc_code_heap_decommit,sizeof(gc_code_heap_decommit));
     NativePageDecommitter os_decommit=(NativePageDecommitter)source_os_decommit.memory;
     assert(!os_decommit(NULL,4096)&&!os_decommit((void *)4097,4096));
     assert(!os_decommit((void *)4096,0)&&!os_decommit((void *)4096,4097));
     assert(!os_decommit((void *)(uintptr_t)(UINT64_MAX&~UINT64_C(4095)),4096));
     assert(!os_decommit((void *)4096,4096));
-
-    gc_run_source_retire_pipeline((SourceRetirer)source_retire.memory,(PoolStep)pool.memory,(BudgetStep)budget.memory,(SourceUncommitter)source_uncommit.memory,(WeakTableFollower)weak_follow.memory,(WeakIncomingStepper)weak_incoming.memory,(WeakTableStepper)weak_table_access.memory,(SourcePayloadUncommitter)source_payload.memory,(NativePageDecommitter)source_os_decommit.memory);
+#else
+    NativePageDecommitter os_decommit=gc_native_heap_decommit_range;
+#endif
+    gc_run_source_retire_pipeline((SourceRetirer)source_retire.memory,(PoolStep)pool.memory,(BudgetStep)budget.memory,(SourceUncommitter)source_uncommit.memory,(WeakTableFollower)weak_follow.memory,(WeakIncomingStepper)weak_incoming.memory,(WeakTableStepper)weak_table_access.memory,(SourcePayloadUncommitter)source_payload.memory,os_decommit);
+    puts("native payload decommit: OS callback drives source retirement PASS");
+#ifdef GC_LINUX_WORKERS
     puts("Linux payload decommit: direct syscall callback drives source retirement PASS");
-    unload_code(source_payload);unload_code(source_os_decommit);
+    unload_code(source_os_decommit);
+#endif
+    unload_code(source_payload);
     unload_code(weak_table_access);
     unload_code(weak_incoming);
     unload_code(weak_follow);
