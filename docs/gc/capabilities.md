@@ -9,6 +9,8 @@ are dated snapshots, not assertions about the current tree.
 
 ## Current contract audit (2026-09-29)
 
+Per-capability status of the production `--gc=generational` path: [g01-g15-status.md](g01-g15-status.md).
+
 Update 2026-09-30: `--gc=generational` (M-G1) is the first ordinary compilation
 path that calls these components: on direct Linux x86-64 it allocates heap
 strings with the emitted `alloc_into` leaf, publishes them under a source guard,
