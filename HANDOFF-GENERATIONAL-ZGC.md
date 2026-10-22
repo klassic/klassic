@@ -1,7 +1,9 @@
 # Handoff: Generational ZGC for Klassic
 
-Written 2026-10-23 for Codex. State as of branch `gc/generational-wip`,
-HEAD `6c8ab23` (base `9346bff` on `main`; **not pushed, not merged**).
+Written 2026-10-23 for Codex. **Already merged into `main` and pushed**:
+`origin/main` = `5c17545` (fast-forward from `9346bff`). The working branch
+`gc/generational-wip` still exists locally at the same commit; new work
+should branch from `main`.
 
 Read in this order: this file -> `docs/gc/g01-g15-status.md` (the scoreboard)
 -> `klassic-generational-zgc-instructions.md` (the spec, 13 sections) ->
@@ -31,7 +33,7 @@ untouched and its output is byte-identical to before.
   `0d674e8`). **None of them was reachable from an ordinary compile**; ~211
   emitters were `#[allow(dead_code)]` and tested only in isolation. More
   isolated components do not advance G01-G15; one production path does.
-- This session built that path in milestones (all on `gc/generational-wip`):
+- This session built that path in milestones (built on `gc/generational-wip`, now in `main`):
 
 | Milestone | Commit(s) | What |
 |---|---|---|
@@ -245,7 +247,10 @@ callers add `ret`; relocations inside blobs are Rel32 to text labels only.
 ## 5. Rules of the repo and of this work
 
 - **Never `git add -A`** (a `.mcp.json` holding a secret exists). Add by path.
-  Commit only when asked. This branch: commits yes, **no push**.
+  Commit and push only when asked. Note `main` is branch-protected on GitHub
+  ("Changes must be made through a pull request"); the one direct push of
+  this work (`9346bff..5c17545`) was accepted by the remote anyway, but new
+  work should go through a PR.
 - `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D
   warnings`; full `cargo test` (includes a ~5 min sanitizer test
   `c_gc_passes_under_sanitizers`) must be green. Rust 2024.
@@ -370,11 +375,14 @@ evidence), implement, run the verification recipe, update
 
 ## 9. Decisions waiting on the owner (Kota)
 
-- **How to integrate `gc/generational-wip` into `main`.** 19 commits on top of `main` (the diff against `9346bff` is 511 files /
-  ~159k lines, almost all of it the earlier component work preserved in the
-  WIP checkpoint `0d674e8`; this session's own changes are the 18 commits
-  after it), nothing pushed. Needs a PR split/review order. Do not push or open
-  PRs without being asked.
+- **Integration is done**, by Kota's instruction: `gc/generational-wip` was
+  fast-forwarded into `main` and pushed directly (20 commits; the diff against
+  `9346bff` is 511 files / ~159k lines, almost all of it the earlier
+  component work preserved in the WIP checkpoint `0d674e8`; this session's
+  own changes are the commits after it). Full `cargo test` (26 suites),
+  fmt and clippy were green on `main` at `5c17545`. It bypassed the PR rule
+  noted in section 5, so reviewers have not seen it; expect to answer
+  review-style questions about it.
 - **AI-only-grown language.** Kota wants Klassic to be developed by AI only
   once the GC is stable, modelled on `onion-lang/onion` (README/AGENTS.md/
   CLAUDE.md there describe an "evolution loop": hourly Maintainer, half-hourly
