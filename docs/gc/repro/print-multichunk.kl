@@ -1,0 +1,7 @@
+def grow(s: String, n: Int): String = if (n <= 0) s else grow(s + s, n - 1)
+mutable k = 0
+while(k < 3) {
+  println(grow("abcdefgh", k + 9))
+  printlnError(grow("E", k))
+  k += 1
+}

@@ -1,0 +1,13 @@
+enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }
+def total(t: Tree): Int = t match { case Leaf(v) => v; case Branch(l, r) => total(l) + total(r) }
+def build(n: Int): Tree = if (n <= 0) Leaf(1) else Branch(build(n - 1), Leaf(n))
+def describe(s: String, n: Int): String = if (n <= 0) s else describe(s + "x", n - 1)
+val keep = build(200)
+mutable i = 0
+mutable acc = 0
+while(i < 40000) {
+  acc += length(describe("abcdefghij", i / 60000 + 20))
+  i += 1
+}
+println(acc)
+println(total(keep))

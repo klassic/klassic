@@ -1,0 +1,11 @@
+enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }
+def same(a: Tree, b: Tree): Boolean = a == b
+mutable i = 0
+mutable ok = 0
+while (i < 50000) {
+  if (same(Branch(Leaf(i), Leaf(i)), Branch(Leaf(i), Leaf(i)))) {
+    ok = ok + 1
+  }
+  i = i + 1
+}
+println(ok)

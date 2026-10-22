@@ -1,0 +1,4 @@
+enum L { case Nil; case Full(n: Int, junk: L) }
+def build(n: Int): L = if (n <= 0) Nil else Full(n, build(n - 1))
+def sz(x: L): Int = x match { case Nil => 0; case Full(n, j) => 1 + sz(j) }
+println(sz(build(40000)))

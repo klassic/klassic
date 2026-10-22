@@ -1,0 +1,3 @@
+enum Option<a> { case Some(value: a); case None }
+def firstOr(o, d) = o match { case Some(Some(v)) => v; case _ => d }
+println(firstOr(Some(Some("hi")), "x"))

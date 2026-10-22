@@ -1,0 +1,8 @@
+def describe(s: String, n: Int): String = if (n <= 0) s else describe(s + "x", n - 1)
+mutable i = 0
+mutable acc = 0
+while(i < 20000) {
+  acc += length(describe("abcdefghij", i / 60000 + 20))
+  i += 1
+}
+println(acc)
