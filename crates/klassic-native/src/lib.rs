@@ -1,6 +1,8 @@
 pub mod gc_abi;
 #[cfg(test)]
 mod gc_atomic_tests;
+#[cfg(test)]
+mod gc_barrier_harness_tests;
 mod gc_codegen;
 mod gc_model;
 #[cfg(test)]
@@ -4417,6 +4419,18 @@ struct WindowsRuntime {
     win_get_env_var: TextLabel,
 }
 
+/// Test-only machine-code program run in place of the source (the GC
+/// barrier harness): `body(generator, arg)` emits it after startup.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct GcTestProgram {
+    body: fn(&mut NativeCodeGenerator, u64),
+    arg: u64,
+    /// `spawn` fails, so no worker thread runs and the harness is
+    /// deterministic (the worker-build code is still emitted).
+    no_worker_thread: bool,
+}
+
 /// The M-G1 `--gc=generational` routines' labels and data.
 struct GenerationalRuntime {
     labels: gc_codegen::production::Labels<TextLabel>,
@@ -4554,6 +4568,10 @@ struct NativeCodeGenerator {
     /// `--gc=generational` spawned a GC worker thread (Linux): exits use
     /// `exit_group`.
     gc_worker_thread: bool,
+    /// Test-only: a machine-code program that replaces the compiled source
+    /// (see `gc_barrier_harness_tests`).
+    #[cfg(test)]
+    gc_test: Option<GcTestProgram>,
     gc_alloc: TextLabel,
     gc_collect: TextLabel,
     /// M6: the collector factored into separately-callable STW pieces.
@@ -5003,6 +5021,8 @@ impl NativeCodeGenerator {
             gc_generational: false,
             gc_gen: None,
             gc_worker_thread: false,
+            #[cfg(test)]
+            gc_test: None,
             gc_alloc,
             gc_collect,
             gc_mark_roots,
@@ -5673,6 +5693,13 @@ impl NativeCodeGenerator {
         // this call is a forward reference to a body whose size is not known
         // until then.
         self.asm.call_label(self.literal_root_seed);
+        #[cfg(test)]
+        if let Some(test) = self.gc_test {
+            (test.body)(&mut self, test.arg);
+        } else {
+            self.compile_top_level(expr)?;
+        }
+        #[cfg(not(test))]
         self.compile_top_level(expr)?;
         self.emit_queued_threads()?;
         if self.gc_log {
@@ -39624,6 +39651,12 @@ impl NativeCodeGenerator {
         let failed = self.asm.create_text_label();
         let child = self.asm.create_text_label();
         self.asm.bind_text_label(spawn);
+        #[cfg(test)]
+        if self.gc_test.is_some_and(|test| test.no_worker_thread) {
+            // Harness: a worker-build runtime whose worker never starts.
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.ret();
+        }
         self.asm.push_reg(Reg::Rbx);
         self.asm.mov_imm64(Reg::Rdi, STACK);
         self.asm.call_label(map);
@@ -39750,10 +39783,15 @@ impl NativeCodeGenerator {
             (&b" mark_drains="[..], stats.mark_drains),
             (&b" unmarked_copied="[..], stats.unmarked_copied),
             (&b" remset_dropped="[..], stats.remset_dropped),
+            (&b" remset_len="[..], stats.remset_len),
+            (&b" remset_flips="[..], stats.remset_flips),
+            (&b" remset_flipped="[..], stats.remset_flipped),
+            (&b" remset_kept="[..], stats.remset_kept),
         ]
         .into_iter()
         .enumerate()
-        .filter(|(index, _)| worker || *index < 8)
+        // Fields 8..18 are the worker's; the remembered-set ones always show.
+        .filter(|(index, _)| worker || !(8..18).contains(index))
         .map(|(_, field)| field)
         {
             let label = self.asm.data_label_with_bytes(name);

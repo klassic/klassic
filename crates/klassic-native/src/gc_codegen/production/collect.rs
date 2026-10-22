@@ -165,14 +165,21 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.bind_text_label(flipped);
     a.store_ptr_disp32(R::V3, d(super::RT_OLD_BASE), R::V1);
     a.store_ptr_disp32(R::V3, d(super::RT_OLD_TOP), R::V1);
-    // Everything is promoted, so no Young survivor needs a remembered field.
+    // Everything is promoted, so no Young survivor needs a remembered field:
+    // both sets (and the slot bits that dedupe them) are discarded.
     a.mov_imm64(R::V0, 0);
     a.store_ptr_disp32(R::V3, d(super::RT_REMSET_LEN), R::V0);
+    a.store_ptr_disp32(R::V3, d(super::RT_REMSET_PREV_LEN), R::V0);
+    lea_rt(a, R::V7, L.rbits as usize);
+    a.mov_imm64(R::V1, super::RBITS_WORDS);
+    a.call_label(l.zero);
     a.load_ptr_disp32(R::V0, R::V3, d(super::RT_FULL_COLLECTIONS));
     a.add_reg_imm32(R::V0, 1);
     a.store_ptr_disp32(R::V3, d(super::RT_FULL_COLLECTIONS), R::V0);
     a.jmp_label(decided);
     a.bind_text_label(young_only);
+    // G07: the current remembered set becomes the previous one.
+    super::remset::emit_flip(a);
     a.mov_imm64(R::V0, 0);
     a.store_ptr_disp32(R::V3, d(super::RT_FULL), R::V0);
     a.bind_text_label(decided);

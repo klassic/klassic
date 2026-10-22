@@ -27,11 +27,16 @@ mod collect;
 mod copy;
 mod enums;
 mod mark;
+mod offsets;
+mod remset;
 mod roots;
 mod scan;
 mod startup;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod worker;
 
+use offsets::*;
 pub(crate) use worker::WorkerHooks;
 
 /// Young pages prepared at startup (64 MiB of payload), split into two
@@ -131,7 +136,14 @@ struct Runtime {
     promoted: u64,
     remset_len: u64,
     rs_index: u64,
-    rs_write: u64,
+    /// Double-buffered remembered sets (G07): byte offset (from the
+    /// runtime block) of the *current* set, entries still unconsumed in
+    /// the *previous* set (non-zero only inside a pause), and counters.
+    remset_base: u64,
+    remset_prev_len: u64,
+    remset_flips: u64,
+    remset_flipped: u64,
+    remset_kept: u64,
     /// M-G6 worker: ticket lock, wake sequence (futex word), liveness,
     /// phase-scanned flag, objects scanned by the worker, pending wake,
     /// and the field word a Cheney heal expects (CAS).
@@ -219,6 +231,8 @@ struct Layout {
     roots: u64,
     roots_bytes: u64,
     remset: u64,
+    remset2: u64,
+    rbits: u64,
     mbits: u64,
     mstack: u64,
     total: u64,
@@ -238,7 +252,9 @@ const fn layout() -> Layout {
         + ROOT_CELLS * size_of::<RootCell>() as u64
         + JOURNAL_ENTRIES * size_of::<RootChange>() as u64;
     let remset = round_up(roots + roots_bytes, 64);
-    let mbits = round_up(remset + REMSET_ENTRIES * 8, 64);
+    let remset2 = round_up(remset + REMSET_ENTRIES * 8, 64);
+    let rbits = round_up(remset2 + REMSET_ENTRIES * 8, 64);
+    let mbits = round_up(rbits + RBITS_WORDS * 8, 64);
     let mstack = round_up(mbits + MBITS_WORDS * 8, 64);
     let total = round_up(mstack + MSTACK_ENTRIES * 8, 4096);
     Layout {
@@ -250,6 +266,8 @@ const fn layout() -> Layout {
         roots,
         roots_bytes,
         remset,
+        remset2,
+        rbits,
         mbits,
         mstack,
         total,
@@ -267,8 +285,11 @@ pub(super) const OLD_BYTES: u64 = 2 * OLD_HALF;
 /// A Young collection may promote at most one Young semispace.
 pub(super) const YOUNG_SEMI_BYTES: u64 = (PAGES / 2) * HEAP_PAGE_BYTES;
 pub(super) const HEAP_BYTES: u64 = YOUNG_END + OLD_BYTES;
-/// Remembered-set capacity: Old fields that hold Young payload addresses.
+/// Capacity of each of the two remembered sets (current/previous): Old
+/// fields that hold Young payload addresses.
 pub(super) const REMSET_ENTRIES: u64 = 1 << 20;
+/// Remembered-slot bitmap: one bit per 8-byte heap word.
+pub(super) const RBITS_WORDS: u64 = HEAP_BYTES / 8 / 64;
 /// Mark bitmap: one bit per 16-byte heap granule.
 pub(super) const MBITS_WORDS: u64 = HEAP_BYTES / 16 / 64;
 /// Mark stack capacity (each object is pushed at most once per cycle).
@@ -294,115 +315,8 @@ fn imm(value: u64) -> i32 {
     i32::try_from(value).expect("layout constant fits imm32")
 }
 
-const RT_CTX: usize = offset_of!(Runtime, ctx);
-const RT_BUILTINS: usize = offset_of!(Runtime, builtins);
-const RT_HEAP_BASE: usize = offset_of!(Runtime, heap_base);
-const RT_PAGES: usize = offset_of!(Runtime, pages);
-const RT_NEXT_PAGE: usize = offset_of!(Runtime, next_page);
-const RT_SEGMENT: usize = offset_of!(Runtime, segment);
-const RT_JOURNAL: usize = offset_of!(Runtime, journal);
-const RT_CELL_SP: usize = offset_of!(Runtime, cell_sp);
-const RT_ALLOC_SIZE: usize = offset_of!(Runtime, alloc_size);
-const RT_ADOPT_SLOT: usize = offset_of!(Runtime, adopt_slot);
-const RT_BIND_PAGE: usize = offset_of!(Runtime, bind_page);
-const RT_PENDING_REF: usize = offset_of!(Runtime, pending_ref);
-const RT_PENDING_PAGE: usize = offset_of!(Runtime, pending_page);
-const RT_PENDING_CELL: usize = offset_of!(Runtime, pending_cell);
-const RT_PUBLISHED: usize = offset_of!(Runtime, published);
-const RT_OBJECTS: usize = offset_of!(Runtime, objects);
-const RT_VERIFIED: usize = offset_of!(Runtime, verified);
-const RT_MARKS: usize = offset_of!(Runtime, marks);
-const RT_PAGES_USED: usize = offset_of!(Runtime, pages_used);
-const RT_SPACE_BASE: usize = offset_of!(Runtime, space_base);
-const RT_SPACE_END: usize = offset_of!(Runtime, space_end);
-const RT_COLLECTING: usize = offset_of!(Runtime, collecting);
-const RT_COLLECTIONS: usize = offset_of!(Runtime, collections);
-const RT_SCAN_INDEX: usize = offset_of!(Runtime, scan_index);
-const RT_SCAN_OLD: usize = offset_of!(Runtime, scan_old);
-const RT_SAVED_SIZE: usize = offset_of!(Runtime, saved_size);
-const RT_SAVED_ELEMENTS: usize = offset_of!(Runtime, saved_elements);
-const RT_SAVED_TAG: usize = offset_of!(Runtime, saved_tag);
-const RT_SAVED_DESCRIPTOR: usize = offset_of!(Runtime, saved_descriptor);
-const RT_FROM_BASE: usize = offset_of!(Runtime, from_base);
-const RT_FROM_END: usize = offset_of!(Runtime, from_end);
-const RT_FROM_MARKS: usize = offset_of!(Runtime, from_marks);
-const RT_ALLOC_TAG: usize = offset_of!(Runtime, alloc_tag);
-const RT_CS_PAGE: usize = offset_of!(Runtime, cs_page);
-const RT_CS_OFF: usize = offset_of!(Runtime, cs_off);
-const RT_CS_FIELD: usize = offset_of!(Runtime, cs_field);
-const RT_CS_COUNT: usize = offset_of!(Runtime, cs_count);
-const RT_FORWARD_CELL: usize = offset_of!(Runtime, forward_cell);
-const RT_SCAN_NEW: usize = offset_of!(Runtime, scan_new);
-const RT_OLD_TOP: usize = offset_of!(Runtime, old_top);
-const RT_OLD_BASE: usize = offset_of!(Runtime, old_base);
-const RT_OLD_FROM: usize = offset_of!(Runtime, old_from);
-const RT_OLD_FROM_END: usize = offset_of!(Runtime, old_from_end);
-const RT_FULL: usize = offset_of!(Runtime, full);
-const RT_FULL_COLLECTIONS: usize = offset_of!(Runtime, full_collections);
-const RT_PHASE_OPEN: usize = offset_of!(Runtime, phase_open);
-const RT_BUDGET: usize = offset_of!(Runtime, budget);
-const RT_RY_LO: usize = offset_of!(Runtime, ry_lo);
-const RT_RY_HI: usize = offset_of!(Runtime, ry_hi);
-const RT_RO_LO: usize = offset_of!(Runtime, ro_lo);
-const RT_RO_HI: usize = offset_of!(Runtime, ro_hi);
-const RT_HEALED: usize = offset_of!(Runtime, healed);
 /// Objects scanned per allocation while a relocation phase is open.
 const QUANTUM_OBJECTS: u64 = 64;
-const RT_OLD_SCAN: usize = offset_of!(Runtime, old_scan);
-const RT_PROMOTED: usize = offset_of!(Runtime, promoted);
-const RT_REMSET_LEN: usize = offset_of!(Runtime, remset_len);
-const RT_RS_INDEX: usize = offset_of!(Runtime, rs_index);
-const RT_RS_WRITE: usize = offset_of!(Runtime, rs_write);
-const RT_LOCK_NEXT: usize = offset_of!(Runtime, lock_next);
-const RT_LOCK_SERVING: usize = offset_of!(Runtime, lock_serving);
-const RT_WORK_SEQ: usize = offset_of!(Runtime, work_seq);
-const RT_WORKER_ALIVE: usize = offset_of!(Runtime, worker_alive);
-const RT_WORKER_DONE: usize = offset_of!(Runtime, worker_done);
-const RT_WORKER_SCANNED: usize = offset_of!(Runtime, worker_scanned);
-const RT_WAKE_PENDING: usize = offset_of!(Runtime, wake_pending);
-const RT_CS_OLD: usize = offset_of!(Runtime, cs_old);
-const RT_BOUNDS: usize = offset_of!(Runtime, bounds);
-const RT_COPY_LOW: usize = offset_of!(Runtime, copy_low);
-const RT_FROM_COPY_LOW: usize = offset_of!(Runtime, from_copy_low);
-const RT_RECYCLE_END: usize = offset_of!(Runtime, recycle_end);
-const RT_CB_PAGE: usize = offset_of!(Runtime, cb_page);
-const RT_CB_OFF: usize = offset_of!(Runtime, cb_off);
-const RT_PROGRESS: usize = offset_of!(Runtime, progress);
-const RT_W_PAGE: usize = offset_of!(Runtime, w_page);
-const RT_W_TOP: usize = offset_of!(Runtime, w_top);
-const RT_W_LIMIT: usize = offset_of!(Runtime, w_limit);
-const RT_W_SRC: usize = offset_of!(Runtime, w_src);
-const RT_W_NEW: usize = offset_of!(Runtime, w_new);
-const RT_W_DESC: usize = offset_of!(Runtime, w_desc);
-const RT_W_PROMOTED: usize = offset_of!(Runtime, w_promoted);
-const RT_W_UNMARKED: usize = offset_of!(Runtime, w_unmarked);
-const RT_WORKER_COPIES: usize = offset_of!(Runtime, worker_copies);
-const RT_WORKER_LOST: usize = offset_of!(Runtime, worker_lost);
-const RT_MUTATOR_COPIES: usize = offset_of!(Runtime, mutator_copies);
-const RT_MUTATOR_LOST: usize = offset_of!(Runtime, mutator_lost);
-const RT_M_COPYING: usize = offset_of!(Runtime, m_copying);
-const RT_MARK_ACTIVE: usize = offset_of!(Runtime, mark_active);
-const RT_MARK_DONE: usize = offset_of!(Runtime, mark_done);
-const RT_MARK_VALID: usize = offset_of!(Runtime, mark_valid);
-const RT_MSTACK_LEN: usize = offset_of!(Runtime, mstack_len);
-const RT_M_OBJ: usize = offset_of!(Runtime, m_obj);
-const RT_M_FIELD: usize = offset_of!(Runtime, m_field);
-const RT_M_COUNT: usize = offset_of!(Runtime, m_count);
-const RT_MARK_CYCLES: usize = offset_of!(Runtime, mark_cycles);
-const RT_MARKED: usize = offset_of!(Runtime, marked);
-const RT_MARK_DRAINS: usize = offset_of!(Runtime, mark_drains);
-const RT_UNMARKED: usize = offset_of!(Runtime, unmarked);
-const RT_REMSET_DROPPED: usize = offset_of!(Runtime, remset_dropped);
-const RT_LIT_MARK: usize = offset_of!(Runtime, lit_mark);
-const RT_SURVIVOR: usize = offset_of!(Runtime, survivor);
-const RT_REQUEST: usize = offset_of!(Runtime, request);
-const RT_INTO: usize = offset_of!(Runtime, into);
-const RT_RESULT: usize = offset_of!(Runtime, result);
-const RT_ALLOC_ROOT: usize = offset_of!(Runtime, alloc_root);
-const RT_FRAME_ROOT: usize = offset_of!(Runtime, frame_root);
-const RT_SPEC: usize = offset_of!(Runtime, spec);
-const RT_ACCESS: usize = offset_of!(Runtime, access);
-const RT_PUBLISH: usize = offset_of!(Runtime, publish);
 
 const HANDLE_CELL: usize = offset_of!(RootRequest, handle) + offset_of!(RootHandle, cell);
 const HANDLE_GENERATION: usize =
@@ -433,6 +347,10 @@ pub(crate) struct StatOffsets {
     pub mark_drains: i32,
     pub unmarked_copied: i32,
     pub remset_dropped: i32,
+    pub remset_len: i32,
+    pub remset_flips: i32,
+    pub remset_flipped: i32,
+    pub remset_kept: i32,
 }
 
 /// Offset of the copy-out buffer inside the runtime block.
@@ -460,6 +378,10 @@ pub(crate) fn stat_offsets() -> StatOffsets {
         mark_drains: d(RT_MARK_DRAINS),
         unmarked_copied: d(RT_UNMARKED),
         remset_dropped: d(RT_REMSET_DROPPED),
+        remset_len: d(RT_REMSET_LEN),
+        remset_flips: d(RT_REMSET_FLIPS),
+        remset_flipped: d(RT_REMSET_FLIPPED),
+        remset_kept: d(RT_REMSET_KEPT),
     }
 }
 

@@ -220,7 +220,7 @@ fn emit_cheney<E: PortableAsm>(
     a.shr_reg_imm8(R::V1, 16);
     a.cmp_reg_imm32(R::V1, YOUNG_END as i32);
     a.jcc_label(C::AboveOrEqual, old_next_field);
-    super::enums::remember(a, l, R::V2, R::V1, R::V6);
+    super::remset::remember(a, l, R::V2, R::V1, R::V6);
     a.bind_text_label(old_next_field);
     a.load_ptr_disp32(R::V7, R::V3, d(RT_CS_FIELD));
     a.add_reg_imm32(R::V7, 1);

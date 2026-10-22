@@ -649,3 +649,7 @@ mod linux_x86_64 {
 
 #[path = "gc_generational/aarch64_macho.rs"]
 mod aarch64_macho;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/remset_log.rs"]
+mod remset_log;

@@ -96,6 +96,7 @@ pub(super) fn emit_startup<E: PortableAsm>(
     store_rt_imm(a, RT_BOUNDS, HALF << 32);
     store_rt_imm(a, RT_OLD_TOP, YOUNG_END);
     store_rt_imm(a, RT_OLD_BASE, YOUNG_END);
+    store_rt_imm(a, RT_REMSET_BASE, L.remset);
     // Builtin descriptors; raw bytes (id 1) is the only one M-G1 allocates.
     lea_rt(a, R::V7, RT_BUILTINS);
     a.call_label(l.builtin_prepare);
