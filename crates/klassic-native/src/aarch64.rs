@@ -7698,7 +7698,14 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
     fn emit_println_list(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         let loop_start = self.asm.new_label();
         let close = self.asm.new_label();
-        self.asm.push(Reg::X0); // cursor survives the writes below
+        // Under --gc=generational every collection moves every object, so
+        // the cursor slot is a root: printing a nested element allocates.
+        let rooted = self.gc_gen.is_some();
+        if rooted {
+            self.push_rooted(Reg::X0);
+        } else {
+            self.asm.push(Reg::X0); // cursor survives the writes below
+        }
         self.asm.emit_write_rodata(STDOUT_FD, b"[");
         self.asm.pop(Reg::X3);
         self.asm.push(Reg::X3);
@@ -7721,7 +7728,11 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         self.asm.emit_write_rodata(STDOUT_FD, b", ");
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(close);
-        self.asm.pop(Reg::X3); // discard the cursor slot
+        if rooted {
+            self.pop_rooted(Reg::X3);
+        } else {
+            self.asm.pop(Reg::X3); // discard the cursor slot
+        }
         self.asm.emit_write_rodata(STDOUT_FD, b"]\n");
         Ok(())
     }
@@ -9638,10 +9649,20 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 self.emit_path_cstring(&arguments[0])?;
                 // The source waits as a root: a run-time target path allocates,
                 // and a collection would move the buffer it is parked in.
+                // Under --gc=generational a root must address an object's
+                // payload, not an interior byte, so the buffer's own address
+                // (payload - 8) is what waits; a rodata path stays external.
+                let generational = self.gc_gen.is_some();
+                if generational {
+                    self.asm.sub_reg_imm(Reg::X0, Reg::X0, 8);
+                }
                 self.push_rooted(Reg::X0);
                 self.emit_path_cstring(&arguments[1])?;
                 self.asm.mov_reg(Reg::X1, Reg::X0);
                 self.pop_rooted(Reg::X0);
+                if generational {
+                    self.asm.add_reg_imm(Reg::X0, Reg::X0, 8);
+                }
                 self.emit_dir_move();
                 Ok(Some(ValueType::Unit))
             }

@@ -113,3 +113,26 @@ fn aarch64_generational_survives_stress_collections() {
     assert!(stats["collections"] > 1000, "stats: {stats:?}");
     assert!(stats["promoted_bytes"] > 0, "stats: {stats:?}");
 }
+
+#[test]
+fn aarch64_generational_stress_roots_print_cursors_and_paths() {
+    // Printing a nested list allocates each inner list's text while the
+    // outer cursor waits (it must be a root under a moving collection), and
+    // FileInput#all reads through a native mapping rather than a 1 MiB heap
+    // buffer, which would exceed a generational page.
+    let source = "val grid = [[1 2 3] [4 5 6]]\n\
+                  println(grid)\n\
+                  val text = FileInput#all(\"Cargo.toml\")\n\
+                  println(length(text) > 0)\n";
+    let expected = evaluate("a64r_eval", source);
+    let flags = ["--gc=generational", "--gc-stress"];
+    let Some(run) = build_and_emulate("a64r", &flags, source) else {
+        return;
+    };
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+}
