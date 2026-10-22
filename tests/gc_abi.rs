@@ -1222,7 +1222,12 @@ int main(void) {
             format!("{} {}\n", r.bits(), decode_ref(r, 4096).unwrap())
         })
         .collect();
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    // Windows' C text stdout expands LF to CRLF; reference bits and decoded
+    // offsets must match exactly after normalizing that platform encoding.
+    let actual = String::from_utf8(output.stdout)
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert_eq!(actual, expected);
 }
 
 #[test]

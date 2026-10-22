@@ -13591,6 +13591,8 @@ impl Emitter {
         self.emit_gc_log_field(b" committed=", gc.committed_count);
         self.emit_gc_log_field(b" relocated=", gc.relocated_count);
         self.emit_gc_log_field(b" stw_fallbacks=", gc.stw_fallbacks);
+        self.emit_gc_log_field(b" max_pause_ns=", gc.pause_max_ns);
+        self.emit_gc_log_field(b" total_pause_ns=", gc.pause_total_ns);
         self.asm.emit_write_rodata(STDERR_FD, b"\n");
     }
 

@@ -715,6 +715,13 @@ mod tests {
             assert_eq!(calls, if enabled { 6 } else { 0 }); // start/end for each of three phases
             let symbol = b"_clock_gettime\0";
             assert_eq!(image.windows(symbol.len()).any(|s| s == symbol), enabled);
+            for field in [b" max_pause_ns=".as_slice(), b" total_pause_ns="] {
+                assert_eq!(
+                    image.windows(field.len()).any(|bytes| bytes == field),
+                    enabled,
+                    "logged pause counters must be reported",
+                );
+            }
         }
     }
     #[test]

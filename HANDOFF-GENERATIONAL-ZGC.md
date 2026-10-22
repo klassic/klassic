@@ -412,7 +412,10 @@ register-preserving trampoline. The focused regression is
 `build_target_aarch64_apple_darwin_gc_split_preserves_allocation_registers`;
 the existing stress/poison corpus and GC-log tests cover the wider path.
 AArch64 default output bytes change intentionally for this correctness fix;
-Linux and Windows output must remain byte-identical. The Linux ELF barrier
+Linux and Windows output must remain byte-identical. The legacy AArch64 log
+also reports its existing monotonic `max_pause_ns`/`total_pause_ns` counters;
+the C/Rust ABI test normalizes Windows C stdout's CRLF line endings before
+comparing numeric output. The Linux ELF barrier
 harness is gated to Linux x86-64; it cannot execute on macOS or Windows.
 
 ## 10. Known soft spots (be suspicious here first)

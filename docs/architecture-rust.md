@@ -3110,3 +3110,10 @@ existing GC corpus also exercises this path. This correctness repair changes
 AArch64 default code bytes intentionally. Linux/Windows emission is unchanged.
 The Linux ELF barrier harness is compiled only on Linux x86-64; fixed-width
 byte decoding uses array chunks for compatibility with current stable Clippy.
+
+The AArch64 legacy `--gc-log` report now includes `max_pause_ns` and
+`total_pause_ns`, connected to the existing monotonic-clock pause counters.
+The host-independent Mach-O clock wiring test checks that the report labels
+are present only with logging; real macOS stress execution checks positive
+and consistent timings. The C/Rust reference ABI comparison normalizes C
+stdout's Windows CRLF encoding before comparing exact numeric output.
