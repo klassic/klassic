@@ -3082,3 +3082,19 @@ barrier and equality routines only while a phase is open); worker heals are a
 CAS against the word read. The mutator, not the worker, finishes the phase at
 its next allocation. Exits become `exit_group`. Windows and Mach-O keep the
 single-threaded allocation quanta; the default output is byte-identical.
+
+G06/G07 (Linux x86-64 and Windows x86-64 `--gc=generational`): the
+remembered set is double buffered (`production/remset.rs`). Two arrays of
+`REMSET_ENTRIES` words exist and `remset_base` names the current one; a Young
+collection flips (previous := current) before its pause consumes the previous
+set as roots, re-registering an entry in the new current set only while its
+slot still holds a Young address. A slot bitmap makes each Old slot appear at
+most once, and a full collection discards both sets. `--gc-log` adds
+`remset_len= remset_flips= remset_flipped= remset_kept=`. Because no Klassic
+program overwrites a heap reference, the write barriers are tested by a
+`#[cfg(test)]` machine-code harness (`gc_barrier_harness_tests*`) that
+assembles the real runtime around a hand-written program; the SATB test has a
+negative control that bypasses `field_store`. The runtime field offsets moved
+to `production/offsets.rs` to keep `production.rs` under 800 lines. Default,
+Windows and AArch64 non-generational output is byte-identical (177 of 177
+release builds of `test-programs/` and `examples/` compared).

@@ -13,11 +13,11 @@ does not count here (see `capabilities.md` for that inventory).
 |---|---|---|---|---|---|
 | G01 | Young/Old, age, promotion | partial | `production/{collect,enums}.rs`: two Young semispaces, Old halves, age in `MarkRecord`, promotion on second survival | `generational_promotes_long_lived_data_and_collects_old` | age is a fixed 2-survival rule; identity (`object_id`) is not preserved across moves |
 | G02 | N mutators + GC workers | partial | `production/worker.rs`: one clone()d worker thread | `generational_worker_thread_relocates_concurrently` (+50 plain/50 stress/20 one-CPU runs) | exactly one mutator and one worker; no 2/8-mutator runs; Windows/Mach-O have no worker |
-| G03 | Concurrent marking, both generations | partial | `production/mark.rs`: bitmap, worker trace, SATB mark of overwritten refs | `generational_worker_marks_concurrently_and_claims_copies_by_cas` | marking does not drive evacuation (copy is reachability-driven); SATB path unexercised by any program; no per-generation marking |
+| G03 | Concurrent marking, both generations | partial | `production/mark.rs`: bitmap, worker trace, SATB mark of overwritten refs | `generational_worker_marks_concurrently_and_claims_copies_by_cas`; `satb_prebarrier_marks_the_overwritten_referent`, `without_the_prebarrier_the_same_overwrite_loses_the_object`, `overwriting_null_scalars_or_outside_a_cycle_marks_nothing` (harness) | marking does not drive evacuation (copy is reachability-driven); SATB is only exercised by the machine-code harness, never by a Klassic program; no per-generation marking |
 | G04 | Concurrent relocation/compaction | partial | `production/{copy,scan}.rs`: CAS-claimed copies, worker-private to-space, load-barrier relocation + heal | same test; race loops 120/120 correct | pages are semispaces, not selected by liveness; two pauses remain; copy loser path lightly tested |
 | G05 | Generational colored refs + load barrier | partial | single-color references in roots; `field_load` barrier for from-space ranges | `generational_enums_survive_evacuation`, stress-default `cli_smoke` | no per-generation remap epochs; heap fields hold raw addresses (range rule), not colored refs |
-| G06 | Generational store barrier | partial | `field_store` remembers Old->Young slots, marks overwritten value | `generational_promotes_long_lived_data_and_collects_old` | overwrite SATB untested (no program overwrites a heap reference); no color/epoch check |
-| G07 | Double remembered sets | open | single remset array (`REMSET_ENTRIES`) | - | no current/previous sets, no flip-time buffers, entries move with objects only via rescan |
+| G06 | Generational store barrier | partial | `field_store` marks the overwritten value (SATB) and remembers Old->Young slots (`production/{enums,remset}.rs`) | harness: `satb_prebarrier_marks_the_overwritten_referent` (+ negative control `without_the_prebarrier...`), `only_old_to_young_stores_register_and_a_slot_registers_once` (Old<-Young registers; null, non-heap word, Old referent, Young holder do not); `generational_promotes_long_lived_data_and_collects_old` | tested only through a hand-written harness program, not Klassic source; no color/epoch check; no per-mutator buffers |
+| G07 | Double remembered sets | partial | `production/remset.rs`: two arrays, flip at Young collection start, previous consumed as roots, kept entries re-registered, slot bitmap dedupe, full collection discards both | harness: `entries_flip_survive_while_young_and_are_dropped_when_old_or_dead`, `an_entry_of_a_dead_holder_is_dropped_by_a_complete_mark`, `a_full_collection_discards_both_sets_and_new_stores_use_the_moved_slot`, `stores_racing_with_the_worker_keep_the_sets_bounded_and_the_values_alive`; source level: `remembered_sets_flip_once_per_young_collection`, `remembered_sets_stay_bounded_under_stress_and_full_collections_discard_them` | the flip happens in the pause by the one mutator, so there are no per-mutator buffers, epochs or concurrent consumption; Old->Old slot remap is not needed (Old moves only in a full collection, which discards the sets); AArch64/Mach-O keeps its own single set |
 | G08 | Concurrent root processing | open | roots (RootCells, literal cells, remset) forwarded inside the pause | - | pause is O(roots); frames are one thread; no concurrent stack scan |
 | G09 | Old mark vs Young collection | open | full collections are stop-the-world flips | - | no Old mark preserved across Young cycles |
 | G10 | Heap/TLAB/metadata | partial | emitted `alloc_into` TLAB, 2^20 root cells, fixed 64+128 MiB heap | `generational_heap_exhaustion...`-class tests | fixed sizes; no hard/soft max, large objects (>128 KiB is an error), uncommit or pre-touch |
@@ -29,7 +29,7 @@ does not count here (see `capabilities.md` for that inventory).
 
 ## Counts
 
-Met: 0. Partial: 9 (G01, G02, G03, G04, G05, G06, G10, G11, G15). Open: 6 (G07, G08, G09, G12, G13, G14).
+Met: 0. Partial: 10 (G01, G02, G03, G04, G05, G06, G07, G10, G11, G15). Open: 5 (G08, G09, G12, G13, G14).
 
 ## What this does not claim
 
@@ -39,24 +39,25 @@ phase finish and the SATB slow path. The spec's final completion report
 (section 12) cannot be filed until every row is met with a named test and a
 measurement.
 
-## SATB cannot be reached from a Klassic program (2026-10-23)
+## SATB is reached only through a machine-code harness (2026-10-23)
 
 `field_store` runs on every `__gc_write`, but those are emitted only by the
 enum constructor, which writes into a freshly allocated record whose slots are
 null, so the SATB branch that marks a non-null overwritten reference never
-executes. `__gc_write` is a post-typecheck desugar product and cannot be
-written in source (`undefined variable`); the language has no assignment to
-a heap field. Exercising SATB therefore needs either a language feature
-(mutable record/enum fields, which touches the evaluator, checker and every
-backend) or a machine-code harness; the decision for this project was to keep
-the language unchanged, so the SATB pre-barrier is **untested** and G06/G03
-cannot move past partial until a harness exists.
+executes for a Klassic program (`__gc_write` is a post-typecheck desugar
+product; the language has no assignment to a heap field). The language stays
+unchanged; instead `crates/klassic-native/src/gc_barrier_harness_tests*`
+compiles the real production runtime around a hand-written instruction
+sequence and observes mark bits, counters and remembered-set contents (see
+`concurrent-plan.md`, "G06/G07 as implemented"). Mutation checks done while
+writing it: removing the SATB mark, the slot-bit dedupe, the re-registration
+of kept entries, and the full-collection discard each fail a named test.
 
 ## Next in order of dependency
 
-1. G06/G03: a program that overwrites a heap reference, to exercise SATB.
-2. G07: current/previous remembered sets.
-3. G05: per-generation colored references in heap fields.
-4. G08/G09: concurrent root scan, Old mark across Young cycles.
-5. G12/G13/G14: scheduler, native boundary, weak handles.
-6. G10/G11, then measurement (section 11) and the final audit.
+1. G06/G03/G07: done to the extent above; remaining are per-mutator buffers,
+   epochs and a SATB path reachable from source (needs mutable fields).
+2. G05: per-generation colored references in heap fields.
+3. G08/G09: concurrent root scan, Old mark across Young cycles.
+4. G12/G13/G14: scheduler, native boundary, weak handles.
+5. G10/G11, then measurement (section 11) and the final audit.

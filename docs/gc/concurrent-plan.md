@@ -177,8 +177,9 @@ Marking (`production/mark.rs`), snapshot-at-the-beginning:
   mark-start pause clears the 1-bit-per-granule bitmap and marks root cells
   and collection-literal cells. The worker traces Young and Old in quanta.
   New objects are marked at allocation; `field_store` marks the reference it
-  overwrites (SATB slow path, under the lock; no current program overwrites
-  a reference, so it is untested by programs).
+  overwrites (SATB slow path, under the lock). No Klassic program overwrites
+  a heap reference, so the barrier is tested by the machine-code harness
+  (`gc_barrier_harness_tests::satb`, below).
 - The relocation pause finishes the trace on the mutator if the worker left
   work (`mark_drains=`), then evacuation uses the mark: a remembered field
   whose Young referent is unmarked is dropped instead of copied
@@ -208,3 +209,41 @@ What still pauses or locks:
 Evidence: `generational_worker_marks_concurrently_and_claims_copies_by_cas`
 (mark cycles, worker copies, `unmarked_copied == 0`); race loops in the
 commit message.
+
+## G06/G07 as implemented (Linux x86-64 and Windows x86-64)
+
+The SATB pre-barrier and the remembered sets are not reachable from source
+(the language has no assignment to a heap field), so they are tested by a
+machine-code harness: `crates/klassic-native/src/gc_barrier_harness_tests*`
+compiles the real `production::emit` runtime (worker build) into an ELF whose
+program is a hand-written instruction sequence (a `#[cfg(test)]` hook in
+`NativeCodeGenerator::compile`). It allocates through `gc_alloc`, roots
+through RootCells, stores through `field_store`, drives `mark_start` /
+`mark_loop` and real collections, and prints `name=value` observations. By
+default `spawn` fails, so no worker thread runs and each interleaving is
+deterministic; `racing_stores` runs the real worker.
+
+- SATB: A.f0 = B, mark cycle starts, the mutator picks B up into a root
+  created after the snapshot, A.f0 is overwritten. With `field_store` B's
+  mark bit is set and counted once; with the same overwrite done as a plain
+  store (negative control) B stays unmarked after the mark drains and the
+  relocation pause reports `unmarked_copied >= 1`. Null / non-heap previous
+  values and overwrites outside a cycle mark nothing.
+- Remembered sets are double buffered. `remset_base` names the current of
+  two `REMSET_ENTRIES` arrays; stores (`field_store`) and the relocation scan
+  append to it. A Young-only collection *flips* first (previous := current,
+  current := empty) and its pause consumes the previous set as roots: each
+  referent is forwarded and the entry is re-registered in the new current set
+  only while its slot still holds a Young address (`remset_kept=`); dead
+  referents (complete mark) are counted in `remset_dropped=`. A full
+  collection promotes everything and moves every Old object, so both sets
+  and the slot bits are discarded. A slot bitmap (`rbits`, one bit per heap
+  word, set with an atomic fetch-or by whichever thread registers the slot)
+  makes each slot appear at most once, so repeated stores cannot grow a set.
+  `--gc-log` shows `remset_len= remset_flips= remset_flipped= remset_kept=`.
+- Honest limits: appends are still lock-free CAS appends and the flip is done
+  in the pause by the mutator, so "stores race with the consumer" is avoided
+  by the pause, not by lock-free buffer exchange; there are no per-mutator
+  buffers or flip-time epochs (one mutator); consumption is not concurrent.
+  Mach-O/AArch64 (a separate backend) keeps its own single remembered set.
+
