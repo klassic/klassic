@@ -9,6 +9,9 @@ fn gc_scope_retires_roots_before_reusing_stack_storage() {
     let mut entries = Vec::new();
     for roots in [1, 2, 8] {
         entries.push(g.asm.text.len());
+        // Preserve Win64 nonvolatile argument registers around the fixture.
+        g.push_reg(P::V7);
+        g.push_reg(P::V6);
         g.push_reg(P::V5);
         g.mov_reg_reg(P::V5, P::V4);
         // Keep an outer scope's storage alive while the inner scope exits.
@@ -27,6 +30,8 @@ fn gc_scope_retires_roots_before_reusing_stack_storage() {
         assert_eq!(g.next_stack_offset, 16);
         g.mov_reg_reg(P::V0, P::V2);
         g.leave();
+        g.pop_reg(P::V6);
+        g.pop_reg(P::V7);
         g.ret();
     }
     g.bind_text_label(g.gc_shadow_pop);

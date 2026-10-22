@@ -197,7 +197,7 @@ typedef struct { uint64_t page, incarnation, token; } MetadataLeaseRequest;
 /* One stable record per page-table index; independent metadata lifetime. */
 typedef struct { MetadataLeaseRequest lifetime;RelocationGate admission; } PinPageRecord;
 typedef struct { MetadataLeasePool *pool;PinPageRecord *records;uint64_t capacity; } PinPageRegistry;
-typedef struct { uint64_t pool,heap,pages,page_count,cursor; MetadataLeaseRequest lease; } HeapWalk;
+typedef struct { uint64_t pool,heap,pages,page_count,cursor; MetadataLeaseRequest lease; } GcHeapWalk;
 typedef struct { uint64_t lease,page,incarnation,table,used,cursor,source_offset; } ObjectWalk;
 typedef struct { uint64_t reference; MetadataLeaseRequest lease; } ReferenceLease;
 typedef struct { uint64_t registration, claim; MetadataLeaseRequest lease; } RememberedLease;
@@ -262,7 +262,7 @@ typedef struct {
 } HeapAuditSlice;
 typedef struct {
     uint64_t context,registry,gate,epoch,phase,target_start,target_limit,stage,findings;
-    HeapWalk walk;
+    GcHeapWalk walk;
     ObjectWalk object;
     HeapAuditSlice slice;
 } HeapAudit;

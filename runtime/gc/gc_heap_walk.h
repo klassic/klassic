@@ -19,8 +19,8 @@
 #define KLASSIC_GC_HEAP_WALK_H
 #include "gc_metadata.h"
 enum { GC_HW_PAGE=0,GC_HW_MORE=1,GC_HW_DONE=2,GC_HW_INVALID=3,GC_HW_FULL=4,GC_HW_EXHAUSTED=5,GC_HW_WAIT=6 };
-typedef uint64_t (*HeapWalker)(MetadataLeasePool *,HeapWalk *);
-static inline uint64_t gc_heap_walk_locked(MetadataLeasePool *g,HeapWalk *q){
+typedef uint64_t (*HeapWalker)(MetadataLeasePool *,GcHeapWalk *);
+static inline uint64_t gc_heap_walk_locked(MetadataLeasePool *g,GcHeapWalk *q){
     if(!g||((uintptr_t)g&7)||!q||((uintptr_t)q&7)||q->pool!=(uintptr_t)g||
        !g->heap||(g->heap&7)||q->heap!=g->heap||q->lease.page||q->lease.incarnation||q->lease.token)return GC_HW_INVALID;
     HeapPool *h=(HeapPool *)(uintptr_t)g->heap;

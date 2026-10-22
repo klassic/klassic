@@ -1,5 +1,6 @@
 #ifndef KLASSIC_GC_ROOT_PIN_CASES_H
 #define KLASSIC_GC_ROOT_PIN_CASES_H
+#include "gc_test_memory.h"
 #include "gc_root_pin.h"
 #include <assert.h>
 #include <stdio.h>
@@ -66,7 +67,7 @@ static inline RootPinOps gc_root_pin_c_ops(void){
 static void gc_run_root_pin_cases(RootPinOps ops){
     for(unsigned scenario=0;scenario<9;scenario++){
         RootPinFixture f;gc_root_pin_fixture(&f);
-        void *mapping=aligned_alloc(16,3*GC_HEAP_PAGE_BYTES);assert(mapping);
+        void *mapping=gc_test_aligned_alloc(16,3*GC_HEAP_PAGE_BYTES);assert(mapping);
         f.heap.heap_base=(uintptr_t)mapping;
         for(unsigned i=0;i<2;i++){
             f.pages[i].heap_base=(uintptr_t)mapping;
@@ -157,7 +158,7 @@ static void gc_run_root_pin_cases(RootPinOps ops){
             assert(!f.pages[i].metadata_leases);
         }
         assert(!f.pool.active);
-        free(mapping);
+        gc_test_aligned_free(mapping);
     }
     puts("root pin: canonical forwarding, independent root, guard exit, native interval and resumable cleanup PASS");
 }

@@ -415,7 +415,12 @@ AArch64 default output bytes change intentionally for this correctness fix;
 Linux and Windows output must remain byte-identical. The legacy AArch64 log
 also reports its existing monotonic `max_pause_ns`/`total_pause_ns` counters;
 the C/Rust ABI test normalizes Windows C stdout's CRLF line endings before
-comparing numeric output. The Linux ELF barrier
+comparing numeric output. Low-level conformance fixtures also use native test
+thread/mutex/park and aligned-allocation adapters on each OS. `GcHeapWalk` is
+the C cursor type (same layout and Rust `HeapWalk` type), avoiding the Win32
+API name. The x86 scope fixture is gated by ISA and uses host executable-memory
+APIs; atomic fixture callbacks use Win64 conventions on Windows and internal
+returns pass through a register-restoring outer wrapper. The Linux ELF barrier
 harness is gated to Linux x86-64; it cannot execute on macOS or Windows.
 
 ## 10. Known soft spots (be suspicious here first)

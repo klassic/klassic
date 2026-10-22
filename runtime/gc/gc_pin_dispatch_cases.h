@@ -2,22 +2,22 @@
 #define KLASSIC_GC_PIN_DISPATCH_CASES_H
 #include "gc_pin_dispatch.h"
 #include "gc_root_pin_cases.h"
-#include <pthread.h>
-typedef struct { pthread_mutex_t mutex;MutatorContext *context;unsigned held,locks,unlocks; } PinDispatchLock;
+#include "gc_test_threads.h"
+typedef struct { GcTestMutex mutex;MutatorContext *context;unsigned held,locks,unlocks; } PinDispatchLock;
 static void gc_pin_dispatch_lock(uint64_t value){
     PinDispatchLock *lock=(void *)(uintptr_t)value;
     assert(!atomic_load(&lock->context->access_epoch)&&!lock->held);
-    assert(!pthread_mutex_lock(&lock->mutex));lock->held=1;lock->locks++;
+    assert(!gc_test_mutex_lock(&lock->mutex));lock->held=1;lock->locks++;
 }
 static void gc_pin_dispatch_unlock(uint64_t value){
     PinDispatchLock *lock=(void *)(uintptr_t)value;
-    assert(lock->held);lock->held=0;lock->unlocks++;assert(!pthread_mutex_unlock(&lock->mutex));
+    assert(lock->held);lock->held=0;lock->unlocks++;assert(!gc_test_mutex_unlock(&lock->mutex));
 }
 typedef uint64_t (*PinDispatcher)(const PinRuntime *,RootPin *,uint64_t);
 static void gc_run_pin_dispatch_cases(PinDispatcher dispatch){
     for(unsigned mode=0;mode<6;mode++){
         RootPinFixture f;gc_root_pin_fixture(&f);
-        PinDispatchLock lock={.context=&f.ctx};assert(!pthread_mutex_init(&lock.mutex,NULL));
+        PinDispatchLock lock={.context=&f.ctx};assert(!gc_test_mutex_init(&lock.mutex,NULL));
         PinRuntime runtime={&f.registry,(uintptr_t)&lock,gc_pin_dispatch_lock,gc_pin_dispatch_unlock};
         assert(gc_root_pin_prepare(&f.registry,&f.ctx,&f.input,&f.output,&f.pin)==GC_RPIN_MORE);
         if(mode==0){
@@ -72,7 +72,7 @@ static void gc_run_pin_dispatch_cases(PinDispatcher dispatch){
             MetadataLeaseRequest lease=f.records[i].lifetime;
             assert(gc_pin_registry_unbind_locked(&f.registry,&lease)==GC_RG_OK);
         }
-        assert(!pthread_mutex_destroy(&lock.mutex));
+        assert(!gc_test_mutex_destroy(&lock.mutex));
     }
     puts("pin dispatch: native mutex ownership, guard-only exit, sticky cancellation and resume/flush retries PASS");
 }

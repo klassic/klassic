@@ -4,11 +4,11 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-#include <pthread.h>
+#include "gc_test_threads.h"
 typedef uint64_t (*PinPageStep)(RelocationGate *,RelocationGateRequest *,uint64_t);
 typedef struct {
     PinPageStep step;
-    pthread_mutex_t lock;
+    GcTestMutex lock;
     RelocationGate page;
     RelocationPermit permit;
     RelocationGateRequest pin,selection;
@@ -16,18 +16,18 @@ typedef struct {
 } PinPageRace;
 static void *gc_pin_page_racer(void *arg){
     PinPageRace *r=arg;
-    assert(!pthread_mutex_lock(&r->lock));
+    assert(!gc_test_mutex_lock(&r->lock));
     r->pinned=r->step(&r->page,&r->pin,GC_PP_PIN);
-    assert(!pthread_mutex_unlock(&r->lock));return NULL;
+    assert(!gc_test_mutex_unlock(&r->lock));return NULL;
 }
 static void gc_run_pin_page_races(PinPageStep step){
     for(unsigned i=0;i<128;i++){
         PinPageRace r={.step=step,.page={.epoch=1}};
-        assert(!pthread_mutex_init(&r.lock,NULL));r.pin.permit=(uintptr_t)&r.permit;
-        pthread_t thread;assert(!pthread_create(&thread,NULL,gc_pin_page_racer,&r));
-        assert(!pthread_mutex_lock(&r.lock));
+        assert(!gc_test_mutex_init(&r.lock,NULL));r.pin.permit=(uintptr_t)&r.permit;
+        GcTestThread thread;assert(!gc_test_thread_create(&thread,NULL,gc_pin_page_racer,&r));
+        assert(!gc_test_mutex_lock(&r.lock));
         r.selected=step(&r.page,&r.selection,GC_PP_SELECT);
-        assert(!pthread_mutex_unlock(&r.lock));assert(!pthread_join(thread,NULL));
+        assert(!gc_test_mutex_unlock(&r.lock));assert(!gc_test_thread_join(thread,NULL));
         assert((r.selected==GC_RG_OK&&r.pinned==GC_RG_WAIT)||
                (r.selected==GC_RG_WAIT&&r.pinned==GC_RG_OK));
         if(r.pinned==GC_RG_OK){
@@ -36,7 +36,7 @@ static void gc_run_pin_page_races(PinPageStep step){
         }
         assert(step(&r.page,&r.selection,GC_PP_REOPEN)==GC_RG_OK);
         assert(!r.page.active&&!r.page.head&&!r.page.closed);
-        assert(!pthread_mutex_destroy(&r.lock));
+        assert(!gc_test_mutex_destroy(&r.lock));
     }
     puts("page pin admission: 128 two-actor selection races PASS");
 }

@@ -4,12 +4,12 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-typedef struct {MetadataLeasePool pool;HeapWalk walk;HeapPool heap;MetadataLeaseSlot slots[2];AllocationPage pages[9];} HeapWalkFixture;
+typedef struct {MetadataLeasePool pool;GcHeapWalk walk;HeapPool heap;MetadataLeaseSlot slots[2];AllocationPage pages[9];} HeapWalkFixture;
 static void heap_walk_fixture(HeapWalkFixture *f){
     memset(f,0,sizeof(*f));
     f->pool=(MetadataLeasePool){(uintptr_t)&f->heap,(uintptr_t)f->slots,1,1,0};
     f->heap.pages=(uintptr_t)f->pages;f->heap.page_count=9;
-    f->walk=(HeapWalk){(uintptr_t)&f->pool,(uintptr_t)&f->heap,(uintptr_t)f->pages,9,0,{0}};
+    f->walk=(GcHeapWalk){(uintptr_t)&f->pool,(uintptr_t)&f->heap,(uintptr_t)f->pages,9,0,{0}};
     for(unsigned i=0;i<9;i++){
         f->pages[i].incarnation=27+i;f->pages[i].run_head=i;
         atomic_store(&f->pages[i].state,i);

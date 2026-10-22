@@ -1145,7 +1145,7 @@ static void graph_allocation_ack(GraphAllocationObserver *w,uint64_t sequence){
 // retirement: the cycle still owns every logical/native control lifetime.
 static uint64_t graph_forward_range_audit(MarkGraph *g,HeapWalker next,ForwardIncomingScanner incoming,
     uint64_t epoch,uint64_t phase,GraphAuditRange range){
-    HeapWalk walk={(uintptr_t)&g->m.leases,(uintptr_t)&g->m.f.h,g->m.f.h.pages,g->m.f.h.page_count,0,{0}};
+    GcHeapWalk walk={(uintptr_t)&g->m.leases,(uintptr_t)&g->m.f.h,g->m.f.h.pages,g->m.f.h.page_count,0,{0}};
     uint64_t findings=0,heads=0,keys=0;unsigned steps=0;
     for(;;){
         metadata_lock(&g->m);
@@ -2303,7 +2303,7 @@ static void gc_run_mark_graph(const GraphLifecycle *lifecycle,const GraphRemembe
         // Enumerate the real pool, including large-run tails and protected
         // payload sources. Joined workers and this exclusive owner keep page
         // topology stable. Leases do not make payloads safe to dereference.
-        HeapWalk heap_walk={(uintptr_t)&g.m.leases,(uintptr_t)&g.m.f.h,g.m.f.h.pages,g.m.f.h.page_count,0,{0}};
+        GcHeapWalk heap_walk={(uintptr_t)&g.m.leases,(uintptr_t)&g.m.f.h,g.m.f.h.pages,g.m.f.h.page_count,0,{0}};
         unsigned seen_source=0,seen_old=0,seen_uncommitted=0,seen_objects=0;
         unsigned canonical_objects=0,forwarded_objects=0,seen_records=0,field_slices=0,heap_findings=0;
         unsigned aged_records=0;uint64_t young_live_bytes=0;
