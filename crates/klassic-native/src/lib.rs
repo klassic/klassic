@@ -4551,6 +4551,9 @@ struct NativeCodeGenerator {
     /// Labels and data of the M-G1 routines, created by `compile` when
     /// `gc_generational` is set.
     gc_gen: Option<GenerationalRuntime>,
+    /// `--gc=generational` spawned a GC worker thread (Linux): exits use
+    /// `exit_group`.
+    gc_worker_thread: bool,
     gc_alloc: TextLabel,
     gc_collect: TextLabel,
     /// M6: the collector factored into separately-callable STW pieces.
@@ -4999,6 +5002,7 @@ impl NativeCodeGenerator {
             gc_evac_off: false,
             gc_generational: false,
             gc_gen: None,
+            gc_worker_thread: false,
             gc_alloc,
             gc_collect,
             gc_mark_roots,
@@ -5753,6 +5757,11 @@ impl NativeCodeGenerator {
     }
 
     fn emit_syscall_number(&mut self, syscall: PlatformSyscall) {
+        if self.gc_worker_thread && matches!(syscall, PlatformSyscall::Exit) {
+            // exit_group: the generational GC worker thread must end too.
+            self.asm.mov_imm64(Reg::Rax, 231);
+            return;
+        }
         self.asm
             .mov_imm64(Reg::Rax, self.platform.syscall_number(syscall));
     }
@@ -39521,7 +39530,19 @@ impl NativeCodeGenerator {
             deep_equal: self.gc_deep_equal,
             literals: self.asm.create_text_label(),
         };
-        let labels = Labels::new(|| self.asm.create_text_label(), map, alloc, backend);
+        let mut labels = Labels::new(|| self.asm.create_text_label(), map, alloc, backend);
+        if !self.is_windows {
+            // M-G6: relocation runs on a GC worker thread (clone + futex).
+            let hooks = gc_codegen::production::WorkerHooks {
+                spawn: self.asm.create_text_label(),
+                park: self.asm.create_text_label(),
+                unpark: self.asm.create_text_label(),
+                relax: self.asm.create_text_label(),
+            };
+            labels = labels.with_worker(hooks, || self.asm.create_text_label());
+            // A second thread outlives `exit`; every exit must end the group.
+            self.gc_worker_thread = true;
+        }
         let data = Data {
             runtime: self.asm.data_label_with_bytes(&[0; 8]),
             fail_text: self.asm.data_label_with_bytes(FAIL_TEXT),
@@ -39559,11 +39580,90 @@ impl NativeCodeGenerator {
         } else {
             gc_codegen::native_metadata::emit_linux_map(self);
         }
+        if let (Some(hooks), Some(entry)) =
+            (runtime.labels.worker_hooks(), runtime.labels.worker_entry())
+        {
+            let (spawn, park, unpark) = (hooks.spawn, hooks.park, hooks.unpark);
+            let relax = hooks.relax;
+            self.emit_generational_worker_leaves(spawn, park, unpark, entry, runtime.labels.map);
+            // relax: sched_yield, keeping every register.
+            self.asm.bind_text_label(relax);
+            for reg in [Reg::Rax, Reg::Rcx, Reg::R11] {
+                self.asm.push_reg(reg);
+            }
+            self.asm.mov_imm64(Reg::Rax, 24);
+            self.asm.syscall();
+            for reg in [Reg::R11, Reg::Rcx, Reg::Rax] {
+                self.asm.pop_reg(reg);
+            }
+            self.asm.ret();
+        }
         let stderr_fd = self.platform.stderr_fd();
         let stress = self.gc_stress;
         gc_codegen::production::emit(self, &runtime.labels, &runtime.data, stderr_fd, stress);
         self.emit_generational_write_heap_string(runtime.write_heap_string, runtime.data.runtime);
         self.gc_gen = Some(runtime);
+    }
+
+    /// Linux leaves for the `--gc=generational` worker thread.
+    /// `spawn`: `() -> rax = 1` when a thread now runs `entry` on a fresh
+    /// mapped stack (`clone` with a shared address space), else 0; keeps rbx.
+    /// `park`: `futex(FUTEX_WAIT_PRIVATE)` on (rdi = u32 address, rsi =
+    /// expected). `unpark`: `futex(FUTEX_WAKE_PRIVATE, 1)` on rdi.
+    fn emit_generational_worker_leaves(
+        &mut self,
+        spawn: TextLabel,
+        park: TextLabel,
+        unpark: TextLabel,
+        entry: TextLabel,
+        map: TextLabel,
+    ) {
+        const STACK: u64 = 256 << 10;
+        // CLONE_VM | FS | FILES | SIGHAND | THREAD | SYSVSEM
+        const FLAGS: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x40000;
+        let failed = self.asm.create_text_label();
+        let child = self.asm.create_text_label();
+        self.asm.bind_text_label(spawn);
+        self.asm.push_reg(Reg::Rbx);
+        self.asm.mov_imm64(Reg::Rdi, STACK);
+        self.asm.call_label(map);
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, failed);
+        self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
+        self.asm.add_reg_imm32(Reg::Rsi, STACK as i32);
+        self.asm.mov_imm64(Reg::Rdi, FLAGS);
+        self.asm.mov_imm64(Reg::Rdx, 0);
+        self.asm.mov_imm64(Reg::R10, 0);
+        self.asm.mov_imm64(Reg::R8, 0);
+        self.asm.mov_imm64(Reg::Rax, 56); // clone
+        self.asm.syscall();
+        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jcc_label(Condition::Equal, child);
+        self.asm.jcc_label(Condition::Less, failed);
+        self.asm.mov_imm64(Reg::Rax, 1);
+        self.asm.pop_reg(Reg::Rbx);
+        self.asm.ret();
+        self.asm.bind_text_label(failed);
+        self.asm.mov_imm64(Reg::Rax, 0);
+        self.asm.pop_reg(Reg::Rbx);
+        self.asm.ret();
+        // The child starts on the empty new stack with the parent's
+        // registers; it never returns.
+        self.asm.bind_text_label(child);
+        self.asm.jmp_label(entry);
+        for (label, op, value) in [(park, 128u64, None), (unpark, 129u64, Some(1u64))] {
+            self.asm.bind_text_label(label);
+            if let Some(count) = value {
+                self.asm.mov_imm64(Reg::Rdx, count);
+            } else {
+                self.asm.mov_reg_reg(Reg::Rdx, Reg::Rsi);
+            }
+            self.asm.mov_imm64(Reg::Rsi, op);
+            self.asm.mov_imm64(Reg::R10, 0);
+            self.asm.mov_imm64(Reg::Rax, 202); // futex
+            self.asm.syscall();
+            self.asm.ret();
+        }
     }
 
     /// `write(fd, bytes)` for a heap string without handing the kernel a
@@ -39627,6 +39727,7 @@ impl NativeCodeGenerator {
         let cell = runtime.data.runtime;
         self.asm.call_label(verify);
         let stats = gc_codegen::production::stat_offsets();
+        let worker = self.gc_worker_thread;
         let text = b"gc[generational]:";
         let label = self.asm.data_label_with_bytes(text);
         self.emit_write_data(self.platform.stderr_fd(), label, text.len());
@@ -39639,7 +39740,11 @@ impl NativeCodeGenerator {
             (&b" pages_used="[..], stats.pages_used),
             (&b" objects="[..], stats.objects),
             (&b" published="[..], stats.published),
-        ] {
+            (&b" worker_scanned="[..], stats.worker_scanned),
+        ]
+        .into_iter()
+        .filter(|(name, _)| worker || !name.starts_with(b" worker"))
+        {
             let label = self.asm.data_label_with_bytes(name);
             self.emit_write_data(self.platform.stderr_fd(), label, name.len());
             self.asm.mov_data_addr(Reg::Rdi, cell);

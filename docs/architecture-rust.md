@@ -3071,3 +3071,14 @@ adapter with x86 flag semantics restored (`FlagAsm`), frame roots stay on the
 shadow stack and are forwarded in place through the `literals` hook, and the
 legacy allocation/store/equality labels wrap the generational routines. Checked
 under the unicorn emulator only; the default AArch64 output is byte-identical.
+
+M-G6 step 5 (Linux x86-64): `--gc=generational` relocates on a GC worker
+thread. Startup `clone`s a thread (shared address space, own mapped stack)
+that, after each pause, runs the resumable Cheney scan in 64-object quanta
+while the mutator runs its own code, parking on a futex when idle. Collector
+state is shared, so collector operations run under one fair ticket lock (the
+mutator takes it in allocation, the barrier slow path, and its root, write
+barrier and equality routines only while a phase is open); worker heals are a
+CAS against the word read. The mutator, not the worker, finishes the phase at
+its next allocation. Exits become `exit_group`. Windows and Mach-O keep the
+single-threaded allocation quanta; the default output is byte-identical.

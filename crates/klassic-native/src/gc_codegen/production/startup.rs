@@ -164,6 +164,7 @@ pub(super) fn emit_startup<E: PortableAsm>(
     store_rt_addr(a, RT_INTO + offset_of!(AllocationInto, root), RT_ALLOC_ROOT);
     // Cell 0 is the allocation scratch root; frame roots use cells 1...
     root_step(a, l, RT_ALLOC_ROOT, ROOT_RESERVE);
+    super::worker::emit_spawn_call(a, l);
     a.pop_reg(R::V3);
     a.ret();
 }

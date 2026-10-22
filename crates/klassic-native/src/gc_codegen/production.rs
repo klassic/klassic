@@ -27,6 +27,9 @@ mod collect;
 mod enums;
 mod roots;
 mod startup;
+mod worker;
+
+pub(crate) use worker::WorkerHooks;
 
 /// Young pages prepared at startup (64 MiB of payload), split into two
 /// semispaces of `HALF` pages: allocation fills one, a collection evacuates
@@ -126,6 +129,17 @@ struct Runtime {
     remset_len: u64,
     rs_index: u64,
     rs_write: u64,
+    /// M-G6 worker: ticket lock, wake sequence (futex word), liveness,
+    /// phase-scanned flag, objects scanned by the worker, pending wake,
+    /// and the field word a Cheney heal expects (CAS).
+    lock_next: u64,
+    lock_serving: u64,
+    work_seq: u64,
+    worker_alive: u64,
+    worker_done: u64,
+    worker_scanned: u64,
+    wake_pending: u64,
+    cs_old: u64,
     marks: MarkArena,
     request: AllocationRequest,
     into: AllocationInto,
@@ -282,6 +296,14 @@ const RT_PROMOTED: usize = offset_of!(Runtime, promoted);
 const RT_REMSET_LEN: usize = offset_of!(Runtime, remset_len);
 const RT_RS_INDEX: usize = offset_of!(Runtime, rs_index);
 const RT_RS_WRITE: usize = offset_of!(Runtime, rs_write);
+const RT_LOCK_NEXT: usize = offset_of!(Runtime, lock_next);
+const RT_LOCK_SERVING: usize = offset_of!(Runtime, lock_serving);
+const RT_WORK_SEQ: usize = offset_of!(Runtime, work_seq);
+const RT_WORKER_ALIVE: usize = offset_of!(Runtime, worker_alive);
+const RT_WORKER_DONE: usize = offset_of!(Runtime, worker_done);
+const RT_WORKER_SCANNED: usize = offset_of!(Runtime, worker_scanned);
+const RT_WAKE_PENDING: usize = offset_of!(Runtime, wake_pending);
+const RT_CS_OLD: usize = offset_of!(Runtime, cs_old);
 const RT_REQUEST: usize = offset_of!(Runtime, request);
 const RT_INTO: usize = offset_of!(Runtime, into);
 const RT_RESULT: usize = offset_of!(Runtime, result);
@@ -310,6 +332,7 @@ pub(crate) struct StatOffsets {
     pub pages_used: i32,
     pub objects: i32,
     pub published: i32,
+    pub worker_scanned: i32,
 }
 
 /// Offset of the copy-out buffer inside the runtime block.
@@ -327,6 +350,7 @@ pub(crate) fn stat_offsets() -> StatOffsets {
         pages_used: d(RT_PAGES_USED),
         objects: d(RT_OBJECTS),
         published: d(RT_VERIFIED),
+        worker_scanned: d(RT_WORKER_SCANNED),
     }
 }
 
@@ -390,6 +414,10 @@ pub(crate) struct Labels<T> {
     oom: T,
     too_large: T,
     old_full: T,
+    /// Recursive body of `deep_equal` (the entry locks around it).
+    deep_equal_body: T,
+    /// M-G6 GC worker thread (None: the single-threaded incremental path).
+    worker: Option<worker::WorkerLabels<T>>,
 }
 
 /// Labels the backend already calls, bound to M-G routines under the flag.
@@ -443,7 +471,25 @@ impl<T: Copy> Labels<T> {
             oom: create(),
             too_large: create(),
             old_full: create(),
+            deep_equal_body: create(),
+            worker: None,
         }
+    }
+
+    /// Run relocation on a GC worker thread spawned through `hooks`.
+    pub(crate) fn with_worker(mut self, hooks: WorkerHooks<T>, create: impl FnMut() -> T) -> Self {
+        self.worker = Some(worker::WorkerLabels::new(hooks, create));
+        self
+    }
+
+    /// Entry of the worker thread (the backend's `spawn` jumps here).
+    pub(crate) fn worker_entry(&self) -> Option<T> {
+        self.worker.as_ref().map(|w| w.entry)
+    }
+
+    /// The backend hooks the worker was configured with.
+    pub(crate) fn worker_hooks(&self) -> Option<&WorkerHooks<T>> {
+        self.worker.as_ref().map(|w| &w.hooks)
     }
 }
 
@@ -562,6 +608,7 @@ pub(crate) fn emit<E: PortableAsm>(
     stress: bool,
 ) {
     emit_leaves(a, l);
+    worker::emit_worker(a, l, data.runtime);
     startup::emit_startup(a, l, data.runtime);
     alloc::emit_alloc(a, l, data.runtime, stress);
     collect::emit_collect(a, l);

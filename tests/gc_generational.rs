@@ -540,6 +540,57 @@ mod linux_x86_64 {
         assert!(compared >= 50, "compared {compared}, declined {declined}");
     }
 
+    /// A long-lived tree stays reachable (and is read) while each iteration
+    /// builds and drops a fresh one, so a collection opens a relocation
+    /// phase with a large to-space left to scan.
+    const WORKER_PROGRAM: &str = "enum Tree { case Leaf(v: Int); case Node(l: Tree, r: Tree) }\n\
+        def build(d: Int): Tree = if (d == 0) Leaf(1) else Node(build(d - 1), build(d - 1))\n\
+        def sum(t: Tree): Int = t match { case Leaf(v) => v; case Node(l, r) => sum(l) + sum(r) }\n\
+        val keep = build(14)\n\
+        mutable i = 0\n\
+        mutable total = 0\n\
+        while (i < 200) {\n\
+          val t = build(10)\n\
+          total += sum(t)\n\
+          if (i / 50 * 50 == i) { total += sum(keep) }\n\
+          i += 1\n\
+        }\n\
+        println(total)\n\
+        println(sum(keep))\n";
+
+    #[test]
+    fn generational_worker_thread_relocates_concurrently() {
+        // The worker reports the objects it scanned; the mutator keeps
+        // allocating and reading the evacuated tree meanwhile. Each build
+        // runs several times to shake out races between the two threads.
+        let expected = evaluate("worker_eval", WORKER_PROGRAM);
+        for flags in [
+            &["--gc=generational", "--gc-log"][..],
+            &["--gc=generational", "--gc-log", "--gc-stress"],
+        ] {
+            let source_path = write_source("worker", WORKER_PROGRAM);
+            let output_path = temp_path("worker", "bin");
+            let result = build(flags, &source_path, &output_path);
+            let _ = fs::remove_file(&source_path);
+            assert!(
+                result.status.success(),
+                "stderr:\n{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            for _ in 0..5 {
+                let run = Command::new(&output_path).output().expect("binary runs");
+                let stderr = String::from_utf8_lossy(&run.stderr);
+                assert!(run.status.success(), "{flags:?} stderr:\n{stderr}");
+                assert_eq!(String::from_utf8_lossy(&run.stdout), expected, "{flags:?}");
+                let stats = gc_stats(&stderr);
+                assert!(stats["collections"] >= 1, "{flags:?} stats: {stats:?}");
+                assert!(stats["worker_scanned"] > 0, "{flags:?} stats: {stats:?}");
+                assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
+            }
+            let _ = fs::remove_file(&output_path);
+        }
+    }
+
     #[test]
     fn generational_builds_an_int_program() {
         let run = build_and_run(

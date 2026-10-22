@@ -12,6 +12,7 @@ pub(super) fn emit_alloc<E: PortableAsm>(
     a.bind_text_label(l.alloc);
     a.push_reg(R::V3);
     load_runtime(a, runtime);
+    worker::lock_if(a, l, false);
     // Advance an open relocation phase by one bounded quantum.
     a.push_reg(R::V7);
     a.push_reg(R::V6);
@@ -27,6 +28,8 @@ pub(super) fn emit_alloc<E: PortableAsm>(
         a.call_label(l.collect);
     }
     a.call_label(l.alloc_raw);
+    worker::unlock_if(a, l, false);
+    worker::wake_if_pending(a, l);
     a.pop_reg(R::V3);
     a.ret();
 

@@ -129,6 +129,7 @@ fn emit_field_access<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtim
     for reg in [R::V6, R::V7, R::V8, R::V9, R::V10, R::V11] {
         a.push_reg(reg);
     }
+    super::worker::lock_if(a, l, false);
     a.mov_imm64(R::V2, 1);
     a.store_ptr_disp32(R::V3, d(super::RT_COLLECTING), R::V2);
     a.shl_reg_imm8(R::V1, 16);
@@ -148,6 +149,7 @@ fn emit_field_access<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtim
         a.pop_reg(reg);
     }
     a.store_ptr_disp32(R::V10, 0, R::V0);
+    super::worker::unlock_if(a, l, false);
     a.jmp_label(restore);
     a.bind_text_label(pass);
     a.bind_text_label(restore);
@@ -165,6 +167,7 @@ fn emit_field_access<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtim
     a.push_reg(R::V2);
     a.push_reg(R::V3);
     load_runtime(a, runtime);
+    super::worker::lock_if(a, l, true);
     a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
     a.mov_reg_reg(R::V0, R::V7);
     a.sub_reg_reg(R::V0, R::V1);
@@ -179,6 +182,7 @@ fn emit_field_access<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtim
     a.load_ptr_disp32(R::V6, R::V7, 0);
     remember(a, l, R::V7, R::V1, R::V2);
     a.bind_text_label(done);
+    super::worker::unlock_if(a, l, true);
     a.load_ptr_disp32(R::V6, R::V7, 0);
     a.pop_reg(R::V3);
     a.pop_reg(R::V2);
@@ -479,6 +483,7 @@ fn emit_cheney<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.jcc_label(C::AboveOrEqual, next_object);
     field_address(a, R::V2, R::V7);
     a.load_ptr_disp32(R::V0, R::V2, 0);
+    super::worker::remember_read(a, l);
     // A field is a reference iff it addresses a heap page's payload.
     a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
     a.sub_reg_reg(R::V0, R::V1);
@@ -496,7 +501,7 @@ fn emit_cheney<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.add_reg_reg(R::V0, R::V1);
     a.load_ptr_disp32(R::V7, R::V3, d(RT_CS_FIELD));
     field_address(a, R::V2, R::V7);
-    a.store_ptr_disp32(R::V2, 0, R::V0);
+    super::worker::heal(a, l, next_field);
     a.bind_text_label(next_field);
     a.load_ptr_disp32(R::V7, R::V3, d(RT_CS_FIELD));
     a.add_reg_imm32(R::V7, 1);
@@ -560,6 +565,7 @@ fn emit_cheney<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.jcc_label(C::AboveOrEqual, old_next_object);
     old_field_address(a, R::V2, R::V7);
     a.load_ptr_disp32(R::V0, R::V2, 0);
+    super::worker::remember_read(a, l);
     // Any heap payload address (Young, or old-half Old in a full
     // collection) is forwarded; forward leaves non-moving ones alone.
     heap_offset(a, R::V0, R::V1, old_next_field);
@@ -574,7 +580,7 @@ fn emit_cheney<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.add_reg_reg(R::V0, R::V2);
     a.load_ptr_disp32(R::V7, R::V3, d(RT_CS_FIELD));
     old_field_address(a, R::V2, R::V7);
-    a.store_ptr_disp32(R::V2, 0, R::V0);
+    super::worker::heal(a, l, old_next_field);
     a.shr_reg_imm8(R::V1, 16);
     a.cmp_reg_imm32(R::V1, YOUNG_END as i32);
     a.jcc_label(C::AboveOrEqual, old_next_field);
@@ -661,6 +667,18 @@ fn emit_deep_equal<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime:
     let slot_next = a.create_text_label();
     let min_done = a.create_text_label();
     a.bind_text_label(l.deep_equal);
+    if l.worker_entry().is_some() {
+        // Lock while a phase is open: the worker rewrites from-space
+        // headers into forwarding records.
+        a.push_reg(R::V3);
+        load_runtime(a, runtime);
+        super::worker::lock_if(a, l, true);
+        a.call_label(l.deep_equal_body);
+        super::worker::unlock_if(a, l, true);
+        a.pop_reg(R::V3);
+        a.ret();
+    }
+    a.bind_text_label(l.deep_equal_body);
     // During an open relocation phase an operand may be an evacuated
     // source: follow its forwarding record to the copy.
     for operand in [R::V7, R::V6] {
@@ -749,7 +767,7 @@ fn emit_deep_equal<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime:
     a.push_reg(R::V2);
     a.mov_reg_reg(R::V7, R::V0);
     a.mov_reg_reg(R::V6, R::V1);
-    a.call_label(l.deep_equal);
+    a.call_label(l.deep_equal_body);
     a.pop_reg(R::V2);
     a.pop_reg(R::V8);
     a.pop_reg(R::V6);

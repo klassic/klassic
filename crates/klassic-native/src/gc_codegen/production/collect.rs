@@ -222,6 +222,7 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     super::enums::emit_cheney_init(a);
     a.mov_imm64(R::V0, 1);
     a.store_ptr_disp32(R::V3, d(super::RT_PHASE_OPEN), R::V0);
+    super::worker::open_phase(a, l);
     clear_scratch(a, l);
 
     a.mov_imm64(R::V0, 0);
@@ -248,6 +249,7 @@ fn emit_phase<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.load_ptr_disp32(R::V0, R::V3, d(super::RT_PHASE_OPEN));
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::Equal, closed);
+    super::worker::quantum_handoff(a, l);
     a.mov_imm64(R::V0, 1);
     a.store_ptr_disp32(R::V3, d(RT_COLLECTING), R::V0);
     a.mov_imm64(R::V0, super::QUANTUM_OBJECTS);
@@ -362,6 +364,9 @@ fn emit_phase<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
         RT_COLLECTING,
     ] {
         a.store_ptr_disp32(R::V3, d(field), R::V0);
+    }
+    if l.worker_entry().is_some() {
+        a.store_ptr_disp32(R::V3, d(super::RT_WORKER_DONE), R::V0);
     }
     a.bind_text_label(closed);
     a.ret();

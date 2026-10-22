@@ -1,6 +1,7 @@
 # M-G6 plan: concurrent relocation and marking for `--gc=generational`
 
-Status: steps 1-3 implemented (2026-10-22); steps 4-6 open. Builds on M-G1..M-G5
+Status: steps 1-3, 5 (Linux x86-64) and 6 implemented (2026-10-22); step 4
+(concurrent marking) open. Builds on M-G1..M-G5
 (`production-integration-plan.md`), where every collection is stop-the-world
 semispace copying.
 
@@ -93,6 +94,53 @@ written to the kernel straight from the heap (no copy-out buffer as on x86).
 Evidence is the unicorn emulator (`tools/run-macho-aarch64.py`), not arm64
 hardware; the arm64 CI runner remains the authority.
 
-Still open: concurrent marking (step 4) and a GC worker thread (step 5).
-Relocation is incremental on the mutator thread, not concurrent on another
-core.
+## Step 5 as implemented (Linux x86-64 only)
+
+- Thread: `startup` calls the backend `spawn` leaf: `clone(CLONE_VM | FS |
+  FILES | SIGHAND | THREAD | SYSVSEM)` onto a 256 KiB mapped stack. The child
+  jumps to the worker loop (`production/worker.rs`). Every exit becomes
+  `exit_group`, so a parked worker never keeps the process alive. If `clone`
+  fails, `worker_alive` stays 0 and the allocation quanta of steps 1-3 run.
+- Work: a pause (still on the mutator, under the lock) bumps a futex word and
+  wakes the worker after `alloc` releases the lock. The worker repeatedly takes
+  the lock, runs `cheney` with a 64-object budget, counts the objects into
+  `--gc-log worker_scanned=`, and releases the lock. When both cursors catch up
+  it sets `worker_done` and parks. With a live worker the mutator does no
+  scanning in `quantum`; it only finishes a phase the worker reported scanned,
+  at its next allocation (the safepoint). Only then is from-space recycled.
+- Synchronisation, honestly: this is coarse-grained. The collector state the
+  copy path uses (the shared TLAB through `alloc_raw`, the scratch root and
+  root journal, publication, forwarding records, the remembered set) is shared
+  between the two threads, and the mutual exclusion is one fair ticket lock
+  (yielding with `sched_yield` every 128 failed polls). The mutator takes it in
+  `alloc` and the load-barrier slow path, and in `root_adopt/pop/store/load`,
+  the write-barrier remember step, `deep_equal` and the `--gc-log` verify only
+  while a phase is open (the mutator alone opens and closes phases, and closes
+  them under the lock, so a closed phase means the worker is idle). The worker
+  copies through the same TLAB as the mutator, under that lock; it does not
+  have its own allocation buffer, and copies are not claimed by a header CAS
+  (the lock makes the forwarding check-and-copy atomic). What is lock-free:
+  the mutator's own computation, its unbarriered field stores and object
+  initialisation, which can race with the worker's scan; the worker therefore
+  heals a field with a CAS against the word it read, so a racing mutator store
+  always wins, and skips the remembered-set append when its heal lost (the
+  mutator's own write barrier covers that store). Root cells are written by
+  the worker only through the allocation scratch root (cell 0) inside
+  `alloc_raw`, under the lock; frame cells are only touched by the mutator.
+- Still pausing: the flip with root/remset/literal forwarding, and a
+  `finish` when the next collection starts before the worker caught up (it
+  completes the scan on the mutator). On one CPU the lock degrades to
+  yield-driven hand-offs.
+- Evidence: `tests/gc_generational.rs::generational_worker_thread_relocates_concurrently`
+  (plain and `--gc-stress`, 5 runs each, `worker_scanned > 0`, output equal to
+  the evaluator). Out of tree: the same program 50 x plain + 50 x stress, and
+  20 stress runs pinned to one CPU (`taskset -c 0`), all correct. With a
+  temporary local hook making `--gc=generational` (and, separately, stress)
+  the default, `cli_smoke` passed 495/511 and 496/511; every failure was an
+  intended rejection (`--gc-poison`, `--backend c`) or a legacy `--gc-log`
+  format check. Default builds of `test-programs/` and `examples/` are
+  byte-identical to the previous commit for Linux, Windows and AArch64.
+
+Still open: concurrent marking (step 4), a worker-private to-space buffer with
+CAS-claimed copies (so copying would not need the global lock), and workers on
+Windows (PE) and Mach-O, which keep the single-threaded allocation quanta.

@@ -56,6 +56,7 @@ pub(super) fn emit_roots<E: PortableAsm>(
     a.bind_text_label(l.root_adopt);
     save_all(a, false);
     load_runtime(a, runtime);
+    super::worker::lock_if(a, l, true);
     a.store_ptr_disp32(R::V3, d(RT_ADOPT_SLOT), R::V0);
     a.load_ptr_disp32(R::V1, R::V0, 0);
     encode(a, R::V1, R::V2);
@@ -85,6 +86,7 @@ pub(super) fn emit_roots<E: PortableAsm>(
     a.load_ptr_disp32(R::V0, R::V3, d(RT_ADOPT_SLOT));
     a.load_ptr_disp32(R::V1, R::V3, d(RT_FRAME_ROOT + HANDLE_CELL));
     a.store_ptr_disp32(R::V0, 0, R::V1);
+    super::worker::unlock_if(a, l, true);
     restore_all(a, false);
     a.ret();
 
@@ -92,6 +94,7 @@ pub(super) fn emit_roots<E: PortableAsm>(
     a.bind_text_label(l.root_pop);
     save_all(a, false);
     load_runtime(a, runtime);
+    super::worker::lock_if(a, l, true);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_CELL_SP));
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::Equal, l.fail);
@@ -106,6 +109,7 @@ pub(super) fn emit_roots<E: PortableAsm>(
     a.load_ptr_disp32(R::V0, R::V3, d(RT_CELL_SP));
     a.sub_reg_imm8(R::V0, 1);
     a.store_ptr_disp32(R::V3, d(RT_CELL_SP), R::V0);
+    super::worker::unlock_if(a, l, true);
     restore_all(a, false);
     a.ret();
 
@@ -113,11 +117,13 @@ pub(super) fn emit_roots<E: PortableAsm>(
     a.bind_text_label(l.root_store);
     save_all(a, false);
     load_runtime(a, runtime);
+    super::worker::lock_if(a, l, true);
     a.load_ptr_disp32(R::V1, R::V1, 0);
     frame_handle(a, R::V1, R::V2);
     encode(a, R::V0, R::V2);
     a.store_ptr_disp32(R::V3, d(RT_FRAME_ROOT + REQUEST_VALUE), R::V0);
     root_step(a, l, RT_FRAME_ROOT, ROOT_STORE);
+    super::worker::unlock_if(a, l, true);
     restore_all(a, false);
     a.ret();
 
@@ -128,6 +134,7 @@ pub(super) fn emit_roots<E: PortableAsm>(
     a.bind_text_label(l.root_load);
     save_all(a, true);
     load_runtime(a, runtime);
+    super::worker::lock_if(a, l, true);
     a.load_ptr_disp32(R::V2, R::V3, d(RT_SEGMENT));
     a.load_ptr_disp32(R::V1, R::V2, d(offset_of!(RootSegment, cells)));
     a.mov_reg_reg(R::V6, R::V0);
@@ -144,6 +151,7 @@ pub(super) fn emit_roots<E: PortableAsm>(
     root_step(a, l, RT_FRAME_ROOT, ROOT_READ_RAW);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_FRAME_ROOT + REQUEST_VALUE));
     decode(a, R::V0, R::V1);
+    super::worker::unlock_if(a, l, true);
     restore_all(a, true);
     a.ret();
 }
@@ -158,6 +166,7 @@ pub(super) fn emit_verify<E: PortableAsm>(
     a.bind_text_label(l.verify);
     a.push_reg(R::V3);
     load_runtime(a, runtime);
+    super::worker::lock_if(a, l, false);
     a.call_label(l.finish);
     a.call_label(l.publish_pending);
     let pages = a.create_text_label();
@@ -219,6 +228,7 @@ pub(super) fn emit_verify<E: PortableAsm>(
     a.bind_text_label(done);
     a.store_ptr_disp32(R::V3, d(RT_OBJECTS), R::V10);
     a.store_ptr_disp32(R::V3, d(RT_VERIFIED), R::V11);
+    super::worker::unlock_if(a, l, false);
     a.pop_reg(R::V3);
     a.ret();
 }
