@@ -24,8 +24,11 @@ use std::mem::{offset_of, size_of};
 
 mod alloc;
 mod collect;
+mod copy;
 mod enums;
+mod mark;
 mod roots;
+mod scan;
 mod startup;
 mod worker;
 
@@ -140,6 +143,48 @@ struct Runtime {
     worker_scanned: u64,
     wake_pending: u64,
     cs_old: u64,
+    /// M-G6 lock-free copying: packed to-space page bounds (next_page in
+    /// the low half, the worker's copy_low in the high half), the worker
+    /// copy-page chain (top-down), the scan cursor over it, per-copier
+    /// scratch and counters.
+    bounds: u64,
+    copy_low: u64,
+    from_copy_low: u64,
+    recycle_end: u64,
+    cb_page: u64,
+    cb_off: u64,
+    progress: u64,
+    w_page: u64,
+    w_top: u64,
+    w_limit: u64,
+    w_src: u64,
+    w_new: u64,
+    w_desc: u64,
+    w_promoted: u64,
+    w_unmarked: u64,
+    worker_copies: u64,
+    worker_lost: u64,
+    mutator_copies: u64,
+    mutator_lost: u64,
+    /// Set while the mutator copies into its TLAB: the newest chain-A
+    /// object may still be incomplete, so the worker must not scan past it.
+    m_copying: u64,
+    /// M-G6 concurrent marking state and counters.
+    mark_active: u64,
+    mark_done: u64,
+    mark_valid: u64,
+    mstack_len: u64,
+    m_obj: u64,
+    m_field: u64,
+    m_count: u64,
+    mark_cycles: u64,
+    marked: u64,
+    mark_drains: u64,
+    unmarked: u64,
+    remset_dropped: u64,
+    lit_mark: u64,
+    /// Shared MarkRecord (age 1) of every worker copy.
+    survivor: MarkRecord,
     marks: MarkArena,
     request: AllocationRequest,
     into: AllocationInto,
@@ -174,6 +219,8 @@ struct Layout {
     roots: u64,
     roots_bytes: u64,
     remset: u64,
+    mbits: u64,
+    mstack: u64,
     total: u64,
 }
 
@@ -191,7 +238,9 @@ const fn layout() -> Layout {
         + ROOT_CELLS * size_of::<RootCell>() as u64
         + JOURNAL_ENTRIES * size_of::<RootChange>() as u64;
     let remset = round_up(roots + roots_bytes, 64);
-    let total = round_up(remset + REMSET_ENTRIES * 8, 4096);
+    let mbits = round_up(remset + REMSET_ENTRIES * 8, 64);
+    let mstack = round_up(mbits + MBITS_WORDS * 8, 64);
+    let total = round_up(mstack + MSTACK_ENTRIES * 8, 4096);
     Layout {
         pages,
         starts,
@@ -201,6 +250,8 @@ const fn layout() -> Layout {
         roots,
         roots_bytes,
         remset,
+        mbits,
+        mstack,
         total,
     }
 }
@@ -218,6 +269,12 @@ pub(super) const YOUNG_SEMI_BYTES: u64 = (PAGES / 2) * HEAP_PAGE_BYTES;
 pub(super) const HEAP_BYTES: u64 = YOUNG_END + OLD_BYTES;
 /// Remembered-set capacity: Old fields that hold Young payload addresses.
 pub(super) const REMSET_ENTRIES: u64 = 1 << 20;
+/// Mark bitmap: one bit per 16-byte heap granule.
+pub(super) const MBITS_WORDS: u64 = HEAP_BYTES / 16 / 64;
+/// Mark stack capacity (each object is pushed at most once per cycle).
+pub(super) const MSTACK_ENTRIES: u64 = 1 << 22;
+/// Concurrent marking starts once this many Young pages are in use.
+pub(super) const MARK_TRIGGER_PAGES: u64 = HALF / 4;
 const _: () = assert!(L.total < i32::MAX as u64);
 const _: () = assert!(L.pages >= size_of::<Runtime>() as u64);
 const _: () = assert!(L.pages < L.starts && L.starts < L.tables && L.tables < L.cells);
@@ -304,6 +361,40 @@ const RT_WORKER_DONE: usize = offset_of!(Runtime, worker_done);
 const RT_WORKER_SCANNED: usize = offset_of!(Runtime, worker_scanned);
 const RT_WAKE_PENDING: usize = offset_of!(Runtime, wake_pending);
 const RT_CS_OLD: usize = offset_of!(Runtime, cs_old);
+const RT_BOUNDS: usize = offset_of!(Runtime, bounds);
+const RT_COPY_LOW: usize = offset_of!(Runtime, copy_low);
+const RT_FROM_COPY_LOW: usize = offset_of!(Runtime, from_copy_low);
+const RT_RECYCLE_END: usize = offset_of!(Runtime, recycle_end);
+const RT_CB_PAGE: usize = offset_of!(Runtime, cb_page);
+const RT_CB_OFF: usize = offset_of!(Runtime, cb_off);
+const RT_PROGRESS: usize = offset_of!(Runtime, progress);
+const RT_W_PAGE: usize = offset_of!(Runtime, w_page);
+const RT_W_TOP: usize = offset_of!(Runtime, w_top);
+const RT_W_LIMIT: usize = offset_of!(Runtime, w_limit);
+const RT_W_SRC: usize = offset_of!(Runtime, w_src);
+const RT_W_NEW: usize = offset_of!(Runtime, w_new);
+const RT_W_DESC: usize = offset_of!(Runtime, w_desc);
+const RT_W_PROMOTED: usize = offset_of!(Runtime, w_promoted);
+const RT_W_UNMARKED: usize = offset_of!(Runtime, w_unmarked);
+const RT_WORKER_COPIES: usize = offset_of!(Runtime, worker_copies);
+const RT_WORKER_LOST: usize = offset_of!(Runtime, worker_lost);
+const RT_MUTATOR_COPIES: usize = offset_of!(Runtime, mutator_copies);
+const RT_MUTATOR_LOST: usize = offset_of!(Runtime, mutator_lost);
+const RT_M_COPYING: usize = offset_of!(Runtime, m_copying);
+const RT_MARK_ACTIVE: usize = offset_of!(Runtime, mark_active);
+const RT_MARK_DONE: usize = offset_of!(Runtime, mark_done);
+const RT_MARK_VALID: usize = offset_of!(Runtime, mark_valid);
+const RT_MSTACK_LEN: usize = offset_of!(Runtime, mstack_len);
+const RT_M_OBJ: usize = offset_of!(Runtime, m_obj);
+const RT_M_FIELD: usize = offset_of!(Runtime, m_field);
+const RT_M_COUNT: usize = offset_of!(Runtime, m_count);
+const RT_MARK_CYCLES: usize = offset_of!(Runtime, mark_cycles);
+const RT_MARKED: usize = offset_of!(Runtime, marked);
+const RT_MARK_DRAINS: usize = offset_of!(Runtime, mark_drains);
+const RT_UNMARKED: usize = offset_of!(Runtime, unmarked);
+const RT_REMSET_DROPPED: usize = offset_of!(Runtime, remset_dropped);
+const RT_LIT_MARK: usize = offset_of!(Runtime, lit_mark);
+const RT_SURVIVOR: usize = offset_of!(Runtime, survivor);
 const RT_REQUEST: usize = offset_of!(Runtime, request);
 const RT_INTO: usize = offset_of!(Runtime, into);
 const RT_RESULT: usize = offset_of!(Runtime, result);
@@ -333,6 +424,15 @@ pub(crate) struct StatOffsets {
     pub objects: i32,
     pub published: i32,
     pub worker_scanned: i32,
+    pub worker_copies: i32,
+    pub worker_lost: i32,
+    pub mutator_copies: i32,
+    pub mutator_lost: i32,
+    pub mark_cycles: i32,
+    pub marked: i32,
+    pub mark_drains: i32,
+    pub unmarked_copied: i32,
+    pub remset_dropped: i32,
 }
 
 /// Offset of the copy-out buffer inside the runtime block.
@@ -351,6 +451,15 @@ pub(crate) fn stat_offsets() -> StatOffsets {
         objects: d(RT_OBJECTS),
         published: d(RT_VERIFIED),
         worker_scanned: d(RT_WORKER_SCANNED),
+        worker_copies: d(RT_WORKER_COPIES),
+        worker_lost: d(RT_WORKER_LOST),
+        mutator_copies: d(RT_MUTATOR_COPIES),
+        mutator_lost: d(RT_MUTATOR_LOST),
+        mark_cycles: d(RT_MARK_CYCLES),
+        marked: d(RT_MARKED),
+        mark_drains: d(RT_MARK_DRAINS),
+        unmarked_copied: d(RT_UNMARKED),
+        remset_dropped: d(RT_REMSET_DROPPED),
     }
 }
 
@@ -414,8 +523,10 @@ pub(crate) struct Labels<T> {
     oom: T,
     too_large: T,
     old_full: T,
-    /// Recursive body of `deep_equal` (the entry locks around it).
+    /// Recursive body of `deep_equal`.
     deep_equal_body: T,
+    /// Recycle from-space pages [scan_index, recycle_end).
+    recycle: T,
     /// M-G6 GC worker thread (None: the single-threaded incremental path).
     worker: Option<worker::WorkerLabels<T>>,
 }
@@ -472,6 +583,7 @@ impl<T: Copy> Labels<T> {
             too_large: create(),
             old_full: create(),
             deep_equal_body: create(),
+            recycle: create(),
             worker: None,
         }
     }
@@ -613,7 +725,10 @@ pub(crate) fn emit<E: PortableAsm>(
     alloc::emit_alloc(a, l, data.runtime, stress);
     collect::emit_collect(a, l);
     enums::emit_enums(a, l, data.runtime);
-    emit_publish_pending(a, l);
+    copy::emit_forwards(a, l);
+    scan::emit_cheneys(a, l);
+    mark::emit_mark(a, l);
+    alloc::emit_publish_pending(a, l);
     roots::emit_roots(a, l, data.runtime);
     roots::emit_verify(a, l, data.runtime);
     // drain: consumed = published (the journal has no consumer in M-G1).
@@ -664,75 +779,6 @@ fn emit_leaves<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.ret();
     a.bind_text_label(l.root_storage_prepare);
     root_storage::emit_prepare(a);
-    a.ret();
-}
-
-fn source_access<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, op: u64) {
-    a.load_ptr_disp32(R::V7, R::V3, d(RT_PENDING_CELL));
-    lea_rt(a, R::V6, RT_ACCESS);
-    a.mov_imm64(R::V2, op);
-    a.call_label(l.source_access);
-    a.test_reg_reg(R::V0, R::V0);
-    a.jcc_label(C::NotEqual, l.fail);
-}
-
-/// ENTER the pending object's source guard, publish readiness, EXIT.
-fn emit_publish_pending<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
-    let done = a.create_text_label();
-    a.bind_text_label(l.publish_pending);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_PENDING_REF));
-    a.test_reg_reg(R::V0, R::V0);
-    a.jcc_label(C::Equal, done);
-    let access = |field: usize| d(RT_ACCESS + field);
-    let publish = |field: usize| d(RT_PUBLISH + field);
-    let lease = |field: usize| d(RT_PUBLISH + offset_of!(GuardedMarkPrepare, lease) + field);
-    lea_rt(a, R::V1, RT_CTX);
-    a.store_ptr_disp32(
-        R::V3,
-        access(offset_of!(SourceAccessRequest, context)),
-        R::V1,
-    );
-    a.store_ptr_disp32(
-        R::V3,
-        publish(offset_of!(GuardedMarkPrepare, reference)),
-        R::V0,
-    );
-    a.shr_reg_imm8(R::V0, 16);
-    a.store_ptr_disp32(
-        R::V3,
-        access(offset_of!(SourceAccessRequest, source_offset)),
-        R::V0,
-    );
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_PENDING_PAGE));
-    a.store_ptr_disp32(R::V3, publish(offset_of!(GuardedMarkPrepare, page)), R::V1);
-    a.store_ptr_disp32(R::V3, lease(offset_of!(MetadataLeaseRequest, page)), R::V1);
-    a.load_ptr_disp32(R::V1, R::V1, d(offset_of!(AllocationPage, incarnation)));
-    a.store_ptr_disp32(
-        R::V3,
-        access(offset_of!(SourceAccessRequest, incarnation)),
-        R::V1,
-    );
-    a.store_ptr_disp32(
-        R::V3,
-        lease(offset_of!(MetadataLeaseRequest, incarnation)),
-        R::V1,
-    );
-    a.mov_imm64(R::V1, PUBLISH_LEASE_TOKEN);
-    a.store_ptr_disp32(R::V3, lease(offset_of!(MetadataLeaseRequest, token)), R::V1);
-    lea_rt(a, R::V1, RT_ACCESS);
-    a.store_ptr_disp32(R::V3, publish(offset_of!(GuardedMarkPrepare, scope)), R::V1);
-    source_access(a, l, SOURCE_ENTER);
-    lea_rt(a, R::V7, RT_PUBLISH);
-    a.call_label(l.publish);
-    a.test_reg_reg(R::V0, R::V0);
-    a.jcc_label(C::NotEqual, l.fail);
-    source_access(a, l, SOURCE_EXIT);
-    a.mov_imm64(R::V0, 0);
-    a.store_ptr_disp32(R::V3, d(RT_PENDING_REF), R::V0);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_PUBLISHED));
-    a.add_reg_imm32(R::V0, 1);
-    a.store_ptr_disp32(R::V3, d(RT_PUBLISHED), R::V0);
-    a.bind_text_label(done);
     a.ret();
 }
 

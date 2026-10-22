@@ -592,6 +592,46 @@ mod linux_x86_64 {
     }
 
     #[test]
+    fn generational_worker_marks_concurrently_and_claims_copies_by_cas() {
+        // Without stress the semispace fills far enough to start a mark
+        // cycle (the worker traces while the mutator allocates), and the
+        // relocation that follows copies through the CAS-claimed path: the
+        // worker's copies land in its private to-space pages.
+        let expected = evaluate("mark_eval", WORKER_PROGRAM);
+        let source_path = write_source("mark", WORKER_PROGRAM);
+        let output_path = temp_path("mark", "bin");
+        let result = build(
+            &["--gc=generational", "--gc-log"],
+            &source_path,
+            &output_path,
+        );
+        let _ = fs::remove_file(&source_path);
+        assert!(
+            result.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut lost = 0;
+        for _ in 0..5 {
+            let run = Command::new(&output_path).output().expect("binary runs");
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert!(run.status.success(), "stderr:\n{stderr}");
+            assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+            let stats = gc_stats(&stderr);
+            assert!(stats["mark_cycles"] >= 1, "stats: {stats:?}");
+            assert!(stats["marked"] > 0, "stats: {stats:?}");
+            // Relocation after a complete mark never meets an unmarked object.
+            assert_eq!(stats["unmarked_copied"], 0, "stats: {stats:?}");
+            assert!(stats["worker_copies"] > 0, "stats: {stats:?}");
+            assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
+            lost += stats["worker_lost"] + stats["mutator_lost"];
+        }
+        // Lost claim races depend on scheduling; they are reported, not required.
+        eprintln!("lost copy races over 5 runs: {lost}");
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
     fn generational_builds_an_int_program() {
         let run = build_and_run(
             "int",

@@ -12,11 +12,12 @@ pub(super) fn emit_alloc<E: PortableAsm>(
     a.bind_text_label(l.alloc);
     a.push_reg(R::V3);
     load_runtime(a, runtime);
-    worker::lock_if(a, l, false);
-    // Advance an open relocation phase by one bounded quantum.
+    // Advance an open relocation phase by one bounded quantum (or, with a
+    // worker, finish one it scanned); maybe start a mark cycle.
     a.push_reg(R::V7);
     a.push_reg(R::V6);
     a.call_label(l.quantum);
+    mark::trigger(a, l);
     a.pop_reg(R::V6);
     a.pop_reg(R::V7);
     a.store_ptr_disp32(R::V3, d(RT_ALLOC_SIZE), R::V7);
@@ -28,7 +29,6 @@ pub(super) fn emit_alloc<E: PortableAsm>(
         a.call_label(l.collect);
     }
     a.call_label(l.alloc_raw);
-    worker::unlock_if(a, l, false);
     worker::wake_if_pending(a, l);
     a.pop_reg(R::V3);
     a.ret();
@@ -120,10 +120,37 @@ pub(super) fn emit_alloc<E: PortableAsm>(
     );
     a.bind_text_label(bind);
     let have_page = a.create_text_label();
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_NEXT_PAGE));
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_SPACE_END));
-    a.cmp_reg_reg(R::V0, R::V1);
-    a.jcc_label(C::Below, have_page);
+    if l.worker.is_some() {
+        // The worker takes pages from the top: claim next_page by a CAS on
+        // the packed bounds (next_page | copy_low << 32).
+        let retry = a.create_text_label();
+        let full = a.create_text_label();
+        a.bind_text_label(retry);
+        a.load_ptr_disp32(R::V0, R::V3, d(RT_BOUNDS));
+        a.mov_reg_reg(R::V1, R::V0);
+        a.shl_reg_imm8(R::V1, 32);
+        a.shr_reg_imm8(R::V1, 32);
+        a.mov_reg_reg(R::V2, R::V0);
+        a.shr_reg_imm8(R::V2, 32);
+        a.cmp_reg_reg(R::V1, R::V2);
+        a.jcc_label(C::AboveOrEqual, full);
+        a.mov_reg_reg(R::V8, R::V0);
+        a.mov_reg_reg(R::V6, R::V0);
+        a.add_reg_imm32(R::V6, 1);
+        a.mov_reg_reg(R::V7, R::V3);
+        a.add_reg_imm32(R::V7, d(RT_BOUNDS));
+        a.atomic_compare_exchange(R::V7, R::V6);
+        a.cmp_reg_reg(R::V0, R::V8);
+        a.jcc_label(C::NotEqual, retry);
+        a.mov_reg_reg(R::V0, R::V1);
+        a.jmp_label(have_page);
+        a.bind_text_label(full);
+    } else {
+        a.load_ptr_disp32(R::V0, R::V3, d(RT_NEXT_PAGE));
+        a.load_ptr_disp32(R::V1, R::V3, d(RT_SPACE_END));
+        a.cmp_reg_reg(R::V0, R::V1);
+        a.jcc_label(C::Below, have_page);
+    }
     // The semispace is full: evacuate once; a second exhaustion (or one
     // while evacuating) means the live data does not fit.
     a.load_ptr_disp32(R::V0, R::V3, d(RT_COLLECTING));
@@ -183,6 +210,76 @@ pub(super) fn emit_alloc<E: PortableAsm>(
     a.load_ptr_disp32(R::V1, R::V1, d(offset_of!(ForwardTable, cells)));
     a.add_reg_reg(R::V1, R::V2);
     a.store_ptr_disp32(R::V3, d(RT_PENDING_CELL), R::V1);
+    mark::alloc_black(a, l);
     decode(a, R::V0, R::V1);
+    a.ret();
+}
+
+fn source_access<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, op: u64) {
+    a.load_ptr_disp32(R::V7, R::V3, d(RT_PENDING_CELL));
+    lea_rt(a, R::V6, RT_ACCESS);
+    a.mov_imm64(R::V2, op);
+    a.call_label(l.source_access);
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::NotEqual, l.fail);
+}
+
+/// ENTER the pending object's source guard, publish readiness, EXIT.
+pub(super) fn emit_publish_pending<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    let done = a.create_text_label();
+    a.bind_text_label(l.publish_pending);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_PENDING_REF));
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::Equal, done);
+    let access = |field: usize| d(RT_ACCESS + field);
+    let publish = |field: usize| d(RT_PUBLISH + field);
+    let lease = |field: usize| d(RT_PUBLISH + offset_of!(GuardedMarkPrepare, lease) + field);
+    lea_rt(a, R::V1, RT_CTX);
+    a.store_ptr_disp32(
+        R::V3,
+        access(offset_of!(SourceAccessRequest, context)),
+        R::V1,
+    );
+    a.store_ptr_disp32(
+        R::V3,
+        publish(offset_of!(GuardedMarkPrepare, reference)),
+        R::V0,
+    );
+    a.shr_reg_imm8(R::V0, 16);
+    a.store_ptr_disp32(
+        R::V3,
+        access(offset_of!(SourceAccessRequest, source_offset)),
+        R::V0,
+    );
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_PENDING_PAGE));
+    a.store_ptr_disp32(R::V3, publish(offset_of!(GuardedMarkPrepare, page)), R::V1);
+    a.store_ptr_disp32(R::V3, lease(offset_of!(MetadataLeaseRequest, page)), R::V1);
+    a.load_ptr_disp32(R::V1, R::V1, d(offset_of!(AllocationPage, incarnation)));
+    a.store_ptr_disp32(
+        R::V3,
+        access(offset_of!(SourceAccessRequest, incarnation)),
+        R::V1,
+    );
+    a.store_ptr_disp32(
+        R::V3,
+        lease(offset_of!(MetadataLeaseRequest, incarnation)),
+        R::V1,
+    );
+    a.mov_imm64(R::V1, PUBLISH_LEASE_TOKEN);
+    a.store_ptr_disp32(R::V3, lease(offset_of!(MetadataLeaseRequest, token)), R::V1);
+    lea_rt(a, R::V1, RT_ACCESS);
+    a.store_ptr_disp32(R::V3, publish(offset_of!(GuardedMarkPrepare, scope)), R::V1);
+    source_access(a, l, SOURCE_ENTER);
+    lea_rt(a, R::V7, RT_PUBLISH);
+    a.call_label(l.publish);
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::NotEqual, l.fail);
+    source_access(a, l, SOURCE_EXIT);
+    a.mov_imm64(R::V0, 0);
+    a.store_ptr_disp32(R::V3, d(RT_PENDING_REF), R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_PUBLISHED));
+    a.add_reg_imm32(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(RT_PUBLISHED), R::V0);
+    a.bind_text_label(done);
     a.ret();
 }

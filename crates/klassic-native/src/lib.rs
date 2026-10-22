@@ -39741,9 +39741,20 @@ impl NativeCodeGenerator {
             (&b" objects="[..], stats.objects),
             (&b" published="[..], stats.published),
             (&b" worker_scanned="[..], stats.worker_scanned),
+            (&b" worker_copies="[..], stats.worker_copies),
+            (&b" worker_lost="[..], stats.worker_lost),
+            (&b" mutator_copies="[..], stats.mutator_copies),
+            (&b" mutator_lost="[..], stats.mutator_lost),
+            (&b" mark_cycles="[..], stats.mark_cycles),
+            (&b" marked="[..], stats.marked),
+            (&b" mark_drains="[..], stats.mark_drains),
+            (&b" unmarked_copied="[..], stats.unmarked_copied),
+            (&b" remset_dropped="[..], stats.remset_dropped),
         ]
         .into_iter()
-        .filter(|(name, _)| worker || !name.starts_with(b" worker"))
+        .enumerate()
+        .filter(|(index, _)| worker || *index < 8)
+        .map(|(_, field)| field)
         {
             let label = self.asm.data_label_with_bytes(name);
             self.emit_write_data(self.platform.stderr_fd(), label, name.len());

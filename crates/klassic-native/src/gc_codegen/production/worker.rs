@@ -1,21 +1,23 @@
-//! M-G6 step 5: the GC worker thread for `--gc=generational`.
+//! M-G6 steps 4-5: the GC worker thread for `--gc=generational`.
 //!
-//! After a pause opens a relocation phase, the worker runs the resumable
-//! Cheney scan (`cheney`, which copies through `forward`) in bounded quanta
-//! while the mutator keeps running its own code. Collector state (TLAB,
-//! scratch root, root journal, forwarding, remembered set) is shared, so
-//! every collector operation runs under one fair ticket lock: the worker
-//! holds it for one quantum at a time; the mutator takes it in `alloc`, in
-//! the load-barrier slow path, and -- only while a phase is open -- in its
-//! root, write-barrier and equality routines. A worker heal of a heap field
-//! is a CAS against the word it read, so a racing unlocked mutator store
-//! always wins. The worker never recycles from-space: it sets `worker_done`
-//! and the mutator finishes the phase at its next allocation (a safepoint).
-//! Without a worker (spawn failed, or a backend without hooks) the
-//! allocation quanta of steps 1-3 run as before.
+//! The worker marks concurrently (from the root snapshot a short pause
+//! takes) and, after a relocation pause, runs the resumable Cheney scan
+//! (`wcheney`, copying through `wforward` into worker-private to-space
+//! pages) while the mutator keeps running. Copies are claimed by a CAS on
+//! the source header, so the mutator's load barrier and the worker never
+//! need a common lock to copy. One fair ticket lock remains: the worker holds
+//! it for one quantum at a time, and the mutator takes it only to stop the
+//! worker (relocation pause, mark start, phase finish, `--gc-log` verify)
+//! and on the SATB slow path. A worker heal of a heap field is a CAS against
+//! the word it read, so a racing mutator store always wins. The worker never
+//! recycles from-space: it sets `worker_done` and the mutator finishes the
+//! phase at its next allocation (a safepoint). Without a worker (spawn
+//! failed, or a backend without hooks) the allocation quanta of steps 1-3
+//! run as before and nothing marks.
 use super::{
-    Labels, RT_COLLECTING, RT_LOCK_NEXT, RT_LOCK_SERVING, RT_PHASE_OPEN, RT_WAKE_PENDING,
-    RT_WORK_SEQ, RT_WORKER_ALIVE, RT_WORKER_DONE, RT_WORKER_SCANNED, d, lea_rt, load_runtime,
+    Labels, RT_LOCK_NEXT, RT_LOCK_SERVING, RT_MARK_ACTIVE, RT_MARK_DONE, RT_PHASE_OPEN,
+    RT_WAKE_PENDING, RT_WORK_SEQ, RT_WORKER_ALIVE, RT_WORKER_DONE, RT_WORKER_SCANNED, d, lea_rt,
+    load_runtime,
 };
 use crate::portable_asm::{Condition as C, PortableAsm, Reg as R};
 
@@ -43,6 +45,14 @@ pub(super) struct WorkerLabels<T> {
     pub(super) entry: T,
     pub(super) lock: T,
     pub(super) unlock: T,
+    /// Worker-side copy (private to-space pages) and scan.
+    pub(super) wforward: T,
+    pub(super) wcheney: T,
+    /// Marking: `mark_ref` (V2 = payload offset), budgeted `mark_loop`,
+    /// and the mark-start pause.
+    pub(super) mark_ref: T,
+    pub(super) mark_loop: T,
+    pub(super) mark_start: T,
 }
 
 impl<T: Copy> WorkerLabels<T> {
@@ -52,45 +62,36 @@ impl<T: Copy> WorkerLabels<T> {
             entry: create(),
             lock: create(),
             unlock: create(),
+            wforward: create(),
+            wcheney: create(),
+            mark_ref: create(),
+            mark_loop: create(),
+            mark_start: create(),
         }
     }
 }
 
-/// Take the collector lock (V3 = runtime). With `only_open`, skip it while
-/// no relocation phase is open: the mutator alone writes `phase_open`, and
-/// it closes only under the lock, so a closed phase means the worker is
-/// idle. The caller must pair it with `unlock_if` on the same condition and
-/// must not open or close a phase in between.
-pub(super) fn lock_if<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, only_open: bool) {
-    let Some(w) = &l.worker else {
-        return;
-    };
-    let skip = a.create_text_label();
-    if only_open {
-        a.push_reg(R::V0);
-        a.load_ptr_disp32(R::V0, R::V3, d(RT_PHASE_OPEN));
-        a.test_reg_reg(R::V0, R::V0);
-        a.pop_reg(R::V0);
-        a.jcc_label(C::Equal, skip);
+/// Take the collector lock (V3 = runtime), stopping the worker between
+/// two quanta. No-op without a worker. Preserves every register.
+pub(super) fn lock<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    if let Some(w) = &l.worker {
+        a.call_label(w.lock);
     }
-    a.call_label(w.lock);
-    a.bind_text_label(skip);
 }
 
-pub(super) fn unlock_if<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, only_open: bool) {
-    let Some(w) = &l.worker else {
-        return;
-    };
-    let skip = a.create_text_label();
-    if only_open {
-        a.push_reg(R::V0);
-        a.load_ptr_disp32(R::V0, R::V3, d(RT_PHASE_OPEN));
-        a.test_reg_reg(R::V0, R::V0);
-        a.pop_reg(R::V0);
-        a.jcc_label(C::Equal, skip);
+pub(super) fn unlock<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    if let Some(w) = &l.worker {
+        a.call_label(w.unlock);
     }
-    a.call_label(w.unlock);
-    a.bind_text_label(skip);
+}
+
+/// Ask the worker to look for work again (it is woken after `alloc`).
+pub(super) fn request_work<E: PortableAsm>(a: &mut E) {
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_WORK_SEQ));
+    a.add_reg_imm32(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(RT_WORK_SEQ), R::V0);
+    a.mov_imm64(R::V0, 1);
+    a.store_ptr_disp32(R::V3, d(RT_WAKE_PENDING), R::V0);
 }
 
 /// After `alloc` released the lock: wake the worker if a pause opened a
@@ -121,16 +122,13 @@ pub(super) fn open_phase<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     }
     a.mov_imm64(R::V0, 0);
     a.store_ptr_disp32(R::V3, d(RT_WORKER_DONE), R::V0);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_WORK_SEQ));
-    a.add_reg_imm32(R::V0, 1);
-    a.store_ptr_disp32(R::V3, d(RT_WORK_SEQ), R::V0);
-    a.mov_imm64(R::V0, 1);
-    a.store_ptr_disp32(R::V3, d(RT_WAKE_PENDING), R::V0);
+    request_work(a);
 }
 
 /// In `quantum`: with a live worker the mutator does no scanning; it only
-/// finishes a phase the worker reported scanned (jumps to `finish`), else
-/// returns. Without a worker, falls through to the mutator quantum.
+/// finishes a phase the worker reported scanned (stopping the worker for
+/// it), else returns. Without a worker, falls through to the mutator
+/// quantum.
 pub(super) fn quantum_handoff<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     if l.worker.is_none() {
         return;
@@ -143,7 +141,9 @@ pub(super) fn quantum_handoff<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel
     a.load_ptr_disp32(R::V0, R::V3, d(RT_WORKER_DONE));
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::Equal, not_done);
-    a.jmp_label(l.finish);
+    lock(a, l);
+    a.call_label(l.finish);
+    unlock(a, l);
     a.bind_text_label(not_done);
     a.ret();
     a.bind_text_label(mutator);
@@ -245,23 +245,38 @@ pub(super) fn emit_worker<E: PortableAsm>(
     let top = a.create_text_label();
     let idle = a.create_text_label();
     let scanned = a.create_text_label();
+    let relocate = a.create_text_label();
+    let release = a.create_text_label();
     a.bind_text_label(w.entry);
     load_runtime(a, runtime);
     a.bind_text_label(top);
     a.call_label(w.lock);
+    // Marking first: it runs only while no relocation phase is open.
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_MARK_ACTIVE));
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::Equal, relocate);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_MARK_DONE));
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::NotEqual, relocate);
+    a.mov_imm64(R::V0, WORKER_QUANTUM);
+    a.store_ptr_disp32(R::V3, d(super::RT_BUDGET), R::V0);
+    a.call_label(w.mark_loop);
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::Equal, release);
+    a.store_ptr_disp32(R::V3, d(RT_MARK_DONE), R::V0);
+    a.bind_text_label(release);
+    a.call_label(w.unlock);
+    a.jmp_label(top);
+    a.bind_text_label(relocate);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_PHASE_OPEN));
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::Equal, idle);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_WORKER_DONE));
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::NotEqual, idle);
-    a.mov_imm64(R::V0, 1);
-    a.store_ptr_disp32(R::V3, d(RT_COLLECTING), R::V0);
     a.mov_imm64(R::V0, WORKER_QUANTUM);
     a.store_ptr_disp32(R::V3, d(super::RT_BUDGET), R::V0);
-    a.call_label(l.cheney);
-    a.mov_imm64(R::V1, 0);
-    a.store_ptr_disp32(R::V3, d(RT_COLLECTING), R::V1);
+    a.call_label(w.wcheney);
     // worker_scanned += quantum - unspent budget.
     a.load_ptr_disp32(R::V1, R::V3, d(RT_WORKER_SCANNED));
     a.add_reg_imm32(R::V1, WORKER_QUANTUM as i32);

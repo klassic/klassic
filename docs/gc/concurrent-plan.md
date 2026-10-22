@@ -1,7 +1,8 @@
 # M-G6 plan: concurrent relocation and marking for `--gc=generational`
 
-Status: steps 1-3, 5 (Linux x86-64) and 6 implemented (2026-10-22); step 4
-(concurrent marking) open. Builds on M-G1..M-G5
+Status: steps 1-6 implemented (2026-10-22); the worker (steps 4-5) runs on
+Linux x86-64 only. See "Lock-free copying and concurrent marking" at the end
+for what is concurrent and what still pauses or locks. Builds on M-G1..M-G5
 (`production-integration-plan.md`), where every collection is stop-the-world
 semispace copying.
 
@@ -141,6 +142,69 @@ hardware; the arm64 CI runner remains the authority.
   format check. Default builds of `test-programs/` and `examples/` are
   byte-identical to the previous commit for Linux, Windows and AArch64.
 
-Still open: concurrent marking (step 4), a worker-private to-space buffer with
-CAS-claimed copies (so copying would not need the global lock), and workers on
-Windows (PE) and Mach-O, which keep the single-threaded allocation quanta.
+The lock-free copy path and concurrent marking below replace the coarse lock
+described in this section.
+
+## Lock-free copying and concurrent marking (Linux x86-64 worker)
+
+Copy protocol (`production/copy.rs`):
+
+- Forwarding is one word: the source header's `descriptor_id` becomes the
+  copy's reference bits with `0xf0f0` in the color bits. Both copiers copy
+  first and then claim the source with a CAS of that word from its original
+  id. A loser turns its tentative copy into a raw-bytes filler (published,
+  never traced) and takes the winner's reference (`--gc-log worker_lost=`,
+  `mutator_lost=`). The load barrier uses the same protocol and heals the
+  field with a CAS against the stale word.
+- Worker copies go to worker-private to-space pages taken from the top of
+  the semispace ("chain B"); the mutator's TLAB takes pages from the bottom
+  ("chain A"). Page reservation is a CAS on one packed word (`next_page |
+  copy_low << 32`), so neither side takes a lock for a page. The worker
+  bump-allocates privately, writes a published header itself (age-1 shared
+  mark record), the payload, the descriptor last, then the page's
+  `allocated_top`, so `--gc-log` verify sees `objects == published`.
+- Promotions reserve Old space with a CAS on `old_top` and write the
+  descriptor last; a scanner waits on a reserved slot whose descriptor is
+  still zero. Remembered-set appends reserve their slot with a CAS.
+- The mutator's own copies still use its TLAB. While one is in flight a flag
+  stops the worker's scan of chain A at that (possibly incomplete) object.
+- The scan (`production/scan.rs`) walks chain A, chain B and the promoted
+  range; it is complete after a pass that scanned nothing.
+
+Marking (`production/mark.rs`), snapshot-at-the-beginning:
+
+- When a quarter of the semispace is in use and no phase is open, a short
+  mark-start pause clears the 1-bit-per-granule bitmap and marks root cells
+  and collection-literal cells. The worker traces Young and Old in quanta.
+  New objects are marked at allocation; `field_store` marks the reference it
+  overwrites (SATB slow path, under the lock; no current program overwrites
+  a reference, so it is untested by programs).
+- The relocation pause finishes the trace on the mutator if the worker left
+  work (`mark_drains=`), then evacuation uses the mark: a remembered field
+  whose Young referent is unmarked is dropped instead of copied
+  (`remset_dropped=`); copying an unmarked object is counted as a violation
+  (`unmarked_copied=`, asserted 0 by the tests). Copying stays
+  reachability-driven (Cheney), so a full collection never copied
+  unreachable objects before either; the mark's gain is remembered-set
+  garbage and the invariant check. Marking and relocation never overlap.
+
+What still pauses or locks:
+
+- Pauses: mark start (bitmap clear plus root/literal marking) and the
+  relocation pause (finish an open phase, drain marking, flip, forward
+  roots, remembered fields and literal cells). The mutator finishes a phase
+  (scan to completion and recycle from-space) at its next allocation after
+  the worker reports it scanned, or at the next collection.
+- One ticket lock remains, but it no longer serialises copying: the worker
+  holds it per quantum, and the mutator takes it only to stop the worker
+  (both pauses, phase finish, `--gc-log` verify) and on the SATB slow path.
+  Allocation, root operations, the load barrier (including copying),
+  `field_store` without SATB and `deep_equal` take no lock.
+- `--gc-stress` collects before every allocation, so a phase is always open
+  and marking never starts under stress; stress exercises the CAS copy path.
+- Windows (PE) and Mach-O have no worker: no marking, plain forwarding
+  stores, and the allocation quanta of steps 1-3.
+
+Evidence: `generational_worker_marks_concurrently_and_claims_copies_by_cas`
+(mark cycles, worker copies, `unmarked_copied == 0`); race loops in the
+commit message.

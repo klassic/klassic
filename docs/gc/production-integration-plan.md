@@ -267,3 +267,9 @@ heap-slot rule is the conservative legacy range check.
 - M-G3: enums (reference descriptors ids 2/4, store barrier, load barrier,
   `gc_deep_equal`, literal roots).
 - M-G4: PE and Mach-O parity, then workers/scheduler (G02, G12).
+- M-G6 (concurrent relocation and marking): see `concurrent-plan.md`. On
+  Linux x86-64 a GC worker thread marks concurrently (SATB) and relocates
+  with CAS-claimed copies into worker-private to-space pages; the mutator's
+  load barrier copies through the same CAS protocol without a lock. Pauses
+  remain for mark start and for the flip with root forwarding; Windows and
+  Mach-O stay single-threaded.

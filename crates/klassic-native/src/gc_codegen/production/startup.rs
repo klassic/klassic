@@ -92,6 +92,8 @@ pub(super) fn emit_startup<E: PortableAsm>(
         HALF * CELLS_PER_PAGE,
     );
     store_rt_imm(a, RT_SPACE_END, HALF);
+    store_rt_imm(a, RT_COPY_LOW, HALF);
+    store_rt_imm(a, RT_BOUNDS, HALF << 32);
     store_rt_imm(a, RT_OLD_TOP, YOUNG_END);
     store_rt_imm(a, RT_OLD_BASE, YOUNG_END);
     // Builtin descriptors; raw bytes (id 1) is the only one M-G1 allocates.

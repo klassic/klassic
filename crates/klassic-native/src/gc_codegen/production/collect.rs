@@ -45,7 +45,7 @@ fn arena<E: PortableAsm>(a: &mut E, dst: R, base: R) {
 }
 
 /// `dst = cells + index * 32` for the root segment.
-fn cell_ptr<E: PortableAsm>(a: &mut E, dst: R, index: R) {
+pub(super) fn cell_ptr<E: PortableAsm>(a: &mut E, dst: R, index: R) {
     a.load_ptr_disp32(dst, R::V3, d(RT_SEGMENT));
     a.load_ptr_disp32(dst, dst, d(offset_of!(RootSegment, cells)));
     a.shl_reg_imm8(index, 5);
@@ -54,6 +54,7 @@ fn cell_ptr<E: PortableAsm>(a: &mut E, dst: R, index: R) {
 
 pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     emit_phase(a, l);
+    emit_recycle(a, l);
     let elements = d(RT_REQUEST + offset_of!(AllocationRequest, elements));
     let descriptor = d(RT_REQUEST + offset_of!(AllocationRequest, descriptor));
     let page_field = d(RT_REQUEST + offset_of!(AllocationRequest, page));
@@ -76,6 +77,8 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     // collect: V3 = runtime. Clobbers the caller-saved registers; the
     // interrupted allocation's size and element count are restored.
     a.bind_text_label(l.collect);
+    // Stop the worker for the whole pause.
+    super::worker::lock(a, l);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_ALLOC_SIZE));
     a.store_ptr_disp32(R::V3, d(RT_SAVED_SIZE), R::V0);
     a.load_ptr_disp32(R::V0, R::V3, elements);
@@ -89,6 +92,8 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     // A relocation phase still open from the previous collection must
     // complete before its spaces can flip again.
     a.call_label(l.finish);
+    // A mark cycle ends here: the mutator finishes what the worker left.
+    super::mark::drain(a, l);
     clear_scratch(a, l);
     // Close the allocating page: it belongs to the space being evacuated.
     let closed = a.create_text_label();
@@ -104,11 +109,15 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.store_ptr_disp32(R::V3, page_field, R::V0);
     a.bind_text_label(closed);
 
-    // Flip: remember from-space, allocate from the other half.
+    // Flip: remember from-space, allocate from the other half. Pages
+    // [space_base, next_page) were bound by the TLAB, [copy_low,
+    // space_end) by the worker.
     a.load_ptr_disp32(R::V0, R::V3, d(RT_SPACE_BASE));
     a.store_ptr_disp32(R::V3, d(RT_FROM_BASE), R::V0);
     a.load_ptr_disp32(R::V1, R::V3, d(RT_NEXT_PAGE));
     a.store_ptr_disp32(R::V3, d(RT_FROM_END), R::V1);
+    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_COPY_LOW));
+    a.store_ptr_disp32(R::V3, d(super::RT_FROM_COPY_LOW), R::V1);
     a.load_ptr_disp32(R::V1, R::V3, d(RT_MARKS + offset_of!(MarkArena, used)));
     a.store_ptr_disp32(R::V3, d(RT_FROM_MARKS), R::V1);
     a.mov_imm64(R::V1, HALF);
@@ -119,6 +128,16 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.store_ptr_disp32(R::V3, d(RT_MARKS + offset_of!(MarkArena, records)), R::V2);
     a.add_reg_imm32(R::V1, imm(HALF));
     a.store_ptr_disp32(R::V3, d(RT_SPACE_END), R::V1);
+    a.store_ptr_disp32(R::V3, d(super::RT_COPY_LOW), R::V1);
+    if l.worker.is_some() {
+        // bounds = next_page | copy_low << 32; the worker takes a fresh page.
+        a.shl_reg_imm8(R::V1, 32);
+        a.load_ptr_disp32(R::V0, R::V3, d(RT_SPACE_BASE));
+        a.or_reg_reg(R::V1, R::V0);
+        a.store_ptr_disp32(R::V3, d(super::RT_BOUNDS), R::V1);
+        a.mov_imm64(R::V0, 0);
+        a.store_ptr_disp32(R::V3, d(super::RT_W_PAGE), R::V0);
+    }
     a.mov_imm64(R::V0, 0);
     a.store_ptr_disp32(R::V3, d(RT_MARKS + offset_of!(MarkArena, used)), R::V0);
     // Full collection when Old could not absorb a worst-case promotion:
@@ -164,8 +183,8 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.add_reg_imm32(R::V0, 1);
     a.shl_reg_imm8(R::V0, 17);
     a.store_ptr_disp32(R::V3, d(super::RT_RY_LO), R::V0);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_FROM_END));
-    a.add_reg_imm32(R::V0, 1);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_FROM_BASE));
+    a.add_reg_imm32(R::V0, imm(HALF + 1));
     a.shl_reg_imm8(R::V0, 17);
     a.store_ptr_disp32(R::V3, d(super::RT_RY_HI), R::V0);
     a.mov_imm64(R::V0, 0);
@@ -219,7 +238,7 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     // The pause ends here: to-space and promoted objects are scanned by the
     // open relocation phase (allocation quanta, load barriers), and
     // from-space is recycled when that phase finishes.
-    super::enums::emit_cheney_init(a);
+    super::scan::emit_cheney_init(a);
     a.mov_imm64(R::V0, 1);
     a.store_ptr_disp32(R::V3, d(super::RT_PHASE_OPEN), R::V0);
     super::worker::open_phase(a, l);
@@ -238,6 +257,7 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.store_ptr_disp32(R::V3, d(RT_ALLOC_TAG), R::V0);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_SAVED_DESCRIPTOR));
     a.store_ptr_disp32(R::V3, descriptor, R::V0);
+    super::worker::unlock(a, l);
     a.ret();
 }
 
@@ -271,15 +291,86 @@ fn emit_phase<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.store_ptr_disp32(R::V3, d(super::RT_BUDGET), R::V0);
     a.call_label(l.cheney);
     clear_scratch(a, l);
-    // Recycle from-space pages [from_base, from_end): zero payload, start
-    // bits and forward cells, then make each READY under a new incarnation.
-    let pages = a.create_text_label();
-    let recycled = a.create_text_label();
+    // Recycle from-space: the TLAB's pages [from_base, from_end) and the
+    // worker's pages [from_copy_low, from_base + HALF).
     a.load_ptr_disp32(R::V0, R::V3, d(RT_FROM_BASE));
     a.store_ptr_disp32(R::V3, d(RT_SCAN_INDEX), R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_FROM_END));
+    a.store_ptr_disp32(R::V3, d(super::RT_RECYCLE_END), R::V0);
+    a.call_label(l.recycle);
+    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_FROM_COPY_LOW));
+    a.store_ptr_disp32(R::V3, d(RT_SCAN_INDEX), R::V0);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_FROM_BASE));
+    a.add_reg_imm32(R::V0, imm(HALF));
+    a.store_ptr_disp32(R::V3, d(super::RT_RECYCLE_END), R::V0);
+    a.call_label(l.recycle);
+    // Zero the used part of from-space's mark arena (168 B = 21 qwords).
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_FROM_BASE));
+    arena(a, R::V7, R::V0);
+    a.load_ptr_disp32(R::V1, R::V3, d(RT_FROM_MARKS));
+    a.mov_reg_reg(R::V0, R::V1);
+    a.shl_reg_imm8(R::V0, 4);
+    a.mov_reg_reg(R::V2, R::V1);
+    a.shl_reg_imm8(R::V2, 2);
+    a.add_reg_reg(R::V1, R::V0);
+    a.add_reg_reg(R::V1, R::V2);
+    a.call_label(l.zero);
+
+    // After a full collection the old Old half is garbage: zero it so the
+    // next flip bump-allocates over clean memory (padding compares equal).
+    let no_full = a.create_text_label();
+    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_FULL));
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::Equal, no_full);
+    a.load_ptr_disp32(R::V7, R::V3, d(super::RT_OLD_FROM));
+    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_OLD_FROM_END));
+    a.sub_reg_reg(R::V1, R::V7);
+    a.shr_reg_imm8(R::V1, 3);
+    a.load_ptr_disp32(R::V0, R::V3, d(RT_HEAP_BASE));
+    a.add_reg_reg(R::V7, R::V0);
+    a.call_label(l.zero);
+    a.mov_imm64(R::V0, 0);
+    a.store_ptr_disp32(R::V3, d(super::RT_FULL), R::V0);
+    a.bind_text_label(no_full);
+    a.mov_imm64(R::V0, 0);
+    for field in [
+        super::RT_PHASE_OPEN,
+        super::RT_RY_LO,
+        super::RT_RY_HI,
+        super::RT_RO_LO,
+        super::RT_RO_HI,
+        RT_COLLECTING,
+    ] {
+        a.store_ptr_disp32(R::V3, d(field), R::V0);
+    }
+    if l.worker_entry().is_some() {
+        a.store_ptr_disp32(R::V3, d(super::RT_WORKER_DONE), R::V0);
+        a.store_ptr_disp32(R::V3, d(super::RT_MARK_VALID), R::V0);
+        // Fold the worker's private counters (it is stopped).
+        for (total, part) in [
+            (super::RT_PROMOTED, super::RT_W_PROMOTED),
+            (super::RT_UNMARKED, super::RT_W_UNMARKED),
+        ] {
+            a.load_ptr_disp32(R::V1, R::V3, d(total));
+            a.load_ptr_disp32(R::V2, R::V3, d(part));
+            a.add_reg_reg(R::V1, R::V2);
+            a.store_ptr_disp32(R::V3, d(total), R::V1);
+            a.store_ptr_disp32(R::V3, d(part), R::V0);
+        }
+    }
+    a.bind_text_label(closed);
+    a.ret();
+}
+
+/// recycle: pages [scan_index, recycle_end) -- zero payload, start bits and
+/// forward cells, then make each READY under a new incarnation.
+fn emit_recycle<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    let pages = a.create_text_label();
+    let recycled = a.create_text_label();
+    a.bind_text_label(l.recycle);
     a.bind_text_label(pages);
     a.load_ptr_disp32(R::V0, R::V3, d(RT_SCAN_INDEX));
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_FROM_END));
+    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_RECYCLE_END));
     a.cmp_reg_reg(R::V0, R::V1);
     a.jcc_label(C::AboveOrEqual, recycled);
     page_ptr(a, R::V8, R::V0, R::V1);
@@ -326,49 +417,6 @@ fn emit_phase<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.store_ptr_disp32(R::V3, d(RT_SCAN_INDEX), R::V0);
     a.jmp_label(pages);
     a.bind_text_label(recycled);
-    // Zero the used part of from-space's mark arena (168 B = 21 qwords).
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_FROM_BASE));
-    arena(a, R::V7, R::V0);
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_FROM_MARKS));
-    a.mov_reg_reg(R::V0, R::V1);
-    a.shl_reg_imm8(R::V0, 4);
-    a.mov_reg_reg(R::V2, R::V1);
-    a.shl_reg_imm8(R::V2, 2);
-    a.add_reg_reg(R::V1, R::V0);
-    a.add_reg_reg(R::V1, R::V2);
-    a.call_label(l.zero);
-
-    // After a full collection the old Old half is garbage: zero it so the
-    // next flip bump-allocates over clean memory (padding compares equal).
-    let no_full = a.create_text_label();
-    a.load_ptr_disp32(R::V0, R::V3, d(super::RT_FULL));
-    a.test_reg_reg(R::V0, R::V0);
-    a.jcc_label(C::Equal, no_full);
-    a.load_ptr_disp32(R::V7, R::V3, d(super::RT_OLD_FROM));
-    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_OLD_FROM_END));
-    a.sub_reg_reg(R::V1, R::V7);
-    a.shr_reg_imm8(R::V1, 3);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_HEAP_BASE));
-    a.add_reg_reg(R::V7, R::V0);
-    a.call_label(l.zero);
-    a.mov_imm64(R::V0, 0);
-    a.store_ptr_disp32(R::V3, d(super::RT_FULL), R::V0);
-    a.bind_text_label(no_full);
-    a.mov_imm64(R::V0, 0);
-    for field in [
-        super::RT_PHASE_OPEN,
-        super::RT_RY_LO,
-        super::RT_RY_HI,
-        super::RT_RO_LO,
-        super::RT_RO_HI,
-        RT_COLLECTING,
-    ] {
-        a.store_ptr_disp32(R::V3, d(field), R::V0);
-    }
-    if l.worker_entry().is_some() {
-        a.store_ptr_disp32(R::V3, d(super::RT_WORKER_DONE), R::V0);
-    }
-    a.bind_text_label(closed);
     a.ret();
 }
 
