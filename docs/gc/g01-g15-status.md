@@ -39,6 +39,19 @@ phase finish and the SATB slow path. The spec's final completion report
 (section 12) cannot be filed until every row is met with a named test and a
 measurement.
 
+## SATB cannot be reached from a Klassic program (2026-10-23)
+
+`field_store` runs on every `__gc_write`, but those are emitted only by the
+enum constructor, which writes into a freshly allocated record whose slots are
+null, so the SATB branch that marks a non-null overwritten reference never
+executes. `__gc_write` is a post-typecheck desugar product and cannot be
+written in source (`undefined variable`); the language has no assignment to
+a heap field. Exercising SATB therefore needs either a language feature
+(mutable record/enum fields, which touches the evaluator, checker and every
+backend) or a machine-code harness; the decision for this project was to keep
+the language unchanged, so the SATB pre-barrier is **untested** and G06/G03
+cannot move past partial until a harness exists.
+
 ## Next in order of dependency
 
 1. G06/G03: a program that overwrites a heap reference, to exercise SATB.
