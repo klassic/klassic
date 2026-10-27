@@ -34,7 +34,7 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools clang
 
       - name: Build runtime staticlib
         # cargo test alone doesn't produce libklassic_runtime.a, which
@@ -47,11 +47,28 @@ jobs:
       - name: Build static binary
         run: cargo build --release --target x86_64-unknown-linux-musl
 
+      - name: Build archive for the system GNU C/LLVM linker
+        # The CLI stays static musl; generated programs use system clang and GNU libc.
+        run: cargo build --release -p klassic-runtime --target x86_64-unknown-linux-gnu
+
       - name: Package
         run: |
           cp target/x86_64-unknown-linux-musl/release/klassic klassic
-          cp target/x86_64-unknown-linux-musl/release/libklassic_runtime.a libklassic_runtime.a
-          tar czf "klassic-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz" klassic libklassic_runtime.a
+          cp target/x86_64-unknown-linux-gnu/release/libklassic_runtime.a libklassic_runtime.a
+          tar czf "klassic-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz" klassic libklassic_runtime.a runtime/gc/*.h \
+            runtime/gc/klassic_gen_runtime.c runtime/gc/klassic_gen_remembered.c runtime/gc/gc_native_driver.c \
+            runtime/gc/klassic_gen_policy.c runtime/gc/klassic_gen_verify.c runtime/gc/klassic_gen_string.c runtime/gc/klassic_gen_scalar.c
+
+      - name: Smoke-test extracted Linux bundle
+        run: |
+          bundle_dir="${RUNNER_TEMP}/klassic-bundle"
+          mkdir -p "$bundle_dir"
+          tar xzf "klassic-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz" -C "$bundle_dir"
+          printf 'println(42)\n' > "$bundle_dir/program.kl"
+          for backend in c llvm; do
+            env -u KLASSIC_RT_LIB -u KLASSIC_GEN_RUNTIME_DIR "$bundle_dir/klassic" --gc=generational --gc-stress --backend "$backend" build "$bundle_dir/program.kl" -o "$bundle_dir/program"
+            test "$("$bundle_dir/program")" = "42"
+          done
 
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/')
