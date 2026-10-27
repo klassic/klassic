@@ -2006,6 +2006,18 @@ fn gc_atomic_emitted_code_two_threads() {
     );
 }
 
+#[test]
+fn c_driver_supervision_drains_stdout_and_stderr_before_exit() {
+    let stdout = run_c_driver("pipe_probe.h", "", "pipe_drain_harness.c");
+    let (payload, marker) = stdout.split_at(4 * 1024 * 1024);
+    assert!(payload.bytes().all(|byte| byte == b'x'));
+    // C text stdout uses CRLF on a native Windows host.
+    assert_eq!(
+        marker.replace("\r\n", "\n"),
+        "\nconcurrent pipe drain PASS\n"
+    );
+}
+
 /// External C driver shared by native instruction and OS-adapter tests.
 pub(super) fn run_c_driver(header_name: &str, header: &str, harness: &str) -> String {
     use std::process::Command;
@@ -2071,34 +2083,60 @@ pub(super) fn run_c_driver(header_name: &str, header: &str, harness: &str) -> St
     let output = run_with_deadline(&executable);
     assert!(
         output.status.success(),
-        "emitted-code conformance {:?}: {}",
+        "emitted-code conformance {:?}: stdout:\n{}\nstderr:\n{}",
         output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
 }
 
 pub(super) fn run_with_deadline(executable: &std::path::Path) -> std::process::Output {
+    use std::io::Read;
     use std::process::Command;
     let mut child = Command::new(executable)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    // The C fixtures intentionally publish progress without stdio buffering.
+    // Drain both pipes while supervising: waiting for exit first can fill a
+    // small host pipe and strand the child in write until its real alarm fires.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let mut timed_out = false;
     while child.try_wait().unwrap().is_none() {
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
-            panic!(
-                "conformance driver timed out: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            timed_out = true;
+            break;
         }
         // Timeout supervision only; fixture interleavings use latches/events.
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    child.wait_with_output().unwrap()
+    let output = std::process::Output {
+        status: child.wait().unwrap(),
+        stdout: stdout_reader.join().unwrap(),
+        stderr: stderr_reader.join().unwrap(),
+    };
+    assert!(
+        !timed_out,
+        "conformance driver timed out: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
