@@ -2027,7 +2027,11 @@ pub(super) fn run_c_driver(header_name: &str, header: &str, harness: &str) -> St
     struct Scratch(std::path::PathBuf);
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            if std::thread::panicking() {
+                eprintln!("failed conformance driver retained: {}", self.0.display());
+            } else {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
     }
     let scratch = Scratch(std::env::temp_dir().join(format!(
@@ -2084,6 +2088,10 @@ pub(super) fn run_c_driver(header_name: &str, header: &str, harness: &str) -> St
         String::from_utf8_lossy(&output.stderr)
     );
     let output = run_with_deadline(&executable);
+    if !output.status.success() {
+        std::fs::write(scratch.0.join("stdout.log"), &output.stdout).unwrap();
+        std::fs::write(scratch.0.join("stderr.log"), &output.stderr).unwrap();
+    }
     assert!(
         output.status.success(),
         "emitted-code conformance {:?}: stdout:\n{}\nstderr:\n{}",

@@ -20,8 +20,10 @@ use crate::{
     TextLabel, write_executable_for_target,
 };
 use std::collections::HashMap;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// Where an operand comes from.
 #[derive(Clone, Copy)]
@@ -516,6 +518,18 @@ fn execute_with_image_retention(
     hard_limit: Option<u64>,
     retain_failure: bool,
 ) -> (Output, Option<std::path::PathBuf>) {
+    let path = create_harness_image(body, arg, worker_thread, stress, soft_limit, hard_limit);
+    run_harness_image(path, arg, retain_failure, Duration::from_secs(180))
+}
+
+fn create_harness_image(
+    body: fn(&mut NativeCodeGenerator, u64),
+    arg: u64,
+    worker_thread: bool,
+    stress: bool,
+    soft_limit: Option<u64>,
+    hard_limit: Option<u64>,
+) -> std::path::PathBuf {
     let target = NativeTargetContext::for_target(NativeTarget::LinuxX86_64);
     let source = SourceFile::new("<gc-harness>", "1");
     let expr =
@@ -560,15 +574,67 @@ fn execute_with_image_retention(
     file.set_permissions(std::fs::Permissions::from_mode(0o755))
         .expect("chmod");
     drop(file);
-    let output = (0..50)
-        .find_map(|attempt| match Command::new(&path).output() {
+    path
+}
+
+/// Drain both pipes while waiting: a full pipe must not impersonate a GC hang.
+fn supervise_harness_image(
+    path: &std::path::Path,
+    timeout: Duration,
+) -> std::io::Result<(Output, bool)> {
+    let mut child = Command::new(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).map(|_| bytes)
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().unwrap()));
+    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+    let started = Instant::now();
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
+        }
+        if started.elapsed() >= timeout {
+            // All emitted workers belong to this process. Reap before joining
+            // the pipe readers so neither workers nor blocked readers survive.
+            let _ = child.kill();
+            break (child.wait()?, true);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    Ok((
+        Output {
+            status,
+            stdout: stdout.join().expect("harness stdout reader panicked")?,
+            stderr: stderr.join().expect("harness stderr reader panicked")?,
+        },
+        timed_out,
+    ))
+}
+
+fn run_harness_image(
+    path: std::path::PathBuf,
+    arg: u64,
+    retain_failure: bool,
+    timeout: Duration,
+) -> (Output, Option<std::path::PathBuf>) {
+    let (output, timed_out) = (0..50)
+        .find_map(|attempt| match supervise_harness_image(&path, timeout) {
             Ok(output) => Some(output),
             Err(error) if error.raw_os_error() == Some(26) && attempt < 49 => {
                 // ETXTBSY: another test thread forked while the file was open.
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(20));
                 None
             }
-            Err(error) => panic!("run harness: {error}"),
+            Err(error) => panic!(
+                "run harness (image retained at {}): {error}",
+                path.display()
+            ),
         })
         .expect("harness ran");
     if let Some(export) = std::env::var_os("KLASSIC_HARNESS_IMAGE") {
@@ -586,6 +652,16 @@ fn execute_with_image_retention(
         )
         .expect("export harness executable by argument");
     }
+    // A timeout is never an expected runtime rejection. Keep the image even
+    // when the caller normally deletes expected-failure fixtures, and fail here
+    // before it can inspect only the unsuccessful exit status.
+    assert!(
+        !timed_out,
+        "harness timed out after {timeout:?}; executable retained: {}\nstdout:\n{}\nstderr:\n{}",
+        path.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let retained = if retain_failure && !output.status.success() {
         eprintln!("failed harness executable retained: {}", path.display());
         Some(path)
@@ -594,6 +670,49 @@ fn execute_with_image_retention(
         None
     };
     (output, retained)
+}
+
+#[test]
+fn harness_supervision_drains_large_stdout_and_stderr() {
+    fn write_both(g: &mut NativeCodeGenerator, _: u64) {
+        let text = g.asm.data_label_with_bytes(&vec![b'x'; 65536]);
+        for _ in 0..64 {
+            g.emit_write_data(1, text, 65536);
+            g.emit_write_data(2, text, 65536);
+        }
+    }
+    let path = create_harness_image(write_both, 0, false, false, None, None);
+    let (output, retained) = run_harness_image(path, 0, true, Duration::from_secs(30));
+    assert!(output.status.success());
+    assert!(retained.is_none());
+    assert_eq!(output.stdout, vec![b'x'; 4 * 1024 * 1024]);
+    assert_eq!(output.stderr, vec![b'x'; 4 * 1024 * 1024]);
+}
+
+#[test]
+fn harness_timeout_is_not_an_expected_failure_and_retains_its_elf() {
+    fn never_finishes(g: &mut NativeCodeGenerator, _: u64) {
+        let text = g.asm.data_label_with_bytes(b"entered loop\n");
+        g.emit_write_data(1, text, 13);
+        let forever = g.create_text_label();
+        g.bind_text_label(forever);
+        g.jmp_label(forever);
+    }
+    let path = create_harness_image(never_finishes, 0, false, false, None, None);
+    // `false` is the policy used by expected runtime-failure tests. A timeout
+    // must panic before such a caller can mistake a killed process for success.
+    let failure = std::panic::catch_unwind(|| {
+        run_harness_image(path.clone(), 0, false, Duration::from_secs(1))
+    })
+    .expect_err("a timeout must fail even an expected-failure fixture");
+    let diagnostic = failure
+        .downcast_ref::<String>()
+        .expect("timeout diagnostic");
+    assert!(diagnostic.contains("harness timed out after 1s"));
+    assert!(diagnostic.contains("entered loop"));
+    assert!(diagnostic.contains(&path.display().to_string()));
+    assert!(std::fs::read(&path).unwrap().starts_with(b"\x7fELF"));
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

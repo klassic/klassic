@@ -9,6 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       KLASSIC_UNICORN_PYTHON: python
+      KLASSIC_GC_GRAPH_TRACE: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,6 +39,16 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: Preserve failed conformance drivers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-failed-conformance-drivers
+          path: |
+            /tmp/klassic-emitted-atomics-*
+            /tmp/klassic-harness-*
+          if-no-files-found: ignore
 
       - name: Build release binary
         run: cargo build --release
