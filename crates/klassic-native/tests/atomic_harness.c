@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "atomic_progress.h"
+#include "conformance_budget.h"
 #include "../../../runtime/gc/gc_native_buffer_incoming_cases.h"
 #include "../../../runtime/gc/gc_native_buffer_quiescence_cases.h"
 #include "../../../runtime/gc/gc_native_heap_cases.h"
@@ -567,7 +568,7 @@ int main(void) {
     InitializeCriticalSection(&latch.mutex);
     InitializeConditionVariable(&latch.condition);
 #else
-    alarm(40); // a broken emitted retry loop must fail rather than hang CI
+    alarm(KLASSIC_CONFORMANCE_TIMEOUT_SECONDS); // bounded whole-suite budget
     assert(pthread_mutex_init(&latch.mutex, NULL) == 0);
     assert(pthread_cond_init(&latch.condition, NULL) == 0);
 #endif

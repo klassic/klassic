@@ -37,8 +37,11 @@ jobs:
         # the C-backend link tests resolve next to the klassic binary.
         run: cargo build -p klassic-runtime
 
-      - name: Test
-        run: cargo test
+      - name: Test native runtime
+        run: cargo test -p klassic-native
+
+      - name: Test remaining workspace
+        run: cargo test --workspace --exclude klassic-native
 
       - name: Preserve failed conformance drivers
         if: failure()
