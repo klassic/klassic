@@ -607,6 +607,12 @@ pub(crate) fn emit_life_locked<A: PortableAsm>(a: &mut A) {
 
 #[allow(dead_code)]
 pub(crate) fn emit_clear_chunk<A: PortableAsm>(a: &mut A) {
+    emit_clear_chunk_bounded(a, 256);
+}
+
+/// Same exclusive-cleaner checks, with a smaller backend work quantum.
+pub(crate) fn emit_clear_chunk_bounded<A: PortableAsm>(a: &mut A, cells: u64) {
+    assert!((1..=256).contains(&cells));
     use crate::gc_abi::RootCell;
     let invalid = a.create_text_label();
     let more = a.create_text_label();
@@ -639,8 +645,8 @@ pub(crate) fn emit_clear_chunk<A: PortableAsm>(a: &mut A) {
     b.branch(local(USED), r!(limit), C::Above, invalid);
     b.branch(r!(limit), s!(capacity), C::Above, invalid);
     b.set(local(NEXT), r!(limit));
-    b.branch(sub(r!(limit), local(USED)), n(256), C::Below, end_ready);
-    b.set(local(NEXT), add(local(USED), n(256)));
+    b.branch(sub(r!(limit), local(USED)), n(cells), C::Below, end_ready);
+    b.set(local(NEXT), add(local(USED), n(cells)));
     b.a.bind_text_label(end_ready);
     b.a.bind_text_label(copy);
     b.branch(local(USED), local(NEXT), C::Equal, finish);
