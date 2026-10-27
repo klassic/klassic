@@ -122,16 +122,16 @@ fn unknown_gc_mode_is_rejected() {
 }
 
 #[test]
-fn canonical_backends_reject_unsupported_executable_targets() {
+fn generational_c_and_llvm_reject_foreign_targets() {
     for backend in ["llvm", "c"] {
         let stderr = build_failure_stderr(
             "backend",
             &[
                 "--gc=generational",
-                "--backend",
-                backend,
                 "--target",
                 "x86_64-pc-windows-msvc",
+                "--backend",
+                backend,
             ],
             "println(1)\n",
         );
@@ -142,10 +142,31 @@ fn canonical_backends_reject_unsupported_executable_targets() {
     }
 }
 
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[test]
+fn generational_c_and_llvm_reject_unsupported_hosts() {
+    for backend in ["llvm", "c"] {
+        let stderr = build_failure_stderr(
+            "backend",
+            &[
+                "--gc=generational",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--backend",
+                backend,
+            ],
+            "println(1)\n",
+        );
+        assert!(
+            stderr.contains("canonical executable linking currently requires a Linux x86-64 host"),
+            "backend {backend} stderr:\n{stderr}"
+        );
+    }
+}
+
 #[test]
 fn generational_builds_for_every_direct_target() {
-    // Every direct backend carries the generational runtime; only
-    // Canonical C/LLVM executable targets are checked separately.
+    // Every direct backend carries its generational runtime.
     for target in [
         "x86_64-unknown-linux-gnu",
         "x86_64-pc-windows-msvc",

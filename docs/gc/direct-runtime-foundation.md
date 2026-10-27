@@ -41,7 +41,9 @@ pipe draining, and canonical collector fixes.
 
 Local integration validation on base `bea00f6` passed: workspace build,
 `cargo test --locked -- --nocapture` (1492 tests, zero failures or ignored
-cases across 36 suites), all-target Clippy and formatting. This includes
+cases across 36 suites), all-target Clippy and formatting. The run includes
+108 GC integration tests and 597 native library tests; the native library
+suite also passed separately before the full run. This includes
 canonical regressions and direct moving/resource-lifetime tests. Cross-platform
 CI remains required; local execution and API-model checks do not establish
 all native-platform or latency acceptance. Failure artifacts and initial logs

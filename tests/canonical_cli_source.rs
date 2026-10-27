@@ -3,7 +3,7 @@
 use std::process::Command;
 
 #[test]
-fn canonical_cli_emits_compilable_source_and_rejects_unavailable_executables() {
+fn canonical_cli_emits_compilable_source_and_preserves_outputs_on_rejection() {
     let dir = std::env::temp_dir().join(format!(
         "klassic-cli-source-{}-{}",
         std::process::id(),
@@ -77,17 +77,6 @@ fn canonical_cli_emits_compilable_source_and_rejects_unavailable_executables() {
             "{}",
             String::from_utf8_lossy(&compile.stderr)
         );
-        let output = dir.join("existing.bin");
-        std::fs::write(&output, b"keep").unwrap();
-        let rejected = Command::new(env!("CARGO_BIN_EXE_klassic"))
-            .args(["--gc=generational", "--backend", backend, "build"])
-            .arg(&input)
-            .arg("-o")
-            .arg(&output)
-            .output()
-            .unwrap();
-        assert!(!rejected.status.success());
-        assert_eq!(std::fs::read(output).unwrap(), b"keep");
         std::fs::write(&source, b"keep source").unwrap();
         for flags in [
             &["--gc-poison"][..],
