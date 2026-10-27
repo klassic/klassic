@@ -95,7 +95,13 @@ static DWORD main_thread;
 static void *WINABI api_VirtualAlloc(void *p,size_t n,uint32_t f,uint32_t prot){void *r=VirtualAlloc(p,n,f,prot);if(!native_runtime&&f==0x3000)native_runtime=r;return r;}
 static uint64_t WINABI api_VirtualFree(void *p,size_t n,uint32_t f){uint32_t ok=VirtualFree(p,n,f);if(ok&&f==0x4000)atomic_fetch_add(&decommits,1);return dirty(ok);}
 #endif
-static void *thread_handle,*event_handle;
+typedef struct { void *thread,*event; unsigned joined,thread_closed,event_closed; } WorkerResource;
+static WorkerResource worker_resources[2];
+static void *event_handle;
+static WorkerResource *resource_for(void *p){
+    for(int i=1;i>=0;i--)if(worker_resources[i].thread==p||worker_resources[i].event==p)return &worker_resources[i];
+    assert(0);return NULL;
+}
 static void *file_handles[128];
 static void native_file_buffer(const void *,uint32_t);
 static int file_index(void *p){if(!p)return -1;for(int i=0;i<128;i++)if(file_handles[i]==p)return i;return -1;}
@@ -293,15 +299,15 @@ static uint64_t WINABI api_FindClose(void *handle){
 
 static void *WINABI api_CreateEventA(void *a,int manual,int signaled,const char *name){
     ABI_CHECK();assert(!a&&!manual&&!signaled&&!name);if(fault==1){last_error=8;return NULL;}
-    atomic_fetch_add(&events,1);
+    unsigned resource_index=atomic_fetch_add(&events,1);assert(resource_index<2);
 #ifdef _WIN32
-    event_handle=CreateEventA(NULL,FALSE,FALSE,NULL);return event_handle;
+    event_handle=CreateEventA(NULL,FALSE,FALSE,NULL);worker_resources[resource_index].event=event_handle;return event_handle;
 #else
-    Handle *h=calloc(1,sizeof(*h));assert(h);h->kind=2;assert(pthread_mutex_init(&h->mutex,NULL)==0);assert(pthread_cond_init(&h->cond,NULL)==0);event_handle=h;return h;
+    Handle *h=calloc(1,sizeof(*h));assert(h);h->kind=2;assert(pthread_mutex_init(&h->mutex,NULL)==0);assert(pthread_cond_init(&h->cond,NULL)==0);event_handle=h;worker_resources[resource_index].event=h;return h;
 #endif
 }
 static void *WINABI api_CreateThread(void *a,size_t n,WorkerEntry entry,void *arg,uint32_t flags,uint32_t *id){
-    ABI_CHECK();assert(!a&&n==256*1024&&entry&&!arg&&flags==0x10000&&!id);
+    ABI_CHECK();assert(!a&&n==256*1024&&entry&&arg&&flags==0x10000&&!id);
     if(fault==2||fault==3||fault==50){last_error=8;return NULL;}atomic_fetch_add(&threads,1);
 #ifdef _WIN32
     void *created=CreateThread(NULL,n,(LPTHREAD_START_ROUTINE)entry,arg,flags,NULL);
@@ -319,7 +325,7 @@ static void *WINABI api_CreateThread(void *a,size_t n,WorkerEntry entry,void *ar
         }
         assert(atomic_load(&waits)>0);
     }
-    thread_handle=created;return created;
+    resource_for(event_handle)->thread=created;return created;
 }
 static uint64_t WINABI api_CloseHandle(void *p){
     ABI_CHECK();assert(p);
@@ -333,9 +339,10 @@ static uint64_t WINABI api_CloseHandle(void *p){
 #endif
     }
     atomic_fetch_add(&closes,1);
-    if(fault==3||(fault==14&&p==thread_handle)||(fault==15&&p==event_handle)){last_error=5;return dirty(0);}
-    if(p==thread_handle){assert(atomic_load(&joined)==1);atomic_fetch_add(&thread_closes,1);}
-    else{assert(p==event_handle);if(atomic_load(&threads))assert(atomic_load(&joined)==1&&atomic_load(&thread_closes)==1);atomic_fetch_add(&event_closes,1);}
+    WorkerResource *resource=resource_for(p);
+    if(fault==3||(fault==14&&p==resource->thread)||(fault==15&&p==resource->event)){last_error=5;return dirty(0);}
+    if(p==resource->thread){assert(resource->joined&&!resource->thread_closed);resource->thread_closed=1;atomic_fetch_add(&thread_closes,1);}
+    else{assert(p==resource->event&&!resource->event_closed);if(resource->thread)assert(resource->joined&&resource->thread_closed);resource->event_closed=1;atomic_fetch_add(&event_closes,1);}
 #ifdef _WIN32
     return dirty(CloseHandle(p));
 #else
@@ -356,15 +363,15 @@ static uint64_t WINABI api_SetEvent(void *p){
 static uint64_t WINABI api_WaitForSingleObject(void *p,uint32_t milliseconds){
     ABI_CHECK();assert(p);
     if(milliseconds==UINT32_MAX){
-        assert(p==thread_handle);assert(atomic_load(&signals)>0);atomic_fetch_add(&join_waits,1);
+        WorkerResource *resource=resource_for(p);assert(p==resource->thread&&!resource->joined);assert(atomic_load(&signals)>0);atomic_fetch_add(&join_waits,1);
         if(fault==13){last_error=5;return dirty(UINT32_MAX);}
 #ifdef _WIN32
         uint32_t result=WaitForSingleObject(p,milliseconds);assert(result==0);
 #else
         Handle *h=p;assert(h->kind==1&&!h->joined);assert(pthread_join(h->thread,NULL)==0);h->joined=1;
-        assert(atomic_load(&worker_returns)==1);
+        assert(atomic_load(&worker_returns)>0);
 #endif
-        atomic_fetch_add(&joined,1);return dirty(0);
+        resource->joined=1;atomic_fetch_add(&joined,1);return dirty(0);
     }
     assert(milliseconds==1000);atomic_fetch_add(&waits,1);
 #ifdef _WIN32
@@ -479,10 +486,10 @@ static const char *WINABI api_GetEnvironmentStringsA(void){return "\0";}
 static _Noreturn void WINABI api_ExitProcess(uint32_t code){
     ABI_CHECK();if(native_runtime){uint32_t *ctx=native_owner_context();assert(atomic_load((_Atomic uint32_t *)&ctx[1])==0);}
     unsigned e=atomic_load(&events),t=atomic_load(&threads),c=atomic_load(&closes);
-    if(!code){assert(atomic_load(&tls_keys_active)==0);assert(atomic_load(&searches_open)==0);assert(fault==49||fault==46||fault==47||fault==48||fault==0||fault==1||fault==2||fault==8||fault==10||fault==11||fault==12||fault==16||fault==17);assert(e==(fault==1?0u:1u));assert(t==((fault==1||fault==2)?0u:1u));assert(c==(fault==1?0u:fault==2?1u:2u));assert(atomic_load(&joined)==t);assert(atomic_load(&thread_closes)==t);assert(atomic_load(&event_closes)==e);}
-    if(fault==18||fault==19){assert(code==(fault==18?7u:23u));assert(e==1&&t==1&&c==2);assert(atomic_load(&joined)==1&&atomic_load(&thread_closes)==1&&atomic_load(&event_closes)==1);}
+    if(!code){assert(atomic_load(&tls_keys_active)==0);assert(atomic_load(&searches_open)==0);assert(fault==49||fault==46||fault==47||fault==48||fault==0||fault==1||fault==2||fault==8||fault==10||fault==11||fault==12||fault==16||fault==17);assert(e==(fault==1?0u:2u));assert(t==((fault==1||fault==2)?0u:2u));assert(c==(fault==1?0u:fault==2?2u:4u));assert(atomic_load(&joined)==t);assert(atomic_load(&thread_closes)==t);assert(atomic_load(&event_closes)==e);}
+    if(fault==18||fault==19){assert(code==(fault==18?7u:23u));assert(e==2&&t==2&&c==4);assert(atomic_load(&joined)==2&&atomic_load(&thread_closes)==2&&atomic_load(&event_closes)==2);}
     if(!code&&fault==12){assert(atomic_load(&yields)>0);}
-    if(!code&&(fault==10||fault==16)){assert(atomic_load(&main_waits)==1);assert(atomic_load(&timeouts)>0);}
+    if(!code&&(fault==10||fault==16)){assert(atomic_load(&main_waits)==2);assert(atomic_load(&timeouts)>0);}
     fprintf(stderr,"win-production: events=%u threads=%u waits=%u timeouts=%u signals=%u closes=%u main_waits=%u notified=%u clocks=%u yields=%u join_waits=%u joined=%u thread_closes=%u event_closes=%u\n",e,t,atomic_load(&waits),atomic_load(&timeouts),atomic_load(&signals),c,atomic_load(&main_waits),atomic_load(&notified),atomic_load(&clocks),atomic_load(&yields),atomic_load(&join_waits),atomic_load(&joined),atomic_load(&thread_closes),atomic_load(&event_closes));fflush(stderr);
 #ifdef _WIN32
     ExitProcess(code);

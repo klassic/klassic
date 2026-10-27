@@ -1,8 +1,10 @@
 //! Owned Linux production worker stack/TLS and kernel-clear-tid joining.
 //! The worker uses raw syscalls only; its private FS base is not libc TLS.
+#[cfg(test)]
+use super::production::{linux_worker_offset, worker_slot_identity_offset};
 use super::{
     linux_clock,
-    production::{WorkerHooks, linux_worker_offset},
+    production::{WorkerHooks, worker_slot_linux_offset, worker_slot_runtime_offset},
     threads,
 };
 use crate::{Condition as C, NativeCodeGenerator, Reg as R, TextLabel};
@@ -19,6 +21,8 @@ pub(crate) enum Fault {
     Free,
     CloneCleanup,
     Bootstrap,
+    SecondClone,
+    SecondBootstrap,
 }
 
 #[repr(C)]
@@ -34,8 +38,14 @@ pub(crate) struct State {
     pub last_stack: u64,
     pub bootstrap: u64,
 }
+// Test introspection retains absolute offsets for slot zero. Production OS
+// leaves instead address the selected stable slot through OwnerContext/R12.
+#[cfg(test)]
 fn field(member: usize) -> i32 {
     linux_worker_offset() + member as i32
+}
+fn slot_field(member: usize) -> i32 {
+    worker_slot_linux_offset() + member as i32
 }
 #[cfg(test)]
 pub(crate) fn last_stack_offset() -> i32 {
@@ -45,6 +55,7 @@ pub(crate) fn last_stack_offset() -> i32 {
 pub(crate) fn bootstrap_offset() -> i32 {
     field(offset_of!(State, bootstrap))
 }
+#[cfg(test)]
 pub(crate) fn offsets() -> [i32; 6] {
     [
         offset_of!(State, stack),
@@ -58,8 +69,16 @@ pub(crate) fn offsets() -> [i32; 6] {
 }
 
 pub(crate) fn emit(g: &mut NativeCodeGenerator, h: &WorkerHooks<TextLabel>, entry: TextLabel) {
-    let [stack, tid, observed, entry_sp, joins, releases] = offsets();
-    let tls = field(offset_of!(State, tls));
+    let [stack, tid, observed, entry_sp, joins, releases] = [
+        offset_of!(State, stack),
+        offset_of!(State, tid),
+        offset_of!(State, observed_tls),
+        offset_of!(State, entry_sp),
+        offset_of!(State, joins),
+        offset_of!(State, releases),
+    ]
+    .map(slot_field);
+    let tls = slot_field(offset_of!(State, tls));
     let alloc = g.asm.create_text_label();
     let start = g.asm.create_text_label();
     let join = g.asm.create_text_label();
@@ -81,22 +100,22 @@ pub(crate) fn emit(g: &mut NativeCodeGenerator, h: &WorkerHooks<TextLabel>, entr
     g.asm.jcc_label(C::AboveOrEqual, allocation_failed);
     g.asm.test_reg_reg(R::Rax, R::Rax);
     g.asm.jcc_label(C::Equal, allocation_failed);
-    g.asm.store_ptr_disp32(R::Rbx, stack, R::Rax);
+    g.asm.store_ptr_disp32(R::R12, stack, R::Rax);
     g.asm
-        .store_ptr_disp32(R::Rbx, field(offset_of!(State, last_stack)), R::Rax);
+        .store_ptr_disp32(R::R12, slot_field(offset_of!(State, last_stack)), R::Rax);
     g.asm.mov_reg_reg(R::Rdi, R::Rax);
     g.asm.add_reg_imm32(R::Rdi, (STACK_BYTES + 4096) as i32);
-    g.asm.mov_reg_reg(R::Rsi, R::Rbx);
+    g.asm.mov_reg_reg(R::Rsi, R::R12);
     g.asm.add_reg_imm32(R::Rsi, tls);
     g.asm.store_ptr_disp32(R::Rsi, 0, R::Rsi);
-    g.asm.store_ptr_disp32(R::Rsi, 8, R::Rbx);
+    g.asm.store_ptr_disp32(R::Rsi, 8, R::R12);
     g.asm.lea_text_addr(R::Rdx, callback);
-    g.asm.mov_reg_reg(R::Rcx, R::Rbx);
-    g.asm.mov_reg_reg(R::R8, R::Rbx);
+    g.asm.mov_reg_reg(R::Rcx, R::R12);
+    g.asm.mov_reg_reg(R::R8, R::R12);
     g.asm.add_reg_imm32(R::R8, tid);
-    g.asm.mov_reg_reg(R::R9, R::Rbx);
+    g.asm.mov_reg_reg(R::R9, R::R12);
     g.asm
-        .add_reg_imm32(R::R9, field(offset_of!(State, bootstrap)));
+        .add_reg_imm32(R::R9, slot_field(offset_of!(State, bootstrap)));
     g.asm.call_label(start);
     g.asm.test_reg_reg(R::Rax, R::Rax);
     g.asm.jcc_label(C::Less, rollback);
@@ -108,7 +127,7 @@ pub(crate) fn emit(g: &mut NativeCodeGenerator, h: &WorkerHooks<TextLabel>, entr
     let bootstrap_ready = g.asm.create_text_label();
     g.asm.bind_text_label(bootstrap_wait);
     g.asm
-        .load_ptr_disp32(R::Rax, R::Rbx, field(offset_of!(State, bootstrap)));
+        .load_ptr_disp32(R::Rax, R::R12, slot_field(offset_of!(State, bootstrap)));
     g.asm.test_reg_reg(R::Rax, R::Rax);
     g.asm.jcc_label(C::Less, bootstrap_failed);
     g.asm.jcc_label(C::NotEqual, bootstrap_ready);
@@ -116,7 +135,7 @@ pub(crate) fn emit(g: &mut NativeCodeGenerator, h: &WorkerHooks<TextLabel>, entr
     g.asm.syscall();
     g.asm.jmp_label(bootstrap_wait);
     g.asm.bind_text_label(bootstrap_failed);
-    g.asm.mov_reg_reg(R::Rdi, R::Rbx);
+    g.asm.mov_reg_reg(R::Rdi, R::R12);
     g.asm.add_reg_imm32(R::Rdi, tid);
     g.asm.call_label(join);
     g.asm.test_reg_reg(R::Rax, R::Rax);
@@ -126,18 +145,18 @@ pub(crate) fn emit(g: &mut NativeCodeGenerator, h: &WorkerHooks<TextLabel>, entr
     g.asm.bind_text_label(bootstrap_ready);
     // Parent-tid is the receipt that prevents a not-yet-started child from
     // looking already terminated to the join fast path.
-    g.asm.load_u32_ptr_disp32(R::Rcx, R::Rbx, tid);
+    g.asm.load_u32_ptr_disp32(R::Rcx, R::R12, tid);
     g.asm.test_reg_reg(R::Rcx, R::Rcx);
     g.asm.jcc_label(C::Equal, invalid);
     g.asm.mov_imm64(R::Rax, 1);
     g.asm.ret();
     g.asm.bind_text_label(rollback);
-    g.asm.load_ptr_disp32(R::Rdi, R::Rbx, stack);
+    g.asm.load_ptr_disp32(R::Rdi, R::R12, stack);
     g.asm.mov_imm64(R::Rsi, STACK_BYTES + 8192);
     g.asm.call_label(free);
     g.asm.test_reg_reg(R::Rax, R::Rax);
     g.asm.jcc_label(C::NotEqual, invalid);
-    g.asm.store_ptr_disp32(R::Rbx, stack, R::Rax);
+    g.asm.store_ptr_disp32(R::R12, stack, R::Rax);
     bump(g, releases);
     g.asm.bind_text_label(failed);
     g.asm.mov_imm64(R::Rax, 0);
@@ -145,37 +164,40 @@ pub(crate) fn emit(g: &mut NativeCodeGenerator, h: &WorkerHooks<TextLabel>, entr
 
     if let Some(label) = h.join {
         g.asm.bind_text_label(label);
-        g.asm.load_ptr_disp32(R::Rax, R::Rbx, stack);
+        g.asm.load_ptr_disp32(R::Rax, R::R12, stack);
         g.asm.test_reg_reg(R::Rax, R::Rax);
         g.asm.jcc_label(C::Equal, invalid);
-        g.asm.mov_reg_reg(R::Rdi, R::Rbx);
+        g.asm.mov_reg_reg(R::Rdi, R::R12);
         g.asm.add_reg_imm32(R::Rdi, tid);
         g.asm.call_label(join);
         g.asm.test_reg_reg(R::Rax, R::Rax);
         g.asm.jcc_label(C::NotEqual, invalid);
         bump(g, joins);
-        g.asm.load_ptr_disp32(R::Rdi, R::Rbx, stack);
+        g.asm.load_ptr_disp32(R::Rdi, R::R12, stack);
         g.asm.mov_imm64(R::Rsi, STACK_BYTES + 8192);
         g.asm.call_label(free);
         g.asm.test_reg_reg(R::Rax, R::Rax);
         g.asm.jcc_label(C::NotEqual, invalid);
-        g.asm.store_ptr_disp32(R::Rbx, stack, R::Rax);
+        g.asm.store_ptr_disp32(R::R12, stack, R::Rax);
         bump(g, releases);
         g.asm.ret();
     }
     g.asm.bind_text_label(callback);
-    // start's trampoline passes the runtime context and supplies aligned stack.
-    g.asm.mov_reg_reg(R::Rbx, R::Rdi);
+    // start's trampoline passes this worker's stable slot, never a shared
+    // singleton. Bind both common registers before any collector operation.
+    g.asm.mov_reg_reg(R::R12, R::Rdi);
+    g.asm
+        .load_ptr_disp32(R::Rbx, R::R12, worker_slot_runtime_offset());
     g.asm.load_fs_u64(R::Rax, 0);
-    g.asm.mov_reg_reg(R::Rcx, R::Rbx);
+    g.asm.mov_reg_reg(R::Rcx, R::R12);
     g.asm.add_reg_imm32(R::Rcx, tls);
     g.asm.cmp_reg_reg(R::Rax, R::Rcx);
     g.asm.jcc_label(C::NotEqual, invalid);
     threads::emit_linux_thread_context(g, R::Rax);
-    g.asm.cmp_reg_reg(R::Rax, R::Rbx);
+    g.asm.cmp_reg_reg(R::Rax, R::R12);
     g.asm.jcc_label(C::NotEqual, invalid);
-    g.asm.store_ptr_disp32(R::Rbx, observed, R::Rax);
-    g.asm.store_ptr_disp32(R::Rbx, entry_sp, R::Rsp);
+    g.asm.store_ptr_disp32(R::R12, observed, R::Rax);
+    g.asm.store_ptr_disp32(R::R12, entry_sp, R::Rsp);
     g.asm.push_reg(R::Rdi); // align before the common worker call
     g.asm.call_label(entry);
     g.asm.pop_reg(R::Rdi);
@@ -206,12 +228,12 @@ pub(crate) fn emit(g: &mut NativeCodeGenerator, h: &WorkerHooks<TextLabel>, entr
     g.emit_runtime_error_text("GC worker stack allocation failed\n");
 }
 fn bump(g: &mut NativeCodeGenerator, offset: i32) {
-    g.asm.load_ptr_disp32(R::Rax, R::Rbx, offset);
+    g.asm.load_ptr_disp32(R::Rax, R::R12, offset);
     g.asm.add_reg_imm32(R::Rax, 1);
-    g.asm.store_ptr_disp32(R::Rbx, offset, R::Rax);
+    g.asm.store_ptr_disp32(R::R12, offset, R::Rax);
 }
 fn emit_waits(g: &mut NativeCodeGenerator, h: &WorkerHooks<TextLabel>) {
-    for (label, op, value) in [(h.park, 128, None), (h.unpark, 129, Some(1))] {
+    for (label, op, value) in [(h.park, 128, None), (h.unpark, 129, Some(i32::MAX as u64))] {
         g.asm.bind_text_label(label);
         if let Some(count) = value {
             g.asm.mov_imm64(R::Rdx, count);
@@ -265,17 +287,34 @@ fn emit_alloc(g: &mut NativeCodeGenerator) {
 }
 fn emit_start(g: &mut NativeCodeGenerator) {
     #[cfg(test)]
-    if matches!(g.linux_worker_fault, Some(Fault::Bootstrap)) {
-        threads::emit_linux_owned_thread_start_failure(g);
-        return;
-    }
-    #[cfg(test)]
-    if matches!(
-        g.linux_worker_fault,
-        Some(Fault::Clone | Fault::CloneCleanup)
-    ) {
-        threads::emit_linux_worker_start_failure(g);
-        return;
+    {
+        if matches!(g.linux_worker_fault, Some(Fault::Bootstrap)) {
+            threads::emit_linux_owned_thread_start_failure(g);
+            return;
+        }
+        if matches!(
+            g.linux_worker_fault,
+            Some(Fault::Clone | Fault::CloneCleanup)
+        ) {
+            threads::emit_linux_worker_start_failure(g);
+            return;
+        }
+        if matches!(
+            g.linux_worker_fault,
+            Some(Fault::SecondClone | Fault::SecondBootstrap)
+        ) {
+            let normal = g.asm.create_text_label();
+            g.asm
+                .load_ptr_disp32(R::Rax, R::R12, worker_slot_identity_offset());
+            g.asm.cmp_reg_imm32(R::Rax, 1);
+            g.asm.jcc_label(C::NotEqual, normal);
+            if matches!(g.linux_worker_fault, Some(Fault::SecondClone)) {
+                threads::emit_linux_worker_start_failure(g);
+            } else {
+                threads::emit_linux_owned_thread_start_failure(g);
+            }
+            g.asm.bind_text_label(normal);
+        }
     }
     threads::emit_linux_owned_thread_start(g);
 }

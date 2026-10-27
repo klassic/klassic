@@ -1010,3 +1010,7 @@ pub(crate) use satb_moving_support::*;
 #[path = "test_support_satb_fallback.rs"]
 mod satb_fallback_support;
 pub(crate) use satb_fallback_support::*;
+
+#[path = "test_support_worker_pool.rs"]
+mod worker_pool_support;
+pub(crate) use worker_pool_support::*;

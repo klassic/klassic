@@ -1,4 +1,4 @@
-//! M-G6 steps 4-5: the GC worker thread for `--gc=generational`.
+//! GC worker pool for `--gc=generational`, with serialized bounded quanta.
 //!
 //! The worker marks concurrently (from the root snapshot a short pause
 //! takes) and, after a relocation pause, runs the resumable Cheney scan
@@ -18,7 +18,7 @@
 use super::{
     Labels, RT_LOCK_NEXT, RT_LOCK_SERVING, RT_MARK_ACTIVE, RT_MARK_DONE, RT_PHASE_OPEN,
     RT_WAKE_PENDING, RT_WORK_SEQ, RT_WORKER_ALIVE, RT_WORKER_DONE, RT_WORKER_SCANNED, lea_rt,
-    load_rt, load_runtime, store_rt,
+    load_rt, store_rt,
 };
 use crate::portable_asm::{Condition as C, PortableAsm, Reg as R};
 
@@ -28,21 +28,24 @@ const WORKER_QUANTUM: u64 = super::QUANTUM_OBJECTS;
 
 /// Backend leaves the worker needs (platform threads and futexes).
 pub(crate) struct WorkerHooks<T> {
-    /// `() -> V0 = 1` when a thread now runs `entry` on its own stack,
-    /// else 0. Preserves V3.
+    /// `(OwnerContext = stable WorkerSlot, V3 = shared runtime) -> V0 = 1`
+    /// when a thread now runs `entry` on its own stack, else 0. The callback
+    /// binds that same slot/runtime. Preserves OwnerContext and V3.
     pub spawn: T,
     /// `(V7 = u32 address, V6 = expected)`: sleep while `*V7 == V6`.
-    /// Clobbers the caller-saved registers.
+    /// Uses this worker slot's notification; preserves OwnerContext and V3.
+    /// Clobbers the other caller-saved registers.
     pub park: T,
-    /// `(V7 = u32 address)`: wake a parked thread. Clobbers the
-    /// caller-saved registers.
+    /// `(OwnerContext = target slot, V7 = u32 address)`: wake that worker.
+    /// Preserves OwnerContext and V3; other caller-saved registers may change.
     pub unpark: T,
     /// `()`: give up the CPU (a lock waiter whose holder was preempted).
     /// Preserves every register.
     pub relax: T,
     /// Monotonic ns in V0, zero on failure; preserves all other registers.
     pub clock: T,
-    /// Join a stopped worker and release its OS notification/thread resources.
+    /// Join OwnerContext's worker and release only its notification/thread
+    /// resources. Preserves OwnerContext and V3.
     /// Available only on backends whose callback can return to its OS caller.
     pub join: Option<T>,
 }
@@ -51,29 +54,7 @@ pub(crate) struct WorkerHooks<T> {
 /// an idle worker, then join outside the collector lock. Fatal exits retain
 /// their process-wide abort path. No collector storage is freed before join.
 pub(crate) fn shutdown<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::DataLabel) {
-    let Some(w) = &l.worker else { return };
-    let Some(join) = w.hooks.join else { return };
-    let done = a.create_text_label();
-    load_runtime(a, runtime);
-    lock(a, l);
-    load_rt(a, R::V0, RT_WORKER_ALIVE);
-    a.test_reg_reg(R::V0, R::V0);
-    let absent = a.create_text_label();
-    a.jcc_label(C::Equal, absent);
-    // Startup can schedule the child before publishing alive=1. Only the
-    // distinct stop value 2 may make the child return from its entry.
-    a.mov_imm64(R::V0, 2);
-    store_rt(a, RT_WORKER_ALIVE, R::V0);
-    request_work(a);
-    unlock(a, l);
-    wake_if_pending(a, l);
-    a.call_label(join);
-    a.mov_imm64(R::V0, 0);
-    store_rt(a, RT_WORKER_ALIVE, R::V0);
-    a.jmp_label(done);
-    a.bind_text_label(absent);
-    unlock(a, l);
-    a.bind_text_label(done);
+    super::worker_pool::shutdown(a, l, runtime);
 }
 
 pub(super) struct WorkerLabels<T> {
@@ -155,21 +136,16 @@ pub(super) fn request_work<E: PortableAsm>(a: &mut E) {
 /// After `alloc` released the lock: wake the worker if a pause opened a
 /// phase. Preserves V0 (the allocation result) and V3.
 pub(super) fn wake_if_pending<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
-    let Some(w) = &l.worker else {
+    if l.worker.is_none() {
         return;
-    };
+    }
     let none = a.create_text_label();
     load_rt(a, R::V1, RT_WAKE_PENDING);
     a.test_reg_reg(R::V1, R::V1);
     a.jcc_label(C::Equal, none);
     a.mov_imm64(R::V1, 0);
     store_rt(a, RT_WAKE_PENDING, R::V1);
-    a.push_reg(R::V0);
-    a.push_reg(R::V0);
-    lea_rt(a, R::V7, RT_WORK_SEQ);
-    a.call_label(w.hooks.unpark);
-    a.pop_reg(R::V0);
-    a.pop_reg(R::V0);
+    super::worker_pool::wake(a, l);
     a.bind_text_label(none);
 }
 
@@ -236,17 +212,13 @@ pub(super) fn heal<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, lost: E:
 
 /// At the end of `startup` (V3 = runtime): start the worker.
 pub(super) fn emit_spawn_call<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
-    let Some(w) = &l.worker else {
-        return;
-    };
-    a.call_label(w.hooks.spawn);
-    store_rt(a, RT_WORKER_ALIVE, R::V0);
+    super::worker_pool::spawn(a, l);
 }
 
 pub(super) fn emit_worker<E: PortableAsm>(
     a: &mut E,
     l: &Labels<E::TextLabel>,
-    runtime: E::DataLabel,
+    _runtime: E::DataLabel,
 ) {
     emit_owner_locks(a, l);
     let Some(w) = &l.worker else {
@@ -309,7 +281,6 @@ pub(super) fn emit_worker<E: PortableAsm>(
     let relocate = a.create_text_label();
     let release = a.create_text_label();
     a.bind_text_label(w.entry);
-    load_runtime(a, runtime);
     super::worker_view::bind(a);
     a.bind_text_label(top);
     #[cfg(test)]
@@ -324,10 +295,11 @@ pub(super) fn emit_worker<E: PortableAsm>(
     super::store_rt_imm(a, super::worker_journal::RETRY, 0);
     if w.hooks.join.is_some() {
         let running = a.create_text_label();
-        load_rt(a, R::V0, RT_WORKER_ALIVE);
-        a.cmp_reg_imm8(R::V0, 2);
+        load_rt(a, R::V0, super::worker_pool::STOP);
+        a.cmp_reg_imm8(R::V0, 1);
         a.jcc_label(C::NotEqual, running);
         super::worker_journal::shutdown(a, l, release);
+        super::worker_pool::exiting(a, l);
         a.call_label(w.unlock);
         a.ret();
         a.bind_text_label(running);
@@ -387,6 +359,7 @@ pub(super) fn emit_worker<E: PortableAsm>(
     store_rt(a, super::RT_BUDGET, R::V0);
     a.call_label(w.mark_loop);
     super::drain::record_worker_mark(a, l);
+    super::worker_pool::record_units(a, super::worker_pool::OLD_UNITS, WORKER_QUANTUM);
     a.mov_imm64(R::V1, 0);
     store_rt(a, super::young_mark::TURN, R::V1);
     a.test_reg_reg(R::V0, R::V0);
@@ -397,6 +370,7 @@ pub(super) fn emit_worker<E: PortableAsm>(
     a.mov_imm64(R::V0, WORKER_QUANTUM);
     store_rt(a, super::RT_BUDGET, R::V0);
     a.call_label(w.young.trace);
+    super::worker_pool::record_units(a, super::worker_pool::YOUNG_UNITS, WORKER_QUANTUM);
     a.mov_imm64(R::V1, WORKER_QUANTUM);
     load_rt(a, R::V2, super::RT_BUDGET);
     a.sub_reg_reg(R::V1, R::V2);
@@ -422,6 +396,7 @@ pub(super) fn emit_worker<E: PortableAsm>(
     store_rt(a, super::RT_BUDGET, R::V0);
     a.call_label(w.wcheney);
     super::drain::record_worker_relocation(a, l);
+    super::worker_pool::record_units(a, super::worker_pool::RELOCATE_UNITS, WORKER_QUANTUM);
     // Count completed objects once, independent of root/field work or resumes.
     load_rt(a, R::V1, RT_WORKER_SCANNED);
     load_rt(a, R::V2, super::RT_CS_COMPLETED);
@@ -449,7 +424,6 @@ pub(super) fn emit_worker<E: PortableAsm>(
     a.call_label(w.unlock);
     lea_rt(a, R::V7, RT_WORK_SEQ);
     a.call_label(w.hooks.park);
-    load_runtime(a, runtime);
     super::worker_view::bind(a);
     a.jmp_label(top);
 }

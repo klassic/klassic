@@ -157,7 +157,7 @@ fn stop_body(g: &mut NativeCodeGenerator, _: u64) {
 #[test]
 fn gc_windows_production_stop_join_is_idempotent_and_releases_idle_worker() {
     // The compiler emits a third shutdown at normal completion. The OS model
-    // requires precisely one join, one returned callback and two closes.
+    // requires two joins, two returned callbacks and four closes.
     run_fixture(stop_body, 16, "stop-ok\n");
 }
 
@@ -235,6 +235,11 @@ fn callback_body(g: &mut NativeCodeGenerator, _: u64) {
     for (i, reg) in regs.iter().enumerate() {
         g.asm.mov_imm64(*reg, 0x51 + i as u64);
     }
+    // The real callback receives a stable worker slot through the OS argument.
+    let slot = g
+        .asm
+        .data_label_with_bytes(&vec![0; crate::gc_codegen::production::worker_slot_size()]);
+    g.asm.mov_data_addr(Reg::Rcx, slot);
     g.asm.sub_reg_imm32(Reg::Rsp, 32);
     g.asm.call_label(callback);
     g.asm.add_reg_imm32(Reg::Rsp, 32);

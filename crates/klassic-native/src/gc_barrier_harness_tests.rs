@@ -922,3 +922,5 @@ mod satb_moving;
 mod satb_fixture;
 
 mod satb_fallback;
+
+mod worker_pool;
