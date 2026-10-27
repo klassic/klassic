@@ -295,6 +295,20 @@ fn eval_comparison(op: BinaryOp, lhs: Value, rhs: Value, span: Span) -> Result<V
         };
         return Ok(Value::Bool(result));
     }
+    // Int comparisons retain all signed 64 bits. Converting two Ints to
+    // Double loses adjacent values above 2^53 (including either i64 limit),
+    // while equality and the native backends already compare them exactly.
+    // Mixed numeric types continue through the existing promotion path below.
+    if let (Value::Int(lhs), Value::Int(rhs)) = (&lhs, &rhs) {
+        let result = match op {
+            BinaryOp::Less => lhs < rhs,
+            BinaryOp::LessEqual => lhs <= rhs,
+            BinaryOp::Greater => lhs > rhs,
+            BinaryOp::GreaterEqual => lhs >= rhs,
+            _ => unreachable!("comparison operator expected"),
+        };
+        return Ok(Value::Bool(result));
+    }
     let (lhs, rhs) = match (numeric_value(&lhs), numeric_value(&rhs)) {
         (Some(lhs), Some(rhs)) => {
             let (lhs, rhs, _) = promote_numeric_pair(lhs, rhs);

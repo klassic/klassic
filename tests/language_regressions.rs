@@ -1953,3 +1953,80 @@ join(upper, " - ")"#,
         Value::String("HELLO - WORLD!".to_string())
     );
 }
+
+#[test]
+fn integer_ordering_preserves_adjacent_values_across_float_precision_boundaries() {
+    for (lhs, rhs) in [
+        (i64::MAX, i64::MAX - 1),
+        (i64::MIN, i64::MIN + 1),
+        (9_007_199_254_740_993, 9_007_199_254_740_992),
+        (-9_007_199_254_740_993, -9_007_199_254_740_992),
+        (i64::MIN, i64::MAX),
+        (i64::MAX, i64::MAX),
+        (i64::MIN, i64::MIN),
+    ] {
+        for (operator, expected) in [
+            ("<", lhs < rhs),
+            ("<=", lhs <= rhs),
+            (">", lhs > rhs),
+            (">=", lhs >= rhs),
+        ] {
+            let source =
+                format!("def order(a: Int, b: Int): Bool = a {operator} b\norder({lhs}, {rhs})");
+            assert_eq!(
+                evaluate_text("integer-order.kl", &source).unwrap(),
+                Value::Bool(expected),
+                "{source}"
+            );
+        }
+    }
+    // Mixed comparisons keep their established numeric promotion and rounding.
+    for (source, expected) in [
+        ("9007199254740993 > 9007199254740992.0", false),
+        ("16777217 > 16777216.0F", false),
+        ("16777217 > 16777216.0", true),
+        ("16777217.0F < 16777217.0", true),
+    ] {
+        assert_eq!(
+            evaluate_text("mixed-order.kl", source).unwrap(),
+            Value::Bool(expected),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn nested_module_functions_inherit_definition_source_and_restore_the_caller() {
+    let mut evaluator = Evaluator::new();
+    let module = "module lexical\ndef make(base: Int): Int = { def inner(n: Int): Int = if (n > 0) inner(n - 1) else base / n; inner(4) }\ndef ok(): Int = 7\n";
+    evaluator
+        .evaluate_text("foreign source β.kl", module)
+        .unwrap();
+    let error = evaluator
+        .evaluate_text("entry.kl", "import lexical as L\nL#make(42)")
+        .unwrap_err();
+    assert_eq!(
+        error.diagnostic.source.as_ref().unwrap().name(),
+        "foreign source β.kl"
+    );
+    assert_eq!(
+        error.diagnostic.span.unwrap().start,
+        module.find("base / n").unwrap()
+    );
+    assert_eq!(error.diagnostic.call_name.as_deref(), Some("inner"));
+    // A successful foreign call must also restore the source before the entry
+    // creates another function; its later error belongs to this caller file.
+    let caller = "import lexical as L\nL#ok()\ndef local(n: Int): Int = 1 / n\nlocal(0)";
+    let error = evaluator
+        .evaluate_text("after return.kl", caller)
+        .unwrap_err();
+    assert_eq!(
+        error.diagnostic.source.as_ref().unwrap().name(),
+        "after return.kl"
+    );
+    assert_eq!(
+        error.diagnostic.span.unwrap().start,
+        caller.find("1 / n").unwrap()
+    );
+    assert_eq!(error.diagnostic.call_name.as_deref(), Some("local"));
+}

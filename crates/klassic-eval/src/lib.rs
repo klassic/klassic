@@ -149,6 +149,20 @@ fn current_source() -> Option<Arc<SourceFile>> {
     CURRENT_SOURCE.with(|cell| cell.borrow().clone())
 }
 
+/// Adopt the definition's lexical source while its body can create further
+/// closures. Restore the caller even on a runtime error or Rust unwind.
+struct SourceGuard(Option<Arc<SourceFile>>);
+impl SourceGuard {
+    fn enter(source: Arc<SourceFile>) -> Self {
+        Self(CURRENT_SOURCE.with(|cell| cell.replace(Some(source))))
+    }
+}
+impl Drop for SourceGuard {
+    fn drop(&mut self) {
+        CURRENT_SOURCE.with(|cell| cell.replace(self.0.take()));
+    }
+}
+
 /// The literal name of the call currently in flight, if any — see
 /// `CURRENT_CALL_NAME`.
 fn current_call_name() -> Option<String> {
@@ -973,15 +987,7 @@ impl Evaluator {
         // value on the way out rather than unconditionally clearing
         // it, in case of (currently nonexistent, but cheap to guard
         // against) nested `evaluate_text_typed` calls.
-        let previous_source = CURRENT_SOURCE.with(|cell| cell.borrow().clone());
-        CURRENT_SOURCE.with(|cell| *cell.borrow_mut() = Some(source.clone()));
-        struct RestoreSource(Option<Arc<SourceFile>>);
-        impl Drop for RestoreSource {
-            fn drop(&mut self) {
-                CURRENT_SOURCE.with(|cell| *cell.borrow_mut() = self.0.take());
-            }
-        }
-        let _restore_source = RestoreSource(previous_source);
+        let _restore_source = SourceGuard::enter(source.clone());
 
         let expr = parse_source(&source).map_err(|diagnostic| EvaluationError {
             source: source.clone(),
@@ -2159,6 +2165,10 @@ fn invoke_user_function(
         ));
     }
 
+    let _lexical_source = function
+        .source
+        .as_ref()
+        .map(|source| SourceGuard::enter(source.clone()));
     let mut call_env = function.env.clone();
     call_env.push_scope();
     for (param, value) in function.params.iter().zip(argument_values.iter().cloned()) {
@@ -3464,6 +3474,21 @@ fn prefer_instance_dispatch(name: &str, argument_values: &[Value]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_guard_restores_caller_during_unwind() {
+        let outer = std::sync::Arc::new(klassic_span::SourceFile::new("caller", ""));
+        let _caller = super::SourceGuard::enter(outer);
+        let result = std::panic::catch_unwind(|| {
+            let _module = super::SourceGuard::enter(std::sync::Arc::new(
+                klassic_span::SourceFile::new("module", ""),
+            ));
+            assert_eq!(super::current_source().unwrap().name(), "module");
+            panic!("intentional source unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(super::current_source().unwrap().name(), "caller");
+    }
+
     use super::{
         Evaluator, EvaluatorConfig, Value, clear_user_instances, clear_user_modules,
         clear_user_records, evaluate_text, evaluate_text_with_config,
