@@ -154,8 +154,8 @@ static inline uint64_t gc_native_allocation_retire_import_locked(NativeAllocatio
     run->retirement_cursor++;
     return run->retirement_cursor==run->retirement_limit?GC_SR_DONE:GC_SR_MORE;
 }
-static inline uint64_t gc_native_allocation_retire_cleanup(NativeAllocationRun *run,const NativeMetadataOps *ops){
-    if(!gc_native_allocation_native(run)||!gc_native_allocation_retirement_owned(run)||
+static inline uint64_t gc_native_allocation_retire_cleanup_native(NativeAllocationRun *run,const NativeMetadataOps *ops,const MutatorContext *actor){
+    if(!gc_native_allocation_actor_native(run,actor)||!gc_native_allocation_retirement_owned(run)||
        (run->bitmap.stage!=3&&run->bitmap.stage!=4&&run->bitmap.stage!=5)||
        (run->forwarding.stage!=2&&run->forwarding.stage!=3)||
        run->retirement.forward_table!=run->forwarding.allocation||
@@ -167,6 +167,9 @@ static inline uint64_t gc_native_allocation_retire_cleanup(NativeAllocationRun *
         if(!status)run->retirement.forward_table=run->imports=0;
     }
     return status==GC_NATIVE_METADATA_OS_ERROR?GC_NATIVE_RUN_OS_ERROR:status?GC_POOL_INVALID:GC_POOL_OK;
+}
+static inline uint64_t gc_native_allocation_retire_cleanup(NativeAllocationRun *run,const NativeMetadataOps *ops){
+    return gc_native_allocation_valid(run)?gc_native_allocation_retire_cleanup_native(run,ops,&run->runtime->context):GC_POOL_INVALID;
 }
 /* At most one tail plus the last head. Failed native cleanup leaves WAIT and
  * all credits held; repeated STEP never dereferences already-reused tails. */

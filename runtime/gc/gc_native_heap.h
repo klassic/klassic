@@ -158,11 +158,15 @@ static inline bool gc_native_heap_decommit_range(void *address,size_t bytes){
 #endif
     return true;
 }
-static inline uint64_t gc_native_heap_decommit_lease(NativeHeapOwner *owner,PageLease *lease){
+static inline uint64_t gc_native_heap_decommit_lease_with(NativeHeapOwner *owner,PageLease *lease,
+        bool (*decommit)(void *,size_t)){
     if(!gc_native_heap_lease_valid(owner,lease)||!lease->committed_mapping)return GC_NATIVE_METADATA_INVALID;
     void *address=(void *)(uintptr_t)(owner->reservation+((lease->head_index+1)<<GC_HEAP_PAGE_SHIFT));
     size_t bytes=(size_t)(lease->page_count<<GC_HEAP_PAGE_SHIFT);
-    if(!gc_native_heap_decommit_range(address,bytes))return GC_NATIVE_METADATA_OS_ERROR;
+    if(!(decommit?decommit:gc_native_heap_decommit_range)(address,bytes))return GC_NATIVE_METADATA_OS_ERROR;
     lease->committed_mapping=0;return GC_NATIVE_METADATA_OK;
+}
+static inline uint64_t gc_native_heap_decommit_lease(NativeHeapOwner *owner,PageLease *lease){
+    return gc_native_heap_decommit_lease_with(owner,lease,NULL);
 }
 #endif

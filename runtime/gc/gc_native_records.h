@@ -59,14 +59,17 @@ static inline uint64_t gc_native_records_begin_locked(NativeAllocationRun *run){
     if(run->import_users)return GC_SR_WAIT;
     run->stage=11;return GC_SR_DONE;
 }
-static inline uint64_t gc_native_records_dispose(NativeAllocationRun *run,const NativeMetadataOps *ops){
-    if(!gc_native_allocation_native(run)||run->stage!=11||run->import_users)return GC_POOL_INVALID;
+static inline uint64_t gc_native_records_dispose_native(NativeAllocationRun *run,const NativeMetadataOps *ops,const MutatorContext *actor){
+    if(!gc_native_allocation_actor_native(run,actor)||run->stage!=11||run->import_users)return GC_POOL_INVALID;
     uint64_t status=gc_native_metadata_dispose(&run->mark_records,ops);
     if(status)return status==GC_NATIVE_METADATA_OS_ERROR?GC_NATIVE_RUN_OS_ERROR:GC_POOL_INVALID;
     /* Keep the lock-published sealed stage unchanged during OS cleanup. Copy
      * installers short-circuit on that stage before reading these pointers;
      * the unique disposer alone touches them until locked FINISH. */
     run->marks.records=0;return GC_POOL_OK;
+}
+static inline uint64_t gc_native_records_dispose(NativeAllocationRun *run,const NativeMetadataOps *ops){
+    return gc_native_allocation_valid(run)?gc_native_records_dispose_native(run,ops,&run->runtime->context):GC_POOL_INVALID;
 }
 static inline uint64_t gc_native_records_finish_locked(NativeAllocationRun *run){
     if(!gc_native_allocation_valid(run)||run->stage!=11||run->import_users||run->marks.records||run->mark_records.allocation||
