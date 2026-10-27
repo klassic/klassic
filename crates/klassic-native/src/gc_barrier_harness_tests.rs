@@ -742,6 +742,31 @@ fn unexpected_runtime_failure_retains_the_actual_generated_executable() {
     );
 }
 
+#[test]
+fn actor_infrastructure_failures_report_actual_errno_and_retain_images() {
+    fn failure(g: &mut NativeCodeGenerator, clone: u64) {
+        let h = H::begin(g);
+        crate::gc_codegen::production::test_support::actor_infrastructure_failure_probe(
+            h.g,
+            clone != 0,
+        );
+    }
+    for (arg, diagnostic) in [
+        (0, "klassic harness infrastructure: stack_map_errno=-9\n"),
+        (1, "klassic harness infrastructure: clone_errno=-22\n"),
+    ] {
+        let (output, retained) =
+            execute_with_image_retention(failure, arg, true, false, None, None, true);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&output.stderr), diagnostic);
+        let path = retained.expect("infrastructure failure also retains its exact image");
+        let replay = Command::new(&path).output().unwrap();
+        assert_eq!(replay.status.code(), output.status.code());
+        assert_eq!(replay.stderr, output.stderr);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 mod admission;
 mod colours;
 mod copy_claims;

@@ -19,6 +19,8 @@ const OLD_WORKER: i32 = 88;
 #[derive(Clone, Copy)]
 enum GraphMode {
     Idle,
+    MapFailure,
+    CloneFailure,
     WeakRace(crate::DataLabel, bool, bool),
     Moving(crate::DataLabel, bool, u64, bool),
     Checkpoint,
@@ -58,6 +60,39 @@ pub(crate) struct ParallelActors {
     count: u64,
     iterations: u64,
 }
+/// Drive the actual guarded-stack or clone failure hook through the actor
+/// launch path, without starting any child or changing collector state.
+pub(crate) fn actor_infrastructure_failure_probe(g: &mut crate::NativeCodeGenerator, clone: bool) {
+    let actor = create_actor(g, 16, 8);
+    run_parallel_impl(
+        g,
+        &[actor],
+        1,
+        None,
+        if clone {
+            GraphMode::CloneFailure
+        } else {
+            GraphMode::MapFailure
+        },
+    );
+}
+
+/// Failure-only infrastructure diagnostics must not impersonate a GC invariant.
+fn infrastructure_failure(g: &mut crate::NativeCodeGenerator, stage: &str) {
+    let message = format!("klassic harness infrastructure: {stage}=");
+    let text = g.asm.data_label_with_bytes(message.as_bytes());
+    g.push_reg(R::V0);
+    g.emit_write_data(2, text, message.len());
+    g.pop_reg(R::V7);
+    g.mov_imm64(R::V6, 2);
+    g.mov_imm64(R::V2, 0);
+    g.call_label(g.print_i64);
+    g.emit_write_data(2, g.newline, 1);
+    g.asm.mov_imm64(X::Rax, 231); // exit_group, including any already-started peer
+    g.asm.mov_imm64(X::Rdi, 1);
+    g.asm.syscall();
+}
+
 /// Guarded stacks and custom TLS are owned until kernel clear-tid join. Only
 /// syscalls and emitted GC code execute on these threads; no libc is called.
 pub(crate) fn run_parallel_actors(
@@ -106,13 +141,26 @@ fn run_parallel_impl(
     let entry = g.create_text_label();
     let body = g.create_text_label();
     let child_done = g.create_text_label();
+    let map_failed = g.create_text_label();
+    let clone_failed = g.create_text_label();
+    let startup_timeout = g.create_text_label();
+    let join_failed = g.create_text_label();
+    let unmap_failed = g.create_text_label();
     g.jmp_label(body);
     g.bind_text_label(start);
-    threads::emit_linux_worker_start(g);
+    if matches!(mode, GraphMode::CloneFailure) {
+        threads::emit_linux_worker_start_failure(g);
+    } else {
+        threads::emit_linux_worker_start(g);
+    }
     g.bind_text_label(join);
     threads::emit_linux_worker_join(g);
     g.bind_text_label(map);
-    threads::emit_linux_stack_alloc(g);
+    if matches!(mode, GraphMode::MapFailure) {
+        threads::emit_linux_stack_map_failure(g);
+    } else {
+        threads::emit_linux_stack_alloc(g);
+    }
     g.bind_text_label(unmap);
     threads::emit_linux_stack_free(g);
     let count = actors.len() as u64 * iterations;
@@ -330,7 +378,7 @@ fn run_parallel_impl(
         g.asm.mov_imm64(X::Rdi, STACK_BYTES);
         g.call_label(map);
         g.asm.cmp_reg_imm32(X::Rax, -4095);
-        g.asm.jcc_label(XC::AboveOrEqual, fail);
+        g.asm.jcc_label(XC::AboveOrEqual, map_failed);
         g.mov_data_addr(R::V9, *control);
         g.store_ptr_disp32(R::V9, STACK, R::V0);
         g.mov_data_addr(R::V1, actor.pointer);
@@ -363,7 +411,7 @@ fn run_parallel_impl(
         g.asm.add_reg_imm32(X::R8, TID);
         g.call_label(start);
         g.cmp_reg_imm32(R::V0, 0);
-        g.jcc_label(C::LessEqual, fail);
+        g.jcc_label(C::LessEqual, clone_failed);
     }
     let all_ready = g.create_text_label();
     let wait = g.create_text_label();
@@ -383,7 +431,7 @@ fn run_parallel_impl(
     g.call_label(clock);
     g.load_rbp_slot(R::V1, 1536);
     g.cmp_reg_reg(R::V0, R::V1);
-    g.jcc_label(C::AboveOrEqual, fail);
+    g.jcc_label(C::AboveOrEqual, startup_timeout);
     g.jmp_label(wait);
     g.bind_text_label(all_ready);
     if old_mark {
@@ -448,13 +496,13 @@ fn run_parallel_impl(
         g.add_reg_imm32(R::V7, TID);
         g.call_label(join);
         g.test_reg_reg(R::V0, R::V0);
-        g.jcc_label(C::NotEqual, fail);
+        g.jcc_label(C::NotEqual, join_failed);
         g.mov_data_addr(R::V7, *control);
         g.load_ptr_disp32(R::V7, R::V7, STACK);
         g.mov_imm64(R::V6, STACK_BYTES + 8192);
         g.call_label(unmap);
         g.test_reg_reg(R::V0, R::V0);
-        g.jcc_label(C::NotEqual, fail);
+        g.jcc_label(C::NotEqual, unmap_failed);
     }
     if checkpoint
         || old_mark
@@ -472,6 +520,25 @@ fn run_parallel_impl(
     if matches!(mode, GraphMode::NativeChurn(..)) || mode.native_lease().is_some() {
         next_mark::finish_move(g);
     }
+    let finished = g.create_text_label();
+    g.jmp_label(finished);
+    for (label, stage) in [
+        (map_failed, "stack_map_errno"),
+        (clone_failed, "clone_errno"),
+        (join_failed, "join_errno"),
+        (unmap_failed, "stack_unmap_errno"),
+    ] {
+        g.bind_text_label(label);
+        infrastructure_failure(g, stage);
+    }
+    g.bind_text_label(startup_timeout);
+    g.mov_data_addr(R::V7, ready);
+    g.atomic_load_acquire(R::V0, R::V7);
+    infrastructure_failure(
+        g,
+        &format!("startup_timeout_expected_{}_ready", actors.len()),
+    );
+    g.bind_text_label(finished);
     ParallelActors {
         controls,
         results,
