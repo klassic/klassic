@@ -165,7 +165,7 @@ static KgPinnedBytes *kgp_pin(const RootCell *root,bool bytes_only){
                 uint64_t released=gc_metadata_step_locked(kg_leases(r),&lease.lease,GC_ML_RELEASE);
                 if(released)kg_fail("pin receiver temporary release",released);
                 if(retry){kg_unlock(r);break;}
-                if(status==KG_PIN_FULL){kg_unlock(r);kgp_grow_owned(r);continue;}if(status)kg_fail("pin page binding",status);
+                if(status==KG_PIN_FULL){kg_unlock(r);kg_lease_pressure_min(r,2);continue;}if(status)kg_fail("pin page binding",status);
             }
             RootRequest source=kg_root_request_locked(r,source_root),empty=kg_root_request_locked(r,reserved);
             status=gc_root_pin_prepare(&p->registry,kg_context(r),&source,&empty,&h->pin);kg_unlock(r);
