@@ -1,3 +1,4 @@
+mod canonical_backend;
 mod cli;
 
 use std::fs;
@@ -152,10 +153,6 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 } else {
                     "c"
                 };
-                if output.extension().is_none_or(|value| value != extension) {
-                    eprintln!("error: canonical C/LLVM executable linking is not yet enabled");
-                    return Err(1);
-                }
                 let modules = user_modules_for(&input, &text)?
                     .into_iter()
                     .map(|module| {
@@ -193,6 +190,9 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     eprintln!("{error}");
                     1u8
                 })?;
+                if output.extension().is_none_or(|value| value != extension) {
+                    return canonical_backend::link(&generated, &output, &command.config);
+                }
                 return fs::write(&output, generated).map_err(|error| {
                     eprintln!("{}: {error}", output.display());
                     1
