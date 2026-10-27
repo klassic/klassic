@@ -254,6 +254,10 @@ fn emit_store<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::D
             // The sole owner's phase/metadata cannot retire during this store.
             // A matching acquired epoch already owns a mark obligation. Any
             // admission still enqueuing it holds the end-check collector lock.
+            if previous {
+                super::satb_buffer::offer(a, l, false);
+                a.jmp_label(protected);
+            }
             super::mark::test_mark(a, R::V2, R::V6, R::V7);
             a.jcc_label(C::NotEqual, protected);
             super::worker::lock(a, l);
@@ -280,7 +284,20 @@ fn emit_store<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::D
     a.jcc_label(C::NotEqual, publish);
     a.mov_reg_reg(R::V2, R::V6);
     super::enums::young_offset(a, R::V2, R::V0, publish);
-    super::remset::remember(a, l, R::V7, R::V1, R::V2);
+    if l.worker.is_some() {
+        let immediate = a.create_text_label();
+        let remembered = a.create_text_label();
+        load_rt(a, R::V0, super::cooperative_old::ENABLED);
+        a.test_reg_reg(R::V0, R::V0);
+        a.jcc_label(C::Equal, immediate);
+        a.call_label(l.remset_buffer_record);
+        a.jmp_label(remembered);
+        a.bind_text_label(immediate);
+        super::remset::remember(a, l, R::V7, R::V1, R::V2);
+        a.bind_text_label(remembered);
+    } else {
+        super::remset::remember(a, l, R::V7, R::V1, R::V2);
+    }
     a.bind_text_label(publish);
     a.mov_reg_reg(R::V0, R::V6);
     super::enums::heap_offset(a, R::V0, R::V2, raw);

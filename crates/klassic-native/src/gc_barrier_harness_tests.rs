@@ -442,8 +442,15 @@ pub(super) fn run_with_stress(
     worker_thread: bool,
     stress: bool,
 ) -> Observed {
-    let (output, _) =
-        execute_with_image_retention(body, arg, worker_thread, stress, None, None, true);
+    let (output, _) = execute_with_image_retention(
+        body,
+        arg,
+        worker_thread,
+        stress,
+        None,
+        None,
+        ImageRetention::Failure,
+    );
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     if std::env::var_os("KLASSIC_HARNESS_DUMP").is_some() {
         eprintln!("--- harness output ---\n{text}");
@@ -504,9 +511,15 @@ fn execute_with_heap_limits(
         stress,
         soft_limit,
         hard_limit,
-        false,
+        ImageRetention::None,
     )
     .0
+}
+
+enum ImageRetention {
+    None,
+    Failure,
+    Always,
 }
 
 fn execute_with_image_retention(
@@ -516,10 +529,10 @@ fn execute_with_image_retention(
     stress: bool,
     soft_limit: Option<u64>,
     hard_limit: Option<u64>,
-    retain_failure: bool,
+    retention: ImageRetention,
 ) -> (Output, Option<std::path::PathBuf>) {
     let path = create_harness_image(body, arg, worker_thread, stress, soft_limit, hard_limit);
-    run_harness_image(path, arg, retain_failure, Duration::from_secs(180))
+    run_harness_image(path, arg, retention, Duration::from_secs(180))
 }
 
 fn create_harness_image(
@@ -620,7 +633,7 @@ fn supervise_harness_image(
 fn run_harness_image(
     path: std::path::PathBuf,
     arg: u64,
-    retain_failure: bool,
+    retention: ImageRetention,
     timeout: Duration,
 ) -> (Output, Option<std::path::PathBuf>) {
     let (output, timed_out) = (0..50)
@@ -662,8 +675,12 @@ fn run_harness_image(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let retained = if retain_failure && !output.status.success() {
-        eprintln!("failed harness executable retained: {}", path.display());
+    let retained = if matches!(retention, ImageRetention::Always)
+        || (matches!(retention, ImageRetention::Failure) && !output.status.success())
+    {
+        if !output.status.success() {
+            eprintln!("failed harness executable retained: {}", path.display());
+        }
         Some(path)
     } else {
         let _ = std::fs::remove_file(&path);
@@ -682,7 +699,8 @@ fn harness_supervision_drains_large_stdout_and_stderr() {
         }
     }
     let path = create_harness_image(write_both, 0, false, false, None, None);
-    let (output, retained) = run_harness_image(path, 0, true, Duration::from_secs(30));
+    let (output, retained) =
+        run_harness_image(path, 0, ImageRetention::Failure, Duration::from_secs(30));
     assert!(output.status.success());
     assert!(retained.is_none());
     assert_eq!(output.stdout, vec![b'x'; 4 * 1024 * 1024]);
@@ -699,10 +717,15 @@ fn harness_timeout_is_not_an_expected_failure_and_retains_its_elf() {
         g.jmp_label(forever);
     }
     let path = create_harness_image(never_finishes, 0, false, false, None, None);
-    // `false` is the policy used by expected runtime-failure tests. A timeout
+    // `None` is the policy used by expected runtime-failure tests. A timeout
     // must panic before such a caller can mistake a killed process for success.
     let failure = std::panic::catch_unwind(|| {
-        run_harness_image(path.clone(), 0, false, Duration::from_secs(1))
+        run_harness_image(
+            path.clone(),
+            0,
+            ImageRetention::None,
+            Duration::from_secs(1),
+        )
     })
     .expect_err("a timeout must fail even an expected-failure fixture");
     let diagnostic = failure
@@ -722,7 +745,8 @@ fn unexpected_runtime_failure_retains_the_actual_generated_executable() {
         h.g.mov_imm64(R::V0, 0); // An actual null RootCell handle is invalid.
         h.g.call_label(h.l.root_load);
     }
-    let (output, retained) = execute_with_image_retention(fail, 0, false, false, None, None, true);
+    let (output, retained) =
+        execute_with_image_retention(fail, 0, false, false, None, None, ImageRetention::Failure);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("runtime invariant violated"));
     let path = retained.expect("unexpected runtime failure preserves its executable");
@@ -734,7 +758,7 @@ fn unexpected_runtime_failure_retains_the_actual_generated_executable() {
     std::fs::remove_file(path).expect("remove this intentional test artifact after replay");
 
     let (expected, retained) =
-        execute_with_image_retention(fail, 0, false, false, None, None, false);
+        execute_with_image_retention(fail, 0, false, false, None, None, ImageRetention::None);
     assert!(!expected.status.success());
     assert!(
         retained.is_none(),
@@ -881,3 +905,20 @@ mod thread_api_c;
 
 mod lease_growth;
 mod weak_growth;
+
+mod remset_buffer;
+mod remset_sealing;
+
+mod satb_buffer;
+mod satb_pressure;
+mod satb_slots;
+
+mod satb_parallel;
+
+mod satb_overwrite;
+
+mod satb_moving;
+
+mod satb_fixture;
+
+mod satb_fallback;

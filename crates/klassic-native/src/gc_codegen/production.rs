@@ -84,12 +84,14 @@ mod registered_roots;
 mod relocate_pages;
 mod relocate_roots;
 mod remset;
+mod remset_buffer;
 pub(crate) mod rendezvous_time;
 mod retire;
 mod root_journal;
 mod root_retirement;
 mod root_work;
 mod roots;
+mod satb_buffer;
 mod scan;
 mod shared_headroom;
 mod slot_owner;
@@ -182,6 +184,8 @@ struct Runtime {
     pin_copies: pin_copy::State,
     pin_adoptions: pin_adopt::State,
     scoped_pins: scoped_pin::State,
+    remset_buffer: remset_buffer::State,
+    satb_buffer: satb_buffer::State,
     pin_api: crate::gc_abi::ScopedPinApi,
     heap_capacity_bytes: u64,
     old_limit_bytes: u64,
@@ -403,6 +407,14 @@ pub(crate) struct Labels<T> {
     pub alloc: T,
     /// Explicit registered OwnerContext entry; derives its shared heap.
     pub(crate) alloc_actor: T,
+    satb_slot_owner: T,
+    satb_record_old: T,
+    satb_record_young: T,
+    satb_flush: T,
+    satb_flush_locked: T,
+    remset_buffer_record: T,
+    remset_buffer_flush: T,
+    remset_buffer_flush_locked: T,
     pub(crate) attach_actor: T,
     pub(crate) metadata_lease_root_actor: T,
     pub(crate) metadata_lease_release_actor: T,
@@ -674,6 +686,14 @@ impl<T: Copy> Labels<T> {
             startup: create(),
             alloc,
             alloc_actor: create(),
+            satb_slot_owner: create(),
+            satb_record_old: create(),
+            satb_record_young: create(),
+            satb_flush: create(),
+            satb_flush_locked: create(),
+            remset_buffer_record: create(),
+            remset_buffer_flush: create(),
+            remset_buffer_flush_locked: create(),
             attach_actor: create(),
             metadata_lease_root_actor: create(),
             metadata_lease_release_actor: create(),
@@ -1112,6 +1132,8 @@ pub(crate) fn emit<E: PortableAsm>(
     scan::emit_cheneys(a, l);
     mark::emit_mark(a, l);
     slot_owner::emit(a, l);
+    remset_buffer::emit(a, l);
+    satb_buffer::emit(a, l);
     alloc::emit_publish_pending(a, l);
     roots::emit_roots(a, l, data.runtime);
     native_io::emit(a, l, data.runtime);

@@ -79,6 +79,8 @@ pub(super) fn emit<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime:
             // Initialized pending objects and root journal publications become
             // visible before releasing Running. No private producer may escape.
             a.call_label(l.publish_pending);
+            super::remset_buffer::flush(a, l, false);
+            super::satb_buffer::flush(a, l, false);
         }
         let retry = a.create_text_label();
         let ready = a.create_text_label();

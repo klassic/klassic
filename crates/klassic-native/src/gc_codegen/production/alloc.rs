@@ -380,6 +380,17 @@ pub(super) fn emit_publish_pending<E: PortableAsm>(a: &mut E, l: &Labels<E::Text
     a.call_label(l.publish);
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::NotEqual, l.fail);
+    // Publish bounded interior-slot lookup hints while the source access
+    // guard still protects this initialized Young object. Allocation already
+    // owns its start bit; publication idempotently supplies card hints too.
+    quiescence::save(a);
+    load_rt(a, R::V8, RT_PENDING_REF);
+    a.shr_reg_imm8(R::V8, 16);
+    load_rt(a, R::V0, RT_HEAP_BASE);
+    a.add_reg_reg(R::V8, R::V0);
+    a.sub_reg_imm32(R::V8, size_of::<ObjectHeader>() as i32);
+    slot_owner::publish(a);
+    quiescence::restore(a);
     source_access(a, l, SOURCE_EXIT);
     a.bind_text_label(published);
     a.mov_imm64(R::V0, 0);

@@ -69,6 +69,10 @@ pub(super) fn poll<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.bind_text_label(done);
     a.pop_reg(R::V1);
     a.pop_reg(R::V0);
+    // All ordinary allocation/API safepoints use this path, not just
+    // poll_actor. A partial private ring must progress before DONE-gated
+    // cooperative scheduling can request its next end rendezvous.
+    super::satb_buffer::flush(a, l, false);
 }
 /// Under the collector ticket, at the executing owner's real safepoint.
 /// Root steps already release-publish their journals; retain that backlog.
@@ -82,6 +86,8 @@ fn prepare_private<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     copy_claims::private_closed(a, l);
     moving_round::admission::refund(a, l);
     a.call_label(l.publish_pending);
+    super::remset_buffer::flush(a, l, true);
+    super::satb_buffer::flush(a, l, true);
     for f in [
         RT_COLLECTING,
         RT_CTX + offset_of!(MutatorContext, private_producers),

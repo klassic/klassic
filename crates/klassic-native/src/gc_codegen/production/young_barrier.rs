@@ -49,7 +49,11 @@ pub(super) fn field_store<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
         for r in [R::V6, R::V7, R::V8, R::V9] {
             a.push_reg(r);
         }
-        protect(a, l);
+        if previous {
+            super::satb_buffer::offer(a, l, true);
+        } else {
+            protect(a, l);
+        }
         for r in [R::V9, R::V8, R::V7, R::V6] {
             a.pop_reg(r);
         }

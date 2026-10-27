@@ -5,8 +5,9 @@
 //! set. Normal relocation quanta consume previous entries with the receiving
 //! actor's copier; exact-word CAS never overwrites a newer mutator store.
 //! Clearing a previous bit cannot erase current registration. The next flip
-//! happens only after consumption and relocation finish. This is the sole
-//! owner's fixed-storage protocol, not N-owner buffer sealing or retirement.
+//! happens only after consumption and relocation finish. Enrolled owners use
+//! `remset_buffer` to seal captured slots before the moving rendezvous; the
+//! collector ticket serializes admission with bitmap flip and full discard.
 use super::{
     Labels, REMSET_ENTRIES, RT_HEAP_BASE, RT_MARK_VALID, RT_REMSET_BASE, RT_REMSET_DROPPED,
     RT_REMSET_FLIPPED, RT_REMSET_FLIPS, RT_REMSET_KEPT, RT_REMSET_LEN, RT_REMSET_PREV_LEN,
@@ -36,6 +37,15 @@ fn slot_bit<E: PortableAsm>(a: &mut E, slot: R, word: R, mask: R, previous: bool
     a.jcc_label(if previous { C::NotEqual } else { C::Equal }, first);
     a.add_reg_imm32(word, (super::geometry(a).rbits_words * 8) as i32);
     a.bind_text_label(first);
+}
+
+/// Current registration is already visible in the global array. Caller owns
+/// the collector ticket; private buffers have not set this bit prematurely.
+pub(super) fn registered<E: PortableAsm>(a: &mut E, slot: R, found: E::TextLabel) {
+    slot_bit(a, slot, R::V11, R::V10, false);
+    a.atomic_load_acquire(R::V0, R::V11);
+    a.test_reg_reg(R::V0, R::V10);
+    a.jcc_label(C::NotEqual, found);
 }
 
 /// Forget that `slot` (preserved) is in a set: clear its slot bit. Only the
@@ -112,7 +122,8 @@ pub(super) fn remember<E: PortableAsm>(
 
 /// In `collect`, for a Young-only collection (V3 = runtime; clobbers V0,
 /// V1): previous := current, current := empty.
-pub(super) fn emit_flip<E: PortableAsm>(a: &mut E) {
+pub(super) fn emit_flip<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    super::remset_buffer::require_empty(a, l);
     load_rt(a, R::V0, RT_REMSET_LEN);
     store_rt(a, RT_REMSET_PREV_LEN, R::V0);
     load_rt(a, R::V1, RT_REMSET_FLIPPED);
