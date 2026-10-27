@@ -1,5 +1,9 @@
 /* Metadata leases, serialized by the heap lock shared with gc_pool_step_locked.
- * Stable native pool/slots/heap/page-table storage is prepared before use. A
+ * Native pool/heap/page-table storage is prepared before use. Slot backing is
+ * stable throughout each locked operation; no caller retains a raw slot pointer
+ * after it. An owning runtime may grow backing while preserving every logical
+ * index/generation and publishing slots/capacity together under this same lock.
+ * The old mapping remains owned until all old pointer borrows have ended. A
  * free slot has page=incarnation=0 and a one-based next_free link; initialize
  * this list outside pause/lock-critical traversal. Tokens belong to ONE pool.
  * Acquiring a token retains page metadata, not object liveness or immobility.

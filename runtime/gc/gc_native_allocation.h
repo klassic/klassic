@@ -21,7 +21,9 @@
 /* Admission uses GC_POOL_* statuses; other operations return OK/INVALID or
  * OS_ERROR. Allocation itself preserves GC_ALLOC_* pressure results. */
 typedef struct NativeAllocationRun {
-    uint64_t self,stage,previous,next;
+    uint64_t self;
+    _Atomic uint64_t stage; /* publishes private preparation before inventory readers */
+    uint64_t previous,next;
     NativeRuntimeOwner *runtime;
     PageLease lease;
     NativeBitmapOwner bitmap;
@@ -44,20 +46,24 @@ static inline bool gc_native_allocation_valid(const NativeAllocationRun *run){
 static inline AllocationPage *gc_native_allocation_page(NativeAllocationRun *run){
     return (AllocationPage *)(uintptr_t)run->runtime->backing.heap.pages+run->lease.head_index;
 }
-static inline bool gc_native_allocation_native(const NativeAllocationRun *run){
-    return gc_native_allocation_valid(run)&&
-        atomic_load_explicit(&run->runtime->context.state,memory_order_acquire)==GC_BLOCKED_NATIVE&&
-        !atomic_load_explicit(&run->runtime->context.access_epoch,memory_order_acquire);
+static inline bool gc_native_allocation_actor_native(const NativeAllocationRun *run,const MutatorContext *actor){
+    return gc_native_allocation_valid(run)&&actor&&!((uintptr_t)actor&7)&&
+        actor->abi_version==GC_ABI_VERSION&&actor->thread_id&&
+        atomic_load_explicit(&actor->state,memory_order_acquire)==GC_BLOCKED_NATIVE&&
+        !atomic_load_explicit(&actor->access_epoch,memory_order_acquire);
 }
-static inline uint64_t gc_native_allocation_reserve_locked(NativeAllocationRun *run,
-        NativeRuntimeOwner *runtime,uint64_t pages,uint64_t capacity,const NativeMetadataOps *ops){
+static inline bool gc_native_allocation_native(const NativeAllocationRun *run){
+    return gc_native_allocation_valid(run)&&gc_native_allocation_actor_native(run,&run->runtime->context);
+}
+/* Shared heap admission for a private mutator run or collector target. No
+ * existing TLAB/guard belongs to this independent transaction; a collector
+ * reserves disjoint pages without reading another actor's private context.
+ * Callers separately own their actor and its native-boundary protocol. */
+static inline uint64_t gc_native_allocation_reserve_kind_locked(NativeAllocationRun *run,
+        NativeRuntimeOwner *runtime,uint64_t pages,uint64_t capacity,uint64_t generation,uint64_t relocation,const NativeMetadataOps *ops){
     if(!run||((uintptr_t)run&7)||!gc_native_runtime_valid(runtime)||runtime->stage!=3||
-       !ops||!ops->map||!ops->unmap||!pages||!capacity||capacity>UINT32_MAX||
-       !gc_native_heap_prepared(&runtime->backing)||runtime->context.tlab_start||
-       runtime->context.tlab_top||runtime->context.tlab_end||
-       atomic_load_explicit(&runtime->context.access_epoch,memory_order_acquire))return GC_POOL_INVALID;
-    uint64_t state=atomic_load_explicit(&runtime->context.state,memory_order_acquire);
-    if(state!=GC_RUNNING&&state!=GC_BLOCKED_NATIVE)return GC_POOL_INVALID;
+       !ops||!ops->map||!ops->unmap||!pages||!capacity||capacity>UINT32_MAX||generation>GC_OLD||relocation>1||
+       !gc_native_heap_prepared(&runtime->backing))return GC_POOL_INVALID;
     const unsigned char *raw=(const void *)run;
     for(size_t i=0;i<sizeof(*run);i++)if(raw[i])return GC_POOL_INVALID;
     uint64_t forward_bytes=0,mark_bytes=0;
@@ -66,7 +72,7 @@ static inline uint64_t gc_native_allocation_reserve_locked(NativeAllocationRun *
     NativeAllocationRun *first=(void *)(uintptr_t)runtime->allocations;
     if(first&&(!gc_native_allocation_valid(first)||first->runtime!=runtime||first->previous))return GC_POOL_INVALID;
     HeapPool *heap=&runtime->backing.heap;
-    run->lease=(PageLease){.page_count=pages,.generation=GC_YOUNG};
+    run->lease=(PageLease){.page_count=pages,.generation=generation,.relocation=relocation};
     uint64_t status=gc_pool_step_locked(heap,&run->lease,GC_POOL_RESERVE);
     if(status){*run=(NativeAllocationRun){0};return status;}
     status=gc_native_bitmap_reserve_locked(&run->bitmap,heap,&run->lease,ops);
@@ -92,19 +98,55 @@ static inline uint64_t gc_native_allocation_reserve_locked(NativeAllocationRun *
     run->next=runtime->allocations;if(first)first->previous=(uintptr_t)run;
     runtime->allocations=(uintptr_t)run;return GC_POOL_OK;
 }
-static inline uint64_t gc_native_allocation_prepare(NativeAllocationRun *run,const NativeMetadataOps *ops){
-    if(!gc_native_allocation_native(run)||run->stage!=1||run->lease.committed_mapping||
-       run->bitmap.mapping||run->forwarding.allocation||run->mark_records.allocation)return GC_POOL_INVALID;
-    uint64_t status=gc_native_heap_commit_lease(&run->runtime->backing,&run->lease);
-    if(!status)status=gc_native_bitmap_prepare(&run->bitmap,ops);
-    if(!status)status=gc_native_metadata_prepare(&run->forwarding,ops);
-    if(!status)status=gc_native_metadata_prepare(&run->mark_records,ops);
+static inline uint64_t gc_native_allocation_reserve_generation_locked(NativeAllocationRun *run,
+        NativeRuntimeOwner *runtime,uint64_t pages,uint64_t capacity,uint64_t generation,const NativeMetadataOps *ops){
+    return gc_native_allocation_reserve_kind_locked(run,runtime,pages,capacity,generation,0,ops);
+}
+static inline uint64_t gc_native_allocation_reserve_target_locked(NativeAllocationRun *run,
+        NativeRuntimeOwner *runtime,uint64_t pages,uint64_t capacity,uint64_t generation,const NativeMetadataOps *ops){
+    return gc_native_allocation_reserve_kind_locked(run,runtime,pages,capacity,generation,1,ops);
+}
+static inline uint64_t gc_native_allocation_reserve_locked(NativeAllocationRun *run,
+        NativeRuntimeOwner *runtime,uint64_t pages,uint64_t capacity,const NativeMetadataOps *ops){
+    if(!gc_native_runtime_valid(runtime)||runtime->context.tlab_start||
+       runtime->context.tlab_top||runtime->context.tlab_end||
+       atomic_load_explicit(&runtime->context.access_epoch,memory_order_acquire))return GC_POOL_INVALID;
+    uint64_t state=atomic_load_explicit(&runtime->context.state,memory_order_acquire);
+    if(state!=GC_RUNNING&&state!=GC_BLOCKED_NATIVE)return GC_POOL_INVALID;
+    return gc_native_allocation_reserve_generation_locked(run,runtime,pages,capacity,GC_YOUNG,ops);
+}
+/* OS preparation belongs to the actual calling native worker. A collector
+ * worker need not borrow or change the mutator context to prepare Old targets.
+ * The unique private run and its budget reservation remain owned throughout. */
+typedef uint64_t (*NativeRunCommitter)(NativeHeapOwner *,PageLease *);
+/* Each successful OS suboperation remains owned after a later failure. Retry
+ * resumes only missing backing; it never zeroes/publishes an existing package. */
+static inline uint64_t gc_native_allocation_prepare_native_with(NativeAllocationRun *run,const NativeMetadataOps *ops,
+        const MutatorContext *actor,NativeRunCommitter commit){
+    if(!gc_native_allocation_valid(run)||!actor||((uintptr_t)actor&7)||
+       actor->abi_version!=GC_ABI_VERSION||!actor->thread_id||
+       atomic_load_explicit(&actor->state,memory_order_acquire)!=GC_BLOCKED_NATIVE||
+       atomic_load_explicit(&actor->access_epoch,memory_order_acquire)||run->stage!=1||
+       (run->bitmap.stage!=1&&run->bitmap.stage!=2)||
+       (run->bitmap.mapping&&run->bitmap.stage!=2)||
+       run->forwarding.stage!=1||run->mark_records.stage!=1)return GC_POOL_INVALID;
+    uint64_t status=0;
+    if(!run->lease.committed_mapping)status=(commit?commit:gc_native_heap_commit_lease)(&run->runtime->backing,&run->lease);
+    if(!status&&run->bitmap.stage==1)status=gc_native_bitmap_prepare(&run->bitmap,ops);
+    if(!status&&!run->forwarding.allocation)status=gc_native_metadata_prepare(&run->forwarding,ops);
+    if(!status&&!run->mark_records.allocation)status=gc_native_metadata_prepare(&run->mark_records,ops);
     if(status)return status==GC_NATIVE_METADATA_OS_ERROR?GC_NATIVE_RUN_OS_ERROR:GC_POOL_INVALID;
     ForwardTable *table=(void *)(uintptr_t)run->forwarding.allocation;
     table->cells=(uintptr_t)(table+1);table->capacity=run->marks.capacity;atomic_init(&table->used,0);
     run->imports=table->cells+table->capacity*sizeof(ForwardCell);
     run->marks.records=run->mark_records.allocation;
     run->stage=2;return GC_POOL_OK;
+}
+static inline uint64_t gc_native_allocation_prepare_native(NativeAllocationRun *run,const NativeMetadataOps *ops,const MutatorContext *actor){
+    return gc_native_allocation_prepare_native_with(run,ops,actor,NULL);
+}
+static inline uint64_t gc_native_allocation_prepare(NativeAllocationRun *run,const NativeMetadataOps *ops){
+    return gc_native_allocation_valid(run)?gc_native_allocation_prepare_native(run,ops,&run->runtime->context):GC_POOL_INVALID;
 }
 static inline uint64_t gc_native_allocation_publish_locked(NativeAllocationRun *run){
     if(!gc_native_allocation_valid(run)||run->stage!=2||
@@ -120,10 +162,13 @@ static inline uint64_t gc_native_allocation_publish_locked(NativeAllocationRun *
     if(gc_native_bitmap_publish_locked(&run->bitmap)!=GC_POOL_OK)return GC_POOL_INVALID;
     run->stage=3;return GC_POOL_OK;
 }
-static inline uint64_t gc_native_allocation_bind_locked(NativeAllocationRun *run){
-    if(!gc_native_allocation_valid(run)||run->stage!=3||
-       gc_tlab_page_locked(&run->runtime->context,gc_native_allocation_page(run),0)!=GC_ALLOC_OK)return GC_POOL_INVALID;
+static inline uint64_t gc_native_allocation_bind_context_locked(NativeAllocationRun *run,MutatorContext *context){
+    if(!gc_native_allocation_valid(run)||!context||run->stage!=3||
+       gc_tlab_page_locked(context,gc_native_allocation_page(run),0)!=GC_ALLOC_OK)return GC_POOL_INVALID;
     run->stage=4;return GC_POOL_OK;
+}
+static inline uint64_t gc_native_allocation_bind_locked(NativeAllocationRun *run){
+    return gc_native_allocation_valid(run)?gc_native_allocation_bind_context_locked(run,&run->runtime->context):GC_POOL_INVALID;
 }
 typedef uint64_t (*NativeAllocationStarter)(MutatorContext *,const AllocationStart *);
 /* Fresh output controls; never overwrite a live output handle. All other live
@@ -146,10 +191,13 @@ static inline uint64_t gc_native_allocation_start(NativeAllocationRun *run,uint6
     AllocationStart start={(uintptr_t)&descriptors->registry,(uintptr_t)&shape,(uintptr_t)root};
     return allocate(&runtime->context,&start);
 }
-static inline uint64_t gc_native_allocation_close_locked(NativeAllocationRun *run){
-    if(!gc_native_allocation_valid(run)||run->stage!=4||
-       gc_tlab_page_locked(&run->runtime->context,gc_native_allocation_page(run),1)!=GC_ALLOC_OK)return GC_POOL_INVALID;
+static inline uint64_t gc_native_allocation_close_context_locked(NativeAllocationRun *run,MutatorContext *context){
+    if(!gc_native_allocation_valid(run)||!context||run->stage!=4||
+       gc_tlab_page_locked(context,gc_native_allocation_page(run),1)!=GC_ALLOC_OK)return GC_POOL_INVALID;
     run->stage=8;return GC_POOL_OK;
+}
+static inline uint64_t gc_native_allocation_close_locked(NativeAllocationRun *run){
+    return gc_native_allocation_valid(run)?gc_native_allocation_close_context_locked(run,&run->runtime->context):GC_POOL_INVALID;
 }
 static inline uint64_t gc_native_allocation_cancel_locked(NativeAllocationRun *run){
     if(!gc_native_allocation_valid(run)||run->stage<1||run->stage>3)return GC_POOL_INVALID;
@@ -160,12 +208,23 @@ static inline uint64_t gc_native_allocation_cancel_locked(NativeAllocationRun *r
     }else if(!gc_native_pool_lease_valid(&run->runtime->backing.heap,&run->lease))return GC_POOL_INVALID;
     run->stage=5;return GC_POOL_OK;
 }
-static inline uint64_t gc_native_allocation_cleanup(NativeAllocationRun *run,const NativeMetadataOps *ops){
-    if(!gc_native_allocation_native(run)||run->stage!=5)return GC_POOL_INVALID;
+static inline uint64_t gc_native_allocation_cleanup_native_with(NativeAllocationRun *run,const NativeMetadataOps *ops,
+        const MutatorContext *actor,NativePageDecommitter decommit){
+    if(!gc_native_allocation_actor_native(run,actor)||run->stage!=5)return GC_POOL_INVALID;
     uint64_t status=0;
     if(run->release.stage){
-        if(run->release.committed_mapping)status=gc_native_page_release_payload(&run->runtime->backing,&run->release,NULL);
-    }else if(run->lease.committed_mapping)status=gc_native_heap_decommit_lease(&run->runtime->backing,&run->lease);
+        if(run->release.committed_mapping)status=gc_native_page_release_payload(&run->runtime->backing,&run->release,decommit);
+    }else if(run->lease.committed_mapping)status=gc_native_heap_decommit_lease_with(&run->runtime->backing,&run->lease,decommit);
+    else if(decommit){
+        /* A backing policy may already own cached pages activated before a
+         * failed payload commit. The exact PREPARING lease still owns this
+         * range even though its active-run commit never completed. Give the
+         * optional policy a chance to restore/discard that physical prefix. */
+        NativeHeapOwner *owner=&run->runtime->backing;
+        if(!gc_native_heap_lease_valid(owner,&run->lease))return GC_POOL_INVALID;
+        void *address=(void *)(uintptr_t)(owner->reservation+((run->lease.head_index+1)<<GC_HEAP_PAGE_SHIFT));
+        if(!decommit(address,(size_t)(run->lease.page_count<<GC_HEAP_PAGE_SHIFT)))status=GC_NATIVE_METADATA_OS_ERROR;
+    }
     if(!status&&run->bitmap.stage<4)
         status=gc_native_bitmap_dispose(&run->bitmap,run->release.stage?&run->release:NULL,ops);
     if(!status){
@@ -178,6 +237,12 @@ static inline uint64_t gc_native_allocation_cleanup(NativeAllocationRun *run,con
     if(!status&&run->mark_records.allocation)status=gc_native_metadata_dispose(&run->mark_records,ops);
     if(status)return status==GC_NATIVE_METADATA_OS_ERROR?GC_NATIVE_RUN_OS_ERROR:GC_POOL_INVALID;
     run->marks.records=run->imports=0;run->stage=6;return GC_POOL_OK;
+}
+static inline uint64_t gc_native_allocation_cleanup_native(NativeAllocationRun *run,const NativeMetadataOps *ops,const MutatorContext *actor){
+    return gc_native_allocation_cleanup_native_with(run,ops,actor,NULL);
+}
+static inline uint64_t gc_native_allocation_cleanup(NativeAllocationRun *run,const NativeMetadataOps *ops){
+    return gc_native_allocation_valid(run)?gc_native_allocation_cleanup_native(run,ops,&run->runtime->context):GC_POOL_INVALID;
 }
 static inline bool gc_native_allocation_links_valid(NativeAllocationRun *run){
     NativeAllocationRun *prev=(void *)(uintptr_t)run->previous,*next=(void *)(uintptr_t)run->next;
