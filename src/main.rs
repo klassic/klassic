@@ -11,8 +11,11 @@ use cli::{
 };
 use klassic_eval::{Evaluator, EvaluatorConfig, set_script_args};
 use klassic_native::{
-    NativeBackend, NativeCompilerConfig, NativeTarget, UserModuleSource, compile_source_to_c,
-    compile_source_to_llvm, compile_source_with_prelude_and_modules_for_target,
+    GenerationalBackendConfig, GenerationalModuleSource, NativeBackend, NativeCompilerConfig,
+    NativeTarget, UserModuleSource, compile_source_to_c,
+    compile_source_to_c_generational_with_modules, compile_source_to_llvm,
+    compile_source_to_llvm_generational_with_modules,
+    compile_source_with_prelude_and_modules_for_target,
 };
 use std::path::Path;
 
@@ -129,6 +132,69 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     return Err(1);
                 }
             };
+            if command.config.gc_generational
+                && (command.config.c_backend || command.config.llvm_backend)
+            {
+                if command.config.gc_poison {
+                    eprintln!("error: --gc-poison is not accepted with --gc=generational");
+                    return Err(1);
+                }
+                if command.config.native_target != NativeTarget::LinuxX86_64 {
+                    eprintln!("error: canonical C/LLVM currently targets Linux x86-64");
+                    return Err(1);
+                }
+                let extension = if command.config.llvm_backend {
+                    "ll"
+                } else {
+                    "c"
+                };
+                if output.extension().is_none_or(|value| value != extension) {
+                    eprintln!("error: canonical C/LLVM executable linking is not yet enabled");
+                    return Err(1);
+                }
+                let modules = user_modules_for(&input, &text)?
+                    .into_iter()
+                    .map(|module| {
+                        let base = input.parent().unwrap_or_else(|| Path::new("."));
+                        let slashed = base.join(format!("{}.kl", module.path.replace('.', "/")));
+                        let dotted = base.join(format!("{}.kl", module.path));
+                        let source_name = if slashed.is_file() { slashed } else { dotted };
+                        GenerationalModuleSource::new(
+                            module.path,
+                            source_name.display().to_string(),
+                            module.source,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let config = GenerationalBackendConfig {
+                    flags: u64::from(command.config.gc_stress)
+                        | (u64::from(command.config.gc_log) << 1),
+                    ..Default::default()
+                };
+                let generated = if command.config.llvm_backend {
+                    compile_source_to_llvm_generational_with_modules(
+                        &input.display().to_string(),
+                        &text,
+                        &modules,
+                        config,
+                    )
+                } else {
+                    compile_source_to_c_generational_with_modules(
+                        &input.display().to_string(),
+                        &text,
+                        &modules,
+                        config,
+                    )
+                }
+                .map_err(|error| {
+                    eprintln!("{error}");
+                    1u8
+                })?;
+                return fs::write(&output, generated).map_err(|error| {
+                    eprintln!("{}: {error}", output.display());
+                    1
+                });
+            }
             if command.config.gc_generational {
                 // The generational GC is wired into every direct backend
                 // (x86-64 ELF/PE, AArch64 Mach-O); --backend c/llvm (and a

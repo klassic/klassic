@@ -98,15 +98,21 @@ fn unknown_gc_mode_is_rejected() {
 }
 
 #[test]
-fn generational_rejects_llvm_and_c_backends() {
+fn generational_rejects_unavailable_c_and_llvm_executables() {
     for backend in ["llvm", "c"] {
         let stderr = build_failure_stderr(
             "backend",
-            &["--gc=generational", "--backend", backend],
+            &[
+                "--gc=generational",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--backend",
+                backend,
+            ],
             "println(1)\n",
         );
         assert!(
-            stderr.contains("--gc=generational is only supported by the direct native backends"),
+            stderr.contains("canonical C/LLVM executable linking is not yet enabled"),
             "backend {backend} stderr:\n{stderr}"
         );
     }
