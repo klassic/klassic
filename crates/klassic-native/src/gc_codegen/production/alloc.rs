@@ -188,11 +188,19 @@ pub(super) fn emit_alloc<E: PortableAsm>(
         a.cmp_reg_reg(R::V0, R::V1);
         a.jcc_label(C::Below, have_page);
     }
-    // Copy exhaustion is an actual destination failure. A fresh owner instead
-    // reaches a safepoint: another owner may already be requesting a new bank.
+    // The forwarder can use its preflighted Old reserve when Young fills.
+    // Null is exclusive to this copy-capacity return: invalid shapes and
+    // metadata exhaustion retain their own diagnostics above.
+    let fresh_exhausted = a.create_text_label();
     load_rt(a, R::V0, RT_COLLECTING);
     a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::Equal, fresh_exhausted);
+    load_rt(a, R::V0, super::moving_round::ENABLED);
+    a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::NotEqual, l.oom);
+    a.mov_imm64(R::V0, 0);
+    a.ret();
+    a.bind_text_label(fresh_exhausted);
     a.call_label(l.collect);
     #[cfg(test)]
     if let Some(hook) = l.alloc_after_collect_hook {

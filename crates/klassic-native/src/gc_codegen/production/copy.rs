@@ -217,12 +217,13 @@ fn emit_forward<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, c: &Copier<
     a.jcc_label(C::NotEqual, promote);
     super::tenuring::promote(a, l, promote);
     if c.worker {
-        worker_young_copy(a, l, c);
+        worker_young_copy(a, l, c, promote);
     } else {
-        mutator_young_copy(a, l, c);
+        mutator_young_copy(a, l, c, promote);
     }
     a.jmp_label(claim);
     a.bind_text_label(promote);
+    load_rt(a, R::V0, c.src);
     promote_copy(a, l, c, concurrent);
     a.bind_text_label(claim);
     publish_copy(a, l, c);
@@ -265,10 +266,15 @@ fn mutator_young_copy<E: PortableAsm>(
     a: &mut E,
     l: &Labels<E::TextLabel>,
     c: &Copier<E::TextLabel>,
+    promote: E::TextLabel,
 ) {
     a.load_ptr_disp32(R::V1, R::V0, PAYLOAD);
     store_rt(a, RT_ALLOC_SIZE, R::V1);
     a.call_label(l.alloc_raw);
+    // Only exhausted Young copying returns null; shape/metadata failures
+    // remain hard errors. The existing Old copier preserves all obligations.
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::Equal, promote);
     a.mov_reg_reg(R::V7, R::V0);
     a.push_reg(R::V0);
     a.push_reg(R::V0);
@@ -297,6 +303,7 @@ fn worker_young_copy<E: PortableAsm>(
     a: &mut E,
     l: &Labels<E::TextLabel>,
     c: &Copier<E::TextLabel>,
+    promote: E::TextLabel,
 ) {
     let fit = a.create_text_label();
     let reserve = a.create_text_label();
@@ -325,7 +332,13 @@ fn worker_young_copy<E: PortableAsm>(
     a.mov_reg_reg(R::V2, R::V0);
     a.shr_reg_imm8(R::V2, 32);
     a.cmp_reg_reg(R::V1, R::V2);
-    a.jcc_label(C::AboveOrEqual, l.relocation_oom);
+    let available = a.create_text_label();
+    a.jcc_label(C::Below, available);
+    load_rt(a, R::V0, super::moving_round::ENABLED);
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::NotEqual, l.relocation_oom);
+    a.jmp_label(promote);
+    a.bind_text_label(available);
     a.mov_reg_reg(R::V8, R::V0);
     a.mov_reg_reg(R::V6, R::V0);
     a.mov_imm64(R::V9, 1 << 32);

@@ -9,7 +9,7 @@ pub(super) fn must_full<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, ful
     load_rt(a, R::V0, large_object::LIVE_PAGES);
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::Equal, done);
-    capacity::mature_promotion_pages(a, l);
+    capacity::normal_promotion_pages(a, l);
     a.mov_reg_reg(R::V11, R::V0);
     // Promotion must fit the current Old destination even when its bound
     // exceeds a whole Young window. Do not apply the Young-window cap here.

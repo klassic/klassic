@@ -201,6 +201,84 @@ fn protected_pages<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, field: u
     copy_bound(a, l);
     a.bind_text_label(done);
 }
+/// Legacy Young copying has one owner and one worker. When its destination
+/// fills, promote remaining copies through the existing Old copier. Before
+/// that point Old must cover the mature-object bound; after that point it must
+/// cover the remaining tentative-copy bytes. Reserve the maximum of the two.
+///
+/// For P-byte next-fit pages, two Young streams occupy at most 2*(C+F)+2P
+/// bytes, where C is copied footprint and F <= P is admitted fresh footprint.
+/// A full Y-byte window therefore contains C >= max(0,(Y-4P)/2) copy bytes.
+/// Each source object has at most two tentative copies, so at most
+/// 2*protected - max(0,(Y-4P)/2) copy bytes remain for Old. Old packs across
+/// page boundaries; only run transitions waste space, each less than P.
+/// Add one page per remaining transition, then round upward to whole pages.
+/// This includes losing copies, partially filled streams and the fresh budget.
+///
+/// Opt-in N-owner moving rounds retain their existing admission contract;
+/// their copier does not take this legacy overflow path. No object walk occurs.
+/// Return V0 pages; preserve V2, as mature_promotion_pages does.
+pub(super) fn normal_promotion_pages<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    let moving = a.create_text_label();
+    let done = a.create_text_label();
+    load_rt(a, R::V0, super::moving_round::ENABLED);
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::NotEqual, moving);
+    a.push_reg(R::V2);
+    young_destination(a, l);
+    let sealed = a.create_text_label();
+    let volume = a.create_text_label();
+    load_rt(a, R::V0, super::young_mark::VALID);
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::NotEqual, sealed);
+    allocated_source_pages(a, l);
+    a.shl_reg_imm8(R::V0, 17);
+    a.jmp_label(volume);
+    a.bind_text_label(sealed);
+    load_rt(a, R::V0, SEALED);
+    a.bind_text_label(volume);
+    a.shl_reg_imm8(R::V0, 1);
+    let partials = a.create_text_label();
+    a.cmp_reg_imm8(R::V2, 4);
+    a.jcc_label(C::Below, partials);
+    a.jcc_label(C::Equal, partials);
+    a.sub_reg_imm8(R::V2, 4);
+    a.shl_reg_imm8(R::V2, 16);
+    let subtract = a.create_text_label();
+    a.cmp_reg_reg(R::V0, R::V2);
+    a.jcc_label(C::AboveOrEqual, subtract);
+    a.mov_reg_reg(R::V0, R::V2);
+    a.bind_text_label(subtract);
+    a.sub_reg_reg(R::V0, R::V2);
+    a.bind_text_label(partials);
+    load_rt(a, R::V1, super::old_runs::COUNT);
+    let no_transitions = a.create_text_label();
+    a.test_reg_reg(R::V1, R::V1);
+    a.jcc_label(C::Equal, no_transitions);
+    load_rt(a, R::V2, super::old_runs::ALLOC);
+    a.cmp_reg_reg(R::V2, R::V1);
+    a.jcc_label(C::AboveOrEqual, l.fail);
+    a.sub_reg_reg(R::V1, R::V2);
+    a.sub_reg_imm8(R::V1, 1);
+    a.shl_reg_imm8(R::V1, 17);
+    a.add_reg_reg(R::V0, R::V1);
+    a.bind_text_label(no_transitions);
+    a.add_reg_imm32(R::V0, (super::HEAP_PAGE_BYTES - 1) as i32);
+    a.shr_reg_imm8(R::V0, 17);
+    a.push_reg(R::V0);
+    mature_promotion_pages(a, l);
+    a.pop_reg(R::V1);
+    let ready = a.create_text_label();
+    a.cmp_reg_reg(R::V0, R::V1);
+    a.jcc_label(C::AboveOrEqual, ready);
+    a.mov_reg_reg(R::V0, R::V1);
+    a.bind_text_label(ready);
+    a.pop_reg(R::V2);
+    a.jmp_label(done);
+    a.bind_text_label(moving);
+    mature_promotion_pages(a, l);
+    a.bind_text_label(done);
+}
 fn requested<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     load_rt(a, R::V2, REQUESTED);
     a.cmp_reg_imm32(R::V2, super::geometry::policy_geometry(a).young_min as i32);

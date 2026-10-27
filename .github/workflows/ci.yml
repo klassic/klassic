@@ -51,6 +51,7 @@ jobs:
           path: |
             /tmp/klassic-emitted-atomics-*
             /tmp/klassic-harness-*
+            /tmp/klassic_gcgen_*
           if-no-files-found: ignore
 
       - name: Build release binary

@@ -133,3 +133,36 @@ pub(crate) fn current_tlab_bound<E: PortableAsm>(a: &mut E) {
         RT_REQUEST + offset_of!(crate::gc_abi::AllocationRequest, page),
     );
 }
+
+/// Pure predicate inputs; no allocation or collection follows these probes.
+pub(crate) fn legacy_overflow_probe(
+    g: &mut crate::NativeCodeGenerator,
+    protected: u64,
+    mature: u64,
+    runs: (u64, u64),
+    available: Option<(u64, u64)>,
+) {
+    let runtime = g.gc_gen.take().expect("generational runtime");
+    store_rt_imm(g, young_mark::VALID, 1);
+    store_rt_imm(g, c::SEALED, protected);
+    store_rt_imm(g, c::MATURE_SEALED, mature);
+    store_rt_imm(g, old_runs::COUNT, runs.0);
+    store_rt_imm(g, old_runs::ALLOC, runs.1);
+    if let Some((pages, used)) = available {
+        store_rt_imm(g, pool::OLD_PAGES, pages);
+        load_rt(g, R::V0, RT_OLD_BASE);
+        g.add_reg_imm32(R::V0, used as i32);
+        store_rt(g, RT_OLD_TOP, R::V0);
+        let full = g.create_text_label();
+        let done = g.create_text_label();
+        pool::must_full(g, &runtime.labels, full);
+        g.mov_imm64(R::V0, 0);
+        g.jmp_label(done);
+        g.bind_text_label(full);
+        g.mov_imm64(R::V0, 1);
+        g.bind_text_label(done);
+    } else {
+        c::normal_promotion_pages(g, &runtime.labels);
+    }
+    g.gc_gen = Some(runtime);
+}

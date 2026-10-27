@@ -262,7 +262,6 @@ mod linux_x86_64 {
         let source_path = write_source(tag, source);
         let output_path = temp_path(tag, "bin");
         let result = build(flags, &source_path, &output_path);
-        let _ = fs::remove_file(&source_path);
         assert!(
             result.status.success(),
             "native build with {flags:?} should succeed\nstderr:\n{}",
@@ -271,7 +270,18 @@ mod linux_x86_64 {
         let run = Command::new(&output_path)
             .output()
             .expect("compiled binary should run");
-        let _ = fs::remove_file(&output_path);
+        if run.status.success() {
+            let _ = fs::remove_file(&source_path);
+            let _ = fs::remove_file(&output_path);
+        } else {
+            let _ = fs::write(output_path.with_extension("stdout.log"), &run.stdout);
+            let _ = fs::write(output_path.with_extension("stderr.log"), &run.stderr);
+            eprintln!(
+                "failed GC executable retained at {} (source {})",
+                output_path.display(),
+                source_path.display()
+            );
+        }
         run
     }
 

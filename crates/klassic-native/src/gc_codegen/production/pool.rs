@@ -303,7 +303,7 @@ pub(super) fn must_full<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, ful
     a.jcc_label(C::Below, full);
     a.mov_reg_reg(R::V2, R::V0);
     let ready = a.create_text_label();
-    capacity::mature_promotion_pages(a, l);
+    capacity::normal_promotion_pages(a, l);
     a.shl_reg_imm8(R::V0, 17);
     a.cmp_reg_reg(R::V2, R::V0);
     a.jcc_label(C::AboveOrEqual, ready);

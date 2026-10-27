@@ -231,3 +231,142 @@ fn production_young_capacity_rejects_out_of_range_requests_before_binding_pages(
         assert!(String::from_utf8_lossy(&o.stderr).contains("runtime invariant violated"));
     }
 }
+
+// Allocation packs one large and one small object per source page. Root
+// visitation groups the sizes, requiring 220 + 110 destination pages.
+fn reordered_dense(g: &mut NativeCodeGenerator, sealed: u64) {
+    use crate::portable_asm::{PortableAsm, Reg};
+    if sealed >= 2 {
+        g.gc_max_heap = 512 << 20;
+    }
+    let mut h = H::begin(g);
+    crate::gc_codegen::production::test_support::set_young_auto(h.g, false);
+    if sealed == 3 {
+        crate::gc_codegen::production::test_support::set_worker_alive(h.g, false);
+    }
+    h.g.sub_reg_imm32(Reg::V4, 4096);
+    for i in 0..220 {
+        h.alloc(1, 70000, 32 + 2 * i);
+        h.alloc(
+            if sealed >= 2 && i == 219 { 2 } else { 1 },
+            50000,
+            33 + 2 * i,
+        );
+    }
+    if sealed >= 2 {
+        h.store(Src::Raw(471), 0, Src::Raw(32), true);
+    }
+    for i in 0..220 {
+        h.root(32 + 2 * i);
+    }
+    for i in 0..220 {
+        h.root(33 + 2 * i);
+    }
+    if sealed == 3 {
+        crate::gc_codegen::production::test_support::set_worker_alive(h.g, true);
+    }
+    if sealed >= 2 {
+        h.mark_start();
+        h.drain_marks();
+    }
+    if sealed != 0 {
+        traced(&mut h);
+    }
+    h.collect();
+    h.report_counter("full", Counter::FullCollections);
+    h.report_counter("active", Counter::CapacityActive);
+    h.report_counter("reserve", Counter::CapacityReserve);
+    h.report_counter("protected", Counter::CapacitySealed);
+    h.finish_collection();
+    h.report("first_large", |h| h.object_id(Src::Root(32)));
+    h.report("first_small", |h| h.object_id(Src::Root(33)));
+    h.report("last_large", |h| h.object_id(Src::Root(470)));
+    h.report("last_small", |h| h.object_id(Src::Root(471)));
+    h.report("last_old", |h| h.is_old(Src::Root(471)));
+    if sealed >= 2 {
+        h.report("child_young", |h| h.is_old(Src::Root(32)));
+        h.report_counter("remembered", Counter::RemsetLen);
+        h.report_counter("old_active", Counter::MarkActive);
+        h.load_barriered(Src::Root(471), 0);
+        h.keep(4);
+        h.report("child_id", |h| h.object_id(Src::Raw(4)));
+        traced(&mut h);
+        cycle(&mut h);
+        h.report_counter("full_after", Counter::FullCollections);
+        h.report_counter("old_active_after", Counter::MarkActive);
+        h.load_barriered(Src::Root(471), 0);
+        h.keep(4);
+        h.report("child_id_after", |h| h.object_id(Src::Raw(4)));
+        h.report("child_old_after", |h| h.is_old(Src::Raw(4)));
+        h.report_counter("unmarked", Counter::Unmarked);
+        h.report_counter("young_unmarked", Counter::YoungUnmarked);
+    }
+    h.g.add_reg_imm32(Reg::V4, 4096);
+}
+#[test]
+fn production_young_reordered_dense_survivors_fit_the_reserved_destination() {
+    for sealed in [0, 1] {
+        let o = run(reordered_dense, sealed, false);
+        assert_eq!(o.get("full"), 0);
+        assert_eq!(o.get("first_large"), 1);
+        assert_eq!(o.get("first_small"), 2);
+        assert_eq!(o.get("last_large"), 439);
+        assert_eq!(o.get("last_small"), 440);
+        assert_eq!(o.get("last_old"), 1);
+    }
+}
+#[test]
+fn production_overflow_promotion_preserves_young_children_and_the_active_old_snapshot() {
+    for (arg, worker) in [(2, false), (3, true)] {
+        let o = run(reordered_dense, arg, worker);
+        for (name, expected) in [
+            ("full", 0),
+            ("last_old", 1),
+            ("child_young", 0),
+            ("old_active", 1),
+            ("child_id", 1),
+            ("full_after", 0),
+            ("old_active_after", 1),
+            ("child_id_after", 1),
+            ("child_old_after", 1),
+            ("unmarked", 0),
+            ("young_unmarked", 0),
+        ] {
+            assert_eq!(o.get(name), expected, "{name}: {}", o.text());
+        }
+        assert!(o.get("remembered") > 0, "{}", o.text());
+    }
+}
+
+fn overflow_bound(g: &mut NativeCodeGenerator, _: u64) {
+    use crate::gc_codegen::production::test_support::legacy_overflow_probe;
+    let mut h = H::begin(g);
+    for (name, bytes, mature, runs, available) in [
+        ("exact", 16 << 20, 0, (1, 0), None),
+        ("rounded", (16 << 20) + 1, 0, (1, 0), None),
+        ("two_tails", 16 << 20, 0, (3, 0), None),
+        ("one_tail", 16 << 20, 0, (5, 3), None),
+        ("mature", 16 << 20, 8 << 20, (1, 0), None),
+        ("fits", 16 << 20, 0, (1, 0), Some((131, PAGE))),
+        ("short", 16 << 20, 0, (1, 0), Some((131, PAGE + 1))),
+    ] {
+        h.report(name, |h| {
+            legacy_overflow_probe(h.g, bytes, mature, runs, available)
+        });
+    }
+}
+#[test]
+fn production_overflow_reserve_rounds_bytes_counts_remaining_run_tails_and_requires_exact_room() {
+    let o = run(overflow_bound, 0, false);
+    for (name, expected) in [
+        ("exact", 130),
+        ("rounded", 131),
+        ("two_tails", 132),
+        ("one_tail", 131),
+        ("mature", 260),
+        ("fits", 0),
+        ("short", 1),
+    ] {
+        assert_eq!(o.get(name), expected, "{name}: {}", o.text());
+    }
+}
