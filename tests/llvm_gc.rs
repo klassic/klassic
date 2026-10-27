@@ -426,7 +426,8 @@ fn c_gc_passes_under_sanitizers() {
         assert_eq!(
             stdout.matches(marker).count(),
             2,
-            "both sanitizer builds must execute {marker}"
+            "both sanitizer builds must execute {marker}\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
