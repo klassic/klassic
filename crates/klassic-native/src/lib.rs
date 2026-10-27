@@ -580,6 +580,29 @@ pub fn compile_source_to_c_generational_with_modules(
         .map_err(|diagnostic| program.sources.error(diagnostic))
 }
 
+/// Emit rooted LLVM IR against the canonical generational runtime adapter.
+#[allow(clippy::result_large_err)]
+pub fn compile_source_to_llvm_generational(
+    name: &str,
+    text: &str,
+    config: GenerationalBackendConfig,
+) -> Result<String, NativeCompileError> {
+    compile_source_to_llvm_generational_with_modules(name, text, &[], config)
+}
+
+/// Emit rooted LLVM IR with explicitly supplied static modules.
+#[allow(clippy::result_large_err)]
+pub fn compile_source_to_llvm_generational_with_modules(
+    name: &str,
+    text: &str,
+    modules: &[GenerationalModuleSource],
+    config: GenerationalBackendConfig,
+) -> Result<String, NativeCompileError> {
+    let program = generational_modules::prepare(name, text, modules)?;
+    llvm::emit_llvm_generational_program(&program.expr, config, &program.sources, &program.names)
+        .map_err(|diagnostic| program.sources.error(diagnostic))
+}
+
 /// Compile Klassic source to a textual LLVM IR module (migration plan
 /// `docs/llvm-backend-plan.md`). Shares the frontend with every other
 /// path; lowering coverage grows milestone by milestone.

@@ -23,6 +23,10 @@
 use klassic_span::{Diagnostic, Span};
 use klassic_syntax::{BinaryOp, Expr, UnaryOp};
 
+#[path = "llvm_generational.rs"]
+mod generational;
+pub(crate) use generational::emit_llvm_generational_program;
+
 fn unsupported(span: Span, feature: &str) -> Diagnostic {
     Diagnostic::compile(
         span,
@@ -34,8 +38,10 @@ fn unsupported(span: Span, feature: &str) -> Diagnostic {
 enum LType {
     I64,
     F64,
+    F32,
     I1,
     Unit,
+    String,
     /// A heap record pointer; the `usize` indexes `Emitter::shapes` for the
     /// field layout. Its LLVM type is an opaque `ptr`.
     Record(usize),
@@ -46,15 +52,16 @@ impl LType {
         match self {
             LType::I64 => "i64",
             LType::F64 => "double",
+            LType::F32 => "float",
             LType::I1 => "i1",
             LType::Unit => "void",
-            LType::Record(_) => "ptr",
+            LType::String | LType::Record(_) => "ptr",
         }
     }
 
     /// A heap pointer whose barriered loads/stores go through the GC.
     fn is_heap(self) -> bool {
-        matches!(self, LType::Record(_))
+        matches!(self, LType::String | LType::Record(_))
     }
 }
 
@@ -64,6 +71,7 @@ fn ltype_from_annotation(text: &str, span: Span) -> Result<LType, Diagnostic> {
         "Double" | "Float" => Ok(LType::F64),
         "Bool" | "Boolean" => Ok(LType::I1),
         "Unit" => Ok(LType::Unit),
+        "String" => Ok(LType::String),
         other => Err(unsupported(span, &format!("type annotation `{other}`"))),
     }
 }
@@ -103,6 +111,18 @@ struct Emitter {
     /// whether to emit GC safepoint polls (only for heap-using programs,
     /// which link the collector); scalar programs get none.
     emit_polls: bool,
+    /// Canonical heap values are stable RootCell pointers, never raw addresses.
+    generational: bool,
+    gen_prologue: String,
+    gen_all_roots: Vec<String>,
+    gen_scope_roots: Vec<Vec<String>>,
+    gen_config: crate::GenerationalBackendConfig,
+    gen_string_globals: String,
+    gen_next_string: u64,
+    gen_next_error: u64,
+    gen_source: Option<crate::generational_modules::Sources>,
+    gen_current_function: Option<String>,
+    gen_function_names: std::collections::HashMap<String, String>,
 }
 
 impl Emitter {
@@ -160,6 +180,7 @@ impl Emitter {
     fn open_scope(&mut self) {
         self.scopes.push(Vec::new());
         self.scope_roots.push(0);
+        self.gen_scope_roots.push(Vec::new());
     }
 
     /// Close a lexical scope, emitting the paired shadow-stack pop for the
@@ -170,6 +191,19 @@ impl Emitter {
         if count > 0 {
             self.emit(&format!("call void @klassic_gc_shadow_pop_n(i64 {count})"));
         }
+        if self.generational {
+            for root in self
+                .gen_scope_roots
+                .pop()
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+            {
+                self.emit(&format!("call void @kg_root_clear(ptr {root})"));
+            }
+        } else {
+            self.gen_scope_roots.pop();
+        }
         self.scopes.pop();
     }
 
@@ -177,6 +211,16 @@ impl Emitter {
     /// the current scope, so a collection during a later allocation updates
     /// it in place.
     fn push_root(&mut self, slot: &str) {
+        if self.generational {
+            let source = self.fresh();
+            self.emit(&format!("{source} = load ptr, ptr {slot}"));
+            let root = self.gen_root();
+            self.emit(&format!(
+                "call void @kg_root_copy(ptr {root}, ptr {source})"
+            ));
+            self.emit(&format!("store ptr {root}, ptr {slot}"));
+            return;
+        }
         self.emit(&format!("call void @klassic_gc_shadow_push(ptr {slot})"));
         if let Some(count) = self.scope_roots.last_mut() {
             *count += 1;
@@ -196,6 +240,10 @@ impl Emitter {
     /// to scan this thread's roots and ack. On the hot path this is a single
     /// load + not-taken branch. No-op for scalar programs (no collector).
     fn emit_poll(&mut self) {
+        if self.generational {
+            self.emit("call void @kg_poll()");
+            return;
+        }
         if !self.emit_polls {
             return;
         }
@@ -235,15 +283,30 @@ impl Emitter {
                 operand: value.to_string(),
                 ty: LType::I64,
             }),
+            Expr::Double {
+                value,
+                kind: klassic_syntax::FloatLiteralKind::Float,
+                ..
+            } if self.generational => Ok(Value {
+                // LLVM float constants use an exactly representable hexadecimal
+                // double spelling of the already rounded Float32 value.
+                operand: format!("0x{:016X}", ((*value as f32) as f64).to_bits()),
+                ty: LType::F32,
+            }),
             Expr::Double { value, .. } => Ok(Value {
                 // Exact bit pattern -- LLVM accepts a hex double literal.
                 operand: format!("0x{:016X}", value.to_bits()),
                 ty: LType::F64,
             }),
+            Expr::Unit { .. } if self.generational => Ok(Value {
+                operand: String::new(),
+                ty: LType::Unit,
+            }),
             Expr::Bool { value, .. } => Ok(Value {
                 operand: if *value { "true" } else { "false" }.to_owned(),
                 ty: LType::I1,
             }),
+            Expr::String { value, .. } if self.generational => Ok(self.gen_string(value)),
             Expr::Identifier { name, span } => {
                 let (ptr, ty) = self
                     .lookup(name)
@@ -255,21 +318,30 @@ impl Emitter {
             Expr::Unary { op, expr, span } => {
                 let value = self.expr(expr)?;
                 match (op, value.ty) {
-                    (UnaryOp::Plus, LType::I64 | LType::F64) => Ok(value),
+                    (UnaryOp::Plus, LType::I64 | LType::F64 | LType::F32) => Ok(value),
                     (UnaryOp::Minus, LType::I64) => {
                         let temp = self.fresh();
-                        self.emit(&format!("{temp} = sub i64 0, {}", value.operand));
+                        if self.generational {
+                            let (prefix, length) = self.gen_error_prefix(*span);
+                            self.emit(&format!("{temp} = call i64 @kg_i64_neg_at(i64 {}, ptr {prefix}, i64 {length})",value.operand));
+                        } else {
+                            self.emit(&format!("{temp} = sub i64 0, {}", value.operand));
+                        }
                         Ok(Value {
                             operand: temp,
                             ty: LType::I64,
                         })
                     }
-                    (UnaryOp::Minus, LType::F64) => {
+                    (UnaryOp::Minus, LType::F64 | LType::F32) => {
                         let temp = self.fresh();
-                        self.emit(&format!("{temp} = fneg double {}", value.operand));
+                        self.emit(&format!(
+                            "{temp} = fneg {} {}",
+                            value.ty.llvm(),
+                            value.operand
+                        ));
                         Ok(Value {
                             operand: temp,
-                            ty: LType::F64,
+                            ty: value.ty,
                         })
                     }
                     (UnaryOp::Not, LType::I1) => {
@@ -305,9 +377,23 @@ impl Emitter {
                 for statement in leading {
                     self.statement(statement)?;
                 }
-                let value = self.expr(last)?;
+                let mut value = self.expr(last)?;
+                if self.generational && value.ty.is_heap() {
+                    value = self.gen_escape(value);
+                }
                 self.close_scope();
                 Ok(value)
+            }
+            Expr::Call { callee, .. }
+                if self.generational
+                    && matches!(callee.as_ref(),Expr::Identifier{name,..} if name=="println")
+                    && !self.functions.iter().any(|f| f.name == "println") =>
+            {
+                self.statement(expr)?;
+                Ok(Value {
+                    operand: String::new(),
+                    ty: LType::Unit,
+                })
             }
             Expr::Call {
                 callee,
@@ -332,6 +418,25 @@ impl Emitter {
                 "a call whose callee is not a plain function name",
             ));
         };
+        if self.generational
+            && name == "length"
+            && arguments.len() == 1
+            && !self.functions.iter().any(|f| f.name == *name)
+        {
+            let value = self.expr(&arguments[0])?;
+            if value.ty != LType::String {
+                return Err(unsupported(span, "length of this type"));
+            }
+            let out = self.fresh();
+            self.emit(&format!(
+                "{out} = call i64 @kg_string_length(ptr {})",
+                value.operand
+            ));
+            return Ok(Value {
+                operand: out,
+                ty: LType::I64,
+            });
+        }
         // Copy the signature so args can be lowered (borrows &mut self).
         let Some((params, ret)) = self
             .functions
@@ -353,11 +458,26 @@ impl Emitter {
         }
         let mut argument_operands = Vec::with_capacity(arguments.len());
         for (argument, (_, param_ty)) in arguments.iter().zip(params.iter()) {
-            let value = self.expr(argument)?;
+            let mut value = self.expr(argument)?;
+            if self.generational && value.ty.is_heap() {
+                value = self.gen_snapshot(value);
+            }
             if value.ty != *param_ty {
                 return Err(unsupported(span, &format!("argument type to `{name}`")));
             }
             argument_operands.push(format!("{} {}", param_ty.llvm(), value.operand));
+        }
+        if self.generational && ret.is_heap() {
+            let out = self.gen_root();
+            argument_operands.push(format!("ptr {out}"));
+            self.emit(&format!(
+                "call void @klassic_{name}({})",
+                argument_operands.join(", ")
+            ));
+            return Ok(Value {
+                operand: out,
+                ty: ret,
+            });
         }
         let call = format!("@klassic_{name}({})", argument_operands.join(", "));
         if ret == LType::Unit {
@@ -383,10 +503,50 @@ impl Emitter {
         rhs: &Expr,
         span: Span,
     ) -> Result<Value, Diagnostic> {
-        let left = self.expr(lhs)?;
-        let right = self.expr(rhs)?;
+        if self.generational && matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
+            return self.gen_logical(lhs, op, rhs, span);
+        }
+        let mut left = self.expr(lhs)?;
+        if self.generational && left.ty.is_heap() {
+            left = self.gen_snapshot(left);
+        }
+        let mut right = self.expr(rhs)?;
+        if self.generational
+            && left.ty != right.ty
+            && matches!(left.ty, LType::I64 | LType::F32 | LType::F64)
+            && matches!(right.ty, LType::I64 | LType::F32 | LType::F64)
+        {
+            let promoted = if left.ty == LType::F64 || right.ty == LType::F64 {
+                LType::F64
+            } else {
+                LType::F32
+            };
+            left = self.gen_promote_numeric(left, promoted);
+            right = self.gen_promote_numeric(right, promoted);
+        }
+        if self.generational && left.ty == LType::String && right.ty == LType::String {
+            return self.gen_string_binary(left, op, right, span);
+        }
         if left.ty != right.ty {
             return Err(unsupported(span, "a binary operator on mixed types"));
+        }
+        if self.generational && left.ty == LType::I64 {
+            let helper = match op {
+                BinaryOp::Add => Some("add"),
+                BinaryOp::Subtract => Some("sub"),
+                BinaryOp::Multiply => Some("mul"),
+                BinaryOp::Divide => Some("div"),
+                _ => None,
+            };
+            if let Some(helper) = helper {
+                let result = self.fresh();
+                let (prefix, length) = self.gen_error_prefix(span);
+                self.emit(&format!("{result} = call i64 @kg_i64_{helper}_at(i64 {}, i64 {}, ptr {prefix}, i64 {length})",left.operand,right.operand));
+                return Ok(Value {
+                    operand: result,
+                    ty: LType::I64,
+                });
+            }
         }
         let temp = self.fresh();
         // Arithmetic keeps the operand type; comparisons yield i1; logical
@@ -396,6 +556,16 @@ impl Emitter {
             (BinaryOp::Subtract, LType::I64) => ("sub i64", LType::I64),
             (BinaryOp::Multiply, LType::I64) => ("mul i64", LType::I64),
             (BinaryOp::Divide, LType::I64) => ("sdiv i64", LType::I64),
+            (BinaryOp::Add, LType::F32) => ("fadd float", LType::F32),
+            (BinaryOp::Subtract, LType::F32) => ("fsub float", LType::F32),
+            (BinaryOp::Multiply, LType::F32) => ("fmul float", LType::F32),
+            (BinaryOp::Divide, LType::F32) => ("fdiv float", LType::F32),
+            (BinaryOp::Less, LType::F32) => ("fcmp olt float", LType::I1),
+            (BinaryOp::LessEqual, LType::F32) => ("fcmp ole float", LType::I1),
+            (BinaryOp::Greater, LType::F32) => ("fcmp ogt float", LType::I1),
+            (BinaryOp::GreaterEqual, LType::F32) => ("fcmp oge float", LType::I1),
+            (BinaryOp::Equal, LType::F32) => ("fcmp oeq float", LType::I1),
+            (BinaryOp::NotEqual, LType::F32) => ("fcmp une float", LType::I1),
             (BinaryOp::Add, LType::F64) => ("fadd double", LType::F64),
             (BinaryOp::Subtract, LType::F64) => ("fsub double", LType::F64),
             (BinaryOp::Multiply, LType::F64) => ("fmul double", LType::F64),
@@ -411,7 +581,7 @@ impl Emitter {
             (BinaryOp::Greater, LType::F64) => ("fcmp ogt double", LType::I1),
             (BinaryOp::GreaterEqual, LType::F64) => ("fcmp oge double", LType::I1),
             (BinaryOp::Equal, LType::F64) => ("fcmp oeq double", LType::I1),
-            (BinaryOp::NotEqual, LType::F64) => ("fcmp one double", LType::I1),
+            (BinaryOp::NotEqual, LType::F64) => ("fcmp une double", LType::I1),
             (BinaryOp::Equal, LType::I1) => ("icmp eq i1", LType::I1),
             (BinaryOp::NotEqual, LType::I1) => ("icmp ne i1", LType::I1),
             (BinaryOp::LogicalAnd, LType::I1) => ("and i1", LType::I1),
@@ -494,6 +664,9 @@ impl Emitter {
         fields: &[(String, Expr)],
         span: Span,
     ) -> Result<Value, Diagnostic> {
+        if self.generational {
+            return self.gen_record_literal(fields, span);
+        }
         if fields.is_empty() {
             return Err(unsupported(span, "an empty record"));
         }
@@ -507,7 +680,7 @@ impl Emitter {
                 "{leaf} = call ptr @klassic_gc_alloc(i64 8, i64 1)"
             ));
             match value.ty {
-                LType::I64 | LType::F64 => self.emit(&format!(
+                LType::I64 | LType::F64 | LType::F32 => self.emit(&format!(
                     "store {} {}, ptr {leaf}",
                     value.ty.llvm(),
                     value.operand
@@ -520,7 +693,7 @@ impl Emitter {
                 LType::Unit => {
                     return Err(unsupported(value_expr.span(), "a unit record field"));
                 }
-                LType::Record(_) => {
+                LType::String | LType::Record(_) => {
                     return Err(unsupported(
                         value_expr.span(),
                         "a record field that is itself a heap value",
@@ -583,6 +756,9 @@ impl Emitter {
         field: &str,
         span: Span,
     ) -> Result<Value, Diagnostic> {
+        if self.generational {
+            return self.gen_field_access(target, field, span);
+        }
         let target_value = self.expr(target)?;
         let LType::Record(shape_id) = target_value.ty else {
             return Err(unsupported(span, "a field access on a non-record value"));
@@ -614,12 +790,13 @@ impl Emitter {
         match field_ty {
             LType::I64 => self.emit(&format!("{result} = load i64, ptr {raw_ptr}")),
             LType::F64 => self.emit(&format!("{result} = load double, ptr {raw_ptr}")),
+            LType::F32 => self.emit(&format!("{result} = load float, ptr {raw_ptr}")),
             LType::I1 => {
                 let widened = self.fresh();
                 self.emit(&format!("{widened} = load i64, ptr {raw_ptr}"));
                 self.emit(&format!("{result} = trunc i64 {widened} to i1"));
             }
-            LType::Unit | LType::Record(_) => {
+            LType::Unit | LType::String | LType::Record(_) => {
                 return Err(unsupported(span, "a field of an unsupported type"));
             }
         }
@@ -678,8 +855,13 @@ impl Emitter {
                 self.close_scope();
                 Ok(())
             }
-            Expr::VarDecl { name, value, .. } => {
+            Expr::VarDecl {
+                name, value, span, ..
+            } => {
                 let value = self.expr(value)?;
+                if self.generational && value.ty == LType::Unit {
+                    return Err(unsupported(*span, "a Unit local binding"));
+                }
                 let ptr = self.declare_local(name, value.ty);
                 if value.ty != LType::Unit {
                     self.emit(&format!(
@@ -703,11 +885,20 @@ impl Emitter {
                 if value.ty != expected {
                     return Err(unsupported(*span, "assignment changing a type"));
                 }
-                self.emit(&format!(
-                    "store {} {}, ptr {ptr}",
-                    value.ty.llvm(),
-                    value.operand
-                ));
+                if self.generational && expected.is_heap() {
+                    let destination = self.fresh();
+                    self.emit(&format!("{destination} = load ptr, ptr {ptr}"));
+                    self.emit(&format!(
+                        "call void @kg_root_copy(ptr {destination}, ptr {})",
+                        value.operand
+                    ));
+                } else {
+                    self.emit(&format!(
+                        "store {} {}, ptr {ptr}",
+                        value.ty.llvm(),
+                        value.operand
+                    ));
+                }
                 Ok(())
             }
             Expr::While {
@@ -769,7 +960,9 @@ impl Emitter {
             }
             Expr::Call {
                 callee, arguments, ..
-            } if matches!(callee.as_ref(), Expr::Identifier { name, .. } if name == "println") => {
+            } if matches!(callee.as_ref(), Expr::Identifier { name, .. } if name == "println")
+                && (!self.generational || !self.functions.iter().any(|f| f.name == "println")) =>
+            {
                 if arguments.len() != 1 {
                     return Err(Diagnostic::compile(
                         expr.span(),
@@ -777,6 +970,9 @@ impl Emitter {
                     ));
                 }
                 let value = self.expr(&arguments[0])?;
+                if self.generational && value.ty != LType::String {
+                    self.emit("call void @kg_native_enter()");
+                }
                 match value.ty {
                     LType::I64 => self.emit(&format!(
                         "call void @klassic_rt_println_i64(i64 {})",
@@ -786,6 +982,10 @@ impl Emitter {
                         "call void @klassic_rt_println_f64(double {})",
                         value.operand
                     )),
+                    LType::F32 => self.emit(&format!(
+                        "call void @klassic_rt_println_f32(float {})",
+                        value.operand
+                    )),
                     LType::I1 => {
                         let widened = self.fresh();
                         self.emit(&format!("{widened} = zext i1 {} to i64", value.operand));
@@ -793,12 +993,26 @@ impl Emitter {
                             "call void @klassic_rt_println_bool(i64 {widened})"
                         ));
                     }
+                    LType::String => self.emit(&format!(
+                        "call void @kg_string_println(ptr {})",
+                        value.operand
+                    )),
                     LType::Unit => return Err(unsupported(expr.span(), "printing unit")),
                     LType::Record(_) => {
                         return Err(unsupported(expr.span(), "printing a record"));
                     }
                 }
+                if self.generational && value.ty != LType::String {
+                    self.emit("call void @kg_native_exit()");
+                }
                 Ok(())
+            }
+            Expr::DefDecl { span, .. } if self.generational => Err(unsupported(
+                *span,
+                "a nested function definition in canonical mode",
+            )),
+            Expr::ModuleHeader { span, .. } | Expr::Import { span, .. } if self.generational => {
+                Err(unsupported(*span, "modules and imports in canonical mode"))
             }
             Expr::ModuleHeader { .. } | Expr::Import { .. } | Expr::DefDecl { .. } => Ok(()),
             other => {
@@ -832,15 +1046,39 @@ fn collect_functions(expr: &Expr, emitter: &mut Emitter) -> Result<(), Diagnosti
             let Some(annotation) = annotation else {
                 return Err(unsupported(*span, "an unannotated function parameter"));
             };
-            lowered.push((
-                param.clone(),
-                ltype_from_annotation(&annotation.text, *span)?,
-            ));
+            let ty = if emitter.generational && annotation.text.trim() == "Float" {
+                LType::F32
+            } else {
+                ltype_from_annotation(&annotation.text, *span)?
+            };
+            if !emitter.generational && ty == LType::String {
+                return Err(unsupported(
+                    *span,
+                    "a String function parameter in legacy LLVM mode",
+                ));
+            }
+            if emitter.generational && ty == LType::Unit {
+                return Err(unsupported(
+                    *span,
+                    "a Unit function parameter in canonical mode",
+                ));
+            }
+            lowered.push((param.clone(), ty));
         }
         let Some(return_annotation) = return_annotation else {
             return Err(unsupported(*span, "a function without a return annotation"));
         };
-        let ret = ltype_from_annotation(&return_annotation.text, *span)?;
+        let ret = if emitter.generational && return_annotation.text.trim() == "Float" {
+            LType::F32
+        } else {
+            ltype_from_annotation(&return_annotation.text, *span)?
+        };
+        if !emitter.generational && ret == LType::String {
+            return Err(unsupported(
+                *span,
+                "a String function return in legacy LLVM mode",
+            ));
+        }
         emitter.functions.push(Function {
             name: name.clone(),
             params: lowered,
@@ -873,6 +1111,14 @@ fn emit_functions_and_main(emitter: &mut Emitter, expr: &Expr) -> Result<String,
         emitter.next_label = 0;
         emitter.scopes.clear();
         emitter.scope_roots.clear();
+        emitter.gen_reset();
+        emitter.gen_current_function = Some(
+            emitter
+                .gen_function_names
+                .get(&name)
+                .unwrap_or(&name)
+                .clone(),
+        );
         emitter.open_scope();
         emitter.current_block = "entry".to_owned();
         let mut param_sig = Vec::with_capacity(params.len());
@@ -881,10 +1127,22 @@ fn emit_functions_and_main(emitter: &mut Emitter, expr: &Expr) -> Result<String,
             param_sig.push(format!("{} {incoming}", ty.llvm()));
             let ptr = emitter.declare_local(param, *ty);
             if *ty != LType::Unit {
-                emitter
-                    .body
-                    .push_str(&format!("  store {} {incoming}, ptr {ptr}\n", ty.llvm()));
+                if emitter.generational && ty.is_heap() {
+                    let owned = emitter.gen_root();
+                    emitter.emit(&format!(
+                        "call void @kg_root_copy(ptr {owned}, ptr {incoming})"
+                    ));
+                    emitter.emit(&format!("store ptr {owned}, ptr {ptr}"));
+                } else {
+                    emitter
+                        .body
+                        .push_str(&format!("  store {} {incoming}, ptr {ptr}\n", ty.llvm()));
+                }
             }
+        }
+        let managed_return = emitter.generational && ret.is_heap();
+        if managed_return {
+            param_sig.push("ptr %kg_return_out".into());
         }
         emitter.emit_poll(); // safepoint at function entry
         let value = emitter.expr(&body)?;
@@ -894,16 +1152,24 @@ fn emit_functions_and_main(emitter: &mut Emitter, expr: &Expr) -> Result<String,
                 "a function body of a different type than its return annotation",
             ));
         }
+        if managed_return {
+            emitter.emit(&format!(
+                "call void @kg_root_copy(ptr %kg_return_out, ptr {})",
+                value.operand
+            ));
+        }
         emitter.close_scope();
+        emitter.gen_release_frame();
         let mangled = format!("klassic_{name}");
         code.push_str(&format!(
             "define {} @{mangled}({}) {{\nentry:\n",
-            ret.llvm(),
+            if managed_return { "void" } else { ret.llvm() },
             param_sig.join(", ")
         ));
         code.push_str(&emitter.allocas);
+        code.push_str(&emitter.gen_prologue);
         code.push_str(&emitter.body);
-        if ret == LType::Unit {
+        if ret == LType::Unit || managed_return {
             code.push_str("  ret void\n");
         } else {
             code.push_str(&format!("  ret {} {}\n", ret.llvm(), value.operand));
@@ -918,6 +1184,7 @@ fn emit_functions_and_main(emitter: &mut Emitter, expr: &Expr) -> Result<String,
     emitter.next_label = 0;
     emitter.scopes.clear();
     emitter.scope_roots.clear();
+    emitter.gen_reset();
     emitter.open_scope();
     emitter.current_block = "entry".to_owned();
     emitter.emit_poll(); // safepoint at program entry
@@ -926,11 +1193,31 @@ fn emit_functions_and_main(emitter: &mut Emitter, expr: &Expr) -> Result<String,
         other => vec![other],
     };
     for statement in statements {
-        emitter.statement(statement)?;
+        if !emitter.generational || !matches!(statement, Expr::DefDecl { .. }) {
+            emitter.statement(statement)?;
+        }
     }
     emitter.close_scope();
+    emitter.gen_release_frame();
+    if emitter.generational {
+        emitter.emit("call void @kg_shutdown()");
+    }
     code.push_str("define i32 @main() {\nentry:\n");
     code.push_str(&emitter.allocas);
+    if emitter.generational {
+        let c = emitter.gen_config;
+        code.push_str(&format!(
+            "  call void @kg_configure(i64 {}, i64 {}, i64 {}, i64 {})\n",
+            c.hard_max, c.min_heap, c.soft_max, c.flags
+        ));
+        if let Some(ns) = c.uncommit_delay_ns {
+            code.push_str(&format!(
+                "  call void @kg_configure_uncommit_delay(i64 {ns})\n"
+            ));
+        }
+        code.push_str("  call void @kg_init()\n");
+    }
+    code.push_str(&emitter.gen_prologue);
     code.push_str(&emitter.body);
     code.push_str("  ret i32 0\n}\n");
     Ok(code)
