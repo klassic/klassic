@@ -57,3 +57,16 @@ Standard arithmetic operators (`+`, `-`, `*`, `/`), comparison
 val ok = (1 + 2) * 3 == 9 && true
 println(ok)   // true
 ```
+
+Comparing two `Int` values uses their exact signed 64-bit values, including
+adjacent numbers above 2^53 and at either limit. For example:
+
+```kl
+val high = 9223372036854775807
+println(high > high - 1)  // true
+```
+
+The evaluator previously converted both integers to `Double` for ordering,
+which incorrectly printed `false` for this example. Integer ordering now agrees
+with the native, C and LLVM backends. Comparisons involving floating values
+retain their numeric promotions and floating-point rounding.

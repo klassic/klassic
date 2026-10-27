@@ -269,6 +269,25 @@ pub fn clear_user_extension_methods() {
     USER_EXTENSION_METHODS.with(|registry| registry.borrow_mut().clear());
 }
 
+mod isolated;
+/// Check one standalone translation unit with only builtins, restoring the
+/// caller's REPL/module registries on success, error or unwind.
+pub fn typecheck_program_isolated(expr: &Expr) -> Result<(), Diagnostic> {
+    let _scope = isolated::UserTypesGuard::enter();
+    typecheck_program(expr)
+}
+
+/// Check an ordered static module bundle with one temporary registry. Module
+/// exports are visible to later units; the caller's session is restored even
+/// when a later unit fails or checking unwinds.
+pub fn typecheck_programs_isolated(exprs: &[&Expr]) -> Result<(), (usize, Diagnostic)> {
+    let _scope = isolated::UserTypesGuard::enter();
+    for (index, expr) in exprs.iter().enumerate() {
+        typecheck_program(expr).map_err(|error| (index, error))?;
+    }
+    Ok(())
+}
+
 pub fn typecheck_program(expr: &Expr) -> Result<(), Diagnostic> {
     typecheck_program_with_bindings(expr, std::iter::empty::<(String, KnownType)>())
 }
