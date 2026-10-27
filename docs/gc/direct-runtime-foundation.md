@@ -25,8 +25,9 @@ existing stress option and module diagnostics are preserved.
 - #676: a loaded two-owner ordinary moving-cycle run previously reported an
   invariant failure. Its original executable was not retained. Later passing
   runs do not identify the cause and do not close this issue.
-- #677: per-mutator remembered-buffer sealing across movement is unfinished.
-  The separate G07 buffer patch is excluded from this foundation.
+- #677: the follow-up [remembered-buffer sealing](direct-remset-sealing.md)
+  implementation adds bounded owner transport and phase admission checks.
+  This does not complete the independent concurrent relocation contract.
 - #678 through #682 retain concurrent marking/relocation lifetime, pressure,
   native/weak/thread completion, platform parity and acceptance work.
 - The full G01-G15 contract remains incomplete. Pause bounds and real-hardware

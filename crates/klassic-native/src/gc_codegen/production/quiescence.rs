@@ -82,6 +82,7 @@ fn prepare_private<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     copy_claims::private_closed(a, l);
     moving_round::admission::refund(a, l);
     a.call_label(l.publish_pending);
+    super::remset_buffer::flush(a, l, true);
     for f in [
         RT_COLLECTING,
         RT_CTX + offset_of!(MutatorContext, private_producers),

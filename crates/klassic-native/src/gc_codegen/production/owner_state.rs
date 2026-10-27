@@ -79,6 +79,7 @@ pub(super) struct OwnerState {
     pub(super) moving_round: moving_round::Owner,
     pub(super) lease_transfer: super::metadata_leases::Owner,
     pub(super) weak: super::weak::Owner,
+    pub(super) remset_buffer: super::remset_buffer::Owner,
     pub(super) native_roots: super::native_roots::Owner,
     pub(super) pin_destination: super::pin_destination::Owner,
     pub(super) pin_adopt: super::pin_adopt::Owner,

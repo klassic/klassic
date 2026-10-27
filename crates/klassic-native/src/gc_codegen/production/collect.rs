@@ -39,6 +39,7 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     // collect: V3 = runtime. Clobbers the caller-saved registers; the
     // interrupted allocation's size and element count are restored.
     a.bind_text_label(l.collect);
+    super::remset_buffer::flush(a, l, false);
     let legacy = a.create_text_label();
     load_rt(a, R::V0, super::moving_round::ENABLED);
     a.test_reg_reg(R::V0, R::V0);
@@ -82,6 +83,10 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     // Young-only moves preserve the active Old snapshot; full Old moves
     // must close it before changing Old physical addresses.
     super::mark_frontier::before_flip(a, l);
+    // The same collector ticket excludes admissions while the rendezvous
+    // keeps acknowledged peers parked. Check before any physical bank or
+    // source-run mutation, not merely before the remembered bitmap flip.
+    super::remset_buffer::require_empty(a, l);
     clear_scratch(a, l);
     // Close the allocating page: it belongs to the space being evacuated.
     let closed = a.create_text_label();
@@ -145,6 +150,7 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     // both sets are discarded. Destinations require clean free pages; the
     // detached source bitmap is cleared during retirement. New
     // stores into moved Old objects can register while cleanup runs.
+    super::remset_buffer::require_empty(a, l);
     a.mov_imm64(R::V0, 0);
     store_rt(a, super::RT_REMSET_LEN, R::V0);
     store_rt(a, super::RT_REMSET_PREV_LEN, R::V0);
@@ -155,7 +161,7 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     a.jmp_label(decided);
     a.bind_text_label(young_only);
     // G07: the current remembered set becomes the previous one.
-    super::remset::emit_flip(a);
+    super::remset::emit_flip(a, l);
     a.mov_imm64(R::V0, 0);
     store_rt(a, super::RT_FULL, R::V0);
     a.bind_text_label(decided);

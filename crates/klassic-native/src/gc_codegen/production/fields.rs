@@ -280,7 +280,20 @@ fn emit_store<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::D
     a.jcc_label(C::NotEqual, publish);
     a.mov_reg_reg(R::V2, R::V6);
     super::enums::young_offset(a, R::V2, R::V0, publish);
-    super::remset::remember(a, l, R::V7, R::V1, R::V2);
+    if l.worker.is_some() {
+        let immediate = a.create_text_label();
+        let remembered = a.create_text_label();
+        load_rt(a, R::V0, super::cooperative_old::ENABLED);
+        a.test_reg_reg(R::V0, R::V0);
+        a.jcc_label(C::Equal, immediate);
+        a.call_label(l.remset_buffer_record);
+        a.jmp_label(remembered);
+        a.bind_text_label(immediate);
+        super::remset::remember(a, l, R::V7, R::V1, R::V2);
+        a.bind_text_label(remembered);
+    } else {
+        super::remset::remember(a, l, R::V7, R::V1, R::V2);
+    }
     a.bind_text_label(publish);
     a.mov_reg_reg(R::V0, R::V6);
     super::enums::heap_offset(a, R::V0, R::V2, raw);

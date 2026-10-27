@@ -440,8 +440,15 @@ pub(super) fn run_with_stress(
     worker_thread: bool,
     stress: bool,
 ) -> Observed {
-    let (output, _) =
-        execute_with_image_retention(body, arg, worker_thread, stress, None, None, true);
+    let (output, _) = execute_with_image_retention(
+        body,
+        arg,
+        worker_thread,
+        stress,
+        None,
+        None,
+        ImageRetention::Failure,
+    );
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     if std::env::var_os("KLASSIC_HARNESS_DUMP").is_some() {
         eprintln!("--- harness output ---\n{text}");
@@ -502,9 +509,15 @@ fn execute_with_heap_limits(
         stress,
         soft_limit,
         hard_limit,
-        false,
+        ImageRetention::None,
     )
     .0
+}
+
+enum ImageRetention {
+    None,
+    Failure,
+    Always,
 }
 
 fn execute_with_image_retention(
@@ -514,7 +527,7 @@ fn execute_with_image_retention(
     stress: bool,
     soft_limit: Option<u64>,
     hard_limit: Option<u64>,
-    retain_failure: bool,
+    retention: ImageRetention,
 ) -> (Output, Option<std::path::PathBuf>) {
     let target = NativeTargetContext::for_target(NativeTarget::LinuxX86_64);
     let source = SourceFile::new("<gc-harness>", "1");
@@ -586,8 +599,12 @@ fn execute_with_image_retention(
         )
         .expect("export harness executable by argument");
     }
-    let retained = if retain_failure && !output.status.success() {
-        eprintln!("failed harness executable retained: {}", path.display());
+    let retained = if matches!(retention, ImageRetention::Always)
+        || (matches!(retention, ImageRetention::Failure) && !output.status.success())
+    {
+        if !output.status.success() {
+            eprintln!("failed harness executable retained: {}", path.display());
+        }
         Some(path)
     } else {
         let _ = std::fs::remove_file(&path);
@@ -603,7 +620,8 @@ fn unexpected_runtime_failure_retains_the_actual_generated_executable() {
         h.g.mov_imm64(R::V0, 0); // An actual null RootCell handle is invalid.
         h.g.call_label(h.l.root_load);
     }
-    let (output, retained) = execute_with_image_retention(fail, 0, false, false, None, None, true);
+    let (output, retained) =
+        execute_with_image_retention(fail, 0, false, false, None, None, ImageRetention::Failure);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("runtime invariant violated"));
     let path = retained.expect("unexpected runtime failure preserves its executable");
@@ -615,7 +633,7 @@ fn unexpected_runtime_failure_retains_the_actual_generated_executable() {
     std::fs::remove_file(path).expect("remove this intentional test artifact after replay");
 
     let (expected, retained) =
-        execute_with_image_retention(fail, 0, false, false, None, None, false);
+        execute_with_image_retention(fail, 0, false, false, None, None, ImageRetention::None);
     assert!(!expected.status.success());
     assert!(
         retained.is_none(),
@@ -762,3 +780,6 @@ mod thread_api_c;
 
 mod lease_growth;
 mod weak_growth;
+
+mod remset_buffer;
+mod remset_sealing;

@@ -987,3 +987,10 @@ pub(crate) use thread_api_probe::*;
 #[path = "test_support_spill_audit.rs"]
 mod spill_audit;
 pub(crate) use spill_audit::*;
+
+#[path = "test_support_remset_buffer.rs"]
+mod remset_buffer_support;
+pub(crate) use remset_buffer_support::*;
+#[path = "test_support_remset_sealing.rs"]
+mod remset_sealing_support;
+pub(crate) use remset_sealing_support::*;

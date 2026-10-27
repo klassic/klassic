@@ -81,7 +81,7 @@ pub(crate) fn generation_destination<E: PortableAsm>(a: &mut E, old_delta: Optio
 pub(crate) fn generation_remembered_retention(g: &mut crate::NativeCodeGenerator) {
     let runtime = g.gc_gen.take().expect("generational runtime");
     worker::lock(g, &runtime.labels);
-    remset::emit_flip(g);
+    remset::emit_flip(g, &runtime.labels);
     super::emit_unbounded_budget(g);
     let paused = g.create_text_label();
     remset::scan(g, &runtime.labels, runtime.labels.forward, paused);
