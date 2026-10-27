@@ -13,17 +13,36 @@ const GC_CLONE_FLAGS: u64 = 0x003d_0f00;
 /// with room for bootstrap words and call frames; caller supplies guard pages.
 #[allow(dead_code)]
 pub(crate) fn emit_linux_worker_start(out: &mut NativeCodeGenerator) {
-    emit_start(out, GC_CLONE_FLAGS);
+    emit_start(out, GC_CLONE_FLAGS, None);
 }
 
-fn emit_start(out: &mut NativeCodeGenerator, flags: u64) {
+/// Runtime-owned launch with a fresh GS association, independent of the
+/// creator's association lifetime. Sixth argument: retained native status word
+/// (0 pending, 1 ready, negative OS error). The callback runs only after ready.
+/// Parent must join even after bootstrap failure before releasing storage.
+pub(crate) fn emit_linux_owned_thread_start(out: &mut NativeCodeGenerator) {
+    emit_start(out, GC_CLONE_FLAGS, Some(0x1001)); // ARCH_SET_GS
+}
+
+#[cfg(test)]
+pub(crate) fn emit_linux_owned_thread_start_failure(out: &mut NativeCodeGenerator) {
+    emit_start(out, GC_CLONE_FLAGS, Some(u64::MAX));
+}
+
+fn emit_start(out: &mut NativeCodeGenerator, flags: u64, gs_operation: Option<u64>) {
     let a = &mut out.asm;
     let parent = a.create_text_label();
     // The new stack contains the entry and rooted worker context. Parent and
     // child return from clone on different stacks; no Rust/C frame is copied.
-    a.sub_reg_imm32(Reg::Rdi, 16);
+    let words = if gs_operation.is_some() { 32 } else { 16 };
+    a.sub_reg_imm32(Reg::Rdi, words);
     a.store_ptr_disp32(Reg::Rdi, 0, Reg::Rdx);
     a.store_ptr_disp32(Reg::Rdi, 8, Reg::Rcx);
+    if gs_operation.is_some() {
+        a.store_ptr_disp32(Reg::Rdi, 16, Reg::R9);
+        a.mov_imm64(Reg::Rax, 0);
+        a.store_ptr_disp32(Reg::R9, 0, Reg::Rax);
+    }
     a.mov_reg_reg(Reg::R9, Reg::Rsi);
     a.mov_reg_reg(Reg::Rsi, Reg::Rdi);
     a.mov_reg_reg(Reg::Rdx, Reg::R8); // parent_tid
@@ -34,9 +53,31 @@ fn emit_start(out: &mut NativeCodeGenerator, flags: u64) {
     a.syscall();
     a.cmp_reg_imm8(Reg::Rax, 0);
     a.jcc_label(Condition::NotEqual, parent); // error also returns here
+    let exit = a.create_text_label();
+    if let Some(operation) = gs_operation {
+        // No inherited GS pointer is read, authenticated or dereferenced.
+        // This runtime owns the new OS thread and its complete entry contract.
+        a.mov_imm64(Reg::Rdi, operation);
+        a.mov_imm64(Reg::Rsi, 0);
+        a.mov_imm64(Reg::Rax, 158); // arch_prctl
+        a.syscall();
+        a.load_ptr_disp32(Reg::Rdx, Reg::Rsp, 16);
+        let ready = a.create_text_label();
+        a.test_reg_reg(Reg::Rax, Reg::Rax);
+        a.jcc_label(Condition::Equal, ready);
+        a.store_ptr_disp32(Reg::Rdx, 0, Reg::Rax); // release on x86 TSO
+        a.jmp_label(exit);
+        a.bind_text_label(ready);
+        a.mov_imm64(Reg::Rax, 1);
+        a.store_ptr_disp32(Reg::Rdx, 0, Reg::Rax);
+    }
     a.pop_reg(Reg::Rax); // entry
     a.pop_reg(Reg::Rdi); // context, stack is again 16-byte aligned before call
+    if gs_operation.is_some() {
+        a.add_reg_imm32(Reg::Rsp, 16);
+    }
     a.call_reg(Reg::Rax);
+    a.bind_text_label(exit);
     a.mov_imm64(Reg::Rdi, 0);
     a.mov_imm64(Reg::Rax, 60); // exit THIS thread, never exit_group
     a.syscall();
@@ -77,6 +118,20 @@ pub(crate) fn emit_linux_worker_join(out: &mut NativeCodeGenerator) {
 #[allow(dead_code)]
 pub(crate) fn emit_linux_thread_context(out: &mut NativeCodeGenerator, dst: Reg) {
     out.asm.load_fs_u64(dst, 8);
+}
+
+/// After actual detach, before releasing context backing: clear this runtime's
+/// real custom TLS slot and the emitted owner's R12 binding. No libc/TLS call.
+#[allow(dead_code)]
+pub(crate) fn emit_linux_thread_unbind(out: &mut NativeCodeGenerator) {
+    out.asm.push_reg(Reg::Rax);
+    out.asm.push_reg(Reg::Rdx);
+    out.asm.load_fs_u64(Reg::Rdx, 0);
+    out.asm.mov_imm64(Reg::Rax, 0);
+    out.asm.store_ptr_disp32(Reg::Rdx, 8, Reg::Rax);
+    out.asm.mov_imm64(Reg::R12, 0);
+    out.asm.pop_reg(Reg::Rdx);
+    out.asm.pop_reg(Reg::Rax);
 }
 
 /// `(usable_bytes) -> mapping_base_or_negative_errno`. Linux x86-64 base pages
@@ -252,7 +307,7 @@ fn emit_linux_word_signal(out: &mut NativeCodeGenerator, value: u64) {
 #[cfg(test)]
 pub(crate) fn emit_linux_worker_start_failure(out: &mut NativeCodeGenerator) {
     // CLONE_THREAD without CLONE_SIGHAND is an intentional EINVAL injection.
-    emit_start(out, 0x0001_0000);
+    emit_start(out, 0x0001_0000, None);
 }
 
 #[cfg(test)]

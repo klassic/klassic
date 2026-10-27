@@ -21,6 +21,14 @@ macro_rules! buffer {
 }
 #[allow(dead_code)]
 pub(crate) fn emit_alloc_into<A: PortableAsm>(a: &mut A) {
+    emit_impl(a, None);
+}
+/// Counts this leaf's direct RootChange publication, beyond root-step wrappers.
+/// The hook must preserve registers and cannot allocate or introduce a poll.
+pub(crate) fn emit_alloc_into_tracked<A: PortableAsm>(a: &mut A, publish: &mut dyn FnMut(&mut A)) {
+    emit_impl(a, Some(publish));
+}
+fn emit_impl<A: PortableAsm>(a: &mut A, publish: Option<&mut dyn FnMut(&mut A)>) {
     let invalid = a.create_text_label();
     let flush = a.create_text_label();
     let exhausted = a.create_text_label();
@@ -104,6 +112,9 @@ pub(crate) fn emit_alloc_into<A: PortableAsm>(a: &mut A) {
     }
     b.set(root!(value), local(PREV));
     b.set(buffer!(top, 0), add(local(USED), n(1)));
+    if let Some(publish) = publish {
+        publish(b.a);
+    }
     b.set(buffer!(published, 1), add(local(USED), n(1)));
     b.set(field(KIND, offset_of!(RootCell, value), 1), local(PREV));
     b.set(

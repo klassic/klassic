@@ -1,3 +1,5 @@
+> Current integration scope and retained failures: [direct runtime foundation](direct-runtime-foundation.md). The historical checkpoints below are not a completion claim for this candidate.
+
 # G01-G15 status against the production `--gc=generational` path
 
 Date: 2026-10-23. Scope of "production path": the opt-in

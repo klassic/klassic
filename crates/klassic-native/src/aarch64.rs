@@ -21,10 +21,16 @@ use klassic_syntax::{BinaryOp, Expr, MatchArm, Pattern, StringPart, UnaryOp};
 
 use crate::macho::{self, DataFixup, FixupSection};
 use crate::portable_asm;
+#[path = "gc_codegen/macos_frame_roots.rs"]
+mod gc_frame_roots;
 #[path = "gc_codegen/macos_generational.rs"]
 mod gc_generational;
 #[path = "gc_codegen/macos.rs"]
 mod gc_macos;
+#[path = "gc_codegen/macos_production.rs"]
+mod gc_macos_production;
+#[path = "gc_codegen/macos_thread_tls.rs"]
+mod gc_macos_thread_tls;
 
 const SYS_EXIT: u16 = 1;
 const SYS_WRITE: u16 = 4;
@@ -133,6 +139,7 @@ enum Reg {
     X12 = 12,
     /// Darwin syscall number register.
     X16 = 16,
+    X17 = 17,
     /// Reserved (formerly the bump allocator's next/end pointers, which
     /// the garbage collector's `gc_alloc` and its `__DATA` cells replaced).
     #[allow(dead_code)]
@@ -254,6 +261,14 @@ struct BranchFixup {
 
 #[derive(Default)]
 struct Assembler {
+    gc_max_heap: Option<u64>,
+    gc_soft_max_heap: Option<u64>,
+    gc_max_metadata: Option<u64>,
+    gc_min_heap: Option<u64>,
+    gc_uncommit_delay_ns: Option<u64>,
+    gc_pre_touch: bool,
+    gc_json_events: bool,
+    gc_timing: bool,
     code: Vec<u8>,
     rodata: Vec<u8>,
     fixups: Vec<DataFixup>,
@@ -789,6 +804,10 @@ impl Assembler {
     /// (`sub sp, #32`). Leaves x1 = first byte, sp+32 = one past the
     /// end. Clobbers x0/x2-x5.
     fn emit_int_digits(&mut self, include_newline: bool) {
+        self.emit_int_magnitude(include_newline, false);
+    }
+
+    fn emit_int_magnitude(&mut self, include_newline: bool, unsigned: bool) {
         self.add_reg_sp_imm(Reg::X1, 32); // one past the buffer end
         if include_newline {
             self.mov_imm64(Reg::X3, b'\n' as u64);
@@ -805,7 +824,13 @@ impl Assembler {
         let digit_loop = self.new_label();
         self.bind(digit_loop);
         self.mov_imm64(Reg::X3, 10);
-        self.sdiv_reg(Reg::X4, Reg::X0, Reg::X3);
+        if unsigned {
+            // |i64::MIN| is 2^63 as an unsigned magnitude, so signed
+            // division would generate negative remainders instead of digits.
+            self.word(0x9ac0_0800 | ((Reg::X3 as u32) << 16) | Reg::X4 as u32);
+        } else {
+            self.sdiv_reg(Reg::X4, Reg::X0, Reg::X3);
+        }
         self.msub_reg(Reg::X2, Reg::X4, Reg::X3, Reg::X0);
         self.add_reg_imm(Reg::X2, Reg::X2, u32::from(b'0'));
         self.store_byte_pre_decrement(Reg::X2, Reg::X1);
@@ -1148,6 +1173,38 @@ impl portable_asm::PortableAsm for Assembler {
     type TextLabel = Label;
     type DataLabel = PortDataAddr;
 
+    fn gc_metadata_limit(&self) -> Option<u64> {
+        self.gc_max_metadata
+    }
+    fn gc_metadata_alignment(&self) -> u64 {
+        16384
+    }
+    fn gc_external_metadata_bytes(&self) -> u64 {
+        crate::gc_layout::GC_SHADOW_STACK_LEN as u64 * 8
+    }
+    fn gc_timing(&self) -> bool {
+        self.gc_timing
+    }
+    fn gc_json_events(&self) -> bool {
+        self.gc_json_events
+    }
+    fn gc_pre_touch(&self) -> bool {
+        self.gc_pre_touch
+    }
+    fn gc_uncommit_delay_ns(&self) -> u64 {
+        self.gc_uncommit_delay_ns
+            .unwrap_or(crate::DEFAULT_GC_UNCOMMIT_DELAY_NS)
+    }
+    fn gc_heap_soft_maximum(&self) -> u64 {
+        self.gc_soft_max_heap
+            .unwrap_or_else(|| self.gc_heap_capacity())
+    }
+    fn gc_heap_minimum(&self) -> u64 {
+        self.gc_min_heap.unwrap_or(crate::DEFAULT_GC_MIN_HEAP)
+    }
+    fn gc_heap_capacity(&self) -> u64 {
+        self.gc_max_heap.unwrap_or(192 << 20)
+    }
     fn create_text_label(&mut self) -> Label {
         self.new_label()
     }
@@ -1285,7 +1342,17 @@ impl portable_asm::PortableAsm for Assembler {
     fn mov_reg_reg(&mut self, dst: portable_asm::Reg, src: portable_asm::Reg) {
         use portable_asm::Reg as P;
         match (dst, src) {
-            (P::V5, P::V4) => self.mov_fp_sp(), // mov x29, sp
+            (P::V5, P::V4) => self.mov_fp_sp(),       // mov x29, sp
+            (P::V4, P::V4) => self.word(0x9100_03ff), // add sp,sp,#0
+            (P::V4, other) => {
+                let source = if other == P::V5 {
+                    Reg::X29
+                } else {
+                    port_reg(other)
+                };
+                self.word(0x9100_001f | ((source as u32) << 5)); // add sp,xn,#0
+            }
+            (_, P::V4) => self.word(0x9100_03e0 | port_reg(dst) as u32), // add xd,sp,#0
             (_, P::V5) => self.mov_reg(port_reg(dst), Reg::X29), // local control-record address
             _ => self.mov_reg(port_reg(dst), port_reg(src)),
         }
@@ -1537,6 +1604,45 @@ impl portable_asm::PortableAsm for Assembler {
         self.bind(done);
     }
 
+    fn plat_write_buffer(&mut self) {
+        Assembler::mov_reg(self, Reg::X0, Reg::X5);
+        Assembler::mov_reg(self, Reg::X1, Reg::X4);
+        Assembler::mov_imm64(self, Reg::X16, u64::from(SYS_WRITE));
+        self.svc_0x80();
+    }
+    fn plat_sleep_millis(&mut self) {
+        self.push_frame_record();
+        self.mov_imm64(Reg::X2, 1000);
+        self.sdiv_reg(Reg::X0, Reg::X5, Reg::X2);
+        self.msub_reg(Reg::X1, Reg::X0, Reg::X2, Reg::X5);
+        self.mov_imm64(Reg::X2, 1_000_000);
+        self.mul_reg(Reg::X1, Reg::X1, Reg::X2);
+        self.sub_sp_imm(32); // request and remaining timespec, native stack only
+        self.add_reg_sp_imm(Reg::X2, 0);
+        self.str_imm(Reg::X0, Reg::X2, 0);
+        self.str_imm(Reg::X1, Reg::X2, 8);
+        let retry = self.new_label();
+        let done = self.new_label();
+        self.bind(retry);
+        self.add_reg_sp_imm(Reg::X0, 0);
+        self.add_reg_sp_imm(Reg::X1, 16);
+        self.call_import(macho::ImportSymbol::Nanosleep);
+        self.word(0x2a00_03e0); // C int result: normalize w0
+        self.branch(done, BranchKind::CompareZero(Reg::X0));
+        self.call_import(macho::ImportSymbol::Error);
+        self.ldr_imm32(Reg::X0, Reg::X0, 0); // Darwin errno is a C int
+        self.cmp_imm(Reg::X0, 4); // EINTR: resume the remaining interval
+        self.branch(done, BranchKind::Conditional(Cond::Ne));
+        self.add_reg_sp_imm(Reg::X2, 0);
+        self.ldr_imm(Reg::X0, Reg::X2, 16);
+        self.ldr_imm(Reg::X1, Reg::X2, 24);
+        self.str_imm(Reg::X0, Reg::X2, 0);
+        self.str_imm(Reg::X1, Reg::X2, 8);
+        self.branch(retry, BranchKind::Unconditional);
+        self.bind(done);
+        self.add_sp_imm(32);
+        self.pop_frame_record();
+    }
     fn plat_write_data(&mut self, fd: u64, data: PortDataAddr, len: usize) {
         Assembler::mov_imm64(self, Reg::X0, fd);
         match data {
@@ -1684,6 +1790,8 @@ enum ValueType {
     /// A record value: index into the emitter's record table (nominal
     /// declarations and interned structural shapes).
     Record(u32),
+    /// Presence token for a native function; it is not a managed address.
+    OpaqueFunction,
     /// An untyped heap pointer: the box cells the enum desugaring builds
     /// around scalars, and any lowered enum value whose enum could not be
     /// named at the point it was built.
@@ -2016,6 +2124,7 @@ fn type_display_name(ty: ValueType) -> String {
         ValueType::Null => "null".to_string(),
         ValueType::Never => "a diverging expression".to_string(),
         ValueType::Ptr => "a heap value".to_string(),
+        ValueType::OpaqueFunction => "a native function".to_string(),
         ValueType::Record(_) => "a record".to_string(),
         ValueType::Enum(_) | ValueType::LoweredEnum(_) => "an enum".to_string(),
         ValueType::EmptyList => "List".to_string(),
@@ -2435,14 +2544,18 @@ struct Emitter {
     fallback_backend_available: bool,
     /// `--gc-log` / `--gc-stress` / `--gc-poison`, threaded in from the CLI.
     gc_log: bool,
+    gc_log_format: crate::GcLogFormat,
     gc_stress: bool,
     gc_poison: bool,
     /// `--gc=generational`: the generational runtime replaces the legacy
     /// collector (see `gc_generational`).
     gc_gen: Option<gc_generational::GenRuntime>,
-    /// Number of shadow-stack roots pushed in each open scope, so leaving
-    /// a scope pops exactly its own.
-    scope_root_counts: Vec<usize>,
+    /// Rooted frame offsets in each lexical scope. Slots contain RootCell
+    /// pointers under generational GC, raw values with the legacy collector.
+    scope_root_slots: Vec<Vec<u32>>,
+    /// First lexical root scope belonging to the function being emitted;
+    /// identical offsets in its caller belong to a different native frame.
+    root_frame_base: usize,
     /// Names of enums `desugar_enums` lowered to `__gc_record` shape.
     lowered_enums: std::collections::HashSet<String>,
     /// What each of those enums looks like, so a value of one can be printed
@@ -3240,7 +3353,7 @@ impl Emitter {
                 if payloads[tag].contains(&ValueType::Never) && !args.is_empty() {
                     return Ok(false);
                 }
-                self.asm.load_local(Reg::X0, slot);
+                self.load_local(Reg::X0, slot);
                 self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
                 self.emit_unbox_scalar();
                 self.asm.cmp_imm(Reg::X0, tag as u32);
@@ -3250,13 +3363,13 @@ impl Emitter {
                     if matches!(argument, Pattern::Wildcard { .. }) {
                         continue;
                     }
-                    self.asm.load_local(Reg::X0, slot);
+                    self.load_local(Reg::X0, slot);
                     self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
                     if is_boxed_scalar(field_ty) {
                         self.emit_unbox_scalar();
                     }
                     let field_slot = self.reserve_locals(8);
-                    self.asm.store_local(Reg::X0, field_slot);
+                    self.store_local(Reg::X0, field_slot);
                     if !self.emit_pattern(field_slot, field_ty, argument, next, bound, span)? {
                         return Ok(false);
                     }
@@ -3292,21 +3405,21 @@ impl Emitter {
         };
         let cursor = self.reserve_locals(16);
         let element = cursor + 8;
-        self.asm.store_local(Reg::X0, cursor);
+        self.store_local(Reg::X0, cursor);
         self.emit_root_frame_slot(cursor);
         let elem_ty = elem_value_type(elem);
         let loop_start = self.asm.new_label();
         let done = self.asm.new_label();
         self.asm.bind(loop_start);
-        self.asm.load_local(Reg::X0, cursor);
+        self.load_local(Reg::X0, cursor);
         self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
         self.emit_gc_load_ptr(Reg::X0, 0);
         if is_boxed_scalar(elem_ty) {
             self.emit_unbox_scalar();
         }
-        self.asm.store_local(Reg::X0, element);
+        self.store_local(Reg::X0, element);
         self.push_binding_scopes();
-        self.scope_root_counts.push(0);
+        self.scope_root_slots.push(Vec::new());
         self.scopes
             .last_mut()
             .expect("emitter scope")
@@ -3320,11 +3433,10 @@ impl Emitter {
         self.widen_loop_mutables(body);
         self.statement(body)?;
         self.pop_binding_scopes();
-        let roots = self.scope_root_counts.pop().expect("emitter root scope");
-        self.emit_shadow_pop(roots);
-        self.asm.load_local(Reg::X0, cursor);
+        self.close_root_scope();
+        self.load_local(Reg::X0, cursor);
         self.emit_gc_load_ptr(Reg::X0, 8);
-        self.asm.store_local(Reg::X0, cursor);
+        self.store_local(Reg::X0, cursor);
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(done);
         self.close_temp_roots(mark);
@@ -3355,7 +3467,7 @@ impl Emitter {
             return Err(unsupported(scrutinee.span(), "matching on this value"));
         }
         let value = self.reserve_locals(8);
-        self.asm.store_local(Reg::X0, value);
+        self.store_local(Reg::X0, value);
         self.emit_root_frame_slot(value);
 
         let end = self.asm.new_label();
@@ -3388,7 +3500,7 @@ impl Emitter {
                 continue;
             }
             self.push_binding_scopes();
-            self.scope_root_counts.push(0);
+            self.scope_root_slots.push(Vec::new());
             for (name, slot, ty) in &bound {
                 self.scopes
                     .last_mut()
@@ -3400,8 +3512,7 @@ impl Emitter {
             }
             let arm_ty = self.expression(&arm.body)?;
             self.pop_binding_scopes();
-            let roots = self.scope_root_counts.pop().expect("emitter root scope");
-            self.emit_shadow_pop(roots);
+            self.close_root_scope();
             result = Some(match result {
                 None => arm_ty,
                 Some(previous) => self
@@ -3589,11 +3700,15 @@ impl Emitter {
                     // alias), so the only thing this has to be is not null.
                     if name.contains('#') {
                         self.asm.mov_imm64(Reg::X0, 1);
-                        return Ok(ValueType::Ptr);
+                        return Ok(if self.gc_gen.is_some() {
+                            ValueType::OpaqueFunction
+                        } else {
+                            ValueType::Ptr
+                        });
                     }
                     return Err(unsupported(*span, &format!("identifier `{name}`")));
                 };
-                self.asm.load_local(Reg::X0, offset);
+                self.load_local(Reg::X0, offset);
                 Ok(ty)
             }
             Expr::Binary { lhs, op, rhs, span } => self.binary(lhs, *op, rhs, *span),
@@ -4195,7 +4310,7 @@ impl Emitter {
                     return Ok(ValueType::Unit);
                 };
                 self.push_binding_scopes();
-                self.scope_root_counts.push(0);
+                self.scope_root_slots.push(Vec::new());
                 for expression in init {
                     self.statement(expression)?;
                 }
@@ -4204,8 +4319,7 @@ impl Emitter {
                 // The block's value is already in x0 and nothing allocates
                 // between here and its use, so dropping the block's roots
                 // now is safe (and the slots themselves are dead).
-                let roots = self.scope_root_counts.pop().expect("emitter root scope");
-                self.emit_shadow_pop(roots);
+                self.close_root_scope();
                 Ok(ty)
             }
             other => Err(unsupported(other.span(), "this expression")),
@@ -4254,12 +4368,18 @@ impl Emitter {
         };
         self.asm.mov_imm64(Reg::X1, flags);
         self.asm.mov_imm64(Reg::X2, DEFAULT_FILE_MODE);
+        self.emit_generational_native_transition(true);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_OPEN));
         self.asm.svc_0x80();
+        self.emit_generational_native_transition(false);
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: FileOutput#write failed to open file\n");
         self.asm.mov_reg(Reg::X3, Reg::X0); // fd
         self.pop_rooted(Reg::X4); // content object
+        if self.gc_gen.is_some() {
+            self.emit_generational_file_content();
+            return;
+        }
 
         self.asm.ldr_imm(Reg::X2, Reg::X4, 0); // content len
         self.asm.add_reg_imm(Reg::X1, Reg::X4, 8); // content bytes
@@ -4290,20 +4410,22 @@ impl Emitter {
     fn emit_file_read_all(&mut self) {
         self.asm.mov_imm64(Reg::X1, O_RDONLY);
         self.asm.mov_imm64(Reg::X2, 0);
+        self.emit_generational_native_transition(true);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_OPEN));
         self.asm.svc_0x80();
+        self.emit_generational_native_transition(false);
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: FileInput#all failed to open file\n");
-        self.emit_read_fd_to_string();
+        self.emit_read_fd_to_string(true);
     }
 
     /// Read everything left on the descriptor in x0 into a fresh string
     /// object, left in x0, and close it. Standard input is a descriptor
     /// nobody opened, which is why this is separate from opening a file.
-    fn emit_read_fd_to_string(&mut self) {
+    fn emit_read_fd_to_string(&mut self, close: bool) {
         const READ_CAP: u64 = 1_048_576;
         if self.gc_gen.is_some() {
-            self.emit_generational_read_fd_to_string(READ_CAP);
+            self.emit_generational_read_fd_to_string(READ_CAP, close);
             return;
         }
 
@@ -4360,8 +4482,10 @@ impl Emitter {
     /// aborts with a source-located message (M14, issue #538).
     fn emit_file_delete(&mut self) {
         const ENOENT: u32 = 2;
+        self.emit_generational_native_transition(true);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_UNLINK));
         self.asm.svc_0x80();
+        self.emit_generational_native_transition(false);
         let ok = self.asm.new_label();
         self.asm.branch(ok, BranchKind::Conditional(Cond::Cc));
         self.asm.cmp_imm(Reg::X0, ENOENT);
@@ -4380,8 +4504,10 @@ impl Emitter {
     /// already-existing path) (M15, issue #538).
     fn emit_dir_mkdir(&mut self) {
         self.asm.mov_imm64(Reg::X1, DEFAULT_DIR_MODE);
+        self.emit_generational_native_transition(true);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_MKDIR));
         self.asm.svc_0x80();
+        self.emit_generational_native_transition(false);
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: Dir#mkdir failed\n");
         self.asm.mov_imm64(Reg::X0, 0); // Unit
@@ -4398,8 +4524,10 @@ impl Emitter {
     fn emit_dir_mkdir_tolerating_eexist(&mut self) {
         const EEXIST: u32 = 17;
         self.asm.mov_imm64(Reg::X1, DEFAULT_DIR_MODE);
+        self.emit_generational_native_transition(true);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_MKDIR));
         self.asm.svc_0x80();
+        self.emit_generational_native_transition(false);
         let ok = self.asm.new_label();
         self.asm.branch(ok, BranchKind::Conditional(Cond::Cc));
         self.asm.cmp_imm(Reg::X0, EEXIST);
@@ -4416,8 +4544,10 @@ impl Emitter {
     /// (errors on a non-empty or missing directory) (M15, issue
     /// #538).
     fn emit_dir_delete(&mut self) {
+        self.emit_generational_native_transition(true);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_RMDIR));
         self.asm.svc_0x80();
+        self.emit_generational_native_transition(false);
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: Dir#delete failed\n");
         self.asm.mov_imm64(Reg::X0, 0); // Unit
@@ -4427,10 +4557,7 @@ impl Emitter {
     /// then tests whether `buf.st_mode`'s file-type bits equal
     /// `S_IFDIR`. Darwin's `stat64` places `st_mode` as a 2-byte
     /// halfword at offset 4 (not 8 bytes at offset 24 like Linux); the
-    /// 144-byte buffer is a fresh bump-heap allocation per call (no
-    /// GC exists yet on this backend to worry about tracing raw stat
-    /// bytes as pointers -- directory checks are not hot-path enough
-    /// to justify a reusable scratch slot). Shifts `st_mode` right by
+    /// 144-byte buffer lives on the native machine stack. Shifts `st_mode` right by
     /// 12 bits to compare only the file-type nibble against `S_IFDIR
     /// >> 12` rather than emitting an `AND`-immediate (Darwin's
     /// `S_IFMT` bitmask encoding is annoying to construct; a value
@@ -4458,8 +4585,10 @@ impl Emitter {
         self.asm.mov_reg(Reg::X1, Reg::X7);
         self.asm.mov_reg(Reg::X2, Reg::X6);
         self.asm.mov_imm64(Reg::X3, 0);
+        self.emit_generational_native_transition(true);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_FSTATAT64));
         self.asm.svc_0x80();
+        self.emit_generational_native_transition(false);
 
         let success = self.asm.new_label();
         let done = self.asm.new_label();
@@ -4480,8 +4609,10 @@ impl Emitter {
     /// Aborts with a source-located message on any failure, matching
     /// the evaluator's `fs::rename` (M15, issue #538).
     fn emit_dir_move(&mut self) {
+        self.emit_generational_native_transition(true);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_RENAME));
         self.asm.svc_0x80();
+        self.emit_generational_native_transition(false);
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: Dir#move failed\n");
         self.asm.mov_imm64(Reg::X0, 0); // Unit
@@ -4739,10 +4870,22 @@ impl Emitter {
         // Asking whether a heap reference is `null` compares a pointer with
         // nothing, so the two sides are different types by construction.
         let comparing_with_null = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
-            && ((lhs_ty == ValueType::Null && is_heap_pointer(rhs_ty))
-                || (rhs_ty == ValueType::Null && is_heap_pointer(lhs_ty)));
+            && ((lhs_ty == ValueType::Null
+                && (is_heap_pointer(rhs_ty) || rhs_ty == ValueType::OpaqueFunction))
+                || (rhs_ty == ValueType::Null
+                    && (is_heap_pointer(lhs_ty) || lhs_ty == ValueType::OpaqueFunction)));
         if lhs_ty != rhs_ty && !comparing_with_null {
             return Err(unsupported(span, "mixed operand types"));
+        }
+        // Function values have no structural equality in the evaluator.
+        // Their presence token is native data, never a managed heap address.
+        if lhs_ty == ValueType::OpaqueFunction
+            && rhs_ty == ValueType::OpaqueFunction
+            && matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+        {
+            self.asm
+                .mov_imm64(Reg::X0, u64::from(op == BinaryOp::NotEqual));
+            return Ok(ValueType::Bool);
         }
         if comparing_with_null {
             self.asm.cmp_reg(Reg::X0, Reg::X1);
@@ -5093,24 +5236,20 @@ impl Emitter {
         }
     }
 
-    /// M7: root the stack slot whose address is `[x29 + offset]`'s home --
-    /// i.e. make the collector treat that frame slot as a live reference.
-    /// The shadow stack holds slot *addresses*, so a moving collector can
-    /// rewrite the slot in place and the mutator observes the new address.
+    /// Rooted slots contain handles under generational GC; reads and stores
+    /// resolve through the shared root ABI. The legacy collector instead
+    /// registers native slot addresses and rewrites their raw referents.
     ///
-    /// Only x0 and x30 are touched at the call site (x0 is restored), so
-    /// this is safe to emit anywhere regardless of what is live.
     /// Note where the current scope's roots stand, so temporaries rooted from
     /// here can be dropped again by `close_temp_roots`.
     ///
-    /// A helper called *inside* an expression has to leave the shadow stack
-    /// exactly as it found it. The stack is strictly last-in-first-out and its
-    /// entries are slot *addresses*, so a frame-slot root left behind is popped
-    /// by whatever `pop_rooted` comes next -- which then leaves that machine
-    /// stack slot rooted after its value is gone, and the next collection reads
-    /// whatever has since been pushed there as a heap reference.
+    /// Helpers inside expressions balance their LIFO roots exactly: a leaked
+    /// frame root would otherwise be popped in place of a rooted temporary.
     fn open_temp_roots(&self) -> usize {
-        *self.scope_root_counts.last().expect("emitter root scope")
+        self.scope_root_slots
+            .last()
+            .expect("emitter root scope")
+            .len()
     }
 
     /// Drop every root taken since `mark`. Preserves x0, so a result being
@@ -5119,13 +5258,22 @@ impl Emitter {
         let count = self.open_temp_roots();
         debug_assert!(count >= mark);
         self.emit_shadow_pop(count - mark);
-        *self
-            .scope_root_counts
+        self.scope_root_slots
             .last_mut()
-            .expect("emitter root scope") = mark;
+            .expect("emitter root scope")
+            .truncate(mark);
     }
 
     fn emit_root_frame_slot(&mut self, offset: u32) {
+        if self.gc_gen.is_some() {
+            assert!(!self.frame_slot_is_root(offset), "duplicate frame root");
+            self.adopt_root_address(Reg::X29, offset);
+            self.scope_root_slots
+                .last_mut()
+                .expect("emitter root scope")
+                .push(offset);
+            return;
+        }
         let push = self.shadow_push_routine_label();
         self.asm.push(Reg::X0); // x0 is the argument register below
         self.asm.push_frame_record(); // the bl clobbers x30
@@ -5133,10 +5281,10 @@ impl Emitter {
         self.asm.branch(push, BranchKind::Link);
         self.asm.pop_frame_record();
         self.asm.pop(Reg::X0);
-        *self
-            .scope_root_counts
+        self.scope_root_slots
             .last_mut()
-            .expect("emitter root scope") += 1;
+            .expect("emitter root scope")
+            .push(offset);
     }
 
     /// M9: root the stack slot at `base + offset`, which must hold a heap
@@ -5150,6 +5298,10 @@ impl Emitter {
     /// interior pointer can be re-derived from the slot and is always
     /// current.
     fn emit_root_address(&mut self, base: Reg, offset: u32) {
+        if self.gc_gen.is_some() {
+            self.adopt_root_address(base, offset);
+            return;
+        }
         let push = self.shadow_push_routine_label();
         self.asm.push(Reg::X0); // the argument register below
         self.asm.push_frame_record(); // the bl clobbers x30
@@ -5166,6 +5318,10 @@ impl Emitter {
     /// this makes the temporary a precise root for exactly its lifetime.
     /// Pair with `pop_rooted`. Preserves every register.
     fn push_rooted(&mut self, reg: Reg) {
+        if self.gc_gen.is_some() {
+            self.push_cell_root(reg);
+            return;
+        }
         let push = self.shadow_push_routine_label();
         self.asm.push(reg); // [sp] = the value, and the slot to root
         self.asm.push_frame_record(); // the bl clobbers x30
@@ -5178,6 +5334,12 @@ impl Emitter {
 
     /// Pop a `push_rooted` temporary into `reg`, dropping its root.
     fn pop_rooted(&mut self, reg: Reg) {
+        if self.gc_gen.is_some() {
+            self.peek_cell_root(reg);
+            self.emit_shadow_pop(1);
+            self.asm.add_sp_imm(16);
+            return;
+        }
         self.emit_shadow_pop(1);
         self.asm.pop(reg);
     }
@@ -5185,6 +5347,13 @@ impl Emitter {
     /// Drop `count` shadow-stack roots. Preserves every register.
     fn emit_shadow_pop(&mut self, count: usize) {
         if count == 0 {
+            return;
+        }
+        if let Some(runtime) = &self.gc_gen {
+            let pop = runtime.frame_roots.pop;
+            for _ in 0..count {
+                portable_asm::PortableAsm::call_label(&mut self.asm, pop);
+            }
             return;
         }
         let pop = self.shadow_pop_routine_label();
@@ -5274,17 +5443,29 @@ impl Emitter {
     /// header-less block would desynchronise the sweep's block walk.
     fn emit_dir_current(&mut self) {
         const PATH_BUF_SIZE: u32 = 4096;
-        self.asm.sub_sp_imm(PATH_BUF_SIZE);
+        if self.gc_gen.is_some() {
+            self.asm.sub_sp_imm(PATH_BUF_SIZE / 2);
+            self.asm.sub_sp_imm(PATH_BUF_SIZE / 2);
+        } else {
+            self.asm.sub_sp_imm(PATH_BUF_SIZE);
+        }
         self.asm.add_reg_sp_imm(Reg::X0, 0);
         self.asm.mov_reg(Reg::X6, Reg::X0);
         self.asm.mov_imm64(Reg::X1, u64::from(PATH_BUF_SIZE));
+        self.emit_generational_native_transition(true);
         self.asm.mov_imm64(Reg::X16, u64::from(SYS_GETCWD));
         self.asm.svc_0x80();
+        self.emit_generational_native_transition(false);
         self.asm
             .emit_abort_if_syscall_failed(b"klassic: Dir#current failed\n");
         self.asm.mov_reg(Reg::X0, Reg::X6);
         self.emit_heap_string_from_cstring();
-        self.asm.add_sp_imm(PATH_BUF_SIZE);
+        if self.gc_gen.is_some() {
+            self.asm.add_sp_imm(PATH_BUF_SIZE / 2);
+            self.asm.add_sp_imm(PATH_BUF_SIZE / 2);
+        } else {
+            self.asm.add_sp_imm(PATH_BUF_SIZE);
+        }
     }
 
     fn emit_heap_string_from_cstring(&mut self) {
@@ -5347,8 +5528,35 @@ impl Emitter {
         if self.expression(path)? != ValueType::Str {
             return Err(unsupported(path.span(), "a path that is not a string"));
         }
-        self.emit_cstring_copy();
+        if self.gc_gen.is_some() {
+            self.emit_generational_path_cstring();
+        } else {
+            self.emit_cstring_copy();
+        }
         Ok(())
+    }
+
+    /// Stage a managed String into a per-callsite native buffer. No user
+    /// call, managed allocation or owner poll occurs between staging and
+    /// the OS call. Two-path calls evaluate/root both operands first.
+    fn emit_generational_path_cstring(&mut self) {
+        const CAP: u64 = 65_536;
+        let buffer = self.asm.reserve_data_cells((CAP as usize + 8) / 8);
+        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+        self.asm.mov_imm64(Reg::X3, CAP);
+        self.asm.cmp_reg(Reg::X2, Reg::X3);
+        let sized = self.asm.new_label();
+        self.asm.branch(sized, BranchKind::Conditional(Cond::Ls));
+        self.asm
+            .emit_write_rodata(STDERR_FD, b"klassic: path exceeds 65536 bytes\n");
+        self.asm.emit_exit(1);
+        self.asm.bind(sized);
+        self.asm.add_reg_imm(Reg::X6, Reg::X0, 8);
+        self.asm.load_data_address(Reg::X7, buffer);
+        self.emit_copy_bytes(Reg::X2, Reg::X6, Reg::X7, Reg::X3);
+        self.asm.mov_imm64(Reg::X3, 0);
+        self.asm.strb_post_increment(Reg::X3, Reg::X7);
+        self.asm.load_data_address(Reg::X0, buffer);
     }
 
     fn emit_heap_string_copy(&mut self) {
@@ -6030,7 +6238,7 @@ impl Emitter {
         self.emit_root_address(Reg::X6, 32);
 
         // Pass 1: count non-overlapping matches.
-        self.asm.ldr_imm(Reg::X8, Reg::X6, 0); // input_bytes_base
+        self.load_root_address(Reg::X8, Reg::X6, 0); // input_bytes_base
         self.asm.add_reg_imm(Reg::X8, Reg::X8, 8); // payload of the rooted object
         self.asm.ldr_imm(Reg::X9, Reg::X6, 8); // input_len
         self.asm.mov_imm64(Reg::X10, 0); // pos
@@ -6046,7 +6254,7 @@ impl Emitter {
         self.asm
             .branch(count_done, BranchKind::Conditional(Cond::Gt));
         self.asm.add_reg(Reg::X0, Reg::X8, Reg::X10); // a_ptr
-        self.asm.ldr_imm(Reg::X1, Reg::X6, 16); // b_ptr = pattern_bytes_base
+        self.load_root_address(Reg::X1, Reg::X6, 16); // b_ptr = pattern_bytes_base
         self.asm.add_reg_imm(Reg::X1, Reg::X1, 8); // payload of the rooted object
         self.asm.mov_reg(Reg::X2, Reg::X7); // len = pattern_len
         self.asm
@@ -6095,10 +6303,10 @@ impl Emitter {
         self.asm.cmp_reg(Reg::X0, Reg::X1);
         self.asm
             .branch(copy_no_match, BranchKind::Conditional(Cond::Gt));
-        self.asm.ldr_imm(Reg::X0, Reg::X6, 0); // input_bytes_base
+        self.load_root_address(Reg::X0, Reg::X6, 0); // input_bytes_base
         self.asm.add_reg_imm(Reg::X0, Reg::X0, 8); // payload of the rooted object
         self.asm.add_reg(Reg::X0, Reg::X0, Reg::X10);
-        self.asm.ldr_imm(Reg::X1, Reg::X6, 16); // pattern_bytes_base
+        self.load_root_address(Reg::X1, Reg::X6, 16); // pattern_bytes_base
         self.asm.add_reg_imm(Reg::X1, Reg::X1, 8); // payload of the rooted object
         self.asm.mov_reg(Reg::X2, Reg::X7);
         self.asm
@@ -6107,7 +6315,7 @@ impl Emitter {
             .branch(copy_is_match, BranchKind::CompareNonZero(Reg::X3));
 
         self.asm.bind(copy_no_match);
-        self.asm.ldr_imm(Reg::X0, Reg::X6, 0); // input_bytes_base
+        self.load_root_address(Reg::X0, Reg::X6, 0); // input_bytes_base
         self.asm.add_reg_imm(Reg::X0, Reg::X0, 8); // payload of the rooted object
         self.asm.add_reg(Reg::X0, Reg::X0, Reg::X10);
         self.asm.ldrb_post_increment(Reg::X1, Reg::X0);
@@ -6116,7 +6324,7 @@ impl Emitter {
         self.asm.branch(copy_loop, BranchKind::Unconditional);
 
         self.asm.bind(copy_is_match);
-        self.asm.ldr_imm(Reg::X0, Reg::X6, 32); // replacement_bytes_base
+        self.load_root_address(Reg::X0, Reg::X6, 32); // replacement_bytes_base
         self.asm.add_reg_imm(Reg::X0, Reg::X0, 8); // payload of the rooted object
         self.asm.ldr_imm(Reg::X1, Reg::X6, 40); // replacement_len
         self.emit_copy_bytes(Reg::X1, Reg::X0, Reg::X11, Reg::X2);
@@ -6163,7 +6371,7 @@ impl Emitter {
         // Re-derive the input's payload from the rooted scratch slot: the
         // allocation above can collect, and once the collector moves objects
         // the x8 saved across it would be a stale interior pointer.
-        self.asm.ldr_imm(Reg::X8, Reg::X6, 0);
+        self.load_root_address(Reg::X8, Reg::X6, 0);
         self.asm.add_reg_imm(Reg::X8, Reg::X8, 8);
         self.asm.add_reg(Reg::X3, Reg::X8, Reg::X0); // src = payload + start
         self.asm.add_reg_imm(Reg::X7, Reg::X5, 8); // dst = new object's payload
@@ -6213,7 +6421,7 @@ impl Emitter {
         self.emit_root_address(Reg::X6, 0);
         self.emit_root_address(Reg::X6, 16);
 
-        self.asm.ldr_imm(Reg::X8, Reg::X6, 0); // the rooted input object
+        self.load_root_address(Reg::X8, Reg::X6, 0); // the rooted input object
         self.asm.add_reg_imm(Reg::X8, Reg::X8, 8); // its payload
         self.asm.ldr_imm(Reg::X9, Reg::X6, 8); // input_len
         self.asm.mov_imm64(Reg::X10, 0); // pos
@@ -6230,7 +6438,7 @@ impl Emitter {
         self.asm
             .branch(scan_done, BranchKind::Conditional(Cond::Gt));
         self.asm.add_reg(Reg::X0, Reg::X8, Reg::X10); // a_ptr
-        self.asm.ldr_imm(Reg::X1, Reg::X6, 16); // the rooted delimiter object
+        self.load_root_address(Reg::X1, Reg::X6, 16); // the rooted delimiter object
         self.asm.add_reg_imm(Reg::X1, Reg::X1, 8); // b_ptr = its payload
         self.asm.ldr_imm(Reg::X2, Reg::X6, 24); // len = delimiter_len
         self.asm
@@ -6487,8 +6695,7 @@ impl Emitter {
         self.asm.add_reg_sp_imm(Reg::X12, 0);
         self.emit_runtime_double_ascii(Reg::X12);
         self.asm.mov_imm64(Reg::X0, STDOUT_FD);
-        self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
-        self.asm.svc_0x80();
+        self.emit_console_buffer_write();
         self.asm.add_sp_imm(DOUBLE_BUFFER_BYTES);
         Ok(())
     }
@@ -6990,7 +7197,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         // enclosing scope; the slot is never reused).
         let acc = self.reserve_locals(8);
         self.asm.mov_imm64(Reg::X0, 0); // nil
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         self.emit_root_frame_slot(acc);
 
         let mut elem_ty = None;
@@ -7005,7 +7212,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             // Is the candidate (x0) already in the partial set?
             self.asm.mov_reg(Reg::X1, Reg::X0);
             self.push_rooted(Reg::X1); // candidate survives the bl
-            self.asm.load_local(Reg::X0, acc);
+            self.load_local(Reg::X0, acc);
             let member = self.member_label(this);
             self.asm.branch(member, BranchKind::Link);
             let skip = self.asm.new_label();
@@ -7018,9 +7225,9 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 self.emit_box_scalar();
             }
             self.push_rooted(Reg::X0); // head for emit_cons_cell
-            self.asm.load_local(Reg::X0, acc);
+            self.load_local(Reg::X0, acc);
             self.emit_cons_cell();
-            self.asm.store_local(Reg::X0, acc);
+            self.store_local(Reg::X0, acc);
             let after = self.asm.new_label();
             self.asm.branch(after, BranchKind::Unconditional);
             self.asm.bind(skip);
@@ -7028,7 +7235,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             self.asm.bind(after);
         }
 
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         let reverse = self.reverse_label();
         self.asm.branch(reverse, BranchKind::Link);
         self.close_temp_roots(mark);
@@ -7072,7 +7279,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         // holds a heap reference across every allocation below.
         let acc = self.reserve_locals(8);
         self.asm.mov_imm64(Reg::X0, 0); // nil
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         self.emit_root_frame_slot(acc);
 
         let mut key_elem = None;
@@ -7103,12 +7310,12 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             }
             self.emit_cons_cell(); // entry = [key][value]
             self.push_rooted(Reg::X0);
-            self.asm.load_local(Reg::X0, acc);
+            self.load_local(Reg::X0, acc);
             self.emit_cons_cell(); // chain cell = [entry][rest]
-            self.asm.store_local(Reg::X0, acc);
+            self.store_local(Reg::X0, acc);
         }
 
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         let reverse = self.reverse_label();
         self.asm.branch(reverse, BranchKind::Link);
         self.close_temp_roots(mark);
@@ -7140,14 +7347,14 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
     /// Prepend a fresh `[key][value]` entry, taken from those two slots, to
     /// the chain in `acc`.
     fn emit_put_entry(&mut self, key_slot: u32, value_slot: u32, acc: u32) {
-        self.asm.load_local(Reg::X0, key_slot);
+        self.load_local(Reg::X0, key_slot);
         self.push_rooted(Reg::X0);
-        self.asm.load_local(Reg::X0, value_slot);
+        self.load_local(Reg::X0, value_slot);
         self.emit_cons_cell(); // entry = [key][value]
         self.push_rooted(Reg::X0);
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         self.emit_cons_cell(); // chain cell = [entry][rest]
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
     }
 
     /// The entry whose key equals the one in x1, or 0 when there is none:
@@ -7208,6 +7415,52 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
     }
 
     /// println of the map in x0 in the evaluator's format: `%[k: v, k2: v2]`.
+    /// A completed native console buffer, with syscall arguments in x0-x2.
+    /// Only unmanaged image/stack storage reaches this entry.
+    fn emit_console_buffer_write(&mut self) {
+        if self.gc_gen.is_some() {
+            let entry = self.gen_labels().write_native_buffer;
+            for r in [Reg::X10, Reg::X11, Reg::X12] {
+                self.asm.push(r);
+            }
+            self.asm.mov_reg(Reg::X5, Reg::X0);
+            self.asm.mov_reg(Reg::X4, Reg::X1);
+            portable_asm::PortableAsm::call_label(&mut self.asm, entry);
+            for r in [Reg::X12, Reg::X11, Reg::X10] {
+                self.asm.pop(r);
+            }
+        } else {
+            self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+            self.asm.svc_0x80();
+        }
+    }
+
+    fn emit_console_rodata(&mut self, fd: u64, bytes: &[u8]) {
+        if self.gc_gen.is_none() {
+            self.asm.emit_write_rodata(fd, bytes);
+            return;
+        }
+        let data = self.asm.intern_rodata(bytes);
+        self.asm.mov_imm64(Reg::X0, fd);
+        self.asm.load_rodata_address(Reg::X1, data);
+        self.asm.mov_imm64(Reg::X2, bytes.len() as u64);
+        self.emit_console_buffer_write();
+    }
+
+    fn emit_console_int_line(&mut self) {
+        if self.gc_gen.is_none() {
+            self.asm.emit_print_int_line();
+            return;
+        }
+        self.asm.sub_sp_imm(32);
+        self.asm.emit_int_magnitude(true, true);
+        self.asm.add_reg_sp_imm(Reg::X2, 32);
+        self.asm.sub_reg(Reg::X2, Reg::X2, Reg::X1);
+        self.asm.mov_imm64(Reg::X0, STDOUT_FD);
+        self.emit_console_buffer_write();
+        self.asm.add_sp_imm(32);
+    }
+
     fn emit_println_map(
         &mut self,
         key: ListElem,
@@ -7215,8 +7468,49 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         span: Span,
     ) -> Result<(), Diagnostic> {
         self.emit_print_map(key, value, span)?;
-        self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+        self.emit_console_rodata(STDOUT_FD, b"\n");
         Ok(())
+    }
+
+    /// A renderer's parent must remain a precise root while writing a child
+    /// can poll. Stack slots hold real RootCell pointers under the flag; the
+    /// legacy spelling is retained verbatim for the default backend.
+    fn push_render_root(&mut self, reg: Reg, legacy_rooted: bool) {
+        if self.gc_gen.is_none() {
+            if legacy_rooted {
+                self.push_rooted(reg);
+            } else {
+                self.asm.push(reg);
+            }
+            return;
+        }
+        self.push_rooted(reg);
+    }
+
+    fn peek_render_root(&mut self, reg: Reg, legacy_rooted: bool) {
+        if self.gc_gen.is_none() {
+            if legacy_rooted {
+                self.pop_rooted(reg);
+                self.push_rooted(reg);
+            } else {
+                self.asm.pop(reg);
+                self.asm.push(reg);
+            }
+            return;
+        }
+        self.peek_cell_root(reg);
+    }
+
+    fn pop_render_root(&mut self, reg: Reg, legacy_rooted: bool) {
+        if self.gc_gen.is_none() {
+            if legacy_rooted {
+                self.pop_rooted(reg);
+            } else {
+                self.asm.pop(reg);
+            }
+            return;
+        }
+        self.pop_rooted(reg);
     }
 
     /// The same rendering without the trailing newline, so a map can be an
@@ -7229,38 +7523,36 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
     ) -> Result<(), Diagnostic> {
         let loop_start = self.asm.new_label();
         let close = self.asm.new_label();
-        self.push_rooted(Reg::X0); // cursor
-        self.asm.emit_write_rodata(STDOUT_FD, b"%[");
-        self.pop_rooted(Reg::X3);
-        self.push_rooted(Reg::X3);
+        self.push_render_root(Reg::X0, true); // cursor
+        self.emit_console_rodata(STDOUT_FD, b"%[");
+        self.peek_render_root(Reg::X3, true);
         self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
         self.asm.bind(loop_start);
-        self.pop_rooted(Reg::X3);
-        self.push_rooted(Reg::X3);
+        self.peek_render_root(Reg::X3, true);
         self.emit_gc_load_ptr(Reg::X3, 0); // x0 = entry (barriered)
-        self.push_rooted(Reg::X0); // the entry survives printing the key
+        self.push_render_root(Reg::X0, true); // the entry survives printing the key
         self.emit_gc_load_ptr(Reg::X0, 0); // x0 = key
         if is_boxed_scalar(elem_value_type(key)) {
             self.emit_unbox_scalar();
         }
         self.emit_print_elem(key, span)?;
-        self.asm.emit_write_rodata(STDOUT_FD, b": ");
-        self.pop_rooted(Reg::X3); // the entry
+        self.emit_console_rodata(STDOUT_FD, b": ");
+        self.pop_render_root(Reg::X3, true); // the entry
         self.emit_gc_load_ptr(Reg::X3, 8); // x0 = value
         if is_boxed_scalar(elem_value_type(value)) {
             self.emit_unbox_scalar();
         }
         self.emit_print_elem(value, span)?;
-        self.pop_rooted(Reg::X3); // the cursor
+        self.pop_render_root(Reg::X3, true); // the cursor
         self.emit_gc_load_ptr(Reg::X3, 8); // x0 = next (barriered)
         self.asm.mov_reg(Reg::X3, Reg::X0);
-        self.push_rooted(Reg::X3);
+        self.push_render_root(Reg::X3, true);
         self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
-        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+        self.emit_console_rodata(STDOUT_FD, b", ");
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(close);
-        self.pop_rooted(Reg::X3); // discard the cursor
-        self.asm.emit_write_rodata(STDOUT_FD, b"]");
+        self.pop_render_root(Reg::X3, true); // discard the cursor
+        self.emit_console_rodata(STDOUT_FD, b"]");
         Ok(())
     }
 
@@ -7268,14 +7560,12 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
     fn emit_println_set(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         let loop_start = self.asm.new_label();
         let close = self.asm.new_label();
-        self.asm.push(Reg::X0);
-        self.asm.emit_write_rodata(STDOUT_FD, b"%(");
-        self.asm.pop(Reg::X3);
-        self.asm.push(Reg::X3);
+        self.push_render_root(Reg::X0, false);
+        self.emit_console_rodata(STDOUT_FD, b"%(");
+        self.peek_render_root(Reg::X3, false);
         self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
         self.asm.bind(loop_start);
-        self.asm.pop(Reg::X3);
-        self.asm.push(Reg::X3);
+        self.peek_render_root(Reg::X3, false);
         self.emit_gc_load_ptr(Reg::X3, 0); // x0 = element (barriered)
         // Scalar elements are boxed in the cell; unbox before printing
         // (string elements are already the pointer).
@@ -7283,16 +7573,16 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             self.emit_unbox_scalar();
         }
         self.emit_print_elem(elem, span)?;
-        self.asm.pop(Reg::X3);
+        self.pop_render_root(Reg::X3, false);
         self.emit_gc_load_ptr(Reg::X3, 8); // x0 = next (barriered)
         self.asm.mov_reg(Reg::X3, Reg::X0);
-        self.asm.push(Reg::X3);
+        self.push_render_root(Reg::X3, false);
         self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
-        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+        self.emit_console_rodata(STDOUT_FD, b", ");
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(close);
-        self.asm.pop(Reg::X3);
-        self.asm.emit_write_rodata(STDOUT_FD, b")\n");
+        self.pop_render_root(Reg::X3, false);
+        self.emit_console_rodata(STDOUT_FD, b")\n");
         Ok(())
     }
 
@@ -7475,38 +7765,33 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     .nested_inner()
                     .expect("a nested element is a list of its inner element");
                 self.emit_list_to_str(inner, "[", "]", span)?;
-                self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
-                self.asm.add_reg_imm(Reg::X1, Reg::X0, 8);
-                self.asm.mov_imm64(Reg::X0, STDOUT_FD);
-                self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
-                self.asm.svc_0x80();
+                self.emit_heap_string_write(STDOUT_FD);
             }
             ListElem::Int => {
                 self.asm.sub_sp_imm(32);
-                self.asm.emit_int_digits(false);
+                if self.gc_gen.is_some() {
+                    self.asm.emit_int_magnitude(false, true);
+                } else {
+                    self.asm.emit_int_digits(false);
+                }
                 self.asm.add_reg_sp_imm(Reg::X2, 32);
                 self.asm.sub_reg(Reg::X2, Reg::X2, Reg::X1);
                 self.asm.mov_imm64(Reg::X0, STDOUT_FD);
-                self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
-                self.asm.svc_0x80();
+                self.emit_console_buffer_write();
                 self.asm.add_sp_imm(32);
             }
             ListElem::Str => {
-                self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
-                self.asm.add_reg_imm(Reg::X1, Reg::X0, 8);
-                self.asm.mov_imm64(Reg::X0, STDOUT_FD);
-                self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
-                self.asm.svc_0x80();
+                self.emit_heap_string_write(STDOUT_FD);
             }
             ListElem::Bool => {
                 let false_label = self.asm.new_label();
                 let end_label = self.asm.new_label();
                 self.asm
                     .branch(false_label, BranchKind::CompareZero(Reg::X0));
-                self.asm.emit_write_rodata(STDOUT_FD, b"true");
+                self.emit_console_rodata(STDOUT_FD, b"true");
                 self.asm.branch(end_label, BranchKind::Unconditional);
                 self.asm.bind(false_label);
-                self.asm.emit_write_rodata(STDOUT_FD, b"false");
+                self.emit_console_rodata(STDOUT_FD, b"false");
                 self.asm.bind(end_label);
             }
         }
@@ -7518,7 +7803,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
     /// structural shapes. Scalar and string fields only for now.
     fn emit_println_record(&mut self, index: u32, span: Span) -> Result<(), Diagnostic> {
         self.emit_print_record_inline(index, span)?;
-        self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+        self.emit_console_rodata(STDOUT_FD, b"\n");
         Ok(())
     }
 
@@ -7545,14 +7830,13 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 return Err(unsupported(span, "printing a record with this field type"));
             }
         }
-        self.asm.push(Reg::X0); // the object survives the writes
-        self.asm.emit_write_rodata(STDOUT_FD, opener.as_bytes());
+        self.push_render_root(Reg::X0, false); // the object survives the writes
+        self.emit_console_rodata(STDOUT_FD, opener.as_bytes());
         for (position, (_, ty)) in fields.iter().enumerate() {
             if position > 0 {
-                self.asm.emit_write_rodata(STDOUT_FD, b", ");
+                self.emit_console_rodata(STDOUT_FD, b", ");
             }
-            self.asm.pop(Reg::X0);
-            self.asm.push(Reg::X0);
+            self.peek_render_root(Reg::X0, false);
             self.emit_gc_load_ptr(Reg::X0, (position * 8) as u32); // barriered
             // A field that may not be there -- `Map#get`'s answer is the one
             // every map entry carries -- prints the word `null` when it is
@@ -7568,7 +7852,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 self.emit_print_elem(elem, span)?;
                 self.asm.branch(end_label, BranchKind::Unconditional);
                 self.asm.bind(null_label);
-                self.asm.emit_write_rodata(STDOUT_FD, b"null");
+                self.emit_console_rodata(STDOUT_FD, b"null");
                 self.asm.bind(end_label);
                 continue;
             }
@@ -7579,8 +7863,8 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             }
             self.emit_print_elem(list_elem_of(*ty).expect("checked above"), span)?;
         }
-        self.asm.pop(Reg::X0); // discard the saved object
-        self.asm.emit_write_rodata(STDOUT_FD, b")");
+        self.pop_render_root(Reg::X0, false); // discard the saved object
+        self.emit_console_rodata(STDOUT_FD, b")");
         Ok(())
     }
 
@@ -7602,7 +7886,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         let (enum_index, payloads) = self.enum_shapes[shape as usize].clone();
         let variants = self.generic_enums[enum_index].1.clone();
         let end = self.asm.new_label();
-        self.asm.push(Reg::X0); // the value survives the writes below
+        self.push_render_root(Reg::X0, false); // the value survives the writes below
         for (tag, (variant, arity)) in variants.iter().enumerate() {
             // A payload this shape never carries means no value of it is this
             // variant, which is the same reading `match` takes of `Never`.
@@ -7610,22 +7894,20 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 continue;
             }
             let next = self.asm.new_label();
-            self.asm.pop(Reg::X0);
-            self.asm.push(Reg::X0);
+            self.peek_render_root(Reg::X0, false);
             self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
             self.emit_unbox_scalar();
             self.asm.cmp_imm(Reg::X0, tag as u32);
             self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
-            self.asm.emit_write_rodata(STDOUT_FD, variant.as_bytes());
+            self.emit_console_rodata(STDOUT_FD, variant.as_bytes());
             if *arity > 0 {
-                self.asm.emit_write_rodata(STDOUT_FD, b"(");
+                self.emit_console_rodata(STDOUT_FD, b"(");
                 let fields = payloads[tag].clone();
                 for (position, field_ty) in fields.iter().copied().take(*arity).enumerate() {
                     if position > 0 {
-                        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+                        self.emit_console_rodata(STDOUT_FD, b", ");
                     }
-                    self.asm.pop(Reg::X0);
-                    self.asm.push(Reg::X0);
+                    self.peek_render_root(Reg::X0, false);
                     self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
                     if is_boxed_scalar(field_ty) {
                         self.emit_unbox_scalar();
@@ -7649,13 +7931,13 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                         }
                     }
                 }
-                self.asm.emit_write_rodata(STDOUT_FD, b")");
+                self.emit_console_rodata(STDOUT_FD, b")");
             }
             self.asm.branch(end, BranchKind::Unconditional);
             self.asm.bind(next);
         }
         self.asm.bind(end);
-        self.asm.pop(Reg::X0); // discard the saved value
+        self.pop_render_root(Reg::X0, false); // discard the saved value
         Ok(())
     }
 
@@ -7694,24 +7976,22 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             return Err(unsupported(span, "printing an enum with no variants"));
         }
         let end = self.asm.new_label();
-        self.asm.push(Reg::X0); // the value survives the writes below
+        self.push_render_root(Reg::X0, false); // the value survives the writes below
         for (tag, (name, fields)) in variants.iter().enumerate() {
             let next = self.asm.new_label();
-            self.asm.pop(Reg::X0);
-            self.asm.push(Reg::X0);
+            self.peek_render_root(Reg::X0, false);
             self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
             self.emit_unbox_scalar();
             self.asm.cmp_imm(Reg::X0, tag as u32);
             self.asm.branch(next, BranchKind::Conditional(Cond::Ne));
-            self.asm.emit_write_rodata(STDOUT_FD, name.as_bytes());
+            self.emit_console_rodata(STDOUT_FD, name.as_bytes());
             if !fields.is_empty() {
-                self.asm.emit_write_rodata(STDOUT_FD, b"(");
+                self.emit_console_rodata(STDOUT_FD, b"(");
                 for (position, repr) in fields.iter().enumerate() {
                     if position > 0 {
-                        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+                        self.emit_console_rodata(STDOUT_FD, b", ");
                     }
-                    self.asm.pop(Reg::X0);
-                    self.asm.push(Reg::X0);
+                    self.peek_render_root(Reg::X0, false);
                     self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
                     match repr {
                         LoweredFieldRepr::Int => {
@@ -7738,13 +8018,13 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                         }
                     }
                 }
-                self.asm.emit_write_rodata(STDOUT_FD, b")");
+                self.emit_console_rodata(STDOUT_FD, b")");
             }
             self.asm.branch(end, BranchKind::Unconditional);
             self.asm.bind(next);
         }
         self.asm.bind(end);
-        self.asm.pop(Reg::X0); // discard the saved value
+        self.pop_render_root(Reg::X0, false); // discard the saved value
         Ok(())
     }
 
@@ -7753,21 +8033,12 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
     fn emit_println_list(&mut self, elem: ListElem, span: Span) -> Result<(), Diagnostic> {
         let loop_start = self.asm.new_label();
         let close = self.asm.new_label();
-        // Under --gc=generational every collection moves every object, so
-        // the cursor slot is a root: printing a nested element allocates.
-        let rooted = self.gc_gen.is_some();
-        if rooted {
-            self.push_rooted(Reg::X0);
-        } else {
-            self.asm.push(Reg::X0); // cursor survives the writes below
-        }
-        self.asm.emit_write_rodata(STDOUT_FD, b"[");
-        self.asm.pop(Reg::X3);
-        self.asm.push(Reg::X3);
+        self.push_render_root(Reg::X0, false);
+        self.emit_console_rodata(STDOUT_FD, b"[");
+        self.peek_render_root(Reg::X3, false);
         self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
         self.asm.bind(loop_start);
-        self.asm.pop(Reg::X3);
-        self.asm.push(Reg::X3);
+        self.peek_render_root(Reg::X3, false);
         self.emit_gc_load_ptr(Reg::X3, 0); // x0 = element (barriered)
         // Scalar elements are boxed in the cell; unbox before printing
         // (string elements are already the pointer).
@@ -7775,32 +8046,64 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             self.emit_unbox_scalar();
         }
         self.emit_print_elem(elem, span)?;
-        self.asm.pop(Reg::X3);
+        self.pop_render_root(Reg::X3, false);
         self.emit_gc_load_ptr(Reg::X3, 8); // x0 = next (barriered)
         self.asm.mov_reg(Reg::X3, Reg::X0);
-        self.asm.push(Reg::X3);
+        self.push_render_root(Reg::X3, false);
         self.asm.branch(close, BranchKind::CompareZero(Reg::X3));
-        self.asm.emit_write_rodata(STDOUT_FD, b", ");
+        self.emit_console_rodata(STDOUT_FD, b", ");
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(close);
-        if rooted {
-            self.pop_rooted(Reg::X3);
-        } else {
-            self.asm.pop(Reg::X3); // discard the cursor slot
-        }
-        self.asm.emit_write_rodata(STDOUT_FD, b"]\n");
+        self.pop_render_root(Reg::X3, false);
+        self.emit_console_rodata(STDOUT_FD, b"]\n");
         Ok(())
     }
 
-    /// println of the string object in x0: one write for the payload,
-    /// one for the newline.
+    /// Copy each chunk through a real temporary root and native buffer.
+    fn emit_heap_string_write(&mut self, fd: u64) {
+        if self.gc_gen.is_some() {
+            let entry = self.gen_labels().write_rooted_string;
+            for r in [Reg::X10, Reg::X11, Reg::X12] {
+                self.asm.push(r);
+            }
+            self.asm.mov_imm64(Reg::X5, fd);
+            portable_asm::PortableAsm::call_label(&mut self.asm, entry);
+            for r in [Reg::X12, Reg::X11, Reg::X10] {
+                self.asm.pop(r);
+            }
+        } else {
+            self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
+            self.asm.add_reg_imm(Reg::X1, Reg::X0, 8);
+            self.asm.mov_imm64(Reg::X0, fd);
+            self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
+            self.asm.svc_0x80();
+        }
+    }
+
+    fn emit_generational_sleep(&mut self) {
+        let non_negative = self.asm.new_label();
+        self.asm.cmp_imm(Reg::X0, 0);
+        self.asm
+            .branch(non_negative, BranchKind::Conditional(Cond::Ge));
+        self.asm
+            .emit_write_rodata(STDERR_FD, b"klassic: sleep expects a non-negative Int\n");
+        self.asm.emit_exit(1);
+        self.asm.bind(non_negative);
+        for r in [Reg::X10, Reg::X11, Reg::X12] {
+            self.asm.push(r);
+        }
+        let entry = self.gen_labels().sleep_millis;
+        portable_asm::PortableAsm::call_label(&mut self.asm, entry);
+        for r in [Reg::X12, Reg::X11, Reg::X10] {
+            self.asm.pop(r);
+        }
+        self.asm.mov_imm64(Reg::X0, 0);
+    }
+
+    /// Print the string in x0, followed by a newline.
     fn emit_println_str(&mut self) {
-        self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
-        self.asm.add_reg_imm(Reg::X1, Reg::X0, 8);
-        self.asm.mov_imm64(Reg::X0, STDOUT_FD);
-        self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
-        self.asm.svc_0x80();
-        self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+        self.emit_heap_string_write(STDOUT_FD);
+        self.emit_console_rodata(STDOUT_FD, b"\n");
     }
 
     /// The shared heap-grow routine: mmap a fresh segment into
@@ -7942,7 +8245,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             // The same line on standard error.
             ("printlnError", 1) => {
                 if let Some(line) = Self::literal_line(&arguments[0])? {
-                    self.asm.emit_write_rodata(STDERR_FD, line.as_bytes());
+                    self.emit_console_rodata(STDERR_FD, line.as_bytes());
                     self.asm.mov_imm64(Reg::X0, 0);
                     return Ok(Some(ValueType::Unit));
                 }
@@ -7952,12 +8255,8 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                         "printing this to standard error",
                     ));
                 }
-                self.asm.ldr_imm(Reg::X2, Reg::X0, 0); // length
-                self.asm.add_reg_imm(Reg::X1, Reg::X0, 8); // bytes
-                self.asm.mov_imm64(Reg::X0, STDERR_FD);
-                self.asm.mov_imm64(Reg::X16, u64::from(SYS_WRITE));
-                self.asm.svc_0x80();
-                self.asm.emit_write_rodata(STDERR_FD, b"\n");
+                self.emit_heap_string_write(STDERR_FD);
+                self.emit_console_rodata(STDERR_FD, b"\n");
                 self.asm.mov_imm64(Reg::X0, 0);
                 Ok(Some(ValueType::Unit))
             }
@@ -8033,33 +8332,33 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let source = self.reserve_locals(24);
                 let acc = source + 8;
                 let count = acc + 8;
-                self.asm.store_local(Reg::X0, source);
+                self.store_local(Reg::X0, source);
                 self.emit_root_frame_slot(source);
                 let empty = self.asm.intern_string_object("");
                 self.asm.load_rodata_address(Reg::X0, empty);
                 self.emit_heap_string_copy();
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.emit_root_frame_slot(acc);
                 if self.expression(&arguments[1])? != ValueType::Int {
                     return Err(unsupported(span, "repeat with a non-Int count"));
                 }
-                self.asm.store_local(Reg::X0, count);
+                self.store_local(Reg::X0, count);
                 let loop_start = self.asm.new_label();
                 let done = self.asm.new_label();
                 self.asm.bind(loop_start);
-                self.asm.load_local(Reg::X0, count);
+                self.load_local(Reg::X0, count);
                 self.asm.cmp_imm(Reg::X0, 0);
                 self.asm.branch(done, BranchKind::Conditional(Cond::Le));
-                self.asm.load_local(Reg::X1, source);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X1, source);
+                self.load_local(Reg::X0, acc);
                 self.emit_str_concat();
-                self.asm.store_local(Reg::X0, acc);
-                self.asm.load_local(Reg::X0, count);
+                self.store_local(Reg::X0, acc);
+                self.load_local(Reg::X0, count);
                 self.asm.sub_reg_imm(Reg::X0, Reg::X0, 1);
-                self.asm.store_local(Reg::X0, count);
+                self.store_local(Reg::X0, count);
                 self.asm.branch(loop_start, BranchKind::Unconditional);
                 self.asm.bind(done);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 self.close_temp_roots(mark);
                 Ok(Some(ValueType::Str))
             }
@@ -8076,60 +8375,60 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let to = from + 8;
                 let head = to + 8;
                 let at = head + 8;
-                self.asm.store_local(Reg::X0, source);
+                self.store_local(Reg::X0, source);
                 self.emit_root_frame_slot(source);
                 // Every slot that will hold a string is rooted before the
                 // branch below, so both paths have pushed the same roots.
                 self.asm.mov_imm64(Reg::X0, 0);
-                self.asm.store_local(Reg::X0, from);
+                self.store_local(Reg::X0, from);
                 self.emit_root_frame_slot(from);
                 self.asm.mov_imm64(Reg::X0, 0);
-                self.asm.store_local(Reg::X0, to);
+                self.store_local(Reg::X0, to);
                 self.emit_root_frame_slot(to);
                 self.asm.mov_imm64(Reg::X0, 0);
-                self.asm.store_local(Reg::X0, head);
+                self.store_local(Reg::X0, head);
                 self.emit_root_frame_slot(head);
                 if self.expression(&arguments[1])? != ValueType::Str {
                     return Err(unsupported(span, "replace with a non-string pattern"));
                 }
-                self.asm.store_local(Reg::X0, from);
+                self.store_local(Reg::X0, from);
                 if self.expression(&arguments[2])? != ValueType::Str {
                     return Err(unsupported(span, "replace with a non-string replacement"));
                 }
-                self.asm.store_local(Reg::X0, to);
-                self.asm.load_local(Reg::X1, from);
-                self.asm.load_local(Reg::X0, source);
+                self.store_local(Reg::X0, to);
+                self.load_local(Reg::X1, from);
+                self.load_local(Reg::X0, source);
                 self.emit_str_index_of(false);
-                self.asm.store_local(Reg::X0, at);
+                self.store_local(Reg::X0, at);
                 let absent = self.asm.new_label();
                 let end = self.asm.new_label();
                 self.asm.cmp_imm(Reg::X0, 0);
                 self.asm.branch(absent, BranchKind::Conditional(Cond::Lt));
                 // head = substring(source, 0, at)
-                self.asm.load_local(Reg::X2, at);
+                self.load_local(Reg::X2, at);
                 self.asm.mov_imm64(Reg::X1, 0);
-                self.asm.load_local(Reg::X0, source);
+                self.load_local(Reg::X0, source);
                 self.emit_substring();
-                self.asm.store_local(Reg::X0, head);
+                self.store_local(Reg::X0, head);
                 // head = head + to
-                self.asm.load_local(Reg::X1, to);
-                self.asm.load_local(Reg::X0, head);
+                self.load_local(Reg::X1, to);
+                self.load_local(Reg::X0, head);
                 self.emit_str_concat();
-                self.asm.store_local(Reg::X0, head);
+                self.store_local(Reg::X0, head);
                 // tail = substring(source, at + len(from), len(source))
-                self.asm.load_local(Reg::X0, from);
+                self.load_local(Reg::X0, from);
                 self.asm.ldr_imm(Reg::X1, Reg::X0, 0);
-                self.asm.load_local(Reg::X0, at);
+                self.load_local(Reg::X0, at);
                 self.asm.add_reg(Reg::X1, Reg::X0, Reg::X1);
-                self.asm.load_local(Reg::X0, source);
+                self.load_local(Reg::X0, source);
                 self.asm.ldr_imm(Reg::X2, Reg::X0, 0);
                 self.emit_substring();
                 self.asm.mov_reg(Reg::X1, Reg::X0);
-                self.asm.load_local(Reg::X0, head);
+                self.load_local(Reg::X0, head);
                 self.emit_str_concat();
                 self.asm.branch(end, BranchKind::Unconditional);
                 self.asm.bind(absent);
-                self.asm.load_local(Reg::X0, source);
+                self.load_local(Reg::X0, source);
                 self.asm.bind(end);
                 self.close_temp_roots(mark);
                 Ok(Some(ValueType::Str))
@@ -8387,12 +8686,12 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let cursor = self.reserve_locals(24);
                 let acc = cursor + 8;
                 let replaced = cursor + 16;
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.emit_root_frame_slot(cursor);
                 self.asm.mov_imm64(Reg::X0, 0);
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.emit_root_frame_slot(acc);
-                self.asm.store_local(Reg::X0, replaced);
+                self.store_local(Reg::X0, replaced);
 
                 // The key and value are rooted for the whole walk: every entry
                 // copied along the way allocates.
@@ -8410,7 +8709,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 }
                 let key_slot = self.reserve_locals(16);
                 let value_slot = key_slot + 8;
-                self.asm.store_local(Reg::X0, key_slot);
+                self.store_local(Reg::X0, key_slot);
                 self.emit_root_frame_slot(key_slot);
                 let value_ty = self.expression(&arguments[2])?;
                 // `Map#get` answers the value *or nothing*, and rebuilding a
@@ -8428,7 +8727,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 if is_boxed_scalar(value_ty) {
                     self.emit_box_scalar();
                 }
-                self.asm.store_local(Reg::X0, value_slot);
+                self.store_local(Reg::X0, value_slot);
                 self.emit_root_frame_slot(value_slot);
 
                 let loop_start = self.asm.new_label();
@@ -8436,7 +8735,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let keep = self.asm.new_label();
                 let next = self.asm.new_label();
                 self.asm.bind(loop_start);
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
                 self.emit_gc_load_ptr(Reg::X0, 0); // this entry
                 self.push_rooted(Reg::X0);
@@ -8444,35 +8743,35 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 if is_boxed_scalar(elem_value_type(key_elem)) {
                     self.emit_unbox_scalar();
                 }
-                self.asm.load_local(Reg::X1, key_slot);
+                self.load_local(Reg::X1, key_slot);
                 self.emit_elem_eq_boxed_rhs(key_elem);
                 self.asm.branch(keep, BranchKind::CompareZero(Reg::X0));
                 self.pop_rooted(Reg::X1); // the old entry, replaced
                 self.asm.mov_imm64(Reg::X0, 1);
-                self.asm.store_local(Reg::X0, replaced);
+                self.store_local(Reg::X0, replaced);
                 self.emit_put_entry(key_slot, value_slot, acc);
                 self.asm.branch(next, BranchKind::Unconditional);
                 self.asm.bind(keep);
                 self.pop_rooted(Reg::X0); // the entry, kept as it is
                 self.push_rooted(Reg::X0);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 self.emit_cons_cell();
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.asm.bind(next);
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.emit_gc_load_ptr(Reg::X0, 8);
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.asm.branch(loop_start, BranchKind::Unconditional);
                 self.asm.bind(done);
                 // A key that was not there goes on the end, which is the front
                 // of the accumulator before it is reversed.
                 let appended = self.asm.new_label();
-                self.asm.load_local(Reg::X0, replaced);
+                self.load_local(Reg::X0, replaced);
                 self.asm
                     .branch(appended, BranchKind::CompareNonZero(Reg::X0));
                 self.emit_put_entry(key_slot, value_slot, acc);
                 self.asm.bind(appended);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 let reverse = self.reverse_label();
                 self.asm.branch(reverse, BranchKind::Link);
                 self.close_temp_roots(mark);
@@ -8491,7 +8790,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 };
                 let cursor = self.reserve_locals(16);
                 let wanted = cursor + 8;
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.emit_root_frame_slot(cursor);
                 let candidate_ty = self.expression(&arguments[1])?;
                 let Some(candidate) = list_elem_of(candidate_ty) else {
@@ -8500,7 +8799,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 if is_boxed_scalar(candidate_ty) {
                     self.emit_box_scalar();
                 }
-                self.asm.store_local(Reg::X0, wanted);
+                self.store_local(Reg::X0, wanted);
                 self.emit_root_frame_slot(wanted);
                 let Some(value_elem) = value_elem else {
                     self.asm.mov_imm64(Reg::X0, 0);
@@ -8515,19 +8814,19 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let missing = self.asm.new_label();
                 let done = self.asm.new_label();
                 self.asm.bind(loop_start);
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.asm.branch(missing, BranchKind::CompareZero(Reg::X0));
                 self.emit_gc_load_ptr(Reg::X0, 0); // this entry
                 self.emit_gc_load_ptr(Reg::X0, 8); // its value
                 if is_boxed_scalar(elem_value_type(value_elem)) {
                     self.emit_unbox_scalar();
                 }
-                self.asm.load_local(Reg::X1, wanted);
+                self.load_local(Reg::X1, wanted);
                 self.emit_elem_eq_boxed_rhs(value_elem);
                 self.asm.branch(found, BranchKind::CompareNonZero(Reg::X0));
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.emit_gc_load_ptr(Reg::X0, 8);
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.asm.branch(loop_start, BranchKind::Unconditional);
                 self.asm.bind(found);
                 self.asm.mov_imm64(Reg::X0, 1);
@@ -8552,10 +8851,10 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 };
                 let cursor = self.reserve_locals(16);
                 let acc = cursor + 8;
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.emit_root_frame_slot(cursor);
                 self.asm.mov_imm64(Reg::X0, 0);
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.emit_root_frame_slot(acc);
                 let key_ty = self.expression(&arguments[1])?;
                 let Some(key_elem) = list_elem_of(key_ty) else {
@@ -8565,7 +8864,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     self.emit_box_scalar();
                 }
                 let key_slot = self.reserve_locals(8);
-                self.asm.store_local(Reg::X0, key_slot);
+                self.store_local(Reg::X0, key_slot);
                 self.emit_root_frame_slot(key_slot);
                 let Some((existing_key, existing_value)) = existing else {
                     // Removing from the empty map is the empty map.
@@ -8581,7 +8880,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let keep = self.asm.new_label();
                 let next = self.asm.new_label();
                 self.asm.bind(loop_start);
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
                 self.emit_gc_load_ptr(Reg::X0, 0); // this entry
                 self.push_rooted(Reg::X0);
@@ -8589,7 +8888,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 if is_boxed_scalar(elem_value_type(key_elem)) {
                     self.emit_unbox_scalar();
                 }
-                self.asm.load_local(Reg::X1, key_slot);
+                self.load_local(Reg::X1, key_slot);
                 self.emit_elem_eq_boxed_rhs(key_elem);
                 self.asm.branch(keep, BranchKind::CompareZero(Reg::X0));
                 self.pop_rooted(Reg::X1); // the matching entry, dropped
@@ -8597,16 +8896,16 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 self.asm.bind(keep);
                 self.pop_rooted(Reg::X0);
                 self.push_rooted(Reg::X0);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 self.emit_cons_cell();
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.asm.bind(next);
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.emit_gc_load_ptr(Reg::X0, 8);
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.asm.branch(loop_start, BranchKind::Unconditional);
                 self.asm.bind(done);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 let reverse = self.reverse_label();
                 self.asm.branch(reverse, BranchKind::Link);
                 self.close_temp_roots(mark);
@@ -8631,28 +8930,28 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let elem = if wants_keys { key_elem } else { value_elem };
                 let cursor = self.reserve_locals(16);
                 let acc = cursor + 8;
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.emit_root_frame_slot(cursor);
                 self.asm.mov_imm64(Reg::X0, 0);
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.emit_root_frame_slot(acc);
                 let loop_start = self.asm.new_label();
                 let done = self.asm.new_label();
                 self.asm.bind(loop_start);
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
                 self.emit_gc_load_ptr(Reg::X0, 0); // entry
                 self.emit_gc_load_ptr(Reg::X0, field); // its key or value
                 self.push_rooted(Reg::X0);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 self.emit_cons_cell();
-                self.asm.store_local(Reg::X0, acc);
-                self.asm.load_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, acc);
+                self.load_local(Reg::X0, cursor);
                 self.emit_gc_load_ptr(Reg::X0, 8);
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.asm.branch(loop_start, BranchKind::Unconditional);
                 self.asm.bind(done);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 let reverse = self.reverse_label();
                 self.asm.branch(reverse, BranchKind::Link);
                 self.close_temp_roots(mark);
@@ -8783,27 +9082,27 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let cursor = acc + 8;
                 let mark = self.open_temp_roots();
                 self.asm.mov_imm64(Reg::X0, 0); // nil
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.emit_root_frame_slot(acc);
                 self.asm.mov_reg(Reg::X0, Reg::X23); // envp
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 let loop_start = self.asm.new_label();
                 let done = self.asm.new_label();
                 self.asm.bind(loop_start);
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.asm.ldr_imm(Reg::X0, Reg::X0, 0); // this entry
                 self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
                 self.emit_heap_string_from_cstring();
                 self.push_rooted(Reg::X0);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 self.emit_cons_cell();
-                self.asm.store_local(Reg::X0, acc);
-                self.asm.load_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, acc);
+                self.load_local(Reg::X0, cursor);
                 self.asm.add_reg_imm(Reg::X0, Reg::X0, 8);
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.asm.branch(loop_start, BranchKind::Unconditional);
                 self.asm.bind(done);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 let reverse = self.reverse_label();
                 self.asm.branch(reverse, BranchKind::Link);
                 self.close_temp_roots(mark);
@@ -8813,15 +9112,15 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let acc = self.reserve_locals(8);
                 let mark = self.open_temp_roots();
                 self.asm.mov_imm64(Reg::X0, 0); // nil
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.emit_root_frame_slot(acc);
                 let index = self.reserve_locals(8);
                 self.asm.mov_imm64(Reg::X0, 1);
-                self.asm.store_local(Reg::X0, index);
+                self.store_local(Reg::X0, index);
                 let loop_start = self.asm.new_label();
                 let done = self.asm.new_label();
                 self.asm.bind(loop_start);
-                self.asm.load_local(Reg::X0, index);
+                self.load_local(Reg::X0, index);
                 self.asm.cmp_reg(Reg::X0, Reg::X21); // argc
                 self.asm.branch(done, BranchKind::Conditional(Cond::Ge));
                 // argv[index]
@@ -8830,15 +9129,15 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 self.asm.ldr_imm(Reg::X0, Reg::X0, 0);
                 self.emit_heap_string_from_cstring();
                 self.push_rooted(Reg::X0);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 self.emit_cons_cell();
-                self.asm.store_local(Reg::X0, acc);
-                self.asm.load_local(Reg::X0, index);
+                self.store_local(Reg::X0, acc);
+                self.load_local(Reg::X0, index);
                 self.asm.add_reg_imm(Reg::X0, Reg::X0, 1);
-                self.asm.store_local(Reg::X0, index);
+                self.store_local(Reg::X0, index);
                 self.asm.branch(loop_start, BranchKind::Unconditional);
                 self.asm.bind(done);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 let reverse = self.reverse_label();
                 self.asm.branch(reverse, BranchKind::Link);
                 self.close_temp_roots(mark);
@@ -8912,6 +9211,11 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 if self.expression(&arguments[0])? != ValueType::Int {
                     return Err(unsupported(arguments[0].span(), "exiting with a non-Int"));
                 }
+                if self.gc_gen.is_some() {
+                    self.asm.push(Reg::X0);
+                    self.emit_generational_worker_shutdown();
+                    self.asm.pop(Reg::X0);
+                }
                 self.asm.mov_reg(Reg::X0, Reg::X0);
                 self.asm.mov_imm64(Reg::X16, u64::from(SYS_EXIT));
                 self.asm.svc_0x80();
@@ -8919,14 +9223,19 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 self.asm.mov_imm64(Reg::X0, 0);
                 Ok(Some(ValueType::Never))
             }
+            ("StandardInput#all", 0) if self.gc_gen.is_some() => {
+                self.asm.mov_imm64(Reg::X0, 0);
+                self.emit_read_fd_to_string(false);
+                Ok(Some(ValueType::Str))
+            }
             // `StandardInput#lines()`: everything on standard input, split the
             // way `FileInput#lines` splits a file -- no trailing empty line.
             ("StandardInput#lines", 0) => {
                 let mark = self.open_temp_roots();
                 self.asm.mov_imm64(Reg::X0, 0); // fd 0
-                self.emit_read_fd_to_string();
+                self.emit_read_fd_to_string(false);
                 let text = self.declare_local("__stdin_text", ValueType::Str);
-                self.asm.store_local(Reg::X0, text);
+                self.store_local(Reg::X0, text);
                 self.emit_root_frame_slot(text);
                 let name_expr = |name: &str| Expr::Identifier {
                     name: name.to_string(),
@@ -8952,7 +9261,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 );
                 let parts_ty = self.expression(&split)?;
                 let parts = self.declare_local("__stdin_parts", parts_ty);
-                self.asm.store_local(Reg::X0, parts);
+                self.store_local(Reg::X0, parts);
                 self.emit_root_frame_slot(parts);
                 let trimmed = Expr::If {
                     condition: Box::new(call(
@@ -8992,6 +9301,10 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             ("sleep", 1) => {
                 if self.expression(&arguments[0])? != ValueType::Int {
                     return Err(unsupported(arguments[0].span(), "sleeping for a non-Int"));
+                }
+                if self.gc_gen.is_some() {
+                    self.emit_generational_sleep();
+                    return Ok(Some(ValueType::Unit));
                 }
                 self.asm.push(Reg::X0); // millis
                 self.emit_time_now_millis(); // x0 = now
@@ -9182,7 +9495,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     _ => return Err(unsupported(span, "a set builtin on a non-set")),
                 };
                 let source = self.reserve_locals(8);
-                self.asm.store_local(Reg::X0, source);
+                self.store_local(Reg::X0, source);
                 self.emit_root_frame_slot(source);
                 let value_ty = self.expression(&arguments[1])?;
                 let Some(elem) = list_elem_of(value_ty) else {
@@ -9195,7 +9508,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     return Err(unsupported(span, "adding an element of another type"));
                 }
                 let raw = self.reserve_locals(8);
-                self.asm.store_local(Reg::X0, raw);
+                self.store_local(Reg::X0, raw);
                 if is_heap_pointer(value_ty) {
                     self.emit_root_frame_slot(raw);
                 }
@@ -9203,7 +9516,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 if is_boxed_scalar(value_ty) {
                     self.emit_box_scalar();
                 }
-                self.asm.store_local(Reg::X0, boxed);
+                self.store_local(Reg::X0, boxed);
                 self.emit_root_frame_slot(boxed);
                 // Already a member? Then the set is its own answer.
                 let present = self.asm.new_label();
@@ -9215,14 +9528,14 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 // `Set#add(s, x)` did when `x` was already there.
                 let acc = self.reserve_locals(8);
                 self.asm.mov_imm64(Reg::X0, 0);
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.emit_root_frame_slot(acc);
                 let cursor = self.reserve_locals(8);
-                self.asm.load_local(Reg::X0, source);
-                self.asm.store_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, source);
+                self.store_local(Reg::X0, cursor);
                 self.emit_root_frame_slot(cursor);
-                self.asm.load_local(Reg::X1, raw);
-                self.asm.load_local(Reg::X0, source);
+                self.load_local(Reg::X1, raw);
+                self.load_local(Reg::X0, source);
                 let member = self.member_label(elem);
                 self.asm.branch(member, BranchKind::Link);
                 self.asm
@@ -9230,27 +9543,27 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let loop_start = self.asm.new_label();
                 let copied = self.asm.new_label();
                 self.asm.bind(loop_start);
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.asm.branch(copied, BranchKind::CompareZero(Reg::X0));
                 self.emit_gc_load_ptr(Reg::X0, 0); // the element, already boxed
                 self.push_rooted(Reg::X0); // head for the cons below
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 self.emit_cons_cell();
-                self.asm.store_local(Reg::X0, acc);
-                self.asm.load_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, acc);
+                self.load_local(Reg::X0, cursor);
                 self.emit_gc_load_ptr(Reg::X0, 8);
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.asm.branch(loop_start, BranchKind::Unconditional);
                 self.asm.bind(copied);
-                self.asm.load_local(Reg::X0, boxed);
+                self.load_local(Reg::X0, boxed);
                 self.push_rooted(Reg::X0);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 self.emit_cons_cell();
                 let reverse = self.reverse_label();
                 self.asm.branch(reverse, BranchKind::Link);
                 self.asm.branch(end, BranchKind::Unconditional);
                 self.asm.bind(present);
-                self.asm.load_local(Reg::X0, source);
+                self.load_local(Reg::X0, source);
                 self.asm.bind(end);
                 self.close_temp_roots(mark);
                 Ok(Some(ValueType::Set(elem)))
@@ -9270,16 +9583,16 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     _ => return Err(unsupported(span, "a set builtin on a non-collection")),
                 };
                 let cursor = self.reserve_locals(8);
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.emit_root_frame_slot(cursor);
                 let acc = self.reserve_locals(8);
                 self.asm.mov_imm64(Reg::X0, 0);
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.emit_root_frame_slot(acc);
                 let loop_start = self.asm.new_label();
                 let done = self.asm.new_label();
                 self.asm.bind(loop_start);
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
                 self.emit_gc_load_ptr(Reg::X0, 0); // the element, already boxed
                 self.push_rooted(Reg::X0); // survives the scan, and is the head
@@ -9287,25 +9600,25 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     self.emit_unbox_scalar();
                 }
                 self.asm.mov_reg(Reg::X1, Reg::X0); // candidate
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 let member = self.member_label(elem);
                 self.asm.branch(member, BranchKind::Link);
                 let skip = self.asm.new_label();
                 let after = self.asm.new_label();
                 self.asm.branch(skip, BranchKind::CompareNonZero(Reg::X0));
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 self.emit_cons_cell(); // takes the parked head
-                self.asm.store_local(Reg::X0, acc);
+                self.store_local(Reg::X0, acc);
                 self.asm.branch(after, BranchKind::Unconditional);
                 self.asm.bind(skip);
                 self.pop_rooted(Reg::X0); // a duplicate: drop the parked head
                 self.asm.bind(after);
-                self.asm.load_local(Reg::X0, cursor);
+                self.load_local(Reg::X0, cursor);
                 self.emit_gc_load_ptr(Reg::X0, 8);
-                self.asm.store_local(Reg::X0, cursor);
+                self.store_local(Reg::X0, cursor);
                 self.asm.branch(loop_start, BranchKind::Unconditional);
                 self.asm.bind(done);
-                self.asm.load_local(Reg::X0, acc);
+                self.load_local(Reg::X0, acc);
                 let reverse = self.reverse_label();
                 self.asm.branch(reverse, BranchKind::Link);
                 self.close_temp_roots(mark);
@@ -9510,8 +9823,10 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             ("Dir#exists", 1) | ("FileOutput#exists", 1) => {
                 self.emit_path_cstring(&arguments[0])?;
                 self.asm.mov_imm64(Reg::X1, 0); // F_OK
+                self.emit_generational_native_transition(true);
                 self.asm.mov_imm64(Reg::X16, u64::from(SYS_ACCESS));
                 self.asm.svc_0x80();
+                self.emit_generational_native_transition(false);
                 self.asm.cset_syscall_succeeded();
                 Ok(Some(ValueType::Bool))
             }
@@ -9566,7 +9881,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 self.emit_path_cstring(&arguments[0])?;
                 self.emit_file_read_all();
                 let text = self.declare_local("__file_lines_text", ValueType::Str);
-                self.asm.store_local(Reg::X0, text);
+                self.store_local(Reg::X0, text);
                 self.emit_root_frame_slot(text);
                 let name_expr = |name: &str| Expr::Identifier {
                     name: name.to_string(),
@@ -9592,7 +9907,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 );
                 let parts_ty = self.expression(&split)?;
                 let parts = self.declare_local("__file_lines_parts", parts_ty);
-                self.asm.store_local(Reg::X0, parts);
+                self.store_local(Reg::X0, parts);
                 self.emit_root_frame_slot(parts);
                 let trimmed = Expr::If {
                     condition: Box::new(call(
@@ -9701,6 +10016,21 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 Ok(Some(ValueType::Bool))
             }
             ("Dir#move", 2) => {
+                if self.gc_gen.is_some() {
+                    if self.expression(&arguments[0])? != ValueType::Str {
+                        return Err(unsupported(span, "move with non-string source"));
+                    }
+                    self.push_rooted(Reg::X0);
+                    if self.expression(&arguments[1])? != ValueType::Str {
+                        return Err(unsupported(span, "move with non-string target"));
+                    }
+                    self.emit_generational_path_cstring();
+                    self.asm.mov_reg(Reg::X1, Reg::X0);
+                    self.pop_rooted(Reg::X0);
+                    self.emit_generational_path_cstring();
+                    self.emit_dir_move();
+                    return Ok(Some(ValueType::Unit));
+                }
                 self.emit_path_cstring(&arguments[0])?;
                 // The source waits as a root: a run-time target path allocates,
                 // and a collection would move the buffer it is parked in.
@@ -9849,38 +10179,38 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         let cursor = self.reserve_locals(24);
         let acc = cursor + 8;
         let sep = acc + 8;
-        self.asm.store_local(Reg::X0, cursor);
+        self.store_local(Reg::X0, cursor);
         self.emit_root_frame_slot(cursor);
         let open_offset = self.asm.intern_string_object(open);
         self.asm.load_rodata_address(Reg::X0, open_offset);
         self.emit_heap_string_copy();
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         self.emit_root_frame_slot(acc);
         self.asm.mov_imm64(Reg::X0, 0);
-        self.asm.store_local(Reg::X0, sep);
+        self.store_local(Reg::X0, sep);
 
         let loop_start = self.asm.new_label();
         let done = self.asm.new_label();
         let no_sep = self.asm.new_label();
         self.asm.bind(loop_start);
-        self.asm.load_local(Reg::X0, cursor);
+        self.load_local(Reg::X0, cursor);
         self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
         // Separator before every element but the first.
-        self.asm.load_local(Reg::X0, sep);
+        self.load_local(Reg::X0, sep);
         self.asm.branch(no_sep, BranchKind::CompareZero(Reg::X0));
         let comma_offset = self.asm.intern_string_object(", ");
         self.asm.load_rodata_address(Reg::X0, comma_offset);
         self.emit_heap_string_copy();
         self.asm.mov_reg(Reg::X1, Reg::X0);
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         self.emit_str_concat();
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         self.asm.bind(no_sep);
         self.asm.mov_imm64(Reg::X0, 1);
-        self.asm.store_local(Reg::X0, sep);
+        self.store_local(Reg::X0, sep);
         // The element's own text.
         let elem_ty = elem_value_type(elem);
-        self.asm.load_local(Reg::X0, cursor);
+        self.load_local(Reg::X0, cursor);
         self.emit_gc_load_ptr(Reg::X0, 0);
         if is_boxed_scalar(elem_ty) {
             self.emit_unbox_scalar();
@@ -9908,13 +10238,13 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             ListElem::Double => self.emit_double_to_str(span)?,
         }
         self.asm.mov_reg(Reg::X1, Reg::X0);
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         self.emit_str_concat();
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         // Advance.
-        self.asm.load_local(Reg::X0, cursor);
+        self.load_local(Reg::X0, cursor);
         self.emit_gc_load_ptr(Reg::X0, 8);
-        self.asm.store_local(Reg::X0, cursor);
+        self.store_local(Reg::X0, cursor);
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(done);
 
@@ -9922,7 +10252,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         self.asm.load_rodata_address(Reg::X0, close_offset);
         self.emit_heap_string_copy();
         self.asm.mov_reg(Reg::X1, Reg::X0);
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         self.emit_str_concat();
         self.close_temp_roots(mark);
         Ok(())
@@ -9934,9 +10264,9 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         self.asm.load_rodata_address(Reg::X0, offset);
         self.emit_heap_string_copy();
         self.asm.mov_reg(Reg::X1, Reg::X0);
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         self.emit_str_concat();
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
     }
 
     /// The rendering `emit_print_enum_inline` writes to stdout, built as a heap
@@ -9958,14 +10288,14 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         let mark = self.open_temp_roots();
         let value = self.reserve_locals(16);
         let acc = value + 8;
-        self.asm.store_local(Reg::X0, value);
+        self.store_local(Reg::X0, value);
         self.emit_root_frame_slot(value);
         // The builder starts empty, and is rooted before any branch so every
         // path through the switch below has pushed the same roots.
         let empty = self.asm.intern_string_object("");
         self.asm.load_rodata_address(Reg::X0, empty);
         self.emit_heap_string_copy();
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         self.emit_root_frame_slot(acc);
         let end = self.asm.new_label();
         for (tag, (variant, arity)) in variants.iter().enumerate() {
@@ -9973,7 +10303,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 continue;
             }
             let next = self.asm.new_label();
-            self.asm.load_local(Reg::X0, value);
+            self.load_local(Reg::X0, value);
             self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
             self.emit_unbox_scalar();
             self.asm.cmp_imm(Reg::X0, tag as u32);
@@ -9986,7 +10316,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     if position > 0 {
                         self.emit_append_literal(acc, ", ");
                     }
-                    self.asm.load_local(Reg::X0, value);
+                    self.load_local(Reg::X0, value);
                     self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
                     if is_boxed_scalar(field_ty) {
                         self.emit_unbox_scalar();
@@ -10013,9 +10343,9 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                         }
                     }
                     self.asm.mov_reg(Reg::X1, Reg::X0);
-                    self.asm.load_local(Reg::X0, acc);
+                    self.load_local(Reg::X0, acc);
                     self.emit_str_concat();
-                    self.asm.store_local(Reg::X0, acc);
+                    self.store_local(Reg::X0, acc);
                 }
                 self.emit_append_literal(acc, ")");
             }
@@ -10023,7 +10353,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             self.asm.bind(next);
         }
         self.asm.bind(end);
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         self.close_temp_roots(mark);
         Ok(())
     }
@@ -10060,17 +10390,17 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         let mark = self.open_temp_roots();
         let value = self.reserve_locals(16);
         let acc = value + 8;
-        self.asm.store_local(Reg::X0, value);
+        self.store_local(Reg::X0, value);
         self.emit_root_frame_slot(value);
         let empty = self.asm.intern_string_object("");
         self.asm.load_rodata_address(Reg::X0, empty);
         self.emit_heap_string_copy();
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         self.emit_root_frame_slot(acc);
         let end = self.asm.new_label();
         for (tag, (name, fields)) in variants.iter().enumerate() {
             let next = self.asm.new_label();
-            self.asm.load_local(Reg::X0, value);
+            self.load_local(Reg::X0, value);
             self.emit_gc_load_ptr(Reg::X0, 0); // the boxed tag
             self.emit_unbox_scalar();
             self.asm.cmp_imm(Reg::X0, tag as u32);
@@ -10082,7 +10412,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     if position > 0 {
                         self.emit_append_literal(acc, ", ");
                     }
-                    self.asm.load_local(Reg::X0, value);
+                    self.load_local(Reg::X0, value);
                     self.emit_gc_load_ptr(Reg::X0, (position as u32 + 1) * 8);
                     match repr {
                         LoweredFieldRepr::Int => {
@@ -10109,9 +10439,9 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                         }
                     }
                     self.asm.mov_reg(Reg::X1, Reg::X0);
-                    self.asm.load_local(Reg::X0, acc);
+                    self.load_local(Reg::X0, acc);
                     self.emit_str_concat();
-                    self.asm.store_local(Reg::X0, acc);
+                    self.store_local(Reg::X0, acc);
                 }
                 self.emit_append_literal(acc, ")");
             }
@@ -10119,7 +10449,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             self.asm.bind(next);
         }
         self.asm.bind(end);
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         self.close_temp_roots(mark);
         Ok(())
     }
@@ -10656,26 +10986,26 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         let cursor = self.reserve_locals(24);
         let acc = cursor + 8;
         let param_slot = acc + 8;
-        self.asm.store_local(Reg::X0, cursor);
+        self.store_local(Reg::X0, cursor);
         self.emit_root_frame_slot(cursor);
         self.asm.mov_imm64(Reg::X0, 0); // acc = nil
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         self.emit_root_frame_slot(acc);
 
         let elem_ty = elem_value_type(elem);
         let loop_start = self.asm.new_label();
         let done = self.asm.new_label();
         self.asm.bind(loop_start);
-        self.asm.load_local(Reg::X0, cursor);
+        self.load_local(Reg::X0, cursor);
         self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
         // element = [cursor + 0], unboxed when it is a scalar
         self.emit_gc_load_ptr(Reg::X0, 0);
         if is_boxed_scalar(elem_ty) {
             self.emit_unbox_scalar();
         }
-        self.asm.store_local(Reg::X0, param_slot);
+        self.store_local(Reg::X0, param_slot);
         self.push_binding_scopes();
-        self.scope_root_counts.push(0);
+        self.scope_root_slots.push(Vec::new());
         self.scopes
             .last_mut()
             .expect("emitter scope")
@@ -10692,21 +11022,20 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         }
         // acc = cons(mapped, acc)
         self.push_rooted(Reg::X0);
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         self.emit_cons_cell();
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         self.pop_binding_scopes();
-        let roots = self.scope_root_counts.pop().expect("emitter root scope");
-        self.emit_shadow_pop(roots);
+        self.close_root_scope();
         // cursor = [cursor + 8]
-        self.asm.load_local(Reg::X0, cursor);
+        self.load_local(Reg::X0, cursor);
         self.emit_gc_load_ptr(Reg::X0, 8);
-        self.asm.store_local(Reg::X0, cursor);
+        self.store_local(Reg::X0, cursor);
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(done);
 
         // Prepending reversed the order; put it back.
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         let reverse = self.reverse_label();
         self.asm.push_frame_record(); // the bl clobbers x30
         self.asm.branch(reverse, BranchKind::Link);
@@ -11755,7 +12084,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         let cursor = acc + 8;
         let acc_slot = cursor + 8;
         let elem_slot = acc_slot + 8;
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         if is_heap_pointer(initial_ty) {
             self.emit_root_frame_slot(acc);
         }
@@ -11766,7 +12095,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             ValueType::EmptyList => return Ok(initial_ty),
             _ => return Err(unsupported(list.span(), "folding over this value")),
         };
-        self.asm.store_local(Reg::X0, cursor);
+        self.store_local(Reg::X0, cursor);
         self.emit_root_frame_slot(cursor);
 
         let elem_ty = elem_value_type(elem);
@@ -11798,17 +12127,17 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         let loop_start = self.asm.new_label();
         let done = self.asm.new_label();
         self.asm.bind(loop_start);
-        self.asm.load_local(Reg::X0, cursor);
+        self.load_local(Reg::X0, cursor);
         self.asm.branch(done, BranchKind::CompareZero(Reg::X0));
         self.emit_gc_load_ptr(Reg::X0, 0);
         if is_boxed_scalar(elem_ty) {
             self.emit_unbox_scalar();
         }
-        self.asm.store_local(Reg::X0, elem_slot);
-        self.asm.load_local(Reg::X0, acc);
-        self.asm.store_local(Reg::X0, acc_slot);
+        self.store_local(Reg::X0, elem_slot);
+        self.load_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc_slot);
         self.push_binding_scopes();
-        self.scope_root_counts.push(0);
+        self.scope_root_slots.push(Vec::new());
         {
             let scope = self.scopes.last_mut().expect("emitter scope");
             scope.insert(acc_param.to_string(), (acc_slot, acc_ty));
@@ -11827,16 +12156,15 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 "a fold whose accumulator changes type",
             ));
         }
-        self.asm.store_local(Reg::X0, acc);
+        self.store_local(Reg::X0, acc);
         self.pop_binding_scopes();
-        let roots = self.scope_root_counts.pop().expect("emitter root scope");
-        self.emit_shadow_pop(roots);
-        self.asm.load_local(Reg::X0, cursor);
+        self.close_root_scope();
+        self.load_local(Reg::X0, cursor);
         self.emit_gc_load_ptr(Reg::X0, 8);
-        self.asm.store_local(Reg::X0, cursor);
+        self.store_local(Reg::X0, cursor);
         self.asm.branch(loop_start, BranchKind::Unconditional);
         self.asm.bind(done);
-        self.asm.load_local(Reg::X0, acc);
+        self.load_local(Reg::X0, acc);
         self.close_temp_roots(mark);
         let _ = span;
         Ok(acc_ty)
@@ -12006,7 +12334,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
             for (param, argument) in lambda_params.iter().zip(arguments) {
                 let ty = self.expression(argument)?;
                 let slot = self.reserve_locals(8);
-                self.asm.store_local(Reg::X0, slot);
+                self.store_local(Reg::X0, slot);
                 if is_heap_pointer(ty) {
                     self.emit_root_frame_slot(slot);
                 }
@@ -12054,7 +12382,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         for (param, argument) in function.params.iter().zip(arguments) {
             let ty = self.expression(argument)?;
             let slot = self.reserve_locals(8);
-            self.asm.store_local(Reg::X0, slot);
+            self.store_local(Reg::X0, slot);
             if is_heap_pointer(ty) {
                 self.emit_root_frame_slot(slot);
             }
@@ -12330,19 +12658,28 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         // shadow anything, and park each one in its own slot.
         let mut bound = Vec::with_capacity(params.len());
         let saved_offset = self.next_local_offset;
+        let precise = self.gc_gen.is_some();
+        if precise {
+            self.scope_root_slots.push(Vec::new());
+        }
         for argument in arguments {
             let ty = self.expression(argument)?;
             if ty == ValueType::Unit {
                 return Err(unsupported(argument.span(), "a unit-typed argument"));
             }
             let offset = self.reserve_locals(8);
-            self.asm.store_local(Reg::X0, offset);
+            self.store_local(Reg::X0, offset);
+            if precise && is_heap_pointer(ty) {
+                self.emit_root_frame_slot(offset);
+            }
             bound.push((offset, ty));
         }
         self.push_binding_scopes();
         // What the lambda closed over, before its parameters shadow anything.
         self.install_captured_env(index);
-        self.scope_root_counts.push(0);
+        if !precise {
+            self.scope_root_slots.push(Vec::new());
+        }
         for (param, (offset, ty)) in params.iter().zip(bound.iter()) {
             self.scopes
                 .last_mut()
@@ -12350,14 +12687,13 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 .insert(param.clone(), (*offset, *ty));
             // A heap-reference parameter is a root for the body's duration,
             // exactly like a binding of the same type would be.
-            if is_heap_pointer(*ty) {
+            if !precise && is_heap_pointer(*ty) {
                 self.emit_root_frame_slot(*offset);
             }
         }
         let result = self.expression(&body)?;
         self.pop_binding_scopes();
-        let roots = self.scope_root_counts.pop().expect("emitter root scope");
-        self.emit_shadow_pop(roots);
+        self.close_root_scope();
         // The parameter slots are dead now; let the next call reuse them.
         self.release_locals_to(saved_offset);
         Ok(result)
@@ -12611,8 +12947,10 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         let frame_patch = self.asm.sub_sp_placeholder();
         self.asm.mov_fp_sp();
 
+        let saved_root_frame_base = self.root_frame_base;
+        self.root_frame_base = self.scope_root_slots.len();
         self.push_binding_scopes();
-        self.scope_root_counts.push(0);
+        self.scope_root_slots.push(Vec::new());
         for (param, lambda) in &lambda_params {
             self.lambda_bindings
                 .last_mut()
@@ -12637,7 +12975,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         let mut param_slots = Vec::new();
         for (position, (param, ty)) in params.iter().enumerate() {
             let offset = self.declare_local(param, *ty);
-            self.asm.store_local(ARG_REGS[position], offset);
+            self.store_local(ARG_REGS[position], offset);
             if is_heap_pointer(*ty) {
                 param_slots.push(offset);
             }
@@ -12651,8 +12989,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         self.pop_binding_scopes();
         // Drop this activation's roots before returning; the result is in
         // x0, which the pop helper preserves.
-        let roots = self.scope_root_counts.pop().expect("emitter root scope");
-        self.emit_shadow_pop(roots);
+        self.close_root_scope();
         // The body is compiled, so the frame's real size is known: fill in the
         // reservation and take it back down the same amount.
         let frame_size = self.max_local_offset.div_ceil(16) * 16;
@@ -12663,6 +13000,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         self.next_local_offset = saved_offset;
         self.max_local_offset = saved_max;
         self.matched_enum_slots = saved_matched;
+        self.root_frame_base = saved_root_frame_base;
         // A body narrower than the registered return type is fine: two shapes
         // of one enum have the same representation, and the wider one is what
         // callers were told. Merging is how "narrower" is decided, since what a
@@ -12711,22 +13049,22 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         }
         let argument = &arguments[0];
         if let Some(line) = Self::literal_line(argument)? {
-            self.asm.emit_write_rodata(STDOUT_FD, line.as_bytes());
+            self.emit_console_rodata(STDOUT_FD, line.as_bytes());
             return Ok(());
         }
         if let Some(number) = self.static_double_of(argument) {
             let line = format!("{}\n", format_double(number));
-            self.asm.emit_write_rodata(STDOUT_FD, line.as_bytes());
+            self.emit_console_rodata(STDOUT_FD, line.as_bytes());
             return Ok(());
         }
         match self.expression(argument)? {
             ValueType::Int => {
-                self.asm.emit_print_int_line();
+                self.emit_console_int_line();
                 Ok(())
             }
             ValueType::Double => {
                 self.emit_print_double(argument.span())?;
-                self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+                self.emit_console_rodata(STDOUT_FD, b"\n");
                 Ok(())
             }
             ValueType::Str => {
@@ -12738,7 +13076,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 Ok(())
             }
             ValueType::EmptyList => {
-                self.asm.emit_write_rodata(STDOUT_FD, b"[]\n");
+                self.emit_console_rodata(STDOUT_FD, b"[]\n");
                 Ok(())
             }
             ValueType::Set(elem) => {
@@ -12746,7 +13084,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 Ok(())
             }
             ValueType::EmptySet => {
-                self.asm.emit_write_rodata(STDOUT_FD, b"%()\n");
+                self.emit_console_rodata(STDOUT_FD, b"%()\n");
                 Ok(())
             }
             ValueType::Map(key, value) => {
@@ -12754,7 +13092,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 Ok(())
             }
             ValueType::EmptyMap => {
-                self.asm.emit_write_rodata(STDOUT_FD, b"%[]\n");
+                self.emit_console_rodata(STDOUT_FD, b"%[]\n");
                 Ok(())
             }
             ValueType::Record(index) => {
@@ -12766,21 +13104,21 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 let end_label = self.asm.new_label();
                 self.asm
                     .branch(false_label, BranchKind::CompareZero(Reg::X0));
-                self.asm.emit_write_rodata(STDOUT_FD, b"true\n");
+                self.emit_console_rodata(STDOUT_FD, b"true\n");
                 self.asm.branch(end_label, BranchKind::Unconditional);
                 self.asm.bind(false_label);
-                self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
+                self.emit_console_rodata(STDOUT_FD, b"false\n");
                 self.asm.bind(end_label);
                 Ok(())
             }
             ValueType::Null => {
-                self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
+                self.emit_console_rodata(STDOUT_FD, b"null\n");
                 Ok(())
             }
             // The evaluator prints unit as `()`, and an assignment is a unit
             // now, so a program can reach here by printing one.
             ValueType::Unit => {
-                self.asm.emit_write_rodata(STDOUT_FD, b"()\n");
+                self.emit_console_rodata(STDOUT_FD, b"()\n");
                 Ok(())
             }
             // `null` or a value: the evaluator prints the word `null` for the
@@ -12805,10 +13143,10 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                         let bool_end = self.asm.new_label();
                         self.asm
                             .branch(false_label, BranchKind::CompareZero(Reg::X0));
-                        self.asm.emit_write_rodata(STDOUT_FD, b"true\n");
+                        self.emit_console_rodata(STDOUT_FD, b"true\n");
                         self.asm.branch(bool_end, BranchKind::Unconditional);
                         self.asm.bind(false_label);
-                        self.asm.emit_write_rodata(STDOUT_FD, b"false\n");
+                        self.emit_console_rodata(STDOUT_FD, b"false\n");
                         self.asm.bind(bool_end);
                     }
                     // Everything `emit_print_elem` can already render: a
@@ -12820,28 +13158,28 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                     | ListElem::LoweredEnum(_)
                     | ListElem::Nested { .. } => {
                         self.emit_print_elem(elem, argument.span())?;
-                        self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+                        self.emit_console_rodata(STDOUT_FD, b"\n");
                         self.asm.branch(end_label, BranchKind::Unconditional);
                         self.asm.bind(null_label);
-                        self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
+                        self.emit_console_rodata(STDOUT_FD, b"null\n");
                         self.asm.bind(end_label);
                         return Ok(());
                     }
                 }
                 self.asm.branch(end_label, BranchKind::Unconditional);
                 self.asm.bind(null_label);
-                self.asm.emit_write_rodata(STDOUT_FD, b"null\n");
+                self.emit_console_rodata(STDOUT_FD, b"null\n");
                 self.asm.bind(end_label);
                 Ok(())
             }
             ValueType::LoweredEnum(index) => {
                 self.emit_print_lowered_enum(index, argument.span())?;
-                self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+                self.emit_console_rodata(STDOUT_FD, b"\n");
                 Ok(())
             }
             ValueType::Enum(shape) => {
                 self.emit_print_enum_inline(shape, argument.span())?;
-                self.asm.emit_write_rodata(STDOUT_FD, b"\n");
+                self.emit_console_rodata(STDOUT_FD, b"\n");
                 Ok(())
             }
             other => Err(unsupported(
@@ -12855,14 +13193,13 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
         match expr {
             Expr::Block { expressions, .. } => {
                 self.push_binding_scopes();
-                self.scope_root_counts.push(0);
+                self.scope_root_slots.push(Vec::new());
                 self.collect_block_widenings(expressions);
                 for expression in expressions {
                     self.statement(expression)?;
                 }
                 self.pop_binding_scopes();
-                let roots = self.scope_root_counts.pop().expect("emitter root scope");
-                self.emit_shadow_pop(roots);
+                self.close_root_scope();
                 Ok(())
             }
             // Declarations have no runtime effect in the current
@@ -13048,7 +13385,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 // the merge of them all.
                 let ty = self.widened_mutable_type(name, ty);
                 let offset = self.declare_local(name, ty);
-                self.asm.store_local(Reg::X0, offset);
+                self.store_local(Reg::X0, offset);
                 // M7: a binding that holds a heap reference becomes a
                 // precise GC root for the rest of its scope. Rooting after
                 // the store (rather than zero-then-root) is safe because
@@ -13091,7 +13428,7 @@ exact decimal expansion is too long, or it is NaN/Infinity\n",
                 if !fits {
                     return Err(unsupported(*span, "assignment changing a type"));
                 }
-                self.asm.store_local(Reg::X0, offset);
+                self.store_local(Reg::X0, offset);
                 Ok(())
             }
             Expr::While {
@@ -14065,25 +14402,41 @@ pub(crate) fn emit_macho_program(
     lowered_enums: std::collections::HashSet<String>,
     lowered_enum_table: LoweredEnumTable,
     gc_log: bool,
+    gc_log_format: crate::GcLogFormat,
     gc_stress: bool,
     gc_poison: bool,
     gc_generational: bool,
+    gc_max_heap: u64,
+    gc_soft_max_heap: Option<u64>,
+    gc_max_metadata: Option<u64>,
+    gc_min_heap: u64,
+    gc_uncommit_delay_ns: u64,
+    gc_pre_touch: bool,
     fallback_backend_available: bool,
 ) -> Result<Vec<u8>, Diagnostic> {
     let mut emitter = Emitter {
         lowered_enums,
         lowered_enum_table,
         gc_log,
+        gc_log_format,
         gc_stress,
         gc_poison,
         fallback_backend_available,
         ..Emitter::default()
     };
+    emitter.asm.gc_max_heap = Some(gc_max_heap);
+    emitter.asm.gc_soft_max_heap = gc_soft_max_heap;
+    emitter.asm.gc_max_metadata = gc_max_metadata;
+    emitter.asm.gc_min_heap = Some(gc_min_heap);
+    emitter.asm.gc_uncommit_delay_ns = Some(gc_uncommit_delay_ns);
+    emitter.asm.gc_pre_touch = gc_pre_touch;
+    emitter.asm.gc_timing = gc_log;
+    emitter.asm.gc_json_events = gc_log && gc_log_format == crate::GcLogFormat::Json;
     emitter.scopes.push(HashMap::new());
     emitter.lambda_bindings.push(HashMap::new());
     emitter.dict_bindings.push(HashMap::new());
     emitter.alias_bindings.push(HashMap::new());
-    emitter.scope_root_counts.push(0);
+    emitter.scope_root_slots.push(Vec::new());
     collect_records(expr, &mut emitter);
     collect_functions(expr, &mut emitter);
 
@@ -14133,6 +14486,7 @@ pub(crate) fn emit_macho_program(
     } else if gc_log {
         emitter.emit_gc_log_report(&gc);
     }
+    emitter.emit_generational_worker_shutdown();
     emitter.asm.emit_exit(0);
 
     // Emit reached functions; their bodies may reach more.
@@ -14238,6 +14592,41 @@ pub(super) fn gc_clock_test_image() -> Vec<u8> {
     )
 }
 
+#[cfg(test)]
+pub(super) fn gc_root_arithmetic_test_image(mode: u64) -> Vec<u8> {
+    use crate::gc_codegen::production::{Backend, Labels, test_support};
+    let mut asm = Assembler::default();
+    let runtime = asm.reserve_data_cells(test_support::root_arithmetic_runtime_bytes().div_ceil(8));
+    let owner = asm.reserve_data_cells(test_support::root_arithmetic_owner_bytes().div_ceil(8));
+    let dummy = asm.new_label();
+    let labels = Labels::new(
+        || dummy,
+        dummy,
+        dummy,
+        Backend {
+            field_store: dummy,
+            deep_equal: dummy,
+            literals: dummy,
+            raw_roots: false,
+        },
+    );
+    asm.load_data_address(Reg::X3, runtime);
+    asm.load_data_address(Reg::X19, owner);
+    test_support::emit_root_arithmetic(&mut asm, &labels, mode);
+    asm.emit_exit(0);
+    asm.bind(dummy);
+    asm.emit_exit(1);
+    asm.finish();
+    macho::write_executable(
+        asm.code,
+        asm.rodata,
+        &asm.fixups,
+        "klassic-root-arithmetic",
+        asm.bss_len as u64,
+        &asm.imports,
+    )
+}
+
 /// Relocatable metadata helpers for the native conformance owner. ADR replaces
 /// each page-relative GOT address pair, so the payload works at any load base.
 #[cfg(test)]
@@ -14301,10 +14690,6 @@ pub(super) fn gc_atomic_test_code(operation: crate::gc_atomic_tests::Operation) 
 }
 
 #[cfg(test)]
-#[path = "gc_native_frame_arm_fixture.rs"]
-pub(crate) mod native_frame_fixture;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -14358,8 +14743,15 @@ mod tests {
                     Default::default(),
                     Default::default(),
                     false,
+                    crate::GcLogFormat::Text,
                     false,
                     false,
+                    false,
+                    crate::DEFAULT_GC_MAX_HEAP,
+                    None,
+                    None,
+                    crate::DEFAULT_GC_MIN_HEAP,
+                    crate::DEFAULT_GC_UNCOMMIT_DELAY_NS,
                     false,
                     false,
                 )
@@ -14656,3 +15048,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gc_native_frame_arm_fixture.rs"]
+pub(crate) mod native_frame_fixture;

@@ -1,178 +1,311 @@
-//! Heap-field load/store barriers and payload range checks for the direct
-//! generational runtime. Heap fields retain the existing payload-address ABI.
-//! RootCells, copying, remembered-set registration and mark/phase rules remain
-//! the caller's existing contracts; this module adds no new owner protocol.
+//! Colored heap fields and the compiler's typed/raw read boundary.
+//!
+//! Record slots contain GcRef bits; RawBytes payloads are opaque. Scalars
+//! boxed by enum lowering must bypass decoding even if their bits happen to
+//! be a valid reference. Colors and load masks use the adopted ABI snapshot;
+//! production phase publication and generation-specific adoption remain open.
 use super::{
-    HEAP_BYTES, Labels, RT_HEAP_BASE, RT_MARK_ACTIVE, RT_MARK_DONE, YOUNG_END, copy::HEADER, d,
-    load_runtime,
+    Labels, RT_COLLECTING, RT_HEALED, RT_HEAP_BASE, RT_MARK_ACTIVE, RT_MARK_DONE, RT_PHASE_OPEN,
+    copy::DESCRIPTOR, decode, load_rt, load_runtime, store_rt,
 };
+use crate::gc_abi::REMEMBERED_MASK;
 use crate::portable_asm::{Condition as C, PortableAsm, Reg as R};
 
-const HEAP_PAGE: u64 = crate::gc_abi::HEAP_PAGE_BYTES;
-/// Lowest heap offset of a Young payload (first page + one header).
-const YOUNG_LOW: i32 = HEAP_PAGE as i32 + HEADER;
+pub(super) use super::colours::offset;
 
-/// Jump to `outside` unless `value - heap_base` (left in `scratch`) is a
-/// Young payload offset.
+/// A nonnull GC-only heal cannot certify a mutator store's bookkeeping.
+/// Keep both remembered bits until an actual store or remset handoff completes.
+pub(super) fn forget_nonnull<E: PortableAsm>(a: &mut E, value: R, scratch: R) {
+    a.mov_imm64(scratch, u64::from(REMEMBERED_MASK));
+    a.or_reg_reg(value, scratch);
+}
+
 pub(super) fn young_offset<E: PortableAsm>(a: &mut E, value: R, scratch: R, outside: E::TextLabel) {
-    a.mov_reg_reg(scratch, value);
-    a.load_ptr_disp32(value, R::V3, d(RT_HEAP_BASE));
-    a.sub_reg_reg(scratch, value);
-    a.jcc_label(C::Below, outside);
-    a.cmp_reg_imm32(scratch, YOUNG_LOW);
-    a.jcc_label(C::Below, outside);
-    a.cmp_reg_imm32(scratch, YOUNG_END as i32);
-    a.jcc_label(C::AboveOrEqual, outside);
+    offset(a, value, scratch, outside);
+    super::generation::test(a, scratch, super::generation::YOUNG);
+    a.jcc_label(C::NotEqual, outside);
 }
 
-/// Like `young_offset`, for any heap payload offset (Young or Old).
-pub(super) fn heap_offset<E: PortableAsm>(a: &mut E, value: R, scratch: R, outside: E::TextLabel) {
-    a.mov_reg_reg(scratch, value);
-    a.load_ptr_disp32(value, R::V3, d(RT_HEAP_BASE));
-    a.sub_reg_reg(scratch, value);
-    a.jcc_label(C::Below, outside);
-    a.cmp_reg_imm32(scratch, YOUNG_LOW);
-    a.jcc_label(C::Below, outside);
-    a.mov_imm64(value, HEAP_BYTES);
-    a.cmp_reg_reg(scratch, value);
-    a.jcc_label(C::AboveOrEqual, outside);
-}
-
-/// field_load: the load barrier. V0 = loaded word, V10 = field address.
-/// While a relocation phase is open, a word that addresses from-space is
-/// relocated (copied once, or the winner's copy taken) and the field
-/// healed by a CAS against the stale word; preserves the rest.
-pub(super) fn emit_field_load<E: PortableAsm>(
-    a: &mut E,
-    l: &Labels<E::TextLabel>,
-    runtime: E::DataLabel,
-) {
-    let pass = a.create_text_label();
-    let hit = a.create_text_label();
-    a.bind_text_label(l.field_load);
-    a.push_reg(R::V3);
+/// Emit an untyped enum read: V1 = canonical owner, V0 = field address.
+/// The descriptor decides whether to decode; the loaded bits never decide
+/// whether a scalar is a reference. V10 is the load-barrier slot argument.
+pub(crate) fn emit_untyped_load<E: PortableAsm>(a: &mut E, barrier: E::TextLabel) {
+    let raw = a.create_text_label();
+    let reference = a.create_text_label();
+    a.mov_reg_reg(R::V10, R::V0);
+    a.load_ptr_disp32(R::V0, R::V10, 0);
     a.push_reg(R::V1);
-    a.push_reg(R::V2);
+    a.load_ptr_disp32(R::V1, R::V1, DESCRIPTOR);
+    a.cmp_reg_imm8(R::V1, 1);
+    a.pop_reg(R::V1);
+    a.jcc_label(C::Equal, raw);
+    a.push_reg(R::V1);
+    a.load_ptr_disp32(R::V1, R::V1, DESCRIPTOR);
+    a.cmp_reg_imm8(R::V1, 4);
+    a.pop_reg(R::V1);
+    a.jcc_label(C::NotEqual, reference);
+    a.cmp_reg_reg(R::V10, R::V1); // PointerList length is scalar too.
+    a.jcc_label(C::Equal, raw);
+    a.bind_text_label(reference);
+    a.call_label(barrier);
+    a.bind_text_label(raw);
+}
+
+pub(super) fn emit<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::DataLabel) {
+    emit_load(a, l, runtime);
+    emit_store(a, l, runtime);
+}
+
+/// V0 = field bits, V10 = slot address -> V0 = resolved payload address.
+/// A GC heal stores encoded bits by CAS; it never writes a raw address.
+fn emit_load<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::DataLabel) {
+    let pass = a.create_text_label();
+    let unchanged = a.create_text_label();
+    let resolved = a.create_text_label();
+    let hit = a.create_text_label();
+    let recolour = a.create_text_label();
+    let body = a.create_text_label();
+    a.bind_text_label(l.field_load);
+    for reg in [R::V3, R::V1, R::V2, R::OwnerContext] {
+        a.push_reg(reg);
+    }
     load_runtime(a, runtime);
-    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_PHASE_OPEN));
-    a.test_reg_reg(R::V1, R::V1);
-    a.jcc_label(C::Equal, pass);
-    a.mov_reg_reg(R::V1, R::V0);
-    a.load_ptr_disp32(R::V2, R::V3, d(RT_HEAP_BASE));
-    a.sub_reg_reg(R::V1, R::V2);
-    a.jcc_label(C::Below, pass);
-    // V1 = heap offset; keep the loaded word on the stack while testing.
+    a.jmp_label(body);
+    a.bind_text_label(l.field_load_actor);
+    for reg in [R::V3, R::V1, R::V2, R::OwnerContext] {
+        a.push_reg(reg);
+    }
+    super::owner_state::bind_running(a, l);
+    a.bind_text_label(body);
+    offset(a, R::V0, R::V1, pass);
     a.push_reg(R::V0);
-    for (lo, hi) in [
-        (super::RT_RY_LO, super::RT_RY_HI),
-        (super::RT_RO_LO, super::RT_RO_HI),
-    ] {
+    load_rt(a, R::V2, RT_PHASE_OPEN);
+    a.test_reg_reg(R::V2, R::V2);
+    a.jcc_label(C::Equal, unchanged);
+    {
+        let (lo, hi) = (super::RT_RY_LO, super::RT_RY_HI);
         a.mov_reg_reg(R::V2, R::V1);
-        a.load_ptr_disp32(R::V0, R::V3, d(lo));
+        load_rt(a, R::V0, lo);
         a.sub_reg_reg(R::V2, R::V0);
-        a.load_ptr_disp32(R::V0, R::V3, d(hi));
+        load_rt(a, R::V0, hi);
         a.push_reg(R::V1);
-        a.load_ptr_disp32(R::V1, R::V3, d(lo));
+        load_rt(a, R::V1, lo);
         a.sub_reg_reg(R::V0, R::V1);
         a.pop_reg(R::V1);
         a.cmp_reg_reg(R::V2, R::V0);
         a.jcc_label(C::Below, hit);
     }
+    super::old_runs::source(a, R::V1);
+    a.jcc_label(C::Equal, hit);
+    a.bind_text_label(unchanged);
     a.pop_reg(R::V0);
-    a.jmp_label(pass);
-    // The stale word stays on the stack for the healing CAS.
+    super::colours::load_access(a);
+    a.xor_reg_reg(R::V1, R::V0);
+    a.and_reg_reg(R::V1, R::V2);
+    a.test_reg_reg(R::V1, R::V1);
+    a.jcc_label(C::NotEqual, recolour);
+    a.jmp_label(resolved);
+    a.bind_text_label(recolour);
+    a.push_reg(R::V0);
+    a.mov_reg_reg(R::V1, R::V0);
+    a.shr_reg_imm8(R::V1, 16);
     a.bind_text_label(hit);
     for reg in [R::V6, R::V7, R::V8, R::V9, R::V10, R::V11] {
         a.push_reg(reg);
     }
+    if l.worker.is_some() {
+        a.push_reg(R::V1);
+        a.push_reg(R::V1);
+        a.mov_reg_reg(R::V2, R::V1);
+        super::young_barrier::protect(a, l);
+        a.pop_reg(R::V1);
+        a.pop_reg(R::V1);
+    }
+    if let Some(w) = &l.worker {
+        let not_marking = a.create_text_label();
+        load_rt(a, R::V0, RT_MARK_ACTIVE);
+        a.test_reg_reg(R::V0, R::V0);
+        a.jcc_label(C::Equal, not_marking);
+        a.push_reg(R::V1);
+        a.push_reg(R::V1);
+        a.mov_reg_reg(R::V2, R::V1);
+        super::worker::lock(a, l);
+        a.call_label(w.mark_ref);
+        a.mov_imm64(R::V0, 0);
+        store_rt(a, RT_MARK_DONE, R::V0);
+        super::worker::request_work(a);
+        super::worker::unlock(a, l);
+        super::worker::wake_if_pending(a, l);
+        a.pop_reg(R::V1);
+        a.pop_reg(R::V1);
+        a.bind_text_label(not_marking);
+    }
     a.mov_imm64(R::V2, 1);
-    a.store_ptr_disp32(R::V3, d(super::RT_COLLECTING), R::V2);
-    a.shl_reg_imm8(R::V1, 16);
-    a.mov_imm64(R::V2, super::color());
-    a.or_reg_reg(R::V1, R::V2);
+    store_rt(a, RT_COLLECTING, R::V2);
     a.mov_reg_reg(R::V0, R::V1);
+    a.shl_reg_imm8(R::V0, 16);
+    super::colours::load_current(a, R::V2);
+    a.or_reg_reg(R::V0, R::V2);
     a.call_label(l.forward);
-    a.shr_reg_imm8(R::V0, 16);
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
-    a.add_reg_reg(R::V0, R::V1);
+    forget_nonnull(a, R::V0, R::V1);
     a.mov_imm64(R::V1, 0);
-    a.store_ptr_disp32(R::V3, d(super::RT_COLLECTING), R::V1);
-    a.load_ptr_disp32(R::V1, R::V3, d(super::RT_HEALED));
-    a.add_reg_imm32(R::V1, 1);
-    a.store_ptr_disp32(R::V3, d(super::RT_HEALED), R::V1);
+    store_rt(a, RT_COLLECTING, R::V1);
+    super::copy::bump(a, RT_HEALED, R::V1);
     for reg in [R::V11, R::V10, R::V9, R::V8, R::V7, R::V6] {
         a.pop_reg(reg);
     }
     a.mov_reg_reg(R::V1, R::V0);
     a.pop_reg(R::V0);
-    if l.worker.is_some() {
-        // Only the worker's own heal of the same field can intervene; it
-        // stores the same copy, so a failed CAS changes nothing.
-        a.atomic_compare_exchange(R::V10, R::V1);
-    } else {
-        a.store_ptr_disp32(R::V10, 0, R::V1);
-    }
+    a.atomic_compare_exchange(R::V10, R::V1);
     a.mov_reg_reg(R::V0, R::V1);
+    a.bind_text_label(resolved);
+    decode(a, R::V0, R::V1);
     a.bind_text_label(pass);
-    a.pop_reg(R::V2);
-    a.pop_reg(R::V1);
-    a.pop_reg(R::V3);
+    for reg in [R::OwnerContext, R::V2, R::V1, R::V3] {
+        a.pop_reg(reg);
+    }
     a.ret();
 }
 
-/// field_store: the SATB pre-barrier (while marking, the overwritten
-/// reference is marked), the store, then the generational write barrier:
-/// an Old field that now holds a Young payload address joins the remset.
-pub(super) fn emit_field_store<E: PortableAsm>(
-    a: &mut E,
-    l: &Labels<E::TextLabel>,
-    runtime: E::DataLabel,
-) {
+/// V7 = slot, V6 = new payload address/null (preserved).
+fn emit_store<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::DataLabel) {
     let done = a.create_text_label();
+    let raw = a.create_text_label();
+    let publish = a.create_text_label();
+    let body = a.create_text_label();
     a.bind_text_label(l.field_store);
-    a.push_reg(R::V0);
-    a.push_reg(R::V1);
-    a.push_reg(R::V2);
-    a.push_reg(R::V3);
+    for reg in [
+        R::V0,
+        R::V1,
+        R::V2,
+        R::V3,
+        R::V6,
+        R::V7,
+        R::V8,
+        R::V9,
+        R::V10,
+        R::V11,
+        R::OwnerContext,
+    ] {
+        a.push_reg(reg);
+    }
     load_runtime(a, runtime);
+    a.jmp_label(body);
+    a.bind_text_label(l.field_store_actor);
+    for reg in [
+        R::V0,
+        R::V1,
+        R::V2,
+        R::V3,
+        R::V6,
+        R::V7,
+        R::V8,
+        R::V9,
+        R::V10,
+        R::V11,
+        R::OwnerContext,
+    ] {
+        a.push_reg(reg);
+    }
+    super::owner_state::bind_running(a, l);
+    a.bind_text_label(body);
+    // Resolve a managed new referent before publishing current color bits.
+    // Non-heap scalar words stay opaque. The caller supplies a current slot.
+    let resolved_value = a.create_text_label();
+    a.mov_reg_reg(R::V0, R::V6);
+    super::enums::heap_offset(a, R::V0, R::V2, resolved_value);
+    a.mov_reg_reg(R::V0, R::V2);
+    a.shl_reg_imm8(R::V0, 16);
+    super::colours::load_current(a, R::V2);
+    a.or_reg_reg(R::V0, R::V2);
+    a.push_reg(R::V7);
+    a.push_reg(R::V7);
+    a.mov_imm64(R::V2, 1);
+    store_rt(a, RT_COLLECTING, R::V2);
+    a.call_label(l.forward);
+    a.mov_imm64(R::V2, 0);
+    store_rt(a, RT_COLLECTING, R::V2);
+    decode(a, R::V0, R::V1);
+    a.mov_reg_reg(R::V6, R::V0);
+    a.pop_reg(R::V7);
+    a.pop_reg(R::V7);
+    a.bind_text_label(resolved_value);
+    super::young_barrier::field_store(a, l);
     if let Some(w) = &l.worker {
         let satb_done = a.create_text_label();
-        a.load_ptr_disp32(R::V0, R::V3, d(RT_MARK_ACTIVE));
+        load_rt(a, R::V0, RT_MARK_ACTIVE);
         a.test_reg_reg(R::V0, R::V0);
         a.jcc_label(C::Equal, satb_done);
-        a.load_ptr_disp32(R::V0, R::V7, 0);
-        heap_offset(a, R::V0, R::V2, satb_done);
-        for reg in [R::V6, R::V7, R::V8, R::V9] {
-            a.push_reg(reg);
-        }
-        a.call_label(w.lock);
-        a.call_label(w.mark_ref);
-        a.mov_imm64(R::V0, 0);
-        a.store_ptr_disp32(R::V3, d(RT_MARK_DONE), R::V0);
-        super::worker::request_work(a);
-        a.call_label(w.unlock);
-        for reg in [R::V9, R::V8, R::V7, R::V6] {
-            a.pop_reg(reg);
+        for previous in [true, false] {
+            let next = a.create_text_label();
+            if previous {
+                a.load_ptr_disp32(R::V0, R::V7, 0);
+                offset(a, R::V0, R::V2, next);
+            } else {
+                // The store publishes current mark bits, so protect its new
+                // raw referent too; callers need not rely on an earlier load.
+                a.mov_reg_reg(R::V0, R::V6);
+                super::enums::heap_offset(a, R::V0, R::V2, next);
+            }
+            for reg in [R::V6, R::V7, R::V8, R::V9] {
+                a.push_reg(reg);
+            }
+            let protected = a.create_text_label();
+            // The sole owner's phase/metadata cannot retire during this store.
+            // A matching acquired epoch already owns a mark obligation. Any
+            // admission still enqueuing it holds the end-check collector lock.
+            super::mark::test_mark(a, R::V2, R::V6, R::V7);
+            a.jcc_label(C::NotEqual, protected);
+            super::worker::lock(a, l);
+            a.call_label(w.mark_ref);
+            a.mov_imm64(R::V0, 0);
+            store_rt(a, RT_MARK_DONE, R::V0);
+            super::worker::request_work(a);
+            super::worker::unlock(a, l);
+            // Newly admitted SATB work must run even without another allocation.
+            super::worker::wake_if_pending(a, l);
+            a.bind_text_label(protected);
+            for reg in [R::V9, R::V8, R::V7, R::V6] {
+                a.pop_reg(reg);
+            }
+            a.bind_text_label(next);
         }
         a.bind_text_label(satb_done);
     }
-    a.store_ptr_disp32(R::V7, 0, R::V6);
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
+    load_rt(a, R::V1, RT_HEAP_BASE);
     a.mov_reg_reg(R::V0, R::V7);
     a.sub_reg_reg(R::V0, R::V1);
-    a.jcc_label(C::Below, done);
-    a.cmp_reg_imm32(R::V0, YOUNG_END as i32);
-    a.jcc_label(C::Below, done);
-    a.mov_imm64(R::V1, HEAP_BYTES);
-    a.cmp_reg_reg(R::V0, R::V1);
-    a.jcc_label(C::AboveOrEqual, done);
-    young_offset(a, R::V6, R::V0, done);
+    a.jcc_label(C::Below, publish);
+    super::generation::test(a, R::V0, super::generation::OLD);
+    a.jcc_label(C::NotEqual, publish);
+    a.mov_reg_reg(R::V2, R::V6);
+    super::enums::young_offset(a, R::V2, R::V0, publish);
     super::remset::remember(a, l, R::V7, R::V1, R::V2);
+    a.bind_text_label(publish);
+    a.mov_reg_reg(R::V0, R::V6);
+    super::enums::heap_offset(a, R::V0, R::V2, raw);
+    a.shl_reg_imm8(R::V2, 16);
+    super::colours::load_current(a, R::V0);
+    a.or_reg_reg(R::V2, R::V0);
+    a.atomic_store_release(R::V7, R::V2);
+    a.jmp_label(done);
+    a.bind_text_label(raw);
+    a.atomic_store_release(R::V7, R::V6);
     a.bind_text_label(done);
-    a.load_ptr_disp32(R::V6, R::V7, 0);
-    a.pop_reg(R::V3);
-    a.pop_reg(R::V2);
-    a.pop_reg(R::V1);
-    a.pop_reg(R::V0);
+    for reg in [
+        R::OwnerContext,
+        R::V11,
+        R::V10,
+        R::V9,
+        R::V8,
+        R::V7,
+        R::V6,
+        R::V3,
+        R::V2,
+        R::V1,
+        R::V0,
+    ] {
+        a.pop_reg(reg);
+    }
     a.ret();
 }

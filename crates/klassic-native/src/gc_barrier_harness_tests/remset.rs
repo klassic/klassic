@@ -183,6 +183,8 @@ fn dead_holder(g: &mut NativeCodeGenerator, _arg: u64) {
     h.report_counter("len_before", Counter::RemsetLen);
     h.pop_root();
     h.mark_start();
+    h.drain_marks(); // This fixture requires a sealed Old snapshot.
+    h.end_marks();
     h.report_counter("dropped_before", Counter::RemsetDropped);
     h.gc_until(3);
     h.settle();
@@ -217,6 +219,14 @@ fn full_collection(g: &mut NativeCodeGenerator, _arg: u64) {
     h.settle();
     h.report("x_old_before", |h| h.is_old(Src::Root(X)));
     h.report("x_before", |h| h.value(Src::Root(X)));
+    h.report("identity_before", |h| h.object_id(Src::Root(X)));
+    h.report_counter("phase_before", Counter::AdoptedPhase);
+    h.report("age_before", |h| {
+        h.object_metadata(
+            Src::Root(X),
+            std::mem::offset_of!(crate::gc_abi::MarkRecord, age),
+        )
+    });
     let top = h.g.create_text_label();
     h.g.bind_text_label(top);
     h.alloc(2, 30000, NODE);
@@ -231,8 +241,17 @@ fn full_collection(g: &mut NativeCodeGenerator, _arg: u64) {
     h.g.jcc_label(C::Equal, top);
     h.settle();
     h.report_counter("full_collections", Counter::FullCollections);
+    h.report_counter("phase_after", Counter::AdoptedPhase);
+    h.report_counter("cycles_after", Counter::Collections);
     h.report_counter("len_after_full", Counter::RemsetLen);
     h.report("x_after", |h| h.value(Src::Root(X)));
+    h.report("identity_after", |h| h.object_id(Src::Root(X)));
+    h.report("age_after", |h| {
+        h.object_metadata(
+            Src::Root(X),
+            std::mem::offset_of!(crate::gc_abi::MarkRecord, age),
+        )
+    });
     h.report("x_old_after", |h| h.is_old(Src::Root(X)));
     h.report("entry0_is_x_f1", |h| h.entry_is_slot(0, Src::Root(X), 1));
     h.report("f1_magic", |h| h.deref_field(Src::Root(X), 1, 1));
@@ -245,14 +264,42 @@ fn full_collection(g: &mut NativeCodeGenerator, _arg: u64) {
     h.report("f0_magic_later", |h| h.deref_field(Src::Root(X), 0, 1));
     h.report("f1_magic_later", |h| h.deref_field(Src::Root(X), 1, 1));
     h.report_counter("len_later", Counter::RemsetLen);
+    h.report_counter("phase_later", Counter::AdoptedPhase);
+    h.report_counter("cycles_later", Counter::Collections);
+    h.report_counter("full_later", Counter::FullCollections);
 }
 
 #[test]
 fn a_full_collection_discards_both_sets_and_new_stores_use_the_moved_slot() {
     let o = run(full_collection, 0, false);
+    assert_eq!((o.get("phase_before") >> 8) & 8, 0);
+    for (phase, cycles, full) in [
+        ("phase_after", "cycles_after", "full_collections"),
+        ("phase_later", "cycles_later", "full_later"),
+    ] {
+        let snapshot = crate::gc_abi::PhaseSnapshot::from_bits(o.get(phase) as u64).unwrap();
+        assert_eq!(snapshot.bits() & 255, 0, "phase must finish Idle");
+        assert_eq!(
+            (snapshot.bits() >> 8) & 12,
+            ((o.get(cycles) as u64 & 1) << 2) | ((o.get(full) as u64 & 1) << 3)
+        );
+        assert_eq!(snapshot.bits() >> 16, o.get(cycles) as u64 * 4);
+    }
     assert_eq!(o.get("x_old_before"), 1, "{}", o.text());
     assert!(o.get("full_collections") >= 1, "{}", o.text());
     assert_ne!(o.get("x_before"), o.get("x_after"), "X must have moved");
+    assert!(o.get("identity_before") > 0, "{}", o.text());
+    assert_eq!(
+        o.get("identity_before"),
+        o.get("identity_after"),
+        "{}",
+        o.text()
+    );
+    assert_eq!(
+        o.get("age_before"),
+        o.get("age_after"),
+        "Old relocation must not age X again"
+    );
     assert_eq!(o.get("x_old_after"), 1);
     // Either no store followed the full collection (0 entries) or the one
     // that did registered X.f1 at its new address.

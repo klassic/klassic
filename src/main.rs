@@ -139,6 +139,20 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     eprintln!("error: --gc-poison is not accepted with --gc=generational");
                     return Err(1);
                 }
+                if command.config.gc_log_format.is_some()
+                    || command.config.gc_max_heap.is_some()
+                    || command.config.gc_soft_max_heap.is_some()
+                    || command.config.gc_max_metadata.is_some()
+                    || command.config.gc_min_heap.is_some()
+                    || command.config.gc_uncommit_delay_ns.is_some()
+                    || command.config.gc_pre_touch
+                    || command.config.gc_large_pages.is_some()
+                {
+                    eprintln!(
+                        "error: canonical C/LLVM output does not yet support direct GC heap, page, timing or log-format controls"
+                    );
+                    return Err(1);
+                }
                 if command.config.gc_log {
                     eprintln!("error: --gc-log is not yet supported by canonical C/LLVM output");
                     return Err(1);
@@ -257,9 +271,17 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                 deny_trust: command.config.deny_trust,
                 warn_trust: command.config.warn_trust,
                 gc_log: command.config.gc_log,
+                gc_log_format: command.config.gc_log_format,
                 gc_stress: command.config.gc_stress,
                 gc_poison: command.config.gc_poison,
                 gc_generational: command.config.gc_generational,
+                gc_max_heap: command.config.gc_max_heap,
+                gc_soft_max_heap: command.config.gc_soft_max_heap,
+                gc_max_metadata: command.config.gc_max_metadata,
+                gc_min_heap: command.config.gc_min_heap,
+                gc_uncommit_delay_ns: command.config.gc_uncommit_delay_ns,
+                gc_pre_touch: command.config.gc_pre_touch,
+                gc_large_pages: command.config.gc_large_pages,
                 // Kept in step with the fallback branch below: a backend that
                 // has to choose between a partial implementation and
                 // declining needs to know which of the two the driver will

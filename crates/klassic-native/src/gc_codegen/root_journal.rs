@@ -6,6 +6,14 @@ use crate::gc_abi::{
 };
 #[allow(dead_code)]
 pub(crate) fn emit_root_journal<A: PortableAsm>(a: &mut A) {
+    emit_impl(a, None);
+}
+/// ACK hook receives the actual acknowledged record count in V0. It must
+/// preserve registers and cannot poll; the storage claim has really ended.
+pub(crate) fn emit_root_journal_tracked<A: PortableAsm>(a: &mut A, ack: &mut dyn FnMut(&mut A)) {
+    emit_impl(a, Some(ack));
+}
+fn emit_impl<A: PortableAsm>(a: &mut A, ack: Option<&mut dyn FnMut(&mut A)>) {
     let status: [_; 5] = std::array::from_fn(|_| a.create_text_label());
     let invalid = status[1];
     let claim = a.create_text_label();
@@ -118,6 +126,10 @@ pub(crate) fn emit_root_journal<A: PortableAsm>(a: &mut A) {
     b.set(r!(leases), sub(r!(leases), n(1)));
     b.set(g!(leases), sub(g!(leases), n(1)));
     b.set(l!(kind), n(0));
+    if let Some(ack) = ack {
+        b.value(local(USED));
+        ack(b.a);
+    }
     b.a.jmp_label(status[0]);
     b.a.bind_text_label(claim);
     b.branch(l!(kind), n(0), C::NotEqual, invalid);

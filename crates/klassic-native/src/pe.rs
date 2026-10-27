@@ -134,13 +134,14 @@ pub(crate) fn write_executable(mut object: ObjectFile, _spec: &NativeTargetSpec)
     let import_dir_off: u64 = 0;
     let import_dir_size: u64 = 20 * 2; // one DLL descriptor + a zero terminator
     let ilt_off = import_dir_off + import_dir_size;
-    let ilt_size = 8 * (ImportSymbol::ALL.len() as u64 + 1); // + zero terminator
+    let imports = ImportSymbol::for_object(&object);
+    let ilt_size = 8 * (imports.len() as u64 + 1); // + zero terminator
     let iat_off = ilt_off + ilt_size;
     let iat_size = ilt_size;
 
-    let mut hint_name_offsets = Vec::with_capacity(ImportSymbol::ALL.len());
+    let mut hint_name_offsets = Vec::with_capacity(imports.len());
     let mut cursor = iat_off + iat_size;
-    for symbol in ImportSymbol::ALL {
+    for symbol in imports {
         hint_name_offsets.push(cursor);
         // WORD Hint + ASCIIZ name, padded to an even total length.
         let entry_len = 2 + symbol.name().len() + 1;
@@ -192,7 +193,7 @@ pub(crate) fn write_executable(mut object: ObjectFile, _spec: &NativeTargetSpec)
     }
     rdata.u64(0);
     debug_assert_eq!(rdata.bytes.len() as u64, hint_name_offsets[0]);
-    for (symbol, &offset) in ImportSymbol::ALL.iter().zip(hint_name_offsets.iter()) {
+    for (symbol, &offset) in imports.iter().zip(hint_name_offsets.iter()) {
         debug_assert_eq!(rdata.bytes.len() as u64, offset);
         rdata.u16(0); // Hint
         rdata.push_bytes(symbol.name().as_bytes());

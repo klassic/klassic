@@ -1,12 +1,27 @@
-//! `--gc=generational` (M-G1): the opt-in generational GC integration on
-//! the direct x86-64 ELF backend. M-G1 never collects; these tests pin the
-//! selector, its rejections, and evaluator == native output under the flag.
+//! Opt-in generational GC integration: selector, direct targets, evacuation,
+//! promotion, barriers, and evaluator == native output under the flag.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// The integer has exactly the format of a valid initial GcRef. It is scalar
+// data inside a RawBytes box, so decoding it would corrupt the language value.
+#[allow(dead_code)]
+const OPAQUE_SCALAR_PROGRAM: &str = r#"
+enum Option<a> { case Some(value: a); case None }
+val keep = Some(8595182864)
+val same = Some(8595182864)
+mutable i = 0
+while(i < 40) {
+  val garbage = Some(i)
+  i += 1
+}
+println(keep == same)
+println(keep match { case Some(v) => v + 1; case None => 0 })
+"#;
 
 fn klassic_bin() -> &'static str {
     env!("CARGO_BIN_EXE_klassic")
@@ -58,6 +73,15 @@ fn build_failure_stderr(tag: &str, flags: &[&str], source: &str) -> String {
 }
 
 #[allow(dead_code)]
+// Native file/read/sleep assertions remain exact; separately recorded console
+// buffer writes now contribute to the aggregate enter/exit counters.
+fn native_nonbuffer_entries(stats: &std::collections::HashMap<String, u64>) -> u64 {
+    assert_eq!(stats["native_io_entries"], stats["native_io_exits"]);
+    stats["native_io_entries"]
+        .checked_sub(stats["native_buffer_writes"])
+        .unwrap()
+}
+
 fn gc_stats(stderr: &str) -> std::collections::HashMap<String, u64> {
     let line = stderr
         .lines()
@@ -98,21 +122,21 @@ fn unknown_gc_mode_is_rejected() {
 }
 
 #[test]
-fn generational_rejects_unavailable_c_and_llvm_executables() {
+fn canonical_backends_reject_unsupported_executable_targets() {
     for backend in ["llvm", "c"] {
         let stderr = build_failure_stderr(
             "backend",
             &[
                 "--gc=generational",
-                "--target",
-                "x86_64-unknown-linux-gnu",
                 "--backend",
                 backend,
+                "--target",
+                "x86_64-pc-windows-msvc",
             ],
             "println(1)\n",
         );
         assert!(
-            stderr.contains("canonical C/LLVM executable linking is not yet enabled"),
+            stderr.contains("canonical C/LLVM currently targets Linux x86-64"),
             "backend {backend} stderr:\n{stderr}"
         );
     }
@@ -121,7 +145,7 @@ fn generational_rejects_unavailable_c_and_llvm_executables() {
 #[test]
 fn generational_builds_for_every_direct_target() {
     // Every direct backend carries the generational runtime; only
-    // --backend c/llvm are declined.
+    // Canonical C/LLVM executable targets are checked separately.
     for target in [
         "x86_64-unknown-linux-gnu",
         "x86_64-pc-windows-msvc",
@@ -142,6 +166,56 @@ fn generational_builds_for_every_direct_target() {
             String::from_utf8_lossy(&result.stderr)
         );
     }
+}
+
+#[test]
+fn generational_direct_build_needs_no_external_toolchain() {
+    let source = write_source("no_toolchain", "println(42)\n");
+    let empty_path = temp_path("no_toolchain", "dir");
+    fs::create_dir(&empty_path).expect("empty PATH directory should be created");
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "aarch64-apple-darwin",
+    ] {
+        let output = temp_path("no_toolchain", "bin");
+        let result = Command::new(klassic_bin())
+            .env("PATH", &empty_path)
+            .args(["--gc=generational", "--target", target, "build"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("klassic should run without PATH tools");
+        assert!(
+            result.status.success(),
+            "{target} build without external tools failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let image = fs::read(&output).expect("output exists");
+        let magic: &[u8] = match target {
+            "x86_64-unknown-linux-gnu" => b"\x7fELF",
+            "x86_64-pc-windows-msvc" => b"MZ",
+            "aarch64-apple-darwin" => &[0xcf, 0xfa, 0xed, 0xfe],
+            _ => unreachable!(),
+        };
+        assert!(
+            image.starts_with(magic),
+            "{target} has the wrong image format"
+        );
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if target == "x86_64-unknown-linux-gnu" {
+            let run = Command::new(&output)
+                .env("PATH", &empty_path)
+                .output()
+                .expect("direct Linux executable should run");
+            assert!(run.status.success());
+            assert_eq!(run.stdout, b"42\n");
+        }
+        fs::remove_file(output).expect("remove generated binary");
+    }
+    fs::remove_file(source).expect("remove source");
+    fs::remove_dir(empty_path).expect("remove empty PATH directory");
 }
 
 #[test]
@@ -181,6 +255,23 @@ mod linux_x86_64 {
     }
 
     #[test]
+    fn generational_boxed_reference_like_integer_stays_scalar() {
+        let expected = evaluate("scalar_eval", OPAQUE_SCALAR_PROGRAM);
+        for flags in [
+            &["--gc=generational"][..],
+            &["--gc=generational", "--gc-stress"],
+        ] {
+            let run = build_and_run("opaque_scalar", flags, OPAQUE_SCALAR_PROGRAM);
+            assert!(
+                run.status.success(),
+                "{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&run.stdout), expected, "{flags:?}");
+        }
+    }
+
+    #[test]
     fn generational_promotes_long_lived_data_and_collects_old() {
         // A long-lived tree is promoted to Old and stays reachable while
         // Young churns; under stress every survivor is promoted, so Old
@@ -208,7 +299,12 @@ mod linux_x86_64 {
         assert!(stats["promoted_bytes"] > 0, "stats: {stats:?}");
         let run = build_and_run(
             "old_stress",
-            &["--gc=generational", "--gc-log", "--gc-stress"],
+            &[
+                "--gc=generational",
+                "--gc-log",
+                "--gc-stress",
+                "--gc-max-heap=16MiB",
+            ],
             source,
         );
         let stderr = String::from_utf8_lossy(&run.stderr);
@@ -266,7 +362,7 @@ mod linux_x86_64 {
 
     #[test]
     fn generational_enums_survive_evacuation() {
-        // Records hold references (payload addresses) to boxes, strings and
+        // Records hold colored references to boxes, strings and
         // nested records; stress evacuates before every allocation.
         let source = "enum Option<a> { case Some(value: a); case None }\n\
                       enum Tree { case Leaf(v: Int); case Branch(l: Tree, r: Tree) }\n\
@@ -350,7 +446,7 @@ mod linux_x86_64 {
     fn generational_reuses_frame_roots_in_long_loops() {
         // Each iteration roots a fresh heap string in a loop-body slot and
         // drops it at the end of the body; RESERVE never recycles a cell,
-        // so without LIFO reuse this would exhaust the 65536-cell segment.
+        // so frame-cell reuse keeps repeated scopes within the finite segment.
         // It also drives the root journal through many FLUSH drains. The
         // depth depends on `i` so the call cannot be folded at compile time.
         let source = "def describe(s: String, n: Int): String = if (n <= 0) s else describe(s + \"x\", n - 1)\n\
@@ -368,7 +464,9 @@ mod linux_x86_64 {
         assert!(run.status.success(), "stderr:\n{stderr}");
         assert_eq!(String::from_utf8_lossy(&run.stdout), "350000\n");
         let stats = gc_stats(&stderr);
-        assert!(stats["objects"] >= 100_000, "stats: {stats:?}");
+        // objects is a residual heap count; earlier collections may reduce it.
+        // Cumulative traffic retains evidence of the 100,000 allocating scopes.
+        assert!(stats["allocated_bytes"] >= 100_000 * 16, "stats: {stats:?}");
         assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
     }
 
@@ -395,23 +493,28 @@ mod linux_x86_64 {
     }
 
     #[test]
-    fn generational_live_data_beyond_a_semispace_is_an_honest_oom() {
-        // Recursion keeps every intermediate string live (~36 MB), which
-        // cannot fit one 32 MiB semispace; the legacy heap holds it.
+    fn generational_live_data_beyond_the_configured_heap_is_an_honest_oom() {
+        // Caller roots retain over 121 MB of intermediate strings. This
+        // exceeds the configured 64-MiB payload heap,
+        // independent of early-cycle timing and survival-age distribution.
         let source = "def churn(s: String, n: Int): Int = if (n <= 0) length(s) else churn(s + \"ab\", n - 1)\n\
                       mutable k = 0\n\
                       while(k < 1) {\n\
-                        println(churn(\"\", k + 6000))\n\
+                        println(churn(\"\", k + 11000))\n\
                         k += 1\n\
                       }\n";
-        let legacy = build_and_run("oom_legacy", &[], source);
-        assert_eq!(String::from_utf8_lossy(&legacy.stdout), "12000\n");
-        let run = build_and_run("oom", &["--gc=generational"], source);
+        let run = build_and_run("oom", &["--gc=generational", "--gc-max-heap=64MiB"], source);
         let stderr = String::from_utf8_lossy(&run.stderr);
         assert_eq!(run.status.code(), Some(1), "stderr:\n{stderr}");
+        // Root discovery can now exhaust the worker's private destination
+        // rather than the pause copier. Require a relocation-space reason;
+        // native mapping/metadata failures are distinct failure-injection tests.
         assert!(
-            stderr
-                .contains("out of memory (--gc=generational live data exceeds a young semispace)"),
+            stderr.contains("out of memory (--gc=generational Young run capacity exhausted)")
+                || stderr.contains(
+                    "out of memory (--gc=generational worker relocation to-space exhausted)"
+                )
+                || stderr.contains("out of memory (--gc=generational Old run capacity exhausted)"),
             "stderr:\n{stderr}"
         );
     }
@@ -433,7 +536,7 @@ mod linux_x86_64 {
     }
 
     #[test]
-    fn generational_rejects_objects_larger_than_a_page_at_run_time() {
+    fn generational_allocates_objects_larger_than_a_young_page_at_run_time() {
         // 8 * 2^15 = 262144 bytes, larger than one 128 KiB Young page.
         let source = "def grow(s: String, n: Int): String = if (n <= 0) s else grow(s + s, n - 1)\n\
                       mutable k = 0\n\
@@ -445,11 +548,8 @@ mod linux_x86_64 {
         assert_eq!(String::from_utf8_lossy(&legacy.stdout), "262144\n");
         let run = build_and_run("large", &["--gc=generational"], source);
         let stderr = String::from_utf8_lossy(&run.stderr);
-        assert_eq!(run.status.code(), Some(1), "stderr:\n{stderr}");
-        assert!(
-            stderr.contains("object larger than one --gc=generational page (M-G1 limit)"),
-            "stderr:\n{stderr}"
-        );
+        assert!(run.status.success(), "stderr:\n{stderr}");
+        assert_eq!(run.stdout, legacy.stdout);
     }
 
     #[test]
@@ -565,16 +665,198 @@ mod linux_x86_64 {
         println(sum(keep))\n";
 
     #[test]
+    fn generational_worker_completes_planned_old_cycles_before_capacity_exhaustion() {
+        let source = r#"
+enum Tree { case Leaf(v: Int); case Node(l: Tree, r: Tree) }
+def build(d: Int): Tree = if (d == 0) Leaf(1) else Node(build(d - 1), build(d - 1))
+def sum(t: Tree): Int = t match { case Leaf(v) => v; case Node(l, r) => sum(l) + sum(r) }
+def consume(): Int = { val big = build(17); sum(big) }
+val keep = build(4)
+println(consume())
+mutable i = 0
+mutable total = 0
+while (i < 96) {
+  val garbage = build(10)
+  total += sum(garbage)
+  i += 1
+}
+println(total)
+println(sum(keep))
+"#;
+        let run = build_and_run("planned_old", &["--gc=generational", "--gc-log"], source);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "stderr:\n{stderr}");
+        assert_eq!(run.stdout, b"131072\n98304\n16\n");
+        let stats = gc_stats(&stderr);
+        assert!(stats["old_planned_cycles"] > 0, "stats: {stats:?}");
+        assert_eq!(
+            stats["old_full_samples"], stats["full_collections"],
+            "stats: {stats:?}"
+        );
+        assert_eq!(
+            stats["old_young_samples"] + stats["old_full_samples"],
+            stats["collections"],
+            "stats: {stats:?}"
+        );
+        assert!(
+            (stats["old_limit_bytes"] / 4
+                ..=stats["old_limit_bytes"] - stats["young_limit_pages"] * 131072)
+                .contains(&stats["old_target_bytes"]),
+            "stats: {stats:?}"
+        );
+        assert!(
+            stats["old_allocation_budget"] >= stats["young_limit_pages"] * 131072,
+            "stats: {stats:?}"
+        );
+        assert!(stats["mark_cycles"] >= 2, "stats: {stats:?}");
+        assert!(
+            stats["old_cycle_checks"] >= stats["old_planned_cycles"],
+            "stats: {stats:?}"
+        );
+        assert_eq!(stats["mark_drains"], 0, "stats: {stats:?}");
+        assert_eq!(stats["unmarked_copied"], 0, "stats: {stats:?}");
+        assert_eq!(stats["young_unmarked_copied"], 0, "stats: {stats:?}");
+        assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
+    }
+
+    #[test]
+    fn generational_tenuring_adapts_with_live_old_heap_and_preserves_tree_values() {
+        let source = r#"
+enum Tree { case Leaf(v: Int); case Node(l: Tree, r: Tree) }
+def build(d: Int): Tree = if (d == 0) Leaf(1) else Node(build(d - 1), build(d - 1))
+def sum(t: Tree): Int = t match { case Leaf(v) => v; case Node(l, r) => sum(l) + sum(r) }
+val keep = Node(build(16), Node(build(15), build(14)))
+mutable i = 0
+mutable total = 0
+while (i < 1024) {
+  val garbage = build(9)
+  total += sum(garbage)
+  i += 1
+}
+println(total)
+println(sum(keep))
+"#;
+        // Keep this pressure fixture at its original 192-MiB geometry: the
+        // larger default deliberately raises the Old pressure threshold.
+        let run = build_and_run(
+            "tenuring",
+            &["--gc=generational", "--gc-log", "--gc-max-heap=192MiB"],
+            source,
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "stderr:\n{stderr}");
+        assert_eq!(run.stdout, b"524288\n114688\n");
+        let stats = gc_stats(&stderr);
+        assert!(
+            stats["tenuring_threshold"] > 2 && stats["tenuring_threshold"] <= 15,
+            "stats: {stats:?}"
+        );
+        assert!(stats["tenuring_updates"] > 0, "stats: {stats:?}");
+        assert!(
+            (8..=192).contains(&stats["start_target_pages"]),
+            "stats: {stats:?}"
+        );
+        assert!(stats["young_mark_elapsed_ns"] > 0, "stats: {stats:?}");
+        assert!(
+            (64..=256).contains(&stats["young_capacity_pages"]),
+            "stats: {stats:?}"
+        );
+        assert!(
+            (64..=256).contains(&stats["young_requested_pages"]),
+            "stats: {stats:?}"
+        );
+        assert!(stats["young_capacity_shrinks"] > 0, "stats: {stats:?}");
+        assert!(stats["young_capacity_samples"] > 0, "stats: {stats:?}");
+        assert!(
+            stats["start_target_pages"] <= stats["young_capacity_pages"] * 3 / 4,
+            "stats: {stats:?}"
+        );
+        assert!(stats["start_rate_samples"] > 0, "stats: {stats:?}");
+        assert!(stats["start_mark_samples"] > 0, "stats: {stats:?}");
+        assert!(
+            stats["start_mark_samples"] <= stats["young_mark_cycles"],
+            "stats: {stats:?}"
+        );
+        assert!(stats["start_target_updates"] > 0, "stats: {stats:?}");
+        assert!(stats["allocation_bytes_per_ms"] > 0, "stats: {stats:?}");
+        assert!(stats["young_mark_units_per_ms"] > 0, "stats: {stats:?}");
+        assert!(stats["last_mark_work_units"] > 0, "stats: {stats:?}");
+        assert!(stats["tenuring_young_samples"] >= 2, "stats: {stats:?}");
+        assert_eq!(
+            stats["tenuring_full_samples"], stats["full_collections"],
+            "stats: {stats:?}"
+        );
+        assert_eq!(
+            stats["tenuring_full_samples"] + stats["tenuring_young_samples"],
+            stats["collections"],
+            "stats: {stats:?}"
+        );
+        assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
+        assert_eq!(stats["unmarked_copied"], 0, "stats: {stats:?}");
+        assert_eq!(stats["young_unmarked_copied"], 0, "stats: {stats:?}");
+    }
+
+    #[test]
+    fn generational_young_capacity_regrows_for_a_new_live_set_after_shrinking() {
+        let source = r#"
+enum Tree { case Leaf(v: Int); case Node(l: Tree, r: Tree) }
+def build(d: Int): Tree = if (d == 0) Leaf(1) else Node(build(d - 1), build(d - 1))
+def sum(t: Tree): Int = t match { case Leaf(v) => v; case Node(l, r) => sum(l) + sum(r) }
+def burn(n: Int): Int = {
+  mutable i = 0
+  mutable total = 0
+  while (i < n) { val garbage = build(9); total += sum(garbage); i += 1 }
+  total
+}
+println(burn(2048))
+val keep = build(16)
+println(sum(keep))
+"#;
+        let run = build_and_run("capacity_spike", &["--gc=generational", "--gc-log"], source);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "stderr:\n{stderr}");
+        assert_eq!(run.stdout, b"1048576\n65536\n");
+        let stats = gc_stats(&stderr);
+        assert!(stats["young_capacity_shrinks"] > 0, "stats: {stats:?}");
+        assert!(stats["young_capacity_grows"] > 0, "stats: {stats:?}");
+        assert!(
+            (64..=256).contains(&stats["young_capacity_pages"]),
+            "stats: {stats:?}"
+        );
+        assert!(stats["young_capacity_clamps"] > 0, "stats: {stats:?}");
+        assert!(
+            stats["start_target_pages"] <= stats["young_capacity_pages"] * 3 / 4,
+            "stats: {stats:?}"
+        );
+        assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
+        assert_eq!(stats["unmarked_copied"], 0, "stats: {stats:?}");
+        assert_eq!(stats["young_unmarked_copied"], 0, "stats: {stats:?}");
+    }
+
+    #[test]
     fn generational_worker_thread_relocates_concurrently() {
         // The worker reports the objects it scanned; the mutator keeps
         // allocating and reading the evacuated tree meanwhile. Each build
         // runs several times to shake out races between the two threads.
-        let expected = evaluate("worker_eval", WORKER_PROGRAM);
         for flags in [
             &["--gc=generational", "--gc-log"][..],
             &["--gc=generational", "--gc-log", "--gc-stress"],
         ] {
-            let source_path = write_source("worker", WORKER_PROGRAM);
+            let stress = flags.contains(&"--gc-stress");
+            // Normal mode needs enough garbage to trigger asynchronous GC.
+            // Stress mode already collects at every allocation: retain a
+            // 511-node graph through >2000 forced collections and all five
+            // race repetitions instead of copying 32767 nodes ~409k times.
+            let program = if stress {
+                WORKER_PROGRAM
+                    .replace("val keep = build(14)", "val keep = build(8)")
+                    .replace("build(10)", "build(5)")
+                    .replace("while (i < 200)", "while (i < 32)")
+            } else {
+                WORKER_PROGRAM.to_owned()
+            };
+            let expected = evaluate("worker_eval", &program);
+            let source_path = write_source("worker", &program);
             let output_path = temp_path("worker", "bin");
             let result = build(flags, &source_path, &output_path);
             let _ = fs::remove_file(&source_path);
@@ -590,6 +872,9 @@ mod linux_x86_64 {
                 assert_eq!(String::from_utf8_lossy(&run.stdout), expected, "{flags:?}");
                 let stats = gc_stats(&stderr);
                 assert!(stats["collections"] >= 1, "{flags:?} stats: {stats:?}");
+                if stress {
+                    assert!(stats["collections"] > 2000, "{flags:?} stats: {stats:?}");
+                }
                 assert!(stats["worker_scanned"] > 0, "{flags:?} stats: {stats:?}");
                 assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
             }
@@ -628,6 +913,10 @@ mod linux_x86_64 {
             assert!(stats["marked"] > 0, "stats: {stats:?}");
             // Relocation after a complete mark never meets an unmarked object.
             assert_eq!(stats["unmarked_copied"], 0, "stats: {stats:?}");
+            assert!(stats["young_mark_cycles"] >= 1, "stats: {stats:?}");
+            assert!(stats["young_marked"] > 0, "stats: {stats:?}");
+            assert!(stats["young_worker_units"] > 0, "stats: {stats:?}");
+            assert_eq!(stats["young_unmarked_copied"], 0, "stats: {stats:?}");
             assert!(stats["worker_copies"] > 0, "stats: {stats:?}");
             assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
             lost += stats["worker_lost"] + stats["mutator_lost"];
@@ -651,6 +940,24 @@ mod linux_x86_64 {
         );
         assert_eq!(String::from_utf8_lossy(&run.stdout), "6765\n");
     }
+    #[test]
+    fn generational_linux_explicit_exit_stops_worker_and_preserves_computed_status_after_churn() {
+        let expected = evaluate("linux_exit_eval", WORKER_PROGRAM);
+        for (tail, code) in [
+            ("exit(7)", 7),
+            ("mutable status = 17\nexit(status + 6)", 23),
+        ] {
+            let source = format!("{WORKER_PROGRAM}\n{tail}\nprintln(99)\n");
+            let output = build_and_run("linux_worker_exit", &["--gc=generational"], &source);
+            assert_eq!(output.status.code(), Some(code), "{output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                expected,
+                "{output:?}"
+            );
+            assert!(output.stderr.is_empty(), "{output:?}");
+        }
+    }
 }
 
 #[path = "gc_generational/aarch64_macho.rs"]
@@ -659,3 +966,75 @@ mod aarch64_macho;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[path = "gc_generational/remset_log.rs"]
 mod remset_log;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/literal_roots.rs"]
+mod literal_roots;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/heap.rs"]
+mod heap;
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+#[path = "gc_generational/windows_production.rs"]
+mod windows_production;
+
+#[path = "gc_generational/macos_production.rs"]
+mod macos_production;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/metadata.rs"]
+mod metadata;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/pre_touch.rs"]
+mod pre_touch;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/soft_heap.rs"]
+mod soft_heap;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/large_pages.rs"]
+mod large_pages;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/log_format.rs"]
+mod log_format;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/large_object.rs"]
+mod large_object;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/native_io.rs"]
+mod native_io;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/native_file_io.rs"]
+mod native_file_io;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/native_sleep.rs"]
+mod native_sleep;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/native_stdio_copy.rs"]
+mod native_stdio_copy;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/blocked_read.rs"]
+mod blocked_read;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/native_filesystem.rs"]
+mod native_filesystem;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/native_console.rs"]
+mod native_console;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_generational/aarch64_frame_roots.rs"]
+mod aarch64_frame_roots;

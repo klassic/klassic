@@ -315,14 +315,20 @@ pub(super) fn emit_event_destroy(a: &mut Assembler) {
 /// Callers may not hold heap-access guards across this blocking operation.
 #[allow(dead_code)]
 pub(super) fn emit_park(a: &mut Assembler) {
-    emit_notification(a, false);
+    emit_notification(a, false, false);
 }
 #[allow(dead_code)]
 pub(super) fn emit_wake(a: &mut Assembler) {
-    emit_notification(a, true);
+    emit_notification(a, true, false);
 }
 
-fn emit_notification(a: &mut Assembler, wake: bool) {
+/// One-second relative timeout lets the production worker service idle work.
+/// The native API reacquires the event mutex on timeout before we unlock it.
+pub(super) fn emit_timed_park(a: &mut Assembler) {
+    emit_notification(a, false, true);
+}
+
+fn emit_notification(a: &mut Assembler, wake: bool, timed: bool) {
     let invalid = a.new_label();
     let unlock = a.new_label();
     let done = a.new_label();
@@ -349,7 +355,25 @@ fn emit_notification(a: &mut Assembler, wake: bool) {
         a.branch(ready, B::CompareNonZero(R::X1));
         address(a, R::X0, COND);
         a.mov_reg(R::X1, R::X19);
-        call_int(a, I::PthreadCondWait);
+        if timed {
+            a.sub_sp_imm(16);
+            a.add_reg_sp_imm(R::X2, 0);
+            a.mov_imm64(R::X9, 1);
+            a.str_imm(R::X9, R::X2, 0);
+            a.mov_imm64(R::X9, 0);
+            a.str_imm(R::X9, R::X2, 8);
+            call_int(a, I::PthreadCondTimedWaitRelative);
+            a.add_sp_imm(16);
+            let not_timeout = a.new_label();
+            a.mov_imm64(R::X9, 60); // Darwin ETIMEDOUT
+            a.cmp_reg(R::X0, R::X9);
+            a.branch(not_timeout, B::Conditional(Cond::Ne));
+            a.mov_imm64(R::X20, 0);
+            a.branch(unlock, B::Unconditional);
+            a.bind(not_timeout);
+        } else {
+            call_int(a, I::PthreadCondWait);
+        }
         a.mov_reg(R::X20, R::X0);
         a.branch(unlock, B::CompareNonZero(R::X0));
         a.branch(recheck, B::Unconditional);

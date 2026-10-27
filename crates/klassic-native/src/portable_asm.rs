@@ -27,7 +27,7 @@
 /// Portable general-purpose register slots. `V0..V11` match the x86-64
 /// backend's 12 freely-assignable registers (mapped 1:1 onto
 /// `Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi, R8-R11` in declaration
-/// order). The three GC-reserved color registers are named by their
+/// order). The owner-context base and three GC color registers are named by their
 /// semantic role rather than a neutral slot number: their meaning is
 /// constant across the whole collector, and a future backend maps them
 /// to any three of its own callee-saved registers -- the name survives
@@ -100,21 +100,54 @@ pub trait PortableAsm {
     /// Call a native-ABI callback with V7/V6 arguments; raw result is in V0.
     /// The caller saves live values and normalizes narrow native return types.
     fn call_native_binary(&mut self, target: Reg);
-    /// Unary native entry: preserve platform nonvolatiles and put the native
-    /// argument in V7. Locals must be 16-byte aligned and at most 4080 bytes.
-    /// V5 remains the private local anchor until native_entry_end.
-    #[allow(dead_code)] // Owner dispatch wiring follows in a later slice.
+    /// Unary native entry: preserve platform nonvolatiles, create a portable
+    /// frame with `locals` aligned bytes and put the native argument in V7.
     fn native_entry_begin(&mut self, locals: u32);
-    /// Restore the native frame/nonvolatiles, retaining V0 as the result.
-    #[allow(dead_code)]
+    /// Restore that entry frame/nonvolatiles; keep V0 as the native result.
     fn native_entry_end(&mut self);
-    /// Materialize an address of a nearby text label (ARM64: checked +/-1MiB).
-    #[allow(dead_code)]
     fn mov_text_addr(&mut self, dst: Reg, label: Self::TextLabel);
     fn ret(&mut self);
     /// Standard frame teardown (`mov rsp, rbp; pop rbp` on x86-64).
     fn leave(&mut self);
 
+    /// Compile-time geometry used by the emitted generational runtime.
+    /// Standalone conformance emitters retain their historical fixture size.
+    fn gc_metadata_limit(&self) -> Option<u64> {
+        None
+    }
+    fn gc_metadata_alignment(&self) -> u64 {
+        4096
+    }
+    fn gc_external_metadata_bytes(&self) -> u64 {
+        0
+    }
+    fn gc_large_pages(&self) -> crate::GcLargePages {
+        crate::GcLargePages::Off
+    }
+    fn gc_timing(&self) -> bool {
+        false
+    }
+    fn gc_json_events(&self) -> bool {
+        false
+    }
+    fn gc_event_capacity(&self) -> u64 {
+        crate::gc_codegen::production::trace::CAPACITY
+    }
+    fn gc_pre_touch(&self) -> bool {
+        false
+    }
+    fn gc_uncommit_delay_ns(&self) -> u64 {
+        crate::DEFAULT_GC_UNCOMMIT_DELAY_NS
+    }
+    fn gc_heap_soft_maximum(&self) -> u64 {
+        self.gc_heap_capacity()
+    }
+    fn gc_heap_minimum(&self) -> u64 {
+        16 << 20
+    }
+    fn gc_heap_capacity(&self) -> u64 {
+        192 << 20
+    }
     fn push_reg(&mut self, r: Reg);
     fn pop_reg(&mut self, r: Reg);
     fn mov_reg_reg(&mut self, dst: Reg, src: Reg);
@@ -214,6 +247,15 @@ pub trait PortableAsm {
     // platform requires (Linux/macOS `syscall`, a Windows shim `call`, a
     // future ARM-Linux `svc`), so that per-OS emission stays inside the
     // impl and never leaks into the portable GC code that calls them.
+    /// Write native storage: V7=fd, V6=buffer, V2=length. No managed address
+    /// may reach this boundary. Returns the backend write result in V0;
+    /// caller saves scratch registers and retains any native buffer lifetime.
+    fn plat_write_buffer(&mut self);
+    /// Suspend the native thread for V7 nonnegative milliseconds. Native
+    /// storage only; caller owns publication/state and saves scratch registers.
+    /// Returns the backend status in V0 (Windows Sleep has no status).
+    fn plat_sleep_millis(&mut self);
+
     /// Write `len` bytes at data label `data` to file descriptor `fd`.
     fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize);
     /// Terminate the process with status `code` (does not return).
@@ -287,6 +329,43 @@ impl PortableAsm for crate::NativeCodeGenerator {
     type TextLabel = crate::TextLabel;
     type DataLabel = crate::DataLabel;
 
+    fn gc_metadata_limit(&self) -> Option<u64> {
+        self.gc_max_metadata
+    }
+    fn gc_large_pages(&self) -> crate::GcLargePages {
+        self.gc_large_pages
+    }
+    fn gc_timing(&self) -> bool {
+        self.gc_log
+    }
+    fn gc_json_events(&self) -> bool {
+        self.gc_log && self.gc_log_format == crate::GcLogFormat::Json
+    }
+    fn gc_event_capacity(&self) -> u64 {
+        #[cfg(test)]
+        {
+            self.gc_trace_capacity
+        }
+        #[cfg(not(test))]
+        {
+            crate::gc_codegen::production::trace::CAPACITY
+        }
+    }
+    fn gc_pre_touch(&self) -> bool {
+        self.gc_pre_touch
+    }
+    fn gc_uncommit_delay_ns(&self) -> u64 {
+        self.gc_uncommit_delay_ns
+    }
+    fn gc_heap_soft_maximum(&self) -> u64 {
+        self.gc_soft_max_heap.unwrap_or(self.gc_max_heap)
+    }
+    fn gc_heap_minimum(&self) -> u64 {
+        self.gc_min_heap
+    }
+    fn gc_heap_capacity(&self) -> u64 {
+        self.gc_max_heap
+    }
     fn create_text_label(&mut self) -> Self::TextLabel {
         self.asm.create_text_label()
     }
@@ -532,6 +611,33 @@ impl PortableAsm for crate::NativeCodeGenerator {
         self.asm.rep_movsb();
     }
 
+    fn plat_write_buffer(&mut self) {
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_write);
+        } else {
+            self.emit_syscall_number(crate::PlatformSyscall::Write);
+            self.asm.syscall();
+        }
+    }
+    fn plat_sleep_millis(&mut self) {
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_sleep);
+        } else {
+            self.asm.mov_reg_reg(crate::Reg::Rax, crate::Reg::Rdi);
+            self.asm.mov_imm64(crate::Reg::Rcx, 1000);
+            self.asm.xor_reg_reg(crate::Reg::Rdx, crate::Reg::Rdx);
+            self.asm.div_reg(crate::Reg::Rcx);
+            self.asm.mov_imm64(crate::Reg::Rcx, 1_000_000);
+            self.asm.imul_reg_reg(crate::Reg::Rdx, crate::Reg::Rcx);
+            self.asm.push_reg(crate::Reg::Rdx);
+            self.asm.push_reg(crate::Reg::Rax);
+            self.asm.mov_reg_reg(crate::Reg::Rdi, crate::Reg::Rsp);
+            self.asm.mov_imm64(crate::Reg::Rsi, 0);
+            self.emit_syscall_number(crate::PlatformSyscall::Nanosleep);
+            self.asm.syscall();
+            self.asm.add_reg_imm32(crate::Reg::Rsp, 16);
+        }
+    }
     fn plat_write_data(&mut self, fd: u64, data: Self::DataLabel, len: usize) {
         self.emit_write_data(fd, data, len);
     }

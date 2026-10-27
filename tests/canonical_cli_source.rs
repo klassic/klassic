@@ -92,6 +92,14 @@ fn canonical_cli_emits_compilable_source_and_rejects_unavailable_executables() {
         for flags in [
             &["--gc-poison"][..],
             &["--gc-log"][..],
+            &["--gc-log-format=json"][..],
+            &["--gc-max-heap=64MiB"][..],
+            &["--gc-soft-max-heap=32MiB"][..],
+            &["--gc-max-metadata=64MiB"][..],
+            &["--gc-min-heap=16MiB"][..],
+            &["--gc-uncommit-delay=1s"][..],
+            &["--gc-pre-touch"][..],
+            &["--gc-large-pages=off"][..],
             &["--target", "x86_64-pc-windows-msvc"][..],
         ] {
             let rejected = Command::new(env!("CARGO_BIN_EXE_klassic"))

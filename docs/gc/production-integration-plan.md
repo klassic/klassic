@@ -1,3 +1,5 @@
+> Current integration scope and retained failures: [direct runtime foundation](direct-runtime-foundation.md). The historical checkpoints below are not a completion claim for this candidate.
+
 # Production integration plan — M-G1 (2026-09-29)
 
 Status: M-G1, M-G2 (stop-the-world Young evacuation) M-G3 (enums) and M-G4/5 (Old generation, remset, full collection) implemented on branch `gc/generational-wip` (2026-09-30), as an

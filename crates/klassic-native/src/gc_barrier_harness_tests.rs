@@ -11,7 +11,7 @@
 //! the tests assert. By default no worker thread is started (`spawn` fails),
 //! so every interleaving is deterministic; the worker code is still emitted.
 use crate::gc_codegen::production::test_support::{
-    Counter, HarnessLabels, counter_offset, emit_current_entry, emit_is_old, emit_marked,
+    Counter, HarnessLabels, emit_counter, emit_current_entry, emit_is_old, emit_marked,
     emit_unbounded_budget, harness_labels,
 };
 use crate::portable_asm::{Condition as C, PortableAsm, Reg as R};
@@ -21,7 +21,7 @@ use crate::{
 };
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
+use std::process::{Command, Output};
 
 /// Where an operand comes from.
 #[derive(Clone, Copy)]
@@ -63,12 +63,17 @@ impl<'a> H<'a> {
         };
         h.g.sub_reg_imm32(R::V4, 2048);
         h.reload();
+        // Existing Old-specific fixtures isolate their lane (some fake a live
+        // worker). Young/ordinary-cycle fixtures explicitly enable production
+        // automatic triggering; non-test production has no such switch.
+        crate::gc_codegen::production::test_support::set_young_auto(h.g, false);
         h
     }
 
     fn reload(&mut self) {
         self.g.mov_data_addr(R::V3, self.runtime);
         self.g.load_ptr_disp32(R::V3, R::V3, 0);
+        crate::gc_codegen::production::test_support::bind_primary_owner(self.g);
     }
 
     /// V0 = the operand's payload address (or immediate).
@@ -112,7 +117,8 @@ impl<'a> H<'a> {
     }
 
     /// `obj.field[index] = val`: through the real `field_store` barrier, or
-    /// (`barrier == false`) a plain store that bypasses it.
+    /// (`barrier == false`) encoding followed by a plain store that bypasses
+    /// bookkeeping, so negative controls still use the field representation.
     pub(super) fn store(&mut self, obj: Src, index: u32, val: Src, barrier: bool) {
         self.value(val);
         self.g.mov_reg_reg(R::V6, R::V0);
@@ -122,6 +128,11 @@ impl<'a> H<'a> {
         if barrier {
             self.g.call_label(self.l.field_store);
         } else {
+            crate::gc_codegen::production::test_support::emit_encode_reference(
+                self.g,
+                R::V6,
+                R::V1,
+            );
             self.g.store_ptr_disp32(R::V7, 0, R::V6);
         }
     }
@@ -141,10 +152,17 @@ impl<'a> H<'a> {
         self.g.call_label(self.l.field_load);
     }
 
+    /// The compiler's generic read: raw boxes bypass reference decoding.
+    pub(super) fn load_untyped(&mut self, obj: Src, index: u32) {
+        self.value(obj);
+        self.g.mov_reg_reg(R::V1, R::V0);
+        self.g.add_reg_imm32(R::V0, (index * 8) as i32);
+        crate::gc_codegen::production::emit_untyped_load(self.g, self.l.field_load);
+    }
+
     /// V0 = a counter or flag.
     pub(super) fn counter(&mut self, counter: Counter) {
-        self.g
-            .load_ptr_disp32(R::V0, R::V3, counter_offset(counter));
+        emit_counter(self.g, counter);
     }
 
     pub(super) fn mark_start(&mut self) {
@@ -159,6 +177,33 @@ impl<'a> H<'a> {
         self.g.call_label(self.l.unlock);
     }
 
+    /// Seal the Old snapshot explicitly, independently of a Young collection.
+    pub(super) fn end_marks(&mut self) {
+        self.g.call_label(self.l.lock);
+        self.g.call_label(self.l.mark_end);
+        self.g.call_label(self.l.unlock);
+    }
+
+    pub(super) fn mark_quantum(&mut self, units: u64) {
+        self.g.call_label(self.l.lock);
+        crate::gc_codegen::production::test_support::emit_budget(self.g, units);
+        self.g.call_label(self.l.mark_loop);
+        self.g.call_label(self.l.unlock);
+    }
+
+    pub(super) fn relocate_quantum(&mut self, units: u64, worker: bool) {
+        self.g.call_label(self.l.lock);
+        crate::gc_codegen::production::test_support::emit_budget(self.g, units);
+        crate::gc_codegen::production::test_support::set_collecting(self.g, true);
+        self.g.call_label(if worker {
+            self.l.worker_cheney
+        } else {
+            self.l.cheney
+        });
+        crate::gc_codegen::production::test_support::set_collecting(self.g, false);
+        self.g.call_label(self.l.unlock);
+    }
+
     /// Pop the newest RootCell (root cells are LIFO).
     pub(super) fn pop_root(&mut self) {
         self.g.call_label(self.l.root_pop);
@@ -167,6 +212,63 @@ impl<'a> H<'a> {
     pub(super) fn marked(&mut self, obj: Src) {
         self.value(obj);
         emit_marked(self.g);
+    }
+
+    pub(super) fn object_metadata(&mut self, obj: Src, field: usize) {
+        use crate::gc_abi::ObjectHeader;
+        self.value(obj);
+        self.g.load_ptr_disp32(
+            R::V0,
+            R::V0,
+            std::mem::offset_of!(ObjectHeader, mark_record) as i32
+                - std::mem::size_of::<ObjectHeader>() as i32,
+        );
+        let done = self.g.create_text_label();
+        self.g.test_reg_reg(R::V0, R::V0);
+        self.g.jcc_label(C::Equal, done);
+        self.g.load_ptr_disp32(R::V0, R::V0, field as i32);
+        self.g.bind_text_label(done);
+    }
+
+    pub(super) fn object_id(&mut self, obj: Src) {
+        self.object_metadata(
+            obj,
+            std::mem::offset_of!(crate::gc_abi::MarkRecord, object_id),
+        );
+    }
+
+    pub(super) fn collect(&mut self) {
+        self.g.call_label(self.l.collect);
+    }
+
+    pub(super) fn finish_collection(&mut self) {
+        self.g.call_label(self.l.lock);
+        self.g.call_label(self.l.finish);
+        self.g.call_label(self.l.unlock);
+    }
+
+    pub(super) fn worker_copy(&mut self, obj: Src) {
+        self.value(obj);
+        self.g.load_ptr_disp32(
+            R::V1,
+            R::V3,
+            crate::gc_codegen::production::test_support::heap_base_offset(),
+        );
+        self.g.sub_reg_reg(R::V0, R::V1);
+        self.g.shl_reg_imm8(R::V0, 16);
+        self.g.mov_imm64(
+            R::V1,
+            u64::from(crate::gc_abi::PhaseSnapshot::initial().color()),
+        );
+        self.g.or_reg_reg(R::V0, R::V1);
+        self.g.call_label(self.l.worker_forward);
+        self.g.shr_reg_imm8(R::V0, 16);
+        self.g.load_ptr_disp32(
+            R::V1,
+            R::V3,
+            crate::gc_codegen::production::test_support::heap_base_offset(),
+        );
+        self.g.add_reg_reg(R::V0, R::V1);
     }
 
     pub(super) fn is_old(&mut self, obj: Src) {
@@ -223,7 +325,7 @@ impl<'a> H<'a> {
         self.g.jcc_label(C::Below, top);
     }
 
-    /// Small allocations until the relocation phase has finished.
+    /// Small allocations until relocation closes, then finish its cleanup.
     pub(super) fn settle(&mut self) {
         let top = self.g.create_text_label();
         self.g.bind_text_label(top);
@@ -233,6 +335,7 @@ impl<'a> H<'a> {
         self.counter(Counter::PhaseOpen);
         self.g.test_reg_reg(R::V0, R::V0);
         self.g.jcc_label(C::NotEqual, top);
+        self.finish_collection();
     }
 
     /// Repeat `body` `times` times (the count lives in a frame slot).
@@ -333,44 +436,24 @@ pub(super) fn run(
     arg: u64,
     worker_thread: bool,
 ) -> Observed {
-    let target = NativeTargetContext::for_target(NativeTarget::LinuxX86_64);
-    let source = SourceFile::new("<gc-harness>", "1");
-    let expr =
-        klassic_syntax::parse_inline_expression("<gc-harness>", "1").expect("trivial source");
-    let mut generator = NativeCodeGenerator::new(source, None, target.platform);
-    generator.gc_generational = true;
-    generator.gc_test = Some(GcTestProgram {
-        body,
-        arg,
-        no_worker_thread: !worker_thread,
-    });
-    let object = generator.compile(&expr).expect("harness program compiles");
-    let bytes = write_executable_for_target(target, object);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let path = std::env::temp_dir().join(format!("klassic-harness-{}-{nanos}", std::process::id()));
-    std::fs::write(&path, bytes).expect("write harness executable");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    let output = (0..50)
-        .find_map(|attempt| match Command::new(&path).output() {
-            Ok(output) => Some(output),
-            Err(error) if error.raw_os_error() == Some(26) && attempt < 49 => {
-                // ETXTBSY: another test thread forked while the file was open.
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                None
-            }
-            Err(error) => panic!("run harness: {error}"),
-        })
-        .expect("harness ran");
-    let _ = std::fs::remove_file(&path);
+    run_with_stress(body, arg, worker_thread, false)
+}
+
+pub(super) fn run_with_stress(
+    body: fn(&mut NativeCodeGenerator, u64),
+    arg: u64,
+    worker_thread: bool,
+    stress: bool,
+) -> Observed {
+    let (output, _) =
+        execute_with_image_retention(body, arg, worker_thread, stress, None, None, true);
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     if std::env::var_os("KLASSIC_HARNESS_DUMP").is_some() {
         eprintln!("--- harness output ---\n{text}");
     }
     assert!(
         output.status.success(),
-        "harness failed ({:?})\nstdout:\n{text}\nstderr:\n{}",
+        "harness failed ({:?}, arg={arg}, worker={worker_thread}, stress={stress})\nstdout:\n{text}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
@@ -384,3 +467,303 @@ pub(super) fn run(
 
 mod remset;
 mod satb;
+
+/// Execute the same production harness when a resource failure is expected.
+pub(super) fn run_failure(body: fn(&mut NativeCodeGenerator, u64), arg: u64) -> Output {
+    execute(body, arg, false, false)
+}
+
+fn execute(
+    body: fn(&mut NativeCodeGenerator, u64),
+    arg: u64,
+    worker_thread: bool,
+    stress: bool,
+) -> Output {
+    execute_with_soft_limit(body, arg, worker_thread, stress, None)
+}
+
+fn execute_with_soft_limit(
+    body: fn(&mut NativeCodeGenerator, u64),
+    arg: u64,
+    worker_thread: bool,
+    stress: bool,
+    soft_limit: Option<u64>,
+) -> Output {
+    execute_with_heap_limits(body, arg, worker_thread, stress, soft_limit, None)
+}
+
+fn execute_with_heap_limits(
+    body: fn(&mut NativeCodeGenerator, u64),
+    arg: u64,
+    worker_thread: bool,
+    stress: bool,
+    soft_limit: Option<u64>,
+    hard_limit: Option<u64>,
+) -> Output {
+    execute_with_image_retention(
+        body,
+        arg,
+        worker_thread,
+        stress,
+        soft_limit,
+        hard_limit,
+        false,
+    )
+    .0
+}
+
+fn execute_with_image_retention(
+    body: fn(&mut NativeCodeGenerator, u64),
+    arg: u64,
+    worker_thread: bool,
+    stress: bool,
+    soft_limit: Option<u64>,
+    hard_limit: Option<u64>,
+    retain_failure: bool,
+) -> (Output, Option<std::path::PathBuf>) {
+    let target = NativeTargetContext::for_target(NativeTarget::LinuxX86_64);
+    let source = SourceFile::new("<gc-harness>", "1");
+    let expr =
+        klassic_syntax::parse_inline_expression("<gc-harness>", "1").expect("trivial source");
+    let mut generator = NativeCodeGenerator::new(source, None, target.platform);
+    generator.gc_generational = true;
+    generator.gc_stress = stress;
+    generator.gc_soft_max_heap = soft_limit;
+    if let Some(hard) = hard_limit {
+        generator.gc_max_heap = hard;
+    }
+    generator.gc_test = Some(GcTestProgram {
+        body,
+        arg,
+        no_worker_thread: !worker_thread,
+    });
+    let object = generator.compile(&expr).expect("harness program compiles");
+    let bytes = write_executable_for_target(target, object);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    // Time alone is not a uniqueness guarantee for concurrent test threads.
+    // Reserve the path exclusively before writing any executable bytes.
+    static NEXT_IMAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (path, mut file) = loop {
+        let id = NEXT_IMAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "klassic-harness-{}-{nanos}-{id}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => break (path, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("create harness executable: {e}"),
+        }
+    };
+    std::io::Write::write_all(&mut file, &bytes).expect("write harness executable");
+    file.set_permissions(std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    drop(file);
+    let output = (0..50)
+        .find_map(|attempt| match Command::new(&path).output() {
+            Ok(output) => Some(output),
+            Err(error) if error.raw_os_error() == Some(26) && attempt < 49 => {
+                // ETXTBSY: another test thread forked while the file was open.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            }
+            Err(error) => panic!("run harness: {error}"),
+        })
+        .expect("harness ran");
+    if let Some(export) = std::env::var_os("KLASSIC_HARNESS_IMAGE") {
+        std::fs::copy(&path, export).expect("export harness executable");
+    }
+    if let Some(directory) = std::env::var_os("KLASSIC_HARNESS_IMAGE_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).expect("create harness export directory");
+        std::fs::copy(
+            &path,
+            directory.join(format!(
+                "{arg}-{}.elf",
+                path.file_name().unwrap().to_string_lossy()
+            )),
+        )
+        .expect("export harness executable by argument");
+    }
+    let retained = if retain_failure && !output.status.success() {
+        eprintln!("failed harness executable retained: {}", path.display());
+        Some(path)
+    } else {
+        let _ = std::fs::remove_file(&path);
+        None
+    };
+    (output, retained)
+}
+
+#[test]
+fn unexpected_runtime_failure_retains_the_actual_generated_executable() {
+    fn fail(g: &mut NativeCodeGenerator, _: u64) {
+        let h = H::begin(g);
+        h.g.mov_imm64(R::V0, 0); // An actual null RootCell handle is invalid.
+        h.g.call_label(h.l.root_load);
+    }
+    let (output, retained) = execute_with_image_retention(fail, 0, false, false, None, None, true);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("runtime invariant violated"));
+    let path = retained.expect("unexpected runtime failure preserves its executable");
+    let bytes = std::fs::read(&path).expect("preserved generated image remains readable");
+    assert!(bytes.starts_with(b"\x7fELF"));
+    let replay = Command::new(&path).output().expect("replay retained image");
+    assert_eq!(replay.status.code(), output.status.code());
+    assert_eq!(replay.stderr, output.stderr);
+    std::fs::remove_file(path).expect("remove this intentional test artifact after replay");
+
+    let (expected, retained) =
+        execute_with_image_retention(fail, 0, false, false, None, None, false);
+    assert!(!expected.status.success());
+    assert!(
+        retained.is_none(),
+        "expected negative cases keep normal cleanup"
+    );
+}
+
+mod admission;
+mod colours;
+mod copy_claims;
+mod detach;
+mod exhaustion;
+mod fields;
+mod identity;
+mod lease_transfer;
+mod load_fast;
+mod mark_roots;
+mod mark_slots;
+mod metadata_leases;
+mod moving_round;
+mod native_completed;
+mod native_tail;
+mod phase;
+mod relocate_roots;
+mod relocate_slots;
+mod root_retirement;
+mod thread_tls;
+
+mod end_check;
+mod literal_roots;
+mod mark_end;
+mod mark_epoch;
+mod mark_prepare;
+mod ready_cycle;
+mod relocate_end;
+mod remset_scan;
+mod retire;
+
+mod mark_frontier;
+
+mod old_mark;
+
+mod store_fast;
+
+mod young_mark;
+
+mod old_cycle;
+
+mod old_policy;
+
+mod tenuring;
+
+mod remset_retire;
+
+mod start_policy;
+
+mod capacity;
+
+mod generation;
+mod slot_owner;
+
+mod pool;
+
+mod old_runs;
+
+mod heap_geometry;
+
+mod commit;
+mod large_pages;
+mod pre_touch;
+
+mod worker_lifecycle;
+
+mod metadata;
+
+mod soft_heap;
+
+mod metadata_retire;
+
+mod mark_arena;
+
+#[path = "gc_barrier_harness_tests/trace.rs"]
+mod trace;
+
+mod mutator_time;
+
+mod large_object;
+mod large_policy;
+mod large_reserve;
+
+mod full_capacity;
+mod old_footprint;
+
+mod promotion_reserve;
+
+mod native_io;
+pub(crate) mod nested_output;
+mod participants;
+mod registered_roots;
+
+mod root_journal;
+
+mod actors;
+mod journal_regions;
+
+mod owner_boundaries;
+
+mod native_mark_sharing;
+
+mod journal_obligations;
+
+mod old_phase_rounds;
+
+mod allocation_old_scheduler;
+mod captured_journal;
+mod dual_mark;
+mod relocate_pages;
+mod worker_journal;
+mod worker_view;
+mod young_scheduler;
+
+mod page_runs;
+mod weak;
+mod weak_race;
+
+mod native_roots;
+
+mod pin_destination;
+
+mod pin_copy;
+
+mod pin_adopt;
+
+mod scoped_pin;
+
+mod pin_abi;
+
+mod pin_native_windows;
+
+mod queue_growth;
+mod queue_spill_frontier;
+mod thread_api;
+mod thread_api_c;
+
+mod lease_growth;
+mod weak_growth;

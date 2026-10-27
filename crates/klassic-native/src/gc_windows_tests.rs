@@ -143,7 +143,7 @@ fn gc_windows_worker_pe_imports_and_relocations() {
     }
     let pe = crate::pe::write_executable(object.clone(), crate::NativeTarget::WindowsX86_64.spec());
     assert_eq!(&pe[..2], b"MZ");
-    for import in I::ALL {
+    for import in I::for_object(&object) {
         assert!(
             pe.windows(import.name().len())
                 .any(|s| s == import.name().as_bytes())
