@@ -283,8 +283,8 @@ fn gc_windows_production_callback_restores_all_native_nonvolatile_gprs_and_simd(
 }
 
 fn tls_context_body(g: &mut NativeCodeGenerator, _: u64) {
-    let h = crate::gc_barrier_harness_tests::H::begin(g);
-    let g = h.g;
+    let runtime = g.gc_gen.as_ref().unwrap().data.runtime;
+    crate::gc_codegen::production::test_support::begin_primary_owner_fixture(g, runtime);
     let rt = g.gc_gen.take().unwrap();
     crate::gc_codegen::production::test_support::bind_primary_owner(g);
     crate::gc_codegen::production::test_support::emit_mark_attach_tls_probe(g, &rt.labels);
@@ -299,8 +299,8 @@ fn gc_windows_production_actual_tls_retains_key_until_detach_clear_and_context_r
 }
 
 fn public_thread_api_body(g: &mut NativeCodeGenerator, _: u64) {
-    let h = crate::gc_barrier_harness_tests::H::begin(g);
-    let g = h.g;
+    let runtime = g.gc_gen.as_ref().unwrap().data.runtime;
+    crate::gc_codegen::production::test_support::begin_primary_owner_fixture(g, runtime);
     let rt = g.gc_gen.take().unwrap();
     crate::gc_codegen::production::test_support::bind_primary_owner(g);
     crate::gc_codegen::production::test_support::emit_public_thread_api_probe(g, &rt.labels);

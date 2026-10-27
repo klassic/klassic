@@ -97,7 +97,7 @@ println(sum(keep))
     let (mut reader, mut writer) = UnixStream::pair().unwrap();
     writer.set_nonblocking(true).unwrap();
     let mut filled = 0;
-    for bytes in [&[b'P'; 8192][..], &[b'P'][..]] {
+    for bytes in [&[b'P'; 8192][..], b"P"] {
         loop {
             match writer.write(bytes) {
                 Ok(n) => filled += n,

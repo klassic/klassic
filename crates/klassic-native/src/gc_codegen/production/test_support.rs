@@ -333,6 +333,18 @@ pub(crate) fn emit_counter<E: PortableAsm>(a: &mut E, counter: Counter) {
 pub(crate) fn store_counter<E: PortableAsm>(a: &mut E, counter: Counter, value: R) {
     store_rt(a, counter_offset(counter), value);
 }
+/// Reserve scratch and bind the primary owner for a standalone emitted fixture.
+/// Shared by Linux ELF harnesses and native Windows PE tests.
+pub(crate) fn begin_primary_owner_fixture<E: PortableAsm>(a: &mut E, runtime: E::DataLabel) {
+    a.sub_reg_imm32(R::V4, 2048);
+    a.mov_data_addr(R::V3, runtime);
+    a.load_ptr_disp32(R::V3, R::V3, 0);
+    bind_primary_owner(a);
+    // Old-specific fixtures isolate their lane. Young/ordinary-cycle tests
+    // explicitly enable automatic triggering after this shared initialization.
+    set_young_auto(a, false);
+}
+
 /// Bind the explicit owner selected by the legacy startup cell for a harness.
 pub(crate) fn bind_primary_owner<E: PortableAsm>(a: &mut E) {
     a.load_ptr_disp32(

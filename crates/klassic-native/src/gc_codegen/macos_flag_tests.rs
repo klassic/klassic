@@ -495,8 +495,8 @@ fn generational_arm64_public_pin_scope_executes_compiled_c_native_callbacks_and_
         e.asm.bind(failed);
         e.asm.emit_exit(1);
         e.asm.bind(callback);
-        for word in code.chunks_exact(4) {
-            e.asm.word(u32::from_le_bytes(word.try_into().unwrap()));
+        for word in code.as_chunks::<4>().0 {
+            e.asm.word(u32::from_le_bytes(*word));
         }
         {
             let runtime = e.gc_gen.take().unwrap();
@@ -572,10 +572,10 @@ fn generational_arm64_rooted_output_reloads_after_full_movement_between_chunks()
 #[test]
 fn generational_arm64_nested_renderers_keep_real_parent_roots_through_full_moves() {
     use crate::aarch64::{LoweredEnumTable, collect_functions, collect_records};
-    use crate::gc_barrier_harness_tests::nested_output::{EXPECTED, SOURCE, lowered};
     use crate::gc_codegen::production::test_support::{
         bind_primary_owner, rooted_write_depth, rooted_write_emit_collection_hook,
     };
+    use crate::gc_nested_output_fixture::{EXPECTED, SOURCE, lowered};
     use std::collections::HashMap;
     for stress in [false, true] {
         let source = klassic_syntax::parse_inline_expression("<nested-output>", SOURCE).unwrap();

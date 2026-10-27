@@ -55,18 +55,13 @@ impl<'a> H<'a> {
         let l = harness_labels(&gen_runtime.labels);
         let runtime = gen_runtime.data.runtime;
         let print_i64 = g.print_i64;
-        let mut h = Self {
+        let h = Self {
             g,
             l,
             runtime,
             print_i64,
         };
-        h.g.sub_reg_imm32(R::V4, 2048);
-        h.reload();
-        // Existing Old-specific fixtures isolate their lane (some fake a live
-        // worker). Young/ordinary-cycle fixtures explicitly enable production
-        // automatic triggering; non-test production has no such switch.
-        crate::gc_codegen::production::test_support::set_young_auto(h.g, false);
+        crate::gc_codegen::production::test_support::begin_primary_owner_fixture(h.g, runtime);
         h
     }
 

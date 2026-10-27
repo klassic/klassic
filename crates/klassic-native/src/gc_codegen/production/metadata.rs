@@ -240,7 +240,9 @@ pub(super) fn after_unlock<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     reclaim::after_unlock(a, l);
 }
 #[cfg(test)]
-pub(crate) use reclaim::{fail_release_next, release_offsets, retry_release};
+pub(crate) use reclaim::fail_release_next;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use reclaim::{release_offsets, retry_release};
 
 #[cfg(test)]
 pub(crate) fn backing_for<E: PortableAsm>(a: &mut E) {

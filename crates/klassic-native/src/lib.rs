@@ -9,6 +9,8 @@ mod gc_atomic_tests;
 mod gc_barrier_harness_tests;
 mod gc_codegen;
 mod gc_model;
+#[cfg(test)]
+mod gc_nested_output_fixture;
 #[cfg(all(
     test,
     target_arch = "x86_64",
@@ -24366,14 +24368,14 @@ impl NativeCodeGenerator {
             let unc_share = self.asm.create_text_label();
             let after_server = self.asm.create_text_label();
             self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rbx, 0);
-            for separator in [b'/', b'\\'] {
+            for separator in *b"/\\" {
                 self.asm.cmp_reg_imm8(Reg::Rax, separator as i8);
                 self.asm.jcc_label(Condition::Equal, rooted);
             }
             self.asm.jmp_label(drive);
             self.asm.bind_text_label(rooted);
             self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rbx, 1);
-            for separator in [b'/', b'\\'] {
+            for separator in *b"/\\" {
                 self.asm.cmp_reg_imm8(Reg::Rax, separator as i8);
                 self.asm.jcc_label(Condition::Equal, unc_server);
             }
@@ -24385,7 +24387,7 @@ impl NativeCodeGenerator {
             self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rbx, Reg::R8);
             self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
             self.asm.jcc_label(Condition::Equal, mkdir_final);
-            for separator in [b'/', b'\\'] {
+            for separator in *b"/\\" {
                 self.asm.cmp_reg_imm8(Reg::Rax, separator as i8);
                 self.asm.jcc_label(Condition::Equal, after_server);
             }
@@ -24398,7 +24400,7 @@ impl NativeCodeGenerator {
             self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
             self.asm.jcc_label(Condition::Equal, mkdir_final);
             let after_share = self.asm.create_text_label();
-            for separator in [b'/', b'\\'] {
+            for separator in *b"/\\" {
                 self.asm.cmp_reg_imm8(Reg::Rax, separator as i8);
                 self.asm.jcc_label(Condition::Equal, after_share);
             }
@@ -24414,7 +24416,7 @@ impl NativeCodeGenerator {
             self.asm.mov_imm64(Reg::R8, 2);
             self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rbx, 2);
             let after_drive = self.asm.create_text_label();
-            for separator in [b'/', b'\\'] {
+            for separator in *b"/\\" {
                 self.asm.cmp_reg_imm8(Reg::Rax, separator as i8);
                 self.asm.jcc_label(Condition::Equal, after_drive);
             }
