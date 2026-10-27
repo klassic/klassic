@@ -26,6 +26,7 @@ mod alloc;
 mod collect;
 mod copy;
 mod enums;
+mod fields;
 mod mark;
 mod offsets;
 mod remset;
