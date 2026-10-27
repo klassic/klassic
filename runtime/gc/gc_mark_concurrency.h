@@ -1270,12 +1270,17 @@ static void graph_reuse_allocate(MarkGraph *g,AllocationPage *page,MarkRecord *r
     assert(!g->m.leases.active&&g->root_registry.active==1&&!g->root_registry.leases&&!g->m.ctx.retiring_roots);
     metadata_unlock(&g->m);
 }
+#ifndef GC_MARK_GRAPH_PROGRESS
+#define GC_MARK_GRAPH_PROGRESS(round,stage) do { \
+    if(getenv("KLASSIC_GC_GRAPH_TRACE"))fprintf(stderr,"mark graph round %u %s\n",round,stage); \
+} while(0)
+#endif
 static void gc_run_mark_graph(const GraphLifecycle *lifecycle,const GraphRememberedOps *remembered,MarkRouter route,MarkStep mark,GraphMarkSpill spill,MarkScanner scan,MetadataStep metadata,BudgetStep budget,ReferenceAcquirer reference_lease,Resolver resolve,
     GuardedStorer store,GuardedHealer heal,PoolStep pool,TlabPage bind,
     uint64_t (*allocate_into)(MutatorContext *,const AllocationInto *),
     DescriptorRegister register_descriptor,GraphRootStep roots,SourceDrainer drain,SourceUncommitter uncommit,ForwardIncomingScanner incoming,ForwardCompressor compress,HeapIncomingScanner heap_incoming,HeapWalker walk_heap,ObjectWalker walk_object,HeapAuditSlicer audit_slice,HeapAuditor audit_owner) {
     for(unsigned round=0;round<64;round++) {
-        if(getenv("KLASSIC_GC_GRAPH_TRACE"))fprintf(stderr,"mark graph round %u start\n",round);
+        GC_MARK_GRAPH_PROGRESS(round,"start");
         MarkGraph g={.lifecycle=*lifecycle,.rem_ops=*remembered,.route=route,.mark=mark,.spill=spill,.scan=scan,.heal=heal,.reference_lease=reference_lease,.resolve=resolve};g.m.metadata=metadata;g.relocation.epoch=1;
 #ifdef _WIN32
         InitializeCriticalSection(&g.m.lock);
@@ -1670,7 +1675,7 @@ static void gc_run_mark_graph(const GraphLifecycle *lifecycle,const GraphRemembe
 #endif
         metadata_unlock(&g.m);
         while(!atomic_load_explicit(&g.offer_busy_wait,memory_order_acquire))metadata_yield();
-        if(getenv("KLASSIC_GC_GRAPH_TRACE"))fprintf(stderr,"mark graph round %u offer busy\n",round);
+        GC_MARK_GRAPH_PROGRESS(round,"offer busy");
         graph_end_check_enter(&g,&owner);
         assert(g.queue.in_flight&&!g.records[1].young_epoch&&!g.records[1].old_epoch);
         assert((atomic_load(&child_source->word)&3)==1&&atomic_load(&child_source->access)==GC_SOURCE_CLOSED);
@@ -1745,7 +1750,7 @@ static void gc_run_mark_graph(const GraphLifecycle *lifecycle,const GraphRemembe
             }
         }
         while(!atomic_load_explicit(&g.array_parked,memory_order_acquire))metadata_yield();
-        if(getenv("KLASSIC_GC_GRAPH_TRACE"))fprintf(stderr,"mark graph round %u array parked\n",round);
+        GC_MARK_GRAPH_PROGRESS(round,"array parked");
         graph_end_check_enter(&g,&owner);
         assert(g.queue.in_flight&&!graph_inventory_end(&g,&audit));
         g.metadata_resume=0; // the array claimant injects pressure at acquisition
@@ -1786,7 +1791,7 @@ static void gc_run_mark_graph(const GraphLifecycle *lifecycle,const GraphRemembe
         // Delay forwarding publication until the consumer has polled on BUSY.
         atomic_store_explicit(&g.array_resume,1,memory_order_release);
         while(!atomic_load_explicit(&g.array_metadata_wait,memory_order_acquire))metadata_yield();
-        if(getenv("KLASSIC_GC_GRAPH_TRACE"))fprintf(stderr,"mark graph round %u scan full\n",round);
+        GC_MARK_GRAPH_PROGRESS(round,"scan full");
         graph_end_check_enter(&g,&owner);
         assert(g.handshake.native>=1&&g.queue.in_flight&&g.scan_pressure_injected);
         assert(g.scan_held_count&&g.m.leases.active>=g.scan_held_count);
@@ -1802,7 +1807,7 @@ static void gc_run_mark_graph(const GraphLifecycle *lifecycle,const GraphRemembe
 #endif
         metadata_unlock(&g.m);
         while(!atomic_load_explicit(&g.scan_busy_wait,memory_order_acquire))metadata_yield();
-        if(getenv("KLASSIC_GC_GRAPH_TRACE"))fprintf(stderr,"mark graph round %u scan busy\n",round);
+        GC_MARK_GRAPH_PROGRESS(round,"scan busy");
         graph_end_check_enter(&g,&owner);
         assert(g.queue.in_flight&&!graph_inventory_end(&g,&audit));
         assert((atomic_load(&array_source->word)&3)==1&&atomic_load(&array_source->access)==GC_SOURCE_CLOSED);

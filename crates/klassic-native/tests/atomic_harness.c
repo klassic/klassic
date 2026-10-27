@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+#include "atomic_progress.h"
+#include "conformance_budget.h"
 #include "../../../runtime/gc/gc_native_buffer_incoming_cases.h"
 #include "../../../runtime/gc/gc_native_buffer_quiescence_cases.h"
 #include "../../../runtime/gc/gc_native_heap_cases.h"
@@ -559,13 +561,14 @@ static uint64_t emitted_pin_registry_step(PinPageRegistry *r,const MetadataLease
 #include "../../../runtime/gc/gc_weak_incoming_cases.h"
 #include "../../../runtime/gc/gc_weak_follow_cases.h"
 int main(void) {
+    atomic_stage("main",0);
     /* Keep the last completed fixture visible if emitted code faults. */
     assert(setvbuf(stdout,NULL,_IONBF,0)==0);
 #ifdef _WIN32
     InitializeCriticalSection(&latch.mutex);
     InitializeConditionVariable(&latch.condition);
 #else
-    alarm(40); // a broken emitted retry loop must fail rather than hang CI
+    alarm(KLASSIC_CONFORMANCE_TIMEOUT_SECONDS); // bounded whole-suite budget
     assert(pthread_mutex_init(&latch.mutex, NULL) == 0);
     assert(pthread_cond_init(&latch.condition, NULL) == 0);
 #endif
@@ -1053,8 +1056,11 @@ int main(void) {
         (MoveMarkSpill)mark_spill.memory,(MarkScanner)mark_scan.memory,(ForwardStep)forward.memory,(SourceAccess)source_access.memory,
         (RelocateTarget)relocate_target.memory,(RelocateCopy)relocate_copy.memory,(RelocatePublish)relocate_publish.memory,(SurvivorAge)survivor_age.memory,(MarkedSurvivorAge)marked_age.memory};
     GraphRememberedOps remembered={&move,(RememberedInventoryStep)remembered_inventory.memory,(RememberedOwnerFinder)remembered_owner.memory,(RememberedLoader)remembered_load.memory,(RememberedWalker)remembered_walk.memory,(RememberedAcquirer)remembered_lease.memory,(RememberedTransferStep)remembered_transfer.memory,(BarrierBufferStep)buffer_step.memory,(RootAccessor)root_access.memory,(PromotionRememberStep)promotion_remember.memory,(RootedLoader)rooted_load.memory,(RootedLoadAdmitter)rooted_load_admit.memory,(PendingFollower)pending_follow.memory,(PendingAccessor)pending_access.memory};
+    atomic_stage("mark_graph begin",0);
     gc_run_mark_graph(&lifecycle,&remembered,(MarkRouter)mark_route.memory,(MarkStep)mark.memory,(MarkSpill)mark_spill.memory,(MarkScanner)mark_scan.memory,(MetadataStep)metadata.memory,(BudgetStep)budget.memory,(ReferenceAcquirer)reference_lease.memory,(Resolver)resolve.memory,(GuardedStorer)guarded_store.memory,(GuardedHealer)guarded_heal.memory,(PoolStep)pool.memory,(TlabPage)bind.memory,(AllocateInto)alloc_into.memory,(DescriptorRegister)descriptor.memory,(RootStep)roots.memory,(SourceDrainer)source_drain.memory,(SourceUncommitter)source_uncommit.memory,(ForwardIncomingScanner)forward_incoming.memory,(ForwardCompressor)forward_compress.memory,(HeapIncomingScanner)heap_incoming.memory,(HeapWalker)heap_walk.memory,(ObjectWalker)object_walk.memory,(HeapAuditSlicer)heap_audit_slice.memory,(HeapAuditor)heap_audit.memory);
+    atomic_stage("mark_graph completed; mark_move begin",0);
     gc_run_mark_move_pipeline(&move,(RememberedInventoryStep)remembered_inventory.memory,(PromotionRememberStep)promotion_remember.memory);
+    atomic_stage("mark_move completed; remembered begin",0);
     gc_run_remembered_pipeline(&move,(RememberedInventoryStep)remembered_inventory.memory,(RememberedLoader)remembered_load.memory,(MarkRouter)mark_route.memory,(RememberedTransferStep)remembered_transfer.memory,(RememberedOwnerFinder)remembered_owner.memory,(RememberedAcquirer)remembered_lease.memory,(ResolveRootDrain)root_drain.memory,(PromotionRememberStep)promotion_remember.memory);
     gc_run_resolve_chains((RootFollower)root_follow.memory,(Resolver)resolve.memory,(ReferenceAcquirer)reference_lease.memory,(MetadataStep)metadata.memory,(ForwardStep)forward.memory,(SourceAccess)source_access.memory,(RootStep)roots.memory,(RootDrainer)root_drain.memory,(RelocateCopy)relocate_copy.memory,(RelocatePublish)relocate_publish.memory,(RelocateTarget)relocate_target.memory,(PoolStep)pool.memory,(ForwardCompressor)forward_compress.memory,(ForwardIncomingScanner)forward_incoming.memory,(PendingFollower)pending_follow.memory,(PendingAccessor)pending_access.memory,(PendingMarker)pending_mark.memory);
     unload_code(pending_follow);
@@ -1196,5 +1202,6 @@ int main(void) {
 #endif
     printf("emitted atomics: %d CAS winner, %d fetch-or, %d publication trials PASS\n", ROUNDS, ROUNDS, ROUNDS);
     printf("emitted atomics: %d u32 CAS, %d u32 publication, exact-width context/guard checks PASS\n", ROUNDS, ROUNDS);
+    atomic_stage("main completed",0);
     return 0;
 }

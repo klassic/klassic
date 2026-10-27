@@ -9,6 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       KLASSIC_UNICORN_PYTHON: python
+      KLASSIC_GC_GRAPH_TRACE: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,8 +37,21 @@ jobs:
         # the C-backend link tests resolve next to the klassic binary.
         run: cargo build -p klassic-runtime
 
-      - name: Test
-        run: cargo test
+      - name: Test native runtime
+        run: cargo test -p klassic-native
+
+      - name: Test remaining workspace
+        run: cargo test --workspace --exclude klassic-native
+
+      - name: Preserve failed conformance drivers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-failed-conformance-drivers
+          path: |
+            /tmp/klassic-emitted-atomics-*
+            /tmp/klassic-harness-*
+          if-no-files-found: ignore
 
       - name: Build release binary
         run: cargo build --release
