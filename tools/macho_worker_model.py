@@ -31,6 +31,7 @@ class WorkerModel:
         self.native_entry = {}
         self.stacks = {}
         self.mutexes, self.conditions = {}, set()
+        self.resource_threads = {}
         self.tls_keys, self.tls_values, self.next_tls_key = set(), {}, 0
         self.current = 0
         self.next_thread = 1
@@ -149,15 +150,21 @@ class WorkerModel:
             self.counts['mutex_init'] += 1
             assert x[1] == 0 and x[0] not in self.mutexes
             if self.fault == 'mutex-init': self.result(12)
-            else: self.mutexes[x[0]] = None; self.result(0)
+            else:
+                self.mutexes[x[0]] = None
+                self.resource_threads[x[0]] = None
+                self.result(0)
         elif symbol == '_pthread_cond_init':
             self.counts['cond_init'] += 1
             assert x[1] == 0 and x[0] not in self.conditions
             if self.fault == 'cond-init': self.result(12)
-            else: self.conditions.add(x[0]); self.result(0)
+            else:
+                self.conditions.add(x[0])
+                self.resource_threads[x[0]] = None
+                self.result(0)
         elif symbol == '_pthread_mutex_destroy':
             self.counts['mutex_destroy'] += 1
-            assert all(t in self.joined for t in self.contexts if t != 0), 'destroy before join'
+            assert self.resource_threads[x[0]] is None or self.resource_threads[x[0]] in self.joined, 'destroy before owning thread join'
             assert x[0] in self.mutexes and self.mutexes[x[0]] is None
             assert not any((w[0] == 'lock' and w[1] == x[0]) or
                            (w[0] == 'cond' and w[2] == x[0]) for w in self.blocked.values())
@@ -165,17 +172,19 @@ class WorkerModel:
             else: del self.mutexes[x[0]]; self.result(0)
         elif symbol == '_pthread_cond_destroy':
             self.counts['cond_destroy'] += 1
-            assert all(t in self.joined for t in self.contexts if t != 0), 'destroy before join'
+            assert self.resource_threads[x[0]] is None or self.resource_threads[x[0]] in self.joined, 'destroy before owning thread join'
             assert x[0] in self.conditions
             assert not any(w[0] == 'cond' and w[1] == x[0] for w in self.blocked.values())
             if self.fault in ('cleanup', 'cond-destroy'): self.result(16)
             else: self.conditions.remove(x[0]); self.result(0)
         elif symbol == '_pthread_create':
-            assert x[1] == x[3] == 0 and x[2], tuple(hex(v) for v in x)
+            assert x[1] == 0 and x[2], tuple(hex(v) for v in x)
             if self.fault in ('thread-create', 'cleanup'): self.result(11)
             else:
                 parent = u.context_save()
                 tid = self.next_thread; self.next_thread += 1
+                for resource, owner in self.resource_threads.items():
+                    if owner is None: self.resource_threads[resource] = tid
                 stack = 0x710000000000 + tid * 0x400000
                 u.mem_map(stack, 0x200000)
                 self.stacks[tid] = stack
@@ -188,6 +197,7 @@ class WorkerModel:
                 u.reg_write(UC_ARM64_REG_FP, stack + 0x200000 - 256)
                 u.reg_write(UC_ARM64_REG_LR, 0)
                 u.reg_write(UC_ARM64_REG_PC, x[2])
+                u.reg_write(UC_ARM64_REG_X0, x[3])
                 self.native_entry[tid] = self.native_registers()
                 self.contexts[tid] = u.context_save()
                 u.context_restore(parent)

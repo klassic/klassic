@@ -1,7 +1,7 @@
-//! Win64 OS leaves for the production single-worker generational collector.
-//! Normal completion stops and joins the worker before releasing both handles.
+//! Win64 OS leaves for individually owned production GC worker slots.
+//! Each slot retains its event and thread handle until that worker joins.
 //! Fatal errors retain process-wide termination without attempting collector work.
-use super::production::{WorkerHooks, windows_worker_offsets};
+use super::production::{WorkerHooks, worker_slot_runtime_offset, worker_slot_windows_offsets};
 use crate::{Condition as C, ImportSymbol as I, NativeCodeGenerator, Reg as R, TextLabel};
 
 fn prologue(g: &mut NativeCodeGenerator) {
@@ -19,7 +19,7 @@ pub(crate) fn emit(
     h: &WorkerHooks<TextLabel>,
     entry: TextLabel,
 ) -> TextLabel {
-    let (event, thread) = windows_worker_offsets();
+    let (event, thread) = worker_slot_windows_offsets();
     let failed = g.asm.create_text_label();
     let rollback = g.asm.create_text_label();
     let invalid = g.asm.create_text_label();
@@ -37,11 +37,11 @@ pub(crate) fn emit(
     g.asm.call_import(I::CreateEventA); // auto-reset, initially nonsignaled
     g.asm.test_reg_reg(R::Rax, R::Rax);
     g.asm.jcc_label(C::Equal, failed);
-    g.asm.store_ptr_disp32(R::Rbx, event, R::Rax);
+    g.asm.store_ptr_disp32(R::R12, event, R::Rax);
     g.asm.mov_imm64(R::Rcx, 0);
     g.asm.mov_imm64(R::Rdx, 256 << 10);
     g.asm.lea_text_addr(R::R8, callback);
-    g.asm.mov_imm64(R::R9, 0);
+    g.asm.mov_reg_reg(R::R9, R::R12); // stable slot is the native callback parameter
     g.asm.mov_imm64(R::Rax, 0x10000); // stack size is a reservation
     g.asm.store_ptr_disp32(R::Rsp, 32, R::Rax);
     g.asm.mov_imm64(R::Rax, 0);
@@ -49,17 +49,17 @@ pub(crate) fn emit(
     g.asm.call_import(I::CreateThread);
     g.asm.test_reg_reg(R::Rax, R::Rax);
     g.asm.jcc_label(C::Equal, rollback);
-    g.asm.store_ptr_disp32(R::Rbx, thread, R::Rax);
+    g.asm.store_ptr_disp32(R::R12, thread, R::Rax);
     g.asm.mov_imm64(R::Rax, 1);
     finish(g);
     g.asm.bind_text_label(rollback);
-    g.asm.load_ptr_disp32(R::Rcx, R::Rbx, event);
+    g.asm.load_ptr_disp32(R::Rcx, R::R12, event);
     g.asm.call_import(I::CloseHandle);
     g.asm.mov_u32_reg_reg(R::Rax, R::Rax);
     g.asm.test_reg_reg(R::Rax, R::Rax);
     g.asm.jcc_label(C::Equal, invalid);
     g.asm.mov_imm64(R::Rax, 0);
-    g.asm.store_ptr_disp32(R::Rbx, event, R::Rax);
+    g.asm.store_ptr_disp32(R::R12, event, R::Rax);
     g.asm.bind_text_label(failed);
     g.asm.mov_imm64(R::Rax, 0);
     finish(g);
@@ -73,7 +73,7 @@ pub(crate) fn emit(
     g.asm.mov_u32_reg_reg(R::Rdx, R::Rsi);
     g.asm.cmp_reg_reg(R::Rax, R::Rdx);
     g.asm.jcc_label(C::NotEqual, awake);
-    g.asm.load_ptr_disp32(R::Rcx, R::Rbx, event);
+    g.asm.load_ptr_disp32(R::Rcx, R::R12, event);
     g.asm.mov_imm64(R::Rdx, 1000); // relative milliseconds, including idle work
     g.asm.call_import(I::WaitForSingleObject);
     g.asm.mov_u32_reg_reg(R::Rax, R::Rax);
@@ -87,7 +87,7 @@ pub(crate) fn emit(
     g.asm.bind_text_label(h.unpark);
     prologue(g);
     let absent = g.asm.create_text_label();
-    g.asm.load_ptr_disp32(R::Rcx, R::Rbx, event);
+    g.asm.load_ptr_disp32(R::Rcx, R::R12, event);
     g.asm.test_reg_reg(R::Rcx, R::Rcx);
     g.asm.jcc_label(C::Equal, absent); // event/thread creation failed
     g.asm.call_import(I::SetEvent);
@@ -127,20 +127,20 @@ pub(crate) fn emit(
     g.asm
         .bind_text_label(h.join.expect("Windows worker join leaf"));
     prologue(g);
-    g.asm.load_ptr_disp32(R::Rcx, R::Rbx, thread);
+    g.asm.load_ptr_disp32(R::Rcx, R::R12, thread);
     g.asm.mov_imm64(R::Rdx, u32::MAX as u64); // INFINITE, thread becomes signaled at termination
     g.asm.call_import(I::WaitForSingleObject);
     g.asm.mov_u32_reg_reg(R::Rax, R::Rax);
     g.asm.test_reg_reg(R::Rax, R::Rax);
     g.asm.jcc_label(C::NotEqual, invalid);
     for field in [thread, event] {
-        g.asm.load_ptr_disp32(R::Rcx, R::Rbx, field);
+        g.asm.load_ptr_disp32(R::Rcx, R::R12, field);
         g.asm.call_import(I::CloseHandle);
         g.asm.mov_u32_reg_reg(R::Rax, R::Rax);
         g.asm.test_reg_reg(R::Rax, R::Rax);
         g.asm.jcc_label(C::Equal, invalid);
         g.asm.mov_imm64(R::Rax, 0);
-        g.asm.store_ptr_disp32(R::Rbx, field, R::Rax);
+        g.asm.store_ptr_disp32(R::R12, field, R::Rax);
     }
     finish(g);
 
@@ -157,6 +157,9 @@ pub(crate) fn emit(
         callback_xmm(g, xmm, false);
     }
     g.asm.sub_reg_imm32(R::Rsp, 32);
+    g.asm.mov_reg_reg(R::R12, R::Rcx);
+    g.asm
+        .load_ptr_disp32(R::Rbx, R::R12, worker_slot_runtime_offset());
     g.asm.call_label(entry);
     g.asm.add_reg_imm32(R::Rsp, 32);
     for xmm in 6..16_u8 {

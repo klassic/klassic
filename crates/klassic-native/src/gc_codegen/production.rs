@@ -115,6 +115,7 @@ mod scoped_pin;
 pub(crate) mod test_support;
 mod weak;
 mod worker;
+mod worker_pool;
 mod worker_view;
 mod young_barrier;
 mod young_mark;
@@ -249,17 +250,14 @@ struct Runtime {
     lock_next: u64,
     lock_serving: u64,
     work_seq: u64,
-    windows_event: u64,
-    windows_thread: u64,
     worker_alive: u64,
     worker_done: u64,
     worker_scanned: u64,
     wake_pending: u64,
     cs_old: u64,
-    /// M-G6 lock-free copying: packed to-space page bounds (next_page in
-    /// the low half, the worker's copy_low in the high half), the worker
-    /// copy-page chain (top-down), the scan cursor over it, per-copier
-    /// scratch and counters.
+    /// Packed to-space page bounds and collector copy-page chain. Pool workers
+    /// share these copy cursors/scratch only while holding the collector ticket;
+    /// mutator copying retains its separate owner-local scratch and CAS claims.
     bounds: u64,
     copy_low: u64,
     from_copy_low: u64,
@@ -303,7 +301,6 @@ struct Runtime {
     marks: MarkArena,
     /// Checked monotonic identity of the active fresh-record bank.
     mark_revision: u64,
-    linux_worker: super::linux_production::State,
     metadata: metadata::State,
     heap_soft_maximum: u64,
     participants: participants::State,
@@ -318,9 +315,8 @@ struct Runtime {
     relocate_pages: relocate_pages::State,
     worker_journal: worker_journal::State,
     registered_roots: registered_roots::State,
-    /// Cold, unregistered worker storage: keep existing hot field offsets.
-    worker_view: OwnerState,
-    worker_epoch: worker_view::Epoch,
+    /// Stable unregistered worker identities and their independent OS lifetimes.
+    worker_pool: worker_pool::State,
     metadata_leases: metadata_leases::State,
     weak: weak::State,
     mark_queue: mark_queue::State,
@@ -1329,17 +1325,36 @@ fn emit_leaves<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.ret();
 }
 
-/// Process-owned Windows worker handles, kept until process termination.
-pub(crate) fn windows_worker_offsets() -> (i32, i32) {
-    (
-        d(offset_of!(Runtime, windows_event)),
-        d(offset_of!(Runtime, windows_thread)),
-    )
+/// Absolute first-worker offset retained for existing diagnostic fixtures.
+#[cfg(test)]
+pub(crate) fn linux_worker_offset() -> i32 {
+    d(worker_pool::slot(0)) + worker_slot_linux_offset()
 }
 
-/// Nonmoving Linux worker resource storage, retained through kernel clear-tid.
-pub(crate) fn linux_worker_offset() -> i32 {
-    d(offset_of!(Runtime, linux_worker))
+/// OS callbacks receive a stable slot pointer in OwnerContext. These offsets
+/// are relative to that pointer, not to shared Runtime or the primary owner.
+pub(crate) fn worker_slot_linux_offset() -> i32 {
+    d(offset_of!(worker_pool::Slot, linux))
+}
+pub(crate) fn worker_slot_windows_offsets() -> (i32, i32) {
+    (
+        d(offset_of!(worker_pool::Slot, windows_event)),
+        d(offset_of!(worker_pool::Slot, windows_thread)),
+    )
+}
+pub(crate) fn worker_slot_macos_offset() -> i32 {
+    d(offset_of!(worker_pool::Slot, macos))
+}
+pub(crate) fn worker_slot_runtime_offset() -> i32 {
+    d(offset_of!(OwnerState, shared_runtime))
+}
+#[cfg(test)]
+pub(crate) fn worker_slot_identity_offset() -> i32 {
+    d(offset_of!(worker_pool::Slot, identity))
+}
+#[cfg(test)]
+pub(crate) fn worker_slot_size() -> usize {
+    size_of::<worker_pool::Slot>()
 }
 
 #[cfg(test)]

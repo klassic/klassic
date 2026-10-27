@@ -5,10 +5,36 @@
 use super::*;
 use crate::gc_abi::RootRegistry;
 
-const VIEW: usize = offset_of!(Runtime, worker_view);
-
 pub(super) fn bind<E: PortableAsm>(a: &mut E) {
-    lea_rt(a, R::OwnerContext, VIEW);
+    // OS callbacks and park leaves retain the actual worker-slot pointer.
+    // Loading the ordinary runtime entry would bind the primary mutator.
+    load_rt(
+        a,
+        R::V3,
+        owner_state::offset(offset_of!(OwnerState, shared_runtime)),
+    );
+}
+
+/// Only exact stable slot addresses identify workers. Registered mutators and
+/// native callers use the same raw ticket without acquiring a worker epoch.
+pub(super) fn only_worker<E: PortableAsm>(a: &mut E, other: E::TextLabel) {
+    let found = a.create_text_label();
+    for index in 0..worker_pool::CAPACITY {
+        lea_rt(a, R::V0, worker_pool::slot(index));
+        a.cmp_reg_reg(R::OwnerContext, R::V0);
+        a.jcc_label(C::Equal, found);
+    }
+    a.jmp_label(other);
+    a.bind_text_label(found);
+}
+
+/// Branch for either real pool slot, leaving ordinary owners on the fallthrough.
+pub(super) fn branch_worker<E: PortableAsm>(a: &mut E, target: E::TextLabel) {
+    for index in 0..worker_pool::CAPACITY {
+        lea_rt(a, R::V0, worker_pool::slot(index));
+        a.cmp_reg_reg(R::OwnerContext, R::V0);
+        a.jcc_label(C::Equal, target);
+    }
 }
 
 /// Raw locks also serve mutators and reclaim callers. Only the actual worker
@@ -16,9 +42,7 @@ pub(super) fn bind<E: PortableAsm>(a: &mut E) {
 /// The lock entry saves V0/V1 around this operation.
 pub(super) fn refresh<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     let done = a.create_text_label();
-    lea_rt(a, R::V0, VIEW);
-    a.cmp_reg_reg(R::OwnerContext, R::V0);
-    a.jcc_label(C::NotEqual, done);
+    only_worker(a, done);
     begin_epoch(a, l);
     lea_rt(
         a,
@@ -46,7 +70,7 @@ pub(super) struct Epoch {
     entered: u64,
     completed: u64,
 }
-const EPOCH: usize = offset_of!(Runtime, worker_epoch);
+const EPOCH: usize = owner_state::offset(offset_of!(worker_pool::Slot, epoch));
 pub(super) const ACTIVE: usize = EPOCH + offset_of!(Epoch, active);
 pub(super) const PHASE: usize = EPOCH + offset_of!(Epoch, phase);
 pub(super) const BANK: usize = EPOCH + offset_of!(Epoch, bank);
@@ -55,11 +79,11 @@ pub(super) const COMPLETED: usize = EPOCH + offset_of!(Epoch, completed);
 
 /// Preserves all registers except V0/V1. Caller holds the actual ticket.
 pub(super) fn require_quiescent<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
-    load_rt(a, R::V0, ACTIVE);
+    load_rt(a, R::V0, worker_pool::ACTIVE);
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::NotEqual, l.fail);
-    load_rt(a, R::V0, ENTERED);
-    load_rt(a, R::V1, COMPLETED);
+    load_rt(a, R::V0, worker_pool::ENTERED);
+    load_rt(a, R::V1, worker_pool::COMPLETED);
     a.cmp_reg_reg(R::V0, R::V1);
     a.jcc_label(C::NotEqual, l.fail);
 }
@@ -78,6 +102,13 @@ fn private_closed<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
 }
 fn begin_epoch<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     require_quiescent(a, l);
+    load_rt(a, R::V0, ACTIVE);
+    a.test_reg_reg(R::V0, R::V0);
+    a.jcc_label(C::NotEqual, l.fail);
+    load_rt(a, R::V0, ENTERED);
+    load_rt(a, R::V1, COMPLETED);
+    a.cmp_reg_reg(R::V0, R::V1);
+    a.jcc_label(C::NotEqual, l.fail);
     private_closed(a, l);
     load_rt(a, R::V0, ENTERED);
     a.mov_imm64(R::V1, u64::MAX);
@@ -96,6 +127,8 @@ fn begin_epoch<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.atomic_load_acquire(R::V0, R::V1);
     store_rt(a, BANK, R::V0);
     store_rt_imm(a, ACTIVE, 1);
+    worker_pool::increment(a, l, worker_pool::ENTERED);
+    store_rt_imm(a, worker_pool::ACTIVE, 1);
 }
 
 /// Every real raw-unlock route passes here, including park and shutdown.
@@ -103,9 +136,7 @@ fn begin_epoch<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
 /// V0/V1 are saved by the lock wrapper; all other registers are preserved.
 pub(super) fn release<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     let done = a.create_text_label();
-    lea_rt(a, R::V0, VIEW);
-    a.cmp_reg_reg(R::OwnerContext, R::V0);
-    a.jcc_label(C::NotEqual, done);
+    only_worker(a, done);
     load_rt(a, R::V0, ACTIVE);
     a.cmp_reg_imm8(R::V0, 1);
     a.jcc_label(C::NotEqual, l.fail);
@@ -130,6 +161,11 @@ pub(super) fn release<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.jcc_label(C::NotEqual, l.fail);
     store_rt(a, COMPLETED, R::V0);
     store_rt_imm(a, ACTIVE, 0);
+    load_rt(a, R::V0, worker_pool::ACTIVE);
+    a.cmp_reg_imm8(R::V0, 1);
+    a.jcc_label(C::NotEqual, l.fail);
+    worker_pool::increment(a, l, worker_pool::COMPLETED);
+    store_rt_imm(a, worker_pool::ACTIVE, 0);
     #[cfg(test)]
     if let Some(hook) = l.worker_epoch_hook {
         a.call_label(hook);

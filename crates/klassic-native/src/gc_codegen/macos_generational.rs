@@ -27,7 +27,6 @@ pub(super) struct GenRuntime {
     /// call sites rely on the legacy routines keeping x1-x12, which the
     /// generational ones do not promise, so a wrapper keeps them.
     wrapped: [(Label, Label); 3],
-    worker_storage: super::DataLabel,
     pub(super) frame_roots: super::gc_frame_roots::Labels,
 }
 
@@ -156,7 +155,6 @@ impl Emitter {
         let labels = Labels::new(|| asm.new_label(), map, alloc, backend)
             .with_worker(hooks, || asm.new_label());
         let frame_roots = super::gc_frame_roots::Labels::new(&mut self.asm);
-        let worker_storage = self.asm.reserve_data_cells(17);
         let runtime = PortDataAddr::Bss(self.asm.reserve_data_cells(1));
         let mut text = |bytes: &[u8]| PortDataAddr::Rodata(self.asm.intern_rodata(bytes));
         let data = Data {
@@ -179,7 +177,6 @@ impl Emitter {
             labels,
             data,
             wrapped,
-            worker_storage,
             frame_roots,
         });
     }
@@ -600,7 +597,6 @@ impl Emitter {
             &mut self.asm,
             l.worker_hooks().expect("worker hooks"),
             l.worker_entry().expect("worker entry"),
-            runtime.worker_storage,
         );
         let mut flags = FlagAsm(&mut self.asm);
         production::emit(

@@ -45,6 +45,15 @@ pub(crate) fn park_wrapped_work_sequence(g: &mut crate::NativeCodeGenerator) {
     worker::unlock(g, &runtime.labels);
     lea_rt(g, R::V7, RT_WORK_SEQ);
     g.mov_imm64(R::V6, 0x1_0000_0005);
-    g.call_label(runtime.labels.worker_hooks().unwrap().park);
+    g.push_reg(R::OwnerContext);
+    lea_rt(g, R::OwnerContext, super::super::worker_pool::slot(0));
+    // The startup broadcast can leave one auto-reset notification pending.
+    // A second unchanged-sequence wait exercises the actual timeout path.
+    for _ in 0..2 {
+        lea_rt(g, R::V7, RT_WORK_SEQ);
+        g.mov_imm64(R::V6, 0x1_0000_0005);
+        g.call_label(runtime.labels.worker_hooks().unwrap().park);
+    }
+    g.pop_reg(R::OwnerContext);
     g.gc_gen = Some(runtime);
 }

@@ -145,9 +145,11 @@ fn run_fixture(mut a: Assembler, tag: &str, expected: &[u8]) -> Option<std::proc
 #[test]
 fn generational_arm64_worker_park_handles_sequence_wrap_and_timeout() {
     use super::super::{BranchKind as B, Cond};
-    use crate::gc_codegen::production::WorkerHooks;
+    use crate::gc_codegen::production::{
+        WorkerHooks, worker_slot_runtime_offset, worker_slot_size,
+    };
     let mut a = Assembler::default();
-    let storage = a.reserve_data_cells(17);
+    let storage = a.reserve_data_cells(worker_slot_size().div_ceil(8));
     let sequence = a.reserve_data_cells(1);
     let stop = a.reserve_data_cells(1);
     let child = a.new_label();
@@ -166,6 +168,8 @@ fn generational_arm64_worker_park_handles_sequence_wrap_and_timeout() {
     a.mov_imm64(Reg::X0, 0x1_0000_0005);
     a.str_imm(Reg::X0, Reg::X1, 0);
     a.mov_imm64(Reg::X3, 0x12345678);
+    a.load_data_address(Reg::X19, storage);
+    a.str_imm(Reg::X3, Reg::X19, worker_slot_runtime_offset() as u32);
     a.call_label(h.spawn);
     a.mov_imm64(Reg::X9, 1);
     a.cmp_reg(Reg::X0, Reg::X9);
@@ -198,7 +202,7 @@ fn generational_arm64_worker_park_handles_sequence_wrap_and_timeout() {
     a.bind(child_done);
     a.pop_frame_record();
     a.ret();
-    super::super::gc_macos_production::emit(&mut a, &h, child, storage);
+    super::super::gc_macos_production::emit(&mut a, &h, child);
     if let Some(output) = run_fixture(a, "wrap", b"wrap-ok\n") {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let line = stderr
@@ -219,9 +223,11 @@ fn generational_arm64_worker_park_handles_sequence_wrap_and_timeout() {
 #[test]
 fn generational_arm64_pthread_callback_restores_every_native_nonvolatile_register() {
     use super::super::{BranchKind as B, Cond};
-    use crate::gc_codegen::production::WorkerHooks;
+    use crate::gc_codegen::production::{
+        WorkerHooks, worker_slot_runtime_offset, worker_slot_size,
+    };
     let mut a = Assembler::default();
-    let storage = a.reserve_data_cells(17);
+    let storage = a.reserve_data_cells(worker_slot_size().div_ceil(8));
     let child = a.new_label();
     let failed = a.new_label();
     let h = WorkerHooks {
@@ -233,6 +239,8 @@ fn generational_arm64_pthread_callback_restores_every_native_nonvolatile_registe
         join: Some(a.new_label()),
     };
     a.mov_imm64(Reg::X3, 0x1234_5678);
+    a.load_data_address(Reg::X19, storage);
+    a.str_imm(Reg::X3, Reg::X19, worker_slot_runtime_offset() as u32);
     a.call_label(h.spawn);
     a.mov_imm64(Reg::X9, 1);
     a.cmp_reg(Reg::X0, Reg::X9);
@@ -257,7 +265,7 @@ fn generational_arm64_pthread_callback_restores_every_native_nonvolatile_registe
     }
     a.mov_imm64(Reg::X0, 0xdead_beef); // native callback must replace this with NULL
     a.ret();
-    super::super::gc_macos_production::emit(&mut a, &h, child, storage);
+    super::super::gc_macos_production::emit(&mut a, &h, child);
     if let Some(output) = run_fixture(a, "callback", b"callback-ok\n") {
         let stderr = String::from_utf8_lossy(&output.stderr);
         for counter in [
@@ -291,13 +299,13 @@ fn generational_arm64_production_stop_join_is_idempotent_and_releases_the_event(
     if let Some(output) = run_fixture(e.asm, "stop", b"stop-ok\n") {
         let stderr = String::from_utf8_lossy(&output.stderr);
         for counter in [
-            "threads=1",
-            "returns=1",
-            "join_calls=1",
-            "joins=1",
-            "stack_releases=1",
-            "cond_destroy=1",
-            "mutex_destroy=1",
+            "threads=2",
+            "returns=2",
+            "join_calls=2",
+            "joins=2",
+            "stack_releases=2",
+            "cond_destroy=2",
+            "mutex_destroy=2",
         ] {
             assert!(stderr.split_whitespace().any(|s| s == counter), "{stderr}");
         }

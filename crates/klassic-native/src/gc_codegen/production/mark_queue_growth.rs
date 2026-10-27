@@ -56,9 +56,7 @@ pub(super) fn retry<E: PortableAsm>(a: &mut E, release: E::TextLabel, young: boo
 pub(super) fn after_unlock<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, young: bool) {
     a.push_reg(R::V0);
     let done = a.create_text_label();
-    lea_rt(a, R::V0, offset_of!(Runtime, worker_view));
-    a.cmp_reg_reg(R::OwnerContext, R::V0);
-    a.jcc_label(C::NotEqual, done);
+    worker_view::only_worker(a, done);
     a.call_label(l.queue_grow_services[usize::from(!young)]);
     a.bind_text_label(done);
     a.pop_reg(R::V0);
@@ -228,17 +226,13 @@ pub(super) fn step<E: PortableAsm>(a: &mut E, _l: &Labels<E::TextLabel>, young: 
 }
 fn enter_native<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, _young: bool) {
     let worker = a.create_text_label();
-    lea_rt(a, R::V0, offset_of!(Runtime, worker_view));
-    a.cmp_reg_reg(R::OwnerContext, R::V0);
-    a.jcc_label(C::Equal, worker);
+    worker_view::branch_worker(a, worker);
     a.call_label(l.native_enter_actor);
     a.bind_text_label(worker);
 }
 fn exit_native<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, _young: bool) {
     let worker = a.create_text_label();
-    lea_rt(a, R::V0, offset_of!(Runtime, worker_view));
-    a.cmp_reg_reg(R::OwnerContext, R::V0);
-    a.jcc_label(C::Equal, worker);
+    worker_view::branch_worker(a, worker);
     a.call_label(l.native_exit_actor);
     a.bind_text_label(worker);
 }

@@ -1,7 +1,9 @@
-//! Darwin native OS leaves for the production single-worker collector.
+//! Darwin native OS leaves for individually owned production GC worker slots.
 //! Nonmoving event storage is destroyed only after the worker has joined.
-use super::{Assembler, BranchKind as B, Cond, DataLabel, Label, Reg as R, gc_macos};
-use crate::gc_codegen::production::WorkerHooks;
+use super::{Assembler, BranchKind as B, Cond, Label, Reg as R, gc_macos};
+use crate::gc_codegen::production::{
+    WorkerHooks, worker_slot_macos_offset, worker_slot_runtime_offset,
+};
 use crate::macho::ImportSymbol as I;
 
 fn begin(a: &mut Assembler) {
@@ -18,7 +20,14 @@ fn status(a: &mut Assembler, symbol: I) {
     a.word(0x2a00_03e0); // mov w0,w0: C int's upper bits are unspecified
 }
 
-pub(super) fn emit(a: &mut Assembler, h: &WorkerHooks<Label>, entry: Label, storage: DataLabel) {
+// OwnerContext is X19. Native calls preserve it; X3 (shared runtime) is saved
+// by begin/end because AAPCS64 treats X3 as volatile.
+fn event_address(a: &mut Assembler) {
+    a.mov_imm64(R::X0, worker_slot_macos_offset() as u64);
+    a.add_reg(R::X0, R::X19, R::X0);
+}
+
+pub(super) fn emit(a: &mut Assembler, h: &WorkerHooks<Label>, entry: Label) {
     let init = a.new_label();
     let destroy = a.new_label();
     let park = a.new_label();
@@ -30,20 +39,20 @@ pub(super) fn emit(a: &mut Assembler, h: &WorkerHooks<Label>, entry: Label, stor
     let lifecycle_failed = a.new_label();
     a.bind(h.spawn);
     begin(a);
-    a.load_data_address(R::X0, storage);
+    event_address(a);
     a.branch(init, B::Link);
     a.branch(cleanup, B::CompareNonZero(R::X0));
-    a.load_data_address(R::X0, storage);
+    event_address(a);
     a.add_reg_imm(R::X0, R::X0, 128); // pthread_t after the event
     a.mov_imm64(R::X1, 0);
     a.branch(callback, B::Address(R::X2));
-    a.mov_imm64(R::X3, 0);
+    a.mov_reg(R::X3, R::X19); // stable slot passed to pthread callback
     status(a, I::PthreadCreate);
     a.branch(cleanup, B::CompareNonZero(R::X0));
     a.mov_imm64(R::X0, 1);
     end(a);
     a.bind(cleanup);
-    a.load_data_address(R::X0, storage);
+    event_address(a);
     a.branch(destroy, B::Link);
     a.branch(invalid, B::CompareNonZero(R::X0));
     a.bind(failed);
@@ -53,7 +62,7 @@ pub(super) fn emit(a: &mut Assembler, h: &WorkerHooks<Label>, entry: Label, stor
     if let Some(join) = h.join {
         a.bind(join);
         begin(a);
-        a.load_data_address(R::X0, storage);
+        event_address(a);
         a.ldr_imm(R::X0, R::X0, 128);
         a.branch(lifecycle_failed, B::CompareZero(R::X0));
         // pthread_join writes the callback's pointer result, not a C int.
@@ -66,7 +75,7 @@ pub(super) fn emit(a: &mut Assembler, h: &WorkerHooks<Label>, entry: Label, stor
         a.word(0xf940_03e0); // ldr x0,[sp]
         a.add_sp_imm(16);
         a.branch(lifecycle_failed, B::CompareNonZero(R::X0));
-        a.load_data_address(R::X0, storage);
+        event_address(a);
         a.mov_imm64(R::X1, 0);
         a.str_imm(R::X1, R::X0, 128);
         a.branch(destroy, B::Link);
@@ -83,7 +92,7 @@ pub(super) fn emit(a: &mut Assembler, h: &WorkerHooks<Label>, entry: Label, stor
     a.word(0x2a04_03e2); // mov w2,w4: compare the low sequence word
     a.cmp_reg(R::X0, R::X2);
     a.branch(awake, B::Conditional(Cond::Ne));
-    a.load_data_address(R::X0, storage);
+    event_address(a);
     a.branch(park, B::Link);
     a.branch(invalid, B::CompareNonZero(R::X0));
     a.bind(awake);
@@ -92,7 +101,7 @@ pub(super) fn emit(a: &mut Assembler, h: &WorkerHooks<Label>, entry: Label, stor
     a.bind(h.unpark);
     begin(a);
     let absent = a.new_label();
-    a.load_data_address(R::X0, storage);
+    event_address(a);
     a.ldr_imm(R::X1, R::X0, 120); // initialized ownership mask
     a.branch(absent, B::CompareZero(R::X1));
     a.branch(wake, B::Link);
@@ -133,6 +142,8 @@ pub(super) fn emit_callback(a: &mut Assembler, entry: Label) {
     for n in 8..=15 {
         a.word(0xfd00_03e0 | ((n - 8) << 10) | n); // str dn,[sp,#offset]
     }
+    a.mov_reg(R::X19, R::X0);
+    a.ldr_imm(R::X3, R::X19, worker_slot_runtime_offset() as u32);
     a.branch(entry, B::Link);
     for n in 8..=15 {
         a.word(0xfd40_03e0 | ((n - 8) << 10) | n); // ldr dn,[sp,#offset]

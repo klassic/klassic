@@ -18,6 +18,9 @@ fn lifecycle(g: &mut crate::NativeCodeGenerator, _: u64) {
     stop(&mut h);
     h.report("base", |h| h.value(Src::Raw(30)));
     h.report("runtime", |h| h.g.mov_reg_reg(R::V0, R::V3));
+    h.report("worker_slot", |h| {
+        production::test_support::pool_slot_address(h.g, 0);
+    });
     for (name, offset) in [
         ("stack", stack),
         ("tid", tid),
@@ -43,7 +46,8 @@ fn lifecycle(g: &mut crate::NativeCodeGenerator, _: u64) {
 fn production_linux_worker_joins_kernel_clear_tid_and_unmaps_its_guarded_stack_once() {
     let o = run(lifecycle, 0, true);
     assert!(o.get("base") > 0, "{}", o.text());
-    assert_eq!(o.get("tls"), o.get("runtime"));
+    assert_eq!(o.get("tls"), o.get("worker_slot"));
+    assert_ne!(o.get("tls"), o.get("runtime"));
     assert!(
         (o.get("base") + 4096..o.get("base") + 4096 + linux::STACK_BYTES as i64)
             .contains(&o.get("sp")),

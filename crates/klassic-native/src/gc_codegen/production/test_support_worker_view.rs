@@ -17,7 +17,7 @@ pub(crate) fn other_owner_cycle(
 }
 
 pub(crate) fn worker_view_metric(g: &mut crate::NativeCodeGenerator, kind: usize) {
-    let base = offset_of!(Runtime, worker_view);
+    let base = worker_pool::slot(0);
     let fields = [
         base + offset_of!(OwnerState, ctx) + offset_of!(MutatorContext, adopted_phase),
         base + offset_of!(OwnerState, ctx) + offset_of!(MutatorContext, thread_id),
@@ -129,12 +129,12 @@ pub(crate) fn worker_epoch_sample(g: &mut crate::NativeCodeGenerator) -> crate::
     worker::lock(g, &rt.labels);
     g.mov_data_addr(R::V2, data);
     for (i, field) in [
-        worker_view::ACTIVE,
-        worker_view::ENTERED,
-        worker_view::COMPLETED,
-        worker_view::PHASE,
-        worker_view::BANK,
-        offset_of!(Runtime, worker_view)
+        worker_pool::field(0, worker_view::ACTIVE),
+        worker_pool::field(0, worker_view::ENTERED),
+        worker_pool::field(0, worker_view::COMPLETED),
+        worker_pool::field(0, worker_view::PHASE),
+        worker_pool::field(0, worker_view::BANK),
+        worker_pool::slot(0)
             + offset_of!(OwnerState, ctx)
             + offset_of!(MutatorContext, adopted_phase),
         allocation_records::REVISION,
@@ -162,12 +162,26 @@ pub(crate) fn worker_epoch_metric(
 /// Inject invalid captured state only after the actual OS worker acquired
 /// its real epoch. No test-manufactured phase, bank, quorum or admission bit.
 pub(crate) fn worker_epoch_fault(g: &mut crate::NativeCodeGenerator, mode: u64) {
+    worker_epoch_fault_for(g, mode, None);
+}
+
+pub(crate) fn worker_epoch_fault_for(
+    g: &mut crate::NativeCodeGenerator,
+    mode: u64,
+    index: Option<usize>,
+) {
     let hook = g.create_text_label();
     let after = g.create_text_label();
     let rt = g.gc_gen.take().unwrap();
     g.jmp_label(after);
     g.bind_text_label(hook);
     quiescence::save(g);
+    let skipped = g.create_text_label();
+    if let Some(index) = index {
+        load_rt(g, R::V0, worker_pool::IDENTITY);
+        g.cmp_reg_imm32(R::V0, index as i32);
+        g.jcc_label(C::NotEqual, skipped);
+    }
     let entered = g.create_text_label();
     load_rt(g, R::V0, worker_view::ACTIVE);
     g.test_reg_reg(R::V0, R::V0);
@@ -176,6 +190,11 @@ pub(crate) fn worker_epoch_fault(g: &mut crate::NativeCodeGenerator, mode: u64) 
     // successfully so a later guard cannot hide this missing rejection.
     g.emit_exit_success();
     g.bind_text_label(entered);
+    if index.is_some() {
+        let marker = b"selected GC worker epoch fault reached\n";
+        let text = g.asm.data_label_with_bytes(marker);
+        g.emit_write_data(2, text, marker.len());
+    }
     match mode {
         0 | 1 => {
             let field = if mode == 0 {
@@ -198,6 +217,7 @@ pub(crate) fn worker_epoch_fault(g: &mut crate::NativeCodeGenerator, mode: u64) 
         }
         _ => unreachable!(),
     }
+    g.bind_text_label(skipped);
     quiescence::restore(g);
     g.ret();
     g.bind_text_label(after);
@@ -212,8 +232,8 @@ pub(crate) fn worker_epoch_exhaust(g: &mut crate::NativeCodeGenerator) {
     worker::lock(g, &rt.labels);
     worker_view::require_quiescent(g, &rt.labels);
     g.mov_imm64(R::V0, u64::MAX);
-    store_rt(g, worker_view::ENTERED, R::V0);
-    store_rt(g, worker_view::COMPLETED, R::V0);
+    store_rt(g, worker_pool::field(0, worker_view::ENTERED), R::V0);
+    store_rt(g, worker_pool::field(0, worker_view::COMPLETED), R::V0);
     worker::request_work(g);
     worker::unlock(g, &rt.labels);
     worker::wake_if_pending(g, &rt.labels);
