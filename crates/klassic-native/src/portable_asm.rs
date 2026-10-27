@@ -47,6 +47,8 @@ pub enum Reg {
     V9,
     V10,
     V11,
+    /// Production owner-private state base (x86-64: r12; AArch64: x19).
+    OwnerContext,
     /// GC load-barrier strip mask (x86-64: r13).
     ColorStrip,
     /// GC current good color (x86-64: r14).
@@ -98,6 +100,17 @@ pub trait PortableAsm {
     /// Call a native-ABI callback with V7/V6 arguments; raw result is in V0.
     /// The caller saves live values and normalizes narrow native return types.
     fn call_native_binary(&mut self, target: Reg);
+    /// Unary native entry: preserve platform nonvolatiles and put the native
+    /// argument in V7. Locals must be 16-byte aligned and at most 4080 bytes.
+    /// V5 remains the private local anchor until native_entry_end.
+    #[allow(dead_code)] // Owner dispatch wiring follows in a later slice.
+    fn native_entry_begin(&mut self, locals: u32);
+    /// Restore the native frame/nonvolatiles, retaining V0 as the result.
+    #[allow(dead_code)]
+    fn native_entry_end(&mut self);
+    /// Materialize an address of a nearby text label (ARM64: checked +/-1MiB).
+    #[allow(dead_code)]
+    fn mov_text_addr(&mut self, dst: Reg, label: Self::TextLabel);
     fn ret(&mut self);
     /// Standard frame teardown (`mov rsp, rbp; pop rbp` on x86-64).
     fn leave(&mut self);
@@ -235,6 +248,7 @@ impl From<Reg> for crate::Reg {
             Reg::V9 => crate::Reg::R9,
             Reg::V10 => crate::Reg::R10,
             Reg::V11 => crate::Reg::R11,
+            Reg::OwnerContext => crate::Reg::R12,
             Reg::ColorStrip => crate::Reg::R13,
             Reg::GoodColor => crate::Reg::R14,
             Reg::BadMask => crate::Reg::R15,
@@ -310,6 +324,74 @@ impl PortableAsm for crate::NativeCodeGenerator {
         if self.is_windows {
             self.asm.add_reg_imm32(crate::Reg::Rsp, 32);
         }
+    }
+    fn native_entry_begin(&mut self, locals: u32) {
+        use crate::Reg as X;
+        assert!(locals.is_multiple_of(16) && locals <= 4080);
+        for r in [
+            X::Rbp,
+            X::Rbx,
+            X::R12,
+            X::R13,
+            X::R14,
+            X::R15,
+            X::Rdi,
+            X::Rsi,
+        ] {
+            self.asm.push_reg(r);
+        }
+        self.asm.sub_reg_imm8(X::Rsp, 8);
+        if self.is_windows {
+            self.asm.sub_reg_imm32(X::Rsp, 160);
+            for xmm in 6..16_u8 {
+                self.asm.bytes(&[
+                    0xf3,
+                    if xmm >= 8 { 0x44 } else { 0x40 },
+                    0x0f,
+                    0x7f,
+                    0x84 | ((xmm & 7) << 3),
+                    0x24,
+                ]);
+                self.asm.bytes(&(i32::from(xmm - 6) * 16).to_le_bytes());
+            }
+            self.asm.mov_reg_reg(X::Rdi, X::Rcx);
+        }
+        self.asm.mov_reg_reg(X::Rbp, X::Rsp);
+        self.asm.sub_reg_imm32(X::Rsp, locals as i32);
+    }
+    fn native_entry_end(&mut self) {
+        use crate::Reg as X;
+        self.asm.mov_reg_reg(X::Rsp, X::Rbp);
+        if self.is_windows {
+            for xmm in 6..16_u8 {
+                self.asm.bytes(&[
+                    0xf3,
+                    if xmm >= 8 { 0x44 } else { 0x40 },
+                    0x0f,
+                    0x6f,
+                    0x84 | ((xmm & 7) << 3),
+                    0x24,
+                ]);
+                self.asm.bytes(&(i32::from(xmm - 6) * 16).to_le_bytes());
+            }
+            self.asm.add_reg_imm32(X::Rsp, 160);
+        }
+        self.asm.add_reg_imm32(X::Rsp, 8);
+        for r in [
+            X::Rsi,
+            X::Rdi,
+            X::R15,
+            X::R14,
+            X::R13,
+            X::R12,
+            X::Rbx,
+            X::Rbp,
+        ] {
+            self.asm.pop_reg(r);
+        }
+    }
+    fn mov_text_addr(&mut self, dst: Reg, label: Self::TextLabel) {
+        self.asm.lea_text_addr(dst.into(), label);
     }
     fn ret(&mut self) {
         self.asm.ret();
