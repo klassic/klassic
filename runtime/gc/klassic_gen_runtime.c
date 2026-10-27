@@ -628,7 +628,7 @@ void kg_store_ref(const RootCell *base,uint64_t offset,const RootCell *value){
     for(;;){
         uint64_t s=gc_rooted_store_dispatch(&d,&q,GC_RSD_STEP);
         if(s==GC_RLOAD_DONE){kg_root_publication_end(r);kg_root_clear(kg_current_mutator(r)->store_observed);return;}
-        if(s==GC_RLOAD_CANCELLED){if(reason==GC_RLOAD_EXHAUSTED)kg_fail("reference store resources exhausted",reason);kg_root_publication_end(r);if(reason==GC_RLOAD_METADATA_FULL)kg_lease_pressure(r);kg_poll();kg_root_publication_begin(r);s=gc_rooted_store_dispatch(&d,&q,GC_RSD_REARM);cancelling=false;}
+        if(s==GC_RLOAD_CANCELLED){if(reason==GC_RLOAD_EXHAUSTED)kg_fail("reference store resources exhausted",reason);kg_root_publication_end(r);if(reason==GC_RLOAD_METADATA_FULL)kg_lease_pressure_min(r,3);kg_poll();kg_root_publication_begin(r);s=gc_rooted_store_dispatch(&d,&q,GC_RSD_REARM);cancelling=false;}
         if(kg_retry_event(s)&&!cancelling){reason=s;(void)gc_rooted_store_dispatch(&d,&q,GC_RSD_CANCEL);cancelling=true;}
         else if(s==GC_RLOAD_INVALID||s==GC_RLOAD_ERROR||s==GC_RLOAD_NULL_RECEIVER)kg_fail("reference store",s);
     }

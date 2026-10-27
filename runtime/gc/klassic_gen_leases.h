@@ -5,8 +5,9 @@
  * actual controls/padding can make the budget limit occur before that ceiling.
  * No active slot is copied, moved or zeroed by later growth.
  *
- * FULL alone is retryable. LIMIT means the same-lock observation has no free
- * token and the current budget/index ceiling refuses a new prefix; it is not a
+ * FULL alone is retryable. LIMIT means the same-lock observation cannot meet
+ * the caller's simultaneous token demand and the budget/index ceiling refuses
+ * a sufficient new prefix; it is not a
  * proof that a different owner can never release a token in the future. Native
  * helpers retain all old tokens and return LIMIT for an explicit retry. The
  * public adapter applies the runtime's hard resource refusal policy after a
@@ -89,34 +90,44 @@ void kg_lease_initialize(KgRuntime *r,const MutatorContext *actor,uint64_t initi
     if(status)kg_fail("initial lease prefix publication",status);
     owner->committed_bytes=initial_bytes;owner->chunks=&owner->initial;pool->slots=owner->reservation;pool->capacity=initial_capacity;pool->free_head=1;kg_unlock(r);
 }
-uint64_t kg_lease_grow_native(KgRuntime *r,const MutatorContext *actor){
-    if(!kgl_native(actor)||!r->lease_backing)return KG_LEASE_INVALID;
+static bool kgl_has_free(const MetadataLeasePool *pool,uint64_t minimum){
+    /* The locked leaf maintains one free-list node for every inactive slot.
+     * This exact count avoids scanning a free chain under the common lock. */
+    return pool->active<=pool->capacity&&pool->capacity-pool->active>=minimum;
+}
+static uint64_t kgl_grow_result(const KgLeaseBacking *owner,const MetadataLeasePool *pool,uint64_t minimum){
+    if(kgl_has_free(pool,minimum))return KG_LEASE_OK;
+    return pool->active>owner->maximum||minimum>owner->maximum-pool->active?KG_LEASE_LIMIT:KG_LEASE_WAIT;
+}
+uint64_t kg_lease_grow_native_min(KgRuntime *r,const MutatorContext *actor,uint64_t minimum){
+    if(!minimum||!kgl_native(actor)||!r->lease_backing)return KG_LEASE_INVALID;
     KgLeaseBacking *owner=r->lease_backing;MetadataLeasePool *pool=kg_leases(r);
     kg_lock(r);
-    if(owner->closing||pool->slots!=owner->reservation){kg_unlock(r);return KG_LEASE_INVALID;}
-    if(pool->free_head){kg_unlock(r);return KG_LEASE_OK;}
+    if(owner->closing||pool->slots!=owner->reservation||pool->active>pool->capacity){kg_unlock(r);return KG_LEASE_INVALID;}
+    if(kgl_has_free(pool,minimum)){kg_unlock(r);return KG_LEASE_OK;}
     if(owner->growing){kg_unlock(r);return KG_LEASE_WAIT;}
-    if(pool->capacity>=owner->maximum){kg_unlock(r);return KG_LEASE_LIMIT;}
+    if(pool->active>owner->maximum||minimum>owner->maximum-pool->active){kg_unlock(r);return KG_LEASE_LIMIT;}
     uint64_t capacity=pool->capacity,amount=owner->maximum-capacity;if(amount>256)amount=256;
     uint64_t target=capacity+amount,bytes;
     if(gc_native_metadata_size(target*sizeof(MetadataLeaseSlot),r->os.metadata.quantum,&bytes)||bytes>owner->reservation_bytes){kg_unlock(r);return KG_LEASE_INVALID;}
     if(bytes<=owner->committed_bytes){
         /* Already prepared physical padding is not zeroed again: it can
          * contain earlier admitted, active slots in the same OS quantum. */
-        uint64_t status=gc_metadata_grow_locked(pool,target);kg_unlock(r);return status?KG_LEASE_INVALID:KG_LEASE_OK;
+        uint64_t status=gc_metadata_grow_locked(pool,target);
+        uint64_t result=status?KG_LEASE_INVALID:kgl_grow_result(owner,pool,minimum);kg_unlock(r);return result;
     }
     owner->growing=1;uint64_t offset=owner->committed_bytes;kg_unlock(r);
     MetadataCharge control={0};uint64_t status=kgl_control(r,sizeof(KgLeaseChunk),&control);
     if(status){
         kg_lock(r);owner->growing=0;
-        if(status==KG_LEASE_LIMIT&&pool->free_head)status=KG_LEASE_OK;
+        if(status==KG_LEASE_LIMIT&&kgl_has_free(pool,minimum))status=KG_LEASE_OK;
         kg_notify(r);kg_unlock(r);return status;
     }
     KgLeaseChunk *chunk=(void *)(uintptr_t)control.allocation;chunk->control=control;chunk->offset=offset;chunk->backing.bytes=bytes-offset;
     kg_lock(r);status=gc_budget_step_locked(&r->native.backing.heap,&chunk->backing,GC_BUDGET_RESERVE);kg_unlock(r);
     if(status){
         kgl_retire_control(r,&chunk->control,actor);kg_lock(r);owner->growing=0;
-        uint64_t result=status==GC_BUDGET_LIMIT?(pool->free_head?KG_LEASE_OK:KG_LEASE_LIMIT):KG_LEASE_INVALID;
+        uint64_t result=status==GC_BUDGET_LIMIT?(kgl_has_free(pool,minimum)?KG_LEASE_OK:KG_LEASE_LIMIT):KG_LEASE_INVALID;
         kg_notify(r);kg_unlock(r);return result;
     }
     void *address=(void *)(uintptr_t)(owner->reservation+offset);uint64_t failures=0;
@@ -129,17 +140,21 @@ uint64_t kg_lease_grow_native(KgRuntime *r,const MutatorContext *actor){
     chunk->next=owner->chunks;owner->chunks=chunk;owner->committed_bytes=bytes;
     /* The core links to the ACTUAL current free head. Existing tokens may
      * have been released/reacquired while this new physical tail was native. */
-    status=gc_metadata_grow_locked(pool,target);owner->growing=0;kg_notify(r);kg_unlock(r);
-    return status?KG_LEASE_INVALID:KG_LEASE_OK;
+    status=gc_metadata_grow_locked(pool,target);owner->growing=0;kg_notify(r);
+    uint64_t result=status?KG_LEASE_INVALID:kgl_grow_result(owner,pool,minimum);kg_unlock(r);
+    return result;
 }
-void kg_lease_pressure(KgRuntime *r){
+uint64_t kg_lease_grow_native(KgRuntime *r,const MutatorContext *actor){
+    return kg_lease_grow_native_min(r,actor,1);
+}
+void kg_lease_pressure_min(KgRuntime *r,uint64_t minimum){
     MutatorContext *actor=kg_current_context(r);
     if(!actor||atomic_load_explicit(&actor->access_epoch,memory_order_acquire)||
        atomic_load_explicit(&actor->private_producers,memory_order_acquire))kg_fail("lease pressure still owns managed work",0);
-    kg_enter_native(r);uint64_t status=kg_lease_grow_native(r,actor);kg_leave_native(r);
+    kg_enter_native(r);uint64_t status=kg_lease_grow_native_min(r,actor,minimum);kg_leave_native(r);
     if(status==KG_LEASE_LIMIT){
         kg_lock(r);KgLeaseBacking *owner=r->lease_backing;
-        if(kg_leases(r)->free_head)status=KG_LEASE_OK;
+        if(kgl_has_free(kg_leases(r),minimum))status=KG_LEASE_OK;
         else if(owner->growing)status=KG_LEASE_WAIT;
         kg_unlock(r);
         if(status==KG_LEASE_LIMIT)kg_fail("metadata lease backing budget or index limit",status);
@@ -147,6 +162,7 @@ void kg_lease_pressure(KgRuntime *r){
     if(status!=KG_LEASE_OK&&status!=KG_LEASE_WAIT)kg_fail("metadata lease growth",status);
     if(status==KG_LEASE_WAIT){kg_driver_step(r);kg_yield();}
 }
+void kg_lease_pressure(KgRuntime *r){kg_lease_pressure_min(r,1);}
 void kg_lease_dispose_native(KgRuntime *r,const MutatorContext *actor){
     KgLeaseBacking *owner=r->lease_backing;if(!owner)return;
     if(!kgl_native(actor)||r->driver||r->native.allocations||kg_leases(r)->active||owner->growing)kg_fail("live lease backing disposal",0);

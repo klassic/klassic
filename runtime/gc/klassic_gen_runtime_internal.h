@@ -110,8 +110,10 @@ typedef struct {
 enum { KG_LEASE_OK=0,KG_LEASE_WAIT=1,KG_LEASE_LIMIT=2,KG_LEASE_INVALID=3 };
 void kg_lease_initialize(KgRuntime *,const MutatorContext *,uint64_t,const KgLeaseOps *);
 uint64_t kg_lease_grow_native(KgRuntime *,const MutatorContext *);
+uint64_t kg_lease_grow_native_min(KgRuntime *,const MutatorContext *,uint64_t);
 bool kg_lease_growing_locked(KgRuntime *);
 void kg_lease_pressure(KgRuntime *);
+void kg_lease_pressure_min(KgRuntime *,uint64_t);
 void kg_lease_dispose_native(KgRuntime *,const MutatorContext *);
 enum { KG_PIN_SELECTED=0,KG_PIN_SKIP=1,KG_PIN_FULL=2,KG_PIN_INVALID=3 };
 uint64_t kg_pin_select_locked(KgRuntime *,KgRun *);

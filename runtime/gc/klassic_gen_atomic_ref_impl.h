@@ -171,7 +171,7 @@ static bool kga_reference(const RootCell *receiver,uint64_t offset,const RootCel
             if(status==GC_RLOAD_DONE||mismatch||status==GC_RLOAD_CANCELLED){
                 kga_release_identity(r,&operation.observed);kga_release_identity(r,&operation.expected);kg_root_publication_end(r);
                 if(status==GC_RLOAD_CANCELLED){if(reason==GC_RLOAD_EXHAUSTED)kg_fail("atomic resources exhausted",reason);
-                    if(reason==GC_RLOAD_METADATA_FULL)kg_lease_pressure(r);break;}
+                    if(reason==GC_RLOAD_METADATA_FULL)kg_lease_pressure_min(r,5);break;}
                 result=!mismatch;goto finished;
             }
             if(kg_retry_event(status)&&!cancelling){reason=status;(void)kga_store_step(r,q,true);cancelling=true;}
