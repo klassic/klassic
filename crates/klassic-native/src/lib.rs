@@ -514,6 +514,11 @@ pub fn compile_source_to_elf(
 }
 
 mod cbackend;
+mod generational_link;
+pub use generational_link::{
+    GenerationalInstrumentation, GenerationalLinkError, GenerationalLinkOptions,
+    GenerationalSourceKind, link_generational_program,
+};
 mod generational_lexical;
 mod generational_modules;
 mod generational_nested;
