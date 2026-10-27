@@ -13,6 +13,9 @@
 use klassic_span::{Diagnostic, Span};
 use klassic_syntax::{BinaryOp, Expr};
 
+#[path = "cbackend_generational.rs"]
+mod generational;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CType {
     Int,
@@ -529,4 +532,20 @@ pub(crate) fn emit_c_program(expr: &Expr) -> Result<String, Diagnostic> {
     out.push_str(&body);
     out.push_str("    return 0;\n}\n");
     Ok(out)
+}
+
+/// Emit canonical rooted C using the shared generational runtime adapter.
+pub(crate) fn emit_c_generational_program(
+    expr: &Expr,
+    config: crate::GenerationalBackendConfig,
+    source: &crate::generational_modules::Sources,
+    function_names: &std::collections::HashMap<String, String>,
+) -> Result<String, Diagnostic> {
+    if config.flags & !7 != 0 {
+        return Err(unsupported(
+            expr.span(),
+            "unknown canonical GC configuration flags",
+        ));
+    }
+    generational::emit(expr, config, source, function_names)
 }
