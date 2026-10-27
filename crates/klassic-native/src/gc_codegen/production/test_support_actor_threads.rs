@@ -19,6 +19,7 @@ const OLD_WORKER: i32 = 88;
 #[derive(Clone, Copy)]
 enum GraphMode {
     Idle,
+    Satb(crate::DataLabel, crate::DataLabel, u64),
     WeakRace(crate::DataLabel, bool, bool),
     Moving(crate::DataLabel, bool, u64, bool),
     Checkpoint,
@@ -75,6 +76,7 @@ fn run_parallel_impl(
     mode: GraphMode,
 ) -> ParallelActors {
     let moving = matches!(mode, GraphMode::Moving(..) | GraphMode::ScheduledMoving);
+    let satb = matches!(mode, GraphMode::Satb(..));
     let copying = matches!(mode, GraphMode::CopyRoot(..));
     let native_cycles = matches!(
         mode,
@@ -168,6 +170,10 @@ fn run_parallel_impl(
     g.bind_text_label(released);
     if let GraphMode::WeakRace(state, young, gate_first) = mode {
         weak_race::child(g, state, young, gate_first, closing_ready, closing_gate);
+        g.jmp_label(child_done);
+    }
+    if let GraphMode::Satb(state, marker_gate, seal) = mode {
+        satb_parallel::child(g, actors.len() as u64, state, marker_gate, seal);
         g.jmp_label(child_done);
     }
     if let GraphMode::Moving(state, true, cycles, _) = mode {
@@ -322,7 +328,7 @@ fn run_parallel_impl(
     g.asm.pop_reg(X::Rbp);
     g.ret();
     g.bind_text_label(body);
-    if checkpoint || running_old || scheduled_old || dual || copying || moving {
+    if checkpoint || running_old || scheduled_old || dual || copying || moving || satb {
         let enter = g.gc_gen.as_ref().unwrap().labels.native_enter_actor;
         graph::call_owner(g, enter);
     }
@@ -464,6 +470,7 @@ fn run_parallel_impl(
         || copying
         || native_cycles
         || moving
+        || satb
         || matches!(mode, GraphMode::WeakRace(..))
     {
         let exit = g.gc_gen.as_ref().unwrap().labels.native_exit_actor;
@@ -740,3 +747,9 @@ fn parallel_leases(
 #[path = "test_support_weak_race.rs"]
 mod weak_race;
 pub(crate) use weak_race::{prepare_weak_race, run_parallel_weak_race, weak_race_metric};
+
+#[path = "test_support_satb_parallel.rs"]
+mod satb_parallel;
+pub(crate) use satb_parallel::{
+    run_parallel_satb_deletions, satb_parallel_metric, satb_parallel_owner_metric,
+};

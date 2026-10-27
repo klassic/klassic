@@ -477,6 +477,7 @@ fn end_check<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     let done = a.create_text_label();
     copy::bump(a, END_CHECKS, R::V0);
     phase::marking(a, l, crate::gc_abi::Phase::MarkEndCheck);
+    satb_buffer::pending(a, false, pending);
     lea_rt(a, R::V1, root_work::PENDING);
     a.atomic_load_acquire(R::V0, R::V1);
     a.test_reg_reg(R::V0, R::V0);

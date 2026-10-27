@@ -908,3 +908,17 @@ mod weak_growth;
 
 mod remset_buffer;
 mod remset_sealing;
+
+mod satb_buffer;
+mod satb_pressure;
+mod satb_slots;
+
+mod satb_parallel;
+
+mod satb_overwrite;
+
+mod satb_moving;
+
+mod satb_fixture;
+
+mod satb_fallback;

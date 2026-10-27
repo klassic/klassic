@@ -254,6 +254,10 @@ fn emit_store<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime: E::D
             // The sole owner's phase/metadata cannot retire during this store.
             // A matching acquired epoch already owns a mark obligation. Any
             // admission still enqueuing it holds the end-check collector lock.
+            if previous {
+                super::satb_buffer::offer(a, l, false);
+                a.jmp_label(protected);
+            }
             super::mark::test_mark(a, R::V2, R::V6, R::V7);
             a.jcc_label(C::NotEqual, protected);
             super::worker::lock(a, l);

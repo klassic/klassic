@@ -40,6 +40,7 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     // interrupted allocation's size and element count are restored.
     a.bind_text_label(l.collect);
     super::remset_buffer::flush(a, l, false);
+    super::satb_buffer::flush(a, l, false);
     let legacy = a.create_text_label();
     load_rt(a, R::V0, super::moving_round::ENABLED);
     a.test_reg_reg(R::V0, R::V0);
@@ -59,6 +60,10 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     // Stop the worker for the whole pause.
     super::worker::lock(a, l);
     a.bind_text_label(l.collect_moving);
+    // The rendezvous must have sealed every owner before either a full
+    // mark drain or any physical work can wait on private obligations.
+    super::remset_buffer::require_empty(a, l);
+    super::satb_buffer::require_empty(a, l);
     load_rt(a, R::V0, RT_ALLOC_SIZE);
     store_rt(a, RT_SAVED_SIZE, R::V0);
     load_rt(a, R::V0, elements);
@@ -87,6 +92,7 @@ pub(super) fn emit_collect<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) 
     // keeps acknowledged peers parked. Check before any physical bank or
     // source-run mutation, not merely before the remembered bitmap flip.
     super::remset_buffer::require_empty(a, l);
+    super::satb_buffer::require_empty(a, l);
     clear_scratch(a, l);
     // Close the allocating page: it belongs to the space being evacuated.
     let closed = a.create_text_label();

@@ -143,6 +143,7 @@ pub(super) fn alloc_black<E: PortableAsm>(a: &mut E) {
 }
 /// Only fixed-count frontier metadata, plus the current retained Old receiver.
 pub(super) fn pending<E: PortableAsm>(a: &mut E, pending: E::TextLabel) {
+    super::satb_buffer::pending(a, true, pending);
     for f in [
         OBJECT,
         LEN,
@@ -181,6 +182,7 @@ pub(super) fn wait<E: PortableAsm>(a: &mut E, l: &RuntimeLabels<E::TextLabel>) {
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::Equal, done);
     a.call_label(l.publish_pending);
+    super::satb_buffer::flush(a, l, false);
     a.bind_text_label(again);
     super::worker::lock(a, l);
     a.call_label(l.root_journal_seal);
@@ -473,6 +475,7 @@ pub(super) fn start_ready<E: PortableAsm>(a: &mut E, l: &RuntimeLabels<E::TextLa
 
 /// Real debt/frontiers already closed under the collector ticket.
 pub(super) fn seal_ready<E: PortableAsm>(a: &mut E, l: &RuntimeLabels<E::TextLabel>) {
+    super::satb_buffer::pending(a, true, l.fail);
     super::registered_roots::finish(a, l, super::registered_roots::YOUNG);
     super::capacity::seal(a, l);
     super::start_policy::end_mark(a, l);

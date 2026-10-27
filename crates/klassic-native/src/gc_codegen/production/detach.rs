@@ -118,6 +118,7 @@ fn begin<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     owner_state::bind_running(a, l);
     a.call_label(l.publish_pending);
     super::remset_buffer::flush(a, l, false);
+    super::satb_buffer::flush(a, l, false);
     let retry = a.create_text_label();
     let round = a.create_text_label();
     let busy = a.create_text_label();

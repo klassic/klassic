@@ -84,7 +84,9 @@ pub(super) fn drain<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     // Initialization completed before entering this allocation safepoint.
     // Seal its pending header before changing the adopted snapshot.
     a.call_label(l.publish_pending);
+    super::satb_buffer::flush(a, l, true);
     super::phase::marking(a, l, crate::gc_abi::Phase::MarkEndCheck);
+    super::satb_buffer::pending(a, false, pending);
     load_rt(a, R::V0, RT_M_OBJ);
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::NotEqual, pending);
@@ -292,6 +294,7 @@ fn emit_mark_loop<E: PortableAsm>(
     a.bind_text_label(roots);
     super::mark_roots::discover(a, l, mark_ref, top, empty, paused);
     a.bind_text_label(empty);
+    super::satb_buffer::pending(a, false, paused);
     load_rt(a, R::V0, super::mark_queue::count(false));
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::NotEqual, paused);

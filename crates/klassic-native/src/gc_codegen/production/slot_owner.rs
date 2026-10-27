@@ -1,4 +1,4 @@
-//! Page-local Old field ownership. Starts share the Young page bitmap layout;
+//! Page-local field ownership. Starts share the Young page bitmap layout;
 //! a card hint covers objects that began before the slot's 1-KiB card.
 //! This is not a page/object metadata lease or a shared-pool transfer protocol.
 use super::{HEAP_PAGE_BYTES, Labels, RT_HEAP_BASE, d, load_rt};
@@ -10,7 +10,7 @@ const HEADER: i32 = size_of::<ObjectHeader>() as i32;
 const RECORD: i32 = offset_of!(ObjectHeader, mark_record) as i32 - HEADER;
 const SAVED: [R; 8] = [R::V1, R::V2, R::V6, R::V7, R::V8, R::V9, R::V10, R::V11];
 
-/// V8 = Old header, preserved. Publish hints/start membership after zeroing
+/// V8 = initialized Young/Old header, preserved. Publish hints/start membership after zeroing
 /// the payload and installing metadata/descriptor. Owner lookup independently
 /// requires PUBLISHED: a fresh large object can register its interior cards
 /// before returning to its initializer. A copy claims forwarding afterward.
@@ -83,11 +83,17 @@ fn highest<E: PortableAsm>(a: &mut E) {
 /// survive. No heap-prefix walk: two bitmap words, at most one hint, one
 /// candidate header. Validate before dereferencing the slot's value.
 pub(super) fn emit<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    emit_lookup(a, l.slot_owner, false);
+    emit_lookup(a, l.satb_slot_owner, true);
+    emit_remembered(a, l);
+}
+
+fn emit_lookup<E: PortableAsm>(a: &mut E, entry: E::TextLabel, include_young: bool) {
     let none = a.create_text_label();
     let done = a.create_text_label();
     let hinted = a.create_text_label();
     let candidate = a.create_text_label();
-    a.bind_text_label(l.slot_owner);
+    a.bind_text_label(entry);
     for r in SAVED {
         a.push_reg(r);
     }
@@ -99,8 +105,17 @@ pub(super) fn emit<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.and_reg_imm32(R::V0, 7);
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::NotEqual, none);
-    super::generation::test(a, R::V6, super::generation::OLD);
-    a.jcc_label(C::NotEqual, none);
+    if include_young {
+        let managed = a.create_text_label();
+        super::generation::test(a, R::V6, super::generation::YOUNG);
+        a.jcc_label(C::Equal, managed);
+        super::generation::test(a, R::V6, super::generation::OLD);
+        a.jcc_label(C::NotEqual, none);
+        a.bind_text_label(managed);
+    } else {
+        super::generation::test(a, R::V6, super::generation::OLD);
+        a.jcc_label(C::NotEqual, none);
+    }
     a.mov_reg_reg(R::V0, R::V6);
     a.sub_reg_imm32(R::V0, HEAP_PAGE_BYTES as i32);
     a.shr_reg_imm8(R::V0, 10);
@@ -147,8 +162,29 @@ pub(super) fn emit<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
     a.jcc_label(C::NotEqual, none);
     a.cmp_reg_reg(R::V10, R::V6);
     a.jcc_label(C::Above, none);
-    super::generation::test(a, R::V10, super::generation::OLD);
-    a.jcc_label(C::NotEqual, none);
+    if include_young {
+        let old = a.create_text_label();
+        let same_generation = a.create_text_label();
+        super::generation::test(a, R::V6, super::generation::YOUNG);
+        a.jcc_label(C::NotEqual, old);
+        super::generation::test(a, R::V10, super::generation::YOUNG);
+        a.jcc_label(C::NotEqual, none);
+        // Young objects fit one physical TLAB page. A stale hint cannot
+        // borrow a header in another page, even if both pages are Young.
+        a.mov_reg_reg(R::V0, R::V6);
+        a.xor_reg_reg(R::V0, R::V10);
+        a.shr_reg_imm8(R::V0, 17);
+        a.test_reg_reg(R::V0, R::V0);
+        a.jcc_label(C::NotEqual, none);
+        a.jmp_label(same_generation);
+        a.bind_text_label(old);
+        super::generation::test(a, R::V10, super::generation::OLD);
+        a.jcc_label(C::NotEqual, none);
+        a.bind_text_label(same_generation);
+    } else {
+        super::generation::test(a, R::V10, super::generation::OLD);
+        a.jcc_label(C::NotEqual, none);
+    }
     // A hint never bypasses exact object-start membership.
     a.mov_reg_reg(R::V0, R::V10);
     a.add_reg_imm32(R::V0, HEADER);
@@ -212,7 +248,6 @@ pub(super) fn emit<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
         a.pop_reg(r);
     }
     a.ret();
-    emit_remembered(a, l);
 }
 /// Completed Old snapshots prune only pre-snapshot holders. New identities
 /// cannot be inferred dead from a snapshot that predates their allocation.

@@ -374,6 +374,11 @@ fn worker_young_copy<E: PortableAsm>(
     super::identity::copy_record(a, l, c.src);
     load_rt(a, R::V2, c.desc);
     a.store_ptr_disp32(R::V8, d(offset_of!(ObjectHeader, descriptor_id)), R::V2);
+    // A worker copy bypasses TLAB publication. Install the same start/card
+    // metadata before forwarding can expose this Young destination.
+    super::quiescence::save(a);
+    super::slot_owner::publish(a);
+    super::quiescence::restore(a);
     load_rt(a, R::V9, RT_W_PAGE);
     load_rt(a, R::V0, RT_W_TOP);
     a.add_reg_imm32(R::V9, d(offset_of!(AllocationPage, allocated_top)));

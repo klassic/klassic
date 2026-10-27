@@ -994,3 +994,19 @@ pub(crate) use remset_buffer_support::*;
 #[path = "test_support_remset_sealing.rs"]
 mod remset_sealing_support;
 pub(crate) use remset_sealing_support::*;
+
+#[path = "test_support_satb_buffer.rs"]
+mod satb_buffer_support;
+pub(crate) use satb_buffer_support::*;
+
+#[path = "test_support_satb_slots.rs"]
+mod satb_slots_support;
+pub(crate) use satb_slots_support::*;
+
+#[path = "test_support_satb_moving.rs"]
+mod satb_moving_support;
+pub(crate) use satb_moving_support::*;
+
+#[path = "test_support_satb_fallback.rs"]
+mod satb_fallback_support;
+pub(crate) use satb_fallback_support::*;
