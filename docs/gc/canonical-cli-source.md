@@ -7,8 +7,9 @@ klassic --gc=generational --backend c build program.kl -o program.c
 klassic --gc=generational --backend llvm build program.kl -o program.ll
 ```
 
-The CLI accepts `--gc-stress` and `--gc-log` for this path. `--gc-poison`,
-non-Linux-x86-64 targets, and executable output are explicitly rejected.
+The CLI accepts `--gc-stress` for this path. `--gc-log` is rejected until the
+canonical runtime reports collection statistics; `--gc-poison`,
+non-Linux-x86-64 targets, and executable output are also explicitly rejected.
 Module files are resolved beside the entry file and passed to the canonical
 frontend. Unsupported constructs receive a source-located diagnostic.
 

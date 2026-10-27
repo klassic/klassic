@@ -35,7 +35,6 @@ fn canonical_cli_emits_compilable_source_and_rejects_unavailable_executables() {
             .args([
                 "--gc=generational",
                 "--gc-stress",
-                "--gc-log",
                 "--backend",
                 backend,
                 "build",
@@ -54,10 +53,10 @@ fn canonical_cli_emits_compilable_source_and_rejects_unavailable_executables() {
         assert!(text.contains("kg_init") && !text.contains("klassic_gc"));
         if backend == "c" {
             assert!(
-                text.contains("kg_configure(UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(3))")
+                text.contains("kg_configure(UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(1))")
             );
         } else {
-            assert!(text.contains("call void @kg_configure(i64 0, i64 0, i64 0, i64 3)"));
+            assert!(text.contains("call void @kg_configure(i64 0, i64 0, i64 0, i64 1)"));
         }
         let mut command = Command::new(compiler);
         command
@@ -92,6 +91,7 @@ fn canonical_cli_emits_compilable_source_and_rejects_unavailable_executables() {
         std::fs::write(&source, b"keep source").unwrap();
         for flags in [
             &["--gc-poison"][..],
+            &["--gc-log"][..],
             &["--target", "x86_64-pc-windows-msvc"][..],
         ] {
             let rejected = Command::new(env!("CARGO_BIN_EXE_klassic"))
