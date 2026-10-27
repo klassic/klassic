@@ -21,6 +21,9 @@ on:
 permissions:
   contents: write
 
+env:
+  PACKAGE_VERSION: ${{ github.event_name == 'workflow_dispatch' && 'dry-run' || github.ref_name }}
+
 jobs:
   release-linux:
     runs-on: ubuntu-latest
@@ -55,7 +58,7 @@ jobs:
         run: |
           cp target/x86_64-unknown-linux-musl/release/klassic klassic
           cp target/x86_64-unknown-linux-gnu/release/libklassic_runtime.a libklassic_runtime.a
-          tar czf "klassic-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz" klassic libklassic_runtime.a runtime/gc/*.h \
+          tar czf "klassic-${PACKAGE_VERSION}-x86_64-unknown-linux-musl.tar.gz" klassic libklassic_runtime.a runtime/gc/*.h \
             runtime/gc/klassic_gen_runtime.c runtime/gc/klassic_gen_remembered.c runtime/gc/gc_native_driver.c \
             runtime/gc/klassic_gen_policy.c runtime/gc/klassic_gen_verify.c runtime/gc/klassic_gen_string.c runtime/gc/klassic_gen_scalar.c
 
@@ -63,7 +66,7 @@ jobs:
         run: |
           bundle_dir="${RUNNER_TEMP}/klassic-bundle"
           mkdir -p "$bundle_dir"
-          tar xzf "klassic-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz" -C "$bundle_dir"
+          tar xzf "klassic-${PACKAGE_VERSION}-x86_64-unknown-linux-musl.tar.gz" -C "$bundle_dir"
           printf 'println(42)\n' > "$bundle_dir/program.kl"
           for backend in c llvm; do
             env -u KLASSIC_RT_LIB -u KLASSIC_GEN_RUNTIME_DIR "$bundle_dir/klassic" --gc=generational --gc-stress --backend "$backend" build "$bundle_dir/program.kl" -o "$bundle_dir/program"
@@ -107,10 +110,10 @@ jobs:
         run: |
           cp target/aarch64-apple-darwin/release/klassic klassic
           cp target/aarch64-apple-darwin/release/libklassic_runtime.a libklassic_runtime.a
-          tar czf "klassic-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" klassic libklassic_runtime.a
+          tar czf "klassic-${PACKAGE_VERSION}-aarch64-apple-darwin.tar.gz" klassic libklassic_runtime.a
           cp target/x86_64-apple-darwin/release/klassic klassic
           cp target/x86_64-apple-darwin/release/libklassic_runtime.a libklassic_runtime.a
-          tar czf "klassic-${GITHUB_REF_NAME}-x86_64-apple-darwin.tar.gz" klassic libklassic_runtime.a
+          tar czf "klassic-${PACKAGE_VERSION}-x86_64-apple-darwin.tar.gz" klassic libklassic_runtime.a
 
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/')
@@ -152,7 +155,7 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item target\x86_64-pc-windows-msvc\release\klassic.exe klassic.exe
-          Compress-Archive -Path klassic.exe -DestinationPath "klassic-$env:GITHUB_REF_NAME-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path klassic.exe -DestinationPath "klassic-$env:PACKAGE_VERSION-x86_64-pc-windows-msvc.zip"
 
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/')
