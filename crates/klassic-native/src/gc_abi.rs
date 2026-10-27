@@ -5,7 +5,7 @@
 //! runtime's finite no-safepoint access guard. Phase transitions here construct
 //! proposals; the coordinator must establish the publication/retirement gates.
 //!
-//! Implemented finite allocation/root transfer contracts (C/shared emitter):
+//! Allocation/root transfer contracts (shared leaves):
 //!
 //! | Operation | May safepoint | Result ownership |
 //! | --- | --- | --- |
@@ -1032,7 +1032,10 @@ pub struct AllocationPage {
     pub forward_table: u64,
 }
 
-/// Heap-lock protected bounded lease table. Slots are stable for the heap life.
+/// Heap-lock protected indexed lease table. Logical slot identities and token
+/// generations survive controlled backing growth. Raw slot pointers are valid
+/// only inside their locked operation; owners replace slots/capacity together
+/// after copying and mirroring mutations, before releasing old backing.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct MetadataLeasePool {
@@ -1068,6 +1071,157 @@ pub struct ReferenceLease {
     pub reference: u64,
     pub lease: MetadataLeaseRequest,
 }
+
+/// Version of the direct runtime's additive, native-callable scoped pin ABI.
+pub const SCOPED_PIN_ABI_VERSION: u64 = 1;
+
+/// Borrowed native adapter binding for one actual attached owner. Keep its
+/// context attached and use it only on that owner. Copying this view does not
+/// create another registration or permit using a foreign context.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct NativeApiBinding {
+    pub version: u64,
+    pub bytes: u64,
+    pub self_: u64,
+    pub context: u64,
+    pub identity: u64,
+    pub pins: u64,
+    pub call: u64,
+}
+
+/// Unary native API request: operation 0 enters root-only Native, 1 returns
+/// Running with actual snapshot adoption, 2 polls Running. All managed values
+/// must be rooted; no unpinned raw heap address may cross these operations.
+/// Returns 0 or 3 (invalid), except additive operation 4 returns the runtime
+/// NativeThreadApi address. Operation 3 remains invalid. Request backing itself
+/// is ordinary native memory.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct NativeApiCall {
+    pub binding: u64,
+    pub operation: u64,
+}
+
+/// Additive native thread ABI, obtained by NativeApiCall operation 4. The table
+/// belongs to its runtime; request/token storage is native, aligned and disjoint.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct NativeThreadApi {
+    pub version: u64,
+    pub bytes: u64,
+    pub self_: u64,
+    pub runtime: u64,
+    pub call: u64,
+    pub token_bytes: u64,
+    pub call_bytes: u64,
+}
+
+/// Exclusive zero-initialized token. Keep this exact address and calling OS
+/// thread through cleanup, including pending/resource-failure results. Never
+/// read, copy or modify the private words. Terminal cleanup zeroes the token.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct NativeThreadToken {
+    pub(crate) self_: u64,
+    pub(crate) runtime: u64,
+    pub(crate) context: u64,
+    pub(crate) thread: u64,
+    pub(crate) stage: u64,
+}
+
+/// Operations: 0 Attach (fresh token), 1 Step attach/cleanup, 2 Detach (Running),
+/// 3 Current (token ignored), 4 Shutdown unused OS TLS key (token ignored).
+/// Context and binding are output only, valid on Attach/Step success or Current.
+/// Keep their owning token/association alive while borrowing them. No managed
+/// value or raw movable heap address crosses this API. Return 0 success,
+/// 2 owned pending/busy, 3 invalid/foreign OS association, 6 resource failure.
+/// After Attach takes ownership, pending/failure still requires Step/Detach;
+/// after context release completes, its token is empty and outputs stay zero.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct NativeThreadCall {
+    pub api: u64,
+    pub token: u64,
+    pub operation: u64,
+    pub cells: u64,
+    pub entries: u64,
+    pub context: u64,
+    pub binding: u64,
+}
+
+/// Unique, zero-initialized native storage. Once owned, keep its address and
+/// creator context until release completes. Its private words are not roots
+/// for the embedding program to read, copy, modify or reconstruct.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct ScopedPinToken {
+    pub(crate) holder: u64,
+    pub(crate) runtime: u64,
+    pub(crate) context: u64,
+    pub(crate) stage: u64,
+    pub(crate) address: u64,
+    pub(crate) identity: u64,
+    pub(crate) root: [u64; 3],
+    pub(crate) destination: [u64; 3],
+    pub(crate) reference: ReferenceLease,
+    pub(crate) family: u64,
+    pub(crate) uses: u64,
+}
+
+/// Unary native ABI request. Source is a live creator-frame RootCell for New.
+/// Operations: 0 New, 1 Step, 2 Release, 3 NativeEnter, 4 NativeExit,
+/// 5 CallbackEnter, 6 CallbackReturn, 7 View, 8 EndRunningUse.
+/// Result: 0 success, 2 owned pending, 3 invalid, 4 unowned New retry,
+/// 6 resource failure (an already owned token still requires Release).
+/// Address/identity are output only; release/failure clears those outputs.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct ScopedPinCall {
+    pub context: u64,
+    pub source: u64,
+    pub token: u64,
+    pub operation: u64,
+    pub address: u64,
+    pub identity: u64,
+}
+
+/// Caller-owned scope, kept at a fixed address through terminal stage 5.
+/// A unary native callback receives this package while its pin use is live.
+/// Its scalar result survives mandatory Native exit and resumable cleanup.
+/// Callback return in Running is also unwound, including nested owned uses.
+/// No C longjmp/foreign exception may bypass the scope's native stack frame.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct ScopedPinScope {
+    pub call: ScopedPinCall,
+    pub api: u64,
+    pub callback: u64,
+    pub user: u64,
+    pub result: u64,
+    pub stage: u64,
+    pub error: u64,
+    pub last_status: u64,
+    pub token: ScopedPinToken,
+}
+
+/// Native function pointers: call(ScopedPinCall*) and scope(ScopedPinScope*).
+/// Context and frame roots come from the actual attached creator; functions
+/// preserve the platform's native nonvolatile registers and stack alignment.
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct ScopedPinApi {
+    pub version: u64,
+    pub token_bytes: u64,
+    pub call_bytes: u64,
+    pub scope_bytes: u64,
+    pub call: u64,
+    pub scope: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<ScopedPinToken>() == 144);
+const _: () = assert!(std::mem::size_of::<ScopedPinCall>() == 48);
+const _: () = assert!(std::mem::size_of::<ScopedPinScope>() == 248);
 
 /// A retained remembered claim to its run-head metadata, not strong liveness.
 #[derive(Clone, Copy, Debug, Default)]

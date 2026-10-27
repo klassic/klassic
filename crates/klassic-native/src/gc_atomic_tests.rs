@@ -3,6 +3,10 @@
 use crate::portable_asm::{PortableAsm, Reg as P};
 use crate::{NativeCodeGenerator, SourceFile, TargetPlatform};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "gc_native_contract_tests.rs"]
+mod native_contract;
+
 pub(super) fn generator() -> NativeCodeGenerator {
     let mut generator = NativeCodeGenerator::new(
         SourceFile::new("<gc-atomics>", ""),

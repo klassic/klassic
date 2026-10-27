@@ -48,6 +48,16 @@ fn select_slot<A: PortableAsm>(b: &mut Emit<'_, A>) {
 /// V7=pool,V6=request,V2=acquire/release/resolve. No scans, allocation or waits.
 #[allow(dead_code)]
 pub(crate) fn emit_metadata_step<A: PortableAsm>(a: &mut A) {
+    emit_metadata_step_tracked(a, &mut |_| {}, &mut |_| {});
+}
+/// Optional production hooks run under the same heap ticket. `changed` sees
+/// the actual mutated slot in V8; `full` sees an unchanged failed request.
+/// Hooks preserve all registers. Standalone leaf behavior remains unchanged.
+pub(crate) fn emit_metadata_step_tracked<A: PortableAsm>(
+    a: &mut A,
+    changed: &mut impl FnMut(&mut A),
+    full: &mut impl FnMut(&mut A),
+) {
     let status: [_; 4] = std::array::from_fn(|_| a.create_text_label());
     let invalid = status[1];
     let held = a.create_text_label();
@@ -180,6 +190,10 @@ pub(crate) fn emit_metadata_step<A: PortableAsm>(a: &mut A) {
         request!(token),
         add(shl(slot!(generation), 32), local(STATE)),
     );
+    b.a.push_reg(R::V8);
+    b.a.load_rbp_slot(R::V8, REG);
+    changed(b.a);
+    b.a.pop_reg(R::V8);
     b.a.jmp_label(status[0]);
     b.a.bind_text_label(release);
     b.branch(page!(metadata_leases), n(0), C::Equal, invalid);
@@ -198,9 +212,16 @@ pub(crate) fn emit_metadata_step<A: PortableAsm>(a: &mut A) {
     for off in [0, 8, 16] {
         b.set(field(Q, off, 0), n(0));
     }
+    b.a.push_reg(R::V8);
+    b.a.load_rbp_slot(R::V8, REG);
+    changed(b.a);
+    b.a.pop_reg(R::V8);
     b.a.jmp_label(status[0]);
     for (value, label) in status.into_iter().enumerate() {
         b.a.bind_text_label(label);
+        if value == 2 {
+            full(b.a);
+        }
         b.a.mov_imm64(R::V0, value as u64);
         b.a.jmp_label(done);
     }

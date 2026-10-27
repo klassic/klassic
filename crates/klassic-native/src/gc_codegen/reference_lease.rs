@@ -35,6 +35,13 @@ fn reference() -> E {
 }
 #[allow(dead_code)]
 pub(crate) fn emit_reference_lease<A: PortableAsm>(a: &mut A) {
+    emit_reference_lease_tracked(a, &mut |_| {}, &mut |_| {});
+}
+pub(crate) fn emit_reference_lease_tracked<A: PortableAsm>(
+    a: &mut A,
+    changed: &mut impl FnMut(&mut A),
+    full: &mut impl FnMut(&mut A),
+) {
     let invalid = a.create_text_label();
     let done = a.create_text_label();
     let core = a.create_text_label();
@@ -205,7 +212,7 @@ pub(crate) fn emit_reference_lease<A: PortableAsm>(a: &mut A) {
     b.a.leave();
     b.a.jmp_label(after);
     b.a.bind_text_label(core);
-    super::metadata::emit_metadata_step(b.a);
+    super::metadata::emit_metadata_step_tracked(b.a, changed, full);
     b.a.ret();
     b.a.bind_text_label(after);
 }

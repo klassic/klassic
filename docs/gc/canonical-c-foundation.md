@@ -3,6 +3,8 @@
 This is a C-only dependency layer for [#683](https://github.com/klassic/klassic/issues/683),
 based on the independent oracle/typechecking changes in PR #684. It does not
 wire a Rust production collector, C/LLVM language emitter or executable CLI.
+The source manifest and validation counts below describe the original PR #685
+checkpoint. Later PR #686 supplies the demand-aware #675 fix in current checkouts.
 The default collector and unsupported backend selection diagnostics are unchanged.
 This C-only PR assigns no G01-G15 achievement counts. The separate ledger for the
 larger opt-in workspace foundation currently says **0 met / 15 partial**; that
@@ -57,23 +59,30 @@ results establish no corresponding platform acceptance.
 export CARGO_TARGET_DIR="$(mktemp -d)"
 export PYTHONDONTWRITEBYTECODE=1
 export KLASSIC_GEN_RUNTIME_DIR="$PWD/runtime/gc"
-(cd runtime/gc && sha256sum -c ../../docs/gc/checkpoints/canonical-c-core-SHA256SUMS)
 cargo build --workspace
 cargo test --test gc_abi
 cargo test --test generational_c_runtime_core --test generational_c_atomic_ref --test generational_c_bulk --test generational_c_threads --test generational_nmutator_driver -- --test-threads=2
 # Repeat with KLASSIC_GEN_SANITIZE=address and =thread; startup failures fail.
 ```
 
-The C units and reachable headers are byte-identical to the tested shutdown-plus-
-delay source subset derived from manifest
+At the original PR #685 checkpoint, the C units and reachable headers are
+byte-identical to the tested shutdown-plus-delay source subset derived from manifest
 `3de0716b4db7c94e168b85dc7339a4502719426790d0a725dc7dd737fd2d2ae6`.
 Unrelated direct native thread/scoped-pin ABI headers and Rust ABI additions are
 excluded; the existing shared C/Rust layouts stay unchanged.
 
-[#675](https://github.com/klassic/klassic/issues/675) remains open: with 1023 of
-1024 C lease tokens held, a multi-lease operation can retry without progress.
-Demand-aware fixes and their tests are excluded. The unfinished direct G07
-prototype is excluded. The original direct moving-cycle invariant/atomic timeout
+To verify that historical manifest, use a separate checkout at commit
+`6ae963e`: `git worktree add --detach ../klassic-c-core-checkpoint 6ae963e`.
+From that checkout run
+`(cd runtime/gc && sha256sum -c ../../docs/gc/checkpoints/canonical-c-core-SHA256SUMS)`.
+The manifest intentionally retains the original checkpoint hashes; PR #686 changes
+five production source entries, so it is not a manifest of the latest checkout.
+
+[#675](https://github.com/klassic/klassic/issues/675) identified a gap in the
+original checkpoint: with 1023 of 1024 C lease tokens held, a multi-lease operation
+could retry without progress. The demand-aware fix and its tests landed in
+[PR #686](https://github.com/klassic/klassic/pull/686). The unfinished direct G07
+prototype is excluded. The original direct moving-cycle invariant
 in [#676](https://github.com/klassic/klassic/issues/676) is still unexplained;
 passing C tests do not resolve it. Earlier failed C/LLVM timeout/startup runs also
 remain failures, distinct from subsequent controlled passing runs. This C-only

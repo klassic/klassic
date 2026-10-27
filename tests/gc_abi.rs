@@ -2,6 +2,53 @@
 use klassic_native::gc_abi::*;
 
 #[test]
+fn native_adapter_headers_compose_and_reject_malformed_requests() {
+    use std::process::Command;
+    let cc = std::env::var("KLASSIC_CLANG").unwrap_or_else(|_| {
+        ["clang-15", "clang", "cc"]
+            .into_iter()
+            .find(|cc| {
+                Command::new(cc)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            })
+            .expect("native adapter ABI conformance requires a C11 compiler")
+            .to_owned()
+    });
+    let executable = std::env::temp_dir().join(format!(
+        "klassic-native-adapter-{}-{}{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        std::env::consts::EXE_SUFFIX
+    ));
+    for order in [0, 1] {
+        let output = Command::new(&cc)
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+            .arg(format!("-DTHREAD_HEADER_FIRST={order}"))
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/runtime/gc/gc_native_adapter_contract_test.c"
+            ))
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(&executable).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    std::fs::remove_file(executable).unwrap();
+}
+
+#[test]
 fn null_and_invalid_references_are_rejected_before_address_formation() {
     assert_eq!(decode_ref(GcRef::NULL, usize::MAX), Ok(0));
     let snapshot = PhaseSnapshot::initial();
@@ -139,8 +186,9 @@ fn c_and_rust_layouts_and_reference_bits_match() {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     )));
     std::fs::create_dir(&scratch.0).unwrap();
-    let mut source =
-        String::from("#include \"gc_abi.h\"\n#include <assert.h>\n#include <stdio.h>\n");
+    let mut source = String::from(
+        "#include \"gc_abi.h\"\n#include \"gc_native_thread_abi.h\"\n#include <assert.h>\n#include <stdio.h>\n",
+    );
     macro_rules! layout {
         ($ty:ty $(, $field:ident)*) => { layout!($ty => $ty $(, $field)*); };
         ($ty:ty => $c_ty:ty $(, $field:ident)*) => {{
@@ -149,6 +197,15 @@ fn c_and_rust_layouts_and_reference_bits_match() {
             $(writeln!(source, "_Static_assert(offsetof({}, {}) == {}, \"offset\");", stringify!($c_ty), stringify!($field), offset_of!($ty, $field)).unwrap();)*
         }};
     }
+    layout!(ScopedPinToken => GcScopedPinToken);
+    layout!(ScopedPinCall => GcScopedPinCall, context, source, token, operation, address, identity);
+    layout!(ScopedPinApi => GcScopedPinApi, version, token_bytes, call_bytes, scope_bytes, call, scope);
+    layout!(ScopedPinScope => GcScopedPinScope, call, api, callback, user, result, stage, error, last_status, token);
+    layout!(NativeApiBinding => GcNativeApiBinding, version, bytes, self_, context, identity, pins, call);
+    layout!(NativeApiCall => GcNativeApiCall, binding, operation);
+    layout!(NativeThreadApi => GcNativeThreadApi, version, bytes, self_, runtime, call, token_bytes, call_bytes);
+    layout!(NativeThreadToken => GcNativeThreadToken);
+    layout!(NativeThreadCall => GcNativeThreadCall, api, token, operation, cells, entries, context, binding);
     layout!(GcRef);
     layout!(PhaseSnapshot);
     layout!(ObjectId);
