@@ -19,6 +19,18 @@ static void partial_and_late(bool full,bool moving){
     for(unsigned i=0;i<40;i++){kg_alloc_into(8,1,child);kg_store_i64(child,0,3000+i);kg_store_ref(graph,i*8,child);}
     kg_root_clear(child);kg_enter_native(r);
     uint64_t owned=kg_driver_cleanup_enter(r,NULL);assert(!owned);KgDriver *d=r->driver;uint64_t turns=0;
+    /* The delayed producer must own the first mark of its target. Earlier
+     * child values can remain in root journals after their roots are cleared.
+     * Acknowledge those real entries while the driver is idle. */
+    kg_lock(r);assert(!d->state&&!d->background_old&&!(r->native.roots.phase&255));kg_unlock(r);
+    for(;;){
+        uint64_t pending=0;kg_lock(r);
+        for(KgRootBlock *b=kg_current_mutator(r)->root_blocks;b;b=b->next){
+            BufferCursor *j=(void *)(uintptr_t)b->roots->segment.journal;
+            pending+=atomic_load_explicit(&j->published,memory_order_acquire)-atomic_load_explicit(&j->consumed,memory_order_acquire);
+        }
+        kg_unlock(r);if(!pending)break;kg_drain_journals(r);assert(++turns<300000);
+    }
     kg_lock(r);d->requested[0]=d->requested[1]=1;kg_unlock(r);
     while(d->state!=3||d->background_old!=3){assert(++turns<300000);quantum(r,d);}
     while(d->root_started!=2){assert(++turns<300000);(void)kgd_roots(d,false);}
@@ -94,6 +106,7 @@ static void partial_and_late(bool full,bool moving){
     KgRun *source=d->cursor;uint64_t captured_tail=d->rebind_tail;
     NativeQueueIncoming late_incoming={0};
     kg_lock(r);uint64_t before=old->last_serial;
+    assert(((MarkRecord *)(uintptr_t)late_record)->old_epoch!=old->epoch);
     assert(gc_native_queue_incoming_begin_locked(&r->native,3*GC_HEAP_PAGE_BYTES,4*GC_HEAP_PAGE_BYTES,&late_incoming)==GC_NSI_MORE);
     assert(gc_native_queue_incoming_prefer_fifo_locked(&late_incoming)==GC_NSI_MORE);kg_unlock(r);
     kgd_native(d,true);
