@@ -139,6 +139,10 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     eprintln!("error: --gc-poison is not accepted with --gc=generational");
                     return Err(1);
                 }
+                if command.config.gc_log {
+                    eprintln!("error: --gc-log is not yet supported by canonical C/LLVM output");
+                    return Err(1);
+                }
                 if command.config.native_target != NativeTarget::LinuxX86_64 {
                     eprintln!("error: canonical C/LLVM currently targets Linux x86-64");
                     return Err(1);
@@ -167,8 +171,7 @@ fn run(command: ParsedCommand) -> Result<(), u8> {
                     })
                     .collect::<Vec<_>>();
                 let config = GenerationalBackendConfig {
-                    flags: u64::from(command.config.gc_stress)
-                        | (u64::from(command.config.gc_log) << 1),
+                    flags: u64::from(command.config.gc_stress),
                     ..Default::default()
                 };
                 let generated = if command.config.llvm_backend {
