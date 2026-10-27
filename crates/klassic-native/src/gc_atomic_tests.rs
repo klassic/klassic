@@ -7,6 +7,9 @@ use crate::{NativeCodeGenerator, SourceFile, TargetPlatform};
 #[path = "gc_native_contract_tests.rs"]
 mod native_contract;
 
+#[path = "gc_native_frame_tests.rs"]
+mod native_frames;
+
 pub(super) fn generator() -> NativeCodeGenerator {
     let mut generator = NativeCodeGenerator::new(
         SourceFile::new("<gc-atomics>", ""),

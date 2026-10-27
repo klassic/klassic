@@ -355,6 +355,15 @@ impl PortableAsm for FlagAsm<'_> {
     fn call_native_binary(&mut self, target: P) {
         self.0.call_native_binary(target);
     }
+    fn native_entry_begin(&mut self, locals: u32) {
+        self.0.native_entry_begin(locals);
+    }
+    fn native_entry_end(&mut self) {
+        self.0.native_entry_end();
+    }
+    fn mov_text_addr(&mut self, dst: P, label: Label) {
+        self.0.mov_text_addr(dst, label);
+    }
     fn ret(&mut self) {
         PortableAsm::ret(self.0);
     }

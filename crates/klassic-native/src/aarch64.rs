@@ -1108,6 +1108,7 @@ fn port_reg(r: portable_asm::Reg) -> Reg {
         P::V9 => Reg::X7,
         P::V10 => Reg::X8,
         P::V11 => Reg::X9,
+        P::OwnerContext => Reg::X19,
         P::ColorStrip => Reg::X24,
         P::GoodColor => Reg::X25,
         P::BadMask => Reg::X26,
@@ -1208,6 +1209,58 @@ impl portable_asm::PortableAsm for Assembler {
         self.push_frame_record();
         self.word(0xd63f_0000 | (16 << 5)); // blr x16
         self.pop_frame_record();
+    }
+    fn native_entry_begin(&mut self, locals: u32) {
+        assert!(locals.is_multiple_of(16) && locals <= 4080);
+        self.push_frame_record();
+        self.sub_sp_imm(208); // x19..x28 (80) and q8..q15 (128)
+        for pair in 0..5_u32 {
+            self.word(
+                0xa900_0000
+                    | ((pair * 2) << 15)
+                    | ((20 + pair * 2) << 10)
+                    | (31 << 5)
+                    | (19 + pair * 2),
+            );
+        }
+        for pair in 0..4_u32 {
+            self.word(
+                0xad00_0000
+                    | ((5 + pair * 2) << 15)
+                    | ((9 + pair * 2) << 10)
+                    | (31 << 5)
+                    | (8 + pair * 2),
+            );
+        }
+        self.word(0x9100_03fd); // mov x29, sp: portable local anchor
+        self.sub_sp_imm(locals);
+        self.mov_reg(Reg::X5, Reg::X0);
+    }
+    fn native_entry_end(&mut self) {
+        self.word(0x9100_03bf); // mov sp, x29
+        for pair in 0..4_u32 {
+            self.word(
+                0xad40_0000
+                    | ((5 + pair * 2) << 15)
+                    | ((9 + pair * 2) << 10)
+                    | (31 << 5)
+                    | (8 + pair * 2),
+            );
+        }
+        for pair in 0..5_u32 {
+            self.word(
+                0xa940_0000
+                    | ((pair * 2) << 15)
+                    | ((20 + pair * 2) << 10)
+                    | (31 << 5)
+                    | (19 + pair * 2),
+            );
+        }
+        self.add_sp_imm(208);
+        self.pop_frame_record();
+    }
+    fn mov_text_addr(&mut self, dst: portable_asm::Reg, label: Label) {
+        self.branch(label, BranchKind::Address(port_reg(dst)));
     }
     fn ret(&mut self) {
         Assembler::ret(self);
@@ -14246,6 +14299,10 @@ pub(super) fn gc_atomic_test_code(operation: crate::gc_atomic_tests::Operation) 
     asm.finish();
     asm.code
 }
+
+#[cfg(test)]
+#[path = "gc_native_frame_arm_fixture.rs"]
+pub(crate) mod native_frame_fixture;
 
 #[cfg(test)]
 mod tests {
