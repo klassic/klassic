@@ -114,6 +114,16 @@ pub extern "C" fn klassic_rt_println_f64(value: f64) {
     println!("{}", format_double_like_evaluator(value));
 }
 
+/// Preserve Float32's own decimal representation when printing.
+#[unsafe(no_mangle)]
+pub extern "C" fn klassic_rt_println_f32(value: f32) {
+    if value.fract() == 0.0 {
+        println!("{value:.1}");
+    } else {
+        println!("{value}");
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn klassic_rt_str_concat(a: KStr, b: KStr) -> KStr {
     let mut text = String::with_capacity(a.len + b.len);

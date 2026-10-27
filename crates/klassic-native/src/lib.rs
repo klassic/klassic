@@ -514,6 +514,10 @@ pub fn compile_source_to_elf(
 }
 
 mod cbackend;
+mod generational_lexical;
+mod generational_modules;
+mod generational_nested;
+pub use generational_modules::GenerationalModuleSource;
 mod gc_layout;
 mod gc_shape;
 mod llvm;
@@ -541,6 +545,39 @@ pub fn compile_source_to_c(name: &str, text: &str) -> Result<String, NativeCompi
         .map_err(|diagnostic| NativeCompileError::with_view(source.clone(), None, diagnostic))?;
     cbackend::emit_c_program(&expr)
         .map_err(|diagnostic| NativeCompileError::with_view(source, None, diagnostic))
+}
+
+/// Configuration consumed by the canonical C mutator adapter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GenerationalBackendConfig {
+    pub hard_max: u64,
+    pub min_heap: u64,
+    pub soft_max: u64,
+    pub flags: u64,
+    pub uncommit_delay_ns: Option<u64>,
+}
+
+/// Compile the supported subset to rooted C against the generational adapter.
+#[allow(clippy::result_large_err)]
+pub fn compile_source_to_c_generational(
+    name: &str,
+    text: &str,
+    config: GenerationalBackendConfig,
+) -> Result<String, NativeCompileError> {
+    compile_source_to_c_generational_with_modules(name, text, &[], config)
+}
+
+/// Compile rooted C with explicitly supplied static modules.
+#[allow(clippy::result_large_err)]
+pub fn compile_source_to_c_generational_with_modules(
+    name: &str,
+    text: &str,
+    modules: &[GenerationalModuleSource],
+    config: GenerationalBackendConfig,
+) -> Result<String, NativeCompileError> {
+    let program = generational_modules::prepare(name, text, modules)?;
+    cbackend::emit_c_generational_program(&program.expr, config, &program.sources, &program.names)
+        .map_err(|diagnostic| program.sources.error(diagnostic))
 }
 
 /// Compile Klassic source to a textual LLVM IR module (migration plan
