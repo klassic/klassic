@@ -1,3 +1,5 @@
+> Current integration scope and retained failures: [direct runtime foundation](direct-runtime-foundation.md). The historical checkpoints below are not a completion claim for this candidate.
+
 # M-G6 plan: concurrent relocation and marking for `--gc=generational`
 
 Status: steps 1-6 implemented (2026-10-22); the worker (steps 4-5) runs on

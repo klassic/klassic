@@ -27,6 +27,8 @@ env:
 jobs:
   release-linux:
     runs-on: ubuntu-latest
+    env:
+      KLASSIC_UNICORN_PYTHON: python
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,10 +41,19 @@ jobs:
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools clang
 
+      - name: Setup ARM64 test emulator
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          pip-install: 'unicorn==2.1.4'
+
       - name: Build runtime staticlib
         # cargo test alone doesn't produce libklassic_runtime.a, which
         # the C-backend link tests resolve next to the klassic binary.
         run: cargo build -p klassic-runtime
+
+      - name: Install Linux syscall observer
+        run: sudo apt-get update && sudo apt-get install -y strace
 
       - name: Test
         run: cargo test
@@ -84,6 +95,8 @@ jobs:
   # cross-builds the Intel binary — Apple's toolchain links both.
   release-macos:
     runs-on: macos-latest
+    env:
+      KLASSIC_UNICORN_PYTHON: python
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -92,6 +105,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Setup ARM64 test emulator
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          pip-install: 'unicorn==2.1.4'
 
       - name: Build runtime staticlib
         # cargo test alone doesn't produce libklassic_runtime.a, which
@@ -130,6 +149,8 @@ jobs:
   # staticlib nothing can consume yet.
   release-windows:
     runs-on: windows-latest
+    env:
+      KLASSIC_UNICORN_PYTHON: python
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -138,6 +159,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+
+      - name: Setup ARM64 test emulator
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          pip-install: 'unicorn==2.1.4'
 
       - name: Build runtime staticlib
         # Kept for shape-parity with the other jobs; the C-backend

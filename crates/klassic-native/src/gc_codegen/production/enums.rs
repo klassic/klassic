@@ -1,32 +1,54 @@
 //! M-G3: heap objects that hold references (enum records and lists).
 //!
-//! Heap fields hold payload addresses, as on the legacy path: generic enum
-//! payloads are written and read through untyped (scalar) funnels, so a
-//! field cannot carry reference bits. Evacuation treats a field word as a
-//! reference exactly when it addresses the heap (the legacy range rule),
-//! and rewrites it with the copy's address. RootCells keep reference bits.
-//! This file composes heap-field barriers from `fields.rs`, remembered-set
-//! roots, collection-literal cells and structural equality. Copying is in
-//! `copy.rs`, the scan in `scan.rs`, marking in `mark.rs`.
+//! Heap reference fields hold GcRef bits; raw boxes remain opaque. Field
+//! barriers and typed/raw read selection live in `fields.rs`.
+//! This file wires the field barriers and remembered-set roots, and emits
+//! collection-literal cells and structural equality. Copying is in `copy.rs`,
+//! scanning in `scan.rs`, and marking in `mark.rs`.
 use super::{
-    L, Labels, RT_FORWARD_CELL, RT_LIT_MARK,
-    copy::{DESCRIPTOR, PAYLOAD, forward_target, unless_forwarded},
-    d, decode, encode, load_runtime,
+    L, Labels, RT_FORWARD_CELL, RT_HEAP_BASE, RT_LIT_MARK,
+    copy::{DESCRIPTOR, HEADER, PAYLOAD, forward_target, unless_forwarded},
+    decode, encode, load_rt, load_runtime, store_rt,
 };
 use crate::portable_asm::{Condition as C, PortableAsm, Reg as R};
 
-// Preserve the existing helper paths used by mark, scan and remset.
-pub(super) use super::fields::{heap_offset, young_offset};
-
 const _: () = assert!(L.pages > 0);
+const HEAP_PAGE: u64 = crate::gc_abi::HEAP_PAGE_BYTES;
+/// Lowest heap offset of a Young payload (first page + one header).
+const YOUNG_LOW: i32 = HEAP_PAGE as i32 + HEADER;
+
+/// Jump to `outside` unless `value - heap_base` (left in `scratch`) is a
+/// Young payload offset.
+pub(super) fn young_offset<E: PortableAsm>(a: &mut E, value: R, scratch: R, outside: E::TextLabel) {
+    a.mov_reg_reg(scratch, value);
+    load_rt(a, value, RT_HEAP_BASE);
+    a.sub_reg_reg(scratch, value);
+    a.jcc_label(C::Below, outside);
+    a.cmp_reg_imm32(scratch, YOUNG_LOW);
+    a.jcc_label(C::Below, outside);
+    super::generation::test(a, scratch, super::generation::YOUNG);
+    a.jcc_label(C::NotEqual, outside);
+}
+
+/// Like `young_offset`, for any heap payload offset (Young or Old).
+pub(super) fn heap_offset<E: PortableAsm>(a: &mut E, value: R, scratch: R, outside: E::TextLabel) {
+    a.mov_reg_reg(scratch, value);
+    load_rt(a, value, RT_HEAP_BASE);
+    a.sub_reg_reg(scratch, value);
+    a.jcc_label(C::Below, outside);
+    a.cmp_reg_imm32(scratch, YOUNG_LOW);
+    a.jcc_label(C::Below, outside);
+    a.mov_imm64(value, super::geometry(a).heap_bytes);
+    a.cmp_reg_reg(scratch, value);
+    a.jcc_label(C::AboveOrEqual, outside);
+}
+
 pub(super) fn emit_enums<E: PortableAsm>(
     a: &mut E,
     l: &Labels<E::TextLabel>,
     runtime: E::DataLabel,
 ) {
-    super::fields::emit_field_load(a, l, runtime);
-    super::fields::emit_field_store(a, l, runtime);
-    super::remset::emit_remset_roots(a, l);
+    super::fields::emit(a, l, runtime);
     emit_forward_cell(a, l, runtime);
     emit_deep_equal(a, l, runtime);
 }
@@ -40,29 +62,41 @@ fn emit_forward_cell<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtim
     let empty = a.create_text_label();
     a.bind_text_label(l.forward_cell_entry);
     a.push_reg(R::V3);
+    a.push_reg(R::OwnerContext);
     load_runtime(a, runtime);
     if let Some(w) = &l.worker {
         // Mark start: the cell is a root of the snapshot, not relocated.
         let relocate = a.create_text_label();
-        a.load_ptr_disp32(R::V1, R::V3, d(RT_LIT_MARK));
+        load_rt(a, R::V1, RT_LIT_MARK);
         a.test_reg_reg(R::V1, R::V1);
         a.jcc_label(C::Equal, relocate);
+        if l.raw_roots {
+            let old = a.create_text_label();
+            a.cmp_reg_imm8(R::V1, 2);
+            a.jcc_label(C::NotEqual, old);
+            a.load_ptr_disp32(R::V0, R::V0, 0);
+            heap_offset(a, R::V0, R::V2, empty);
+            a.call_label(w.young.reference);
+            a.jmp_label(empty);
+            a.bind_text_label(old);
+        }
         a.load_ptr_disp32(R::V0, R::V0, 0);
         heap_offset(a, R::V0, R::V2, empty);
         a.call_label(w.mark_ref);
         a.jmp_label(empty);
         a.bind_text_label(relocate);
     }
-    a.store_ptr_disp32(R::V3, d(RT_FORWARD_CELL), R::V0);
+    store_rt(a, RT_FORWARD_CELL, R::V0);
     a.load_ptr_disp32(R::V0, R::V0, 0);
     encode(a, R::V0, R::V1);
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::Equal, empty);
     a.call_label(l.forward);
     decode(a, R::V0, R::V1);
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_FORWARD_CELL));
+    load_rt(a, R::V1, RT_FORWARD_CELL);
     a.store_ptr_disp32(R::V1, 0, R::V0);
     a.bind_text_label(empty);
+    a.pop_reg(R::OwnerContext);
     a.pop_reg(R::V3);
     a.ret();
 }
@@ -93,10 +127,12 @@ fn emit_deep_equal<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime:
         a.load_ptr_disp32(desc, operand, DESCRIPTOR);
         unless_forwarded(a, desc, R::V1, direct);
         a.mov_reg_reg(operand, desc);
-        forward_target(a, operand, R::V1);
         a.push_reg(R::V3);
+        a.push_reg(R::OwnerContext);
         load_runtime(a, runtime);
+        forward_target(a, operand, R::V1);
         decode(a, operand, R::V0);
+        a.pop_reg(R::OwnerContext);
         a.pop_reg(R::V3);
         a.load_ptr_disp32(desc, operand, DESCRIPTOR);
         a.bind_text_label(direct);
@@ -171,6 +207,13 @@ fn emit_deep_equal<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>, runtime:
     a.push_reg(R::V2);
     a.mov_reg_reg(R::V7, R::V0);
     a.mov_reg_reg(R::V6, R::V1);
+    a.push_reg(R::V3);
+    a.push_reg(R::OwnerContext);
+    load_runtime(a, runtime);
+    decode(a, R::V7, R::V0);
+    decode(a, R::V6, R::V0);
+    a.pop_reg(R::OwnerContext);
+    a.pop_reg(R::V3);
     a.call_label(l.deep_equal_body);
     a.pop_reg(R::V2);
     a.pop_reg(R::V8);

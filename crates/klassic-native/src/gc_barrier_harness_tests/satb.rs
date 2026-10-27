@@ -10,12 +10,10 @@ const C: u32 = 2;
 const B_AGAIN: u32 = 3;
 const MAGIC_B: u64 = 0x1b1b;
 
-/// A.f0 = B (B reachable only through A); a mark cycle starts; the mutator
-/// picks B up through A.f0 into a *new* root (created after the snapshot, so
-/// the cycle never scans it); then A.f0 is overwritten with C. `arg` 0 uses
-/// the real `field_store`; 1 is the negative control, a plain store that
-/// skips the SATB pre-barrier. The marker is then drained and a real
-/// collection follows, which counts any live object the mark missed.
+/// A.f0 = B at the snapshot. Read A and C (protecting those roots), but
+/// deliberately never read B through the load barrier before overwriting it.
+/// This isolates deletion SATB from load/root-publication keep-alive. After
+/// observing the snapshot loss, a new strong root rescues B before relocation.
 fn overwrite_while_marking(g: &mut NativeCodeGenerator, arg: u64) {
     let barrier = arg == 0;
     let mut h = H::begin(g);
@@ -30,16 +28,22 @@ fn overwrite_while_marking(g: &mut NativeCodeGenerator, arg: u64) {
     h.report("b_marked_at_start", |h| h.marked(Src::Raw(B)));
     h.report_counter("marked_at_start", Counter::Marked);
     h.report_counter("mark_active", Counter::MarkActive);
-    h.load(Src::Root(A), 0);
-    h.keep(B_AGAIN);
-    h.root(B_AGAIN);
-    h.store(Src::Root(A), 0, Src::Root(C), barrier);
+    h.value(Src::Root(A));
+    h.keep(4);
+    h.value(Src::Root(C));
+    h.keep(5);
+    h.report_counter("marked_before_store", Counter::Marked);
+    h.store(Src::Raw(4), 0, Src::Raw(5), barrier);
     h.report("b_marked_after_store", |h| h.marked(Src::Raw(B)));
     h.report_counter("marked_after_store", Counter::Marked);
     h.drain_marks();
     h.report("b_marked_after_drain", |h| h.marked(Src::Raw(B)));
     h.report("c_marked_after_drain", |h| h.marked(Src::Root(C)));
     h.report("a_marked_after_drain", |h| h.marked(Src::Root(A)));
+    h.value(Src::Raw(B));
+    h.keep(B_AGAIN);
+    h.root(B_AGAIN); // Strong publication must protect a post-snapshot root.
+    h.report("b_rescued", |h| h.marked(Src::Raw(B)));
     h.gc_until(1);
     h.settle();
     h.report_counter("collections", Counter::Collections);
@@ -60,7 +64,7 @@ fn satb_prebarrier_marks_the_overwritten_referent() {
     assert_eq!(o.get("b_marked_after_store"), 1);
     assert_eq!(
         o.get("marked_after_store"),
-        o.get("marked_at_start") + 1,
+        o.get("marked_before_store") + 1,
         "the SATB mark is counted exactly once: {}",
         o.text()
     );
@@ -75,23 +79,22 @@ fn satb_prebarrier_marks_the_overwritten_referent() {
 }
 
 #[test]
-fn without_the_prebarrier_the_same_overwrite_loses_the_object() {
-    // Negative control: identical program, but the store bypasses
-    // `field_store`. B is live (a post-snapshot root holds it) yet the mark
-    // never reaches it, and the relocation pause counts the violation.
+fn without_the_prebarrier_an_unread_snapshot_edge_is_lost() {
+    // Negative control: deletion bypasses SATB, so the unread snapshot
+    // referent is missed. A later strong-root publication rescues it.
     let o = run(overwrite_while_marking, 1, false);
     assert_eq!(o.get("b_marked_at_start"), 0);
     assert_eq!(o.get("b_marked_after_store"), 0, "{}", o.text());
-    assert_eq!(o.get("marked_after_store"), o.get("marked_at_start"));
+    assert_eq!(o.get("marked_after_store"), o.get("marked_before_store"));
     assert_eq!(o.get("b_marked_after_drain"), 0, "{}", o.text());
     assert_eq!(o.get("c_marked_after_drain"), 1);
     assert!(o.get("collections") >= 1);
-    assert!(
-        o.get("unmarked_copied") >= 1,
-        "a live, unmarked object must be reported: {}",
-        o.text()
+    assert_eq!(o.get("b_rescued"), 1);
+    assert_eq!(
+        o.get("unmarked_copied"),
+        0,
+        "new strong roots protect before publication"
     );
-    // Copying is reachability-driven, so the data itself still survives.
     assert_eq!(o.get("b_magic_after_gc"), MAGIC_B as i64);
 }
 
@@ -111,6 +114,9 @@ fn overwrites_that_do_not_mark(g: &mut NativeCodeGenerator, _arg: u64) {
     h.report("b_marked_without_cycle", |h| h.marked(Src::Raw(B)));
     h.report_counter("marked_without_cycle", Counter::Marked);
     h.mark_start();
+    // Root discovery is asynchronous now. Finish it so C is already marked
+    // and this fixture isolates null/scalar stores rather than root discovery.
+    h.drain_marks();
     h.report_counter("marked_at_start", Counter::Marked);
     // Previous value null: nothing to mark.
     h.store(Src::Root(A), 0, Src::Null, true);

@@ -2021,13 +2021,56 @@ fn c_driver_supervision_drains_stdout_and_stderr_before_exit() {
     );
 }
 
+// The complete C suite reached graph round 52/64 at 39.874s on CI while
+// still advancing. Budget the whole suite, including later fixtures, rather
+// than treating its former 40s cumulative alarm as a stalled-loop diagnosis.
+const C_DRIVER_TIMEOUT_SECS: u64 = 120;
+const DRIVER_SUPERVISION_GRACE_SECS: u64 = 5;
+
+#[test]
+fn c_driver_supervision_terminates_stalled_child_and_preserves_output() {
+    use std::io::Write;
+    const CHILD: &str = "KLASSIC_DEADLINE_REGRESSION_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        println!("stalled stdout marker");
+        eprintln!("stalled stderr marker");
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    let started = std::time::Instant::now();
+    let failure = std::panic::catch_unwind(|| {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "gc_atomic_tests::c_driver_supervision_terminates_stalled_child_and_preserves_output",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+        run_command_with_deadline(command, std::time::Duration::from_secs(1))
+    })
+    .expect_err("a stalled child must fail within its configured deadline");
+    let diagnostic = failure.downcast_ref::<String>().unwrap();
+    assert!(diagnostic.contains("conformance driver timed out after 1s"));
+    assert!(diagnostic.contains("stalled stdout marker"));
+    assert!(diagnostic.contains("stalled stderr marker"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
 /// External C driver shared by native instruction and OS-adapter tests.
 pub(super) fn run_c_driver(header_name: &str, header: &str, harness: &str) -> String {
     use std::process::Command;
     struct Scratch(std::path::PathBuf);
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            if std::thread::panicking() {
+                eprintln!("failed conformance driver retained: {}", self.0.display());
+            } else {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
     }
     let scratch = Scratch(std::env::temp_dir().join(format!(
@@ -2040,6 +2083,12 @@ pub(super) fn run_c_driver(header_name: &str, header: &str, harness: &str) -> St
         )));
     std::fs::create_dir(&scratch.0).unwrap();
     std::fs::write(scratch.0.join(header_name), header).unwrap();
+    // Keep the exact budget beside the generated instructions for replay.
+    std::fs::write(
+        scratch.0.join("conformance_budget.h"),
+        format!("#define KLASSIC_CONFORMANCE_TIMEOUT_SECONDS {C_DRIVER_TIMEOUT_SECS}\n"),
+    )
+    .unwrap();
     let cc = std::env::var("KLASSIC_CLANG").unwrap_or_else(|_| {
         ["clang-15", "clang", "cc"]
             .into_iter()
@@ -2084,6 +2133,10 @@ pub(super) fn run_c_driver(header_name: &str, header: &str, harness: &str) -> St
         String::from_utf8_lossy(&output.stderr)
     );
     let output = run_with_deadline(&executable);
+    if !output.status.success() {
+        std::fs::write(scratch.0.join("stdout.log"), &output.stdout).unwrap();
+        std::fs::write(scratch.0.join("stderr.log"), &output.stderr).unwrap();
+    }
     assert!(
         output.status.success(),
         "emitted-code conformance {:?}: stdout:\n{}\nstderr:\n{}",
@@ -2095,9 +2148,18 @@ pub(super) fn run_c_driver(header_name: &str, header: &str, harness: &str) -> St
 }
 
 pub(super) fn run_with_deadline(executable: &std::path::Path) -> std::process::Output {
+    run_command_with_deadline(
+        std::process::Command::new(executable),
+        std::time::Duration::from_secs(C_DRIVER_TIMEOUT_SECS + DRIVER_SUPERVISION_GRACE_SECS),
+    )
+}
+
+fn run_command_with_deadline(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::process::Output {
     use std::io::Read;
-    use std::process::Command;
-    let mut child = Command::new(executable)
+    let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -2117,7 +2179,7 @@ pub(super) fn run_with_deadline(executable: &std::path::Path) -> std::process::O
         stderr.read_to_end(&mut bytes).unwrap();
         bytes
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let deadline = std::time::Instant::now() + timeout;
     let mut timed_out = false;
     while child.try_wait().unwrap().is_none() {
         if std::time::Instant::now() >= deadline {
@@ -2135,7 +2197,7 @@ pub(super) fn run_with_deadline(executable: &std::path::Path) -> std::process::O
     };
     assert!(
         !timed_out,
-        "conformance driver timed out: stdout:\n{}\nstderr:\n{}",
+        "conformance driver timed out after {timeout:?}: stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

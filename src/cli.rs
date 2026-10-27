@@ -1,3 +1,7 @@
+#[path = "gc_duration.rs"]
+mod gc_duration;
+#[path = "gc_heap.rs"]
+mod gc_heap;
 use std::path::PathBuf;
 
 use klassic_native::{NativeTarget, PlannedTarget, TargetRecognition};
@@ -22,6 +26,7 @@ pub struct ExecutionConfig {
     /// `--gc-log`: emitted programs print GC statistics to stderr at
     /// exit.
     pub gc_log: bool,
+    pub gc_log_format: Option<klassic_native::GcLogFormat>,
     /// `--gc-stress`: emitted `gc_alloc` collects before every
     /// allocation (deterministic detector for pointers left unrooted
     /// across an allocation).
@@ -30,12 +35,16 @@ pub struct ExecutionConfig {
     /// unbarriered dereference faults on a non-canonical address and the
     /// load-barrier slow path runs on every load.
     pub gc_poison: bool,
-    /// `--gc=generational`: the direct x86-64 ELF backend routes heap
-    /// strings through the generational GC ABI (M-G1 integration
-    /// scaffold: offset references, RootCells, TLAB allocation, no
-    /// collection). `--gc=legacy` (the default) keeps the existing
-    /// collector.
+    /// Select the generational direct native collector; legacy remains default.
     pub gc_generational: bool,
+    pub gc_max_heap: Option<u64>,
+    pub gc_soft_max_heap: Option<u64>,
+    pub gc_max_metadata: Option<u64>,
+    /// Initial accessible payload and lower limit for page uncommit.
+    pub gc_min_heap: Option<u64>,
+    pub gc_uncommit_delay_ns: Option<u64>,
+    pub gc_pre_touch: bool,
+    pub gc_large_pages: Option<klassic_native::GcLargePages>,
 }
 
 impl ExecutionConfig {
@@ -48,9 +57,17 @@ impl ExecutionConfig {
             llvm_backend: false,
             explicit_target: false,
             gc_log: false,
+            gc_log_format: None,
             gc_stress: false,
             gc_poison: false,
             gc_generational: false,
+            gc_max_heap: None,
+            gc_soft_max_heap: None,
+            gc_max_metadata: None,
+            gc_min_heap: None,
+            gc_uncommit_delay_ns: None,
+            gc_pre_touch: false,
+            gc_large_pages: None,
         }
     }
 }
@@ -97,6 +114,7 @@ pub enum CommandLineError {
     /// `--gc=<mode>` named something other than `legacy` or
     /// `generational`.
     UnknownGcMode(String),
+    InvalidGcHeap(String),
 }
 
 pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineError> {
@@ -107,9 +125,17 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     let mut native_target = NativeTarget::default();
     let mut explicit_target = false;
     let mut gc_log = false;
+    let mut gc_log_format = None;
     let mut gc_stress = false;
     let mut gc_poison = false;
     let mut gc_generational = false;
+    let mut gc_max_heap = None;
+    let mut gc_soft_max_heap = None;
+    let mut gc_max_metadata = None;
+    let mut gc_min_heap = None;
+    let mut gc_uncommit_delay_ns = None;
+    let mut gc_pre_touch = false;
+    let mut gc_large_pages = None;
     let mut others = Vec::new();
     let mut script_args = Vec::new();
     let mut seen_separator = false;
@@ -134,6 +160,25 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
                 warn_trust = true;
                 index += 1;
             }
+            "--gc-log-format" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    CommandLineError::InvalidGcHeap("missing --gc-log-format value".into())
+                })?;
+                gc_log_format = Some(
+                    value
+                        .parse()
+                        .map_err(|e: &str| CommandLineError::InvalidGcHeap(e.into()))?,
+                );
+                index += 2;
+            }
+            value if value.starts_with("--gc-log-format=") => {
+                gc_log_format = Some(
+                    value["--gc-log-format=".len()..]
+                        .parse()
+                        .map_err(|e: &str| CommandLineError::InvalidGcHeap(e.into()))?,
+                );
+                index += 1;
+            }
             "--gc-log" => {
                 gc_log = true;
                 index += 1;
@@ -152,6 +197,103 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
                     "generational" => gc_generational = true,
                     other => return Err(CommandLineError::UnknownGcMode(other.to_owned())),
                 }
+                index += 1;
+            }
+            "--gc-large-pages" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    CommandLineError::InvalidGcHeap("missing --gc-large-pages value".into())
+                })?;
+                gc_large_pages = Some(
+                    value
+                        .parse()
+                        .map_err(|e: &str| CommandLineError::InvalidGcHeap(e.into()))?,
+                );
+                index += 2;
+            }
+            value if value.starts_with("--gc-large-pages=") => {
+                gc_large_pages = Some(
+                    value["--gc-large-pages=".len()..]
+                        .parse()
+                        .map_err(|e: &str| CommandLineError::InvalidGcHeap(e.into()))?,
+                );
+                index += 1;
+            }
+            "--gc-pre-touch" => {
+                gc_pre_touch = true;
+                index += 1;
+            }
+            "--gc-uncommit-delay" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    CommandLineError::InvalidGcHeap("missing --gc-uncommit-delay value".into())
+                })?;
+                gc_uncommit_delay_ns =
+                    Some(gc_duration::parse(value).map_err(CommandLineError::InvalidGcHeap)?);
+                index += 2;
+            }
+            value if value.starts_with("--gc-uncommit-delay=") => {
+                gc_uncommit_delay_ns = Some(
+                    gc_duration::parse(&value["--gc-uncommit-delay=".len()..])
+                        .map_err(CommandLineError::InvalidGcHeap)?,
+                );
+                index += 1;
+            }
+            "--gc-min-heap" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    CommandLineError::InvalidGcHeap("missing --gc-min-heap value".into())
+                })?;
+                gc_min_heap =
+                    Some(gc_heap::parse_min(value).map_err(CommandLineError::InvalidGcHeap)?);
+                index += 2;
+            }
+            value if value.starts_with("--gc-min-heap=") => {
+                gc_min_heap = Some(
+                    gc_heap::parse_min(&value["--gc-min-heap=".len()..])
+                        .map_err(CommandLineError::InvalidGcHeap)?,
+                );
+                index += 1;
+            }
+            "--gc-soft-max-heap" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    CommandLineError::InvalidGcHeap("missing --gc-soft-max-heap value".into())
+                })?;
+                gc_soft_max_heap =
+                    Some(gc_heap::parse_soft(value).map_err(CommandLineError::InvalidGcHeap)?);
+                index += 2;
+            }
+            value if value.starts_with("--gc-soft-max-heap=") => {
+                gc_soft_max_heap = Some(
+                    gc_heap::parse_soft(&value["--gc-soft-max-heap=".len()..])
+                        .map_err(CommandLineError::InvalidGcHeap)?,
+                );
+                index += 1;
+            }
+            "--gc-max-metadata" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    CommandLineError::InvalidGcHeap("missing --gc-max-metadata value".into())
+                })?;
+                gc_max_metadata =
+                    Some(gc_heap::parse_metadata(value).map_err(CommandLineError::InvalidGcHeap)?);
+                index += 2;
+            }
+            value if value.starts_with("--gc-max-metadata=") => {
+                gc_max_metadata = Some(
+                    gc_heap::parse_metadata(&value["--gc-max-metadata=".len()..])
+                        .map_err(CommandLineError::InvalidGcHeap)?,
+                );
+                index += 1;
+            }
+            "--gc-max-heap" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    CommandLineError::InvalidGcHeap("missing --gc-max-heap value".into())
+                })?;
+                gc_max_heap = Some(gc_heap::parse(value).map_err(CommandLineError::InvalidGcHeap)?);
+                index += 2;
+            }
+            value if value.starts_with("--gc-max-heap=") => {
+                gc_max_heap = Some(
+                    gc_heap::parse(&value["--gc-max-heap=".len()..])
+                        .map_err(CommandLineError::InvalidGcHeap)?,
+                );
                 index += 1;
             }
             "--backend" => {
@@ -195,10 +337,18 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
     config.c_backend = c_backend;
     config.llvm_backend = llvm_backend;
     config.explicit_target = explicit_target;
-    config.gc_log = gc_log;
+    config.gc_log = gc_log || gc_log_format.is_some();
+    config.gc_log_format = gc_log_format;
     config.gc_stress = gc_stress;
     config.gc_poison = gc_poison;
     config.gc_generational = gc_generational;
+    config.gc_max_heap = gc_max_heap;
+    config.gc_soft_max_heap = gc_soft_max_heap;
+    config.gc_max_metadata = gc_max_metadata;
+    config.gc_min_heap = gc_min_heap;
+    config.gc_uncommit_delay_ns = gc_uncommit_delay_ns;
+    config.gc_pre_touch = gc_pre_touch;
+    config.gc_large_pages = gc_large_pages;
     let action = match others.as_slice() {
         [command] if command == "targets" => RunAction::ListTargets,
         [flag] if flag == "--version" || flag == "-V" => RunAction::ShowVersion,
@@ -220,6 +370,56 @@ pub fn parse_command_line(args: &[String]) -> Result<ParsedCommand, CommandLineE
         _ => return Err(CommandLineError::Usage),
     };
 
+    if gc_log_format.is_some()
+        && (!gc_generational
+            || c_backend
+            || llvm_backend
+            || !matches!(action, RunAction::BuildFile { .. }))
+    {
+        return Err(CommandLineError::InvalidGcHeap(
+            "--gc-log-format requires a --gc=generational native build".into(),
+        ));
+    }
+    if (gc_soft_max_heap.is_some()
+        || gc_max_heap.is_some()
+        || gc_max_metadata.is_some()
+        || gc_min_heap.is_some()
+        || gc_uncommit_delay_ns.is_some()
+        || gc_pre_touch
+        || gc_large_pages.is_some())
+        && (!gc_generational
+            || !matches!(action, RunAction::BuildFile { .. })
+            || ((c_backend || llvm_backend)
+                && (gc_max_metadata.is_some() || gc_pre_touch || gc_large_pages.is_some())))
+    {
+        return Err(CommandLineError::InvalidGcHeap(
+            if gc_max_metadata.is_some() {
+                "heap/metadata/uncommit settings require a --gc=generational native build"
+            } else {
+                "heap/uncommit/pre-touch/large-page settings require a --gc=generational native build"
+            }
+            .into(),
+        ));
+    }
+    if gc_soft_max_heap.is_some() || gc_max_heap.is_some() || gc_min_heap.is_some() {
+        klassic_native::validate_gc_soft_heap_limits(
+            gc_min_heap.unwrap_or(klassic_native::DEFAULT_GC_MIN_HEAP),
+            gc_soft_max_heap
+                .or(gc_max_heap)
+                .unwrap_or(klassic_native::DEFAULT_GC_MAX_HEAP),
+            gc_max_heap.unwrap_or(klassic_native::DEFAULT_GC_MAX_HEAP),
+        )
+        .map_err(|e| CommandLineError::InvalidGcHeap(e.into()))?;
+    }
+    if let Some(mode) = gc_large_pages {
+        klassic_native::validate_gc_large_pages(
+            mode,
+            native_target,
+            gc_min_heap.unwrap_or(klassic_native::DEFAULT_GC_MIN_HEAP),
+            gc_max_heap.unwrap_or(klassic_native::DEFAULT_GC_MAX_HEAP),
+        )
+        .map_err(|e| CommandLineError::InvalidGcHeap(e.into()))?;
+    }
     Ok(ParsedCommand {
         action,
         config,
@@ -236,10 +436,17 @@ pub fn usage() -> String {
        --deny-trust       : reject programs that depend on trusted proofs\n\
        --warn-trust       : warn when trusted proofs are used\n\
        --target <target>  : native build target (supported: {})\n\
-       --backend c        : `build` emits a portable C translation unit instead of an ELF executable\n\
+       --backend c        : C backend; a .c output writes source, otherwise compile and link\n\
        --backend llvm     : `build` emits LLVM IR and compiles it with clang (>= 15); an .ll output writes the IR\n\
        --gc=<mode>        : `build` collector: legacy (default) or generational \
-(Linux x86-64 only; M-G1 scaffold that never collects)\n\
+(direct native; canonical C/LLVM on Linux x86-64)\n\
+       --gc-large-pages=off|try|required: Linux THP policy (default off)\n\
+       --gc-pre-touch: write each OS page when payload memory is committed\n\
+       --gc-uncommit-delay <duration>: free-page delay (default 300s; ns/us/ms/s/m; plain seconds)\n\
+       --gc-min-heap <size>: initial accessible payload and uncommit floor (default 16 MiB)\n\
+       --gc-soft-max-heap <size>: advisory payload target (default hard maximum)\n\
+       --gc-max-metadata <size>: direct metadata budget (default geometry bound; canonical C/LLVM fixes 256 MiB and rejects overrides)\n\
+       --gc-max-heap <size>: generational payload limit (default 256 MiB; KiB/MiB/GiB)\n\
        <fileName>         : read a program from <fileName> and execute it\n\
        run <fileName>     : same as <fileName>; pairs naturally with `-- <args>`\n\
        -e <expression>    : evaluate <expression>\n\
@@ -281,6 +488,7 @@ pub fn render_command_line_error(error: &CommandLineError) -> String {
             "error: unknown target '{}'\n  help: run `klassic targets` to list known targets\n",
             argument
         ),
+        CommandLineError::InvalidGcHeap(message) => format!("error: {message}\n"),
         CommandLineError::UnknownGcMode(argument) => format!(
             "error: unknown --gc mode '{argument}'\n  help: supported modes: legacy, generational\n"
         ),
@@ -580,9 +788,480 @@ mod tests {
     }
 
     #[test]
+    fn large_pages_parse_modes_and_reject_unsupported_scope_target_and_alignment() {
+        for args in [
+            vec!["--gc-large-pages", "try"],
+            vec!["--gc-large-pages=try"],
+        ] {
+            let mut a = vec!["--gc=generational"];
+            a.extend(args);
+            a.extend(["build", "x.kl", "-o", "x"]);
+            let c = parse_command_line(&a.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                .unwrap()
+                .config;
+            assert_eq!(c.gc_large_pages, Some(klassic_native::GcLargePages::Try));
+        }
+        for args in [
+            vec!["--gc-large-pages=off", "build", "x.kl", "-o", "x"],
+            vec!["--gc=generational", "--gc-large-pages=try", "-e", "1"],
+            vec![
+                "--gc=generational",
+                "--gc-large-pages=try",
+                "--backend",
+                "c",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-large-pages=try",
+                "--backend",
+                "llvm",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-large-pages=required",
+                "--gc-min-heap=128KiB",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-large-pages=required",
+                "--target",
+                "aarch64-apple-darwin",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-large-pages=try",
+                "--target",
+                "x86_64-pc-windows-msvc",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-large-pages=bad",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec!["--gc=generational", "--gc-large-pages"],
+        ] {
+            assert!(
+                parse_command_line(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
+        let a = [
+            "--gc=generational",
+            "--gc-large-pages=required",
+            "--gc-min-heap=4MiB",
+            "--gc-max-heap=64MiB",
+            "build",
+            "x.kl",
+            "-o",
+            "x",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            parse_command_line(&a).unwrap().config.gc_large_pages,
+            Some(klassic_native::GcLargePages::Required)
+        );
+    }
+
+    #[test]
+    fn pre_touch_requires_a_generational_direct_native_build_and_stays_opt_in() {
+        let build = ["--gc=generational", "build", "x.kl", "-o", "x"];
+        assert!(
+            !parse_command_line(&build.map(str::to_owned))
+                .unwrap()
+                .config
+                .gc_pre_touch
+        );
+        let mut enabled = build.to_vec();
+        enabled.insert(0, "--gc-pre-touch");
+        assert!(
+            parse_command_line(&enabled.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                .unwrap()
+                .config
+                .gc_pre_touch
+        );
+        for args in [
+            vec!["--gc-pre-touch", "build", "x.kl", "-o", "x"],
+            vec!["--gc=generational", "--gc-pre-touch", "-e", "1"],
+            vec![
+                "--gc=generational",
+                "--gc-pre-touch",
+                "--backend",
+                "c",
+                "build",
+                "x.kl",
+                "-o",
+                "x.c",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-pre-touch",
+                "--backend",
+                "llvm",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-pre-touch=false",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+        ] {
+            assert!(
+                parse_command_line(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn soft_heap_target_accepts_both_spellings_and_validates_order_and_scope() {
+        for option in [
+            vec!["--gc-soft-max-heap", "32MiB"],
+            vec!["--gc-soft-max-heap=32MiB"],
+        ] {
+            let mut args = vec![
+                "--gc=generational",
+                "--gc-min-heap=4MiB",
+                "--gc-max-heap=64MiB",
+            ];
+            args.extend(option);
+            args.extend(["build", "x.kl", "-o", "x"]);
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let config = parse_command_line(&args).unwrap().config;
+            assert_eq!(config.gc_soft_max_heap, Some(32 << 20));
+            assert_eq!(config.gc_max_heap, Some(64 << 20));
+        }
+        for options in [
+            vec!["--gc=generational", "--gc-soft-max-heap"],
+            vec!["--gc=generational", "--gc-soft-max-heap=0"],
+            vec!["--gc=generational", "--gc-soft-max-heap=16777217"],
+            vec!["--gc=generational", "--gc-soft-max-heap=8MiB"],
+            vec!["--gc=generational", "--gc-soft-max-heap=512MiB"],
+            vec![
+                "--gc=generational",
+                "--gc-soft-max-heap=18446744073709551615GiB",
+            ],
+            vec!["--gc-soft-max-heap=32MiB"],
+        ] {
+            let mut args = options.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            // Missing value must remain last so it is diagnosed directly.
+            if args.last().unwrap() != "--gc-soft-max-heap" {
+                args.extend(["build", "x.kl", "-o", "x"].map(str::to_owned));
+            }
+            assert!(parse_command_line(&args).is_err(), "{args:?}");
+        }
+        for backend in ["c", "llvm"] {
+            let args = [
+                "--gc=generational",
+                "--gc-soft-max-heap=32MiB",
+                "--backend",
+                backend,
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ]
+            .map(str::to_owned);
+            assert_eq!(
+                parse_command_line(&args).unwrap().config.gc_soft_max_heap,
+                Some(32 << 20)
+            );
+        }
+        let args = ["--gc=generational", "--gc-soft-max-heap=32MiB", "-e", "1"].map(str::to_owned);
+        assert!(parse_command_line(&args).is_err());
+    }
+
+    #[test]
+    fn metadata_budget_accepts_both_spellings_and_is_independent_of_payload() {
+        for option in [
+            vec!["--gc-max-metadata", "4GiB"],
+            vec!["--gc-max-metadata=4GiB"],
+        ] {
+            let args: Vec<String> = [
+                vec!["--gc=generational", "--gc-max-heap=16MiB"],
+                option,
+                vec!["build", "x.kl", "-o", "x"],
+            ]
+            .concat()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            let c = parse_command_line(&args).unwrap().config;
+            assert_eq!(c.gc_max_metadata, Some(4 << 30));
+            assert_eq!(c.gc_max_heap, Some(16 << 20));
+        }
+        assert_eq!(
+            super::ExecutionConfig::new(false, false, NativeTarget::LinuxX86_64).gc_max_metadata,
+            None
+        );
+    }
+
+    #[test]
+    fn metadata_budget_rejects_invalid_values_and_unsupported_execution_modes() {
+        for args in [
+            vec!["--gc=generational", "--gc-max-metadata"],
+            vec![
+                "--gc=generational",
+                "--gc-max-metadata=0",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-max-metadata=4097",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-max-metadata=9223372036854775808",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec!["--gc-max-metadata=4MiB", "build", "x.kl", "-o", "x"],
+            vec!["--gc=generational", "--gc-max-metadata=4MiB", "-e", "1"],
+            vec![
+                "--gc=generational",
+                "--gc-max-metadata=4MiB",
+                "--backend",
+                "c",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-max-metadata=4MiB",
+                "--backend",
+                "llvm",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert!(parse_command_line(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn expression_invocation_without_separator_has_no_script_args() {
         let args = vec!["-e".to_string(), "1 + 2".to_string()];
         let parsed = parse_command_line(&args).expect("expression invocation should parse");
         assert!(parsed.script_args.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod heap_tests {
+    use super::*;
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).into()).collect()
+    }
+    #[test]
+    fn minimum_heap_requires_native_generation_and_orders_effective_limits() {
+        let a = args(&[
+            "--gc=generational",
+            "--gc-max-heap=16MiB",
+            "--gc-min-heap=128KiB",
+            "build",
+            "input.kl",
+            "-o",
+            "output",
+        ]);
+        assert_eq!(
+            parse_command_line(&a).unwrap().config.gc_min_heap,
+            Some(128 << 10)
+        );
+        for flags in [
+            vec!["--gc-min-heap=4MiB"],
+            vec![
+                "--gc=generational",
+                "--gc-min-heap=32MiB",
+                "--gc-max-heap=16MiB",
+            ],
+        ] {
+            let mut a = args(&flags);
+            a.extend(args(&["build", "input.kl", "-o", "output"]));
+            assert!(matches!(
+                parse_command_line(&a),
+                Err(CommandLineError::InvalidGcHeap(_))
+            ));
+        }
+    }
+    #[test]
+    fn maximum_heap_requires_a_generational_native_build_and_accepts_both_forms() {
+        for flags in [
+            ["--gc-max-heap", "16MiB"].as_slice(),
+            ["--gc-max-heap=16MiB"].as_slice(),
+        ] {
+            let mut a = vec!["--gc=generational".to_owned()];
+            a.extend(args(flags));
+            a.extend(args(&["build", "input.kl", "-o", "output"]));
+            assert_eq!(
+                parse_command_line(&a).unwrap().config.gc_max_heap,
+                Some(16 << 20)
+            );
+        }
+        for values in [
+            vec![
+                "--gc-max-heap",
+                "16MiB",
+                "build",
+                "input.kl",
+                "-o",
+                "output",
+            ],
+            vec!["--gc=generational", "--gc-max-heap=16MiB", "-e", "1"],
+            vec!["--gc=generational", "--gc-max-heap"],
+        ] {
+            assert!(matches!(
+                parse_command_line(&args(&values)),
+                Err(CommandLineError::InvalidGcHeap(_))
+            ));
+        }
+    }
+    #[test]
+    fn uncommit_delay_requires_generational_native_build_and_accepts_both_forms() {
+        for flag in [
+            vec!["--gc-uncommit-delay", "2ms"],
+            vec!["--gc-uncommit-delay=2ms"],
+        ] {
+            let mut a = vec!["--gc=generational".to_owned()];
+            a.extend(flag.into_iter().map(str::to_owned));
+            a.extend(["build", "x.kl", "-o", "x"].map(str::to_owned));
+            assert_eq!(
+                parse_command_line(&a).unwrap().config.gc_uncommit_delay_ns,
+                Some(2_000_000)
+            );
+        }
+        for backend in ["c", "llvm"] {
+            let args = [
+                "--gc=generational",
+                "--backend",
+                backend,
+                "--gc-uncommit-delay=1s",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ]
+            .map(str::to_owned);
+            assert_eq!(
+                parse_command_line(&args)
+                    .unwrap()
+                    .config
+                    .gc_uncommit_delay_ns,
+                Some(1000000000)
+            );
+        }
+        for a in [
+            vec!["--gc-uncommit-delay=1s", "build", "x.kl", "-o", "x"],
+            vec!["--gc=generational", "--gc-uncommit-delay=1s", "-e", "1"],
+            vec!["--gc=generational", "--gc-uncommit-delay"],
+            vec![
+                "--gc=generational",
+                "--gc-uncommit-delay=18446744074s",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+        ] {
+            assert!(
+                parse_command_line(&a.into_iter().map(str::to_owned).collect::<Vec<_>>()).is_err()
+            );
+        }
+    }
+    #[test]
+    fn log_format_parses_and_enables_logging_but_rejects_unsupported_scope() {
+        for mode in ["text", "json"] {
+            for flag in [
+                vec![format!("--gc-log-format={mode}")],
+                vec!["--gc-log-format".into(), mode.into()],
+            ] {
+                let mut args = vec!["--gc=generational".to_owned()];
+                args.extend(flag);
+                args.extend(["build", "x.kl", "-o", "x"].map(str::to_owned));
+                let c = parse_command_line(&args).unwrap().config;
+                assert!(c.gc_log);
+                assert_eq!(c.gc_log_format, Some(mode.parse().unwrap()));
+            }
+        }
+        for args in [
+            vec!["--gc-log-format"],
+            vec![
+                "--gc=generational",
+                "--gc-log-format=yaml",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec!["--gc-log-format=text", "build", "x.kl", "-o", "x"],
+            vec![
+                "--gc=generational",
+                "--gc-log-format=json",
+                "--backend",
+                "c",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec![
+                "--gc=generational",
+                "--gc-log-format=json",
+                "--backend",
+                "llvm",
+                "build",
+                "x.kl",
+                "-o",
+                "x",
+            ],
+            vec!["--gc=generational", "--gc-log-format=json", "-e", "1"],
+            vec!["--gc=generational", "--gc-log-format=json"],
+        ] {
+            assert!(
+                parse_command_line(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
     }
 }

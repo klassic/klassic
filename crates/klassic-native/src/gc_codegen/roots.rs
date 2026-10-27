@@ -18,20 +18,30 @@ fn acquire<E: PortableAsm>(a: &mut E, dst: R, base: R, offset: usize) {
 /// `(V7=ctx, V6=request, V2=op) -> OK/INVALID/FULL/FLUSH/EXHAUSTED 0..4`.
 #[allow(dead_code)]
 pub(crate) fn emit_step<E: PortableAsm>(a: &mut E) {
-    emit_step_impl(a, false, false);
+    emit_step_impl(a, false, false, None);
 }
 /// Internal finite handoff after the caller validates a live source scope.
 pub(crate) fn emit_guarded_store<E: PortableAsm>(a: &mut E) {
     a.mov_imm64(R::V2, 1);
-    emit_step_impl(a, true, false);
+    emit_step_impl(a, true, false, None);
 }
 /// Cancel only a null owner root; keep scan bounds, journals and generations.
 #[allow(dead_code)]
 pub(crate) fn emit_cancel_empty<E: PortableAsm>(a: &mut E) {
     a.mov_imm64(R::V2, 3);
-    emit_step_impl(a, false, true);
+    emit_step_impl(a, false, true, None);
 }
-fn emit_step_impl<E: PortableAsm>(a: &mut E, guarded_store: bool, cancel_empty: bool) {
+/// Production-only credit immediately before a successful journal release.
+/// The hook must preserve all registers and may not poll or allocate.
+pub(crate) fn emit_step_tracked<E: PortableAsm>(a: &mut E, publish: &mut dyn FnMut(&mut E)) {
+    emit_step_impl(a, false, false, Some(publish));
+}
+fn emit_step_impl<E: PortableAsm>(
+    a: &mut E,
+    guarded_store: bool,
+    cancel_empty: bool,
+    publish: Option<&mut dyn FnMut(&mut E)>,
+) {
     let invalid = a.create_text_label();
     let full = a.create_text_label();
     let flush = a.create_text_label();
@@ -226,6 +236,9 @@ fn emit_step_impl<E: PortableAsm>(a: &mut E, guarded_store: bool, cancel_empty: 
     a.store_ptr_disp32(R::V11, offset_of!(B, top) as i32, R::V10);
     a.mov_reg_reg(R::V0, R::V11);
     a.add_reg_imm32(R::V0, offset_of!(B, published) as i32);
+    if let Some(publish) = publish {
+        publish(a);
+    }
     a.atomic_store_release(R::V0, R::V10);
     a.atomic_store_release(R::V9, R::V1);
     a.cmp_reg_imm32(R::V2, 2);

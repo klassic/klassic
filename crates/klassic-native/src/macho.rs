@@ -14,6 +14,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImportSymbol {
     ClockGettime,
+    Nanosleep,
+    Error,
     Mmap,
     Munmap,
     Mprotect,
@@ -24,6 +26,7 @@ pub(crate) enum ImportSymbol {
     PthreadKeyDelete,
     PthreadSetSpecific,
     PthreadGetSpecific,
+    PthreadSelf,
     PthreadMutexInit,
     PthreadMutexDestroy,
     PthreadMutexLock,
@@ -31,6 +34,7 @@ pub(crate) enum ImportSymbol {
     PthreadCondInit,
     PthreadCondDestroy,
     PthreadCondWait,
+    PthreadCondTimedWaitRelative,
     PthreadCondSignal,
 }
 
@@ -38,6 +42,8 @@ impl ImportSymbol {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::ClockGettime => "_clock_gettime",
+            Self::Nanosleep => "_nanosleep",
+            Self::Error => "___error",
             Self::Mmap => "_mmap",
             Self::Munmap => "_munmap",
             Self::Mprotect => "_mprotect",
@@ -48,6 +54,7 @@ impl ImportSymbol {
             Self::PthreadKeyDelete => "_pthread_key_delete",
             Self::PthreadSetSpecific => "_pthread_setspecific",
             Self::PthreadGetSpecific => "_pthread_getspecific",
+            Self::PthreadSelf => "_pthread_self",
             Self::PthreadMutexInit => "_pthread_mutex_init",
             Self::PthreadMutexDestroy => "_pthread_mutex_destroy",
             Self::PthreadMutexLock => "_pthread_mutex_lock",
@@ -55,6 +62,7 @@ impl ImportSymbol {
             Self::PthreadCondInit => "_pthread_cond_init",
             Self::PthreadCondDestroy => "_pthread_cond_destroy",
             Self::PthreadCondWait => "_pthread_cond_wait",
+            Self::PthreadCondTimedWaitRelative => "_pthread_cond_timedwait_relative_np",
             Self::PthreadCondSignal => "_pthread_cond_signal",
         }
     }

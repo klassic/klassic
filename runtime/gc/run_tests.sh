@@ -19,13 +19,17 @@ failed=0
 run_case() {
   local label="$1"
   shift
-  if ASAN_OPTIONS=detect_leaks=0 "${runner[@]}" "$@" >"$tmp/result.log" 2>&1; then
-    cat "$tmp/result.log"
+  # Keep buffered suite markers separate from unbuffered worker diagnostics.
+  # Sharing one file lets stderr split a stdout line at a stdio buffer boundary.
+  if ASAN_OPTIONS=detect_leaks=0 "${runner[@]}" "$@" >"$tmp/result.stdout" 2>"$tmp/result.stderr"; then
+    cat "$tmp/result.stdout"
+    cat "$tmp/result.stderr" >&2
     echo "PASS $label"
     passed=$((passed + 1))
   else
     local status=$?
-    cat "$tmp/result.log" >&2
+    cat "$tmp/result.stdout" >&2
+    cat "$tmp/result.stderr" >&2
     echo "FAIL $label (exit $status; sanitizer startup failure is not a pass)" >&2
     failed=$((failed + 1))
   fi

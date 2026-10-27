@@ -1,4 +1,8 @@
 pub mod gc_abi;
+mod gc_log_format;
+pub use gc_log_format::GcLogFormat;
+mod gc_large_pages;
+pub use gc_large_pages::{GcLargePages, validate_gc_large_pages};
 #[cfg(test)]
 mod gc_atomic_tests;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -6,7 +10,16 @@ mod gc_barrier_harness_tests;
 mod gc_codegen;
 mod gc_model;
 #[cfg(test)]
+mod gc_nested_output_fixture;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+mod gc_windows_production_tests;
+#[cfg(test)]
 mod gc_windows_tests;
+mod literal_roots;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -22,6 +35,57 @@ use klassic_syntax::{
 use klassic_types::proof::{ProofConfig, analyze_proofs};
 use klassic_types::typecheck_program;
 
+/// Default initial/minimum accessible payload; excludes metadata and the guard.
+pub const DEFAULT_GC_MIN_HEAP: u64 = 16 << 20;
+/// Default observed-Free delay before physical page uncommit.
+pub const DEFAULT_GC_UNCOMMIT_DELAY_NS: u64 = 300_000_000_000;
+/// Default hard payload capacity; excludes metadata and the guard.
+pub const DEFAULT_GC_MAX_HEAP: u64 = gc_codegen::production::geometry::DEFAULT_CAPACITY;
+/// Metadata mappings have a separate byte budget, independent of payload capacity.
+pub fn validate_gc_max_metadata(bytes: u64) -> Result<(), &'static str> {
+    if bytes < 4096 || !bytes.is_multiple_of(4096) || bytes > i64::MAX as u64 {
+        return Err("GC maximum metadata must be positive 4-KiB pages within signed 64-bit limits");
+    }
+    Ok(())
+}
+pub fn validate_gc_max_heap(bytes: u64) -> Result<(), &'static str> {
+    gc_codegen::production::geometry::validate(bytes)
+}
+pub fn validate_gc_min_heap(bytes: u64) -> Result<(), &'static str> {
+    let page = gc_abi::HEAP_PAGE_BYTES;
+    if bytes < page {
+        return Err("GC minimum heap must be at least 128 KiB");
+    }
+    if !bytes.is_multiple_of(page) {
+        return Err("GC minimum heap must be a multiple of 128 KiB");
+    }
+    Ok(())
+}
+pub fn validate_gc_heap_limits(minimum: u64, maximum: u64) -> Result<(), &'static str> {
+    validate_gc_max_heap(maximum)?;
+    validate_gc_min_heap(minimum)?;
+    if minimum > maximum {
+        return Err("GC minimum heap must not exceed maximum heap");
+    }
+    Ok(())
+}
+
+/// Validate the advisory payload target without reducing the hard reservation.
+pub fn validate_gc_soft_heap_limits(
+    minimum: u64,
+    soft: u64,
+    maximum: u64,
+) -> Result<(), &'static str> {
+    validate_gc_heap_limits(minimum, maximum)?;
+    if soft < minimum || soft > maximum {
+        return Err("GC soft maximum heap must be between minimum and maximum heap");
+    }
+    if !soft.is_multiple_of(gc_abi::HEAP_PAGE_BYTES) {
+        return Err("GC soft maximum heap must be a multiple of 128 KiB");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativeCompilerConfig {
     pub target: NativeTarget,
@@ -31,6 +95,8 @@ pub struct NativeCompilerConfig {
     /// to stderr at exit (collections, allocations, bytes, max/total
     /// pause nanoseconds). Off by default; zero cost when off.
     pub gc_log: bool,
+    /// Explicit format enables the generational exit snapshot. None preserves text.
+    pub gc_log_format: Option<GcLogFormat>,
     /// `--gc-stress`: the emitted `gc_alloc` runs a full collection
     /// before every allocation attempt. Turns any pointer left
     /// unrooted across an allocation into a deterministic crash rather
@@ -41,10 +107,23 @@ pub struct NativeCompilerConfig {
     /// color, so the load-barrier slow path runs on every load and any
     /// unbarriered dereference faults on a non-canonical address.
     pub gc_poison: bool,
-    /// `--gc=generational`: route heap strings through the generational
-    /// GC ABI (M-G1 integration scaffold; never collects). Direct x86-64
-    /// ELF only; the driver rejects every other target and backend.
+    /// Select the generational collector in the direct native runtime.
     pub gc_generational: bool,
+    /// Payload heap hard limit for the generational direct runtime. Does not include
+    /// metadata or the logical first-page guard.
+    pub gc_max_heap: Option<u64>,
+    /// Advisory payload target; None follows the configured hard maximum.
+    pub gc_soft_max_heap: Option<u64>,
+    /// Separate writable-mapping budget; None derives a geometry-bounded maximum.
+    pub gc_max_metadata: Option<u64>,
+    /// Initial accessible payload and floor for later page uncommit.
+    pub gc_min_heap: Option<u64>,
+    /// Minimum observed-Free age in nanoseconds before physical uncommit.
+    pub gc_uncommit_delay_ns: Option<u64>,
+    /// Write every OS page of newly committed payload before publication.
+    pub gc_pre_touch: bool,
+    /// OS large-page policy; None selects Off.
+    pub gc_large_pages: Option<GcLargePages>,
     /// Whether the driver will retry through the portable C backend if this
     /// build reports a `Diagnostic` -- true for the aarch64 host default,
     /// false for an explicit `--target` and for the ELF/PE backends.
@@ -519,12 +598,12 @@ pub use generational_link::{
     GenerationalInstrumentation, GenerationalLinkError, GenerationalLinkOptions,
     GenerationalSourceKind, link_generational_program,
 };
+mod gc_layout;
+mod gc_shape;
 mod generational_lexical;
 mod generational_modules;
 mod generational_nested;
 pub use generational_modules::GenerationalModuleSource;
-mod gc_layout;
-mod gc_shape;
 mod llvm;
 #[allow(clippy::result_large_err)]
 mod map_chain;
@@ -552,17 +631,23 @@ pub fn compile_source_to_c(name: &str, text: &str) -> Result<String, NativeCompi
         .map_err(|diagnostic| NativeCompileError::with_view(source, None, diagnostic))
 }
 
-/// Configuration consumed by the canonical C mutator adapter.
+/// Configuration consumed by the canonical C/LLVM mutator adapter. Zero heap
+/// sizes choose adapter defaults. Flags are stress (1), diagnostics (2), verify
+/// (4); the adapter must reject any control it cannot implement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GenerationalBackendConfig {
     pub hard_max: u64,
     pub min_heap: u64,
     pub soft_max: u64,
     pub flags: u64,
+    /// None retains the embedding adapter policy; CLI supplies its shared default.
     pub uncommit_delay_ns: Option<u64>,
 }
 
-/// Compile the supported subset to rooted C against the generational adapter.
+/// Emit scalar, UTF-8 string and structural record C against the canonical
+/// mutator adapter. Scalars use separate raw leaves; managed fields retain
+/// canonical roots. Strings use the rooted UTF-8 adapter and never the legacy
+/// unmanaged KStr representation.
 #[allow(clippy::result_large_err)]
 pub fn compile_source_to_c_generational(
     name: &str,
@@ -572,7 +657,8 @@ pub fn compile_source_to_c_generational(
     compile_source_to_c_generational_with_modules(name, text, &[], config)
 }
 
-/// Compile rooted C with explicitly supplied static modules.
+/// Compile a standalone entry with explicitly supplied static function modules.
+/// Each module retains its diagnostic filename and source offsets.
 #[allow(clippy::result_large_err)]
 pub fn compile_source_to_c_generational_with_modules(
     name: &str,
@@ -585,7 +671,10 @@ pub fn compile_source_to_c_generational_with_modules(
         .map_err(|diagnostic| program.sources.error(diagnostic))
 }
 
-/// Emit rooted LLVM IR against the canonical generational runtime adapter.
+/// Emit LLVM over canonical RootCell/GcRef operations. This does not route to
+/// the legacy pointer-stack collector. Execution requires the matching shared
+/// `klassic_gen_runtime` adapter; it does not by itself establish collector or
+/// backend acceptance.
 #[allow(clippy::result_large_err)]
 pub fn compile_source_to_llvm_generational(
     name: &str,
@@ -595,7 +684,8 @@ pub fn compile_source_to_llvm_generational(
     compile_source_to_llvm_generational_with_modules(name, text, &[], config)
 }
 
-/// Emit rooted LLVM IR with explicitly supplied static modules.
+/// Compile a standalone entry with explicitly supplied static function modules.
+/// Each module retains its diagnostic filename and source offsets.
 #[allow(clippy::result_large_err)]
 pub fn compile_source_to_llvm_generational_with_modules(
     name: &str,
@@ -707,6 +797,67 @@ fn compile_internal(
     user_modules: &[UserModuleSource],
     config: NativeCompilerConfig,
 ) -> Result<Vec<u8>, NativeCompileError> {
+    if config.gc_soft_max_heap.is_some()
+        || config.gc_max_heap.is_some()
+        || config.gc_max_metadata.is_some()
+        || config.gc_min_heap.is_some()
+        || config.gc_uncommit_delay_ns.is_some()
+        || config.gc_pre_touch
+        || config.gc_large_pages.is_some()
+        || config.gc_log_format.is_some()
+    {
+        let error = if config.gc_generational {
+            validate_gc_soft_heap_limits(
+                config.gc_min_heap.unwrap_or(DEFAULT_GC_MIN_HEAP),
+                config
+                    .gc_soft_max_heap
+                    .or(config.gc_max_heap)
+                    .unwrap_or(DEFAULT_GC_MAX_HEAP),
+                config.gc_max_heap.unwrap_or(DEFAULT_GC_MAX_HEAP),
+            )
+            .and_then(|_| {
+                config
+                    .gc_max_metadata
+                    .map_or(Ok(()), validate_gc_max_metadata)
+            })
+            .and_then(|_| {
+                validate_gc_large_pages(
+                    config.gc_large_pages.unwrap_or_default(),
+                    config.target,
+                    config.gc_min_heap.unwrap_or(DEFAULT_GC_MIN_HEAP),
+                    config.gc_max_heap.unwrap_or(DEFAULT_GC_MAX_HEAP),
+                )
+            })
+            .and_then(|_| {
+                if config.gc_log_format == Some(GcLogFormat::Json) {
+                    gc_codegen::production::trace::validate_layout(
+                        config.gc_max_heap.unwrap_or(DEFAULT_GC_MAX_HEAP),
+                        if config.target == NativeTarget::MacosAarch64 {
+                            16384
+                        } else {
+                            4096
+                        },
+                    )
+                } else {
+                    Ok(())
+                }
+            })
+            .err()
+        } else if config.gc_log_format.is_some() {
+            Some("--gc-log-format requires --gc=generational")
+        } else if config.gc_max_metadata.is_some() {
+            Some("metadata settings require --gc=generational")
+        } else {
+            Some("heap/uncommit/pre-touch/large-page settings require --gc=generational")
+        };
+        if let Some(message) = error {
+            return Err(NativeCompileError::with_view(
+                source,
+                user_view,
+                Diagnostic::compile(Span::new(0, 0), message),
+            ));
+        }
+    }
     let expr = parse_source(&source).map_err(|diagnostic| {
         NativeCompileError::with_view(source.clone(), user_view.clone(), diagnostic)
     })?;
@@ -773,10 +924,20 @@ fn compile_internal(
             generator.mono_enum_variants = mono_enum_variants;
             generator.ext_method_enum_types = ext_registry;
             generator.variant_owner_enum = variant_owner_enum;
-            generator.gc_log = config.gc_log;
+            generator.gc_log = config.gc_log || config.gc_log_format.is_some();
+            generator.gc_log_format = config.gc_log_format.unwrap_or_default();
             generator.gc_stress = config.gc_stress;
             generator.gc_poison = config.gc_poison;
             generator.gc_generational = config.gc_generational;
+            generator.gc_max_heap = config.gc_max_heap.unwrap_or(DEFAULT_GC_MAX_HEAP);
+            generator.gc_soft_max_heap = config.gc_soft_max_heap;
+            generator.gc_pre_touch = config.gc_pre_touch;
+            generator.gc_large_pages = config.gc_large_pages.unwrap_or_default();
+            generator.gc_max_metadata = config.gc_max_metadata;
+            generator.gc_min_heap = config.gc_min_heap.unwrap_or(DEFAULT_GC_MIN_HEAP);
+            generator.gc_uncommit_delay_ns = config
+                .gc_uncommit_delay_ns
+                .unwrap_or(DEFAULT_GC_UNCOMMIT_DELAY_NS);
             let object = generator.compile(&expr).map_err(|diagnostic| {
                 NativeCompileError::with_view(source, user_view, diagnostic)
             })?;
@@ -790,10 +951,19 @@ fn compile_internal(
                 &mono_enum_field_annotations,
                 &variant_owner_enum,
             ),
-            config.gc_log,
+            config.gc_log || config.gc_log_format.is_some(),
+            config.gc_log_format.unwrap_or_default(),
             config.gc_stress,
             config.gc_poison,
             config.gc_generational,
+            config.gc_max_heap.unwrap_or(DEFAULT_GC_MAX_HEAP),
+            config.gc_soft_max_heap,
+            config.gc_max_metadata,
+            config.gc_min_heap.unwrap_or(DEFAULT_GC_MIN_HEAP),
+            config
+                .gc_uncommit_delay_ns
+                .unwrap_or(DEFAULT_GC_UNCOMMIT_DELAY_NS),
+            config.gc_pre_touch,
             config.fallback_backend_available,
         )
         .map_err(|diagnostic| NativeCompileError::with_view(source, user_view, diagnostic)),
@@ -4500,9 +4670,7 @@ struct GcTestProgram {
 struct GenerationalRuntime {
     labels: gc_codegen::production::Labels<TextLabel>,
     data: gc_codegen::production::Data<DataLabel>,
-    /// rax = heap-string payload, rdi = fd: write the bytes through the
-    /// runtime's copy-out buffer.
-    write_heap_string: TextLabel,
+    print_i64_native: TextLabel,
 }
 
 struct NativeCodeGenerator {
@@ -4614,6 +4782,9 @@ struct NativeCodeGenerator {
     /// (collect before every allocation). Both compile-time; zero cost
     /// when off.
     gc_log: bool,
+    gc_log_format: GcLogFormat,
+    #[cfg(test)]
+    gc_trace_capacity: u64,
     gc_stress: bool,
     /// `--gc-poison`: color heap-stored pointers with a BAD color, so any
     /// unbarriered dereference faults on a non-canonical address and the
@@ -4627,6 +4798,17 @@ struct NativeCodeGenerator {
     /// ABI (offset references, RootCells, TLAB allocation) instead of the
     /// legacy collector. Off by default; the default path is unchanged.
     gc_generational: bool,
+    /// Emission of ordinary user output, never collector diagnostics.
+    gc_console_output: bool,
+    gc_max_heap: u64,
+    gc_soft_max_heap: Option<u64>,
+    gc_max_metadata: Option<u64>,
+    gc_min_heap: u64,
+    gc_uncommit_delay_ns: u64,
+    gc_pre_touch: bool,
+    gc_large_pages: GcLargePages,
+    #[cfg(test)]
+    gc_large_pages_fault: bool,
     /// Labels and data of the M-G1 routines, created by `compile` when
     /// `gc_generational` is set.
     gc_gen: Option<GenerationalRuntime>,
@@ -4637,6 +4819,8 @@ struct NativeCodeGenerator {
     /// (see `gc_barrier_harness_tests`).
     #[cfg(test)]
     gc_test: Option<GcTestProgram>,
+    #[cfg(test)]
+    linux_worker_fault: Option<gc_codegen::linux_production::Fault>,
     gc_alloc: TextLabel,
     gc_collect: TextLabel,
     /// M6: the collector factored into separately-callable STW pieces.
@@ -5077,6 +5261,9 @@ impl NativeCodeGenerator {
             gc_pause_timespec,
             gc_pause_start_ns,
             gc_log: false,
+            gc_log_format: GcLogFormat::Text,
+            #[cfg(test)]
+            gc_trace_capacity: gc_codegen::production::trace::CAPACITY,
             gc_stress: false,
             gc_poison: false,
             // Evacuation is ON: the collector moves live objects out of
@@ -5084,10 +5271,22 @@ impl NativeCodeGenerator {
             // the M6 non-moving mark-sweep for bisection.
             gc_evac_off: false,
             gc_generational: false,
+            gc_console_output: false,
+            gc_max_heap: 192 << 20, // Explicit historical standalone fixture geometry.
+            gc_soft_max_heap: None,
+            gc_max_metadata: None,
+            gc_min_heap: DEFAULT_GC_MIN_HEAP,
+            gc_uncommit_delay_ns: DEFAULT_GC_UNCOMMIT_DELAY_NS,
+            gc_pre_touch: false,
+            gc_large_pages: GcLargePages::Off,
+            #[cfg(test)]
+            gc_large_pages_fault: false,
             gc_gen: None,
             gc_worker_thread: false,
             #[cfg(test)]
             gc_test: None,
+            #[cfg(test)]
+            linux_worker_fault: None,
             gc_alloc,
             gc_collect,
             gc_mark_roots,
@@ -5762,11 +5961,19 @@ impl NativeCodeGenerator {
         if let Some(test) = self.gc_test {
             (test.body)(&mut self, test.arg);
         } else {
+            self.gc_console_output = true;
             self.compile_top_level(expr)?;
+            self.gc_console_output = false;
         }
         #[cfg(not(test))]
-        self.compile_top_level(expr)?;
+        {
+            self.gc_console_output = true;
+            self.compile_top_level(expr)?;
+            self.gc_console_output = false;
+        }
+        self.gc_console_output = true;
         self.emit_queued_threads()?;
+        self.gc_console_output = false;
         if self.gc_log {
             if self.gc_gen.is_some() {
                 self.emit_generational_log_report();
@@ -5774,8 +5981,11 @@ impl NativeCodeGenerator {
                 self.emit_gc_log_report();
             }
         }
+        self.emit_generational_worker_shutdown();
         self.emit_exit_success();
+        self.gc_console_output = true;
         self.emit_functions()?;
+        self.gc_console_output = false;
         // After `emit_functions`, because a literal inside a function body
         // allocates its cell while that body compiles.
         self.emit_literal_root_seed();
@@ -9035,8 +9245,7 @@ impl NativeCodeGenerator {
                 self.load_var_slot(Reg::R10, slot);
             }
             RuntimeMapCallableDispatchScalarKey::Data(slot) => {
-                self.asm.mov_data_addr(Reg::R10, slot);
-                self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+                self.emit_load_literal_slot(Reg::R10, slot);
             }
         }
     }
@@ -12529,11 +12738,14 @@ impl NativeCodeGenerator {
         // A GC pointer spills the same way, but its cell also has to be a
         // root: the collector traces and *moves* what it points at, and a
         // plain `.data` cell is invisible to both walks. `emit_literal_root_seed`
-        // pushes one shadow-stack entry per cell at startup.
+        // adopts one permanent RootCell per slot at startup under the flag,
+        // or pushes the raw slot on the legacy shadow stack.
         if value == NativeValue::HeapPointer {
-            let slot = self.asm.data_label_with_i64s(&[0]);
+            let slot = self.new_literal_scalar_slot(value);
             self.emit_store_rax_to_data_slot(slot);
-            self.literal_root_cells.push(slot);
+            if self.gc_gen.is_none() {
+                self.literal_root_cells.push(slot);
+            }
             // The value itself does not say which enum it is; the marker the
             // lowering leaves does, and it published the shape just now.
             if let Some(shape) = self.pending_enum_shape.clone() {
@@ -12603,8 +12815,7 @@ impl NativeCodeGenerator {
         match value {
             CompiledLiteralValue::Native(value) => value,
             CompiledLiteralValue::Scalar { value, slot } => {
-                self.asm.mov_data_addr(Reg::R10, slot);
-                self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                self.emit_load_literal_slot(Reg::Rax, slot);
                 // Taking an element out of a collection has to republish what
                 // the element is, the way constructing one does: a heap
                 // pointer alone does not say which enum it names, so without
@@ -13742,8 +13953,7 @@ impl NativeCodeGenerator {
                 )?;
             }
             CompiledLiteralValue::Scalar { value, slot } => {
-                self.asm.mov_data_addr(Reg::R10, slot);
-                self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                self.emit_load_literal_slot(Reg::Rax, slot);
                 match value {
                     NativeValue::Int => self.emit_append_i64_rax_to_runtime_buffer_offset_label(
                         data,
@@ -14122,6 +14332,25 @@ impl NativeCodeGenerator {
                 span,
                 format!("sleep expects 1 argument but got {}", arguments.len()),
             ));
+        }
+        if let Some(sleep) = self
+            .gc_gen
+            .as_ref()
+            .map(|runtime| runtime.labels.sleep_millis)
+        {
+            if self.compile_expr(&arguments[0])? != NativeValue::Int {
+                return Err(unsupported(
+                    span,
+                    "native sleep for non-Int millisecond argument",
+                ));
+            }
+            let ok = self.asm.create_text_label();
+            self.asm.cmp_reg_imm8(Reg::Rax, 0);
+            self.asm.jcc_label(Condition::GreaterEqual, ok);
+            self.emit_runtime_error(span, "sleep expects a non-negative integer index");
+            self.asm.bind_text_label(ok);
+            self.asm.call_label(sleep);
+            return Ok(NativeValue::Unit);
         }
         if let Some(millis) = const_int_expr(&arguments[0]) {
             if millis < 0 {
@@ -14859,12 +15088,10 @@ impl NativeCodeGenerator {
                 portable_asm::emit_gc_load_barrier(self, slow);
             }
         } else if let Some(runtime) = &self.gc_gen {
-            // Untyped (scalar) reads also see generic payload addresses, so
-            // they take the generational load barrier too.
+            // Generic reads decode record references, while a scalar box's
+            // raw bits remain opaque even when they resemble a reference.
             let load = runtime.labels.field_load;
-            self.asm.mov_reg_reg(Reg::R10, Reg::Rax);
-            self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
-            self.asm.call_label(load);
+            gc_codegen::production::emit_untyped_load(self, load);
         } else {
             self.asm.load_ptr_disp32(Reg::Rax, Reg::Rax, 0);
         }
@@ -17001,8 +17228,7 @@ impl NativeCodeGenerator {
             let Some(bits) = Self::static_value_scalar_bits(entry_key, key_value) else {
                 return Ok(None);
             };
-            self.asm.mov_data_addr(Reg::R10, slot);
-            self.asm.load_ptr_disp32(Reg::R10, Reg::R10, 0);
+            self.emit_load_literal_slot(Reg::R10, slot);
             self.asm.mov_imm64(Reg::Rax, bits);
             self.asm.cmp_reg_reg(Reg::R10, Reg::Rax);
             self.asm.jcc_label(Condition::Equal, label);
@@ -17641,7 +17867,7 @@ impl NativeCodeGenerator {
                 }
                 let extra = match *template {
                     CompiledLiteralValue::Scalar { value, .. } => {
-                        let slot = self.asm.data_label_with_i64s(&[0]);
+                        let slot = self.new_literal_scalar_slot(value);
                         CompiledLiteralValue::Scalar { value, slot }
                     }
                     CompiledLiteralValue::Native(value)
@@ -18336,8 +18562,7 @@ impl NativeCodeGenerator {
     ) -> Option<NativeValue> {
         match source {
             CompiledLiteralValue::Scalar { value, slot } if value == output_value => {
-                self.asm.mov_data_addr(Reg::R10, slot);
-                self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                self.emit_load_literal_slot(Reg::Rax, slot);
                 Some(value)
             }
             CompiledLiteralValue::Native(value) => self
@@ -19193,11 +19418,9 @@ impl NativeCodeGenerator {
                     }
                     continue;
                 }
-                self.asm.mov_data_addr(Reg::R10, slot);
-                self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
+                self.emit_load_literal_slot(Reg::R8, slot);
                 if let Some(needle_slot) = needle_scalar_slot {
-                    self.asm.mov_data_addr(Reg::R10, needle_slot);
-                    self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                    self.emit_load_literal_slot(Reg::Rax, needle_slot);
                 }
                 self.asm.cmp_reg_reg(Reg::R8, Reg::Rax);
                 self.asm.jcc_label(Condition::NotEqual, next);
@@ -19214,8 +19437,7 @@ impl NativeCodeGenerator {
         }
 
         self.asm.bind_text_label(done);
-        self.asm.mov_data_addr(Reg::R10, result_slot);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.emit_load_literal_slot(Reg::Rax, result_slot);
         Ok(NativeValue::Bool)
     }
 
@@ -19268,7 +19490,8 @@ impl NativeCodeGenerator {
             None
         };
 
-        let result_slot = self.asm.data_label_with_i64s(&[0]);
+        let result_slot =
+            self.new_literal_scalar_slot(result_kind_scalar.unwrap_or(NativeValue::Int));
         self.asm.mov_imm64(Reg::Rax, 0);
         self.emit_store_rax_to_data_slot(result_slot);
 
@@ -19327,11 +19550,9 @@ impl NativeCodeGenerator {
                     }
                     continue;
                 }
-                self.asm.mov_data_addr(Reg::R10, slot);
-                self.asm.load_ptr_disp32(Reg::R8, Reg::R10, 0);
+                self.emit_load_literal_slot(Reg::R8, slot);
                 if let Some(needle_slot) = key_scalar_slot {
-                    self.asm.mov_data_addr(Reg::R10, needle_slot);
-                    self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                    self.emit_load_literal_slot(Reg::Rax, needle_slot);
                 }
                 self.asm.cmp_reg_reg(Reg::R8, Reg::Rax);
                 self.asm.jcc_label(Condition::NotEqual, next);
@@ -19347,8 +19568,7 @@ impl NativeCodeGenerator {
 
             match val_slot {
                 CompiledLiteralValue::Scalar { value: _, slot } => {
-                    self.asm.mov_data_addr(Reg::R10, slot);
-                    self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                    self.emit_load_literal_slot(Reg::Rax, slot);
                     self.emit_store_rax_to_data_slot(result_slot);
                 }
                 CompiledLiteralValue::Native(slot_value) if value_is_string => {
@@ -19387,8 +19607,7 @@ impl NativeCodeGenerator {
         if let Some((data, len)) = result_string_buffer {
             return Ok(NativeValue::RuntimeString { data, len });
         }
-        self.asm.mov_data_addr(Reg::R10, result_slot);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.emit_load_literal_slot(Reg::Rax, result_slot);
         Ok(result_kind_scalar.unwrap_or(NativeValue::Int))
     }
 
@@ -19625,7 +19844,7 @@ impl NativeCodeGenerator {
         if let Some(value) = Self::compiled_literal_scalar_value_kind(values, span)? {
             return Ok(CompiledLiteralMapGetOutput::Scalar {
                 value,
-                slot: self.asm.data_label_with_i64s(&[0]),
+                slot: self.new_literal_scalar_slot(value),
             });
         }
         if values.iter().all(|value| {
@@ -20104,8 +20323,7 @@ impl NativeCodeGenerator {
         Ok(match output {
             CompiledLiteralMapGetOutput::Static(value) => self.emit_static_value(&value),
             CompiledLiteralMapGetOutput::Scalar { value, slot } => {
-                self.asm.mov_data_addr(Reg::R10, slot);
-                self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                self.emit_load_literal_slot(Reg::Rax, slot);
                 value
             }
             CompiledLiteralMapGetOutput::RuntimeString { data, len } => {
@@ -21341,7 +21559,61 @@ impl NativeCodeGenerator {
         Ok(NativeValue::RuntimeLinesList { data, len })
     }
 
+    fn emit_generational_stdin_to_runtime_string(&mut self, span: Span, name: &str) -> NativeValue {
+        const CAP: usize = 65_536;
+        let data = self.asm.data_label_with_bytes(&vec![0; CAP]);
+        let overflow = self.asm.data_label_with_bytes(&[0]);
+        let len = self.asm.data_label_with_i64s(&[0]);
+        let again = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.mov_data_addr(Reg::R9, len);
+        self.asm.mov_imm64(Reg::R8, 0);
+        self.asm.store_ptr_disp32(Reg::R9, 0, Reg::R8);
+        self.asm.bind_text_label(again);
+        self.asm.mov_data_addr(Reg::R9, len);
+        self.asm.load_ptr_disp32(Reg::R8, Reg::R9, 0);
+        self.asm.mov_data_addr(Reg::Rsi, data);
+        self.asm.add_reg_reg(Reg::Rsi, Reg::R8);
+        self.asm.mov_imm64(Reg::Rdx, CAP as u64);
+        self.asm.sub_reg_reg(Reg::Rdx, Reg::R8);
+        self.asm.mov_imm64(Reg::Rdi, self.platform.stdin_fd());
+        self.emit_generational_stdin_read();
+        self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to read stdin"));
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, done);
+        self.asm.add_reg_reg(Reg::R8, Reg::Rax);
+        self.asm.mov_data_addr(Reg::R9, len);
+        self.asm.store_ptr_disp32(Reg::R9, 0, Reg::R8);
+        self.asm.cmp_reg_imm32(Reg::R8, CAP as i32);
+        self.asm.jcc_label(Condition::Below, again);
+        // Once full, distinguish EOF from an over-capacity stream.
+        self.asm.mov_data_addr(Reg::Rsi, overflow);
+        self.asm.mov_imm64(Reg::Rdx, 1);
+        self.asm.mov_imm64(Reg::Rdi, self.platform.stdin_fd());
+        self.emit_generational_stdin_read();
+        self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to read stdin"));
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, done);
+        self.emit_runtime_error(span, &format!("{name} runtime string exceeds 65536 bytes"));
+        self.asm.bind_text_label(done);
+        NativeValue::RuntimeString { data, len }
+    }
+
+    fn emit_generational_stdin_read(&mut self) {
+        self.emit_generational_native_transition(true);
+        if self.is_windows {
+            self.asm.call_label(self.windows_runtime().win_read_stdin);
+        } else {
+            self.emit_syscall_number(PlatformSyscall::Read);
+            self.asm.syscall();
+        }
+        self.emit_generational_native_transition(false);
+    }
+
     fn emit_standard_input_to_runtime_string(&mut self, span: Span, name: &str) -> NativeValue {
+        if self.gc_generational {
+            return self.emit_generational_stdin_to_runtime_string(span, name);
+        }
         const RUNTIME_STRING_CAP: usize = 65_536;
         let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
         let overflow = self.asm.data_label_with_bytes(&[0]);
@@ -21965,6 +22237,7 @@ impl NativeCodeGenerator {
                 self.emit_runtime_error(span, "Process#exit expects a non-negative integer index");
                 return Ok(NativeValue::Unit);
             }
+            self.emit_generational_worker_shutdown();
             if !self.is_windows {
                 self.emit_syscall_number(PlatformSyscall::Exit);
             }
@@ -21986,6 +22259,14 @@ impl NativeCodeGenerator {
         self.asm.jcc_label(Condition::GreaterEqual, ok);
         self.emit_runtime_error(span, "Process#exit expects a non-negative integer index");
         self.asm.bind_text_label(ok);
+        if self.gc_gen.is_some() {
+            // Shutdown clobbers V0; retain the computed application exit code.
+            self.asm.push_reg(Reg::Rax);
+            self.asm.push_reg(Reg::Rax);
+            self.emit_generational_worker_shutdown();
+            self.asm.pop_reg(Reg::Rax);
+            self.asm.pop_reg(Reg::Rax);
+        }
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
         if !self.is_windows {
             self.emit_syscall_number(PlatformSyscall::Exit);
@@ -22254,6 +22535,20 @@ impl NativeCodeGenerator {
             .map_err(|error| Diagnostic::compile(span, format!("native {name} failed: {error}")))
     }
 
+    /// Native file buffers/paths are outside the managed heap. The shared
+    /// transition preserves portable registers, including the syscall result;
+    /// each error check therefore runs after the owner is Running again.
+    fn emit_generational_native_transition(&mut self, entering: bool) {
+        if let Some(runtime) = &self.gc_gen {
+            let entry = if entering {
+                runtime.labels.native_enter
+            } else {
+                runtime.labels.native_exit
+            };
+            self.asm.call_label(entry);
+        }
+    }
+
     fn emit_file_write(&mut self, path: &str, bytes: &[u8], append: bool, span: Span, name: &str) {
         let path_label = self.nul_terminated_data_label(path);
         self.emit_file_write_to_path_label(path_label, bytes, append, span, name);
@@ -22269,6 +22564,7 @@ impl NativeCodeGenerator {
     ) {
         let content_label = self.asm.data_label_with_bytes(bytes);
         let flags = self.platform.open_write_flags(append);
+        self.emit_generational_native_transition(true);
         if self.is_windows {
             self.asm.mov_data_addr(Reg::Rdi, path_label);
             self.asm.mov_imm64(Reg::Rsi, flags);
@@ -22283,6 +22579,7 @@ impl NativeCodeGenerator {
                 .mov_imm64(Reg::Rdx, self.platform.default_file_mode());
             self.asm.syscall();
         }
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open file"));
         self.asm.push_reg(Reg::Rax);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -22291,18 +22588,25 @@ impl NativeCodeGenerator {
         }
         self.asm.mov_data_addr(Reg::Rsi, content_label);
         self.asm.mov_imm64(Reg::Rdx, bytes.len() as u64);
+        self.emit_generational_native_transition(true);
         if self.is_windows {
             self.asm.call_label(self.windows_runtime().win_write_handle);
         } else {
             self.asm.syscall();
         }
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to write file"));
         self.asm.pop_reg(Reg::Rdi);
+        self.emit_generational_native_transition(true);
         if self.is_windows {
             self.asm.call_label(self.windows_runtime().win_close_handle);
         } else {
             self.emit_syscall_number(PlatformSyscall::Close);
             self.asm.syscall();
+        }
+        self.emit_generational_native_transition(false);
+        if self.gc_generational {
+            self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to close file"));
         }
     }
 
@@ -22327,6 +22631,7 @@ impl NativeCodeGenerator {
         name: &str,
     ) {
         let flags = self.platform.open_write_flags(append);
+        self.emit_generational_native_transition(true);
         if self.is_windows {
             self.asm.mov_data_addr(Reg::Rdi, path_label);
             self.asm.mov_imm64(Reg::Rsi, flags);
@@ -22341,6 +22646,7 @@ impl NativeCodeGenerator {
                 .mov_imm64(Reg::Rdx, self.platform.default_file_mode());
             self.asm.syscall();
         }
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open file"));
         self.asm.push_reg(Reg::Rax);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
@@ -22349,18 +22655,25 @@ impl NativeCodeGenerator {
         }
         self.asm.mov_data_addr(Reg::Rsi, content.data);
         self.emit_load_native_string_len(Reg::Rdx, content.len);
+        self.emit_generational_native_transition(true);
         if self.is_windows {
             self.asm.call_label(self.windows_runtime().win_write_handle);
         } else {
             self.asm.syscall();
         }
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to write file"));
         self.asm.pop_reg(Reg::Rdi);
+        self.emit_generational_native_transition(true);
         if self.is_windows {
             self.asm.call_label(self.windows_runtime().win_close_handle);
         } else {
             self.emit_syscall_number(PlatformSyscall::Close);
             self.asm.syscall();
+        }
+        self.emit_generational_native_transition(false);
+        if self.gc_generational {
+            self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to close file"));
         }
     }
 
@@ -22372,11 +22685,15 @@ impl NativeCodeGenerator {
     fn emit_file_delete_label(&mut self, path_label: DataLabel, span: Span, name: &str) {
         if self.is_windows {
             self.asm.mov_data_addr(Reg::Rdi, path_label);
+            self.emit_generational_native_transition(true);
             self.asm.call_label(self.windows_runtime().win_delete_file);
+            self.emit_generational_native_transition(false);
         } else {
             self.emit_syscall_number(PlatformSyscall::Unlink);
             self.asm.mov_data_addr(Reg::Rdi, path_label);
+            self.emit_generational_native_transition(true);
             self.asm.syscall();
+            self.emit_generational_native_transition(false);
         }
         self.emit_runtime_error_if_rax_negative_except_errno(
             span,
@@ -22399,8 +22716,10 @@ impl NativeCodeGenerator {
             // below (which tests "rax == 0", Access's own success
             // convention) one line down.
             self.asm.mov_data_addr(Reg::Rdi, path_label);
+            self.emit_generational_native_transition(true);
             self.asm
                 .call_label(self.windows_runtime().win_get_file_attributes);
+            self.emit_generational_native_transition(false);
             self.asm.cmp_reg_imm8(Reg::Rax, 0);
             self.asm.setcc_al(Condition::GreaterEqual);
             self.asm.movzx_rax_al();
@@ -22409,7 +22728,9 @@ impl NativeCodeGenerator {
         self.emit_syscall_number(PlatformSyscall::Access);
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         self.asm.mov_imm64(Reg::Rsi, 0);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.setcc_al(Condition::Equal);
         self.asm.movzx_rax_al();
@@ -22449,8 +22770,10 @@ impl NativeCodeGenerator {
             let not_found = self.asm.create_text_label();
             let done = self.asm.create_text_label();
             self.asm.mov_data_addr(Reg::Rdi, path_label);
+            self.emit_generational_native_transition(true);
             self.asm
                 .call_label(self.windows_runtime().win_get_file_attributes);
+            self.emit_generational_native_transition(false);
             self.emit_runtime_error_if_rax_negative_except_errno(
                 span,
                 self.platform.errno_no_entry(),
@@ -22482,7 +22805,9 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::Rsi, path_label);
         self.asm.mov_data_addr(Reg::Rdx, stat_buffer);
         self.asm.mov_imm64(Reg::R10, 0);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative_except_errno(
             span,
             self.platform.errno_no_entry(),
@@ -22531,7 +22856,9 @@ impl NativeCodeGenerator {
             // sequence below with a single WinAPI call.
             self.asm.mov_data_addr(Reg::Rdi, source_label);
             self.asm.mov_data_addr(Reg::Rsi, target_label);
+            self.emit_generational_native_transition(true);
             self.asm.call_label(self.windows_runtime().win_copy_file);
+            self.emit_generational_native_transition(false);
             self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to copy file"));
             return;
         }
@@ -22540,7 +22867,9 @@ impl NativeCodeGenerator {
         self.asm
             .mov_imm64(Reg::Rsi, self.platform.open_read_flags());
         self.asm.mov_imm64(Reg::Rdx, 0);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(
             span,
             &format!("{name} failed to open source file"),
@@ -22553,7 +22882,9 @@ impl NativeCodeGenerator {
             .mov_imm64(Reg::Rsi, self.platform.open_write_flags(false));
         self.asm
             .mov_imm64(Reg::Rdx, self.platform.default_file_mode());
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(
             span,
             &format!("{name} failed to open target file"),
@@ -22569,7 +22900,9 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rdx, 0);
         self.asm
             .mov_imm64(Reg::R10, self.platform.sendfile_chunk_max());
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to copy file"));
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Equal, done);
@@ -22578,10 +22911,23 @@ impl NativeCodeGenerator {
 
         self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R8);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
+        if self.gc_generational {
+            self.emit_runtime_error_if_rax_negative(
+                span,
+                &format!("{name} failed to close target file"),
+            );
+        }
         self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
+        if self.gc_generational {
+            self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to close file"));
+        }
     }
 
     fn emit_file_stream_to_fd(&mut self, path: &str, fd: u64, span: Span, name: &str) {
@@ -22602,7 +22948,9 @@ impl NativeCodeGenerator {
         self.asm
             .mov_imm64(Reg::Rsi, self.platform.open_read_flags());
         self.asm.mov_imm64(Reg::Rdx, 0);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open file"));
         self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
 
@@ -22613,7 +22961,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
         self.asm.mov_data_addr(Reg::Rsi, buffer);
         self.asm.mov_imm64(Reg::Rdx, 8192);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to read file"));
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Equal, done);
@@ -22627,7 +22977,9 @@ impl NativeCodeGenerator {
         if self.is_windows {
             self.asm.call_label(self.windows_runtime().win_write);
         } else {
+            self.emit_generational_native_transition(true);
             self.asm.syscall();
+            self.emit_generational_native_transition(false);
         }
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to write output"));
         self.asm.jmp_label(read_loop);
@@ -22635,7 +22987,12 @@ impl NativeCodeGenerator {
 
         self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
+        if self.gc_generational {
+            self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to close file"));
+        }
     }
 
     fn emit_file_read_to_runtime_string(
@@ -22658,6 +23015,7 @@ impl NativeCodeGenerator {
         let data = self.asm.data_label_with_bytes(&vec![0; RUNTIME_STRING_CAP]);
         let overflow = self.asm.data_label_with_bytes(&[0]);
         let len = self.asm.data_label_with_i64s(&[0]);
+        self.emit_generational_native_transition(true);
         if self.is_windows {
             self.asm.mov_data_addr(Reg::Rdi, path_label);
             self.asm
@@ -22672,9 +23030,11 @@ impl NativeCodeGenerator {
             self.asm.mov_imm64(Reg::Rdx, 0);
             self.asm.syscall();
         }
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open file"));
         self.asm.mov_reg_reg(Reg::R9, Reg::Rax);
 
+        self.emit_generational_native_transition(true);
         if self.is_windows {
             self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
             self.asm.mov_data_addr(Reg::Rsi, data);
@@ -22687,6 +23047,7 @@ impl NativeCodeGenerator {
             self.asm.mov_imm64(Reg::Rdx, RUNTIME_STRING_CAP as u64);
             self.asm.syscall();
         }
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to read file"));
         self.asm.mov_data_addr(Reg::Rcx, len);
         self.asm.store_ptr_disp32(Reg::Rcx, 0, Reg::Rax);
@@ -22694,6 +23055,7 @@ impl NativeCodeGenerator {
         self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
         let close_file = self.asm.create_text_label();
         self.asm.jcc_label(Condition::NotEqual, close_file);
+        self.emit_generational_native_transition(true);
         if self.is_windows {
             self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
             self.asm.mov_data_addr(Reg::Rsi, overflow);
@@ -22706,12 +23068,14 @@ impl NativeCodeGenerator {
             self.asm.mov_imm64(Reg::Rdx, 1);
             self.asm.syscall();
         }
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to read file"));
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Equal, close_file);
         self.emit_runtime_error(span, &format!("{name} runtime string exceeds 65536 bytes"));
 
         self.asm.bind_text_label(close_file);
+        self.emit_generational_native_transition(true);
         if self.is_windows {
             self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
             self.asm.call_label(self.windows_runtime().win_close_handle);
@@ -22719,6 +23083,10 @@ impl NativeCodeGenerator {
             self.emit_syscall_number(PlatformSyscall::Close);
             self.asm.mov_reg_reg(Reg::Rdi, Reg::R9);
             self.asm.syscall();
+        }
+        self.emit_generational_native_transition(false);
+        if self.gc_generational {
+            self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to close file"));
         }
         NativeValue::RuntimeString { data, len }
     }
@@ -22746,9 +23114,13 @@ impl NativeCodeGenerator {
         self.asm
             .mov_imm64(Reg::Rsi, (RUNTIME_STRING_CAP + 1) as u64);
         if self.is_windows {
+            self.emit_generational_native_transition(true);
             self.asm.call_label(self.windows_runtime().win_getcwd);
+            self.emit_generational_native_transition(false);
         } else {
+            self.emit_generational_native_transition(true);
             self.asm.syscall();
+            self.emit_generational_native_transition(false);
         }
         self.emit_runtime_error_if_rax_negative(span, "Dir#current failed");
         self.asm.dec_reg(Reg::Rax);
@@ -22927,6 +23299,17 @@ impl NativeCodeGenerator {
         }
         let path =
             self.static_string_from_argument_preserving_effects(&arguments[0], span, name)?;
+        if self.gc_generational && recursive && path.is_empty() {
+            return Ok(NativeValue::Unit);
+        }
+        if self.gc_generational && self.is_windows && recursive {
+            // Parse target separators at run time: the build host's Path
+            // components do not recognize Windows drive and UNC roots.
+            let label = self.nul_terminated_data_label(&path);
+            self.emit_dir_mkdirs_label(label, span, name);
+            self.virtual_dirs.insert(path);
+            return Ok(NativeValue::Unit);
+        }
         let paths = if recursive {
             mkdir_prefixes(&path)
         } else {
@@ -23038,11 +23421,20 @@ impl NativeCodeGenerator {
         self.expect_static_arity("Dir#copy", arguments, 2, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0])
             || self.expr_may_yield_runtime_string(&arguments[1])
+            || self.gc_generational
+                && (self.expr_yields_runtime_or_heap_string(&arguments[0])
+                    || self.expr_yields_runtime_or_heap_string(&arguments[1]))
         {
-            let (source_label, _source) =
-                self.compile_path_argument_to_label(&arguments[0], span, "Dir#copy")?;
-            let (target_label, target) =
-                self.compile_path_argument_to_label(&arguments[1], span, "Dir#copy")?;
+            let ((source_label, _source), (target_label, target)) = if self.gc_generational {
+                let [source, target] =
+                    self.compile_rooted_native_paths(arguments, span, "Dir#copy")?;
+                (source, target)
+            } else {
+                (
+                    self.compile_path_argument_to_label(&arguments[0], span, "Dir#copy")?,
+                    self.compile_path_argument_to_label(&arguments[1], span, "Dir#copy")?,
+                )
+            };
             self.emit_file_copy_path_labels(source_label, target_label, span, "Dir#copy");
             if let Some(target) = target {
                 self.virtual_files.remove(&target);
@@ -23138,11 +23530,20 @@ impl NativeCodeGenerator {
         self.expect_static_arity("Dir#move", arguments, 2, span)?;
         if self.expr_may_yield_runtime_string(&arguments[0])
             || self.expr_may_yield_runtime_string(&arguments[1])
+            || self.gc_generational
+                && (self.expr_yields_runtime_or_heap_string(&arguments[0])
+                    || self.expr_yields_runtime_or_heap_string(&arguments[1]))
         {
-            let (source_label, source) =
-                self.compile_path_argument_to_label(&arguments[0], span, "Dir#move")?;
-            let (target_label, target) =
-                self.compile_path_argument_to_label(&arguments[1], span, "Dir#move")?;
+            let ((source_label, source), (target_label, target)) = if self.gc_generational {
+                let [source, target] =
+                    self.compile_rooted_native_paths(arguments, span, "Dir#move")?;
+                (source, target)
+            } else {
+                (
+                    self.compile_path_argument_to_label(&arguments[0], span, "Dir#move")?,
+                    self.compile_path_argument_to_label(&arguments[1], span, "Dir#move")?,
+                )
+            };
             self.emit_dir_move_labels(source_label, target_label, span, "Dir#move");
             if let Some(source) = source {
                 self.forget_virtual_descendants(&source);
@@ -23284,7 +23685,9 @@ impl NativeCodeGenerator {
         self.asm
             .mov_imm64(Reg::Rsi, self.platform.open_directory_flags());
         self.asm.mov_imm64(Reg::Rdx, 0);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open directory"));
         self.asm.mov_data_addr(Reg::R10, fd_slot);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
@@ -23301,7 +23704,9 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
         self.asm.mov_data_addr(Reg::Rsi, dir_buffer);
         self.asm.mov_imm64(Reg::Rdx, DIR_BUFFER_CAP as u64);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to read directory"));
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Equal, done);
@@ -23378,7 +23783,15 @@ impl NativeCodeGenerator {
         self.emit_syscall_number(PlatformSyscall::Close);
         self.asm.mov_data_addr(Reg::R10, fd_slot);
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
+        self.emit_generational_native_transition(true);
         self.asm.syscall();
+        self.emit_generational_native_transition(false);
+        if self.gc_generational {
+            self.emit_runtime_error_if_rax_negative(
+                span,
+                &format!("{name} failed to close directory"),
+            );
+        }
         self.emit_sort_runtime_lines(
             output,
             output_offset,
@@ -23500,8 +23913,10 @@ impl NativeCodeGenerator {
 
         self.asm.mov_data_addr(Reg::Rdi, pattern);
         self.asm.mov_data_addr(Reg::Rsi, find_data);
+        self.emit_generational_native_transition(true);
         self.asm
             .call_label(self.windows_runtime().win_find_first_file);
+        self.emit_generational_native_transition(false);
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to open directory"));
         self.asm.mov_data_addr(Reg::R10, handle_slot);
         self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
@@ -23558,16 +23973,32 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::R10, handle_slot);
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
         self.asm.mov_data_addr(Reg::Rsi, find_data);
+        self.emit_generational_native_transition(true);
         self.asm
             .call_label(self.windows_runtime().win_find_next_file);
+        self.emit_generational_native_transition(false);
+        if self.gc_generational {
+            self.emit_runtime_error_if_rax_negative(
+                span,
+                &format!("{name} failed to read directory"),
+            );
+        }
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::NotEqual, entry_loop);
 
         self.asm.bind_text_label(done);
         self.asm.mov_data_addr(Reg::R10, handle_slot);
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
+        self.emit_generational_native_transition(true);
         self.asm.call_label(self.windows_runtime().win_find_close);
+        self.emit_generational_native_transition(false);
 
+        if self.gc_generational {
+            self.emit_runtime_error_if_rax_negative(
+                span,
+                &format!("{name} failed to close directory"),
+            );
+        }
         self.emit_sort_runtime_lines(
             output,
             output_offset,
@@ -23893,9 +24324,13 @@ impl NativeCodeGenerator {
         self.asm
             .mov_imm64(Reg::Rsi, self.platform.default_dir_mode());
         if self.is_windows {
+            self.emit_generational_native_transition(true);
             self.asm.call_label(self.windows_runtime().win_mkdir);
+            self.emit_generational_native_transition(false);
         } else {
+            self.emit_generational_native_transition(true);
             self.asm.syscall();
+            self.emit_generational_native_transition(false);
         }
         if recursive {
             self.emit_runtime_error_if_rax_negative_except_errno(
@@ -23913,10 +24348,82 @@ impl NativeCodeGenerator {
 
     fn emit_dir_mkdirs_label(&mut self, path_label: DataLabel, span: Span, name: &str) {
         self.asm.mov_data_addr(Reg::Rbx, path_label);
+        let empty_done = if self.gc_generational {
+            let done = self.asm.create_text_label();
+            self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rbx, 0);
+            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.jcc_label(Condition::Equal, done);
+            Some(done)
+        } else {
+            None
+        };
         self.asm.mov_imm64(Reg::R8, 1);
         let scan = self.asm.create_text_label();
         let mkdir_prefix = self.asm.create_text_label();
         let mkdir_final = self.asm.create_text_label();
+        if self.gc_generational && self.is_windows {
+            let drive = self.asm.create_text_label();
+            let rooted = self.asm.create_text_label();
+            let unc_server = self.asm.create_text_label();
+            let unc_share = self.asm.create_text_label();
+            let after_server = self.asm.create_text_label();
+            self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rbx, 0);
+            for separator in *b"/\\" {
+                self.asm.cmp_reg_imm8(Reg::Rax, separator as i8);
+                self.asm.jcc_label(Condition::Equal, rooted);
+            }
+            self.asm.jmp_label(drive);
+            self.asm.bind_text_label(rooted);
+            self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rbx, 1);
+            for separator in *b"/\\" {
+                self.asm.cmp_reg_imm8(Reg::Rax, separator as i8);
+                self.asm.jcc_label(Condition::Equal, unc_server);
+            }
+            self.asm.jmp_label(scan);
+            self.asm.bind_text_label(unc_server);
+            self.asm.mov_imm64(Reg::R8, 2);
+            let server_loop = self.asm.create_text_label();
+            self.asm.bind_text_label(server_loop);
+            self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rbx, Reg::R8);
+            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.jcc_label(Condition::Equal, mkdir_final);
+            for separator in *b"/\\" {
+                self.asm.cmp_reg_imm8(Reg::Rax, separator as i8);
+                self.asm.jcc_label(Condition::Equal, after_server);
+            }
+            self.asm.inc_reg(Reg::R8);
+            self.asm.jmp_label(server_loop);
+            self.asm.bind_text_label(after_server);
+            self.asm.inc_reg(Reg::R8);
+            self.asm.bind_text_label(unc_share);
+            self.asm.movzx_byte_indexed(Reg::Rax, Reg::Rbx, Reg::R8);
+            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.jcc_label(Condition::Equal, mkdir_final);
+            let after_share = self.asm.create_text_label();
+            for separator in *b"/\\" {
+                self.asm.cmp_reg_imm8(Reg::Rax, separator as i8);
+                self.asm.jcc_label(Condition::Equal, after_share);
+            }
+            self.asm.inc_reg(Reg::R8);
+            self.asm.jmp_label(unc_share);
+            self.asm.bind_text_label(after_share);
+            self.asm.inc_reg(Reg::R8);
+            self.asm.jmp_label(scan);
+            self.asm.bind_text_label(drive);
+            self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rbx, 1);
+            self.asm.cmp_reg_imm8(Reg::Rax, b':' as i8);
+            self.asm.jcc_label(Condition::NotEqual, scan);
+            self.asm.mov_imm64(Reg::R8, 2);
+            self.asm.movzx_byte_disp32(Reg::Rax, Reg::Rbx, 2);
+            let after_drive = self.asm.create_text_label();
+            for separator in *b"/\\" {
+                self.asm.cmp_reg_imm8(Reg::Rax, separator as i8);
+                self.asm.jcc_label(Condition::Equal, after_drive);
+            }
+            self.asm.jmp_label(scan);
+            self.asm.bind_text_label(after_drive);
+            self.asm.inc_reg(Reg::R8);
+        }
         // Risk 4: on Windows, treat '\' as an intermediate-directory
         // separator too (alongside '/'), via a fully separate
         // prefix-handling block below so every existing Linux
@@ -23963,6 +24470,9 @@ impl NativeCodeGenerator {
 
         self.asm.bind_text_label(mkdir_final);
         self.emit_dir_mkdir_label(path_label, true, span, name);
+        if let Some(done) = empty_done {
+            self.asm.bind_text_label(done);
+        }
     }
 
     fn emit_dir_delete(&mut self, path: &str, span: Span, name: &str) {
@@ -23976,9 +24486,13 @@ impl NativeCodeGenerator {
         }
         self.asm.mov_data_addr(Reg::Rdi, path_label);
         if self.is_windows {
+            self.emit_generational_native_transition(true);
             self.asm.call_label(self.windows_runtime().win_rmdir);
+            self.emit_generational_native_transition(false);
         } else {
+            self.emit_generational_native_transition(true);
             self.asm.syscall();
+            self.emit_generational_native_transition(false);
         }
         self.emit_runtime_error_if_rax_negative(
             span,
@@ -24005,9 +24519,13 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::Rdi, source_label);
         self.asm.mov_data_addr(Reg::Rsi, target_label);
         if self.is_windows {
+            self.emit_generational_native_transition(true);
             self.asm.call_label(self.windows_runtime().win_move);
+            self.emit_generational_native_transition(false);
         } else {
+            self.emit_generational_native_transition(true);
             self.asm.syscall();
+            self.emit_generational_native_transition(false);
         }
         self.emit_runtime_error_if_rax_negative(span, &format!("{name} failed to move path"));
     }
@@ -24201,8 +24719,7 @@ impl NativeCodeGenerator {
             RuntimeRecordField::Static(value) => Ok(self.emit_static_value(&value)),
             RuntimeRecordField::Runtime(value) => Ok(value),
             RuntimeRecordField::Scalar { value, slot } => {
-                self.asm.mov_data_addr(Reg::R10, slot);
-                self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                self.emit_load_literal_slot(Reg::Rax, slot);
                 Ok(value)
             }
         }
@@ -24795,15 +25312,16 @@ impl NativeCodeGenerator {
                 "native if record branches with incompatible scalar fields",
             ));
         }
-        self.asm.mov_data_addr(Reg::R10, slot);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.emit_load_literal_slot(Reg::Rax, slot);
         self.emit_store_rax_to_data_slot(*output_slot);
         Ok(())
     }
 
     fn emit_store_rax_to_data_slot(&mut self, slot: DataLabel) {
         self.asm.mov_data_addr(Reg::R10, slot);
-        self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        if !self.emit_store_literal_root(slot) {
+            self.asm.store_ptr_disp32(Reg::R10, 0, Reg::Rax);
+        }
     }
 
     fn record_value_matches_runtime_record_shape(
@@ -27532,6 +28050,39 @@ impl NativeCodeGenerator {
             .ok_or_else(|| unsupported(span, &format!("native {name} for non-static string")))
     }
 
+    fn compile_rooted_native_paths(
+        &mut self,
+        arguments: &[Expr],
+        span: Span,
+        name: &str,
+    ) -> Result<[(DataLabel, Option<String>); 2], Diagnostic> {
+        // A recursive target expression can reuse this callsite's
+        // native staging buffers. Retain both strings as managed
+        // roots until argument evaluation is finished, then stage.
+        let mut slots = Vec::new();
+        let mut known = Vec::new();
+        for argument in arguments {
+            let value = self.compile_expr(argument)?;
+            known.push(
+                self.static_value_from_native(value)
+                    .and_then(|v| self.static_string_from_value(&v)),
+            );
+            self.emit_heap_string_concat_fragment(value, span, &format!("{name} path"), false)?;
+            let slot = self.allocate_anonymous_slot(NativeValue::HeapPointer);
+            self.store_var_slot(slot, Reg::Rax);
+            slots.push(slot);
+        }
+        let mut paths = Vec::new();
+        for slot in slots {
+            self.load_var_slot(Reg::Rax, slot);
+            let path = self
+                .native_string_ref_or_copy(NativeValue::HeapString, span, name)
+                .expect("a rooted heap string has a native view");
+            paths.push(self.emit_nul_terminated_path_buffer(path, span, name));
+        }
+        Ok([(paths[0], known.remove(0)), (paths[1], known.remove(0))])
+    }
+
     fn compile_runtime_path_argument(
         &mut self,
         expr: &Expr,
@@ -29205,8 +29756,7 @@ impl NativeCodeGenerator {
             self.asm.mov_imm64(Reg::Rax, 0);
             return;
         };
-        self.asm.mov_data_addr(Reg::R10, slot);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.emit_load_literal_slot(Reg::Rax, slot);
         self.asm.mov_imm64(Reg::Rcx, expected);
         self.asm.cmp_reg_reg(Reg::Rax, Reg::Rcx);
         self.asm.setcc_al(Condition::Equal);
@@ -29226,10 +29776,8 @@ impl NativeCodeGenerator {
         // `%(Sm(1) Sm(1) Nn)` printed all three. `gc_deep_equal` is the same
         // routine `==` and `assertResult` use on a heap value.
         if expected_value == NativeValue::HeapPointer && actual_value == NativeValue::HeapPointer {
-            self.asm.mov_data_addr(Reg::R10, expected_slot);
-            self.asm.load_ptr_disp32(Reg::Rdi, Reg::R10, 0);
-            self.asm.mov_data_addr(Reg::R10, actual_slot);
-            self.asm.load_ptr_disp32(Reg::Rsi, Reg::R10, 0);
+            self.emit_load_literal_slot(Reg::Rdi, expected_slot);
+            self.emit_load_literal_slot(Reg::Rsi, actual_slot);
             self.asm.call_label(self.gc_deep_equal);
             return;
         }
@@ -29244,10 +29792,8 @@ impl NativeCodeGenerator {
         {
             let equal = self.asm.create_text_label();
             let done = self.asm.create_text_label();
-            self.asm.mov_data_addr(Reg::R10, expected_slot);
-            self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
-            self.asm.mov_data_addr(Reg::R10, actual_slot);
-            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+            self.emit_load_literal_slot(Reg::Rcx, expected_slot);
+            self.emit_load_literal_slot(Reg::Rax, actual_slot);
             self.asm.cmp_reg_reg(Reg::Rcx, Reg::Rax);
             self.asm.jcc_label(Condition::Equal, equal);
             // Both zero, whatever their signs?
@@ -29270,10 +29816,8 @@ impl NativeCodeGenerator {
             self.asm.mov_imm64(Reg::Rax, 0);
             return;
         }
-        self.asm.mov_data_addr(Reg::R10, expected_slot);
-        self.asm.load_ptr_disp32(Reg::Rcx, Reg::R10, 0);
-        self.asm.mov_data_addr(Reg::R10, actual_slot);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.emit_load_literal_slot(Reg::Rcx, expected_slot);
+        self.emit_load_literal_slot(Reg::Rax, actual_slot);
         self.asm.cmp_reg_reg(Reg::Rcx, Reg::Rax);
         self.asm.setcc_al(Condition::Equal);
         self.asm.movzx_rax_al();
@@ -32646,8 +33190,7 @@ impl NativeCodeGenerator {
                 self.bind_constant(binding.to_string(), value);
             }
             CompiledLiteralValue::Scalar { value, slot } => {
-                self.asm.mov_data_addr(Reg::R10, slot);
-                self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                self.emit_load_literal_slot(Reg::Rax, slot);
                 let slot = self.allocate_slot(binding.to_string(), value);
                 self.store_var_slot(slot, Reg::Rax);
             }
@@ -33332,13 +33875,13 @@ impl NativeCodeGenerator {
                 self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
                 self.asm.mov_imm64(Reg::Rsi, fd);
                 self.asm.mov_imm64(Reg::Rdx, 0);
-                self.asm.call_label(self.print_i64);
+                self.emit_print_i64_call();
             }
             NativeValue::HeapString if self.gc_gen.is_some() => {
                 let write = self
                     .gc_gen
                     .as_ref()
-                    .map(|runtime| runtime.write_heap_string)
+                    .map(|runtime| runtime.labels.write_rooted_string)
                     .expect("checked by the guard");
                 self.asm.mov_imm64(Reg::Rdi, fd);
                 self.asm.call_label(write);
@@ -33477,8 +34020,7 @@ impl NativeCodeGenerator {
         match value {
             CompiledLiteralValue::Native(value) => self.emit_print_value_fragment(fd, value, span),
             CompiledLiteralValue::Scalar { value, slot } => {
-                self.asm.mov_data_addr(Reg::R10, slot);
-                self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+                self.emit_load_literal_slot(Reg::Rax, slot);
                 self.emit_print_value_fragment(fd, value, span);
             }
         }
@@ -33595,7 +34137,7 @@ impl NativeCodeGenerator {
             self.asm.mov_reg_reg(Reg::Rdi, Reg::Rax);
             self.asm.mov_imm64(Reg::Rsi, fd);
             self.asm.mov_imm64(Reg::Rdx, 0);
-            self.asm.call_label(self.print_i64);
+            self.emit_print_i64_call();
         }
         self.emit_write_data(fd, self.list_close, 1);
     }
@@ -33678,11 +34220,7 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_data_addr(Reg::Rsi, input.data);
         self.asm.add_reg_reg(Reg::Rsi, Reg::R9);
-        if self.is_windows {
-            self.asm.call_label(self.windows_runtime().win_write);
-        } else {
-            self.asm.syscall();
-        }
+        self.emit_console_buffer_write();
     }
 
     fn emit_runtime_lines_list_to_runtime_string(
@@ -35011,11 +35549,7 @@ impl NativeCodeGenerator {
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_data_addr(Reg::Rsi, label);
         self.asm.mov_imm64(Reg::Rdx, len as u64);
-        if self.is_windows {
-            self.asm.call_label(self.windows_runtime().win_write);
-        } else {
-            self.asm.syscall();
-        }
+        self.emit_console_buffer_write();
     }
 
     fn emit_write_data_dynamic_len(&mut self, fd: u64, data: DataLabel, len: DataLabel) {
@@ -35026,11 +35560,31 @@ impl NativeCodeGenerator {
         self.asm.mov_data_addr(Reg::Rsi, data);
         self.asm.mov_data_addr(Reg::Rdx, len);
         self.asm.load_ptr_disp32(Reg::Rdx, Reg::Rdx, 0);
-        if self.is_windows {
+        self.emit_console_buffer_write();
+    }
+
+    /// Native image/stack buffers only: fd=rdi, bytes=rsi, length=rdx.
+    fn emit_console_buffer_write(&mut self) {
+        if self.gc_console_output
+            && let Some(runtime) = &self.gc_gen
+        {
+            self.asm.call_label(runtime.labels.write_native_buffer);
+        } else if self.is_windows {
             self.asm.call_label(self.windows_runtime().win_write);
         } else {
             self.asm.syscall();
         }
+    }
+
+    fn emit_print_i64_call(&mut self) {
+        let label = if self.gc_console_output {
+            self.gc_gen
+                .as_ref()
+                .map_or(self.print_i64, |r| r.print_i64_native)
+        } else {
+            self.print_i64
+        };
+        self.asm.call_label(label);
     }
 
     /// Materialize a GC heap string (length-prefixed, pointer in rax)
@@ -37110,11 +37664,7 @@ impl NativeCodeGenerator {
         }
         self.asm.mov_imm64(Reg::Rdi, fd);
         self.asm.mov_reg_reg(Reg::Rdx, Reg::Rcx);
-        if self.is_windows {
-            self.asm.call_label(self.windows_runtime().win_write);
-        } else {
-            self.asm.syscall();
-        }
+        self.emit_console_buffer_write();
     }
 
     fn emit_bool_rax_to_runtime_string_ref(
@@ -37689,13 +38239,24 @@ impl NativeCodeGenerator {
         }
     }
 
+    /// User-requested process completion, outside collector critical sections.
+    fn emit_generational_worker_shutdown(&mut self) {
+        if let Some(runtime) = self.gc_gen.take() {
+            gc_codegen::production::shutdown_worker(self, &runtime.labels, runtime.data.runtime);
+            self.gc_gen = Some(runtime);
+        }
+    }
+
     fn emit_exit_success(&mut self) {
         self.emit_exit_code(0);
     }
 
     fn emit_runtime_error_text(&mut self, text: &str) {
         let label = self.asm.data_label_with_bytes(text.as_bytes());
+        let user_output = self.gc_console_output;
+        self.gc_console_output = false;
         self.emit_write_data(self.platform.stderr_fd(), label, text.len());
+        self.gc_console_output = user_output;
         self.emit_exit_code(1);
     }
 
@@ -38160,7 +38721,14 @@ impl NativeCodeGenerator {
     }
 
     fn emit_print_i64_runtime(&mut self) {
-        self.asm.bind_text_label(self.print_i64);
+        self.emit_print_i64_body(self.print_i64, false);
+        if let Some(runtime) = &self.gc_gen {
+            self.emit_print_i64_body(runtime.print_i64_native, true);
+        }
+    }
+
+    fn emit_print_i64_body(&mut self, entry: TextLabel, native: bool) {
+        self.asm.bind_text_label(entry);
         self.asm.push_reg(Reg::Rbp);
         self.asm.mov_reg_reg(Reg::Rbp, Reg::Rsp);
         self.asm.sub_reg_imm8(Reg::Rsp, 48);
@@ -38213,7 +38781,10 @@ impl NativeCodeGenerator {
         }
         self.asm.mov_reg_reg(Reg::Rdi, Reg::R10);
         self.asm.mov_reg_reg(Reg::Rdx, Reg::Rcx);
-        if self.is_windows {
+        if native {
+            let label = self.gc_gen.as_ref().unwrap().labels.write_native_buffer;
+            self.asm.call_label(label);
+        } else if self.is_windows {
             self.asm.call_label(self.windows_runtime().win_write);
         } else {
             self.asm.syscall();
@@ -38442,9 +39013,13 @@ impl NativeCodeGenerator {
         // rax = bytes written, read back from the scratch DWORD
         // (allocated as a zero-initialized qword, so the untouched
         // high 32 bits keep this a correct zero-extended value).
-        self.asm
-            .mov_data_addr(Reg::R10, windows.write_bytes_scratch);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        if self.gc_generational {
+            self.emit_win_io_count_result(windows.write_bytes_scratch);
+        } else {
+            self.asm
+                .mov_data_addr(Reg::R10, windows.write_bytes_scratch);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        }
 
         self.emit_win_shim_epilogue();
     }
@@ -38567,14 +39142,34 @@ impl NativeCodeGenerator {
 
         let ok = self.asm.create_text_label();
         let done = self.asm.create_text_label();
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::NotEqual, ok);
+        if self.gc_generational {
+            let failed = self.asm.create_text_label();
+            let eof = self.asm.create_text_label();
+            self.asm.call_import(ImportSymbol::GetLastError);
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.cmp_reg_imm32(Reg::Rax, 109); // ERROR_BROKEN_PIPE
+            self.asm.jcc_label(Condition::Equal, eof);
+            self.asm.cmp_reg_imm32(Reg::Rax, 38); // ERROR_HANDLE_EOF
+            self.asm.jcc_label(Condition::NotEqual, failed);
+            self.asm.bind_text_label(eof);
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.jmp_label(done);
+            self.asm.bind_text_label(failed);
+        }
         self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
         self.asm.jmp_label(done);
         self.asm.bind_text_label(ok);
         self.asm
             .mov_data_addr(Reg::R10, windows.stdin_bytes_read_scratch);
         self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
         self.asm.bind_text_label(done);
 
         self.emit_win_shim_epilogue();
@@ -38728,9 +39323,15 @@ impl NativeCodeGenerator {
         let no_entry = self.asm.create_text_label();
         let exists = self.asm.create_text_label();
         let done = self.asm.create_text_label();
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::NotEqual, ok);
         self.asm.call_import(ImportSymbol::GetLastError);
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
         self.asm.cmp_reg_imm32(Reg::Rax, ERROR_FILE_NOT_FOUND);
         self.asm.jcc_label(Condition::Equal, no_entry);
         self.asm.cmp_reg_imm32(Reg::Rax, ERROR_PATH_NOT_FOUND);
@@ -38844,11 +39445,18 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rdx, Reg::Rdi); // lpBuffer
         self.emit_win_shim_align_stack(0x20); // shadow space only
         self.asm.call_import(ImportSymbol::GetCurrentDirectoryA);
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
 
         let fail = self.asm.create_text_label();
         let done = self.asm.create_text_label();
         self.asm.cmp_reg_imm8(Reg::Rax, 0);
         self.asm.jcc_label(Condition::Equal, fail);
+        if self.gc_generational {
+            self.asm.cmp_reg_reg(Reg::Rax, Reg::Rsi);
+            self.asm.jcc_label(Condition::AboveOrEqual, fail);
+        }
         // GetCurrentDirectoryA returns length **excl.** NUL;
         // absorb the delta from the reused Linux `Getcwd` syscall's
         // "len incl. NUL" convention here so `emit_dir_current`'s
@@ -38918,6 +39526,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi); // lpFileName
         self.emit_win_shim_align_stack(0x20); // shadow space only
         self.asm.call_import(ImportSymbol::GetFileAttributesA);
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
 
         // rax = zero-extended DWORD result. Compare against a
         // register holding the zero-extended sentinel (not a
@@ -38932,6 +39543,9 @@ impl NativeCodeGenerator {
 
         self.asm.bind_text_label(invalid);
         self.asm.call_import(ImportSymbol::GetLastError);
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
         let no_entry = self.asm.create_text_label();
         self.asm.cmp_reg_imm32(Reg::Rax, ERROR_FILE_NOT_FOUND);
         self.asm.jcc_label(Condition::Equal, no_entry);
@@ -38975,6 +39589,9 @@ impl NativeCodeGenerator {
         self.asm.cmp_reg_imm8(Reg::Rax, -1);
         self.asm.jcc_label(Condition::NotEqual, done);
         self.asm.call_import(ImportSymbol::GetLastError);
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
         self.asm.cmp_reg_imm32(Reg::Rax, 2); // ERROR_FILE_NOT_FOUND
         self.asm.jcc_label(Condition::Equal, no_entry);
         self.asm.cmp_reg_imm32(Reg::Rax, 3); // ERROR_PATH_NOT_FOUND
@@ -38990,13 +39607,10 @@ impl NativeCodeGenerator {
 
     /// `FindNextFileA(hFindFile, lpFindFileData)`-shaped shim. Input:
     /// rdi=handle, rsi=`WIN32_FIND_DATAA*` (overwritten with the next
-    /// matching entry as a side effect). Output: rax=BOOL, straight
-    /// from `FindNextFileA`'s own zero-extended 32-bit return -- 0
-    /// means enumeration is finished (whether because there are no
-    /// more files or because of a genuine I/O error; this shim does
-    /// not distinguish the two, matching the "loop until 0" contract
-    /// the Linux `getdents64` loop also follows), nonzero means
-    /// `lpFindFileData` holds a fresh entry.
+    /// matching entry as a side effect). Legacy output is the API BOOL.
+    /// Generational output is zero-extended BOOL on success, zero for
+    /// ERROR_NO_MORE_FILES, or -1 for another error. Result decoding
+    /// occurs after the caller restores Running.
     fn emit_win_find_next_file_runtime(&mut self) {
         let windows = self.windows_runtime();
         self.asm.bind_text_label(windows.win_find_next_file);
@@ -39009,12 +39623,29 @@ impl NativeCodeGenerator {
         self.emit_win_shim_align_stack(0x20); // shadow space only
         self.asm.call_import(ImportSymbol::FindNextFileA);
 
+        if self.gc_generational {
+            let done = self.asm.create_text_label();
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.jcc_label(Condition::NotEqual, done);
+            self.asm.call_import(ImportSymbol::GetLastError);
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+            self.asm.cmp_reg_imm32(Reg::Rax, 18); // ERROR_NO_MORE_FILES
+            let failed = self.asm.create_text_label();
+            self.asm.jcc_label(Condition::NotEqual, failed);
+            self.asm.mov_imm64(Reg::Rax, 0);
+            self.asm.jmp_label(done);
+            self.asm.bind_text_label(failed);
+            self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+            self.asm.bind_text_label(done);
+        }
+
         self.emit_win_shim_epilogue();
     }
 
     /// `FindClose(hFindFile)`-shaped shim. Input: rdi=handle. Return
-    /// value ignored, mirroring the Linux path's unchecked `close` on
-    /// the directory fd at the end of `Dir#list`/`Dir#listFull`.
+    /// value is ignored by legacy callers. Generational callers check
+    /// normalized zero/-errno after restoring Running, like Linux close.
     fn emit_win_find_close_runtime(&mut self) {
         let windows = self.windows_runtime();
         self.asm.bind_text_label(windows.win_find_close);
@@ -39025,6 +39656,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi);
         self.emit_win_shim_align_stack(0x20); // shadow space only
         self.asm.call_import(ImportSymbol::FindClose);
+        if self.gc_generational {
+            self.emit_win_normalize_bool_result();
+        }
 
         self.emit_win_shim_epilogue();
     }
@@ -39106,6 +39740,11 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi); // lpName
         self.emit_win_shim_align_stack(0x20); // shadow space only
         self.asm.call_import(ImportSymbol::GetEnvironmentVariableA);
+        if self.gc_generational {
+            // DWORD upper bits are unspecified. Keep the legacy image bytes
+            // stable while the generational path normalizes the API result.
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
 
         let zero_result = self.asm.create_text_label();
         let too_small = self.asm.create_text_label();
@@ -39120,6 +39759,9 @@ impl NativeCodeGenerator {
 
         self.asm.bind_text_label(zero_result);
         self.asm.call_import(ImportSymbol::GetLastError);
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
         self.asm.cmp_reg_imm32(Reg::Rax, ERROR_ENVVAR_NOT_FOUND);
         self.asm.jcc_label(Condition::Equal, not_found);
         // 0 without ERROR_ENVVAR_NOT_FOUND: an empty-valued variable
@@ -39205,9 +39847,26 @@ impl NativeCodeGenerator {
         self.emit_win_shim_epilogue();
     }
 
-    /// `read(fd, buf, cap)`-shaped shim wrapping `ReadFile`, the twin
-    /// of `win_write`. Input: rdi=HANDLE, rsi=buf, rdx=cap. Output:
-    /// rax=bytes read, read back from `read_bytes_scratch`.
+    /// BOOL and DWORD outputs are distinct results. Ignore unspecified upper
+    /// bits, and never consume a successful/stale count after native failure.
+    fn emit_win_io_count_result(&mut self, scratch: DataLabel) {
+        let failed = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.cmp_reg_imm8(Reg::Rax, 0);
+        self.asm.jcc_label(Condition::Equal, failed);
+        self.asm.mov_data_addr(Reg::R10, scratch);
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        self.asm.jmp_label(done);
+        self.asm.bind_text_label(failed);
+        self.asm.mov_imm64(Reg::Rax, (-1i64) as u64);
+        self.asm.bind_text_label(done);
+    }
+
+    /// `read(fd, buf, cap)`-shaped `ReadFile` shim. Input:
+    /// rdi=HANDLE, rsi=buf, rdx=cap; output rax=count or -1 on failure
+    /// for generational mode (legacy retains its emitted behavior).
     fn emit_win_read_runtime(&mut self) {
         let windows = self.windows_runtime();
         self.asm.bind_text_label(windows.win_read);
@@ -39226,8 +39885,12 @@ impl NativeCodeGenerator {
         self.asm.store_ptr_disp32(Reg::Rsp, 0x20, Reg::R10); // lpOverlapped = NULL
         self.asm.call_import(ImportSymbol::ReadFile);
 
-        self.asm.mov_data_addr(Reg::R10, windows.read_bytes_scratch);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        if self.gc_generational {
+            self.emit_win_io_count_result(windows.read_bytes_scratch);
+        } else {
+            self.asm.mov_data_addr(Reg::R10, windows.read_bytes_scratch);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        }
         self.emit_win_shim_epilogue();
     }
 
@@ -39253,18 +39916,21 @@ impl NativeCodeGenerator {
         self.asm.store_ptr_disp32(Reg::Rsp, 0x20, Reg::R10); // lpOverlapped = NULL
         self.asm.call_import(ImportSymbol::WriteFile);
 
-        self.asm
-            .mov_data_addr(Reg::R10, windows.write_bytes_scratch);
-        self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        if self.gc_generational {
+            self.emit_win_io_count_result(windows.write_bytes_scratch);
+        } else {
+            self.asm
+                .mov_data_addr(Reg::R10, windows.write_bytes_scratch);
+            self.asm.load_ptr_disp32(Reg::Rax, Reg::R10, 0);
+        }
         self.emit_win_shim_epilogue();
     }
 
     /// `close(fd)`-shaped shim wrapping `CloseHandle`. Input:
     /// rdi=HANDLE. Output: rax=0 on success, or -1 on failure --
     /// normalized from `CloseHandle`'s BOOL 0(fail)/nonzero(success)
-    /// return so the "negative = error" convention holds even though
-    /// nothing currently checks this shim's result (Linux `Close` call
-    /// sites are fire-and-forget too).
+    /// return. Generational file callers check this result after
+    /// returning to Running.
     fn emit_win_close_handle_runtime(&mut self) {
         let windows = self.windows_runtime();
         self.asm.bind_text_label(windows.win_close_handle);
@@ -39275,6 +39941,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi); // hObject
         self.emit_win_shim_align_stack(0x20);
         self.asm.call_import(ImportSymbol::CloseHandle);
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
 
         let failed = self.asm.create_text_label();
         let done = self.asm.create_text_label();
@@ -39304,6 +39973,9 @@ impl NativeCodeGenerator {
         self.asm.mov_reg_reg(Reg::Rcx, Reg::Rdi); // lpFileName
         self.emit_win_shim_align_stack(0x20);
         self.asm.call_import(ImportSymbol::DeleteFileA);
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
 
         let failed = self.asm.create_text_label();
         let done = self.asm.create_text_label();
@@ -39333,6 +40005,9 @@ impl NativeCodeGenerator {
     /// `emit_runtime_error_if_rax_negative[_except_errno]` call site
     /// can then stay target-agnostic.
     fn emit_win_translate_last_error_to_errno(&mut self) {
+        if self.gc_generational {
+            self.asm.mov_u32_reg_reg(Reg::Rax, Reg::Rax);
+        }
         let no_entry = self.asm.create_text_label();
         let check_exists = self.asm.create_text_label();
         let exists = self.asm.create_text_label();
@@ -39609,7 +40284,8 @@ impl NativeCodeGenerator {
     /// Create the M-G1 labels and data (`--gc=generational`).
     fn prepare_generational_runtime(&mut self) {
         use gc_codegen::production::{
-            Backend, Data, FAIL_TEXT, Labels, OLD_FULL_TEXT, OOM_TEXT, TOO_LARGE_TEXT,
+            Backend, Data, FAIL_TEXT, Labels, METADATA_OOM_TEXT, NATIVE_OOM_TEXT, OLD_FULL_TEXT,
+            OOM_TEXT, RELOCATION_OOM_TEXT, TOO_LARGE_TEXT,
         };
         let map = self.asm.create_text_label();
         // Every allocation site calls `gc_alloc`; M-G1 binds its allocator
@@ -39621,32 +40297,57 @@ impl NativeCodeGenerator {
             field_store: self.gc_store_pointer,
             deep_equal: self.gc_deep_equal,
             literals: self.asm.create_text_label(),
+            raw_roots: false,
         };
         let mut labels = Labels::new(|| self.asm.create_text_label(), map, alloc, backend);
-        if !self.is_windows {
-            // M-G6: relocation runs on a GC worker thread (clone + futex).
-            let hooks = gc_codegen::production::WorkerHooks {
-                spawn: self.asm.create_text_label(),
-                park: self.asm.create_text_label(),
-                unpark: self.asm.create_text_label(),
-                relax: self.asm.create_text_label(),
-            };
-            labels = labels.with_worker(hooks, || self.asm.create_text_label());
-            // A second thread outlives `exit`; every exit must end the group.
-            self.gc_worker_thread = true;
-        }
+        let join_enabled = true;
+        #[cfg(test)]
+        let join_enabled =
+            join_enabled && (self.is_windows || !self.gc_test.is_some_and(|t| t.no_worker_thread));
+        let hooks = gc_codegen::production::WorkerHooks {
+            spawn: self.asm.create_text_label(),
+            park: self.asm.create_text_label(),
+            unpark: self.asm.create_text_label(),
+            relax: self.asm.create_text_label(),
+            clock: self.asm.create_text_label(),
+            // Controlled harnesses have no OS worker resources; some simulate
+            // liveness for individual controller transitions. Do not allocate
+            // a join label in that case: every allocated label must be bound.
+            join: join_enabled.then(|| self.asm.create_text_label()),
+        };
+        labels = labels.with_worker(hooks, || self.asm.create_text_label());
+        // Linux needs exit_group; Windows' ExitProcess already ends all threads.
+        self.gc_worker_thread = !self.is_windows;
         let data = Data {
             runtime: self.asm.data_label_with_bytes(&[0; 8]),
             fail_text: self.asm.data_label_with_bytes(FAIL_TEXT),
             oom_text: self.asm.data_label_with_bytes(OOM_TEXT),
+            native_oom_text: self.asm.data_label_with_bytes(NATIVE_OOM_TEXT),
+            heap_commit_failed_text: self
+                .asm
+                .data_label_with_bytes(gc_codegen::production::HEAP_COMMIT_FAILED_TEXT),
+            large_pages_failed_text: self
+                .asm
+                .data_label_with_bytes(gc_codegen::production::LARGE_PAGES_FAILED_TEXT),
+            heap_decommit_failed_text: self
+                .asm
+                .data_label_with_bytes(gc_codegen::production::HEAP_DECOMMIT_FAILED_TEXT),
+            metadata_release_failed_text: self
+                .asm
+                .data_label_with_bytes(gc_codegen::production::METADATA_RELEASE_FAILED_TEXT),
+            metadata_oom_text: self.asm.data_label_with_bytes(METADATA_OOM_TEXT),
+            metadata_budget_oom_text: self
+                .asm
+                .data_label_with_bytes(gc_codegen::production::METADATA_BUDGET_OOM_TEXT),
+            relocation_oom_text: self.asm.data_label_with_bytes(RELOCATION_OOM_TEXT),
             too_large_text: self.asm.data_label_with_bytes(TOO_LARGE_TEXT),
             old_full_text: self.asm.data_label_with_bytes(OLD_FULL_TEXT),
         };
-        let write_heap_string = self.asm.create_text_label();
+        let print_i64_native = self.asm.create_text_label();
         self.gc_gen = Some(GenerationalRuntime {
             labels,
             data,
-            write_heap_string,
+            print_i64_native,
         });
     }
 
@@ -39672,151 +40373,101 @@ impl NativeCodeGenerator {
         } else {
             gc_codegen::native_metadata::emit_linux_map(self);
         }
+        gc_codegen::heap_memory::emit(self, &runtime.labels.memory);
+        gc_codegen::thread_tls::emit(self, &runtime.labels.tls_os);
         if let (Some(hooks), Some(entry)) =
             (runtime.labels.worker_hooks(), runtime.labels.worker_entry())
         {
-            let (spawn, park, unpark) = (hooks.spawn, hooks.park, hooks.unpark);
-            let relax = hooks.relax;
-            self.emit_generational_worker_leaves(spawn, park, unpark, entry, runtime.labels.map);
-            // relax: sched_yield, keeping every register.
-            self.asm.bind_text_label(relax);
-            for reg in [Reg::Rax, Reg::Rcx, Reg::R11] {
-                self.asm.push_reg(reg);
+            if self.is_windows {
+                gc_codegen::windows_production::emit(self, hooks, entry);
+            } else {
+                gc_codegen::linux_production::emit(self, hooks, entry);
             }
-            self.asm.mov_imm64(Reg::Rax, 24);
-            self.asm.syscall();
-            for reg in [Reg::R11, Reg::Rcx, Reg::Rax] {
-                self.asm.pop_reg(reg);
-            }
-            self.asm.ret();
         }
         let stderr_fd = self.platform.stderr_fd();
         let stress = self.gc_stress;
         gc_codegen::production::emit(self, &runtime.labels, &runtime.data, stderr_fd, stress);
-        self.emit_generational_write_heap_string(runtime.write_heap_string, runtime.data.runtime);
         self.gc_gen = Some(runtime);
     }
 
-    /// Linux leaves for the `--gc=generational` worker thread.
-    /// `spawn`: `() -> rax = 1` when a thread now runs `entry` on a fresh
-    /// mapped stack (`clone` with a shared address space), else 0; keeps rbx.
-    /// `park`: `futex(FUTEX_WAIT_PRIVATE)` on (rdi = u32 address, rsi =
-    /// expected). `unpark`: `futex(FUTEX_WAKE_PRIVATE, 1)` on rdi.
-    fn emit_generational_worker_leaves(
-        &mut self,
-        spawn: TextLabel,
-        park: TextLabel,
-        unpark: TextLabel,
-        entry: TextLabel,
-        map: TextLabel,
-    ) {
-        const STACK: u64 = 256 << 10;
-        // CLONE_VM | FS | FILES | SIGHAND | THREAD | SYSVSEM
-        const FLAGS: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x40000;
-        let failed = self.asm.create_text_label();
-        let child = self.asm.create_text_label();
-        self.asm.bind_text_label(spawn);
-        #[cfg(test)]
-        if self.gc_test.is_some_and(|test| test.no_worker_thread) {
-            // Harness: a worker-build runtime whose worker never starts.
-            self.asm.mov_imm64(Reg::Rax, 0);
-            self.asm.ret();
-        }
-        self.asm.push_reg(Reg::Rbx);
-        self.asm.mov_imm64(Reg::Rdi, STACK);
-        self.asm.call_label(map);
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, failed);
-        self.asm.mov_reg_reg(Reg::Rsi, Reg::Rax);
-        self.asm.add_reg_imm32(Reg::Rsi, STACK as i32);
-        self.asm.mov_imm64(Reg::Rdi, FLAGS);
-        self.asm.mov_imm64(Reg::Rdx, 0);
-        self.asm.mov_imm64(Reg::R10, 0);
-        self.asm.mov_imm64(Reg::R8, 0);
-        self.asm.mov_imm64(Reg::Rax, 56); // clone
-        self.asm.syscall();
-        self.asm.test_reg_reg(Reg::Rax, Reg::Rax);
-        self.asm.jcc_label(Condition::Equal, child);
-        self.asm.jcc_label(Condition::Less, failed);
-        self.asm.mov_imm64(Reg::Rax, 1);
-        self.asm.pop_reg(Reg::Rbx);
-        self.asm.ret();
-        self.asm.bind_text_label(failed);
-        self.asm.mov_imm64(Reg::Rax, 0);
-        self.asm.pop_reg(Reg::Rbx);
-        self.asm.ret();
-        // The child starts on the empty new stack with the parent's
-        // registers; it never returns.
-        self.asm.bind_text_label(child);
-        self.asm.jmp_label(entry);
-        for (label, op, value) in [(park, 128u64, None), (unpark, 129u64, Some(1u64))] {
-            self.asm.bind_text_label(label);
-            if let Some(count) = value {
-                self.asm.mov_imm64(Reg::Rdx, count);
-            } else {
-                self.asm.mov_reg_reg(Reg::Rdx, Reg::Rsi);
-            }
-            self.asm.mov_imm64(Reg::Rsi, op);
-            self.asm.mov_imm64(Reg::R10, 0);
-            self.asm.mov_imm64(Reg::Rax, 202); // futex
-            self.asm.syscall();
-            self.asm.ret();
+    /// Write one retained record using the cursor in R14.
+    fn emit_generational_trace_fields(&mut self, header_bytes: &[u8], fields: &[(&[u8], i32)]) {
+        let header = self.asm.data_label_with_bytes(header_bytes);
+        self.emit_write_data(self.platform.stderr_fd(), header, header_bytes.len());
+        for &(name, offset) in fields {
+            let label = self.asm.data_label_with_bytes(name);
+            self.emit_write_data(self.platform.stderr_fd(), label, name.len());
+            self.asm.load_ptr_disp32(Reg::Rdi, Reg::R14, offset);
+            self.asm.mov_imm64(Reg::Rsi, self.platform.stderr_fd());
+            self.asm.mov_imm64(Reg::Rdx, 0);
+            self.emit_print_i64_call();
         }
     }
 
-    /// `write(fd, bytes)` for a heap string without handing the kernel a
-    /// managed address: copy at most `COPY_OUT_BYTES` at a time into the
-    /// runtime's native buffer and write from there. Like the legacy path it
-    /// issues one `write` per chunk. rax = payload, rdi = fd.
-    fn emit_generational_write_heap_string(&mut self, entry: TextLabel, runtime: DataLabel) {
-        use gc_codegen::production::{COPY_OUT_BYTES, copy_out_offset};
-        let chunk = self.asm.create_text_label();
-        let sized = self.asm.create_text_label();
-        let done = self.asm.create_text_label();
-        self.asm.bind_text_label(entry);
-        self.asm.push_reg(Reg::Rbx);
-        self.asm.push_reg(Reg::R12);
+    /// Flush sole-owner records after verify/finish, outside the collector lock.
+    fn emit_generational_trace_report(&mut self, cell: DataLabel) {
+        use gc_codegen::production::trace;
+        if self.gc_log_format != GcLogFormat::Json {
+            return;
+        }
         self.asm.push_reg(Reg::R13);
-        self.asm.mov_reg_reg(Reg::R12, Reg::Rdi);
-        self.asm.load_ptr_disp32(Reg::R13, Reg::Rax, 0);
-        self.asm.mov_reg_reg(Reg::Rbx, Reg::Rax);
-        self.asm.add_reg_imm32(Reg::Rbx, 8);
-        self.asm.bind_text_label(chunk);
+        self.asm.push_reg(Reg::R14);
+        self.asm.mov_data_addr(Reg::R14, cell);
+        self.asm.load_ptr_disp32(Reg::R14, Reg::R14, 0);
+        self.asm
+            .load_ptr_disp32(Reg::R13, Reg::R14, trace::COUNT as i32);
+        self.asm.add_reg_imm32(Reg::R14, trace::buffer_offset(self));
+        let again = self.asm.create_text_label();
+        let done = self.asm.create_text_label();
+        self.asm.bind_text_label(again);
         self.asm.test_reg_reg(Reg::R13, Reg::R13);
         self.asm.jcc_label(Condition::Equal, done);
-        self.asm.mov_imm64(Reg::Rcx, COPY_OUT_BYTES);
-        self.asm.cmp_reg_reg(Reg::R13, Reg::Rcx);
-        self.asm.jcc_label(Condition::AboveOrEqual, sized);
-        self.asm.mov_reg_reg(Reg::Rcx, Reg::R13);
-        self.asm.bind_text_label(sized);
-        self.asm.mov_reg_reg(Reg::Rsi, Reg::Rbx);
-        self.asm.mov_data_addr(Reg::Rdi, runtime);
-        self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rdi, 0);
-        self.asm.add_reg_imm32(Reg::Rdi, copy_out_offset());
-        self.asm.mov_reg_reg(Reg::Rdx, Reg::Rcx);
-        self.asm.add_reg_reg(Reg::Rbx, Reg::Rcx);
-        self.asm.sub_reg_reg(Reg::R13, Reg::Rcx);
-        self.asm.rep_movsb();
-        self.asm.mov_data_addr(Reg::Rsi, runtime);
-        self.asm.load_ptr_disp32(Reg::Rsi, Reg::Rsi, 0);
-        self.asm.add_reg_imm32(Reg::Rsi, copy_out_offset());
-        self.asm.mov_reg_reg(Reg::Rdi, Reg::R12);
-        if self.is_windows {
-            self.asm.call_label(self.windows_runtime().win_write);
-        } else {
-            self.emit_syscall_number(PlatformSyscall::Write);
-            self.asm.syscall();
-        }
-        self.asm.jmp_label(chunk);
+        let timer = self.asm.create_text_label();
+        let rendezvous = self.asm.create_text_label();
+        let park = self.asm.create_text_label();
+        let written = self.asm.create_text_label();
+        self.asm.load_ptr_disp32(Reg::Rax, Reg::R14, 24);
+        self.asm
+            .cmp_reg_imm8(Reg::Rax, gc_codegen::production::mutator_time::TAG as i8);
+        self.asm.jcc_label(Condition::Equal, timer);
+        self.asm
+            .cmp_reg_imm8(Reg::Rax, gc_codegen::production::rendezvous_time::TAG as i8);
+        self.asm.jcc_label(Condition::Equal, rendezvous);
+        self.asm.cmp_reg_imm8(
+            Reg::Rax,
+            gc_codegen::production::rendezvous_time::PARK_TAG as i8,
+        );
+        self.asm.jcc_label(Condition::Equal, park);
+        self.emit_generational_trace_fields(trace::HEADER, &trace::FIELDS);
+        self.asm.jmp_label(written);
+        self.asm.bind_text_label(timer);
+        self.emit_generational_trace_fields(
+            gc_codegen::production::mutator_time::HEADER,
+            &gc_codegen::production::mutator_time::FIELDS,
+        );
+        self.asm.jmp_label(written);
+        self.asm.bind_text_label(rendezvous);
+        self.emit_generational_trace_fields(
+            gc_codegen::production::rendezvous_time::HEADER,
+            &gc_codegen::production::rendezvous_time::FIELDS,
+        );
+        self.asm.jmp_label(written);
+        self.asm.bind_text_label(park);
+        self.emit_generational_trace_fields(
+            gc_codegen::production::rendezvous_time::PARK_HEADER,
+            &gc_codegen::production::rendezvous_time::PARK_FIELDS,
+        );
+        self.asm.bind_text_label(written);
+        let end = self.asm.data_label_with_bytes(b"}\n");
+        self.emit_write_data(self.platform.stderr_fd(), end, 2);
+        self.asm.add_reg_imm32(Reg::R14, trace::RECORD_BYTES as i32);
+        self.asm.dec_reg(Reg::R13);
+        self.asm.jmp_label(again);
         self.asm.bind_text_label(done);
+        self.asm.pop_reg(Reg::R14);
         self.asm.pop_reg(Reg::R13);
-        self.asm.pop_reg(Reg::R12);
-        self.asm.pop_reg(Reg::Rbx);
-        self.asm.ret();
     }
 
-    /// `--gc-log` under `--gc=generational`: publish the pending object,
-    /// walk the current semispace, and print collections and what it holds.
     fn emit_generational_log_report(&mut self) {
         let Some(runtime) = &self.gc_gen else {
             return;
@@ -39825,11 +40476,38 @@ impl NativeCodeGenerator {
         let cell = runtime.data.runtime;
         self.asm.call_label(verify);
         let stats = gc_codegen::production::stat_offsets();
-        let worker = self.gc_worker_thread;
-        let text = b"gc[generational]:";
+        let worker = runtime.labels.worker_hooks().is_some();
+        self.emit_generational_trace_report(cell);
+        let text = self.gc_log_format.header();
         let label = self.asm.data_label_with_bytes(text);
         self.emit_write_data(self.platform.stderr_fd(), label, text.len());
         for (name, offset) in [
+            (&b" trace_events="[..], stats.trace[0]),
+            (&b" trace_dropped="[..], stats.trace[1]),
+            (&b" trace_clock_invalid="[..], stats.trace[2]),
+            (&b" trace_capacity="[..], stats.trace[3]),
+            (&b" native_io_entries="[..], stats.native_io[0]),
+            (&b" native_io_exits="[..], stats.native_io[1]),
+            (&b" native_copyout_chunks="[..], stats.native_io[2]),
+            (&b" native_buffer_writes="[..], stats.native_io[3]),
+            (&b" mutator_collect_calls="[..], stats.mutator_time[0]),
+            (&b" mutator_collect_valid="[..], stats.mutator_time[1]),
+            (&b" mutator_collect_invalid="[..], stats.mutator_time[2]),
+            (&b" mutator_collect_total_ns="[..], stats.mutator_time[3]),
+            (&b" mutator_collect_max_ns="[..], stats.mutator_time[4]),
+            (&b" mutator_collect_last_ns="[..], stats.mutator_time[5]),
+            (
+                &b" mutator_collect_clock_invalid="[..],
+                stats.mutator_time[6],
+            ),
+            (&b" mutator_collect_last_status="[..], stats.mutator_time[7]),
+            (&b" large_allocations="[..], stats.large_object[0]),
+            (&b" large_allocated_bytes="[..], stats.large_object[1]),
+            (&b" large_allocation_retries="[..], stats.large_object[2]),
+            (&b" large_live_pages="[..], stats.large_object[3]),
+            (&b" large_reclaimed_pages="[..], stats.large_object[4]),
+            (&b" large_scanned_fields="[..], stats.large_object[5]),
+            (&b" large_full_cycles="[..], stats.large_object[6]),
             (&b" collections="[..], stats.collections),
             (&b" full_collections="[..], stats.full_collections),
             (&b" healed="[..], stats.healed),
@@ -39852,24 +40530,159 @@ impl NativeCodeGenerator {
             (&b" remset_flips="[..], stats.remset_flips),
             (&b" remset_flipped="[..], stats.remset_flipped),
             (&b" remset_kept="[..], stats.remset_kept),
+            (&b" allocation_stalls="[..], stats.allocation_stalls),
+            (&b" fresh_allocated_bytes="[..], stats.fresh_allocated_bytes),
+            (&b" old_prediction_clamps="[..], stats.old_prediction_clamps),
+            (&b" young_mark_elapsed_ns="[..], stats.young_mark_elapsed_ns),
+            (&b" heap_min_committed_bytes="[..], stats.heap_minimum),
+            (&b" heap_initial_committed_bytes="[..], stats.heap_minimum),
+            (
+                &b" heap_uncommit_delay_ns="[..],
+                stats.heap_uncommit_delay_ns,
+            ),
+            (&b" heap_committed_bytes="[..], stats.heap_committed),
+            (&b" heap_peak_committed_bytes="[..], stats.heap_peak),
+            (&b" heap_commit_pages="[..], stats.heap_commits),
+            (&b" heap_recommit_pages="[..], stats.heap_recommits),
+            (&b" heap_uncommit_pages="[..], stats.heap_uncommits),
+            (&b" heap_pretouched_bytes="[..], stats.heap_pretouched),
+            (&b" heap_large_page_mode="[..], stats.large_pages[0]),
+            (&b" heap_reservation_base="[..], stats.large_pages[1]),
+            (&b" heap_reservation_bytes="[..], stats.large_pages[2]),
+            (
+                &b" heap_large_page_advised_bytes="[..],
+                stats.large_pages[3],
+            ),
+            (
+                &b" heap_large_page_advice_failures="[..],
+                stats.large_pages[4],
+            ),
+            (
+                &b" heap_large_page_collapsed_bytes="[..],
+                stats.large_pages[5],
+            ),
+            (
+                &b" heap_large_page_collapse_failures="[..],
+                stats.large_pages[6],
+            ),
+            (&b" heap_capacity_bytes="[..], stats.heap_capacity_bytes),
+            (&b" heap_soft_max_bytes="[..], stats.heap_soft_maximum),
+            (&b" metadata_limit_bytes="[..], stats.metadata[0]),
+            (&b" metadata_initial_bytes="[..], stats.metadata[1]),
+            (&b" metadata_charged_bytes="[..], stats.metadata[2]),
+            (&b" metadata_committed_bytes="[..], stats.metadata[3]),
+            (&b" metadata_pending_bytes="[..], stats.metadata[4]),
+            (&b" metadata_peak_committed_bytes="[..], stats.metadata[5]),
+            (&b" metadata_maps="[..], stats.metadata[6]),
+            (&b" metadata_map_failures="[..], stats.metadata[7]),
+            (&b" metadata_unmaps="[..], stats.metadata[8]),
+            (&b" metadata_unmap_failures="[..], stats.metadata[9]),
+            (&b" metadata_retire_pending="[..], stats.metadata[10]),
+            (&b" old_limit_bytes="[..], stats.old_limit_bytes),
+            (&b" old_charged_bytes="[..], stats.old_charged_bytes),
+            (&b" young_limit_pages="[..], stats.young_limit_pages),
+            (&b" old_run_count="[..], stats.old_run_count),
+            (&b" old_run_switches="[..], stats.old_run_switches),
+            (&b" old_capacity_pages="[..], stats.old_capacity_pages),
+            (&b" pool_reduced_old_runs="[..], stats.pool_reduced_old_runs),
+            (&b" pool_runs="[..], stats.pool_runs),
+            (&b" pool_released_pages="[..], stats.pool_released_pages),
+            (&b" pool_role_transfers="[..], stats.pool_role_transfers),
+            (&b" young_capacity_pages="[..], stats.young_capacity_pages),
+            (&b" young_requested_pages="[..], stats.young_requested_pages),
+            (&b" young_protected_bytes="[..], stats.young_protected_bytes),
+            (
+                &b" young_copy_reserve_pages="[..],
+                stats.young_copy_reserve_pages,
+            ),
+            (&b" young_capacity_clamps="[..], stats.young_capacity_clamps),
+            (&b" young_capacity_grows="[..], stats.young_capacity_grows),
+            (
+                &b" young_capacity_shrinks="[..],
+                stats.young_capacity_shrinks,
+            ),
+            (
+                &b" young_capacity_samples="[..],
+                stats.young_capacity_samples,
+            ),
+            (&b" start_target_pages="[..], stats.start_target_pages),
+            (
+                &b" allocation_bytes_per_ms="[..],
+                stats.allocation_bytes_per_ms,
+            ),
+            (
+                &b" young_mark_units_per_ms="[..],
+                stats.young_mark_units_per_ms,
+            ),
+            (&b" start_rate_samples="[..], stats.start_rate_samples),
+            (&b" start_mark_samples="[..], stats.start_mark_samples),
+            (&b" start_target_updates="[..], stats.start_target_updates),
+            (&b" start_invalid_samples="[..], stats.start_invalid_samples),
+            (&b" last_mark_work_units="[..], stats.last_mark_work_units),
+            (&b" tenuring_threshold="[..], stats.tenuring_threshold),
+            (&b" tenuring_frozen="[..], stats.tenuring_frozen),
+            (&b" tenuring_updates="[..], stats.tenuring_updates),
+            (
+                &b" tenuring_young_samples="[..],
+                stats.tenuring_young_samples,
+            ),
+            (&b" tenuring_full_samples="[..], stats.tenuring_full_samples),
+            (&b" young_survivor_bytes="[..], stats.young_survivor_bytes),
+            (
+                &b" young_promoted_winner_bytes="[..],
+                stats.young_promoted_winner_bytes,
+            ),
+            (&b" old_target_bytes="[..], stats.old_target_bytes),
+            (&b" old_retained_bytes="[..], stats.old_retained_bytes),
+            (&b" old_promotion_ema="[..], stats.old_promotion_ema),
+            (&b" old_allocation_budget="[..], stats.old_allocation_budget),
+            (&b" old_full_samples="[..], stats.old_full_samples),
+            (&b" old_young_samples="[..], stats.old_young_samples),
+            (&b" old_target_updates="[..], stats.old_target_updates),
+            (&b" old_deferred="[..], stats.old_deferred),
+            (&b" old_periodic_requests="[..], stats.old_periodic_requests),
+            (&b" old_pressure_requests="[..], stats.old_pressure_requests),
+            (&b" old_planned_cycles="[..], stats.old_planned_cycles),
+            (&b" old_cycle_checks="[..], stats.old_cycle_checks),
+            (&b" old_cycle_retries="[..], stats.old_cycle_retries),
+            (&b" young_mark_cycles="[..], stats.young_mark_cycles),
+            (&b" young_marked="[..], stats.young_marked),
+            (&b" young_worker_units="[..], stats.young_worker_units),
+            (&b" young_mark_waits="[..], stats.young_mark_waits),
+            (&b" young_unmarked_copied="[..], stats.young_unmarked_copied),
         ]
         .into_iter()
         .enumerate()
-        // Fields 8..18 are the worker's; the remembered-set ones always show.
-        .filter(|(index, _)| worker || !(8..18).contains(index))
+        // Fields 27..37 are the worker's; the remembered-set ones always show.
+        .filter(|(index, _)| worker || !(27..37).contains(index))
         .map(|(_, field)| field)
         {
-            let label = self.asm.data_label_with_bytes(name);
+            let name = self.gc_log_format.field(name);
+            let label = self.asm.data_label_with_bytes(&name);
             self.emit_write_data(self.platform.stderr_fd(), label, name.len());
+            if offset == stats.heap_uncommit_delay_ns {
+                // Immutable configuration spans all u64 values. Render its
+                // exact decimal literal without the signed language printer.
+                let digits = self.gc_uncommit_delay_ns.to_string();
+                let value = self.asm.data_label_with_bytes(digits.as_bytes());
+                self.emit_write_data(self.platform.stderr_fd(), value, digits.len());
+                continue;
+            }
             self.asm.mov_data_addr(Reg::Rdi, cell);
             self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rdi, 0);
-            self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rdi, offset);
+            gc_codegen::production::load_diagnostic(
+                self,
+                portable_asm::Reg::V7,
+                portable_asm::Reg::V7,
+                offset,
+            );
             self.asm.mov_imm64(Reg::Rsi, self.platform.stderr_fd());
             self.asm.mov_imm64(Reg::Rdx, 0);
-            self.asm.call_label(self.print_i64);
+            self.emit_print_i64_call();
         }
-        let newline = self.asm.data_label_with_bytes(b"\n");
-        self.emit_write_data(self.platform.stderr_fd(), newline, 1);
+        let footer = self.gc_log_format.footer();
+        let newline = self.asm.data_label_with_bytes(footer);
+        self.emit_write_data(self.platform.stderr_fd(), newline, footer.len());
     }
 
     fn emit_gc_log_field(&mut self, label: &[u8], cell: DataLabel) {
@@ -39879,7 +40692,7 @@ impl NativeCodeGenerator {
         self.asm.load_ptr_disp32(Reg::Rdi, Reg::Rdi, 0);
         self.asm.mov_imm64(Reg::Rsi, self.platform.stderr_fd());
         self.asm.mov_imm64(Reg::Rdx, 0); // no leading newline
-        self.asm.call_label(self.print_i64);
+        self.emit_print_i64_call();
     }
 
     /// Emit the `--gc-log` statistics line to stderr. Called from the
@@ -40631,18 +41444,7 @@ impl NativeCodeGenerator {
     /// seeding every cell up front is safe before any of them is live.
     fn emit_literal_root_seed(&mut self) {
         let entry = self.literal_root_seed;
-        if let Some(runtime) = &self.gc_gen {
-            // --gc=generational: no shadow stack; evacuation visits each
-            // cell through `literals` and rewrites its payload address.
-            let (literals, forward) = (runtime.labels.literals, runtime.labels.forward_cell_entry);
-            self.asm.bind_text_label(entry);
-            self.asm.ret();
-            self.asm.bind_text_label(literals);
-            for cell in self.literal_root_cells.clone() {
-                self.asm.mov_data_addr(Reg::Rax, cell);
-                self.asm.call_label(forward);
-            }
-            self.asm.ret();
+        if self.emit_generational_literal_seed(entry) {
             return;
         }
         self.asm.bind_text_label(entry);
@@ -43028,12 +43830,13 @@ enum RelocKind {
 /// `ALL` -- see `pe::write_executable`), and `ImportSymbol::iat_index`
 /// derives each symbol's slot from its position in `ALL` too, so every
 /// `call [rip+disp32]` emitted by `Assembler::call_import` resolves
-/// against that same order. Adding a new imported function only ever
-/// needs a new variant, an `ALL` entry, and a `name()` arm -- nothing
-/// in `pe.rs` or `iat_index` needs to change.
+/// against that same order. New optional imports follow the fixed legacy
+/// prefix; `for_object` includes their tail only when referenced, preserving
+/// existing programs' complete import-table bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ImportSymbol {
     GetStdHandle,
+    GetCurrentThreadId,
     WriteFile,
     ExitProcess,
     VirtualAlloc,
@@ -43072,7 +43875,7 @@ enum ImportSymbol {
 }
 
 impl ImportSymbol {
-    const ALL: [ImportSymbol; 36] = [
+    const ALL: [ImportSymbol; 37] = [
         ImportSymbol::GetStdHandle,
         ImportSymbol::WriteFile,
         ImportSymbol::ExitProcess,
@@ -43109,12 +43912,15 @@ impl ImportSymbol {
         ImportSymbol::TlsGetValue,
         ImportSymbol::CreateEventA,
         ImportSymbol::SetEvent,
+        // Optional tail: preserve legacy ILT/IAT bytes when not referenced.
+        ImportSymbol::GetCurrentThreadId,
     ];
 
     /// Exact, case-sensitive export name from `kernel32.dll`.
     fn name(self) -> &'static str {
         match self {
             ImportSymbol::GetStdHandle => "GetStdHandle",
+            ImportSymbol::GetCurrentThreadId => "GetCurrentThreadId",
             ImportSymbol::WriteFile => "WriteFile",
             ImportSymbol::ExitProcess => "ExitProcess",
             ImportSymbol::VirtualAlloc => "VirtualAlloc",
@@ -43151,6 +43957,18 @@ impl ImportSymbol {
             ImportSymbol::CreateEventA => "CreateEventA",
             ImportSymbol::SetEvent => "SetEvent",
         }
+    }
+
+    /// Keep the original import prefix byte-identical for existing programs;
+    /// extend it only as far as a new optional import is actually referenced.
+    fn for_object(object: &ObjectFile) -> &'static [Self] {
+        let mut count = Self::GetCurrentThreadId.iat_index();
+        for reloc in &object.relocs {
+            if let RelocTarget::Import(symbol) = reloc.target {
+                count = count.max(symbol.iat_index() + 1);
+            }
+        }
+        &Self::ALL[..count]
     }
 
     /// This symbol's zero-based slot in the ILT/IAT arrays, derived

@@ -15,8 +15,8 @@ release bundles the runtime files beside its static musl CLI; generated programs
 link against the host GNU libc.
 
 The CLI accepts `--gc-stress`. It rejects `--gc-log` until the canonical runtime
-reports collection statistics, and rejects `--gc-poison` and non-Linux-x86-64
-targets. Executable linking also requires a Linux x86-64 host.
+reports collection statistics, and rejects `--gc-poison`, direct GC
+heap/page/timing/log-format controls, and non-Linux-x86-64 targets. Executable linking also requires a Linux x86-64 host.
 Module files are resolved beside the entry file and passed to the canonical
 frontend. Unsupported constructs receive a source-located diagnostic. Compiler,
 linker, frontend, and option errors preserve an existing executable.

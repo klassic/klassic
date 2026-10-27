@@ -44,7 +44,12 @@ fn remembered_sets_stay_bounded_under_stress_and_full_collections_discard_them()
     let expected = evaluate("remset_stress_eval", PROGRAM);
     let run = build_and_run(
         "remset_stress",
-        &["--gc=generational", "--gc-log", "--gc-stress"],
+        &[
+            "--gc=generational",
+            "--gc-log",
+            "--gc-stress",
+            "--gc-max-heap=16MiB",
+        ],
         PROGRAM,
     );
     let stderr = String::from_utf8_lossy(&run.stderr);

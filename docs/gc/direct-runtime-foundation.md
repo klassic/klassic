@@ -1,0 +1,103 @@
+# Opt-in direct runtime foundation
+
+This integration candidate advances the direct `--gc=generational` runtime.
+The default collector remains unchanged. It is a partial implementation, not
+completion of the Generational ZGC contract or a latency acceptance result.
+
+## Included implementation
+
+The direct runtime now contains physical heap/metadata ownership, registered
+owner contexts and root journals, worker-driven marking, moving rounds,
+queue and lease backing, weak/pin/native-thread boundaries, and heap policy
+controls. These modules share runtime layout and phase/lifetime state and are
+integrated together. Runtime tests emit and execute the actual machine code.
+Linux x86-64, Windows x86-64 and AArch64 macOS have distinct host adapters.
+Cross-platform model evidence does not substitute for native execution.
+
+The CLI exposes direct heap minimum/hard/soft limits, metadata limits,
+uncommit delay, pre-touch, large-page policy, and text/JSON logging controls.
+Their target-specific admission is checked before emission. Canonical C/LLVM
+source output rejects these newly introduced controls and `--gc-log`; its
+existing stress option and module diagnostics are preserved.
+
+## Remaining work
+
+- #676: a loaded two-owner ordinary moving-cycle run previously reported an
+  invariant failure. Its original executable was not retained. Later passing
+  runs do not identify the cause and do not close this issue.
+- #677: per-mutator remembered-buffer sealing across movement is unfinished.
+  The separate G07 buffer patch is excluded from this foundation.
+- #678 through #682 retain concurrent marking/relocation lifetime, pressure,
+  native/weak/thread completion, platform parity and acceptance work.
+- The full G01-G15 contract remains incomplete. Pause bounds and real-hardware
+  platform acceptance have not been established.
+
+## Review and validation
+
+Review runtime state/dispatch with its `production/` modules, then the direct
+compiler/host adapters and generated-code harnesses. The integration retains
+main's native ABI/frame conformance tests, entry frame bounds, concurrent
+pipe draining, and canonical collector fixes.
+
+Local integration validation on base `bea00f6` passed: workspace build,
+`cargo test --locked -- --nocapture` (1492 tests, zero failures or ignored
+cases across 36 suites), all-target Clippy and formatting. The run includes
+108 GC integration tests and 597 native library tests; the native library
+suite also passed separately before the full run. This includes
+canonical regressions and direct moving/resource-lifetime tests. Cross-platform
+CI remains required; local execution and API-model checks do not establish
+all native-platform or latency acceptance. Failure artifacts and initial logs
+are retained separately from the successful run.
+
+## Integration test corrections
+
+The ARM blocked-read supervisor now allows the model's existing 180-second
+program deadline to report before its own 190-second cleanup deadline. An
+exact original-image replay required 85 seconds and satisfied the native-read
+progress predicate; the former 60-second supervisor killed it during preflight.
+The model predicates and Windows deadline are unchanged.
+
+The Windows idle-uncommit fixture now completes synchronous large/full cycles
+before blocking its owner, matching the native-read fixture. It asserts actual
+full/large cycle counts as well as unchanged owner signaling, worker wakeups,
+and decommit progress. This establishes completed collection setup; it does
+not directly inspect private retired-page leases. The original failed run had
+15 worker timeouts with no decommit; its generated image was deleted by the
+old cleanup, so failure artifacts are now retained on panic. A successful old
+fixture replay had zero full cycles; that is not the missing original snapshot.
+
+Stress-only workloads retain the normal workloads and all original assertions:
+ARM retains its depth-200 graph and more than 1000 forced collections; the
+native worker fixture retains a 511-node graph through more than 2000 forced
+collections and five race repetitions. The initial oversized ARM run was
+intentionally interrupted with its exact image retained; it is not a pass.
+
+### Young overflow under a delayed worker (PR 700)
+
+The 512-MiB, 11,000-step retained-string workload could fail during its first
+Young relocation even though Old was empty. A foundation-runtime reproduction
+with the worker delayed on a contended CPU captured 32,556,224 protected bytes
+(8,148,768 traced plus 24,407,456 born black), no mature survivors, and all 256
+Young destination pages claimed. The worker had no losing copies. The source
+contained 11,318 objects and 998,208 bytes of page tails; a different copy order
+exhausted the destination. Capping the conservative reservation at 256 pages did
+not establish that the live objects would fit.
+
+The legacy single-owner path now reserves Old headroom before publishing the
+move and uses the existing promotion copier when an actual Young page claim
+fails. Before Young fills, the existing mature-promotion bound applies. Once
+it fills, a separate bound subtracts the minimum copied footprint already in
+Young from the maximum two-actor tentative-copy volume, includes the admitted
+fresh window and remaining Old-run tails, and rounds upward. Both bounds must
+fit the available Old reservation; otherwise collection selection chooses Full.
+The calculation reads fixed metadata and adds no object walk. Opt-in N-owner
+moving rounds retain their previous admission and exhaustion behavior.
+
+This preserves normal high-survival Young cycles and adaptive age decisions;
+capacity-driven promotion is a distinct reason to move an object early. Focused
+checks cover reordered 70,000/50,000-byte objects, exact capacity and one-byte
+shortfall, Old-run tails, and an overflow-promoted parent whose child remains
+Young across an active Old snapshot and is healed at the next Young cycle.
+The original retained-string program also completes after a controlled worker
+delay, printing `22000`, with zero unmarked-copy counters. Failure executables
+and stdout/stderr from Linux GC integration runs are retained and uploaded by CI.

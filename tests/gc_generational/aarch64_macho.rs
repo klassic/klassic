@@ -7,7 +7,7 @@ use super::*;
 
 /// A Python interpreter that can import `unicorn`: `$KLASSIC_UNICORN_PYTHON`,
 /// then `python3`, then any pyenv-installed `python3`.
-fn emulator_python() -> Option<PathBuf> {
+pub(super) fn emulator_python() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::env::var_os("KLASSIC_UNICORN_PYTHON")
         .map(PathBuf::from)
         .into_iter()
@@ -34,7 +34,7 @@ fn emulator_python() -> Option<PathBuf> {
 
 /// Build `source` for aarch64-apple-darwin with `flags` and run it in the
 /// emulator; `None` when no emulator is available.
-fn build_and_emulate(tag: &str, flags: &[&str], source: &str) -> Option<Output> {
+pub(super) fn build_and_emulate(tag: &str, flags: &[&str], source: &str) -> Option<Output> {
     let source_path = write_source(tag, source);
     let output_path = temp_path(tag, "macho");
     let mut all = vec!["--target", "aarch64-apple-darwin"];
@@ -52,11 +52,16 @@ fn build_and_emulate(tag: &str, flags: &[&str], source: &str) -> Option<Output> 
         return None;
     };
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/run-macho-aarch64.py");
-    let run = Command::new(python)
-        .arg(script)
-        .arg(&output_path)
-        .output()
-        .expect("emulator should run");
+    let mut command = Command::new(python);
+    command.arg(script).arg(&output_path);
+    if tag == "a64s" {
+        // Preserve the complete 3,000-iteration forced-GC workload with
+        // deterministic instruction quanta and explicit YIELD scheduling.
+        command
+            .env("KLASSIC_MACHO_WORKER_QUANTUM", "1000000")
+            .env("KLASSIC_MACHO_WORKER_SECONDS", "3600");
+    }
+    let run = command.output().expect("emulator should run");
     let _ = fs::remove_file(&output_path);
     Some(run)
 }
@@ -93,15 +98,52 @@ fn aarch64_generational_matches_the_evaluator() {
     assert!(run.status.success(), "stderr:\n{stderr}");
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
     let stats = gc_stats(&stderr);
+    assert_eq!(
+        stats["tenuring_full_samples"], stats["full_collections"],
+        "stats: {stats:?}"
+    );
+    assert_eq!(
+        stats["tenuring_full_samples"] + stats["tenuring_young_samples"],
+        stats["collections"],
+        "stats: {stats:?}"
+    );
+    assert!(
+        (2..=15).contains(&stats["tenuring_threshold"]),
+        "stats: {stats:?}"
+    );
+    assert!(
+        (2..=15).contains(&stats["tenuring_frozen"]),
+        "stats: {stats:?}"
+    );
+    assert!(stats["fresh_allocated_bytes"] > 0, "stats: {stats:?}");
+    assert_eq!(
+        stats["old_full_samples"], stats["full_collections"],
+        "stats: {stats:?}"
+    );
+    assert_eq!(
+        stats["old_full_samples"] + stats["old_young_samples"],
+        stats["collections"],
+        "stats: {stats:?}"
+    );
+    assert!(
+        (stats["old_limit_bytes"] / 4
+            ..=stats["old_limit_bytes"] - stats["young_limit_pages"] * 131072)
+            .contains(&stats["old_target_bytes"]),
+        "stats: {stats:?}"
+    );
     assert!(stats["objects"] > 0, "stats: {stats:?}");
     assert_eq!(stats["objects"], stats["published"], "stats: {stats:?}");
 }
 
 #[test]
 fn aarch64_generational_survives_stress_collections() {
-    let expected = evaluate("a64s_eval", PROGRAM);
+    // Keep the retained depth-200 graph and >1000 forced collections, while
+    // the normal (non-stress) case retains the full 3000-iteration workload.
+    // 64 iterations allocate at least 1280 strings after graph construction.
+    let program = PROGRAM.replace("while(i < 3000)", "while(i < 64)");
+    let expected = evaluate("a64s_eval", &program);
     let flags = ["--gc=generational", "--gc-log", "--gc-stress"];
-    let Some(run) = build_and_emulate("a64s", &flags, PROGRAM) else {
+    let Some(run) = build_and_emulate("a64s", &flags, &program) else {
         return;
     };
     let stderr = String::from_utf8_lossy(&run.stderr);
@@ -110,6 +152,39 @@ fn aarch64_generational_survives_stress_collections() {
     // A collection before every allocation, and the long-lived tree is
     // promoted to Old.
     let stats = gc_stats(&stderr);
+    assert_eq!(
+        stats["tenuring_full_samples"], stats["full_collections"],
+        "stats: {stats:?}"
+    );
+    assert_eq!(
+        stats["tenuring_full_samples"] + stats["tenuring_young_samples"],
+        stats["collections"],
+        "stats: {stats:?}"
+    );
+    assert!(
+        (2..=15).contains(&stats["tenuring_threshold"]),
+        "stats: {stats:?}"
+    );
+    assert!(
+        (2..=15).contains(&stats["tenuring_frozen"]),
+        "stats: {stats:?}"
+    );
+    assert!(stats["fresh_allocated_bytes"] > 0, "stats: {stats:?}");
+    assert_eq!(
+        stats["old_full_samples"], stats["full_collections"],
+        "stats: {stats:?}"
+    );
+    assert_eq!(
+        stats["old_full_samples"] + stats["old_young_samples"],
+        stats["collections"],
+        "stats: {stats:?}"
+    );
+    assert!(
+        (stats["old_limit_bytes"] / 4
+            ..=stats["old_limit_bytes"] - stats["young_limit_pages"] * 131072)
+            .contains(&stats["old_target_bytes"]),
+        "stats: {stats:?}"
+    );
     assert!(stats["collections"] > 1000, "stats: {stats:?}");
     assert!(stats["promoted_bytes"] > 0, "stats: {stats:?}");
 }
@@ -135,4 +210,119 @@ fn aarch64_generational_stress_roots_print_cursors_and_paths() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+}
+
+#[test]
+fn aarch64_generational_boxed_reference_like_integer_stays_scalar() {
+    let expected = evaluate("a64_scalar_eval", OPAQUE_SCALAR_PROGRAM);
+    for flags in [
+        &["--gc=generational"][..],
+        &["--gc=generational", "--gc-stress"],
+    ] {
+        let Some(run) = build_and_emulate("a64_scalar", flags, OPAQUE_SCALAR_PROGRAM) else {
+            return;
+        };
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), expected, "{flags:?}");
+    }
+}
+
+#[test]
+fn aarch64_configured_heap_limits_drive_the_portable_runtime() {
+    let expected = evaluate("a64_heap_eval", OPAQUE_SCALAR_PROGRAM);
+    for size in [16, 512] {
+        let flag = format!("--gc-max-heap={size}MiB");
+        let flags = ["--gc=generational", "--gc-log", "--gc-stress", &flag];
+        let Some(run) = build_and_emulate("a64_heap", &flags, OPAQUE_SCALAR_PROGRAM) else {
+            return;
+        };
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+        let stats = gc_stats(&stderr);
+        assert_eq!(stats["heap_capacity_bytes"], size << 20);
+        assert_eq!(stats["old_limit_bytes"], (size << 20) / 131072 / 3 * 131072);
+    }
+}
+
+#[test]
+fn aarch64_minimum_heap_is_protected_then_committed_on_demand() {
+    let flags = [
+        "--gc=generational",
+        "--gc-log",
+        "--gc-stress",
+        "--gc-max-heap=16MiB",
+        "--gc-min-heap=128KiB",
+    ];
+    let Some(run) = build_and_emulate("a64_min_heap", &flags, OPAQUE_SCALAR_PROGRAM) else {
+        return;
+    };
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "true\n8595182865\n");
+    let stats = gc_stats(&stderr);
+    assert_eq!(stats["heap_initial_committed_bytes"], 128 << 10);
+    assert!(stats["heap_commit_pages"] > 1);
+    assert_eq!(
+        stats["heap_commit_pages"] * 131072,
+        stats["heap_committed_bytes"]
+    );
+    assert!(stats["heap_peak_committed_bytes"] <= 16 << 20);
+}
+
+#[test]
+fn aarch64_zero_uncommit_delay_runs_owner_maintenance_and_preserves_live_values() {
+    let flags = [
+        "--gc=generational",
+        "--gc-log",
+        "--gc-stress",
+        "--gc-max-heap=16MiB",
+        "--gc-min-heap=128KiB",
+        "--gc-uncommit-delay=0ns",
+    ];
+    // More than two complete owner scan rounds; the short scalar fixture
+    // alone performs fewer than two 64-allocation maintenance samples.
+    let source = OPAQUE_SCALAR_PROGRAM.replace("i < 40", "i < 1024");
+    let Some(run) = build_and_emulate("a64_uncommit", &flags, &source) else {
+        return;
+    };
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "true\n8595182865\n");
+    let v = gc_stats(&stderr);
+    assert_eq!(v["heap_uncommit_delay_ns"], 0);
+    assert!(v["heap_uncommit_pages"] > 0, "{v:?}");
+    assert!(v["heap_recommit_pages"] > 0, "{v:?}");
+    assert_eq!(
+        v["heap_committed_bytes"],
+        (v["heap_commit_pages"] - v["heap_uncommit_pages"]) * 131072
+    );
+    assert!(v["heap_committed_bytes"] >= 128 << 10, "{v:?}");
+    assert!(v["heap_peak_committed_bytes"] <= 16 << 20, "{v:?}");
+}
+
+#[test]
+fn aarch64_full_unsigned_uncommit_delay_is_logged_exactly() {
+    let flags = [
+        "--gc=generational",
+        "--gc-log",
+        "--gc-min-heap=128KiB",
+        "--gc-max-heap=16MiB",
+        "--gc-uncommit-delay=18446744073709551615ns",
+    ];
+    let Some(run) = build_and_emulate("a64_delay_u64", &flags, "println(1)\n") else {
+        return;
+    };
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert_eq!(run.stdout, b"1\n");
+    assert!(
+        stderr.contains("heap_uncommit_delay_ns=18446744073709551615"),
+        "{stderr}"
+    );
+    assert_eq!(gc_stats(&stderr)["heap_uncommit_delay_ns"], u64::MAX);
 }

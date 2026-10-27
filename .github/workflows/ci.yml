@@ -7,12 +7,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      KLASSIC_UNICORN_PYTHON: python
+      KLASSIC_GC_GRAPH_TRACE: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup ARM64 test emulator
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          pip-install: 'unicorn==2.1.4'
+
+      - name: Install Linux syscall observer
+        run: sudo apt-get update && sudo apt-get install -y strace
 
       - name: Check formatting
         run: cargo fmt --check
@@ -25,8 +37,22 @@ jobs:
         # the C-backend link tests resolve next to the klassic binary.
         run: cargo build -p klassic-runtime
 
-      - name: Test
-        run: cargo test
+      - name: Test native runtime
+        run: cargo test -p klassic-native
+
+      - name: Test remaining workspace
+        run: cargo test --workspace --exclude klassic-native
+
+      - name: Preserve failed conformance drivers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-failed-conformance-drivers
+          path: |
+            /tmp/klassic-emitted-atomics-*
+            /tmp/klassic-harness-*
+            /tmp/klassic_gcgen_*
+          if-no-files-found: ignore
 
       - name: Build release binary
         run: cargo build --release
@@ -39,12 +65,20 @@ jobs:
   # runner ever stops being arm64 (which would silently skip them).
   test-macos:
     runs-on: macos-latest
+    env:
+      KLASSIC_UNICORN_PYTHON: python
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup ARM64 test emulator
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          pip-install: 'unicorn==2.1.4'
 
       - name: Show runner architecture
         run: uname -m  # must be arm64; the aarch64 backend executes here
@@ -63,12 +97,20 @@ jobs:
   # crash-checked here on every push.
   test-windows:
     runs-on: windows-latest
+    env:
+      KLASSIC_UNICORN_PYTHON: python
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup ARM64 test emulator
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          pip-install: 'unicorn==2.1.4'
 
       - name: Build runtime staticlib
         # cargo test alone doesn't produce libklassic_runtime.a, which

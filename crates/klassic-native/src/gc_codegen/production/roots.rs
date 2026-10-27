@@ -3,7 +3,7 @@ use super::{
     HANDLE_CELL, HANDLE_GENERATION, HANDLE_SCOPE, Labels, REQUEST_VALUE, ROOT_READ_RAW,
     ROOT_RESERVE, ROOT_STORE, RT_ADOPT_SLOT, RT_CELL_SP, RT_COPY_LOW, RT_FRAME_ROOT, RT_HEAP_BASE,
     RT_NEXT_PAGE, RT_OBJECTS, RT_PAGES_USED, RT_SEGMENT, RT_SPACE_BASE, RT_SPACE_END, RT_VERIFIED,
-    SEGMENT_SCOPE, d, decode, encode, load_runtime, root_step,
+    d, decode, encode, load_rt, load_runtime, root_step, store_rt,
 };
 use crate::gc_abi::{AllocationPage, OBJECT_PUBLISHED, ObjectHeader, RootCell, RootSegment};
 use crate::portable_asm::{Condition as C, PortableAsm, Reg as R};
@@ -11,14 +11,16 @@ use std::mem::{offset_of, size_of};
 
 /// Fill `frame_root.handle` for the cell pointer in `cell`.
 pub(super) fn frame_handle<E: PortableAsm>(a: &mut E, cell: R, scratch: R) {
-    a.store_ptr_disp32(R::V3, d(RT_FRAME_ROOT + HANDLE_CELL), cell);
+    store_rt(a, RT_FRAME_ROOT + HANDLE_CELL, cell);
     a.load_ptr_disp32(scratch, cell, d(offset_of!(RootCell, reuse_generation)));
-    a.store_ptr_disp32(R::V3, d(RT_FRAME_ROOT + HANDLE_GENERATION), scratch);
-    a.mov_imm64(scratch, SEGMENT_SCOPE);
-    a.store_ptr_disp32(R::V3, d(RT_FRAME_ROOT + HANDLE_SCOPE), scratch);
+    store_rt(a, RT_FRAME_ROOT + HANDLE_GENERATION, scratch);
+    load_rt(a, scratch, RT_SEGMENT);
+    a.load_ptr_disp32(scratch, scratch, d(offset_of!(RootSegment, scope)));
+    store_rt(a, RT_FRAME_ROOT + HANDLE_SCOPE, scratch);
 }
 
-const SAVED: [R; 10] = [
+const SAVED: [R; 11] = [
+    R::OwnerContext,
     R::V0,
     R::V1,
     R::V2,
@@ -47,26 +49,43 @@ fn restore_all<E: PortableAsm>(a: &mut E, skip_v0: bool) {
     }
 }
 
+/// Raw referent in V0 -> resolved reference bits. A late root publication
+/// must not hide a from-space address behind the newly adopted color.
+fn encode_resolved<E: PortableAsm>(a: &mut E, l: &Labels<E::TextLabel>) {
+    encode(a, R::V0, R::V1);
+    a.mov_imm64(R::V2, 1);
+    store_rt(a, super::RT_COLLECTING, R::V2);
+    a.call_label(l.forward);
+    a.mov_imm64(R::V2, 0);
+    store_rt(a, super::RT_COLLECTING, R::V2);
+}
+
 pub(super) fn emit_roots<E: PortableAsm>(
     a: &mut E,
     l: &Labels<E::TextLabel>,
     runtime: E::DataLabel,
 ) {
     // root_adopt: V0 = slot address; slot holds a payload address or null.
+    let root_adopt_body = a.create_text_label();
     a.bind_text_label(l.root_adopt);
     save_all(a, false);
     load_runtime(a, runtime);
-    a.store_ptr_disp32(R::V3, d(RT_ADOPT_SLOT), R::V0);
-    a.load_ptr_disp32(R::V1, R::V0, 0);
-    encode(a, R::V1, R::V2);
-    a.store_ptr_disp32(R::V3, d(RT_FRAME_ROOT + REQUEST_VALUE), R::V1);
+    a.jmp_label(root_adopt_body);
+    a.bind_text_label(l.root_adopt_actor);
+    save_all(a, false);
+    super::owner_state::bind_running(a, l);
+    a.bind_text_label(root_adopt_body);
+    store_rt(a, RT_ADOPT_SLOT, R::V0);
+    a.load_ptr_disp32(R::V0, R::V0, 0);
+    encode_resolved(a, l);
+    store_rt(a, RT_FRAME_ROOT + REQUEST_VALUE, R::V0);
     // Frame cell k (k >= 1) is reused once reserved: RESERVE never hands a
     // cell out twice, so LIFO reuse keeps loops from exhausting the segment.
     let reuse = a.create_text_label();
     let have = a.create_text_label();
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_CELL_SP));
+    load_rt(a, R::V0, RT_CELL_SP);
     a.add_reg_imm32(R::V0, 1);
-    a.load_ptr_disp32(R::V2, R::V3, d(RT_SEGMENT));
+    load_rt(a, R::V2, RT_SEGMENT);
     a.load_ptr_disp32(R::V1, R::V2, d(offset_of!(RootSegment, used)));
     a.cmp_reg_reg(R::V0, R::V1);
     a.jcc_label(C::Below, reuse);
@@ -79,44 +98,56 @@ pub(super) fn emit_roots<E: PortableAsm>(
     frame_handle(a, R::V1, R::V2);
     a.bind_text_label(have);
     root_step(a, l, RT_FRAME_ROOT, ROOT_STORE);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_CELL_SP));
+    load_rt(a, R::V0, RT_CELL_SP);
     a.add_reg_imm32(R::V0, 1);
-    a.store_ptr_disp32(R::V3, d(RT_CELL_SP), R::V0);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_ADOPT_SLOT));
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_FRAME_ROOT + HANDLE_CELL));
+    store_rt(a, RT_CELL_SP, R::V0);
+    load_rt(a, R::V0, RT_ADOPT_SLOT);
+    load_rt(a, R::V1, RT_FRAME_ROOT + HANDLE_CELL);
     a.store_ptr_disp32(R::V0, 0, R::V1);
     restore_all(a, false);
     a.ret();
 
     // root_pop: clear the top frame cell (cells[cell_sp]) and pop it.
+    let root_pop_body = a.create_text_label();
     a.bind_text_label(l.root_pop);
     save_all(a, false);
     load_runtime(a, runtime);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_CELL_SP));
+    a.jmp_label(root_pop_body);
+    a.bind_text_label(l.root_pop_actor);
+    save_all(a, false);
+    super::owner_state::bind_running(a, l);
+    a.bind_text_label(root_pop_body);
+    load_rt(a, R::V0, RT_CELL_SP);
     a.test_reg_reg(R::V0, R::V0);
     a.jcc_label(C::Equal, l.fail);
-    a.load_ptr_disp32(R::V2, R::V3, d(RT_SEGMENT));
+    load_rt(a, R::V2, RT_SEGMENT);
     a.load_ptr_disp32(R::V1, R::V2, d(offset_of!(RootSegment, cells)));
     a.shl_reg_imm8(R::V0, 5);
     a.add_reg_reg(R::V1, R::V0);
     frame_handle(a, R::V1, R::V2);
     a.mov_imm64(R::V0, 0);
-    a.store_ptr_disp32(R::V3, d(RT_FRAME_ROOT + REQUEST_VALUE), R::V0);
+    store_rt(a, RT_FRAME_ROOT + REQUEST_VALUE, R::V0);
     root_step(a, l, RT_FRAME_ROOT, ROOT_STORE);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_CELL_SP));
+    load_rt(a, R::V0, RT_CELL_SP);
     a.sub_reg_imm8(R::V0, 1);
-    a.store_ptr_disp32(R::V3, d(RT_CELL_SP), R::V0);
+    store_rt(a, RT_CELL_SP, R::V0);
     restore_all(a, false);
     a.ret();
 
     // root_store: V0 = payload address or null, V1 = slot address.
+    let root_store_body = a.create_text_label();
     a.bind_text_label(l.root_store);
     save_all(a, false);
     load_runtime(a, runtime);
+    a.jmp_label(root_store_body);
+    a.bind_text_label(l.root_store_actor);
+    save_all(a, false);
+    super::owner_state::bind_running(a, l);
+    a.bind_text_label(root_store_body);
     a.load_ptr_disp32(R::V1, R::V1, 0);
     frame_handle(a, R::V1, R::V2);
-    encode(a, R::V0, R::V2);
-    a.store_ptr_disp32(R::V3, d(RT_FRAME_ROOT + REQUEST_VALUE), R::V0);
+    encode_resolved(a, l);
+    store_rt(a, RT_FRAME_ROOT + REQUEST_VALUE, R::V0);
     root_step(a, l, RT_FRAME_ROOT, ROOT_STORE);
     restore_all(a, false);
     a.ret();
@@ -125,10 +156,16 @@ pub(super) fn emit_roots<E: PortableAsm>(
     // range check runs before the handle is built, so a frame slot that
     // still holds a raw address (a store that bypassed root_store) traps
     // here instead of being read as a cell.
+    let root_load_body = a.create_text_label();
     a.bind_text_label(l.root_load);
     save_all(a, true);
     load_runtime(a, runtime);
-    a.load_ptr_disp32(R::V2, R::V3, d(RT_SEGMENT));
+    a.jmp_label(root_load_body);
+    a.bind_text_label(l.root_load_actor);
+    save_all(a, true);
+    super::owner_state::bind_running(a, l);
+    a.bind_text_label(root_load_body);
+    load_rt(a, R::V2, RT_SEGMENT);
     a.load_ptr_disp32(R::V1, R::V2, d(offset_of!(RootSegment, cells)));
     a.mov_reg_reg(R::V6, R::V0);
     a.sub_reg_reg(R::V6, R::V1);
@@ -142,8 +179,20 @@ pub(super) fn emit_roots<E: PortableAsm>(
     a.jcc_label(C::AboveOrEqual, l.fail);
     frame_handle(a, R::V0, R::V2);
     root_step(a, l, RT_FRAME_ROOT, ROOT_READ_RAW);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_FRAME_ROOT + REQUEST_VALUE));
+    load_rt(a, R::V0, RT_FRAME_ROOT + REQUEST_VALUE);
+    // The root access guard is closed before the barrier can wait on the
+    // collector lock. The permanent segment retains this cell throughout.
+    let external = a.create_text_label();
+    let decoded = a.create_text_label();
+    a.mov_reg_reg(R::V1, R::V0);
+    a.and_reg_imm32(R::V1, super::EXTERNAL);
+    a.jcc_label(C::NotEqual, external);
+    load_rt(a, R::V10, RT_FRAME_ROOT + HANDLE_CELL);
+    a.call_label(l.field_load_actor);
+    a.jmp_label(decoded);
+    a.bind_text_label(external);
     decode(a, R::V0, R::V1);
+    a.bind_text_label(decoded);
     restore_all(a, true);
     a.ret();
 }
@@ -157,10 +206,13 @@ pub(super) fn emit_verify<E: PortableAsm>(
 ) {
     a.bind_text_label(l.verify);
     a.push_reg(R::V3);
+    a.push_reg(R::OwnerContext);
     load_runtime(a, runtime);
     super::worker::lock(a, l);
     a.call_label(l.finish);
     a.call_label(l.publish_pending);
+    super::old_runs::used(a, R::V0);
+    store_rt(a, super::RT_OLD_CHARGED_BYTES, R::V0);
     let pages = a.create_text_label();
     let objects = a.create_text_label();
     let next_page = a.create_text_label();
@@ -168,14 +220,14 @@ pub(super) fn emit_verify<E: PortableAsm>(
     let done = a.create_text_label();
     // Walk the current semispace: the TLAB's pages [space_base, next_page)
     // and the worker's pages [copy_low, space_end).
-    a.load_ptr_disp32(R::V9, R::V3, d(RT_SPACE_BASE)); // page index
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_NEXT_PAGE));
+    load_rt(a, R::V9, RT_SPACE_BASE); // page index
+    load_rt(a, R::V0, RT_NEXT_PAGE);
     a.sub_reg_reg(R::V0, R::V9);
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_SPACE_END));
+    load_rt(a, R::V1, RT_SPACE_END);
     a.add_reg_reg(R::V0, R::V1);
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_COPY_LOW));
+    load_rt(a, R::V1, RT_COPY_LOW);
     a.sub_reg_reg(R::V0, R::V1);
-    a.store_ptr_disp32(R::V3, d(RT_PAGES_USED), R::V0);
+    store_rt(a, RT_PAGES_USED, R::V0);
     a.mov_imm64(R::V10, 0); // objects
     a.mov_imm64(R::V11, 0); // published
     let walk = a.create_text_label();
@@ -183,13 +235,13 @@ pub(super) fn emit_verify<E: PortableAsm>(
     a.bind_text_label(locate);
     super::scan::page_ptr(a, R::V8, R::V9, R::V0);
     a.bind_text_label(pages);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_SPACE_END));
+    load_rt(a, R::V0, RT_SPACE_END);
     a.cmp_reg_reg(R::V9, R::V0);
     a.jcc_label(C::AboveOrEqual, done);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_NEXT_PAGE));
+    load_rt(a, R::V0, RT_NEXT_PAGE);
     a.cmp_reg_reg(R::V9, R::V0);
     a.jcc_label(C::Below, walk);
-    a.load_ptr_disp32(R::V0, R::V3, d(RT_COPY_LOW));
+    load_rt(a, R::V0, RT_COPY_LOW);
     a.cmp_reg_reg(R::V9, R::V0);
     a.jcc_label(C::AboveOrEqual, walk);
     a.mov_reg_reg(R::V9, R::V0);
@@ -200,7 +252,7 @@ pub(super) fn emit_verify<E: PortableAsm>(
     a.bind_text_label(objects);
     a.cmp_reg_reg(R::V6, R::V7);
     a.jcc_label(C::AboveOrEqual, next_page);
-    a.load_ptr_disp32(R::V1, R::V3, d(RT_HEAP_BASE));
+    load_rt(a, R::V1, RT_HEAP_BASE);
     a.add_reg_reg(R::V1, R::V6);
     a.add_reg_imm32(R::V10, 1);
     a.load_ptr_disp32(R::V2, R::V1, d(offset_of!(ObjectHeader, descriptor_id)));
@@ -228,9 +280,13 @@ pub(super) fn emit_verify<E: PortableAsm>(
     a.add_reg_imm32(R::V9, 1);
     a.jmp_label(pages);
     a.bind_text_label(done);
-    a.store_ptr_disp32(R::V3, d(RT_OBJECTS), R::V10);
-    a.store_ptr_disp32(R::V3, d(RT_VERIFIED), R::V11);
+    store_rt(a, RT_OBJECTS, R::V10);
+    store_rt(a, RT_VERIFIED, R::V11);
+    super::commit::snapshot(a);
+    super::large_pages::snapshot(a);
+    super::metadata::snapshot(a);
     super::worker::unlock(a, l);
+    a.pop_reg(R::OwnerContext);
     a.pop_reg(R::V3);
     a.ret();
 }
